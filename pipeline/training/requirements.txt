@@ -1,0 +1,7 @@
+# Installed inside the SageMaker training job (HF DLC base image provides torch).
+transformers>=4.51
+trl>=0.17
+peft>=0.15
+datasets>=3.0
+bitsandbytes>=0.45
+accelerate>=1.0

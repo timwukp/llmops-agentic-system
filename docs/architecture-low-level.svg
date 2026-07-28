@@ -1,0 +1,132 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1240 560" font-family="system-ui,-apple-system,'Segoe UI',Roboto,sans-serif">
+
+  <defs>
+    <marker id="ahB" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L8,4 L0,8 Z" fill="#5b8cff"/>
+    </marker>
+    <marker id="ahG" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L8,4 L0,8 Z" fill="#3ecf8e"/>
+    </marker>
+    <marker id="ahO" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L8,4 L0,8 Z" fill="#ffb454"/>
+    </marker>
+    <marker id="ahR" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L8,4 L0,8 Z" fill="#ff6b81"/>
+    </marker>
+    <marker id="ahP" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L8,4 L0,8 Z" fill="#b48cff"/>
+    </marker>
+    <style>
+      .bg    { fill:#0b1020; }
+      .card  { fill:#141b33; stroke-width:2; rx:12; }
+      .cTrig { stroke:#b48cff; } .cSpine{ stroke:#5b8cff; } .cAgent{ stroke:#ffb454; }
+      .cAws  { stroke:#3ecf8e; } .cOps  { stroke:#ff6b81; } .cDim  { stroke:#26305a; }
+      .title { fill:#e7ecff; font-size:14px; font-weight:650; }
+      .sub   { fill:#8592c0; font-size:10px; }
+      .band  { fill:#101731; stroke:#26305a; stroke-width:1.5; }
+      .bandT { fill:#8592c0; font-size:11px; font-weight:600; letter-spacing:1px; }
+      .wire  { stroke:#5b8cff; stroke-width:2.5; fill:none; stroke-dasharray:7 6; animation:dash 1.1s linear infinite; }
+      .wireG { stroke:#3ecf8e; stroke-width:2.5; fill:none; stroke-dasharray:7 6; animation:dash 1.1s linear infinite; }
+      .wireO { stroke:#ffb454; stroke-width:2.5; fill:none; stroke-dasharray:7 6; animation:dash 1.1s linear infinite; }
+      .wireR { stroke:#ff6b81; stroke-width:2.5; fill:none; stroke-dasharray:7 6; animation:dash 1.4s linear infinite; }
+      .wireP { stroke:#b48cff; stroke-width:2.5; fill:none; stroke-dasharray:7 6; animation:dash 1.4s linear infinite; }
+      .wireDim { stroke:#26305a; stroke-width:2; fill:none; stroke-dasharray:4 5; }
+      @keyframes dash { to { stroke-dashoffset:-13; } }
+      a { cursor:pointer; }
+    </style>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1240" height="560" rx="16"/>
+  <text class="title" x="30" y="40" font-size="18">Inside a worker harness — drawn from the live configs, not aspiration</text>
+  <text class="sub" x="30" y="60">agents/*/harness.json · Fable 5 · timeoutSeconds 840 · sliding-window 150 · launch-and-release</text>
+  <a href="https://github.com/timwukp/llmops-agentic-system/blob/main/orchestration/harness_driver/handler.py" target="_top">
+    <g>
+      <rect class="card cSpine" x="30" y="240" width="180" height="56" rx="12"/>
+      <text class="title" x="120.0" y="264" text-anchor="middle">🔌 harness-driver λ</text>
+      <text class="sub" x="120.0" y="282" text-anchor="middle">toolUse ⇄ toolResult</text>
+    </g>
+  </a>
+
+  <rect class="band" x="286" y="100" width="640" height="380" rx="14"/>
+  <text class="bandT" x="306" y="128">AGENTCORE HARNESS SESSION (microVM · shell · filesystem)</text>
+  <a href="https://github.com/timwukp/llmops-agentic-system/blob/main/agents/README.md" target="_top">
+    <g>
+      <rect class="card cAgent" x="316" y="150" width="180" height="56" rx="12"/>
+      <text class="title" x="406.0" y="174" text-anchor="middle">🧠 Fable 5 agent loop</text>
+      <text class="sub" x="406.0" y="192" text-anchor="middle">Strands · maxIterations 100</text>
+    </g>
+  </a>
+
+  <a href="https://github.com/timwukp/llmops-agentic-system/blob/main/agents/data-prep/harness.json" target="_top">
+    <g>
+      <rect class="card cDim" x="316" y="260" width="180" height="56" rx="12"/>
+      <text class="title" x="406.0" y="284" text-anchor="middle">📚 mounted skills</text>
+      <text class="sub" x="406.0" y="302" text-anchor="middle">MLOps-agent-skills llmops/*</text>
+    </g>
+  </a>
+
+  <a href="https://github.com/timwukp/llmops-agentic-system/blob/main/agents/README.md" target="_top">
+    <g>
+      <rect class="card cDim" x="316" y="370" width="180" height="56" rx="12"/>
+      <text class="title" x="406.0" y="394" text-anchor="middle">🐚 shell + code interpreter</text>
+      <text class="sub" x="406.0" y="412" text-anchor="middle">aws cli · python</text>
+    </g>
+  </a>
+
+  <a href="https://github.com/timwukp/llmops-agentic-system/blob/main/agents/README.md" target="_top">
+    <g>
+      <rect class="card cOps" x="660" y="150" width="220" height="56" rx="12"/>
+      <text class="title" x="770.0" y="174" text-anchor="middle">🧩 inline functions</text>
+      <text class="sub" x="770.0" y="192" text-anchor="middle">stage_complete · checkpoint · job_launched …</text>
+    </g>
+  </a>
+
+  <a href="https://github.com/timwukp/llmops-agentic-system/blob/main/deploy/04_wire_memory.py" target="_top">
+    <g>
+      <rect class="card cDim" x="660" y="260" width="220" height="56" rx="12"/>
+      <text class="title" x="770.0" y="284" text-anchor="middle">🗃️ shared BYO memory</text>
+      <text class="sub" x="770.0" y="302" text-anchor="middle">SEMANTIC + EPISODIC · cross-run</text>
+    </g>
+  </a>
+
+  <a href="https://github.com/timwukp/llmops-agentic-system/blob/main/deploy/06_observability.py" target="_top">
+    <g>
+      <rect class="card cDim" x="660" y="370" width="220" height="56" rx="12"/>
+      <text class="title" x="770.0" y="394" text-anchor="middle">🛰️ OTel traces</text>
+      <text class="sub" x="770.0" y="412" text-anchor="middle">always_on → console evals</text>
+    </g>
+  </a>
+
+  <path class="wireO" d="M210,258.0 L282,258.0" marker-end="url(#ahO)"/>
+
+  <path class="wireR" d="M286,280.0 L214,280.0" marker-end="url(#ahR)"/>
+
+  <text class="sub" x="245" y="250.0" text-anchor="middle">invoke</text>
+  <text class="sub" x="250" y="322" text-anchor="middle">pause: stopReason=tool_use</text>
+  <path class="wire" d="M406.0,206 L406.0,256" marker-end="url(#ahB)"/>
+
+  <path class="wire" d="M406.0,316 L406.0,366" marker-end="url(#ahB)"/>
+
+  <path class="wireO" d="M496,178.0 L656,178.0" marker-end="url(#ahO)"/>
+
+  <a href="https://github.com/timwukp/llmops-agentic-system/blob/main/docs/ARCHITECTURE.md" target="_top">
+    <g>
+      <rect class="card cAws" x="986" y="150" width="220" height="56" rx="12"/>
+      <text class="title" x="1096.0" y="174" text-anchor="middle">☁️ SageMaker / Bedrock</text>
+      <text class="sub" x="1096.0" y="192" text-anchor="middle">jobs · endpoints · converse</text>
+    </g>
+  </a>
+
+  <a href="https://github.com/timwukp/llmops-agentic-system/blob/main/pipeline/contracts/manifest.schema.json" target="_top">
+    <g>
+      <rect class="card cAws" x="986" y="260" width="220" height="56" rx="12"/>
+      <text class="title" x="1096.0" y="284" text-anchor="middle">🪣 S3 manifest</text>
+      <text class="sub" x="1096.0" y="302" text-anchor="middle">single source of truth</text>
+    </g>
+  </a>
+
+  <path class="wireG" d="M406.0,426 L406.0,452 L1222,452 L1222,178.0 L1210,178.0" marker-end="url(#ahG)"/>
+
+  <path class="wireG" d="M880,288.0 L982,288.0" marker-end="url(#ahG)"/>
+
+</svg>

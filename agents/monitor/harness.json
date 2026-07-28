@@ -1,0 +1,189 @@
+{
+  "_comment": "llmops-monitor — stage 5 worker. Watches the deployed student endpoint (CloudWatch metrics, token/cost tracking, drift signals) and sweeps for orphaned SageMaker endpoints as cost control. Skills mounted from MLOps-agent-skills (git source, default branch). Created via deploy/create_harness.py; BYO shared memory attached post-create by deploy/wire_memory.py; validate offline with deploy/validate_config.py first.",
+  "harnessName": "llmops_monitor",
+  "model": {
+    "bedrockModelConfig": {
+      "modelId": "global.anthropic.claude-fable-5",
+      "apiFormat": "converse_stream",
+      "maxTokens": 65536
+    }
+  },
+  "systemPrompt": [
+    {
+      "text": "You are the MONITOR agent of an autonomous LLMOps pipeline (knowledge distillation: teacher DeepSeek-R1 on Bedrock -> student Qwen3-1.7B on SageMaker).\n\nYour mounted skills (llm-observability, llm-cost-optimization, llm-agent-orchestration) are your methodology — consult them before acting.\n\nInputs arrive as JSON: {run_id, stage, manifest_uri, params}. The S3 manifest at manifest_uri is the single source of truth; read it first, append your results to it, never overwrite other stages' entries.\n\nYour job per invocation depends on params.task:\n- \"health\": read CloudWatch metrics for the student endpoint (name in the manifest or params.student_endpoint) via the shell ('aws cloudwatch get-metric-statistics' / 'get-metric-data'): Invocations, ModelLatency p50/p90, Invocation4XXErrors/5XXErrors. Track token throughput and per-invocation cost per llm-cost-optimization. Check for drift signals per llm-observability (latency creep, error-rate rise, output-length shift vs the eval baseline in evaluation/report.json). Save console screenshot evidence (browser) to reports/run-latest/screenshots/. Write monitoring/health.json and call stage_complete; any DriftDetected-worthy finding goes in metrics (e.g. metrics.drift_detected true with the signal) so the orchestrator can emit the event.\n- \"sweep\": cost control — list SageMaker endpoints tagged project=llmops-agentic-system ('aws sagemaker list-endpoints' + 'list-tags'), flag any idle >2 hours (zero Invocations over the window per CloudWatch), write monitoring/sweep.json reporting them for teardown, and call stage_complete with the flagged endpoints in metrics. Do NOT delete endpoints yourself — report them; teardown is the deploy agent's duty.\n- \"report\": consolidate the run's story from the manifest and the monitoring/ prefix into monitoring/report.json plus a human-readable monitoring/report.md (stage timeline, key metrics per stage, total estimated cost, open findings), and call stage_complete.\n\nRules:\n- Work in bounded turns: your turn budget is ~13 minutes. If work remains, call checkpoint with a progress S3 URI and exit the turn; you will be re-invoked.\n- Never hold long waits in-turn beyond 10 minutes; there are no training jobs at your stage.\n- Report facts with numbers, never impressions: every finding cites the metric, window, and threshold it breached.\n- Read AWS region and bucket from the invocation params, never hardcode account-specific values.\n- On unrecoverable errors or findings needing human judgment (e.g. drift with unclear cause), call escalate_human with specifics.\n- When a task finishes, call stage_complete with {stage, outputs: [s3 uris], metrics, evidence}. Write a human-readable summary to the manifest as well.\n- Record durable learnings (baseline latency/cost per instance type, which drift signals fired first) — they persist in memory for future runs."
+    }
+  ],
+  "tools": [
+    {
+      "type": "agentcore_code_interpreter",
+      "name": "code_interpreter"
+    },
+    {
+      "type": "agentcore_browser",
+      "name": "browser"
+    },
+    {
+      "type": "inline_function",
+      "name": "stage_complete",
+      "config": {
+        "inlineFunction": {
+          "description": "Signal the orchestrator that this stage's task is complete. Call exactly once, after all outputs are written to S3. DriftDetected-worthy findings go in metrics so the orchestrator can emit the event.",
+          "inputSchema": {
+            "type": "object",
+            "properties": {
+              "stage": {
+                "type": "string",
+                "description": "Stage name, e.g. monitor"
+              },
+              "task": {
+                "type": "string",
+                "description": "Task that completed: health | sweep | report"
+              },
+              "outputs": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "S3 URIs of produced artifacts"
+              },
+              "metrics": {
+                "type": "object",
+                "description": "Key numbers: latency p50/p90, error rate, cost estimate, drift_detected flag, idle endpoints flagged"
+              },
+              "evidence": {
+                "type": "string",
+                "description": "One-paragraph proof of what was verified"
+              }
+            },
+            "required": [
+              "stage",
+              "task",
+              "outputs"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "type": "inline_function",
+      "name": "checkpoint",
+      "config": {
+        "inlineFunction": {
+          "description": "Persist progress and yield the turn when the ~13-minute budget nears. You will be re-invoked in the same session to continue.",
+          "inputSchema": {
+            "type": "object",
+            "properties": {
+              "progress_uri": {
+                "type": "string",
+                "description": "S3 URI of the progress snapshot"
+              },
+              "next_action": {
+                "type": "string",
+                "description": "What to do when re-invoked"
+              },
+              "percent_complete": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "progress_uri",
+              "next_action"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "type": "inline_function",
+      "name": "escalate_human",
+      "config": {
+        "inlineFunction": {
+          "description": "Escalate to a human operator on unrecoverable errors or judgment calls above your authority. The pipeline pauses.",
+          "inputSchema": {
+            "type": "object",
+            "properties": {
+              "reason": {
+                "type": "string"
+              },
+              "details": {
+                "type": "string",
+                "description": "Error output, S3 URIs, what was attempted"
+              },
+              "options": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Suggested resolutions"
+              }
+            },
+            "required": [
+              "reason",
+              "details"
+            ]
+          }
+        }
+      }
+    }
+  ],
+  "allowedTools": [
+    "shell",
+    "file_read",
+    "file_write",
+    "code_interpreter",
+    "browser",
+    "skills",
+    "stage_complete",
+    "checkpoint",
+    "escalate_human"
+  ],
+  "skills": [
+    {
+      "git": {
+        "url": "https://github.com/timwukp/MLOps-agent-skills",
+        "path": "skills/llmops/llm-observability"
+      }
+    },
+    {
+      "git": {
+        "url": "https://github.com/timwukp/MLOps-agent-skills",
+        "path": "skills/llmops/llm-cost-optimization"
+      }
+    },
+    {
+      "git": {
+        "url": "https://github.com/timwukp/MLOps-agent-skills",
+        "path": "skills/llmops/llm-agent-orchestration"
+      }
+    }
+  ],
+  "_memory_note": "Created WITHOUT memory; the shared BYO memory (llmops-shared-memory, SEMANTIC+EPISODIC across all 5 agents) is attached post-create by deploy/04_wire_memory.py — the skill's 3-step wiring (CreateMemory + UpdateHarness optionalValue + IAM grant).",
+  "maxIterations": 100,
+  "maxTokens": 65536,
+  "timeoutSeconds": 840,
+  "truncation": {
+    "strategy": "sliding_window",
+    "config": {
+      "slidingWindow": {
+        "messagesCount": 150
+      }
+    }
+  },
+  "environment": {
+    "agentCoreRuntimeEnvironment": {
+      "networkConfiguration": {
+        "networkMode": "PUBLIC"
+      },
+      "lifecycleConfiguration": {
+        "idleRuntimeSessionTimeout": 900,
+        "maxLifetime": 28800
+      }
+    }
+  },
+  "tags": {
+    "project": "llmops-agentic-system",
+    "environment": "development",
+    "agent-type": "monitor",
+    "pipeline-stage": "5"
+  }
+}

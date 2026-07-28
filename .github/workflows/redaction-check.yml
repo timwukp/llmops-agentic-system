@@ -1,0 +1,25 @@
+name: Redaction check
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Scan for account IDs, credentials, account-bearing ARNs
+        run: |
+          set -e
+          ALLOW='683313688378|763104351884|123456789012'
+          hits=$(grep -rnE 'AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}|aws_secret_access_key|arn:aws[a-z-]*:[a-z0-9-]+:[a-z0-9-]*:[0-9]{12}|(^|[^0-9.])[0-9]{12}([^0-9.]|$)' \
+            --include='*.py' --include='*.json' --include='*.md' --include='*.yml' --include='*.yaml' --include='*.sh' --include='*.svg' . \
+            | grep -vE '^\./(\.github/workflows/redaction-check\.yml|hooks/pre-commit):' \
+            | grep -vE "$ALLOW" | grep -vE '<ACCOUNT_ID>|[0-9]{13,}' || true)
+          if [ -n "$hits" ]; then
+            echo "::error::Possible account ID / credential / account-bearing ARN found:"
+            echo "$hits" | head -20
+            exit 1
+          fi
+          echo "Redaction scan clean."

@@ -1,0 +1,230 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1240 700" font-family="system-ui,-apple-system,'Segoe UI',Roboto,sans-serif">
+
+  <defs>
+    <marker id="ahB" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L8,4 L0,8 Z" fill="#5b8cff"/>
+    </marker>
+    <marker id="ahG" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L8,4 L0,8 Z" fill="#3ecf8e"/>
+    </marker>
+    <marker id="ahO" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L8,4 L0,8 Z" fill="#ffb454"/>
+    </marker>
+    <marker id="ahR" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L8,4 L0,8 Z" fill="#ff6b81"/>
+    </marker>
+    <marker id="ahP" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L8,4 L0,8 Z" fill="#b48cff"/>
+    </marker>
+    <style>
+      .bg    { fill:#0b1020; }
+      .card  { fill:#141b33; stroke-width:2; rx:12; }
+      .cTrig { stroke:#b48cff; } .cSpine{ stroke:#5b8cff; } .cAgent{ stroke:#ffb454; }
+      .cAws  { stroke:#3ecf8e; } .cOps  { stroke:#ff6b81; } .cDim  { stroke:#26305a; }
+      .title { fill:#e7ecff; font-size:14px; font-weight:650; }
+      .sub   { fill:#8592c0; font-size:10px; }
+      .band  { fill:#101731; stroke:#26305a; stroke-width:1.5; }
+      .bandT { fill:#8592c0; font-size:11px; font-weight:600; letter-spacing:1px; }
+      .wire  { stroke:#5b8cff; stroke-width:2.5; fill:none; stroke-dasharray:7 6; animation:dash 1.1s linear infinite; }
+      .wireG { stroke:#3ecf8e; stroke-width:2.5; fill:none; stroke-dasharray:7 6; animation:dash 1.1s linear infinite; }
+      .wireO { stroke:#ffb454; stroke-width:2.5; fill:none; stroke-dasharray:7 6; animation:dash 1.1s linear infinite; }
+      .wireR { stroke:#ff6b81; stroke-width:2.5; fill:none; stroke-dasharray:7 6; animation:dash 1.4s linear infinite; }
+      .wireP { stroke:#b48cff; stroke-width:2.5; fill:none; stroke-dasharray:7 6; animation:dash 1.4s linear infinite; }
+      .wireDim { stroke:#26305a; stroke-width:2; fill:none; stroke-dasharray:4 5; }
+      @keyframes dash { to { stroke-dashoffset:-13; } }
+      a { cursor:pointer; }
+    </style>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1240" height="700" rx="16"/>
+  <text class="title" x="30" y="40" font-size="18">llmops-agentic-system — autonomous LLMOps on AgentCore</text>
+  <text class="sub" x="30" y="60">teacher DeepSeek-R1 (Bedrock) → student Qwen3-1.7B (SageMaker QLoRA) · click any card</text>
+  <a href="https://github.com/timwukp/llmops-agentic-system/blob/main/docs/TRIGGERS.md" target="_top">
+    <g>
+      <rect class="card cTrig" x="30" y="92" width="180" height="56" rx="12"/>
+      <text class="title" x="120.0" y="116" text-anchor="middle">⏰ EventBridge Scheduler</text>
+      <text class="sub" x="120.0" y="134" text-anchor="middle">cron · nightly runs</text>
+    </g>
+  </a>
+
+  <a href="https://github.com/timwukp/llmops-agentic-system/blob/main/docs/TRIGGERS.md" target="_top">
+    <g>
+      <rect class="card cTrig" x="30" y="168" width="180" height="56" rx="12"/>
+      <text class="title" x="120.0" y="192" text-anchor="middle">🐙 GitHub Actions</text>
+      <text class="sub" x="120.0" y="210" text-anchor="middle">OIDC · fire-and-monitor</text>
+    </g>
+  </a>
+
+  <a href="https://github.com/timwukp/llmops-agentic-system/blob/main/docs/TRIGGERS.md" target="_top">
+    <g>
+      <rect class="card cTrig" x="30" y="244" width="180" height="56" rx="12"/>
+      <text class="title" x="120.0" y="268" text-anchor="middle">🖥️ Admin API</text>
+      <text class="sub" x="120.0" y="286" text-anchor="middle">Cognito · POST /runs</text>
+    </g>
+  </a>
+
+  <a href="https://github.com/timwukp/llmops-agentic-system/blob/main/docs/TRIGGERS.md" target="_top">
+    <g>
+      <rect class="card cTrig" x="30" y="320" width="180" height="56" rx="12"/>
+      <text class="title" x="120.0" y="344" text-anchor="middle">🪝 Webhook</text>
+      <text class="sub" x="120.0" y="362" text-anchor="middle">HMAC-verified</text>
+    </g>
+  </a>
+
+  <a href="https://github.com/timwukp/llmops-agentic-system/blob/main/agents/orchestrator/harness.json" target="_top">
+    <g>
+      <rect class="card cAgent" x="286" y="92" width="180" height="56" rx="12"/>
+      <text class="title" x="376.0" y="116" text-anchor="middle">🎼 llmops_orchestrator</text>
+      <text class="sub" x="376.0" y="134" text-anchor="middle">goal → plan → dispatch · triage</text>
+    </g>
+  </a>
+
+  <a href="https://github.com/timwukp/llmops-agentic-system/blob/main/orchestration/start_pipeline/handler.py" target="_top">
+    <g>
+      <rect class="card cSpine" x="286" y="168" width="180" height="56" rx="12"/>
+      <text class="title" x="376.0" y="192" text-anchor="middle">🚀 start_pipeline λ</text>
+      <text class="sub" x="376.0" y="210" text-anchor="middle">run_id · manifest seed</text>
+    </g>
+  </a>
+
+  <a href="https://github.com/timwukp/llmops-agentic-system/blob/main/orchestration/state_machine.asl.json" target="_top">
+    <g>
+      <rect class="card cSpine" x="286" y="282" width="180" height="56" rx="12"/>
+      <text class="title" x="376.0" y="306" text-anchor="middle">🧭 Step Functions</text>
+      <text class="sub" x="376.0" y="324" text-anchor="middle">stage DAG · waitForTaskToken</text>
+    </g>
+  </a>
+
+  <a href="https://github.com/timwukp/llmops-agentic-system/blob/main/orchestration/harness_driver/handler.py" target="_top">
+    <g>
+      <rect class="card cSpine" x="286" y="396" width="180" height="56" rx="12"/>
+      <text class="title" x="376.0" y="420" text-anchor="middle">🔌 harness-driver λ</text>
+      <text class="sub" x="376.0" y="438" text-anchor="middle">InvokeHarness · inline-fn loop</text>
+    </g>
+  </a>
+
+  <path class="wireP" d="M210,120.0 L232,120.0 L232,104 L282,104" marker-end="url(#ahP)"/>
+
+  <path class="wireP" d="M210,196.0 L244,196.0 L244,115 L282,115" marker-end="url(#ahP)"/>
+
+  <path class="wireP" d="M210,272.0 L256,272.0 L256,126 L282,126" marker-end="url(#ahP)"/>
+
+  <path class="wireP" d="M210,348.0 L268,348.0 L268,137 L282,137" marker-end="url(#ahP)"/>
+
+  <path class="wireO" d="M376.0,148 L376.0,164" marker-end="url(#ahO)"/>
+
+  <path class="wire" d="M376.0,224 L376.0,278" marker-end="url(#ahB)"/>
+
+  <path class="wire" d="M376.0,338 L376.0,392" marker-end="url(#ahB)"/>
+
+  <a href="https://github.com/timwukp/llmops-agentic-system/blob/main/agents/data-prep/harness.json" target="_top">
+    <g>
+      <rect class="card cAgent" x="560" y="92" width="180" height="56" rx="12"/>
+      <text class="title" x="650.0" y="116" text-anchor="middle">📥 llmops_data_prep</text>
+      <text class="sub" x="650.0" y="134" text-anchor="middle">distill data · guardrails</text>
+    </g>
+  </a>
+
+  <a href="https://github.com/timwukp/llmops-agentic-system/blob/main/agents/finetune/harness.json" target="_top">
+    <g>
+      <rect class="card cAgent" x="560" y="190" width="180" height="56" rx="12"/>
+      <text class="title" x="650.0" y="214" text-anchor="middle">🏋️ llmops_finetune</text>
+      <text class="sub" x="650.0" y="232" text-anchor="middle">QLoRA launch-and-release</text>
+    </g>
+  </a>
+
+  <a href="https://github.com/timwukp/llmops-agentic-system/blob/main/agents/eval/harness.json" target="_top">
+    <g>
+      <rect class="card cAgent" x="560" y="288" width="180" height="56" rx="12"/>
+      <text class="title" x="650.0" y="312" text-anchor="middle">🧾 llmops_eval</text>
+      <text class="sub" x="650.0" y="330" text-anchor="middle">judge gates · vs teacher</text>
+    </g>
+  </a>
+
+  <a href="https://github.com/timwukp/llmops-agentic-system/blob/main/agents/deploy/harness.json" target="_top">
+    <g>
+      <rect class="card cAgent" x="560" y="386" width="180" height="56" rx="12"/>
+      <text class="title" x="650.0" y="410" text-anchor="middle">🚢 llmops_deploy</text>
+      <text class="sub" x="650.0" y="428" text-anchor="middle">endpoint · smoke · teardown</text>
+    </g>
+  </a>
+
+  <a href="https://github.com/timwukp/llmops-agentic-system/blob/main/agents/monitor/harness.json" target="_top">
+    <g>
+      <rect class="card cAgent" x="560" y="484" width="180" height="56" rx="12"/>
+      <text class="title" x="650.0" y="508" text-anchor="middle">📈 llmops_monitor</text>
+      <text class="sub" x="650.0" y="526" text-anchor="middle">drift · cost sweep</text>
+    </g>
+  </a>
+
+  <path class="wireO" d="M466,402.0 L490,402.0 L490,120.0 L556,120.0" marker-end="url(#ahO)"/>
+
+  <path class="wireO" d="M466,413.0 L503,413.0 L503,218.0 L556,218.0" marker-end="url(#ahO)"/>
+
+  <path class="wireO" d="M466,424.0 L516,424.0 L516,316.0 L556,316.0" marker-end="url(#ahO)"/>
+
+  <path class="wireO" d="M466,435.0 L529,435.0 L529,414.0 L556,414.0" marker-end="url(#ahO)"/>
+
+  <path class="wireO" d="M466,446.0 L542,446.0 L542,512.0 L556,512.0" marker-end="url(#ahO)"/>
+
+  <a href="https://github.com/timwukp/llmops-agentic-system/blob/main/docs/ARCHITECTURE.md" target="_top">
+    <g>
+      <rect class="card cAws" x="850" y="92" width="180" height="56" rx="12"/>
+      <text class="title" x="940.0" y="116" text-anchor="middle">🧠 Bedrock</text>
+      <text class="sub" x="940.0" y="134" text-anchor="middle">DeepSeek-R1 teacher · Fable 5</text>
+    </g>
+  </a>
+
+  <a href="https://github.com/timwukp/llmops-agentic-system/blob/main/pipeline/training/train_qlora.py" target="_top">
+    <g>
+      <rect class="card cAws" x="850" y="240" width="180" height="56" rx="12"/>
+      <text class="title" x="940.0" y="264" text-anchor="middle">🎓 SageMaker Training</text>
+      <text class="sub" x="940.0" y="282" text-anchor="middle">Qwen3-1.7B QLoRA job</text>
+    </g>
+  </a>
+
+  <a href="https://github.com/timwukp/llmops-agentic-system/blob/main/docs/ARCHITECTURE.md" target="_top">
+    <g>
+      <rect class="card cAws" x="850" y="388" width="180" height="56" rx="12"/>
+      <text class="title" x="940.0" y="412" text-anchor="middle">🌐 SageMaker Endpoint</text>
+      <text class="sub" x="940.0" y="430" text-anchor="middle">student inference · g5.xlarge</text>
+    </g>
+  </a>
+
+  <path class="wireG" d="M740,120.0 L846,120.0" marker-end="url(#ahG)"/>
+
+  <path class="wireG" d="M740,218.0 L800,218.0 L800,268.0 L846,268.0" marker-end="url(#ahG)"/>
+
+  <path class="wireG" d="M740,414.0 L800,414.0 L800,430.0 L846,430.0" marker-end="url(#ahG)"/>
+
+  <a href="https://github.com/timwukp/llmops-agentic-system/blob/main/orchestration/resume_pipeline/handler.py" target="_top">
+    <g>
+      <rect class="card cSpine" x="850" y="505" width="180" height="56" rx="12"/>
+      <text class="title" x="940.0" y="529" text-anchor="middle">📡 EventBridge rule</text>
+      <text class="sub" x="940.0" y="547" text-anchor="middle">job state change → resume λ</text>
+    </g>
+  </a>
+
+  <path class="wire" d="M940.0,296 L940.0,501" marker-end="url(#ahB)"/>
+
+  <path class="wire" d="M850,533.0 L376.0,533.0 L376.0,342" marker-end="url(#ahB)"/>
+
+  <a href="https://github.com/timwukp/llmops-agentic-system/blob/main/deploy/console/wire_console.py" target="_top">
+    <g>
+      <rect class="card cOps" x="1040" y="505" width="186" height="56" rx="12"/>
+      <text class="title" x="1133.0" y="529" text-anchor="middle">🖥️ llmops-admin console</text>
+      <text class="sub" x="1133.0" y="547" text-anchor="middle">obs · evals · optimizations</text>
+    </g>
+  </a>
+
+  <text class="sub" x="1133" y="495" text-anchor="middle" fill="#ff6b81">reads traces · reports · runs</text>
+  <path class="wireR" d="M560,316.0 L540,316.0 L540,234.0 L556,234.0" marker-end="url(#ahR)"/>
+
+  <text class="sub" x="650.0" y="274" text-anchor="middle" fill="#ff6b81">gate fail → remediate (≤3)</text>
+  <path class="wireR" d="M650.0,92 L650.0,78 L406.0,78 L406.0,88" marker-end="url(#ahR)"/>
+
+  <text class="sub" x="460" y="72" text-anchor="middle" fill="#ff6b81">escalations → conductor triage first · page human only if needed</text>
+  <rect class="band" x="30" y="600" width="1180" height="72" rx="14"/>
+  <text class="bandT" x="50" y="626">STATE — S3 runs/&lt;run_id&gt;/manifest.json · DynamoDB runs + stage-events · shared AgentCore Memory · EventBridge bus llmops-pipeline</text>
+  <text class="sub" x="50" y="648">skills mounted from MLOps-agent-skills (git in dev, S3 mirror in prod) · VPC-isolated in production · least-privilege IAM · TEST-PROVEN gates per phase</text>
+</svg>
