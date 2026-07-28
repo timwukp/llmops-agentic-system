@@ -1,0 +1,185 @@
+{
+  "_comment": "Four Lambda execution roles for the orchestration spine, one per function, each least-privilege for exactly its job. deploy/01_iam.py creates roles llmops-lambda-<key> from the 'roles' map and substitutes <REGION>/<ACCOUNT_ID>/<DATA_BUCKET>. GOTCHAS baked in: (1) invoking a harness needs BOTH bedrock-agentcore:InvokeHarness on the harness/* ARN AND bedrock-agentcore:InvokeAgentRuntime on the runtime/harness_* ARN (the harness API is fronted by an agent runtime named harness_<name>_*; missing either => AccessDeniedException); (2) states:SendTaskSuccess/Failure/Heartbeat do not support resource-level permissions for waitForTaskToken callbacks, so Resource must be '*'; (3) ec2 ENI actions for VPC-attached Lambdas (prod) largely do not support resource-level permissions — kept as the standard AWSLambdaVPCAccessExecutionRole action set with Resource '*'; (4) Secrets Manager ARNs end in a random 6-char suffix, hence the trailing wildcard on the webhook secret.",
+
+  "trustPolicy": {
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Sid": "AllowLambdaToAssume",
+        "Effect": "Allow",
+        "Principal": { "Service": "lambda.amazonaws.com" },
+        "Action": "sts:AssumeRole",
+        "Condition": {
+          "StringEquals": { "aws:SourceAccount": "<ACCOUNT_ID>" }
+        }
+      }
+    ]
+  },
+
+  "sharedStatements": [
+    {
+      "Sid": "OwnLogGroupWrite",
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents"
+      ],
+      "Resource": "arn:aws:logs:<REGION>:<ACCOUNT_ID>:log-group:/aws/lambda/llmops-*"
+    },
+    {
+      "Sid": "VpcEniLifecycle",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:CreateNetworkInterface",
+        "ec2:DescribeNetworkInterfaces",
+        "ec2:DeleteNetworkInterface",
+        "ec2:AssignPrivateIpAddresses",
+        "ec2:UnassignPrivateIpAddresses"
+      ],
+      "Resource": "*"
+    }
+  ],
+
+  "roles": {
+    "driver": {
+      "_comment": "harness-driver: invoked by Step Functions per stage; streams InvokeHarness, brokers inline-function toolUse<->toolResult, reports back via task token, re-invokes itself on checkpoint.",
+      "permissionsPolicy": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Sid": "InvokeLlmopsHarnessesDualArn",
+            "Effect": "Allow",
+            "Action": [
+              "bedrock-agentcore:InvokeHarness",
+              "bedrock-agentcore:InvokeAgentRuntime"
+            ],
+            "Resource": [
+              "arn:aws:bedrock-agentcore:<REGION>:<ACCOUNT_ID>:harness/llmops_*",
+              "arn:aws:bedrock-agentcore:<REGION>:<ACCOUNT_ID>:runtime/harness_llmops_*"
+            ]
+          },
+          {
+            "Sid": "PipelineTablesReadWrite",
+            "Effect": "Allow",
+            "Action": [
+              "dynamodb:GetItem",
+              "dynamodb:PutItem",
+              "dynamodb:UpdateItem",
+              "dynamodb:Query"
+            ],
+            "Resource": [
+              "arn:aws:dynamodb:<REGION>:<ACCOUNT_ID>:table/llmops-pipeline-runs",
+              "arn:aws:dynamodb:<REGION>:<ACCOUNT_ID>:table/llmops-pipeline-runs/index/*",
+              "arn:aws:dynamodb:<REGION>:<ACCOUNT_ID>:table/llmops-stage-events"
+            ]
+          },
+          {
+            "Sid": "PutPipelineEvents",
+            "Effect": "Allow",
+            "Action": "events:PutEvents",
+            "Resource": "arn:aws:events:<REGION>:<ACCOUNT_ID>:event-bus/llmops-pipeline"
+          },
+          {
+            "Sid": "TaskTokenCallbacks",
+            "Effect": "Allow",
+            "Action": [
+              "states:SendTaskSuccess",
+              "states:SendTaskFailure",
+              "states:SendTaskHeartbeat"
+            ],
+            "Resource": "*"
+          },
+          {
+            "Sid": "EscalationPublish",
+            "Effect": "Allow",
+            "Action": "sns:Publish",
+            "Resource": "arn:aws:sns:<REGION>:<ACCOUNT_ID>:llmops-escalations"
+          },
+          {
+            "Sid": "SelfReinvokeOnCheckpoint",
+            "Effect": "Allow",
+            "Action": "lambda:InvokeFunction",
+            "Resource": "arn:aws:lambda:<REGION>:<ACCOUNT_ID>:function:llmops-harness-driver"
+          }
+        ]
+      }
+    },
+
+    "start": {
+      "_comment": "start_pipeline: mints run_id, writes the initial S3 manifest, records the run in DDB, starts the state machine.",
+      "permissionsPolicy": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Sid": "WriteRunManifest",
+            "Effect": "Allow",
+            "Action": "s3:PutObject",
+            "Resource": "arn:aws:s3:::<DATA_BUCKET>/runs/*"
+          },
+          {
+            "Sid": "RecordRun",
+            "Effect": "Allow",
+            "Action": "dynamodb:PutItem",
+            "Resource": "arn:aws:dynamodb:<REGION>:<ACCOUNT_ID>:table/llmops-pipeline-runs"
+          },
+          {
+            "Sid": "StartPipelineStateMachine",
+            "Effect": "Allow",
+            "Action": "states:StartExecution",
+            "Resource": "arn:aws:states:<REGION>:<ACCOUNT_ID>:stateMachine:llmops-pipeline*"
+          }
+        ]
+      }
+    },
+
+    "resume": {
+      "_comment": "resume_pipeline: EventBridge SageMaker job-state rule target; looks up the waiting task token by job name via the GSI, resumes the state machine.",
+      "permissionsPolicy": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Sid": "LookupTokenByJobName",
+            "Effect": "Allow",
+            "Action": "dynamodb:Query",
+            "Resource": [
+              "arn:aws:dynamodb:<REGION>:<ACCOUNT_ID>:table/llmops-pipeline-runs",
+              "arn:aws:dynamodb:<REGION>:<ACCOUNT_ID>:table/llmops-pipeline-runs/index/job_name-index"
+            ]
+          },
+          {
+            "Sid": "TaskTokenCallbacks",
+            "Effect": "Allow",
+            "Action": [
+              "states:SendTaskSuccess",
+              "states:SendTaskFailure",
+              "states:SendTaskHeartbeat"
+            ],
+            "Resource": "*"
+          }
+        ]
+      }
+    },
+
+    "webhook": {
+      "_comment": "webhook: HMAC-verifies inbound GitHub/webhook calls using the shared secret, then invokes start_pipeline. No data-plane access of its own.",
+      "permissionsPolicy": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Sid": "ReadWebhookHmacSecret",
+            "Effect": "Allow",
+            "Action": "secretsmanager:GetSecretValue",
+            "Resource": "arn:aws:secretsmanager:<REGION>:<ACCOUNT_ID>:secret:llmops/webhook*"
+          },
+          {
+            "Sid": "InvokeStartPipeline",
+            "Effect": "Allow",
+            "Action": "lambda:InvokeFunction",
+            "Resource": "arn:aws:lambda:<REGION>:<ACCOUNT_ID>:function:llmops-start-pipeline"
+          }
+        ]
+      }
+    }
+  }
+}

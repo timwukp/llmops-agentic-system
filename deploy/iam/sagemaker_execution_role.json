@@ -1,0 +1,68 @@
+{
+  "_comment": "Execution role PASSED TO SageMaker jobs/models (llmops-sagemaker-execution) — what the QLoRA training job and the student endpoint container may do, deliberately minimal: read/write ONLY the runs/ prefix of the data bucket, pull the training/inference image from ECR, write CloudWatch logs. It has NO Bedrock, NO DynamoDB, NO events access — those belong to the harness/Lambda roles. Placeholders substituted by deploy/01_iam.py. ECR pull is scoped to <REGION> but any registry account because SageMaker deep-learning container images are hosted in AWS-owned ECR accounts (e.g. 763104351884 in us-east-1) which vary by region; ecr:GetAuthorizationToken does not support resource-level permissions.",
+
+  "trustPolicy": {
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Sid": "AllowSageMakerToAssume",
+        "Effect": "Allow",
+        "Principal": { "Service": "sagemaker.amazonaws.com" },
+        "Action": "sts:AssumeRole",
+        "Condition": {
+          "StringEquals": { "aws:SourceAccount": "<ACCOUNT_ID>" }
+        }
+      }
+    ]
+  },
+
+  "permissionsPolicy": {
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Sid": "S3RunsReadWrite",
+        "Effect": "Allow",
+        "Action": ["s3:GetObject", "s3:PutObject"],
+        "Resource": "arn:aws:s3:::<DATA_BUCKET>/runs/*"
+      },
+      {
+        "Sid": "S3RunsList",
+        "Effect": "Allow",
+        "Action": "s3:ListBucket",
+        "Resource": "arn:aws:s3:::<DATA_BUCKET>",
+        "Condition": {
+          "StringLike": { "s3:prefix": "runs/*" }
+        }
+      },
+      {
+        "Sid": "EcrAuth",
+        "Effect": "Allow",
+        "Action": "ecr:GetAuthorizationToken",
+        "Resource": "*"
+      },
+      {
+        "Sid": "EcrPullImages",
+        "Effect": "Allow",
+        "Action": [
+          "ecr:BatchCheckLayerAvailability",
+          "ecr:GetDownloadUrlForLayer",
+          "ecr:BatchGetImage"
+        ],
+        "Resource": "arn:aws:ecr:<REGION>:*:repository/*"
+      },
+      {
+        "Sid": "CloudWatchLogsWrite",
+        "Effect": "Allow",
+        "Action": [
+          "logs:CreateLogGroup",
+          "logs:CreateLogStream",
+          "logs:PutLogEvents"
+        ],
+        "Resource": [
+          "arn:aws:logs:<REGION>:<ACCOUNT_ID>:log-group:/aws/sagemaker/*",
+          "arn:aws:logs:<REGION>:<ACCOUNT_ID>:log-group:/aws/sagemaker/*:log-stream:*"
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,61 @@
+#!/bin/bash
+# pre-commit — redaction scan + bilingual-doc pairing check.
+# Install: ln -sf ../../hooks/pre-commit .git/hooks/pre-commit
+set -e
+cd "$(git rev-parse --show-toplevel)"
+
+STAGED=$(git diff --cached --name-only --diff-filter=ACM)
+[ -z "$STAGED" ] && exit 0
+
+fail=0
+
+# ---- 1. Redaction scan (staged content, not just filenames) ----------------
+# AWS account IDs (bare 12-digit), credentials, account-bearing ARNs.
+# Allowlist: AWS public ECR gallery accounts used in official image URIs.
+ALLOW='683313688378|763104351884|123456789012'
+for f in $STAGED; do
+  case "$f" in *.png|*.jpg|*.jpeg|*.gif|*.pdf|*.zip) continue;; esac
+  # the scanners contain their own patterns as literals — skip them
+  case "$f" in hooks/pre-commit|.github/workflows/redaction-check.yml) continue;; esac
+  hits=$(git show ":$f" | grep -nE 'AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}|aws_secret_access_key|arn:aws[a-z-]*:[a-z0-9-]+:[a-z0-9-]*:[0-9]{12}|(^|[^0-9.])[0-9]{12}([^0-9.]|$)' \
+        | grep -vE "$ALLOW" | grep -vE '<ACCOUNT_ID>|ACCOUNT_ID_PLACEHOLDER|[0-9]{13,}' || true)
+  if [ -n "$hits" ]; then
+    echo "✗ REDACTION: possible account ID / credential / account-bearing ARN in $f:"
+    echo "$hits" | head -5
+    fail=1
+  fi
+done
+
+# ---- 2. Bilingual pairing: staged EN doc with a zh-TW twin must stage both --
+for f in $STAGED; do
+  case "$f" in
+    README.md|docs/ARCHITECTURE.md|docs/CASE_STUDY.md)
+      twin="${f%.md}.zh-TW.md"
+      if [ -f "$twin" ] && ! echo "$STAGED" | grep -qx "$twin"; then
+        echo "✗ BILINGUAL: $f staged but its twin $twin is not (repo rule: update both in the same commit)"
+        fail=1
+      fi
+      ;;
+    README.zh-TW.md|docs/ARCHITECTURE.zh-TW.md|docs/CASE_STUDY.zh-TW.md)
+      twin="${f%.zh-TW.md}.md"
+      if [ -f "$twin" ] && ! echo "$STAGED" | grep -qx "$twin"; then
+        echo "✗ BILINGUAL: $f staged but its twin $twin is not"
+        fail=1
+      fi
+      ;;
+  esac
+done
+
+# ---- 3. SVGs must pass the geometry check if staged ------------------------
+if echo "$STAGED" | grep -qE 'docs/architecture.*\.svg'; then
+  if command -v python3 >/dev/null && [ -f tests/check_svg_geometry.py ]; then
+    python3 tests/check_svg_geometry.py $(echo "$STAGED" | grep -E 'docs/architecture.*\.svg') || fail=1
+  fi
+fi
+
+if [ $fail -ne 0 ]; then
+  echo ""
+  echo "Commit blocked. Fix the issues above (see AGENTS.md security rules)."
+  exit 1
+fi
+exit 0

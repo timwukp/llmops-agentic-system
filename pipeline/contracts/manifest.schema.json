@@ -1,0 +1,91 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/timwukp/llmops-agentic-system/pipeline/contracts/manifest.schema.json",
+  "title": "LLMOps run manifest",
+  "description": "Single source of truth for one pipeline run, stored at s3://<bucket>/runs/<run_id>/manifest.json. Agents read it first and append their stage entries; the harness driver verifies claims before recording them. The iteration counter drives the remediation loop (max 3).",
+  "type": "object",
+  "required": ["run_id", "created_at", "trigger_source", "iteration", "stages", "models"],
+  "additionalProperties": true,
+  "properties": {
+    "run_id": {
+      "type": "string",
+      "pattern": "^llmops-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{6}$",
+      "description": "llmops-<UTC timestamp>-<6 hex chars>, assigned by start_pipeline"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "trigger_source": {
+      "type": "string",
+      "enum": ["direct", "api", "webhook", "schedule", "conductor"],
+      "description": "Which of the pipeline triggers started this run"
+    },
+    "plan": {
+      "type": "object",
+      "description": "Optional run plan written by the llmops_orchestrator conductor (plan.json contents): per-stage params, cost estimate, quality bar.",
+      "additionalProperties": true
+    },
+    "iteration": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Remediation-loop counter; 0 on first attempt, incremented per finetune remediate cycle, escalates to human when it would exceed 3"
+    },
+    "stages": {
+      "type": "object",
+      "description": "One entry per pipeline stage/task keyed by stage name (e.g. data-prep, finetune, eval, deploy, monitor).",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["status"],
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": ["pending", "running", "completed", "failed", "escalated", "skipped"]
+          },
+          "started_at": {"type": ["string", "null"], "format": "date-time"},
+          "ended_at": {"type": ["string", "null"], "format": "date-time"},
+          "outputs": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "S3 URIs of produced artifacts, verified to exist by the driver. Empty array is VALID (empty-but-valid is distinct from missing)."
+          },
+          "metrics": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "evidence": {
+            "type": "string",
+            "description": "Agent's one-paragraph proof of what was verified"
+          }
+        },
+        "additionalProperties": true
+      }
+    },
+    "models": {
+      "type": "object",
+      "required": ["teacher", "student"],
+      "properties": {
+        "teacher": {
+          "type": "object",
+          "required": ["provider", "model_id"],
+          "properties": {
+            "provider": {"type": "string", "description": "e.g. bedrock"},
+            "model_id": {"type": "string", "description": "e.g. the DeepSeek-R1 Bedrock model id"}
+          },
+          "additionalProperties": true
+        },
+        "student": {
+          "type": "object",
+          "required": ["model_id"],
+          "properties": {
+            "model_id": {"type": "string", "description": "e.g. Qwen/Qwen3-1.7B"},
+            "adapter_uri": {"type": "string", "description": "S3 URI of the trained QLoRA adapter"},
+            "endpoint_name": {"type": "string", "description": "SageMaker endpoint serving the student"}
+          },
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

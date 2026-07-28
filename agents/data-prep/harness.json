@@ -1,0 +1,186 @@
+{
+  "_comment": "llmops-data-prep — stage 1 worker. Generates the distillation dataset: seed prompts -> teacher (DeepSeek-R1 via Bedrock) -> curated JSONL in S3. Skills mounted from MLOps-agent-skills (git source, default branch). Created via deploy/create_harness.py; BYO shared memory attached post-create by deploy/wire_memory.py; validate offline with deploy/validate_config.py first.",
+  "harnessName": "llmops_data_prep",
+  "model": {
+    "bedrockModelConfig": {
+      "modelId": "global.anthropic.claude-fable-5",
+      "apiFormat": "converse_stream",
+      "maxTokens": 65536,
+      "temperature": 0.2,
+      "topP": 0.9
+    }
+  },
+  "systemPrompt": [
+    {
+      "text": "You are the DATA PREPARATION agent of an autonomous LLMOps pipeline (knowledge distillation: teacher DeepSeek-R1 on Bedrock -> student Qwen3-1.7B on SageMaker).\n\nYour mounted skills (llm-data-preparation, llm-prompt-engineering, llm-guardrails) are your methodology — consult them before acting.\n\nInputs arrive as JSON: {run_id, stage, manifest_uri, params}. The S3 manifest at manifest_uri is the single source of truth; read it first, append your results to it, never overwrite other stages' entries.\n\nYour job per invocation depends on params.task:\n- \"verify\": prove your toolchain — list mounted skills, run 'aws sts get-caller-identity' and 'aws sagemaker list-training-jobs --max-results 3' in the shell, write a probe file to the runs/ S3 prefix, then call stage_complete with evidence.\n- \"generate\": produce seed prompts per llm-prompt-engineering self-instruct patterns for the domain in params.domain, invoke the teacher model via 'aws bedrock-runtime converse' (model id in params.teacher_model_id) in batches, strip <think>...</think> reasoning blocks keeping final answers (unless params.keep_reasoning), write distillation/generated.jsonl to the run's S3 prefix.\n- \"curate\": dedupe (near-duplicate removal), filter by length/format, scrub PII per llm-guardrails, quality-filter with your own judgment (score each sample 1-5, drop <4), split 90/10 train/val, write distillation/curated.jsonl + distillation/stats.json.\n\nRules:\n- Work in bounded turns: your turn budget is ~13 minutes. If work remains, call checkpoint with a progress S3 URI and exit the turn; you will be re-invoked.\n- Never hold long waits in-turn beyond 10 minutes; there are no training jobs at your stage.\n- Read AWS region and bucket from the invocation params, never hardcode account-specific values.\n- On unrecoverable errors or ambiguous quality tradeoffs, call escalate_human with specifics.\n- When a task finishes, call stage_complete with {stage, outputs: [s3 uris], metrics, evidence}. Write a human-readable summary to the manifest as well.\n- Record durable learnings (what prompt patterns yielded diverse data, what filters cut most noise) — they persist in memory for future runs."
+    }
+  ],
+  "tools": [
+    {
+      "type": "agentcore_code_interpreter",
+      "name": "code_interpreter"
+    },
+    {
+      "type": "inline_function",
+      "name": "stage_complete",
+      "config": {
+        "inlineFunction": {
+          "description": "Signal the orchestrator that this stage's task is complete. Call exactly once, after all outputs are written to S3.",
+          "inputSchema": {
+            "type": "object",
+            "properties": {
+              "stage": {
+                "type": "string",
+                "description": "Stage name, e.g. data-prep"
+              },
+              "task": {
+                "type": "string",
+                "description": "Task that completed: verify | generate | curate"
+              },
+              "outputs": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "S3 URIs of produced artifacts"
+              },
+              "metrics": {
+                "type": "object",
+                "description": "Key numbers: samples generated/kept, dedupe rate, judge-score distribution"
+              },
+              "evidence": {
+                "type": "string",
+                "description": "One-paragraph proof of what was verified"
+              }
+            },
+            "required": [
+              "stage",
+              "task",
+              "outputs"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "type": "inline_function",
+      "name": "checkpoint",
+      "config": {
+        "inlineFunction": {
+          "description": "Persist progress and yield the turn when the ~13-minute budget nears. You will be re-invoked in the same session to continue.",
+          "inputSchema": {
+            "type": "object",
+            "properties": {
+              "progress_uri": {
+                "type": "string",
+                "description": "S3 URI of the progress snapshot"
+              },
+              "next_action": {
+                "type": "string",
+                "description": "What to do when re-invoked"
+              },
+              "percent_complete": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "progress_uri",
+              "next_action"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "type": "inline_function",
+      "name": "escalate_human",
+      "config": {
+        "inlineFunction": {
+          "description": "Escalate to a human operator on unrecoverable errors or judgment calls above your authority. The pipeline pauses.",
+          "inputSchema": {
+            "type": "object",
+            "properties": {
+              "reason": {
+                "type": "string"
+              },
+              "details": {
+                "type": "string",
+                "description": "Error output, S3 URIs, what was attempted"
+              },
+              "options": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Suggested resolutions"
+              }
+            },
+            "required": [
+              "reason",
+              "details"
+            ]
+          }
+        }
+      }
+    }
+  ],
+  "allowedTools": [
+    "shell",
+    "file_read",
+    "file_write",
+    "code_interpreter",
+    "skills",
+    "stage_complete",
+    "checkpoint",
+    "escalate_human"
+  ],
+  "skills": [
+    {
+      "git": {
+        "url": "https://github.com/timwukp/MLOps-agent-skills",
+        "path": "skills/llmops/llm-data-preparation"
+      }
+    },
+    {
+      "git": {
+        "url": "https://github.com/timwukp/MLOps-agent-skills",
+        "path": "skills/llmops/llm-prompt-engineering"
+      }
+    },
+    {
+      "git": {
+        "url": "https://github.com/timwukp/MLOps-agent-skills",
+        "path": "skills/llmops/llm-guardrails"
+      }
+    }
+  ],
+  "_memory_note": "Created WITHOUT memory; the shared BYO memory (llmops-shared-memory, SEMANTIC+EPISODIC across all 5 agents) is attached post-create by deploy/04_wire_memory.py — the skill's 3-step wiring (CreateMemory + UpdateHarness optionalValue + IAM grant).",
+  "maxIterations": 100,
+  "maxTokens": 65536,
+  "timeoutSeconds": 840,
+  "truncation": {
+    "strategy": "sliding_window",
+    "config": {
+      "slidingWindow": {
+        "messagesCount": 150
+      }
+    }
+  },
+  "environment": {
+    "agentCoreRuntimeEnvironment": {
+      "networkConfiguration": {
+        "networkMode": "PUBLIC"
+      },
+      "lifecycleConfiguration": {
+        "idleRuntimeSessionTimeout": 900,
+        "maxLifetime": 28800
+      }
+    }
+  },
+  "tags": {
+    "project": "llmops-agentic-system",
+    "environment": "development",
+    "agent-type": "data-prep",
+    "pipeline-stage": "1"
+  }
+}

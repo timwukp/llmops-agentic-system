@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install deps
+        run: pip install -q "boto3>=1.43.51" pytest
+      - name: Compile all Python
+        run: python -m py_compile $(git ls-files '*.py')
+      - name: Validate harness configs (offline)
+        run: |
+          for f in agents/*/harness.json; do
+            echo "== $f"
+            python deploy/validate_config.py --config "$f"
+          done
+      - name: Validate policy JSON
+        run: |
+          for f in deploy/iam/*.json orchestration/state_machine.asl.json pipeline/contracts/manifest.schema.json; do
+            [ -f "$f" ] && python -m json.tool "$f" > /dev/null && echo "OK $f"
+          done
+      - name: Offline dry-runs
+        run: |
+          python deploy/01_iam.py --region us-east-1 --account-id 123456789012 --dry-run > /dev/null
+          python deploy/03_storage.py --region us-east-1 --account-id 123456789012 --dry-run > /dev/null
+          echo "dry-runs OK"
+      - name: Unit tests
+        run: python -m pytest tests/ -q --ignore=tests/golden
+      - name: SVG geometry check (if diagrams exist)
+        run: |
+          ls docs/architecture-*.svg 2>/dev/null && python tests/check_svg_geometry.py docs/architecture-*.svg || echo "no SVGs yet"

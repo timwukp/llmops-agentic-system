@@ -1,0 +1,185 @@
+{
+  "_comment": "llmops-eval — stage 3 worker. Evaluates the fine-tuned student against the teacher on held-out prompts (LLM-judge win-rate + ROUGE + safety spot-checks) and emits the quality-gate verdict. Skills mounted from MLOps-agent-skills (git source, default branch). Created via deploy/create_harness.py; BYO shared memory attached post-create by deploy/wire_memory.py; validate offline with deploy/validate_config.py first.",
+  "harnessName": "llmops_eval",
+  "model": {
+    "bedrockModelConfig": {
+      "modelId": "global.anthropic.claude-fable-5",
+      "apiFormat": "converse_stream",
+      "maxTokens": 65536,
+      "temperature": 0.2,
+      "topP": 0.9
+    }
+  },
+  "systemPrompt": [
+    {
+      "text": "You are the EVAL agent of an autonomous LLMOps pipeline (knowledge distillation: teacher DeepSeek-R1 on Bedrock -> student Qwen3-1.7B on SageMaker).\n\nYour mounted skills (llm-evaluation, llm-guardrails) are your methodology — consult them before acting.\n\nInputs arrive as JSON: {run_id, stage, manifest_uri, params}. The S3 manifest at manifest_uri is the single source of truth; read it first, append your results to it, never overwrite other stages' entries.\n\nYour job per invocation depends on params.task:\n- \"evaluate\": run the student-vs-teacher comparison on the held-out prompt set (the 10% val split from distillation/curated.jsonl). Get student answers via the SageMaker endpoint ('aws sagemaker-runtime invoke-endpoint', endpoint name in params.student_endpoint) and teacher answers via Bedrock ('aws bedrock-runtime converse', model id in params.teacher_model_id). Score per llm-evaluation: LLM-judge pairwise win-rate at temperature 0 with fixed judge prompts, plus ROUGE against teacher references; run safety spot-checks per llm-guardrails on a sample of student outputs; measure student p50 latency. Write evaluation/report.json and evaluation/judge_details.jsonl to the run's S3 prefix, and save console screenshot evidence (browser) to reports/run-latest/screenshots/.\n- \"gate\": apply the quality gates to evaluation/report.json: student judge-score >= 0.80 x teacher score, safety spot-checks pass, and p50 latency within the target in params.latency_p50_target_ms. Call stage_complete with metrics.gate_passed (boolean) as the verdict the orchestrator branches on. If any score is borderline (within 0.05 of its threshold), do NOT decide yourself — call escalate_human with the numbers.\n\nRules:\n- Work in bounded turns: your turn budget is ~13 minutes. If work remains (e.g. mid-way through judging), call checkpoint with a progress S3 URI and exit the turn; you will be re-invoked.\n- Never hold long waits in-turn beyond 10 minutes; there are no training jobs at your stage.\n- Judge determinism is non-negotiable: temperature 0, fixed judge prompts, record every judge verdict verbatim in judge_details.jsonl so the gate is auditable.\n- Read AWS region and bucket from the invocation params, never hardcode account-specific values.\n- On unrecoverable errors or ambiguous quality tradeoffs, call escalate_human with specifics.\n- When a task finishes, call stage_complete with {stage, outputs: [s3 uris], metrics, evidence}. Write a human-readable summary to the manifest as well.\n- Record durable learnings (which judge prompts discriminated well, common student failure modes) — they persist in memory for future runs."
+    }
+  ],
+  "tools": [
+    {
+      "type": "agentcore_code_interpreter",
+      "name": "code_interpreter"
+    },
+    {
+      "type": "agentcore_browser",
+      "name": "browser"
+    },
+    {
+      "type": "inline_function",
+      "name": "stage_complete",
+      "config": {
+        "inlineFunction": {
+          "description": "Signal the orchestrator that this stage's task is complete. Call exactly once, after all outputs are written to S3. For the gate task, metrics.gate_passed (boolean) is the verdict the pipeline branches on.",
+          "inputSchema": {
+            "type": "object",
+            "properties": {
+              "stage": {
+                "type": "string",
+                "description": "Stage name, e.g. eval"
+              },
+              "task": {
+                "type": "string",
+                "description": "Task that completed: evaluate | gate"
+              },
+              "outputs": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "S3 URIs of produced artifacts"
+              },
+              "metrics": {
+                "type": "object",
+                "description": "Key numbers: judge win-rate, ROUGE, safety pass rate, p50 latency, gate_passed boolean"
+              },
+              "evidence": {
+                "type": "string",
+                "description": "One-paragraph proof of what was verified"
+              }
+            },
+            "required": [
+              "stage",
+              "task",
+              "outputs"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "type": "inline_function",
+      "name": "checkpoint",
+      "config": {
+        "inlineFunction": {
+          "description": "Persist progress and yield the turn when the ~13-minute budget nears. You will be re-invoked in the same session to continue.",
+          "inputSchema": {
+            "type": "object",
+            "properties": {
+              "progress_uri": {
+                "type": "string",
+                "description": "S3 URI of the progress snapshot"
+              },
+              "next_action": {
+                "type": "string",
+                "description": "What to do when re-invoked"
+              },
+              "percent_complete": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "progress_uri",
+              "next_action"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "type": "inline_function",
+      "name": "escalate_human",
+      "config": {
+        "inlineFunction": {
+          "description": "Escalate to a human operator on unrecoverable errors or judgment calls above your authority — including borderline gate scores. The pipeline pauses.",
+          "inputSchema": {
+            "type": "object",
+            "properties": {
+              "reason": {
+                "type": "string"
+              },
+              "details": {
+                "type": "string",
+                "description": "Error output, S3 URIs, what was attempted; for borderline gates, the exact scores vs thresholds"
+              },
+              "options": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Suggested resolutions"
+              }
+            },
+            "required": [
+              "reason",
+              "details"
+            ]
+          }
+        }
+      }
+    }
+  ],
+  "allowedTools": [
+    "shell",
+    "file_read",
+    "file_write",
+    "code_interpreter",
+    "browser",
+    "skills",
+    "stage_complete",
+    "checkpoint",
+    "escalate_human"
+  ],
+  "skills": [
+    {
+      "git": {
+        "url": "https://github.com/timwukp/MLOps-agent-skills",
+        "path": "skills/llmops/llm-evaluation"
+      }
+    },
+    {
+      "git": {
+        "url": "https://github.com/timwukp/MLOps-agent-skills",
+        "path": "skills/llmops/llm-guardrails"
+      }
+    }
+  ],
+  "_memory_note": "Created WITHOUT memory; the shared BYO memory (llmops-shared-memory, SEMANTIC+EPISODIC across all 5 agents) is attached post-create by deploy/04_wire_memory.py — the skill's 3-step wiring (CreateMemory + UpdateHarness optionalValue + IAM grant).",
+  "maxIterations": 100,
+  "maxTokens": 65536,
+  "timeoutSeconds": 840,
+  "truncation": {
+    "strategy": "sliding_window",
+    "config": {
+      "slidingWindow": {
+        "messagesCount": 150
+      }
+    }
+  },
+  "environment": {
+    "agentCoreRuntimeEnvironment": {
+      "networkConfiguration": {
+        "networkMode": "PUBLIC"
+      },
+      "lifecycleConfiguration": {
+        "idleRuntimeSessionTimeout": 900,
+        "maxLifetime": 28800
+      }
+    }
+  },
+  "tags": {
+    "project": "llmops-agentic-system",
+    "environment": "development",
+    "agent-type": "eval",
+    "pipeline-stage": "3"
+  }
+}

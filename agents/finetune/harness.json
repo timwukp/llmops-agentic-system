@@ -1,0 +1,217 @@
+{
+  "_comment": "llmops-finetune — stage 2 worker. Fine-tunes the student (Qwen3-1.7B QLoRA SFT) on the curated distillation dataset via a SageMaker training job: launch-and-release, then analyze on resume. Skills mounted from MLOps-agent-skills (git source, default branch). Created via deploy/create_harness.py; BYO shared memory attached post-create by deploy/wire_memory.py; validate offline with deploy/validate_config.py first.",
+  "harnessName": "llmops_finetune",
+  "model": {
+    "bedrockModelConfig": {
+      "modelId": "global.anthropic.claude-fable-5",
+      "apiFormat": "converse_stream",
+      "maxTokens": 65536,
+      "temperature": 0.2,
+      "topP": 0.9
+    }
+  },
+  "systemPrompt": [
+    {
+      "text": "You are the FINETUNE agent of an autonomous LLMOps pipeline (knowledge distillation: teacher DeepSeek-R1 on Bedrock -> student Qwen3-1.7B on SageMaker).\n\nYour mounted skills (llm-fine-tuning, llm-distillation, llm-cost-optimization) are your methodology — consult them before acting.\n\nInputs arrive as JSON: {run_id, stage, manifest_uri, params}. The S3 manifest at manifest_uri is the single source of truth; read it first, append your results to it, never overwrite other stages' entries.\n\nYour job per invocation depends on params.task:\n- \"prepare\": read the manifest to locate distillation/curated.jsonl, verify the dataset (row count, train/val split, schema), and prepare the training configuration for Qwen3-1.7B QLoRA SFT (TRL + PEFT, 4-bit quantization) per llm-fine-tuning and llm-distillation: hyperparameters, instance type (ml.g5.2xlarge unless params override), estimated cost per llm-cost-optimization. Write training/config.json to the run's S3 prefix and call stage_complete.\n- \"launch\": launch the SageMaker training job from the prepared config via the shell ('aws sagemaker create-training-job'), verify it reached InProgress, record the job name/ARN in the manifest, then call job_launched and END YOUR TURN. Never poll a training job in-turn — the pipeline releases this session and resumes on job completion (launch-and-release).\n- \"remediate\": the eval stage FAILED the quality gates (params.iteration tells you which attempt this is, max 3). Read evaluation/report.json and training/metrics.json from the manifest, diagnose per your skills (overfitting? undertraining? data quality? lr?), decide ONE targeted change (hyperparameters, epochs, data filtering request, or lora rank), write the revised training/config.json with a \"remediation_rationale\" field, then proceed exactly as \"launch\" (job_launched, launch-and-release). This is the pipeline's self-iteration loop: your goal is passing the gates, validated by tests, not maximal change.\n- \"analyze\": you are in a FRESH session after job completion. Read the completed job's status, metrics, and CloudWatch logs ('aws sagemaker describe-training-job', 'aws logs'), verify the model artifacts landed in S3, write training/metrics.json, and call stage_complete on success (final loss, train time, artifact URIs) or escalate_human if the job failed or the loss curve looks pathological.\n\nRules:\n- Work in bounded turns: your turn budget is ~13 minutes. If work remains, call checkpoint with a progress S3 URI and exit the turn; you will be re-invoked.\n- Never hold long waits in-turn beyond 10 minutes; training jobs are ALWAYS launch-and-release via job_launched, never awaited.\n- Read AWS region and bucket from the invocation params, never hardcode account-specific values.\n- On unrecoverable errors or ambiguous quality tradeoffs, call escalate_human with specifics.\n- When a task finishes, call stage_complete with {stage, outputs: [s3 uris], metrics, evidence}. Write a human-readable summary to the manifest as well.\n- Each remediation must change ONE thing with a written rationale — no shotgun tuning; if iteration 3 still fails the gates, the pipeline escalates to a human automatically.\n- Record durable learnings (what hyperparameters converged best, what dataset sizes justified which instance types) — they persist in memory for future runs."
+    }
+  ],
+  "tools": [
+    {
+      "type": "agentcore_code_interpreter",
+      "name": "code_interpreter"
+    },
+    {
+      "type": "inline_function",
+      "name": "stage_complete",
+      "config": {
+        "inlineFunction": {
+          "description": "Signal the orchestrator that this stage's task is complete. Call exactly once, after all outputs are written to S3.",
+          "inputSchema": {
+            "type": "object",
+            "properties": {
+              "stage": {
+                "type": "string",
+                "description": "Stage name, e.g. finetune"
+              },
+              "task": {
+                "type": "string",
+                "description": "Task that completed: prepare | launch | analyze | remediate"
+              },
+              "outputs": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "S3 URIs of produced artifacts"
+              },
+              "metrics": {
+                "type": "object",
+                "description": "Key numbers: final loss, epochs, train time, estimated cost"
+              },
+              "evidence": {
+                "type": "string",
+                "description": "One-paragraph proof of what was verified"
+              }
+            },
+            "required": [
+              "stage",
+              "task",
+              "outputs"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "type": "inline_function",
+      "name": "job_launched",
+      "config": {
+        "inlineFunction": {
+          "description": "Signal the orchestrator that a SageMaker training job was launched. The pipeline releases this session and resumes on job completion — call this and end your turn; never poll the job yourself.",
+          "inputSchema": {
+            "type": "object",
+            "properties": {
+              "job_name": {
+                "type": "string",
+                "description": "SageMaker training job name"
+              },
+              "job_arn": {
+                "type": "string",
+                "description": "SageMaker training job ARN"
+              },
+              "estimated_duration_minutes": {
+                "type": "number",
+                "description": "Expected wall-clock training duration"
+              }
+            },
+            "required": [
+              "job_name",
+              "job_arn"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "type": "inline_function",
+      "name": "checkpoint",
+      "config": {
+        "inlineFunction": {
+          "description": "Persist progress and yield the turn when the ~13-minute budget nears. You will be re-invoked in the same session to continue.",
+          "inputSchema": {
+            "type": "object",
+            "properties": {
+              "progress_uri": {
+                "type": "string",
+                "description": "S3 URI of the progress snapshot"
+              },
+              "next_action": {
+                "type": "string",
+                "description": "What to do when re-invoked"
+              },
+              "percent_complete": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "progress_uri",
+              "next_action"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "type": "inline_function",
+      "name": "escalate_human",
+      "config": {
+        "inlineFunction": {
+          "description": "Escalate to a human operator on unrecoverable errors or judgment calls above your authority. The pipeline pauses.",
+          "inputSchema": {
+            "type": "object",
+            "properties": {
+              "reason": {
+                "type": "string"
+              },
+              "details": {
+                "type": "string",
+                "description": "Error output, S3 URIs, what was attempted"
+              },
+              "options": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Suggested resolutions"
+              }
+            },
+            "required": [
+              "reason",
+              "details"
+            ]
+          }
+        }
+      }
+    }
+  ],
+  "allowedTools": [
+    "shell",
+    "file_read",
+    "file_write",
+    "code_interpreter",
+    "skills",
+    "stage_complete",
+    "job_launched",
+    "checkpoint",
+    "escalate_human"
+  ],
+  "skills": [
+    {
+      "git": {
+        "url": "https://github.com/timwukp/MLOps-agent-skills",
+        "path": "skills/llmops/llm-fine-tuning"
+      }
+    },
+    {
+      "git": {
+        "url": "https://github.com/timwukp/MLOps-agent-skills",
+        "path": "skills/llmops/llm-distillation"
+      }
+    },
+    {
+      "git": {
+        "url": "https://github.com/timwukp/MLOps-agent-skills",
+        "path": "skills/llmops/llm-cost-optimization"
+      }
+    }
+  ],
+  "_memory_note": "Created WITHOUT memory; the shared BYO memory (llmops-shared-memory, SEMANTIC+EPISODIC across all 5 agents) is attached post-create by deploy/04_wire_memory.py — the skill's 3-step wiring (CreateMemory + UpdateHarness optionalValue + IAM grant).",
+  "maxIterations": 100,
+  "maxTokens": 65536,
+  "timeoutSeconds": 840,
+  "truncation": {
+    "strategy": "sliding_window",
+    "config": {
+      "slidingWindow": {
+        "messagesCount": 150
+      }
+    }
+  },
+  "environment": {
+    "agentCoreRuntimeEnvironment": {
+      "networkConfiguration": {
+        "networkMode": "PUBLIC"
+      },
+      "lifecycleConfiguration": {
+        "idleRuntimeSessionTimeout": 900,
+        "maxLifetime": 28800
+      }
+    }
+  },
+  "tags": {
+    "project": "llmops-agentic-system",
+    "environment": "development",
+    "agent-type": "finetune",
+    "pipeline-stage": "2"
+  }
+}

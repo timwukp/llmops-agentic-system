@@ -1,0 +1,281 @@
+{
+  "Comment": "llmops-pipeline — stage DAG with waitForTaskToken per harness task and the self-iteration remediation loop (eval gate fail -> remediate finetune, <=3 iterations, then escalate).",
+  "StartAt": "DataPrepGenerate",
+  "States": {
+    "DataPrepGenerate": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+      "Parameters": {
+        "FunctionName": "${HarnessDriverArn}",
+        "Payload": {
+          "run_id.$": "$.run_id",
+          "manifest_uri.$": "$.manifest_uri",
+          "stage": "data-prep",
+          "task": "generate",
+          "harness_id": "llmops_data_prep",
+          "task_token.$": "$$.Task.Token",
+          "iteration.$": "$.iteration"
+        }
+      },
+      "ResultPath": "$.data_prep_generate",
+      "TimeoutSeconds": 7200,
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.TooManyRequestsException", "Lambda.AWSLambdaException"],
+          "IntervalSeconds": 10,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "EscalateFail"}
+      ],
+      "Next": "DataPrepCurate"
+    },
+    "DataPrepCurate": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+      "Parameters": {
+        "FunctionName": "${HarnessDriverArn}",
+        "Payload": {
+          "run_id.$": "$.run_id",
+          "manifest_uri.$": "$.manifest_uri",
+          "stage": "data-prep",
+          "task": "curate",
+          "harness_id": "llmops_data_prep",
+          "task_token.$": "$$.Task.Token",
+          "iteration.$": "$.iteration"
+        }
+      },
+      "ResultPath": "$.data_prep_curate",
+      "TimeoutSeconds": 7200,
+      "Catch": [
+        {"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "EscalateFail"}
+      ],
+      "Next": "FinetuneLaunch"
+    },
+    "FinetuneLaunch": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+      "Parameters": {
+        "FunctionName": "${HarnessDriverArn}",
+        "Payload": {
+          "run_id.$": "$.run_id",
+          "manifest_uri.$": "$.manifest_uri",
+          "stage": "finetune",
+          "task": "launch",
+          "harness_id": "llmops_finetune",
+          "task_token.$": "$$.Task.Token",
+          "iteration.$": "$.iteration"
+        }
+      },
+      "ResultPath": "$.training",
+      "TimeoutSeconds": 21600,
+      "HeartbeatSeconds": 18000,
+      "Catch": [
+        {"ErrorEquals": ["TrainingJobFailed"], "ResultPath": "$.error", "Next": "RemediationChoice"},
+        {"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "EscalateFail"}
+      ],
+      "Next": "FinetuneAnalyze"
+    },
+    "FinetuneAnalyze": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+      "Parameters": {
+        "FunctionName": "${HarnessDriverArn}",
+        "Payload": {
+          "run_id.$": "$.run_id",
+          "manifest_uri.$": "$.manifest_uri",
+          "stage": "finetune",
+          "task": "analyze",
+          "harness_id": "llmops_finetune",
+          "task_token.$": "$$.Task.Token",
+          "iteration.$": "$.iteration"
+        }
+      },
+      "ResultPath": "$.training_analysis",
+      "TimeoutSeconds": 3600,
+      "Catch": [
+        {"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "EscalateFail"}
+      ],
+      "Next": "EvalGate"
+    },
+    "EvalGate": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+      "Parameters": {
+        "FunctionName": "${HarnessDriverArn}",
+        "Payload": {
+          "run_id.$": "$.run_id",
+          "manifest_uri.$": "$.manifest_uri",
+          "stage": "eval",
+          "task": "gate",
+          "harness_id": "llmops_eval",
+          "task_token.$": "$$.Task.Token",
+          "iteration.$": "$.iteration"
+        }
+      },
+      "ResultPath": "$.evaluation",
+      "TimeoutSeconds": 7200,
+      "Catch": [
+        {"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "EscalateFail"}
+      ],
+      "Next": "QualityGateChoice"
+    },
+    "QualityGateChoice": {
+      "Type": "Choice",
+      "Choices": [
+        {"Variable": "$.evaluation.gate_passed", "BooleanEquals": true, "Next": "Deploy"}
+      ],
+      "Default": "RemediationChoice"
+    },
+    "RemediationChoice": {
+      "Type": "Choice",
+      "Comment": "Self-iteration budget: remediate while iteration < 3, then escalate to human.",
+      "Choices": [
+        {"Variable": "$.iteration", "NumericLessThan": 3, "Next": "IncrementIteration"}
+      ],
+      "Default": "EscalateFail"
+    },
+    "IncrementIteration": {
+      "Type": "Pass",
+      "Parameters": {
+        "run_id.$": "$.run_id",
+        "manifest_uri.$": "$.manifest_uri",
+        "iteration.$": "States.MathAdd($.iteration, 1)"
+      },
+      "Next": "RemediateFinetune"
+    },
+    "RemediateFinetune": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+      "Parameters": {
+        "FunctionName": "${HarnessDriverArn}",
+        "Payload": {
+          "run_id.$": "$.run_id",
+          "manifest_uri.$": "$.manifest_uri",
+          "stage": "finetune",
+          "task": "remediate",
+          "harness_id": "llmops_finetune",
+          "task_token.$": "$$.Task.Token",
+          "iteration.$": "$.iteration"
+        }
+      },
+      "ResultPath": "$.remediation",
+      "TimeoutSeconds": 21600,
+      "HeartbeatSeconds": 18000,
+      "Catch": [
+        {"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "EscalateFail"}
+      ],
+      "Next": "FinetuneAnalyze"
+    },
+    "Deploy": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+      "Parameters": {
+        "FunctionName": "${HarnessDriverArn}",
+        "Payload": {
+          "run_id.$": "$.run_id",
+          "manifest_uri.$": "$.manifest_uri",
+          "stage": "deploy",
+          "task": "deploy",
+          "harness_id": "llmops_deploy",
+          "task_token.$": "$$.Task.Token",
+          "iteration.$": "$.iteration"
+        }
+      },
+      "ResultPath": "$.deployment",
+      "TimeoutSeconds": 7200,
+      "Catch": [
+        {"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "EscalateFail"}
+      ],
+      "Next": "SmokeTest"
+    },
+    "SmokeTest": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+      "Parameters": {
+        "FunctionName": "${HarnessDriverArn}",
+        "Payload": {
+          "run_id.$": "$.run_id",
+          "manifest_uri.$": "$.manifest_uri",
+          "stage": "deploy",
+          "task": "smoke",
+          "harness_id": "llmops_deploy",
+          "task_token.$": "$$.Task.Token",
+          "iteration.$": "$.iteration"
+        }
+      },
+      "ResultPath": "$.smoke",
+      "TimeoutSeconds": 3600,
+      "Catch": [
+        {"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "Teardown"}
+      ],
+      "Next": "Teardown"
+    },
+    "Teardown": {
+      "Type": "Task",
+      "Comment": "Always runs after deploy — orphaned endpoints are the #1 cost risk.",
+      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+      "Parameters": {
+        "FunctionName": "${HarnessDriverArn}",
+        "Payload": {
+          "run_id.$": "$.run_id",
+          "manifest_uri.$": "$.manifest_uri",
+          "stage": "deploy",
+          "task": "teardown",
+          "harness_id": "llmops_deploy",
+          "task_token.$": "$$.Task.Token",
+          "iteration.$": "$.iteration"
+        }
+      },
+      "ResultPath": "$.teardown",
+      "TimeoutSeconds": 3600,
+      "Catch": [
+        {"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "EscalateFail"}
+      ],
+      "Next": "Complete"
+    },
+    "Complete": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::events:putEvents",
+      "Parameters": {
+        "Entries": [
+          {
+            "Source": "llmops.pipeline",
+            "DetailType": "PipelineCompleted",
+            "EventBusName": "${EventBusName}",
+            "Detail": {
+              "run_id.$": "$.run_id",
+              "iteration.$": "$.iteration"
+            }
+          }
+        ]
+      },
+      "End": true
+    },
+    "EscalateFail": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::events:putEvents",
+      "Parameters": {
+        "Entries": [
+          {
+            "Source": "llmops.pipeline",
+            "DetailType": "EscalatedToHuman",
+            "EventBusName": "${EventBusName}",
+            "Detail": {
+              "run_id.$": "$.run_id",
+              "iteration.$": "$.iteration"
+            }
+          }
+        ]
+      },
+      "Next": "Fail"
+    },
+    "Fail": {
+      "Type": "Fail",
+      "Error": "PipelineFailed",
+      "Cause": "Terminal failure or remediation budget exhausted — see EscalatedToHuman event, SNS, and DDB stage events."
+    }
+  }
+}
