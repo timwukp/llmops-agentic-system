@@ -23,24 +23,18 @@
 
 ## 架構
 
-<!-- 架構圖由 docs/gen_architecture_svg.py 生成；佈局由 tests/check_svg_geometry.py 驗證 -->
-高層架構：`docs/architecture-high-level.svg` · 低層架構：`docs/architecture-low-level.svg`（Phase 6 生成）
+<!-- 架構圖由 docs/gen_architecture_svg.py 生成；佈局由 tests/check_svg_geometry.py 驗證（虛線零交叉、零穿框） -->
 
-```
-觸發器（4 種）                 編排主幹                          Worker Harness（5 個）
-EventBridge Scheduler ─┐  ┌───────────────┐  ┌──────────────┐  llmops_data_prep   （llm-data-preparation ·
-GitHub Actions (OIDC) ─┼─▶│ start_pipeline│─▶│ Step         │─▶                    llm-prompt-engineering · llm-guardrails）
-管理 API（Cognito）    ─┤  │ Lambda        │  │ Functions    │  llmops_finetune    （llm-fine-tuning · llm-distillation ·
-HMAC webhook          ─┘  └───────────────┘  │ Standard     │                      llm-cost-optimization）
-                                             │ waitForTask  │  llmops_eval        （llm-evaluation · llm-guardrails）
-        harness-driver Lambda ◀──────────────│ Token        │  llmops_deploy      （llm-deployment · llm-cost-optimization）
-        （InvokeHarness 串流，               └──────────────┘  llmops_monitor     （llm-observability · llm-cost-optimization ·
-         inline-fn toolUse ⇄ toolResult）           ▲                              llm-agent-orchestration）
-   EventBridge：SageMaker 作業狀態變化 ─▶ resume ───┘
-   狀態：S3 runs/<run_id>/manifest.json · DynamoDB · 共享 AgentCore Memory
-   模型：teacher DeepSeek-R1（Bedrock serverless）· student Qwen3-1.7B（SageMaker QLoRA → endpoint）
-   控制台：bedrock-agentcore-agent-ops-console（直接復用，環境變數接線）
-```
+![高層架構](docs/architecture-high-level.svg)
+
+Worker harness 內部（依照真實配置繪製）：
+
+![低層架構](docs/architecture-low-level.svg)
+
+**模型**：teacher DeepSeek-R1（Bedrock serverless）· student Qwen3-1.7B（SageMaker QLoRA → endpoint）·
+harness 主迴圈 `global.anthropic.claude-fable-5`。
+**狀態**：S3 `runs/<run_id>/manifest.json` · DynamoDB · 共享 AgentCore Memory。
+**控制台**：bedrock-agentcore-agent-ops-console（直接復用，環境變數接線）。
 
 核心設計決策（完整論證見 [docs/ARCHITECTURE.zh-TW.md](docs/ARCHITECTURE.zh-TW.md)）：
 
