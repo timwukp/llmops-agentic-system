@@ -47,7 +47,11 @@ def main() -> int:
         return 0
 
     import boto3
-    client = boto3.client("bedrock-agentcore", region_name=args.region)  # DATA plane
+    from botocore.config import Config as BotoConfig
+    # default 60s read timeout kills long harness turns; retries would re-run the turn
+    client = boto3.client("bedrock-agentcore", region_name=args.region,  # DATA plane
+                          config=BotoConfig(read_timeout=870, connect_timeout=30,
+                                            retries={"max_attempts": 0}))
     try:
         resp = client.invoke_harness(**kwargs)
     except Exception as e:  # noqa: BLE001
