@@ -36,10 +36,11 @@ STRATEGIES = [
     {"semanticMemoryStrategy": {
         "name": "llmops_facts",
         "namespaces": ["/users/{actorId}/facts"]}},
+    # reflection namespace must equal or prefix the episodic namespace (live-verified)
     {"episodicMemoryStrategy": {
         "name": "llmops_episodes",
         "namespaces": ["/episodes/{actorId}/{sessionId}"],
-        "reflectionConfiguration": {"namespaces": ["/episodes/{actorId}/reflections"]}}},
+        "reflectionConfiguration": {"namespaces": ["/episodes/{actorId}"]}}},
 ]
 
 

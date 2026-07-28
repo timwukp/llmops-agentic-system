@@ -36,7 +36,8 @@ BUILTIN_EVALUATORS = ["Builtin.Correctness", "Builtin.GoalSuccessRate",
 def deliveries(region, harness, dry):
     """Delegate to the skill's battle-tested setup_observability.py (idempotent)."""
     cmd = [sys.executable, str(REPO / "setup_observability.py"),
-           "--region", region, "--harness", harness]
+           "--region", region, "--harness-id", harness,
+           "--log-group", f"/aws/bedrock-agentcore/{harness}"]
     if dry:
         return {"harness": harness, "would_run": " ".join(cmd[1:])}
     out = subprocess.run(cmd, capture_output=True, text=True)

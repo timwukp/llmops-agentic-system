@@ -51,8 +51,10 @@ def ensure_env(cfg):
 
 
 def existing_harness(ctl, name):
+    """harnessId is `<name>-<10char suffix>`, so match on the name prefix/field."""
     for h in ctl.list_harnesses().get("harnesses", []):
-        if h.get("harnessId") == name or h.get("name") == name:
+        if h.get("name") == name or h.get("harnessName") == name \
+                or h.get("harnessId", "").rsplit("-", 1)[0] == name:
             return h
     return None
 
@@ -83,21 +85,25 @@ def create_or_update(ctl, cfg, role_arn, dry):
         # UpdateHarness: memory/environmentArtifact/authorizerConfiguration wrap in
         # optionalValue; everything else passes directly. We never send memory here
         # (04_wire_memory.py owns it).
+        harness_id = exists["harnessId"]
+        wait_ready(ctl, harness_id)  # can't update while CREATING/UPDATING
         update = {k: v for k, v in cfg.items()
                   if k in ("model", "systemPrompt", "tools", "skills", "allowedTools",
                            "maxIterations", "maxTokens", "timeoutSeconds", "truncation",
                            "environment", "environmentVariables")}
-        ctl.update_harness(harnessId=name, clientToken=secrets.token_hex(20), **update)
+        ctl.update_harness(harnessId=harness_id, clientToken=secrets.token_hex(20), **update)
         action = "updated"
     else:
-        ctl.create_harness(harnessName=name, executionRoleArn=role_arn,
-                           clientToken=secrets.token_hex(20), **cfg)
+        resp = ctl.create_harness(harnessName=name, executionRoleArn=role_arn,
+                                  clientToken=secrets.token_hex(20), **cfg)
+        harness_id = resp["harness"]["harnessId"]
         action = "created"
 
-    h = wait_ready(ctl, name)
+    h = wait_ready(ctl, harness_id)
     if tags:
         ctl.tag_resource(resourceArn=h["arn"], tags=tags)
-    return {"harness": name, "action": action, "status": h["status"], "arn_field": "redacted"}
+    return {"harness": name, "harness_id": harness_id, "action": action,
+            "status": h["status"]}
 
 
 def main():
@@ -114,7 +120,7 @@ def main():
 
     role_arn = None
     if not args.dry_run:
-        role_arn = ssm.get_parameter(Name="/llmops/iam/llmops-harness-execution_arn")["Parameter"]["Value"]
+        role_arn = ssm.get_parameter(Name="/llmops/iam/harness_execution_arn")["Parameter"]["Value"]
 
     results = []
     for agent in agents:
@@ -122,7 +128,7 @@ def main():
         res = create_or_update(ctl, cfg, role_arn, args.dry_run)
         results.append(res)
         if not args.dry_run:
-            ssm.put_parameter(Name=f"/llmops/harness/{agent}", Value=res["harness"],
+            ssm.put_parameter(Name=f"/llmops/harness/{agent}", Value=res["harness_id"],
                               Type="String", Overwrite=True)
 
     print(json.dumps({"results": results, "prod": args.prod, "dry_run": args.dry_run}, indent=2))

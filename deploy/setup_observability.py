@@ -107,17 +107,24 @@ def main() -> int:
     control = boto3.client("bedrock-agentcore-control", region_name=args.region)
     account_id = sts.get_caller_identity()["Account"]
 
-    # resolve the harness ARN — the delivery-source resourceArn
+    # resolve the delivery-source resourceArn. Log deliveries only accept LogType
+    # `runtime` resources — NOT the harness ARN — so target the auto-created
+    # runtime `harness_<name>-<suffix>` that backs every harness (live-verified:
+    # PutDeliverySource rejects harness ARNs with "not allowed for this LogType").
     try:
-        h = control.get_harness(harnessId=args.harness_id)
-        resource_arn = h.get("harnessArn") or h.get("arn")
+        harness_name = args.harness_id.rsplit("-", 1)[0]
+        resource_arn = None
+        for rt in control.list_agent_runtimes().get("agentRuntimes", []):
+            if rt.get("agentRuntimeName") == f"harness_{harness_name}":
+                resource_arn = rt.get("agentRuntimeArn")
+                break
     except Exception as e:  # noqa: BLE001
-        print(f"FAIL  get_harness({args.harness_id}): {e}")
+        print(f"FAIL  list_agent_runtimes for {args.harness_id}: {e}")
         return 1
     if not resource_arn:
-        print("FAIL  could not resolve harness ARN from GetHarness response.")
+        print(f"FAIL  no runtime named harness_{harness_name} in list_agent_runtimes.")
         return 1
-    print(f"OK    harness ARN: {resource_arn}")
+    print(f"OK    runtime ARN resolved for harness {args.harness_id}")
 
     # 1. log group + retention
     try:

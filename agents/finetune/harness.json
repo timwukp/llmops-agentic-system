@@ -5,9 +5,7 @@
     "bedrockModelConfig": {
       "modelId": "global.anthropic.claude-fable-5",
       "apiFormat": "converse_stream",
-      "maxTokens": 65536,
-      "temperature": 0.2,
-      "topP": 0.9
+      "maxTokens": 65536
     }
   },
   "systemPrompt": [
