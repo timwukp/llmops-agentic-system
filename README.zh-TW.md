@@ -48,6 +48,32 @@ harness 主迴圈 `global.anthropic.claude-fable-5`。
 - **企業級態勢** —— 生產環境的 harness 與 Lambda 都在 VPC 內隔離運行（interface endpoints，
   無互聯網出口）；全程最小權限 IAM；生產技能從 S3 鏡像掛載。
 
+## 為什麼這些 agent 能替代 LLMOps 工程師：三層疊加，而不是單一模型
+
+Phase 3 的真實事件（完整記錄見
+[`deploy/evidence/VERIFICATION_phase3.md`](deploy/evidence/VERIFICATION_phase3.md)）：
+finetune agent 被指派啟動 QLoRA 訓練作業，下載訓練腳本時遭遇 S3 403。**全程無人干預**，它：
+探測了兩個 prefix 並歸納出自己的 IAM role 是 prefix 範圍限定（`runs/*` 可讀、`code/*` 不可讀），
+而不是無腦重試；按優先級搜索備選（本地 workspace → skill 目錄 → 歷史作業的 sourcedir）；
+發現 sandbox 沒有 `tar`，改用 Python `tarfile` 重建 `sourcedir.tar.gz`；上傳到自己**有**寫權限
+的 prefix；提交作業；確認 `InProgress`；然後調 `job_launched` 釋放。訓練首次嘗試即啟動，零人力。
+
+這種行為不屬於任何單一組件 —— 它是三層能力的乘積：
+
+| 層 | 提供什麼 | 缺了它會怎樣 |
+|---|---|---|
+| **模型能力**（harness 主迴圈用 Claude Fable 5） | *每一跳恢復的推理質量* —— 每次失敗都產出有設計的假設（兩點權限探測 →「role 是 prefix 限定」）、有先驗的搜索排序、零猶豫的工具替換。弱模型會重試同一個 403 或直接放棄 | 診斷繞圈或過早升級人類 |
+| **Harness 運行時**（AgentCore microVM：shell、文件系統、code interpreter） | *行動能力* —— 探測 S3 權限、構建 tarball、調 SageMaker 都是真實環境裡的真實動作，不是聊天窗口裡的建議 | 診斷正確，但沒有手 |
+| **授權的工程設計**（任務 prompt + 掛載的 skills） | *有邊界的行動許可* —— 每個任務 prompt 都明確授予自我修復預算（「診斷、修正、重試 —— 最多 3 次；然後 `escalate_human`」），掛載的 skills 提供正確修復的領域形態（script-mode sourcedir 長什麼樣） | 保守對齊的模型在第一個 403 就停下來問人 |
+
+這個 repo 要證明的論點：**替代人類 LLMOps 工程師的不是某個模型，而是「強模型 × 真實執行環境 ×
+明確工程化的授權邊界」這個系統。** 拿掉任何一層，同一事件的結局就是 `escalate_human: S3 403`,
+而不是一個跑起來的訓練作業。
+
+同樣的三層還在無提示的情況下產出了：microVM 回收毀掉本地狀態後,agent 自行採用逐任務 S3
+checkpoint 並把它記入 manifest 作為標準實踐；發現 sandbox 禁用 `kill` 後改為冪等並行 worker；
+數據生成階段從 `stop_reason` 證據自我診斷出 token 截斷並修復（8k → 32k）。
+
 ## 蒸餾管線
 
 1. **data-prep** —— 種子提示詞（self-instruct 模式）→ 經 `bedrock-runtime converse` 調 DeepSeek-R1
