@@ -412,7 +412,10 @@ def observability(hours=24):
 # ── evaluations (ported unchanged: all configs, tolerant score extraction) ────
 def evaluations():
     """Online evaluation configs + recent scores from the results log group."""
-    cfgs = ctl.list_online_evaluation_configs().get("onlineEvaluationConfigs", [])
+    cfgs = [c for c in ctl.list_online_evaluation_configs().get("onlineEvaluationConfigs", [])
+            if str(c.get("onlineEvaluationConfigName", "")).startswith("llmops_")]
+    # telemetry isolation: ui_qa_* configs belong to the agent-cicd-admin (CI/CD)
+    # dashboard — showing them here conflates two different platforms' scores
     out = []
     for c0 in cfgs:
         cid = c0.get("onlineEvaluationConfigId")
@@ -581,9 +584,11 @@ def list_batch_evaluations():
     failure so the caller can tell 'API down' apart from 'none yet'."""
     try:
         out = []
-        for be in data.list_batch_evaluations().get("batchEvaluations", [])[:10]:
-            if str(be.get("batchEvaluationName", "")).startswith("llmops_ins_"):
-                continue  # insights reports render in their own panel
+        evals = [b for b in data.list_batch_evaluations().get("batchEvaluations", [])
+                 if str(b.get("batchEvaluationName", "")).startswith("llmops_be_")]
+        # llmops_be_ prefix isolates this platform's scores (ui_qa_* = CI/CD stack)
+        # and excludes llmops_ins_* (insights render in their own panel)
+        for be in evals[:10]:
             item = {"id": be.get("batchEvaluationId"), "name": be.get("batchEvaluationName"),
                     "status": str(be.get("status")), "createdAt": str(be.get("createdAt", ""))}
             try:
@@ -669,7 +674,9 @@ def list_native_recommendations():
     """AWS-native Optimizations Recommendations (data-plane SDK)."""
     try:
         out = []
-        for rec in data.list_recommendations().get("recommendationSummaries", [])[:10]:
+        recs = [r for r in data.list_recommendations().get("recommendationSummaries", [])
+                if str(r.get("name", "")).startswith("llmops_")]  # isolate from ui_qa_* (CI/CD stack)
+        for rec in recs[:10]:
             item = {"id": rec.get("recommendationId"), "name": rec.get("name"),
                     "status": str(rec.get("status")), "type": rec.get("type"),
                     "createdAt": str(rec.get("createdAt", ""))}
