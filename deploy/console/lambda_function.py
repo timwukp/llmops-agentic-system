@@ -490,9 +490,13 @@ STAGE_TASKS = [("data-prep", "generate"), ("data-prep", "curate"),
                ("eval", "gate"), ("deploy", "deploy"), ("deploy", "smoke"), ("deploy", "teardown")]
 
 
-def _recent_session_ids(cap=20):
-    """Last N run ids (created after SPANS_SINCE — earlier sessions have no span docs
-    and can never score) × the known stage/task combos, capped."""
+def _recent_session_ids(cap=20, stage_filter=None):
+    """Session ids for stage/tasks that ACTUALLY RAN, reconstructed from the
+    stage-events table (fabricating ids for never-executed stage/task combos
+    just produces 'failed sessions' — no spans exist for them).
+
+    stage_filter: sessions live on the harness that RAN them, so batch-eval
+    fan-out sends each runtime only its own stage's session ids."""
     sids = []
     for it in recent_runs(30):
         rid = str(it.get("run_id", ""))
@@ -500,38 +504,76 @@ def _recent_session_ids(cap=20):
             continue
         if SPANS_SINCE and str(it.get("created_at", "")) < SPANS_SINCE:
             continue
+        ran = set()
+        try:
+            for ev0 in events_tbl.query(KeyConditionExpression=Key("run_id").eq(rid)).get("Items", []):
+                stage = str(ev0.get("sk", "")).split("#")[1] if "#" in str(ev0.get("sk", "")) else ""
+                task = ""
+                try:
+                    task = json.loads(ev0.get("detail", "{}")).get("task", "")
+                except Exception:
+                    pass
+                if stage:
+                    ran.add((stage, task))
+        except Exception:
+            pass
         for stage, task in STAGE_TASKS:
+            if stage_filter and stage != stage_filter:
+                continue
+            # include only combos this run actually executed (task match when known)
+            if ran and not any(s == stage and (t == task or not t) for s, t in ran):
+                continue
             sids.append(session_id(rid, stage, task))
             if len(sids) >= cap:
                 return sids
     return sids
 
 
-def _eval_data_source(sids):
-    """serviceNames + logGroupNames covering all 6 runtimes (each stage runs on a
-    different harness), with the reconstructed session-id filter."""
-    lgs, svc = [], []
+def _pipeline_runtimes():
+    """The five pipeline-stage runtimes (orchestrator sessions never match the
+    reconstructed pipeline session ids, so it is excluded from batch scoring)."""
+    names = [n for n in WATCHED_RUNTIMES if "orchestrator" not in n]
+    out = []
     for r in ctl.list_agent_runtimes().get("agentRuntimes", []):
-        if r["agentRuntimeName"] in WATCHED_RUNTIMES:
-            lgs.append(f"/aws/bedrock-agentcore/runtimes/{r['agentRuntimeId']}-DEFAULT")
-            svc.append(f"{r['agentRuntimeName']}.DEFAULT")
-    return {"cloudWatchLogs": {"serviceNames": svc, "logGroupNames": lgs,
+        if r["agentRuntimeName"] in names:
+            out.append({"name": r["agentRuntimeName"],
+                        "lg": f"/aws/bedrock-agentcore/runtimes/{r['agentRuntimeId']}-DEFAULT",
+                        "svc": f"{r['agentRuntimeName']}.DEFAULT"})
+    return out
+
+
+def _eval_data_source_for(rt, sids):
+    """One runtime per call — live-verified API constraint: serviceNames caps at
+    ONE entry (and logGroupNames at five), so multi-runtime scoring fans out."""
+    return {"cloudWatchLogs": {"serviceNames": [rt["svc"]], "logGroupNames": [rt["lg"]],
                                "filterConfig": {"sessionIds": sids}}}
 
 
 def start_batch_eval():
-    sids = _recent_session_ids()
-    if not sids:
+    """Fan out one batch evaluation per pipeline runtime (serviceNames caps at 1)."""
+    started, errors = [], []
+    for rt in _pipeline_runtimes():
+        stage = rt["name"].replace("harness_llmops_", "")[:12]
+        ddb_stage = stage.replace("_", "-")  # runtime names use _, stage names use -
+        sids = _recent_session_ids(cap=20, stage_filter=ddb_stage)
+        if not sids:
+            continue  # no sessions for this stage in the window
+        try:
+            r = data.start_batch_evaluation(
+                batchEvaluationName=f"llmops_be_{stage}_{secrets.token_hex(3)}",  # [a-zA-Z][a-zA-Z0-9_]{0,47}
+                evaluators=[{"evaluatorId": "Builtin.Correctness"},
+                            {"evaluatorId": "Builtin.GoalSuccessRate"},
+                            {"evaluatorId": "Builtin.ToolSelectionAccuracy"}],
+                dataSourceConfig=_eval_data_source_for(rt, sids),
+                clientToken=secrets.token_hex(20),
+                description=f"LLMOps admin dashboard — {stage} stage sessions")
+            started.append({"stage": stage, "id": r.get("batchEvaluationId"),
+                            "status": str(r.get("status"))})
+        except Exception as e:  # collect per-runtime failures, don't abort the fan-out
+            errors.append({"stage": stage, "error": str(e)[:200]})
+    if not started and not errors:
         return {"error": "no recent pipeline runs after SPANS_SINCE to score — start a run first"}
-    r = data.start_batch_evaluation(
-        batchEvaluationName="llmops_be_" + secrets.token_hex(3),  # regex [a-zA-Z][a-zA-Z0-9_]{0,47}
-        evaluators=[{"evaluatorId": "Builtin.Correctness"},
-                    {"evaluatorId": "Builtin.GoalSuccessRate"},
-                    {"evaluatorId": "Builtin.ToolSelectionAccuracy"}],
-        dataSourceConfig=_eval_data_source(sids),
-        clientToken=secrets.token_hex(20),
-        description="Started from the LLMOps admin dashboard")
-    return {"id": r.get("batchEvaluationId"), "status": str(r.get("status")), "sessions": len(sids)}
+    return {"started": started, "errors": errors}
 
 
 def list_batch_evaluations():
@@ -566,18 +608,33 @@ def list_batch_evaluations():
 
 
 def start_insights_report():
-    sids = _recent_session_ids()
-    if not sids:
+    """Fan out one insights report per pipeline runtime (serviceNames caps at 1)."""
+    started, errors = [], []
+    # Service quota: max 5 CONCURRENT batch evaluations account-wide — insights
+    # runs per-stage too, so cap the fan-out at the two most informative stages
+    # when others are running (data-prep + finetune carry most failure signal).
+    for rt in _pipeline_runtimes():
+        stage = rt["name"].replace("harness_llmops_", "")[:12]
+        ddb_stage = stage.replace("_", "-")
+        sids = _recent_session_ids(cap=20, stage_filter=ddb_stage)
+        if not sids:
+            continue
+        try:
+            r = data.start_batch_evaluation(
+                batchEvaluationName=f"llmops_ins_{stage}_{secrets.token_hex(3)}",
+                insights=[{"insightId": "Builtin.Insight.FailureAnalysis"},
+                          {"insightId": "Builtin.Insight.UserIntent"},
+                          {"insightId": "Builtin.Insight.ExecutionSummary"}],
+                dataSourceConfig=_eval_data_source_for(rt, sids),
+                clientToken=secrets.token_hex(20),
+                description=f"LLMOps admin dashboard insights — {stage} stage")
+            started.append({"stage": stage, "id": r.get("batchEvaluationId"),
+                            "status": str(r.get("status"))})
+        except Exception as e:
+            errors.append({"stage": stage, "error": str(e)[:200]})
+    if not started and not errors:
         return {"error": "no recent pipeline runs after SPANS_SINCE to analyze — start a run first"}
-    r = data.start_batch_evaluation(
-        batchEvaluationName="llmops_ins_" + secrets.token_hex(3),
-        insights=[{"insightId": "Builtin.Insight.FailureAnalysis"},
-                  {"insightId": "Builtin.Insight.UserIntent"},
-                  {"insightId": "Builtin.Insight.ExecutionSummary"}],
-        dataSourceConfig=_eval_data_source(sids),
-        clientToken=secrets.token_hex(20),
-        description="On-demand insights report from the LLMOps admin dashboard")
-    return {"id": r.get("batchEvaluationId"), "status": str(r.get("status")), "sessions": len(sids)}
+    return {"started": started, "errors": errors}
 
 
 def get_insights_report(bid):

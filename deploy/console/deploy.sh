@@ -6,8 +6,9 @@
 # All resource names are llmops-prefixed on purpose — this stack must NOT collide with
 # an existing agent-cicd-admin deployment in the same account.
 #
-# Prereqs: aws cli v2 configured, python3, pip3, zip.
+# Prereqs: aws cli v2 configured, python >= 3.10, zip.
 set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # ── configuration ─────────────────────────────────────────────────────────────
 REGION="${REGION:-us-east-1}"
@@ -100,7 +101,21 @@ fi
 
 # ── package: vendor boto3 (Lambda's builtin may predate AgentCore harness APIs) ─
 BUILD=$(mktemp -d)
-pip3 install -q boto3 -t "$BUILD"
+# AgentCore batch-eval/recommendation APIs need boto3 >= 1.43.51, which requires
+# Python >= 3.10 — macOS system python3 (3.9) silently vendors 1.42.x and every
+# batch-eval op then fails at runtime with "object has no attribute". Pick a
+# modern interpreter explicitly and hard-fail if the vendored version is short.
+PY_FOR_BUILD=""
+for cand in python3.12 python3.11 python3.10 "$SCRIPT_DIR/../../.venv/bin/python"; do
+  if command -v "$cand" >/dev/null 2>&1 || [ -x "$cand" ]; then PY_FOR_BUILD="$cand"; break; fi
+done
+[ -z "$PY_FOR_BUILD" ] && { echo "FATAL: no python >= 3.10 found for vendoring boto3"; exit 1; }
+"$PY_FOR_BUILD" -m pip install -q "boto3>=1.43.51" -t "$BUILD"
+VENDORED=$("$PY_FOR_BUILD" -c "import sys; sys.path.insert(0,'$BUILD'); import boto3; print(boto3.__version__)")
+case "$VENDORED" in
+  1.4[3-9].*|1.[5-9]*|[2-9].*) echo "vendored boto3 $VENDORED OK";;
+  *) echo "FATAL: vendored boto3 $VENDORED < 1.43.51"; exit 1;;
+esac
 cp "$(dirname "$0")/lambda_function.py" "$BUILD/lambda_function.py"
 cp "$(dirname "$0")/frontend.html" "$BUILD/frontend.html"   # read once at cold start by the handler
 (cd "$BUILD" && zip -rq /tmp/llmops-admin-dashboard.zip .)
