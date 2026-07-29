@@ -4,7 +4,7 @@
 
 [English](README.md) · [架構](docs/ARCHITECTURE.zh-TW.md) · [安全](SECURITY.md) · [Agent 指引](AGENTS.md)
 
-五個 AI agent —— 數據準備、微調、評估、部署、監控 —— 無人干預地執行完整 LLMOps 生命週期：
+六個 AI agent —— 指揮家（orchestrator）加上數據準備、微調、評估、部署、監控五位專家 —— 無人干預地執行完整 LLMOps 生命週期：
 **teacher 大模型（Bedrock 上的 DeepSeek-R1）**生成訓練數據，**student 小模型（Qwen3-1.7B）**
 以 SageMaker 訓練作業做 QLoRA 微調，通過質量門檻評估後部署到 SageMaker endpoint 並持續監控 ——
 只有 agent 呼叫 `escalate_human` 時才需要人類介入。
@@ -38,7 +38,7 @@ harness 主迴圈 `global.anthropic.claude-fable-5`。
 
 核心設計決策（完整論證見 [docs/ARCHITECTURE.zh-TW.md](docs/ARCHITECTURE.zh-TW.md)）：
 
-- **5 個按階段拆分的 harness，而非巨型 agent** —— 各階段獨立掛載技能、獨立版本與 endpoint
+- **6 個 harness（5 位階段專家 + 指揮家），而非巨型 agent** —— 各階段獨立掛載技能、獨立版本與 endpoint
   釘選、獨立評估；爆炸半徑小。
 - **確定性主幹 + 智能 worker** —— 階段 DAG 不需要 LLM 判斷，因此編排用 Step Functions；
   智能封裝在每個階段內部。
@@ -88,7 +88,7 @@ checkpoint 並把它記入 manifest 作為標準實踐；發現 sandbox 禁用 `
 ## Repo 結構
 
 ```
-agents/           5 個 harness 配置（開發 + 生產雙版本）+ 提示詞
+agents/           6 個 harness 配置（5 個專家 + 指揮家）+ 提示詞
 orchestration/    狀態機 + 4 個 Lambda（driver / start / resume / webhook）
 deploy/           編號冪等部署腳本 + 最小權限 IAM + 驗證證據
 pipeline/         訓練入口 + 契約（manifest schema、事件、報告）
@@ -106,7 +106,7 @@ python -m venv .venv && .venv/bin/pip install "boto3>=1.43.51" pytest
 # 02_network.py 僅生產環境需要（VPC + endpoints；按小時計費 —— 見 --destroy）
 ```
 
-完整執行順序：[deploy/README.md](deploy/README.md) · 觸發器：`docs/TRIGGERS.md`（Phase 5）
+完整執行順序：[deploy/README.md](deploy/README.md) · 觸發器：[docs/TRIGGERS.md](docs/TRIGGERS.md)
 
 ## 進度 —— 全部階段完成（v1）
 

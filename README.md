@@ -4,7 +4,8 @@
 
 [繁體中文](README.zh-TW.md) · [Architecture](docs/ARCHITECTURE.md) · [Security](SECURITY.md) · [Agent orientation](AGENTS.md)
 
-Five AI agents — data-prep, finetune, eval, deploy, monitor — execute the full LLMOps
+Six AI agents — a conductor (orchestrator) plus data-prep, finetune, eval, deploy,
+monitor specialists — execute the full LLMOps
 lifecycle without human intervention: a **teacher LLM (DeepSeek-R1 on Bedrock)** generates
 training data, a **student model (Qwen3-1.7B)** is QLoRA-fine-tuned as a SageMaker training
 job, evaluated against quality gates, deployed to a SageMaker endpoint, and monitored —
@@ -39,7 +40,7 @@ harness loop `global.anthropic.claude-fable-5`.
 
 Key design decisions (full rationale in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)):
 
-- **5 per-stage harnesses, not a mega-agent** — per-stage skill mounting, versioning,
+- **6 harnesses (5 per-stage specialists + a conductor), not a mega-agent** — per-stage skill mounting, versioning,
   endpoint pins, and evaluations; small blast radius.
 - **Deterministic spine, agentic workers** — the stage DAG needs no LLM judgment, so
   orchestration is Step Functions; intelligence lives inside each stage.
@@ -97,7 +98,7 @@ evidence during data generation.
 ## Repo map
 
 ```
-agents/           5 harness configs (dev + prod variants) + prompts
+agents/           6 harness configs (5 specialists + conductor) + prompts
 orchestration/    state machine + 4 Lambdas (driver / start / resume / webhook)
 deploy/           numbered idempotent provisioning scripts + least-priv IAM + evidence
 pipeline/         training entry point + contracts (manifest schema, events, report)
@@ -115,7 +116,7 @@ python -m venv .venv && .venv/bin/pip install "boto3>=1.43.51" pytest
 # 02_network.py is production-only (VPC + endpoints; hourly-billed — see --destroy)
 ```
 
-Full run order: [deploy/README.md](deploy/README.md) · Triggers: `docs/TRIGGERS.md` *(Phase 5)*
+Full run order: [deploy/README.md](deploy/README.md) · Triggers: [docs/TRIGGERS.md](docs/TRIGGERS.md)
 
 ## Status — all phases complete (v1)
 
