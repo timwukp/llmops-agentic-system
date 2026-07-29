@@ -12,8 +12,10 @@ memory attached post-create by `deploy/04_wire_memory.py`.
 | 3 | [eval](eval/harness.json) | `llmops_eval` | llm-evaluation, llm-guardrails | stage_complete, checkpoint, escalate_human | evaluate, gate |
 | 4 | [deploy](deploy/harness.json) | `llmops_deploy` | llm-deployment, llm-cost-optimization | stage_complete, checkpoint, escalate_human | deploy, smoke, teardown |
 | 5 | [monitor](monitor/harness.json) | `llmops_monitor` | llm-observability, llm-cost-optimization, llm-agent-orchestration | stage_complete, checkpoint, escalate_human | health, sweep, report |
+| 6 | [orchestrator](orchestrator/harness.json) | `llmops_orchestrator` | llm-agent-orchestration, ml-solution-design, llm-cost-optimization | **launch_run, resolve_escalation, page_human, write_report**, checkpoint | plan, triage, report |
 
-All agents: model `global.anthropic.claude-sonnet-5` (converse_stream, temperature 0.2),
+All agents: model `global.anthropic.claude-fable-5` with Opus 5 as the standing fallback
+(vendor-quota failover — see AGENTS.md; no temperature/topP: Claude ≥ 4.7 rejects them),
 `timeoutSeconds` 840 (driver Lambda 900s limit), sliding-window truncation (150 messages),
 shell + code interpreter + skills; eval and monitor additionally get the managed browser for
 console screenshot evidence. `job_launched` implements launch-and-release for SageMaker

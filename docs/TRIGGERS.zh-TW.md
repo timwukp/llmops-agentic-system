@@ -14,7 +14,7 @@ manifest 默認值（dataset、sample_count、gates、實例類型、`max_iterat
 | EventBridge Scheduler | 每夜 cron，**默認 DISABLED** | scheduler role | 已建立 |
 | Webhook | API Gateway HTTP API `POST /webhook` | HMAC-SHA256 | 實測：壞簽名 → 403，好簽名 → 202 + 運行啟動 |
 | Admin API | 同一 HTTP API 的 `POST /runs` | AWS_IAM | 路由已上線 |
-| GitHub Actions | `workflow_dispatch` → OIDC → Lambda 調用 | OIDC role | 待完成（Phase 6 repo 側） |
+| GitHub Actions | `workflow_dispatch` → OIDC → Lambda 調用 | OIDC role | workflow 已在 repo（`.github/workflows/run-pipeline.yml`）；需一次性 OIDC role + `AWS_OIDC_ROLE_ARN` secret |
 
 ## 1. EventBridge Scheduler（每夜 cron）
 
@@ -123,5 +123,6 @@ Step Functions 運行比任何 GitHub job 都長命，所以 workflow 以
 summary、然後綠色退出。進度請看 ops console 或 Step Functions 控制台 ——
 Actions 顯示綠色只代表「已啟動」，不代表「已通過」。
 
-狀態：AWS 側除 OIDC role 外無需任何資源；repo 側 workflow 隨 Phase 6 落地
-（Phase 5 證據中標記為 pending）。
+狀態：workflow 已隨本 repo 提供（`.github/workflows/run-pipeline.yml`）。
+剩餘的一次性設置在 AWS 側：建立 OIDC role 並把其 ARN 存入 repo secret
+`AWS_OIDC_ROLE_ARN`（步驟見上）。

@@ -17,7 +17,7 @@ Live status as of Phase 5:
 | EventBridge Scheduler | nightly cron, **DISABLED by default** | scheduler role | created |
 | Webhook | API Gateway HTTP API `POST /webhook` | HMAC-SHA256 | live: bad sig → 403, good sig → 202 + run started |
 | Admin API | `POST /runs` on the same HTTP API | AWS_IAM | route live |
-| GitHub Actions | `workflow_dispatch` → OIDC → Lambda invoke | OIDC role | pending (Phase 6 repo-side) |
+| GitHub Actions | `workflow_dispatch` → OIDC → Lambda invoke | OIDC role | workflow in repo (`.github/workflows/run-pipeline.yml`); needs one-time OIDC role + `AWS_OIDC_ROLE_ARN` secret |
 
 ## 1. EventBridge Scheduler (nightly cron)
 
@@ -132,5 +132,6 @@ outlives any GitHub job, so the workflow invokes start-pipeline with
 and exits green. Watch progress in the ops console or the Step Functions
 console — a green Actions run means "started", not "passed".
 
-Status: the AWS side needs nothing beyond the OIDC role; the repo-side
-workflow lands with Phase 6 (marked pending in the Phase 5 evidence).
+Status: the workflow ships in this repo (`.github/workflows/run-pipeline.yml`).
+One-time setup remains on the AWS side: create the OIDC role and store its ARN
+in the `AWS_OIDC_ROLE_ARN` repo secret (steps above).

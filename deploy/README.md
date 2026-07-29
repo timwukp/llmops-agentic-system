@@ -24,10 +24,12 @@ time from `sts get-caller-identity` and are never committed to the repo.
 | 01 | `01_iam.py` | 6 roles: `llmops-harness-execution`, `llmops-sagemaker-execution`, `llmops-lambda-{driver,start,resume,webhook}` + inline policies; SSM `/llmops/iam/*` | always, first |
 | 02 | `02_network.py` | dedicated VPC, 2 private subnets, SGs, gateway + interface VPC endpoints; SSM `/llmops/network/*` | **prod only** (dev harnesses use PUBLIC network mode) |
 | 03 | `03_storage.py` | S3 data bucket (versioned, SSE-S3, public-access-block, `runs/` 90-day lifecycle), DDB `llmops-pipeline-runs` + `llmops-stage-events`, EventBridge bus `llmops-pipeline`, SNS `llmops-escalations`; SSM `/llmops/storage/*` | always |
-| 04 | `04_wire_memory.py` *(placeholder)* | shared BYO AgentCore Memory (SEMANTIC+EPISODIC) + per-Memory IAM grants (re-run `01_iam.py --memory-id <id>` or let it patch the role) | before first harness create |
-| 05 | `05_harnesses.py` *(placeholder — uses `create_harness.py`/`update_harness.py`)* | the 5 worker harnesses from `agents/*/harness.json` (dev) or `harness.prod.json` (VPC + S3-mirrored skills) | after 01/03 (and 02+04 for prod) |
-| 06 | `06_orchestration.py` *(placeholder)* | Step Functions state machine, 4 Lambdas, EventBridge rules, webhook secret | after 05 |
-| 07 | `console/wire_console.py` *(placeholder)* | ops-console env wiring + observability (`setup_observability.py`) | last |
+| 04 | `04_wire_memory.py` | shared BYO AgentCore Memory (SEMANTIC+EPISODIC), attach to every harness, per-Memory IAM grant; SSM `/llmops/memory/*` | after 05 creates harnesses (re-run to attach new ones) |
+| 05 | `05_harnesses.py` | all 6 harnesses from `agents/*/harness.json` (dev) or `harness.prod.json` (VPC + S3-mirrored skills); injects `OTEL_TRACES_SAMPLER=always_on`; SSM `/llmops/harness/*` | after 01/03 (and 02 for prod) |
+| 06 | `06_observability.py` | log/trace deliveries per harness (targets the auto-created runtime ARN); `--evals` attaches Builtin online evaluation configs (needs `llmops-eval-execution` role) | after 05 |
+| 07 | `07_lambdas.py` | 4 spine Lambdas (driver/start/resume/webhook, contracts vendored), Step Functions `llmops-pipeline`, SageMaker job-state EventBridge rule | after 05 |
+| 08 | `08_triggers.py` | EventBridge Scheduler (nightly, DISABLED), webhook HMAC secret, HTTP API (`POST /webhook`, `POST /runs` IAM); SSM `/llmops/triggers/*` | after 07; `--enable-schedule` for nightly |
+| — | ops console | deployed from [bedrock-agentcore-agent-ops-console](https://github.com/timwukp/bedrock-agentcore-agent-ops-console) `deploy/deploy.sh` with `UI_HARNESS`/`QA_BUCKET` env pointing at this platform | last |
 
 ```bash
 .venv/bin/python deploy/01_iam.py     --region us-east-1 [--dry-run]

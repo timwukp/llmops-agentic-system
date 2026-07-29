@@ -4,7 +4,7 @@
 
 [English](README.md) · [架構](docs/ARCHITECTURE.zh-TW.md) · [安全](SECURITY.md) · [Agent 指引](AGENTS.md)
 
-五個 AI agent —— 數據準備、微調、評估、部署、監控 —— 無人干預地執行完整 LLMOps 生命週期：
+六個 AI agent —— 指揮家（orchestrator）加上數據準備、微調、評估、部署、監控五位專家 —— 無人干預地執行完整 LLMOps 生命週期：
 **teacher 大模型（Bedrock 上的 DeepSeek-R1）**生成訓練數據，**student 小模型（Qwen3-1.7B）**
 以 SageMaker 訓練作業做 QLoRA 微調，通過質量門檻評估後部署到 SageMaker endpoint 並持續監控 ——
 只有 agent 呼叫 `escalate_human` 時才需要人類介入。
@@ -38,7 +38,7 @@ harness 主迴圈 `global.anthropic.claude-fable-5`。
 
 核心設計決策（完整論證見 [docs/ARCHITECTURE.zh-TW.md](docs/ARCHITECTURE.zh-TW.md)）：
 
-- **5 個按階段拆分的 harness，而非巨型 agent** —— 各階段獨立掛載技能、獨立版本與 endpoint
+- **6 個 harness（5 位階段專家 + 指揮家），而非巨型 agent** —— 各階段獨立掛載技能、獨立版本與 endpoint
   釘選、獨立評估；爆炸半徑小。
 - **確定性主幹 + 智能 worker** —— 階段 DAG 不需要 LLM 判斷，因此編排用 Step Functions；
   智能封裝在每個階段內部。
@@ -88,7 +88,7 @@ checkpoint 並把它記入 manifest 作為標準實踐；發現 sandbox 禁用 `
 ## Repo 結構
 
 ```
-agents/           5 個 harness 配置（開發 + 生產雙版本）+ 提示詞
+agents/           6 個 harness 配置（5 個專家 + 指揮家）+ 提示詞
 orchestration/    狀態機 + 4 個 Lambda（driver / start / resume / webhook）
 deploy/           編號冪等部署腳本 + 最小權限 IAM + 驗證證據
 pipeline/         訓練入口 + 契約（manifest schema、事件、報告）
@@ -106,19 +106,26 @@ python -m venv .venv && .venv/bin/pip install "boto3>=1.43.51" pytest
 # 02_network.py 僅生產環境需要（VPC + endpoints；按小時計費 —— 見 --destroy）
 ```
 
-完整執行順序：[deploy/README.md](deploy/README.md) · 觸發器：`docs/TRIGGERS.md`（Phase 5）
+完整執行順序：[deploy/README.md](deploy/README.md) · 觸發器：[docs/TRIGGERS.md](docs/TRIGGERS.md)
 
-## 進度
+## 進度 —— 全部階段完成（v1）
 
-| 階段 | 門檻 | 狀態 |
-|---|---|---|
-| 0 — 腳手架 | preflight + 配置驗證 + 單元測試全過 | ✅ |
-| 1 — 主幹驗證 | data-prep harness 真實調用驗證 | ⏳ |
-| 2 — 蒸餾數據 | 經 DeepSeek-R1 產出 curated.jsonl | 待開始 |
-| 3 — 訓練 | launch-and-release 產出 ModelTrained | 待開始 |
-| 4 — 評估 + 部署 | 門檻通過、endpoint 冒煙測試 | 待開始 |
-| 5 — 自主運行 | EventBridge 觸發的全程無人 e2e | 待開始 |
-| 6 — 運維 | 控制台上線、回滾演練、雙語文檔 | 待開始 |
+下表每個門檻都在真實 AWS 帳號上通過；逐階段證據在
+[`deploy/evidence/`](deploy/evidence/)，綜合記錄在
+[`docs/TEST_RESULTS.zh-TW.md`](docs/TEST_RESULTS.zh-TW.md)。
+
+| 階段 | 門檻 | 狀態 | 證據 |
+|---|---|---|---|
+| 0 — 腳手架 | preflight + 配置驗證 + 單元測試全過 | ✅ | PR #1 |
+| 1 — 主幹驗證 | data-prep harness 真實調用驗證（skills、SageMaker API、S3） | ✅ | [phase1](deploy/evidence/VERIFICATION_phase1.md) |
+| 2 — 蒸餾數據 | 24 任務數據集經 DeepSeek-R1 生成 + 清洗，agent 自我迭代 | ✅ | [pilot](deploy/evidence/VERIFICATION_phase2_pilot.md) · [main](deploy/evidence/VERIFICATION_phase2_main.md) |
+| 3 — 訓練 | 6 輪自我修復後 QLoRA 完成；launch-and-release + EventBridge 喚醒驗證 | ✅ | [phase3](deploy/evidence/VERIFICATION_phase3.md) |
+| 4 — 評估 + 部署 | endpoint InService + 冒煙通過；**質量門誠實判 FAIL**（門攔住了 —— 這正是設計目的） | ✅ | [phase4](deploy/evidence/VERIFICATION_phase4.md) |
+| 5 — 自主運行 | 5 次 e2e 迭代，最終 run 7 站全程無人到誠實終態 | ✅ | [phase5](deploy/evidence/VERIFICATION_phase5.md) |
+| 6 — 運維 | 控制台上線、自動模型 failover、OIDC 觸發器、雙語文檔 | ✅ | [phase6](deploy/evidence/VERIFICATION_phase6.md) |
+
+下一步實驗（v2）：code-as-reasoning 蒸餾 + 程序化增廣；Kimi K3 teacher A/B ——
+見 [docs/CASE_STUDY.zh-TW.md](docs/CASE_STUDY.zh-TW.md)。
 
 ## 授權
 

@@ -4,7 +4,8 @@
 
 [繁體中文](README.zh-TW.md) · [Architecture](docs/ARCHITECTURE.md) · [Security](SECURITY.md) · [Agent orientation](AGENTS.md)
 
-Five AI agents — data-prep, finetune, eval, deploy, monitor — execute the full LLMOps
+Six AI agents — a conductor (orchestrator) plus data-prep, finetune, eval, deploy,
+monitor specialists — execute the full LLMOps
 lifecycle without human intervention: a **teacher LLM (DeepSeek-R1 on Bedrock)** generates
 training data, a **student model (Qwen3-1.7B)** is QLoRA-fine-tuned as a SageMaker training
 job, evaluated against quality gates, deployed to a SageMaker endpoint, and monitored —
@@ -39,7 +40,7 @@ harness loop `global.anthropic.claude-fable-5`.
 
 Key design decisions (full rationale in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)):
 
-- **5 per-stage harnesses, not a mega-agent** — per-stage skill mounting, versioning,
+- **6 harnesses (5 per-stage specialists + a conductor), not a mega-agent** — per-stage skill mounting, versioning,
   endpoint pins, and evaluations; small blast radius.
 - **Deterministic spine, agentic workers** — the stage DAG needs no LLM judgment, so
   orchestration is Step Functions; intelligence lives inside each stage.
@@ -97,7 +98,7 @@ evidence during data generation.
 ## Repo map
 
 ```
-agents/           5 harness configs (dev + prod variants) + prompts
+agents/           6 harness configs (5 specialists + conductor) + prompts
 orchestration/    state machine + 4 Lambdas (driver / start / resume / webhook)
 deploy/           numbered idempotent provisioning scripts + least-priv IAM + evidence
 pipeline/         training entry point + contracts (manifest schema, events, report)
@@ -115,19 +116,26 @@ python -m venv .venv && .venv/bin/pip install "boto3>=1.43.51" pytest
 # 02_network.py is production-only (VPC + endpoints; hourly-billed — see --destroy)
 ```
 
-Full run order: [deploy/README.md](deploy/README.md) · Triggers: `docs/TRIGGERS.md` *(Phase 5)*
+Full run order: [deploy/README.md](deploy/README.md) · Triggers: [docs/TRIGGERS.md](docs/TRIGGERS.md)
 
-## Status
+## Status — all phases complete (v1)
 
-| Phase | Gate | Status |
-|---|---|---|
-| 0 — scaffold | preflight + validation + unit tests clean | ✅ |
-| 1 — spine proof | data-prep harness invoke-verified live | ⏳ |
-| 2 — distillation data | curated.jsonl via DeepSeek-R1 | pending |
-| 3 — training | ModelTrained via launch-and-release | pending |
-| 4 — eval + deploy | gates PASSED, endpoint smoke-tested | pending |
-| 5 — autonomy | hands-off e2e from EventBridge trigger | pending |
-| 6 — ops | console live, rollback drill, bilingual docs | pending |
+Every gate below was passed on a real AWS account; per-phase evidence lives in
+[`deploy/evidence/`](deploy/evidence/) and the consolidated record in
+[`docs/TEST_RESULTS.md`](docs/TEST_RESULTS.md).
+
+| Phase | Gate | Status | Evidence |
+|---|---|---|---|
+| 0 — scaffold | preflight + validation + unit tests clean | ✅ | PR #1 |
+| 1 — spine proof | data-prep harness invoke-verified live (skills, SageMaker API, S3) | ✅ | [phase1](deploy/evidence/VERIFICATION_phase1.md) |
+| 2 — distillation data | 24-task dataset generated + curated via DeepSeek-R1, agent self-iterated | ✅ | [pilot](deploy/evidence/VERIFICATION_phase2_pilot.md) · [main](deploy/evidence/VERIFICATION_phase2_main.md) |
+| 3 — training | QLoRA complete after 6-iteration self-remediation; launch-and-release + EventBridge wake verified | ✅ | [phase3](deploy/evidence/VERIFICATION_phase3.md) |
+| 4 — eval + deploy | endpoint InService + smoke-tested; **quality gates FAILED honestly** (the gate held — that's the point) | ✅ | [phase4](deploy/evidence/VERIFICATION_phase4.md) |
+| 5 — autonomy | 5 e2e iterations, final run 7 states hands-off to an honest terminal state | ✅ | [phase5](deploy/evidence/VERIFICATION_phase5.md) |
+| 6 — ops | console live, auto model failover, OIDC trigger, bilingual docs | ✅ | [phase6](deploy/evidence/VERIFICATION_phase6.md) |
+
+Next experiments (v2): code-as-reasoning distillation with programmatic
+augmentation; Kimi K3 teacher A/B — see [docs/CASE_STUDY.md](docs/CASE_STUDY.md).
 
 ## License
 
