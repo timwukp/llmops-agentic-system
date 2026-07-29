@@ -108,17 +108,24 @@ python -m venv .venv && .venv/bin/pip install "boto3>=1.43.51" pytest
 
 完整執行順序：[deploy/README.md](deploy/README.md) · 觸發器：`docs/TRIGGERS.md`（Phase 5）
 
-## 進度
+## 進度 —— 全部階段完成（v1）
 
-| 階段 | 門檻 | 狀態 |
-|---|---|---|
-| 0 — 腳手架 | preflight + 配置驗證 + 單元測試全過 | ✅ |
-| 1 — 主幹驗證 | data-prep harness 真實調用驗證 | ⏳ |
-| 2 — 蒸餾數據 | 經 DeepSeek-R1 產出 curated.jsonl | 待開始 |
-| 3 — 訓練 | launch-and-release 產出 ModelTrained | 待開始 |
-| 4 — 評估 + 部署 | 門檻通過、endpoint 冒煙測試 | 待開始 |
-| 5 — 自主運行 | EventBridge 觸發的全程無人 e2e | 待開始 |
-| 6 — 運維 | 控制台上線、回滾演練、雙語文檔 | 待開始 |
+下表每個門檻都在真實 AWS 帳號上通過；逐階段證據在
+[`deploy/evidence/`](deploy/evidence/)，綜合記錄在
+[`docs/TEST_RESULTS.zh-TW.md`](docs/TEST_RESULTS.zh-TW.md)。
+
+| 階段 | 門檻 | 狀態 | 證據 |
+|---|---|---|---|
+| 0 — 腳手架 | preflight + 配置驗證 + 單元測試全過 | ✅ | PR #1 |
+| 1 — 主幹驗證 | data-prep harness 真實調用驗證（skills、SageMaker API、S3） | ✅ | [phase1](deploy/evidence/VERIFICATION_phase1.md) |
+| 2 — 蒸餾數據 | 24 任務數據集經 DeepSeek-R1 生成 + 清洗，agent 自我迭代 | ✅ | [pilot](deploy/evidence/VERIFICATION_phase2_pilot.md) · [main](deploy/evidence/VERIFICATION_phase2_main.md) |
+| 3 — 訓練 | 6 輪自我修復後 QLoRA 完成；launch-and-release + EventBridge 喚醒驗證 | ✅ | [phase3](deploy/evidence/VERIFICATION_phase3.md) |
+| 4 — 評估 + 部署 | endpoint InService + 冒煙通過；**質量門誠實判 FAIL**（門攔住了 —— 這正是設計目的） | ✅ | [phase4](deploy/evidence/VERIFICATION_phase4.md) |
+| 5 — 自主運行 | 5 次 e2e 迭代，最終 run 7 站全程無人到誠實終態 | ✅ | [phase5](deploy/evidence/VERIFICATION_phase5.md) |
+| 6 — 運維 | 控制台上線、自動模型 failover、OIDC 觸發器、雙語文檔 | ✅ | [phase6](deploy/evidence/VERIFICATION_phase6.md) |
+
+下一步實驗（v2）：code-as-reasoning 蒸餾 + 程序化增廣；Kimi K3 teacher A/B ——
+見 [docs/CASE_STUDY.zh-TW.md](docs/CASE_STUDY.zh-TW.md)。
 
 ## 授權
 

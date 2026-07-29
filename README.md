@@ -117,17 +117,24 @@ python -m venv .venv && .venv/bin/pip install "boto3>=1.43.51" pytest
 
 Full run order: [deploy/README.md](deploy/README.md) · Triggers: `docs/TRIGGERS.md` *(Phase 5)*
 
-## Status
+## Status — all phases complete (v1)
 
-| Phase | Gate | Status |
-|---|---|---|
-| 0 — scaffold | preflight + validation + unit tests clean | ✅ |
-| 1 — spine proof | data-prep harness invoke-verified live | ⏳ |
-| 2 — distillation data | curated.jsonl via DeepSeek-R1 | pending |
-| 3 — training | ModelTrained via launch-and-release | pending |
-| 4 — eval + deploy | gates PASSED, endpoint smoke-tested | pending |
-| 5 — autonomy | hands-off e2e from EventBridge trigger | pending |
-| 6 — ops | console live, rollback drill, bilingual docs | pending |
+Every gate below was passed on a real AWS account; per-phase evidence lives in
+[`deploy/evidence/`](deploy/evidence/) and the consolidated record in
+[`docs/TEST_RESULTS.md`](docs/TEST_RESULTS.md).
+
+| Phase | Gate | Status | Evidence |
+|---|---|---|---|
+| 0 — scaffold | preflight + validation + unit tests clean | ✅ | PR #1 |
+| 1 — spine proof | data-prep harness invoke-verified live (skills, SageMaker API, S3) | ✅ | [phase1](deploy/evidence/VERIFICATION_phase1.md) |
+| 2 — distillation data | 24-task dataset generated + curated via DeepSeek-R1, agent self-iterated | ✅ | [pilot](deploy/evidence/VERIFICATION_phase2_pilot.md) · [main](deploy/evidence/VERIFICATION_phase2_main.md) |
+| 3 — training | QLoRA complete after 6-iteration self-remediation; launch-and-release + EventBridge wake verified | ✅ | [phase3](deploy/evidence/VERIFICATION_phase3.md) |
+| 4 — eval + deploy | endpoint InService + smoke-tested; **quality gates FAILED honestly** (the gate held — that's the point) | ✅ | [phase4](deploy/evidence/VERIFICATION_phase4.md) |
+| 5 — autonomy | 5 e2e iterations, final run 7 states hands-off to an honest terminal state | ✅ | [phase5](deploy/evidence/VERIFICATION_phase5.md) |
+| 6 — ops | console live, auto model failover, OIDC trigger, bilingual docs | ✅ | [phase6](deploy/evidence/VERIFICATION_phase6.md) |
+
+Next experiments (v2): code-as-reasoning distillation with programmatic
+augmentation; Kimi K3 teacher A/B — see [docs/CASE_STUDY.md](docs/CASE_STUDY.md).
 
 ## License
 
