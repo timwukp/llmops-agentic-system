@@ -1,0 +1,715 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>LLMOps Admin</title>
+<style>
+  :root {
+    --bg:#0b1020; --panel:#141b33; --panel2:#1b2444; --line:#26305a;
+    --text:#e7ecff; --muted:#8592c0; --accent:#5b8cff; --green:#3ecf8e;
+    --amber:#f5b342; --red:#ff6b6b; --crit:#ff4d6d;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; font:14px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+         background:var(--bg); color:var(--text); }
+  header { display:flex; align-items:center; gap:12px; padding:16px 24px;
+           border-bottom:1px solid var(--line); background:var(--panel); }
+  header .logo { width:28px; height:28px; border-radius:7px;
+                 background:linear-gradient(135deg,var(--accent),#9d5bff); }
+  header h1 { font-size:16px; margin:0; font-weight:650; }
+  header .sub { color:var(--muted); font-size:12px; }
+  header .spacer { flex:1; }
+  button { font:inherit; cursor:pointer; border:1px solid var(--line);
+           background:var(--panel2); color:var(--text); border-radius:8px; padding:7px 13px; }
+  button:hover { border-color:var(--accent); }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#001; font-weight:600; }
+  .wrap { padding:20px 24px; display:grid; gap:16px;
+          grid-template-columns:repeat(12,1fr); max-width:1400px; margin:0 auto; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:16px; }
+  .card h2 { font-size:12px; text-transform:uppercase; letter-spacing:.06em;
+             color:var(--muted); margin:0 0 12px; font-weight:600; }
+  .col-4 { grid-column:span 4; } .col-6 { grid-column:span 6; }
+  .col-8 { grid-column:span 8; } .col-12 { grid-column:span 12; }
+  @media (max-width:900px){ .col-4,.col-6,.col-8 { grid-column:span 12; } }
+  .row { display:flex; align-items:center; justify-content:space-between; gap:10px;
+         padding:8px 0; border-bottom:1px solid var(--line); }
+  .row:last-child { border-bottom:0; }
+  .pill { font-size:11px; padding:2px 9px; border-radius:20px; font-weight:600; }
+  .ok { background:rgba(62,207,142,.15); color:var(--green); }
+  .warn { background:rgba(245,179,66,.15); color:var(--amber); }
+  .err { background:rgba(255,107,107,.15); color:var(--red); }
+  .idle { background:var(--panel2); color:var(--muted); }
+  .mono { font-family:ui-monospace,Menlo,monospace; font-size:12px; color:var(--muted); }
+  table { width:100%; border-collapse:collapse; }
+  td,th { text-align:left; padding:7px 6px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--muted); font-size:11px; text-transform:uppercase; }
+  input,select,textarea { font:inherit; background:var(--bg); color:var(--text);
+                   border:1px solid var(--line); border-radius:7px; padding:7px; width:100%; }
+  label { display:block; color:var(--muted); font-size:12px; margin:8px 0 3px; }
+  .flex { display:flex; gap:8px; align-items:center; }
+  .stat { font-size:26px; font-weight:700; } .stat small { font-size:12px; color:var(--muted); font-weight:400; }
+  nav.tabs { display:flex; gap:6px; padding:10px 24px 0; background:var(--panel);
+             border-bottom:1px solid var(--line); }
+  nav.tabs button { border:1px solid var(--line); border-bottom:none;
+                    border-radius:8px 8px 0 0; background:transparent; color:var(--muted);
+                    padding:8px 16px; }
+  nav.tabs button.active { background:var(--bg); color:var(--text);
+                           border-color:var(--accent); font-weight:600; }
+  .obsgrid { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px; margin-bottom:14px; }
+  .tile { background:var(--panel2); border:1px solid var(--line); border-radius:10px; padding:10px 12px; }
+  .tile .tlabel { font-size:11px; color:var(--muted); display:flex; align-items:center; gap:6px; }
+  .tile .tvalue { font-size:26px; font-weight:650; margin:2px 0; }
+  .tile .tsub { font-size:11px; color:var(--muted); }
+  .dot { width:8px; height:8px; border-radius:50%; display:inline-block; }
+  .chartbox { background:var(--panel2); border:1px solid var(--line); border-radius:10px; padding:12px; }
+  .chartbox h3 { font-size:11px; text-transform:uppercase; letter-spacing:.05em; color:var(--muted); margin:0 0 8px; font-weight:600; }
+  .legend { display:flex; gap:14px; font-size:11px; color:var(--muted); margin-top:6px; flex-wrap:wrap; }
+  .legend span { display:flex; align-items:center; gap:5px; }
+  .meter { height:10px; border-radius:5px; background:rgba(62,207,142,.15); overflow:hidden; margin-top:6px; }
+  .meter i { display:block; height:100%; border-radius:5px; }
+  .flow { width:100%; height:auto; display:block; }
+  .flow .node rect { fill:#1b2444; stroke:#26305a; stroke-width:1.5; rx:10; transition:all .2s; }
+  .flow .node text { fill:#e7ecff; font:600 12px system-ui,-apple-system,sans-serif; }
+  .flow .node .nsub { fill:#8592c0; font:400 10.5px system-ui,-apple-system,sans-serif; }
+  .flow .wire { stroke:#3a4577; stroke-width:2; fill:none; stroke-dasharray:6 5; animation:flowdash 1.2s linear infinite; }
+  .flow .arrow { fill:#3a4577; }
+  @keyframes flowdash { to { stroke-dashoffset:-11; } }
+  .flow .pulse { animation:pipepulse 1.1s ease-in-out infinite; }
+  @keyframes pipepulse { 0%,100%{ opacity:1; } 50%{ opacity:.25; } }
+  .flow .looplbl { fill:#8592c0; font:600 11px system-ui,-apple-system,sans-serif; letter-spacing:.04em; }
+  #runDetail { margin-top:12px; background:var(--panel2); border:1px solid var(--line);
+               border-radius:10px; padding:12px 14px; }
+  .obsrow2 { display:grid; grid-template-columns:2fr 1fr; gap:10px; }
+  @media (max-width:900px){ .obsrow2 { grid-template-columns:1fr; } }
+</style>
+</head>
+<body>
+<header>
+  <div class="logo"></div>
+  <div>
+    <h1>LLMOps Admin</h1>
+    <div class="sub">Operator console for the llmops-agentic-system pipeline</div>
+  </div>
+  <div class="spacer"></div>
+  <span id="clock" class="sub"></span>
+  <button id="loginBtn" onclick="signIn()">Sign in</button>
+  <button onclick="refresh()">&#8635; Refresh</button>
+</header>
+
+<nav class="tabs">
+  <button data-tab="pipeline" class="active" onclick="showTab('pipeline')">Pipeline</button>
+  <button data-tab="fleet" onclick="showTab('fleet')">Fleet</button>
+  <button data-tab="obs" onclick="showTab('obs')">Observability</button>
+  <button data-tab="evals" onclick="showTab('evals')">Evaluations</button>
+  <button data-tab="opts" onclick="showTab('opts')">Optimizations</button>
+</nav>
+
+<div class="wrap">
+  <!-- KPIs -->
+  <div data-tab-panel="all" class="card col-4"><h2>Harness fleet</h2>
+    <div class="stat" id="kpiFleet">&ndash;</div><small>llmops harnesses (target: 6 READY)</small></div>
+  <div data-tab-panel="all" class="card col-4"><h2>Pipeline runs</h2>
+    <div class="stat" id="kpiRuns">&ndash;</div><small id="kpiRunsSub">recent runs in DynamoDB</small></div>
+  <div data-tab-panel="all" class="card col-4"><h2>Executions</h2>
+    <div class="stat" id="kpiExec">&ndash;</div><small id="kpiExecSub">Step Functions llmops-pipeline</small></div>
+
+  <!-- Pipeline: stage-flow diagram -->
+  <div data-tab-panel="pipeline" class="card col-12"><h2>Pipeline &middot; llmops-pipeline &middot; live stage flow</h2>
+    <div class="flex" style="margin-bottom:10px;flex-wrap:wrap">
+      <select id="execPick" style="max-width:460px" onchange="loadPipe()"></select>
+      <span id="pipeHead" class="sub">loading&hellip;</span>
+    </div>
+    <div id="pipeViz"></div>
+  </div>
+
+  <!-- Pipeline: recent runs + start run -->
+  <div data-tab-panel="pipeline" class="card col-8"><h2>Recent runs &middot; click for detail</h2><div id="runsList"><span class="sub">loading&hellip;</span></div></div>
+  <div data-tab-panel="pipeline" class="card col-4"><h2>Start run</h2>
+    <label>Task count</label><input id="taskCount" type="number" min="1" placeholder="pipeline default" />
+    <label>Sample count</label><input id="sampleCount" type="number" min="1" placeholder="2000" />
+    <label>Note</label><input id="runNote" placeholder="optional annotation" />
+    <div class="flex" style="margin-top:10px">
+      <button class="primary" onclick="startRun()">&#9654; Start pipeline run</button>
+    </div>
+    <div id="startMsg" class="sub" style="margin-top:8px"></div>
+  </div>
+
+  <!-- Pipeline: run detail -->
+  <div data-tab-panel="pipeline" class="card col-12"><h2>Run detail</h2>
+    <div id="runDetail" style="display:none"></div>
+    <div id="runDetailEmpty" class="sub">select a run above</div>
+  </div>
+
+  <!-- Fleet -->
+  <div data-tab-panel="fleet" class="card col-12"><h2>Harness fleet &middot; 6 pipeline agents</h2><div id="fleet"><span class="sub">loading&hellip;</span></div></div>
+
+  <!-- Observability -->
+  <div data-tab-panel="obs" class="card col-12"><h2>Observability <span id="obsWin" class="mono">&middot; 24h</span></h2>
+    <div class="flex" style="margin-bottom:10px">
+      <select id="obsHours" style="width:120px" onchange="loadObs()">
+        <option value="24">24 hours</option><option value="72">3 days</option><option value="168">7 days</option>
+      </select>
+    </div>
+    <div id="obs"><span class="sub">loading&hellip;</span></div></div>
+  <div data-tab-panel="obs" class="card col-12"><h2>SageMaker &middot; training jobs &amp; student endpoints</h2><div id="sagemaker"><span class="sub">loading&hellip;</span></div></div>
+
+  <!-- Evaluations -->
+  <div data-tab-panel="evals" class="card col-12"><h2>Evaluations (online)</h2><div id="evals"><span class="sub">loading&hellip;</span></div></div>
+  <div data-tab-panel="evals" class="card col-12"><h2>Insights &middot; AI session analysis</h2>
+    <div class="row" style="border-bottom:none;padding:2px 0 6px">
+      <span class="sub">clusters failures / intents / summaries across recent pipeline sessions</span>
+      <span style="white-space:nowrap"><button class="primary" onclick="runInsightsReport()" style="padding:4px 12px;font-size:12px">&#9654; Generate report now</button> <span id="insMsg" class="sub"></span></span>
+    </div>
+    <div id="insReports"><span class="sub">loading&hellip;</span></div>
+  </div>
+
+  <!-- Optimizations -->
+  <div data-tab-panel="opts" class="card col-6"><h2>Recommendations &middot; AWS native</h2>
+    <div id="natRecs"><span class="sub">loading&hellip;</span></div>
+    <div class="flex" style="margin-top:10px">
+      <select id="recHarness" style="max-width:220px"></select>
+      <button class="primary" onclick="genNativeRec()">&#9881; Generate from traces</button>
+      <span id="optMsg" class="sub"></span>
+    </div>
+  </div>
+  <div data-tab-panel="opts" class="card col-6"><h2>Prompt drafts &middot; Bedrock-assisted</h2>
+    <div id="drafts"><span class="sub">loading&hellip;</span></div>
+    <div class="flex" style="margin-top:10px">
+      <select id="optHarness" style="max-width:220px"></select>
+      <button onclick="genOpt()">&#10024; Draft new prompt</button>
+      <span id="draftMsg" class="sub"></span>
+    </div>
+  </div>
+</div>
+
+<script>
+const API = "";  // same-origin
+// The Cognito access token lives in this in-memory variable ONLY — deliberately not in
+// localStorage/sessionStorage. A reload costs one sign-in and buys the property that
+// there is nothing on disk to steal. Read-only browsing needs no sign-in at all.
+let SESSION = null;
+function authHeaders(){ return SESSION ? {"authorization": "Bearer "+SESSION.token} : {}; }
+function setAuthUi(){
+  const b = $("loginBtn");
+  if (b) b.textContent = SESSION ? ("admin · sign out") : "Sign in";
+}
+function signOut(){ SESSION = null; setAuthUi(); }
+async function signIn(){
+  if (SESSION) { if (confirm("Sign out?")) signOut(); return true; }
+  const u = prompt("Admin username:", "admin"); if (!u) return false;
+  const p = prompt("Password:"); if (!p) return false;
+  const r = await fetch(API+"/api/login",{method:"POST",headers:{"content-type":"application/json"},
+    body:JSON.stringify({username:u.trim(), password:p})}).then(x=>x.json()).catch(e=>({error:String(e)}));
+  if (r.accessToken) {
+    SESSION = {token:r.accessToken, exp: Date.now()+(r.expiresIn-60)*1000, user:u.trim()};
+    setAuthUi(); return true;
+  }
+  alert("Login failed: "+(r.error||"unknown")); return false;
+}
+async function ensureToken(){
+  if (SESSION && SESSION.exp && Date.now() > SESSION.exp) SESSION = null;  // expired → re-auth
+  if (SESSION) return true;
+  return await signIn();
+}
+const $ = (id) => document.getElementById(id);
+// XSS sinks (ported): escape at the sink; jstr() for values landing in inline handlers.
+function esc(s){ return String(s==null?"":s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")
+  .replace(/"/g,"&quot;").replace(/'/g,"&#39;"); }
+function jstr(s){ return esc(JSON.stringify(String(s==null?"":s))); }
+const badge = (s) => {
+  s = String(s||"").toUpperCase();
+  if (["READY","SUCCEEDED","COMPLETED","COMPLETE","PASSED","INSERVICE","ACTIVE"].includes(s)) return "ok";
+  if (["FAILED","ERROR","TIMED_OUT","ABORTED","ESCALATED"].includes(s)) return "err";
+  if (["RUNNING","IN_PROGRESS","PENDING","GENERATING","CREATING","UPDATING","STOPPING"].includes(s)) return "warn";
+  return "idle";
+};
+function fmtN(n){ n=+n||0; return n>=1e6?(n/1e6).toFixed(1)+"M":n>=1e3?(n/1e3).toFixed(1)+"K":String(Math.round(n)); }
+
+setInterval(()=>$("clock").textContent=new Date().toLocaleTimeString(),1000);
+
+// ── overview: KPIs + fleet + runs + execution picker ─────────────────────────
+let _execs = [], _fleet = [];
+async function refresh(){
+  try {
+    const o = await fetch(API+"/api/overview").then(r=>r.json());
+    _fleet = o.harnesses||[];
+    _execs = Array.isArray(o.executions) ? o.executions : [];
+    const ready = _fleet.filter(h=>h.status==="READY").length;
+    $("kpiFleet").textContent = ready+"/"+_fleet.length;
+    $("kpiRuns").textContent = (o.runs||[]).length;
+    const running = _execs.filter(e=>e.status==="RUNNING").length;
+    $("kpiExec").textContent = running;
+    $("kpiExecSub").textContent = running ? "running now" : "none running · "+_execs.length+" recent";
+    renderFleet(_fleet);
+    renderRuns(o.runs||[]);
+    renderExecPicker();
+    const t = localStorage.getItem("adminTab")||"pipeline";
+    if (t==="pipeline") loadPipe().catch(console.error);
+  } catch(e){ console.error(e); }
+}
+
+function renderFleet(hs){
+  $("fleet").innerHTML = hs.length ? `<table><tr><th>Harness</th><th>Status</th><th>Model</th><th>Skills</th><th>Max iter</th><th>Timeout</th></tr>`+
+    hs.map(h=>`<tr><td><b>${esc(h.name)}</b><div class="mono">${esc(h.id||"")}</div></td>`+
+      `<td><span class="pill ${badge(h.status)}">${esc(h.status)}</span></td>`+
+      `<td class="mono">${esc(h.model||"?")}</td><td>${+h.skillsCount||0}</td>`+
+      `<td>${h.maxIterations!=null?esc(h.maxIterations):"–"}</td>`+
+      `<td>${h.timeoutSeconds!=null?esc(h.timeoutSeconds)+"s":"–"}</td></tr>`).join("")+`</table>`
+    : `<span class="sub">no llmops harnesses found</span>`;
+  // harness pickers on the Optimizations tab
+  const opts = hs.map(h=>`<option value="${esc(h.name)}">${esc(h.name)}</option>`).join("");
+  ["recHarness","optHarness"].forEach(id=>{
+    const el=$(id); const cur=el.value;
+    el.innerHTML = opts;
+    if (cur && hs.some(h=>h.name===cur)) el.value = cur;
+    else el.value = "llmops_orchestrator";
+  });
+}
+
+function renderRuns(runs){
+  $("runsList").innerHTML = runs.length ? `<table><tr><th>Run</th><th>Status</th><th>Stage</th><th>Trigger</th><th>Created</th></tr>`+
+    runs.map(r=>`<tr style="cursor:pointer" onclick="loadRun(${jstr(r.run_id)})">`+
+      `<td class="mono">${esc(r.run_id)}</td>`+
+      `<td><span class="pill ${badge(r.status)}">${esc(r.status||"?")}</span></td>`+
+      `<td>${esc(r.current_stage||"–")}</td><td>${esc(r.trigger_source||"?")}</td>`+
+      `<td class="mono">${esc(String(r.created_at||"").slice(0,19))}</td></tr>`).join("")+`</table>`
+    : `<span class="sub">no runs yet — start one on the right</span>`;
+}
+
+function renderExecPicker(){
+  const cur = $("execPick").value;
+  $("execPick").innerHTML = _execs.length ? _execs.map(e=>
+    `<option value="${esc(e.arn)}">${esc(e.status)} · ${esc(e.name)} · ${esc(String(e.startDate||"").slice(0,19))}</option>`).join("")
+    : `<option value="">no executions</option>`;
+  if (cur && _execs.some(e=>e.arn===cur)) $("execPick").value = cur;
+}
+
+// ── stage-flow diagram: 9 logical stages + remediation loop ──────────────────
+const STAGE_SUBS = {"data-prep-generate":"teacher generates","data-prep-curate":"curate + split",
+  "finetune-launch":"QLoRA on SageMaker","finetune-analyze":"loss curves","eval-gate":"quality gates",
+  "deploy":"student endpoint","smoke":"live inference","teardown":"cost hygiene","complete":"event out"};
+function stageColor(st){
+  if (st==="running") return "#f5b342";
+  if (st==="succeeded") return "#3ecf8e";
+  if (st==="failed") return "#ff6b6b";
+  if (st==="skipped") return "#3a4577";
+  return "#5a6491";  // pending
+}
+function renderPipe(d){
+  const stages = d.stages||[];
+  const NW=128, GAP=18, Y=40, H=72, STEP=NW+GAP;
+  const W = stages.length*STEP-GAP+20, VH=205;
+  let svg = `<svg class="flow" viewBox="0 0 ${W} ${VH}" role="img" aria-label="LLMOps pipeline stage flow">`+
+    `<defs><marker id="pah" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L8,4 L0,8 Z" class="arrow"/></marker></defs>`;
+  const xs = stages.map((_,i)=>10+i*STEP);
+  stages.forEach((st,i)=>{
+    const x = xs[i], c = stageColor(st.status), live = st.status==="running";
+    if (i<stages.length-1)
+      svg += `<path class="wire" d="M${x+NW},${Y+H/2} H${x+STEP-5}" marker-end="url(#pah)"/>`;
+    svg += `<g class="node">`+
+      `<rect x="${x}" y="${Y}" width="${NW}" height="${H}" style="stroke:${c}"/>`+
+      `<circle cx="${x+14}" cy="${Y+14}" r="5" fill="${c}"${live?' class="pulse"':''}/>`+
+      `<text x="${x+NW/2}" y="${Y+34}" text-anchor="middle" style="font-size:11.5px">${esc(st.label)}</text>`+
+      `<text x="${x+NW/2}" y="${Y+50}" text-anchor="middle" class="nsub">${esc(STAGE_SUBS[st.key]||"")}</text>`+
+      `<text x="${x+NW/2}" y="${Y+64}" text-anchor="middle" class="nsub" style="fill:${c}">${esc(st.status)}</text></g>`;
+  });
+  // remediation loop: eval-gate → finetune-launch (RemediateFinetune + IncrementIteration)
+  const ei = stages.findIndex(s=>s.key==="eval-gate"), fi = stages.findIndex(s=>s.key==="finetune-launch");
+  if (ei>=0 && fi>=0){
+    const ex = xs[ei]+NW/2, fx = xs[fi]+NW/2;
+    const loopC = (+d.iteration||0) > 0 ? "#f5b342" : "#3a4577";
+    svg += `<path class="wire" style="stroke:${loopC}" d="M${ex},${Y+H} V${Y+H+46} H${fx} V${Y+H+8}" marker-end="url(#pah)"/>`+
+      `<text class="looplbl" x="${(ex+fx)/2}" y="${Y+H+40}" text-anchor="middle">gate failed → remediate finetune (iteration ${+d.iteration||0})</text>`;
+  }
+  svg += `</svg>`;
+  $("pipeViz").innerHTML = svg;
+  const ex = d.execution;
+  $("pipeHead").innerHTML = ex ?
+    `<span class="pill ${badge(ex.status)}">${esc(ex.status)}</span> `+
+    `<span class="mono">${esc(ex.name)}</span>`+
+    (d.runId?` · run <a href="#" onclick="loadRun(${jstr(d.runId)});return false" style="color:var(--accent)" class="mono">${esc(d.runId)}</a>`:"")+
+    ` · iteration ${+d.iteration||0}`+
+    (d.escalated?` · <span class="pill err">ESCALATED</span>`:"")
+    : `no executions yet`;
+}
+let PIPE_TIMER = null;
+async function loadPipe(){
+  try {
+    const sel = $("execPick").value;
+    const d = await fetch(API+"/api/pipeline"+(sel?"?execution="+encodeURIComponent(sel):"")).then(r=>r.json());
+    if (d.error) { $("pipeHead").textContent = "error: "+d.error; return; }
+    renderPipe(d);
+    if (d.runId && !window._runShown) loadRun(d.runId);
+  } catch(e){ $("pipeHead").textContent = "pipeline error: "+e; }
+}
+function pipePoll(on){
+  if (PIPE_TIMER) { clearInterval(PIPE_TIMER); PIPE_TIMER = null; }
+  if (on) PIPE_TIMER = setInterval(()=>{ refresh(); }, 30000);  // poll only while tab active
+}
+
+// ── run detail: manifest gates/metrics/evidence + events + training job ──────
+async function loadRun(runId){
+  window._runShown = runId;
+  $("runDetailEmpty").style.display = "none";
+  $("runDetail").style.display = "";
+  $("runDetail").innerHTML = `<span class="sub">loading ${esc(runId)}…</span>`;
+  try {
+    const d = await fetch(API+"/api/run?run_id="+encodeURIComponent(runId)).then(r=>r.json());
+    const man = d.manifest||{};
+    const stages = man.stages||{};
+    let html = `<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">`+
+      `<b class="mono">${esc(runId)}</b>`+
+      (d.gateVerdict?`<span class="pill ${d.gateVerdict==="passed"?"ok":"err"}">gate ${esc(d.gateVerdict)}</span>`:"")+`</div>`;
+    // gates table
+    if ((d.gates||[]).length) {
+      html += `<h2 style="margin-top:12px">Quality gates</h2><table><tr><th>Gate</th><th>Threshold</th><th>Actual</th><th>Verdict</th></tr>`+
+        d.gates.map(g=>`<tr><td>${esc(g.name)}</td><td class="mono">${esc(g.threshold)}</td>`+
+          `<td class="mono">${g.actual!=null?esc(g.actual):"–"}</td>`+
+          `<td>${g.passed==null?`<span class="pill idle">n/a</span>`:`<span class="pill ${g.passed?"ok":"err"}">${g.passed?"PASS":"FAIL"}</span>`}</td></tr>`).join("")+`</table>`;
+    }
+    // per-stage manifest: status / metrics / evidence
+    const sk = Object.keys(stages);
+    if (sk.length) {
+      html += `<h2 style="margin-top:12px">Stages (manifest)</h2><table><tr><th>Stage</th><th>Status</th><th>Metrics</th><th>Evidence</th></tr>`+
+        sk.map(s=>{const st=stages[s]||{};
+          const met = Object.entries(st.metrics||{}).map(([k,v])=>`${esc(k)}=${esc(typeof v==="object"?JSON.stringify(v):v)}`).join(" · ");
+          return `<tr><td><b>${esc(s)}</b></td><td><span class="pill ${badge(st.status)}">${esc(st.status||"?")}</span></td>`+
+            `<td class="mono">${met||"–"}</td><td class="sub">${esc(String(st.evidence||"").slice(0,220))}</td></tr>`;}).join("")+`</table>`;
+    } else if (d.manifestError) {
+      html += `<div class="sub" style="margin-top:8px">manifest: ${esc(d.manifestError)}</div>`;
+    }
+    // training job
+    if (d.trainingJob) {
+      const tj = d.trainingJob;
+      html += `<div style="margin-top:12px" class="row"><span>SageMaker training job <span class="mono">${esc(tj.name)}</span>`+
+        (tj.failureReason?`<div class="sub">${esc(tj.failureReason)}</div>`:"")+`</span>`+
+        `<span class="pill ${badge(tj.status)}">${esc(tj.status)}${tj.secondaryStatus?" · "+esc(tj.secondaryStatus):""}</span></div>`;
+    }
+    // stage events
+    const evs = d.events||[];
+    if (evs.length) {
+      html += `<h2 style="margin-top:12px">Stage events (${evs.length})</h2><table><tr><th>When · stage · event</th><th>Detail</th></tr>`+
+        evs.slice(-25).map(e=>{
+          let det = e.detail; if (typeof det!=="string") det = JSON.stringify(det);
+          return `<tr><td class="mono">${esc(e.sk)}</td><td class="sub mono">${esc(String(det||"").slice(0,180))}</td></tr>`;}).join("")+`</table>`;
+    }
+    $("runDetail").innerHTML = html;
+  } catch(e){ $("runDetail").innerHTML = `<span class="sub">error: ${esc(e)}</span>`; }
+}
+
+async function startRun(){
+  if (!await ensureToken()) { $("startMsg").textContent = "sign-in required"; return; }
+  $("startMsg").textContent = "starting…";
+  const body = {task_count: $("taskCount").value||undefined,
+                sample_count: $("sampleCount").value||undefined,
+                note: $("runNote").value||undefined};
+  const r = await fetch(API+"/api/start-run",{method:"POST",
+    headers:{"content-type":"application/json",...authHeaders()},
+    body:JSON.stringify(body)}).then(x=>x.json()).catch(e=>({error:String(e)}));
+  $("startMsg").textContent = r.ok ? "✓ started — refresh in a few seconds" : "error: "+(r.error||JSON.stringify(r)).slice(0,120);
+  setTimeout(refresh, 4000);
+}
+
+// ── observability (ported charts + SageMaker section) ────────────────────────
+const OBS_COLORS = ["#5b8cff","#d95926","#3ecf8e","#f5b342","#9d5bff","#4dd4e8"];
+function roundTopBar(x,y,w,h,r){ if(h<=0) return ""; r=Math.min(r,w/2,h);
+  return `M${x},${y+h} L${x},${y+r} Q${x},${y} ${x+r},${y} L${x+w-r},${y} Q${x+w},${y} ${x+w},${y+r} L${x+w},${y+h} Z`; }
+function dailyChart(H){
+  const days=[...new Set(H.flatMap(([n,m])=>(m.daily||[]).map(d=>d.d)))].sort();
+  if(!days.length) return `<div class="sub">no daily series in window</div>`;
+  const byH=H.map(([n,m])=>{const map={};(m.daily||[]).forEach(d=>map[d.d]=d.v);return days.map(d=>map[d]||0);});
+  const W=620,Ht=170,padL=36,padB=20,padT=12,cw=(W-padL-8)/days.length;
+  const max=Math.max(1,...byH.flat()); const step=max<=4?1:Math.ceil(max/4);
+  const top=Math.ceil(max/step)*step;
+  const ticks=[]; for(let v=0;v<=top;v+=step) ticks.push(v);
+  const y=v=>padT+(Ht-padT-padB)*(1-v/(ticks[ticks.length-1]||1));
+  const bw=Math.max(3,Math.min(20,(cw-8)/byH.length-2));
+  let g=ticks.map(v=>`<line x1="${padL}" y1="${y(v)}" x2="${W-4}" y2="${y(v)}" stroke="#26305a" stroke-width="1"/>`+
+    `<text x="${padL-6}" y="${y(v)+3.5}" font-size="10" fill="#8592c0" text-anchor="end">${fmtN(v)}</text>`).join("");
+  let bars="";
+  byH.forEach((vals,si)=>{ vals.forEach((v,di)=>{
+    const x=padL+di*cw+(cw-byH.length*(bw+2))/2+si*(bw+2);
+    bars+=`<path d="${roundTopBar(x,y(v),bw,y(0)-y(v),3)}" fill="${OBS_COLORS[si%OBS_COLORS.length]}"><title>${esc(H[si][0])} · ${esc(days[di])}: ${+v||0} invocations</title></path>`;
+  });});
+  const xl=days.map((d,di)=>`<text x="${padL+di*cw+cw/2}" y="${Ht-6}" font-size="10" fill="#8592c0" text-anchor="middle">${esc(d)}</text>`).join("");
+  return `<svg viewBox="0 0 ${W} ${Ht}" style="width:100%;height:auto" role="img" aria-label="Daily invocations by harness">${g}${bars}${xl}</svg>`;
+}
+function latencyBars(H){
+  const max=Math.max(1,...H.map(([n,m])=>m.Latency||0));
+  return H.map(([n,m],i)=>{const v=m.Latency||0,w=Math.max(2,100*v/max);
+    return `<div style="margin:7px 0"><div style="display:flex;justify-content:space-between;font-size:11px;color:var(--muted)">`+
+      `<span><span class="dot" style="background:${OBS_COLORS[i%OBS_COLORS.length]}"></span> ${esc(n)}</span><span style="color:var(--text)">${fmtN(v)} ms</span></div>`+
+      `<svg viewBox="0 0 100 8" preserveAspectRatio="none" style="width:100%;height:8px;margin-top:3px"><rect x="0" y="0" width="100" height="8" rx="4" fill="#26305a"/>`+
+      `<rect x="0" y="0" width="${w}" height="8" rx="4" fill="${OBS_COLORS[i%OBS_COLORS.length]}"><title>${esc(n)}: ${Math.round(v)} ms avg</title></rect></svg></div>`;}).join("");
+}
+async function loadObs(){
+  try {
+    const hours = $("obsHours").value||"24";
+    $("obsWin").textContent = "· "+hours+"h";
+    const o = await fetch(API+"/api/observability?hours="+hours).then(r=>r.json());
+    const H = Object.entries(o.harnesses||{});
+    const t = o.tokens||{};
+    const totErr = H.reduce((a,[n,m])=>a+(m.SystemErrors||0)+(m.UserErrors||0),0);
+    const totInv = H.reduce((a,[n,m])=>a+(m.Invocations||0),0);
+    const errPct = totInv? (100*totErr/totInv) : 0;
+    const errColor = errPct===0 ? "#3ecf8e" : errPct<5 ? "#f5b342" : "#ff6b6b";
+    let tiles = H.map(([n,m],i)=>`<div class="tile"><div class="tlabel"><span class="dot" style="background:${OBS_COLORS[i%OBS_COLORS.length]}"></span>${esc(n.replace("harness_llmops_",""))}</div>`+
+      `<div class="tvalue">${fmtN(m.Invocations||0)}</div><div class="tsub">${fmtN(m.Sessions||0)} sessions · ${fmtN(m.Latency||0)} ms avg</div></div>`).join("");
+    tiles += `<div class="tile"><div class="tlabel">Tokens in / out</div><div class="tvalue">${fmtN(t.input||0)}</div><div class="tsub">out ${fmtN(t.output||0)} · ${esc(o.tokenScope||"")}</div></div>`;
+    tiles += `<div class="tile"><div class="tlabel">Error rate</div><div class="tvalue" style="display:flex;align-items:center;gap:8px">${errPct.toFixed(1)}%`+
+      `<span style="font-size:12px;color:${errColor}">${errPct===0?"✓ healthy":totErr+" errors"}</span></div>`+
+      `<div class="meter"><i style="width:${Math.min(100,errPct*10)}%;background:${errColor}"></i></div></div>`;
+    const legend = `<div class="legend">${H.map(([n],i)=>`<span><span class="dot" style="background:${OBS_COLORS[i%OBS_COLORS.length]}"></span>${esc(n.replace("harness_llmops_",""))}</span>`).join("")}</div>`;
+    $("obs").innerHTML = `<div class="obsgrid">${tiles}</div>`+
+      `<div class="obsrow2"><div class="chartbox"><h3>Daily invocations</h3>${dailyChart(H)}${legend}</div>`+
+      `<div class="chartbox"><h3>Avg latency</h3>${latencyBars(H)}<div class="sub" style="margin-top:10px">${esc(o.source||"")}</div></div></div>`;
+    // SageMaker section
+    const smk = o.sagemaker||{};
+    const jobs = smk.trainingJobs||[], eps = smk.endpoints||[];
+    $("sagemaker").innerHTML =
+      `<div class="obsrow2"><div class="chartbox"><h3>Training jobs (llmops-, last 10)</h3>`+
+      (jobs.length ? jobs.map(j=>`<div class="row"><span class="mono">${esc(j.name)}</span>`+
+        `<span class="pill ${badge(j.status)}">${esc(j.status)}</span></div>`).join("")
+        : `<div class="sub">${esc(smk.trainingJobsError||"none")}</div>`)+`</div>`+
+      `<div class="chartbox"><h3>Student endpoints (llmops-student)</h3>`+
+      (eps.length ? eps.map(e=>`<div class="row"><span class="mono">${esc(e.name)}</span>`+
+        `<span class="pill ${badge(e.status)}">${esc(e.status)}</span></div>`).join("")
+        : `<div class="sub">${esc(smk.endpointsError||"none — torn down after smoke test (cost hygiene)")}</div>`)+`</div></div>`;
+  } catch(e){ $("obs").innerHTML = `<span class="sub">error: ${esc(e)}</span>`; }
+}
+
+// ── evaluations (ported gauges + batch eval + insights) ──────────────────────
+const EVAL_DESC = {Correctness:"factually accurate responses", GoalSuccessRate:"achieves the stage goal",
+  ToolSelectionAccuracy:"picks the right tool"};
+function scoreArc(pct, color){
+  const r=34, cx=44, cy=44, C=2*Math.PI*r, off=C*(1-Math.max(0,Math.min(1,pct)));
+  return `<svg viewBox="0 0 88 88" style="width:88px;height:88px">`+
+    `<circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="#26305a" stroke-width="8"/>`+
+    `<circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="${color}" stroke-width="8" stroke-linecap="round"`+
+    ` stroke-dasharray="${C}" stroke-dashoffset="${off}" transform="rotate(-90 ${cx} ${cy})"/>`+
+    `<text x="${cx}" y="${cy+5}" font-size="18" font-weight="650" fill="#e7ecff" text-anchor="middle">${Math.round(pct*100)}</text></svg>`;
+}
+function evalGauges(c){
+  const st = c.scoreStats||{};
+  return (c.evaluators||[]).map(ev=>{
+    const k = String(ev||"").replace("Builtin.","");
+    const a = st[k];
+    const has = a && a.count>0;
+    const pct = has ? a.avg : 0;
+    const color = !has ? "#26305a" : pct>=0.8 ? "#3ecf8e" : pct>=0.5 ? "#f5b342" : "#ff6b6b";
+    return `<div class="tile" style="display:flex;align-items:center;gap:14px">`+
+      (has ? scoreArc(pct,color)
+           : `<svg viewBox="0 0 88 88" style="width:88px;height:88px"><circle cx="44" cy="44" r="34" fill="none" stroke="#26305a" stroke-width="8" stroke-dasharray="4 7"/><text x="44" y="49" font-size="15" fill="#8592c0" text-anchor="middle">—</text></svg>`)+
+      `<div><div style="font-weight:600">${esc(k)}</div>`+
+      `<div class="tsub">${esc(EVAL_DESC[k]||"")}</div>`+
+      `<div class="tsub" style="margin-top:4px">${has ? a.count+" scored traces · avg "+(pct*100).toFixed(0)+"%" : "awaiting traffic"}</div></div></div>`;
+  }).join("");
+}
+async function loadEvals(){
+  try {
+    const d = await fetch(API+"/api/evaluations").then(r=>r.json());
+    const cs = d.configs||[];
+    const evalCs = cs.filter(c=>!(c.insights||[]).length);
+    const insightCs = cs.filter(c=>(c.insights||[]).length);
+    let html = evalCs.length ? evalCs.map(c=>{
+      const anyScores = c.scoreStats && Object.keys(c.scoreStats).length;
+      return `<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">`+
+        `<div><span style="font-weight:600">${esc(c.name)}</span>`+
+        ` <span class="mono">${+c.sampling||0}% sampling · ${(c.logGroups||[]).length} log group(s)</span></div>`+
+        `<span class="pill ${badge(c.status==="ACTIVE"?"READY":c.status)}">${esc(c.status)}</span></div>`+
+        `<div class="obsgrid" style="grid-template-columns:repeat(auto-fit,minmax(240px,1fr))">${evalGauges(c)}</div>`+
+        (anyScores ? "" : `<div class="sub" style="margin-top:8px">⏳ ${esc(c.scoresNote||"awaiting scored traffic")} — start a pipeline run to generate traces.</div>`);
+    }).join(`<hr style="border:none;border-top:1px solid var(--line);margin:14px 0">`)
+      : `<span class="sub">no online eval configs</span>`;
+    if (insightCs.length) {
+      html += `<hr style="border:none;border-top:1px solid var(--line);margin:14px 0">`+
+        insightCs.map(c=>`<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">`+
+          `<div><span style="font-weight:600">${esc(c.name)}</span> <span class="mono">AI insights · ${esc((c.frequencies||["DAILY"]).join("/").toLowerCase())} · ${+c.sampling||0}% sampling</span></div>`+
+          `<span class="pill ${badge(c.status==="ACTIVE"?"READY":c.status)}">${esc(c.status)}</span></div>`+
+          `<div style="margin-bottom:6px">${(c.insights||[]).map(i=>`<span class="pill warn" style="margin-right:6px">${esc(String(i).replace(/([A-Z])/g," $1").trim())}</span>`).join("")}</div>`).join("");
+    }
+    html += `<hr style="border:none;border-top:1px solid var(--line);margin:14px 0">`
+      + `<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">`
+      + `<span style="font-weight:600">Batch evaluations <span class="mono">offline scoring · minutes</span></span>`
+      + `<span><button class="primary" onclick="runBatchEval()" style="padding:4px 12px;font-size:12px">▶ Score recent pipeline sessions</button> <span id="beMsg" class="sub"></span></span></div>`
+      + `<div id="batchEvals"><span class="sub">loading…</span></div>`;
+    $("evals").innerHTML = html;
+    loadBatchEvals();
+  } catch(e){ $("evals").innerHTML = `<span class="sub">error: ${esc(e)}</span>`; }
+}
+
+async function loadBatchEvals(){
+  try {
+    const d = await fetch(API+"/api/batch-evals").then(r=>r.json());
+    const bs = d.batchEvaluations||[];
+    if (bs.error) { $("batchEvals").innerHTML = `<span class="sub">${esc(bs.error)}</span>`; return; }
+    $("batchEvals").innerHTML = bs.length ? bs.slice(0,5).map(b=>{
+      const gauges = (b.evaluatorSummaries||[]).filter(e=>e.avg!=null).map(e=>{
+        const pct = e.avg, color = pct>=0.8?"#3ecf8e":pct>=0.5?"#f5b342":"#ff6b6b";
+        return `<div class="tile" style="display:flex;align-items:center;gap:12px">${scoreArc(pct,color)}`+
+          `<div><div style="font-weight:600">${esc(e.evaluator)}</div>`+
+          `<div class="tsub">${+e.evaluated||0} evaluated · avg ${(pct*100).toFixed(0)}%</div></div></div>`;}).join("");
+      return `<div style="display:flex;align-items:center;justify-content:space-between;margin:6px 0">`+
+        `<span class="mono">${esc(b.name)} · ${esc(b.id)}</span>`+
+        `<span class="pill ${badge(b.status)}">${esc(b.status)}</span></div>`+
+        (gauges?`<div class="obsgrid" style="grid-template-columns:repeat(auto-fit,minmax(220px,1fr))">${gauges}</div>`:
+         `<div class="sub">sessions: ${+(b.sessions||{}).completed||0}/${+(b.sessions||{}).total||0} scored</div>`);
+    }).join("") : `<span class="sub">none yet — click "Score recent pipeline sessions"</span>`;
+  } catch(e){ $("batchEvals").innerHTML = `<span class="sub">error: ${esc(e)}</span>`; }
+}
+
+async function runBatchEval(){
+  if (!await ensureToken()) { $("beMsg").textContent = "sign-in required"; return; }
+  $("beMsg").textContent = "starting…";
+  const r = await fetch(API+"/api/batch-eval",{method:"POST",headers:{"content-type":"application/json",...authHeaders()},body:"{}"}).then(x=>x.json());
+  if (r.id) {
+    $("beMsg").textContent = "⏳ "+r.id+" scoring "+r.sessions+" session(s)…";
+    let n=0; const t=setInterval(async()=>{ n++; await loadBatchEvals();
+      const d = await fetch(API+"/api/batch-evals").then(x=>x.json());
+      const me = (d.batchEvaluations||[]).find(x=>x.id===r.id);
+      if ((me && me.status!=="PENDING" && me.status!=="IN_PROGRESS") || n>30) { clearInterval(t); $("beMsg").textContent = me?me.status:"done"; }
+    }, 10000);
+  } else { $("beMsg").textContent = "error: "+(r.error||"").slice(0,100); }
+}
+
+async function loadInsightsReports(){
+  try {
+    const d = await fetch(API+"/api/insights-reports").then(r=>r.json());
+    const rs = d.reports||[];
+    if (!rs.length) { $("insReports").innerHTML = `<div class="sub">no reports yet — generate one from recent sessions</div>`; return; }
+    const done = rs.find(r=>r.status==="COMPLETED");
+    let head = `<div class="sub" style="margin:2px 0 8px">reports: `+rs.slice(0,4).map(r=>
+      `<span class="mono">${esc(r.name)}</span> <span class="pill ${badge(r.status)}">${esc(r.status)}</span>`).join(" · ")+`</div>`;
+    let cols = "";
+    if (done) {
+      const rep = await fetch(API+"/api/insights-report?id="+encodeURIComponent(done.id)).then(r=>r.json());
+      const trunc = (s,n)=>{s=s||""; return s.length<=n?s:s.slice(0,n)+"…";};
+      const col = (title, items) => `<div class="chartbox"><h3>${title}</h3>`+
+        ((items&&items.length) ? items.slice(0,4).map(x=>
+          `<div style="padding:8px 0;border-bottom:1px solid var(--line)">`+
+          `<div style="display:flex;justify-content:space-between;gap:8px"><span style="font-weight:600;font-size:13px">${esc(x.name)}</span>`+
+          `<span class="pill warn" style="white-space:nowrap">${+x.affectedSessionCount||0} session${x.affectedSessionCount>1?"s":""}</span></div>`+
+          `<div class="sub" style="margin-top:3px">${esc(trunc(x.description,180))}</div></div>`).join("")
+         : `<div class="sub">none found</div>`)+`</div>`;
+      cols = `<div class="obsgrid" style="grid-template-columns:repeat(auto-fit,minmax(300px,1fr))">`+
+        col("Failure clusters", rep.failures)+col("User intents", rep.intents)+col("Execution summaries", rep.summaries)+`</div>`;
+    }
+    $("insReports").innerHTML = head + cols;
+  } catch(e){ $("insReports").innerHTML = `<span class="sub">report error: ${esc(e)}</span>`; }
+}
+
+async function runInsightsReport(){
+  if (!await ensureToken()) { $("insMsg").textContent = "sign-in required"; return; }
+  $("insMsg").textContent = "starting…";
+  const r = await fetch(API+"/api/insights-report",{method:"POST",headers:{"content-type":"application/json",...authHeaders()},body:"{}"}).then(x=>x.json());
+  $("insMsg").textContent = r.id ? "⏳ analyzing "+r.sessions+" session(s) (~2 min)" : "error: "+(r.error||"").slice(0,80);
+  if (r.id) setTimeout(loadInsightsReports, 90000);
+  loadInsightsReports();
+}
+
+// ── optimizations (ported: native recs + Bedrock drafts) ─────────────────────
+function trunc(s,n){ s=s||""; if (s.length<=n) return s; const i=s.lastIndexOf(" ",n); return s.slice(0, i>40?i:n)+"…"; }
+async function loadOpts(){
+  try {
+    const d = await fetch(API+"/api/optimizations").then(r=>r.json());
+    const nat = Array.isArray(d.native) ? d.native : [];
+    // n.explanation / r.rationale are model-generated prose; ids reach inline onclick → jstr().
+    $("natRecs").innerHTML = nat.length ? nat.map(n=>
+      `<div class="row"><span>${esc(n.name)} <span class="mono">${n.type==="SYSTEM_PROMPT_RECOMMENDATION"?"system prompt":esc(n.type||"")}</span>`+
+      `<div class="sub">${esc(trunc(n.explanation||"",170))}</div></span>`+
+      `<span style="white-space:nowrap"><span class="pill ${badge(n.status)}">${esc(n.status)}</span>`+
+      (n.status==="COMPLETED"&&n.recommendedPrompt?` <button onclick="applyNativeRec(${jstr(n.id)})" style="padding:2px 10px;font-size:11px">apply</button>`:``)+
+      `</span></div>`).join("")
+      : (d.native&&d.native.error ? `<span class="sub">${esc(d.native.error)}</span>`
+         : `<span class="sub">none yet — generate one from recent traces</span>`);
+    const rs = d.recommendations||[];
+    $("drafts").innerHTML = rs.length ? rs.map(r=>
+      `<div class="row"><span><span class="mono">${esc(r.id)} · ${esc(r.harnessId||"")}</span>`+
+      `<div class="sub">${esc(trunc(r.rationale||r.error_msg||"",170))}</div></span>`+
+      `<span style="white-space:nowrap"><span class="pill ${r.status==="applied"?"ok":r.status==="error"?"err":"warn"}">${esc(r.status)}</span>`+
+      (r.status==="proposed"?` <button onclick="applyOpt(${jstr(r.id)})" style="padding:2px 10px;font-size:11px">apply</button>`:``)+
+      `</span></div>`).join("")
+      : `<span class="sub">none yet — draft one from run outcomes + eval data</span>`;
+    loadInsightsReports();
+  } catch(e){ $("natRecs").innerHTML = `<span class="sub">error: ${esc(e)}</span>`; }
+}
+
+async function genNativeRec(){
+  if (!await ensureToken()) { $("optMsg").textContent = "sign-in required"; return; }
+  $("optMsg").textContent = "starting native recommendation… (~10 min)";
+  const r = await fetch(API+"/api/native-rec",{method:"POST",headers:{"content-type":"application/json",...authHeaders()},
+    body:JSON.stringify({harness:$("recHarness").value})}).then(x=>x.json());
+  $("optMsg").textContent = r.id ? "⏳ "+r.id+" "+r.status+" — refresh in ~10 min" : "error: "+(r.error||"").slice(0,100);
+  loadOpts();
+}
+
+async function applyNativeRec(id){
+  if (!await ensureToken()) return;
+  if (!confirm("Apply the AWS-recommended prompt to the live harness?")) return;
+  const r = await fetch(API+"/api/native-rec-apply",{method:"POST",headers:{"content-type":"application/json",...authHeaders()},
+    body:JSON.stringify({id, harness:$("recHarness").value})}).then(x=>x.json());
+  alert(r.ok ? "Applied — harness updating" : "Error: "+(r.error||"unknown"));
+  loadOpts();
+}
+
+async function genOpt(){
+  if (!await ensureToken()) { $("draftMsg").textContent = "cancelled — sign-in required"; return; }
+  $("draftMsg").textContent="generating… (~30s)";
+  try {
+    const r = await fetch(API+"/api/optimize",{method:"POST",headers:{"content-type":"application/json",...authHeaders()},
+      body:JSON.stringify({harness:$("optHarness").value})}).then(r=>r.json());
+    if (r.id) {
+      $("draftMsg").textContent = "⏳ "+r.id+" generating…";
+      let n = 0;
+      const t = setInterval(async () => {
+        n++; await loadOpts();
+        const d = await fetch(API+"/api/optimizations").then(x=>x.json());
+        const me = (d.recommendations||[]).find(x=>x.id===r.id);
+        if ((me && me.status!=="generating") || n>20) {
+          clearInterval(t);
+          $("draftMsg").textContent = me && me.status==="proposed" ? "✓ "+r.id+" proposed" : (me && me.error_msg ? "error: "+me.error_msg.slice(0,80) : "✓ done");
+        }
+      }, 5000);
+    } else {
+      if (r.error==="unauthorized") { signOut();
+        $("draftMsg").textContent = "session expired — click again to sign in"; }
+      else $("draftMsg").textContent = "error: "+(r.error||JSON.stringify(r)).slice(0,80);
+    }
+  } catch(e){ $("draftMsg").textContent = "error: "+e; }
+  loadOpts();
+}
+
+async function applyOpt(id){
+  if (!await ensureToken()) return;
+  if (!confirm("Apply this prompt to the live harness via UpdateHarness?")) return;
+  const r = await fetch(API+"/api/optimize-apply",{method:"POST",headers:{"content-type":"application/json",...authHeaders()},
+    body:JSON.stringify({id})}).then(r=>r.json());
+  alert(r.ok ? "Applied — harness updating" : "Error: "+(r.error||"unknown"));
+  loadOpts();
+}
+
+// ── tabs (ported: persistence + poll only while active) ──────────────────────
+function showTab(t){
+  document.querySelectorAll("[data-tab-panel]").forEach(el=>{
+    el.style.display = (el.dataset.tabPanel===t || el.dataset.tabPanel==="all") ? "" : "none"; });
+  document.querySelectorAll("nav.tabs button").forEach(b=>b.classList.toggle("active", b.dataset.tab===t));
+  localStorage.setItem("adminTab", t);
+  pipePoll(t==="pipeline");
+  if (t==="pipeline") loadPipe().catch(console.error);
+  if (t==="obs") { loadObs(); }
+  if (t==="evals") loadEvals();
+  if (t==="opts") loadOpts();
+}
+
+// tab on load: ?tab= URL param > localStorage > pipeline default
+const KNOWN_TABS = ["pipeline","fleet","obs","evals","opts"];
+const _urlTab = new URLSearchParams(location.search).get("tab");
+const _memTab = localStorage.getItem("adminTab");
+showTab(KNOWN_TABS.includes(_urlTab) ? _urlTab
+      : KNOWN_TABS.includes(_memTab) ? _memTab : "pipeline");
+setAuthUi();
+refresh();
+</script>
+</body>
+</html>

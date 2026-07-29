@@ -1,0 +1,177 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "Logs",
+      "Effect": "Allow",
+      "Action": ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"],
+      "Resource": "arn:aws:logs:REGION:ACCOUNT_ID:*"
+    },
+    {
+      "Sid": "AgentCoreControl",
+      "Effect": "Allow",
+      "Action": [
+        "bedrock-agentcore:ListHarnesses",
+        "bedrock-agentcore:GetHarness",
+        "bedrock-agentcore:UpdateHarness",
+        "bedrock-agentcore:ListAgentRuntimes"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "EvalRead",
+      "Effect": "Allow",
+      "Action": [
+        "bedrock-agentcore:ListEvaluators",
+        "bedrock-agentcore:GetEvaluator",
+        "bedrock-agentcore:ListOnlineEvaluationConfigs",
+        "bedrock-agentcore:GetOnlineEvaluationConfig"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "BatchEval",
+      "Effect": "Allow",
+      "Action": [
+        "bedrock-agentcore:StartBatchEvaluation",
+        "bedrock-agentcore:GetBatchEvaluation",
+        "bedrock-agentcore:ListBatchEvaluations"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "NativeRecs",
+      "Effect": "Allow",
+      "Action": [
+        "bedrock-agentcore:StartRecommendation",
+        "bedrock-agentcore:GetRecommendation",
+        "bedrock-agentcore:ListRecommendations"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "StepFunctionsRead",
+      "Effect": "Allow",
+      "Action": [
+        "states:ListExecutions",
+        "states:DescribeStateMachine"
+      ],
+      "Resource": "arn:aws:states:REGION:ACCOUNT_ID:stateMachine:llmops-pipeline"
+    },
+    {
+      "Sid": "StepFunctionsExecRead",
+      "Effect": "Allow",
+      "Action": [
+        "states:DescribeExecution",
+        "states:GetExecutionHistory"
+      ],
+      "Resource": "arn:aws:states:REGION:ACCOUNT_ID:execution:llmops-pipeline:*"
+    },
+    {
+      "Sid": "SageMakerRead",
+      "Effect": "Allow",
+      "Action": [
+        "sagemaker:DescribeTrainingJob",
+        "sagemaker:ListTrainingJobs",
+        "sagemaker:DescribeEndpoint",
+        "sagemaker:ListEndpoints"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "CWMetricsRead",
+      "Effect": "Allow",
+      "Action": ["cloudwatch:GetMetricData", "cloudwatch:ListMetrics"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "AgentCoreLogsRead",
+      "Effect": "Allow",
+      "Action": [
+        "logs:DescribeLogStreams",
+        "logs:StartQuery",
+        "logs:GetQueryResults",
+        "logs:FilterLogEvents",
+        "logs:GetLogEvents"
+      ],
+      "Resource": [
+        "arn:aws:logs:REGION:ACCOUNT_ID:log-group:/aws/bedrock-agentcore*",
+        "arn:aws:logs:REGION:ACCOUNT_ID:log-group:/aws/bedrock-agentcore*:*",
+        "arn:aws:logs:REGION:ACCOUNT_ID:log-group:aws/spans",
+        "arn:aws:logs:REGION:ACCOUNT_ID:log-group:aws/spans:*"
+      ]
+    },
+    {
+      "Sid": "LogsDescribeAndFas",
+      "Effect": "Allow",
+      "Action": [
+        "logs:DescribeLogGroups",
+        "logs:PutRetentionPolicy",
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "Bedrock",
+      "Effect": "Allow",
+      "Action": ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "S3Manifests",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:ListBucket"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "SsmParams",
+      "Effect": "Allow",
+      "Action": ["ssm:GetParameter", "ssm:GetParameters"],
+      "Resource": "arn:aws:ssm:REGION:ACCOUNT_ID:parameter/llmops/*"
+    },
+    {
+      "Sid": "Secrets",
+      "Effect": "Allow",
+      "Action": ["secretsmanager:GetSecretValue"],
+      "Resource": "arn:aws:secretsmanager:REGION:ACCOUNT_ID:secret:llmops-admin/*"
+    },
+    {
+      "Sid": "DDBConsole",
+      "Effect": "Allow",
+      "Action": ["dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:GetItem", "dynamodb:Scan"],
+      "Resource": "arn:aws:dynamodb:REGION:ACCOUNT_ID:table/LlmopsAdminRuns"
+    },
+    {
+      "Sid": "DDBPipelineRead",
+      "Effect": "Allow",
+      "Action": ["dynamodb:GetItem", "dynamodb:Query", "dynamodb:Scan"],
+      "Resource": [
+        "arn:aws:dynamodb:REGION:ACCOUNT_ID:table/llmops-pipeline-runs",
+        "arn:aws:dynamodb:REGION:ACCOUNT_ID:table/llmops-stage-events"
+      ]
+    },
+    {
+      "Sid": "InvokeStartPipelineAndSelf",
+      "Effect": "Allow",
+      "Action": ["lambda:InvokeFunction"],
+      "Resource": [
+        "arn:aws:lambda:REGION:ACCOUNT_ID:function:llmops-start-pipeline",
+        "arn:aws:lambda:REGION:ACCOUNT_ID:function:llmops-admin"
+      ]
+    },
+    {
+      "Sid": "CognitoAuth",
+      "Effect": "Allow",
+      "Action": ["cognito-idp:InitiateAuth", "cognito-idp:GetUser"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "STS",
+      "Effect": "Allow",
+      "Action": ["sts:GetCallerIdentity"],
+      "Resource": "*"
+    }
+  ]
+}
