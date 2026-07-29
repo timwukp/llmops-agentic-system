@@ -1,0 +1,235 @@
+# Architecture — design rationale
+
+[繁體中文](ARCHITECTURE.zh-TW.md) · [README](../README.md) · [Infrastructure](INFRASTRUCTURE.md) · [Triggers](TRIGGERS.md) · [Test results](TEST_RESULTS.md)
+
+Every decision below was validated by a real invocation on a real AWS account
+(evidence in `deploy/evidence/VERIFICATION_phase*.md`). Where a decision was
+*changed* by live evidence, the incident that changed it is cited.
+
+![High-level architecture](architecture-high-level.svg)
+
+![Low-level architecture](architecture-low-level.svg)
+
+## 1. Six harnesses (5 specialists + 1 conductor), not a mega-agent
+
+The platform is six AgentCore Harnesses:
+
+| Harness | Role | Tasks |
+|---|---|---|
+| `llmops_data_prep` | specialist | verify, generate, curate |
+| `llmops_finetune` | specialist | prepare, launch, analyze, remediate |
+| `llmops_eval` | specialist | evaluate, gate |
+| `llmops_deploy` | specialist | deploy, smoke, teardown |
+| `llmops_monitor` | specialist | health, sweep, report |
+| `llmops_orchestrator` | **conductor** | plan, triage, report |
+
+Why not one mega-agent with all the skills and all the permissions:
+
+- **Per-stage skill mounting** — each harness mounts only its stage's skills from
+  [MLOps-agent-skills](https://github.com/timwukp/MLOps-agent-skills) (e.g. finetune gets
+  `llm-fine-tuning`, `llm-distillation`, `llm-cost-optimization`; eval gets `llm-evaluation`,
+  `llm-guardrails`). A mega-agent's context would carry every skill on every turn.
+- **Per-stage versioning and endpoint pins** — a change to the deploy agent cannot regress
+  the data-prep agent; each harness versions and pins independently.
+- **Per-stage least-privilege IAM** — small blast radius. Phase 4's teardown proved the value:
+  the deploy agent's role denies `List*`/`DeleteModel`, so it planned teardown around
+  known-name deletion and *flagged* what it couldn't do rather than silently claiming it.
+- **Per-stage evaluations** — online evals attach per harness, so quality regressions
+  localize to a stage.
+- **Independent honesty** — Phase 2 pilot: `llm-cost-optimization` is deliberately NOT
+  mounted on data-prep; the agent flagged that it couldn't cross-check pricing instead of
+  guessing. Separation makes that boundary real.
+
+The conductor sits ABOVE the state machine, not inside it: it parses natural-language
+goals into run plans, dispatches runs, triages escalations first-line, and synthesizes
+cross-run reports. It does not execute pipeline stages and does not schedule intra-run
+steps. The config comment says it best: 樂譜不即興，指揮家不吹每個音符 — the score doesn't
+improvise, and the conductor doesn't play every note.
+
+## 2. Deterministic spine, agentic workers
+
+The stage DAG (data-prep → finetune → eval → deploy → monitor) never changes per run —
+it needs zero LLM judgment. So orchestration is a **Step Functions Standard state machine**,
+and intelligence lives *inside* each stage. An LLM deciding "what stage comes next" would
+add nondeterminism, cost, and failure modes to the one part of the system that benefits
+from having none.
+
+The state machine (`orchestration/state_machine.asl.json`) has **8 harness-task states
+on the happy path** — each a `waitForTaskToken` Lambda invocation of the harness driver
+— plus the loop-only `RemediateFinetune`:
+
+```
+DataPrepGenerate → DataPrepCurate → FinetuneLaunch → FinetuneAnalyze → EvalGate
+                                                        │ (gate fail)
+                              RemediateFinetune ←───────┘   … then, on gate pass:
+                                                     Deploy → SmokeTest → Teardown
+```
+
+plus the control states that route between them: `QualityGateChoice` (gate pass → Deploy,
+else remediation), `RemediationChoice` (iteration < 3 → remediate, else escalate),
+`IncrementIteration` (Pass), and the terminals `Complete` (emits `PipelineCompleted`),
+`EscalateFail` (emits `EscalatedToHuman`), and `Fail`.
+
+Two spine details that are policy, not plumbing:
+
+- **`Teardown` always runs after deploy** — even when `SmokeTest` fails, its `Catch`
+  routes to `Teardown` first. Orphaned endpoints are the #1 cost risk (Phase 4 found an
+  unrelated endpoint in the account that had been InService since 2024-04).
+- The spine is also the **deterministic fallback**: during a transient Bedrock outage in
+  Phase 3, the orchestrator submitted training job `-r5` directly (tagged
+  `launched_by: orchestrator-fallback-bedrock-5xx`) while the agent was unreachable.
+
+## 3. The inline-function contract
+
+Agents don't "report" in free text — the driver only trusts structured inline-function
+calls, which are the sole channel by which an agent affects the pipeline.
+
+**Worker contract** (all 5 specialists):
+
+| Function | Meaning | Driver behavior |
+|---|---|---|
+| `stage_complete` | stage done, here are outputs + metrics | **trust-but-verify**: `head_object` every claimed `s3://` output; missing outputs → the call is *rejected* back to the agent ("write them and call stage_complete again"). The driver — never the agent — writes the canonical run report. `outputs: []` is a legitimate success. |
+| `job_launched` | long job launched (SageMaker training) | launch-and-release: park the Step Functions task token in DynamoDB keyed by job name; release the session (§4) |
+| `checkpoint` | turn budget nearing, progress persisted | re-invoke the same session to continue (self-reinvoke if the Lambda itself is near its limit) |
+| `escalate_human` | out of budget or out of authority | SNS notification, run marked `escalated`, `EscalatedToHuman` event, task token failed |
+
+**Conductor contract** (`llmops_orchestrator`): `launch_run` (dispatch a planned run via
+start-pipeline), `resolve_escalation` (first-line triage within policy: relaunch a stage
+with adjusted params, skip, documented retry), `page_human` (ONLY for decisions above its
+authority — budget overruns, shared-resource deletion, business tradeoffs — with a
+decision brief: situation, options, recommendation), `write_report` (publish cross-run
+operations synthesis), plus `checkpoint`.
+
+If a turn ends *without* an inline-function call (models sometimes narrate completion but
+skip the structured call), the driver re-asks up to 2 times in the same session, then
+fails the stage as `MissingStageComplete` — narration is never promoted to success.
+
+## 4. Launch-and-release with EventBridge wake
+
+A harness turn is bounded (~14 min); a training job runs for hours. The rule: **a harness
+never waits on a job**. The finetune agent launches the SageMaker job, calls
+`job_launched`, and its session is released. The chain that resumes the pipeline:
+
+1. Driver parks the Step Functions task token in DynamoDB (`llmops-pipeline-runs`,
+   GSI `job_name-index`), keyed by job name.
+2. The job's terminal state fires the EventBridge rule on "SageMaker Training Job State
+   Change" (Completed | Failed | Stopped) → `llmops-resume-pipeline` Lambda.
+3. The Lambda looks the run up by job name, emits `ModelTrained` / `PipelineFailed`,
+   settles the token (`send_task_success` / `send_task_failure`), and **removes the token**
+   so a duplicate EventBridge delivery cannot double-settle.
+4. `FinetuneAnalyze` then runs in a **fresh session**, reconstructing all context from AWS
+   state (describe-training-job + S3 + manifest).
+
+Live-verified in Phase 3 (two resume-Lambda invocations observed: one on an early failure,
+one on the successful completion; 1.5 s duration, 0 errors) and again hands-off, twice, in
+Phase 5.
+
+## 5. Manifest as the single source of truth
+
+**State lives in `s3://<bucket>/runs/<run_id>/manifest.json` + DynamoDB, never in the
+session.** The start-pipeline Lambda seeds the manifest (run params, models, gates,
+budget); every stage reads it and appends its entry; `remediation_history` is
+append-only. Consequences, all live-proven:
+
+- Sessions are disposable: Phase 3's post-training `analyze` ran in a fresh session with
+  zero context loss; Phase 2 survived 3 client-side stream disconnects (including a full
+  laptop-close) with zero lost work.
+- Scaling is a parameter change, not new engineering: the 24-task Phase 2 run and the
+  2-sample Phase 5 mini-run differ only in manifest params.
+- Learnings persist where the next run will look: the Phase 2 agents recorded token-budget
+  and checkpointing findings directly into the manifest.
+
+## 6. Shared BYO Memory — cross-run learning
+
+One AgentCore Memory (`llmops_shared_memory`, strategies **SEMANTIC + EPISODIC**) is
+shared by all six harnesses, wired post-create by `deploy/04_wire_memory.py`. Per-agent
+`actorId` (= harness name) partitions namespaces while retrieval can still cross-read
+shared facts. USER_PREFERENCE/SUMMARIZATION strategies are deliberately skipped — there
+is no human user in the loop.
+
+This is the mechanism by which run-N learnings reach run-N+1, and it is proven: in
+Phase 5's e2e run, the finetune agent launched its training job **first-try** using the
+floors-only-requirements + torch-2.6-DLC recipe learned in Phase 3's remediation gauntlet
+— a recipe that had cost 5 failed jobs to discover.
+
+## 7. Fail-closed gates
+
+Quality gates default to FAIL. This was made strict by a live defect (Phase 5, e2e
+iteration 4): a mini-run's eval agent emitted `gate_passed: null` + `needs_human: true`,
+and the old default-True coercion *promoted a null to a pass*. The fix in the driver:
+
+- On an eval gate task, `gate_passed` is `metrics.get("gate_passed") is True` — absent,
+  null, or anything non-True means NOT passed. Regression-tested.
+- The gate held in Phase 4 the way that matters most: the model genuinely failed
+  (0/16 twice, `closed_think_rate` 0%) and the verdict **stood** — it was not "fixed"
+  into a pass. A gate you can talk your way past is not a gate.
+
+## 8. The remediation loop (≤ 3 iterations)
+
+`QualityGateChoice` fail → `RemediationChoice`: while `iteration < 3`,
+`IncrementIteration` → `RemediateFinetune` → back to `FinetuneAnalyze` → `EvalGate`.
+Budget exhausted → `EscalateFail`. The same budget appears inside the agents' task
+prompts ("diagnose, fix, retry — max 3; then `escalate_human`"), so the machine-level
+and agent-level budgets agree.
+
+The loop's honest edge case is its best evidence (Phase 5, run 5): the eval agent
+returned `FAIL_CLOSED_NO_INPUT` (no quality signal exists at 2-sample scale), the machine
+correctly armed `RemediateFinetune` — and the finetune agent answered
+`REMEDIATE_PREMISE_INVALID — no quality signal to remediate` and escalated instead of
+burning iterations on an unfixable premise. Honest-over-busy is a design requirement,
+and the loop's exit for it is `escalate_human`.
+
+## 9. Model failover is a design layer, not an emergency measure
+
+Live-established (Phase 5): vendor model quotas are a HARD constraint — even AWS-internal
+accounts are rate-limited by the model provider, and a multi-agent platform is its own
+token-flood generator (6 harnesses × agent loops × long streams). ~12 Fable 5 5xx bursts
+recurred across a single day. Design rules (full text in [AGENTS.md](../AGENTS.md)):
+
+1. Every harness has a fallback chain: `global.anthropic.claude-fable-5` →
+   `global.anthropic.claude-opus-5` (same family, zero prompt changes). Hot-swap via
+   `UpdateHarness`, ~15 s to READY; sessions survive the swap.
+2. The "switch" signature: repeated `InternalServerException`/`ServiceUnavailableException`
+   from ConverseStream while a direct single-shot probe of the same model succeeds —
+   quota pressure, not an outage (it never surfaces as an explicit ThrottlingException).
+3. Mixed allocation spreads quota pressure: premium tier for judgment-heavy agents
+   (orchestrator, eval), Opus 5 for process-execution agents (data-prep, deploy, monitor).
+4. The driver detects model-5xx during stream salvage and hot-swaps to the fallback,
+   emitting an informational failover event (`_maybe_failover_model` in
+   `orchestration/harness_driver/handler.py`); full automated-failover hardening is Phase 6.
+
+## 10. The driver's turn-continuation design (900 s Lambda vs 840 s turns)
+
+The harness driver Lambda is the bridge between Step Functions and a harness: one
+invocation streams `InvokeHarness`, services the toolUse ⇄ toolResult protocol, verifies
+outputs, and settles the task token. The arithmetic problem: the Lambda's hard ceiling is
+**900 s** and a harness turn budget (`timeoutSeconds`) is **840 s** — so only ONE turn
+fits per invocation. Live evidence forced the design (Phase 5, e2e iteration 4):
+`Sandbox.Timedout` killed a run whose agent had *finished its work but never got a turn
+to report it*.
+
+The fix: **between-turn self-reinvoke**. Whenever the loop would start another turn
+without enough remaining time, the driver asynchronously re-invokes itself carrying a
+continuation payload (pending content + retry/re-ask counters); the deterministic session
+id and the task token survive across invocations, so the conversation resumes exactly
+where it stopped. Other production patterns baked into the same loop, each from a real
+failure: `read_timeout=870, retries=0` on the AgentCore client (default 60 s kills long
+streams; auto-retry would silently re-run a whole agent turn), and a one-shot same-session
+salvage retry when a stream dies mid-turn.
+
+## 11. VPC posture for production
+
+Dev harness configs (`agents/*/harness.json`) run PUBLIC-network for iteration speed.
+Production variants (`agents/*/harness.prod.json`) and the Lambdas run **VPC-isolated
+with interface endpoints — no internet egress** (`deploy/02_network.py`). Two forcing
+functions:
+
+- VPC-mode harnesses can't reach GitHub, so production skills mount from an **S3-mirrored
+  snapshot** (`deploy/05_mirror_skills.py`) instead of the git source.
+- That is also correctness, not just connectivity: the git skill source reads the default
+  branch only, so main-branch drift would silently change production agent behavior.
+  The S3 mirror pins what production agents actually run.
+
+Least-privilege IAM throughout (no `*FullAccess`), all resources scoped to `llmops-*`,
+and this being a public repo: no account IDs anywhere — deploy scripts substitute
+`<ACCOUNT_ID>` at run time, enforced by a pre-commit hook and CI redaction scan.

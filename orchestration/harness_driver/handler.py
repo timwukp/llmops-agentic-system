@@ -256,6 +256,48 @@ def handle_escalate(c, event, args) -> dict:
     return {"escalated": True}
 
 
+#: Fallback chain for vendor-quota 5xx bursts (AGENTS.md: failover is a design layer).
+MODEL_FALLBACKS = {
+    "global.anthropic.claude-fable-5": "global.anthropic.claude-opus-5",
+    "us.anthropic.claude-fable-5": "global.anthropic.claude-opus-5",
+}
+
+
+def _is_model_5xx(error: str) -> bool:
+    return any(sig in error for sig in
+               ("InternalServerException", "ServiceUnavailableException"))
+
+
+def _maybe_failover_model(c, event) -> None:
+    """Hot-swap the harness to its fallback model on a vendor 5xx burst.
+    Best-effort: any failure here must not break the salvage retry."""
+    try:
+        region = os.environ.get("AWS_REGION", "us-east-1")
+        ctl = boto3.client("bedrock-agentcore-control", region_name=region)
+        arn = _resolve_harness_arn(event["harness_id"])
+        harness_full_id = arn.rsplit("/", 1)[-1]
+        h = ctl.get_harness(harnessId=harness_full_id)["harness"]
+        model = h["model"]
+        current = model.get("bedrockModelConfig", {}).get("modelId", "")
+        fallback = MODEL_FALLBACKS.get(current)
+        if not fallback:
+            return
+        model["bedrockModelConfig"]["modelId"] = fallback
+        ctl.update_harness(harnessId=harness_full_id, model=model,
+                           clientToken=hashlib.sha256(
+                               f"{harness_full_id}-{fallback}".encode()).hexdigest()[:40])
+        for _ in range(24):  # wait READY (~15s typical)
+            if ctl.get_harness(harnessId=harness_full_id)["harness"]["status"] == "READY":
+                break
+            time.sleep(5)
+        ev.emit_event(os.environ["EVENT_BUS"], ev.ESCALATED_TO_HUMAN, {
+            "run_id": event.get("run_id", "?"), "stage": event.get("stage", "?"),
+            "reason": f"ModelFailover: {current} -> {fallback} (vendor 5xx burst); "
+                      "informational, pipeline continuing"}, client=c["events"])
+    except Exception:  # noqa: BLE001 — never let failover break the retry path
+        pass
+
+
 RE_ASK = ("Your turn ended without an inline-function call. If your task is "
           "INCOMPLETE, continue now and finish it — then call the appropriate "
           "inline function (job_launched for launched jobs, stage_complete for "
@@ -311,6 +353,8 @@ def handler(event, context=None, clients=None):
         if out["error"] and not stream_retried:
             # involuntary stream death — same-session salvage retry, once
             stream_retried = True
+            if _is_model_5xx(out["error"]):
+                _maybe_failover_model(c, event)  # vendor-quota burst: hot-swap model
             content = [{"text": "The stream was interrupted. Continue from where "
                                 "you left off; call your pending inline function."}]
             continue
