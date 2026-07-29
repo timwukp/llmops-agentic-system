@@ -1,4 +1,28 @@
-# AGENTS.md — orientation for AI agents working on this repo
+# AGENTS.md
+
+## Model failover is a first-class design layer (not an emergency measure)
+
+Live-established 2026-07-29: vendor model quotas are a HARD constraint — even
+AWS-internal accounts are rate-limited by the model provider; quota increases
+are not a plan. A multi-agent platform is its own token-flood generator (6
+harnesses × agent loops × long streams), so 5xx bursts against the premium
+model tier are structural, not incidental.
+
+Design rules:
+1. Every harness has a **fallback model chain**: `global.anthropic.claude-fable-5`
+   → `global.anthropic.claude-opus-5` (same-family, zero prompt changes).
+   Hot-swap via `UpdateHarness` (~15s to READY); sessions survive the swap.
+2. Failure signature that means "switch": repeated
+   `runtimeClientError → InternalServerException/ServiceUnavailableException`
+   from ConverseStream while a direct single-shot probe of the same model
+   succeeds — that's quota pressure, not an outage (it never surfaces as an
+   explicit ThrottlingException).
+3. **Mixed allocation** spreads quota pressure by design: premium tier (Fable 5)
+   for judgment-heavy agents (orchestrator, eval), Opus 5 for process-execution
+   agents (data-prep, deploy, monitor).
+4. Phase-6 hardening: the harness driver auto-swaps after N consecutive 5xx
+   and emits a ModelFailover event (today's manual procedure, automated).
+ — orientation for AI agents working on this repo
 
 This file front-loads what an AI coding agent needs to work here safely and correctly.
 (Convention borrowed from AWS's own repos and timwukp/Harness-agentic-AI-agent-best-practices-and-use-case.)

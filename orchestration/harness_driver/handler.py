@@ -72,9 +72,33 @@ def _clients():
     }
 
 
+_arn_cache: dict = {}
+
+
+def _resolve_harness_arn(harness_id: str) -> str:
+    """InvokeHarness requires the full ARN (live-verified: harnessId is not an
+    accepted parameter). The state machine passes logical names (llmops_data_prep);
+    the full suffixed id lives in SSM /llmops/harness/<agent> (set by 05_harnesses.py).
+    Env override HARNESS_ARN_<NAME> short-circuits SSM (also keeps unit tests offline)."""
+    if harness_id.startswith("arn:"):
+        return harness_id
+    if harness_id in _arn_cache:
+        return _arn_cache[harness_id]
+    env_key = f"HARNESS_ARN_{harness_id.upper()}"
+    if os.environ.get(env_key):
+        _arn_cache[harness_id] = os.environ[env_key]
+        return _arn_cache[harness_id]
+    region = os.environ.get("AWS_REGION", "us-east-1")
+    agent = harness_id.removeprefix("llmops_").replace("_", "-")
+    ssm = boto3.client("ssm", region_name=region)
+    full_id = ssm.get_parameter(Name=f"/llmops/harness/{agent}")["Parameter"]["Value"]
+    account = boto3.client("sts", region_name=region).get_caller_identity()["Account"]
+    _arn_cache[harness_id] = f"arn:aws:bedrock-agentcore:{region}:{account}:harness/{full_id}"
+    return _arn_cache[harness_id]
+
+
 def _invoke(ac, harness_id: str, sess: str, content: list, qualifier: Optional[str]):
-    kwargs = dict(harnessId=harness_id, runtimeSessionId=sess,
-                  actorId="llmops-pipeline",
+    kwargs = dict(harnessArn=_resolve_harness_arn(harness_id), runtimeSessionId=sess,
                   messages=[{"role": "user", "content": content}])
     if qualifier:
         kwargs["qualifier"] = qualifier
@@ -182,8 +206,15 @@ def handle_stage_complete(c, event, args) -> dict:
         write_run_report(c["s3"], os.environ["DATA_BUCKET"], manifest)
 
     if event.get("task_token"):
-        payload = {"run_id": run_id, "stage": stage, "task": task, **norm.get("metrics", {})}
-        payload["gate_passed"] = bool(norm.get("metrics", {}).get("gate_passed", True))
+        metrics = norm.get("metrics", {})
+        payload = {"run_id": run_id, "stage": stage, "task": task, **metrics}
+        # Gate semantics must be strict for gate tasks: an absent/None gate_passed on
+        # an eval gate means NOT passed (fail closed) — a mini-run agent once emitted
+        # gate_passed=null + needs_human=true and the old default-True promoted it.
+        if stage == "eval" and task == "gate":
+            payload["gate_passed"] = metrics.get("gate_passed") is True
+        else:
+            payload["gate_passed"] = bool(metrics.get("gate_passed", True))
         c["sfn"].send_task_success(taskToken=event["task_token"],
                                    output=json.dumps(payload, default=str))
     return {"ok": True, "normalized": norm}
@@ -225,8 +256,12 @@ def handle_escalate(c, event, args) -> dict:
     return {"escalated": True}
 
 
-RE_ASK = ("You finished without calling stage_complete. Call stage_complete now "
-          "with your results (outputs may be an empty list if nothing was produced).")
+RE_ASK = ("Your turn ended without an inline-function call. If your task is "
+          "INCOMPLETE, continue now and finish it — then call the appropriate "
+          "inline function (job_launched for launched jobs, stage_complete for "
+          "completed stages, checkpoint if you need another turn). If the work "
+          "is already done, call stage_complete now (outputs may be an empty "
+          "list if nothing was produced).")
 
 
 def handler(event, context=None, clients=None):
@@ -238,11 +273,37 @@ def handler(event, context=None, clients=None):
     if event.get("task_token"):
         payload["params"]["iteration"] = event.get("iteration", 0)
 
-    content = [{"text": json.dumps(payload, default=str)}]
-    stream_retried = False
-    re_asked = False
+    # Continuation across Lambda invocations: one harness turn can run 840s and the
+    # Lambda dies at 900s, so only ONE turn fits per invocation. Whenever the loop
+    # would start another turn without enough time left, self-reinvoke carrying the
+    # pending content (session + task token survive; live-verified Sandbox.Timedout
+    # killed a run whose agent finished its work but never got to report it).
+    if event.get("_continuation"):
+        content = event["_continuation"]
+        stream_retried = bool(event.get("_stream_retried"))
+        re_asks = int(event.get("_re_asks", 0))
+    else:
+        content = [{"text": json.dumps(payload, default=str)}]
+        stream_retried = False
+        re_asks = 0  # up to 2: continue-and-finish nudge, then final demand
+
+    def _out_of_time() -> bool:
+        return bool(context) and context.get_remaining_time_in_millis() < 850_000
+
+    def _self_reinvoke():
+        c["lambda"].invoke(
+            FunctionName=context.function_name, InvocationType="Event",
+            Payload=json.dumps({**event, "_continuation": content,
+                                "_stream_retried": stream_retried,
+                                "_re_asks": re_asks}, default=str))
+        return {"status": "self_reinvoked_between_turns"}
+
+    first_turn = True
 
     while True:
+        if not first_turn and _out_of_time():
+            return _self_reinvoke()
+        first_turn = False
         resp = _invoke(c["agentcore"], event["harness_id"], sess, content,
                        event.get("qualifier"))
         out = _drain(resp)
@@ -294,12 +355,12 @@ def handler(event, context=None, clients=None):
             continue
 
         # Stream ended without a tool call.
-        if not re_asked:
-            re_asked = True
+        if re_asks < 2:
+            re_asks += 1
             content = [{"text": RE_ASK}]
             continue
 
-        # Re-ask failed too → treat as stage failure.
+        # Re-asks exhausted → treat as stage failure.
         if event.get("task_token"):
             c["sfn"].send_task_failure(taskToken=event["task_token"],
                                        error="MissingStageComplete",

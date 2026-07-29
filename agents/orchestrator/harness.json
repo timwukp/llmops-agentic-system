@@ -1,0 +1,176 @@
+{
+  "_comment": "llmops_orchestrator — the conductor (指揮家). Sits ABOVE the state machine: understands customer goals, decomposes them into run plans, dispatches runs, triages escalations first-line, and synthesizes cross-run learnings. It does NOT execute pipeline stages (the 5 specialists do) and does NOT schedule intra-run steps (Step Functions does). 樂譜不即興，指揮家不吹每個音符.",
+  "harnessName": "llmops_orchestrator",
+  "model": {
+    "bedrockModelConfig": {
+      "modelId": "global.anthropic.claude-fable-5",
+      "apiFormat": "converse_stream",
+      "maxTokens": 65536
+    }
+  },
+  "systemPrompt": [
+    {
+      "text": "You are the ORCHESTRATOR (conductor) of an autonomous LLMOps platform running on AWS Bedrock AgentCore. Five specialist agent runtimes (data-prep, finetune, eval, deploy, monitor) execute pipeline stages under a Step Functions state machine; you are the project brain ABOVE that machine.\n\nYour mounted skills (llm-agent-orchestration, ml-solution-design) are your methodology — consult them before acting.\n\nYour duties per invocation depend on params.task:\n- \"plan\": a customer goal arrives in natural language (params.goal). Parse it into a run plan: domain, dataset, teacher/student models, sample counts, quality gates, instance types, cost estimate, and per-stage params. If the goal is ambiguous on a material point, state your assumption explicitly in the plan rather than guessing silently (assumptions block at the top). Write plan.json to the S3 URI given in params.plan_uri, reply with the plan summary, then call launch_run with {plan_uri, params} — the start-pipeline Lambda seeds the manifest from it.\n- \"triage\": an EscalatedToHuman event arrives (params.escalation). You are the FIRST line: read the run's manifest + stage events + the escalation details. If it is resolvable within policy (adjust hyperparams/params and relaunch a stage, skip a non-critical stage, retry with a documented fix), call resolve_escalation with your decision and rationale. Only if it requires true owner authority (spend above budget, deleting shared resources, ambiguous business tradeoffs) call page_human with a crisp decision brief: situation, options, your recommendation.\n- \"report\": synthesize cross-run learnings from your memory, the runs DynamoDB table, and recent manifests into a concise operations report; write it to params.report_uri and call write_report.\n\nRules:\n- Read AWS region/bucket/table names from the invocation params or SSM (/llmops/*), never hardcode account-specific values.\n- Cost discipline: every plan MUST include a cost estimate and respect params.budget_usd if given; endpoint-bearing stages must have teardown steps.\n- You command WHAT each specialist does (via the plan/manifest params); Step Functions commands WHEN. Never try to invoke specialist harnesses directly.\n- Bounded turns (~13 min): call checkpoint with a progress URI if you approach the limit.\n- Record durable judgments (what plans worked, which escalations recur, cost patterns) — your memory is shared with the specialists.\n- Honesty over completion: if you cannot verify something, say so explicitly in the plan/triage output."
+    }
+  ],
+  "tools": [
+    {
+      "type": "agentcore_code_interpreter",
+      "name": "code_interpreter"
+    },
+    {
+      "type": "inline_function",
+      "name": "launch_run",
+      "config": {
+        "inlineFunction": {
+          "description": "Dispatch a planned run: the orchestrator Lambda invokes start-pipeline with this plan. Call exactly once per planned run, after plan.json is written to S3.",
+          "inputSchema": {
+            "type": "object",
+            "properties": {
+              "plan_uri": {"type": "string", "description": "S3 URI of the written plan.json"},
+              "params": {"type": "object", "description": "Per-stage parameter overrides for the manifest (models, sample_count, gates, instances)"},
+              "cost_estimate_usd": {"type": "number"}
+            },
+            "required": ["plan_uri"]
+          }
+        }
+      }
+    },
+    {
+      "type": "inline_function",
+      "name": "resolve_escalation",
+      "config": {
+        "inlineFunction": {
+          "description": "Resolve an escalation autonomously (within policy): records the decision and triggers the corrective action (stage relaunch with adjusted params, skip, or documented retry).",
+          "inputSchema": {
+            "type": "object",
+            "properties": {
+              "run_id": {"type": "string"},
+              "decision": {"type": "string", "description": "relaunch_stage | skip_stage | retry_with_fix | close_no_action"},
+              "stage": {"type": "string"},
+              "adjusted_params": {"type": "object"},
+              "rationale": {"type": "string"}
+            },
+            "required": ["run_id", "decision", "rationale"]
+          }
+        }
+      }
+    },
+    {
+      "type": "inline_function",
+      "name": "page_human",
+      "config": {
+        "inlineFunction": {
+          "description": "Page the human owner — ONLY for decisions above orchestrator authority (budget overruns, shared-resource deletion, business tradeoffs). Sends SNS with your decision brief.",
+          "inputSchema": {
+            "type": "object",
+            "properties": {
+              "run_id": {"type": "string"},
+              "situation": {"type": "string"},
+              "options": {"type": "array", "items": {"type": "string"}},
+              "recommendation": {"type": "string"}
+            },
+            "required": ["situation", "recommendation"]
+          }
+        }
+      }
+    },
+    {
+      "type": "inline_function",
+      "name": "write_report",
+      "config": {
+        "inlineFunction": {
+          "description": "Publish an operations report (cross-run synthesis). Call after the report is written to S3.",
+          "inputSchema": {
+            "type": "object",
+            "properties": {
+              "report_uri": {"type": "string"},
+              "period": {"type": "string"},
+              "headline": {"type": "string", "description": "One-line summary for the console"}
+            },
+            "required": ["report_uri", "headline"]
+          }
+        }
+      }
+    },
+    {
+      "type": "inline_function",
+      "name": "checkpoint",
+      "config": {
+        "inlineFunction": {
+          "description": "Persist progress and yield the turn when the ~13-minute budget nears. You will be re-invoked in the same session to continue.",
+          "inputSchema": {
+            "type": "object",
+            "properties": {
+              "progress_uri": {"type": "string"},
+              "next_action": {"type": "string"},
+              "percent_complete": {"type": "number"}
+            },
+            "required": ["progress_uri", "next_action"]
+          }
+        }
+      }
+    }
+  ],
+  "allowedTools": [
+    "shell",
+    "file_read",
+    "file_write",
+    "code_interpreter",
+    "skills",
+    "launch_run",
+    "resolve_escalation",
+    "page_human",
+    "write_report",
+    "checkpoint"
+  ],
+  "skills": [
+    {
+      "git": {
+        "url": "https://github.com/timwukp/MLOps-agent-skills",
+        "path": "skills/llmops/llm-agent-orchestration"
+      }
+    },
+    {
+      "git": {
+        "url": "https://github.com/timwukp/MLOps-agent-skills",
+        "path": "skills/mlops/ml-solution-design"
+      }
+    },
+    {
+      "git": {
+        "url": "https://github.com/timwukp/MLOps-agent-skills",
+        "path": "skills/llmops/llm-cost-optimization"
+      }
+    }
+  ],
+  "_memory_note": "Shared BYO memory llmops_shared_memory attached post-create by deploy/04_wire_memory.py (actorId = harness name). The conductor READS the specialists' learnings and WRITES planning/triage judgments.",
+  "maxIterations": 100,
+  "maxTokens": 65536,
+  "timeoutSeconds": 840,
+  "truncation": {
+    "strategy": "sliding_window",
+    "config": {
+      "slidingWindow": {
+        "messagesCount": 150
+      }
+    }
+  },
+  "environment": {
+    "agentCoreRuntimeEnvironment": {
+      "networkConfiguration": {
+        "networkMode": "PUBLIC"
+      },
+      "lifecycleConfiguration": {
+        "idleRuntimeSessionTimeout": 900,
+        "maxLifetime": 28800
+      }
+    }
+  },
+  "tags": {
+    "project": "llmops-agentic-system",
+    "agent-type": "orchestrator",
+    "pipeline-stage": "conductor",
+    "environment": "development"
+  }
+}
