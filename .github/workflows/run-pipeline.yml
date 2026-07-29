@@ -1,0 +1,56 @@
+# Fire-and-monitor pipeline trigger from GitHub Actions (OIDC — no long-lived keys).
+#
+# Setup (once): create an IAM role trusting GitHub's OIDC provider for this repo,
+# with lambda:InvokeFunction on llmops-start-pipeline; store its ARN in the repo
+# secret AWS_OIDC_ROLE_ARN (account id never appears in the workflow file).
+#
+# Fire-and-monitor, not fire-and-wait: the SFN run outlives any GitHub job, so we
+# start it, print the run_id + console URL, and exit green. Watch progress in the
+# llmops-admin console or Step Functions.
+name: Run LLMOps pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      task_count:
+        description: "ARC tasks to distill from"
+        required: false
+        default: "24"
+      sample_count:
+        description: "target curated samples"
+        required: false
+        default: "2000"
+      note:
+        description: "run annotation"
+        required: false
+        default: "manual dispatch from GitHub Actions"
+
+permissions:
+  id-token: write   # OIDC
+  contents: read
+
+jobs:
+  start:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Start pipeline
+        run: |
+          PAYLOAD=$(jq -n \
+            --arg tc "${{ inputs.task_count }}" \
+            --arg sc "${{ inputs.sample_count }}" \
+            --arg note "${{ inputs.note }}" \
+            '{trigger_source: "github-actions",
+              params: {task_count: ($tc|tonumber), sample_count: ($sc|tonumber), note: $note}}')
+          OUT=$(aws lambda invoke --function-name llmops-start-pipeline \
+            --cli-binary-format raw-in-base64-out \
+            --payload "$PAYLOAD" /tmp/out.json >/dev/null && cat /tmp/out.json)
+          echo "$OUT" | jq .
+          RUN_ID=$(echo "$OUT" | jq -r .run_id)
+          echo "### Pipeline started: \`$RUN_ID\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "Monitor in the llmops-admin console or Step Functions (fire-and-monitor: this job exits now)." >> "$GITHUB_STEP_SUMMARY"

@@ -59,7 +59,14 @@ def normalize_stage_complete(args: dict | None) -> dict:
     metrics = _first_present(args, _METRIC_KEYS)
     if metrics is None:
         metrics = {}
-    if not isinstance(metrics, dict):
+    if isinstance(metrics, str):
+        # agents sometimes emit metrics as a JSON string — parse before wrapping
+        try:
+            parsed = json.loads(metrics)
+            metrics = parsed if isinstance(parsed, dict) else {"value": parsed}
+        except json.JSONDecodeError:
+            metrics = {"value": metrics}
+    elif not isinstance(metrics, dict):
         metrics = {"value": metrics}
 
     evidence = _first_present(args, _EVIDENCE_KEYS)

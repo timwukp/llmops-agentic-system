@@ -25,7 +25,7 @@ import time
 import boto3
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
-AGENTS = ["data-prep", "finetune", "eval", "deploy", "monitor"]
+AGENTS = ["data-prep", "finetune", "eval", "deploy", "monitor", "orchestrator"]
 
 
 def strip_comments(obj):

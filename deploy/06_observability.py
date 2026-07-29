@@ -45,30 +45,47 @@ def deliveries(region, harness, dry):
             "tail": (out.stdout or out.stderr).strip().splitlines()[-1] if (out.stdout or out.stderr) else ""}
 
 
-def online_eval(ctl, harness, dry):
-    """One online evaluation config per harness over the three Builtin evaluators."""
-    name = f"{harness}-online-eval"
-    if not dry:
-        existing = [c for c in ctl.list_online_evaluation_configs().get("onlineEvaluationConfigs", [])
-                    if c.get("name") == name]
-        if existing:
-            return {"harness": harness, "eval_config": name, "action": "exists"}
-    body = {
-        "name": name,
-        "evaluators": [{"builtinEvaluator": {"name": e}} for e in BUILTIN_EVALUATORS],
-        "rule": {"samplingRule": {"rate": 1.0}},
-        "clientToken": secrets.token_hex(20),
-    }
+def online_eval(ctl, region, harness, role_arn, dry):
+    """One online evaluation config per harness over the three Builtin evaluators.
+
+    Real API shape (live-introspected 2026-07-29 — differs from console labels):
+    onlineEvaluationConfigName + rule.samplingConfig.samplingPercentage +
+    dataSourceConfig.cloudWatchLogs{logGroupNames, serviceNames} +
+    evaluators[{evaluatorId}] + evaluationExecutionRoleArn + enableOnCreate.
+    Data source = the runtime's DEFAULT OTel log group; serviceName = runtime name.
+    """
+    # config names only allow [a-zA-Z0-9_]
+    name = f"{harness.replace('-', '_')}_online_eval"[:64]
+    runtime_name = f"harness_{harness.rsplit('-', 1)[0]}"
     if dry:
         return {"harness": harness, "would_create": name}
-    # The config binds to the harness runtime's trace source; introspect live shape
-    # (preflight.py --show-shape CreateOnlineEvaluationConfig) if this call drifts.
+    existing = [c for c in ctl.list_online_evaluation_configs()
+                .get("onlineEvaluationConfigSummaries", [])
+                if c.get("onlineEvaluationConfigName") == name]
+    if existing:
+        return {"harness": harness, "eval_config": name, "action": "exists"}
+    # resolve the runtime id for the DEFAULT log group
+    runtime_id = None
+    for rt in ctl.list_agent_runtimes().get("agentRuntimes", []):
+        if rt.get("agentRuntimeName") == runtime_name:
+            runtime_id = rt.get("agentRuntimeId")
+            break
+    if not runtime_id:
+        return {"harness": harness, "error": f"no runtime {runtime_name}"}
+    log_group = f"/aws/bedrock-agentcore/runtimes/{runtime_id}-DEFAULT"
     resp = ctl.create_online_evaluation_config(
-        **body,
-        target={"harnessTarget": {"harnessId": harness}},
+        clientToken=secrets.token_hex(20),
+        onlineEvaluationConfigName=name,
+        rule={"samplingConfig": {"samplingPercentage": 100.0}},
+        dataSourceConfig={"cloudWatchLogs": {
+            "logGroupNames": [log_group], "serviceNames": [runtime_name]}},
+        evaluators=[{"evaluatorId": e} for e in BUILTIN_EVALUATORS],
+        evaluationExecutionRoleArn=role_arn,
+        enableOnCreate=True,
+        tags={"project": "llmops-agentic-system"},
     )
     return {"harness": harness, "eval_config": name, "action": "created",
-            "id": resp.get("onlineEvaluationConfig", {}).get("id", "?")}
+            "arn_field": "created"}
 
 
 def main():
@@ -83,7 +100,12 @@ def main():
     results = {"deliveries": [deliveries(args.region, h, args.dry_run) for h in targets]}
     if args.evals:
         ctl = boto3.client("bedrock-agentcore-control", region_name=args.region)
-        results["online_evals"] = [online_eval(ctl, h, args.dry_run) for h in targets]
+        role_arn = None
+        if not args.dry_run:
+            ssm = boto3.client("ssm", region_name=args.region)
+            role_arn = ssm.get_parameter(Name="/llmops/iam/eval_execution_arn")["Parameter"]["Value"]
+        results["online_evals"] = [online_eval(ctl, args.region, h, role_arn, args.dry_run)
+                                   for h in targets]
 
     print(json.dumps({**results, "dry_run": args.dry_run}, indent=2))
 

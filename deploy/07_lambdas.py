@@ -1,0 +1,190 @@
+#!/usr/bin/env python3
+"""07_lambdas.py — package and deploy the four spine Lambdas + the state machine.
+
+Each Lambda bundle = its handler.py + the contracts (events.py, report.py,
+manifest.schema.json) vendored flat so the `except ImportError` fallback path
+resolves. Roles come from SSM (01_iam.py); env vars from SSM (03_storage.py).
+State machine is created/updated from orchestration/state_machine.asl.json with
+${HarnessDriverArn} and ${EventBusName} substituted.
+
+Usage:
+  python deploy/07_lambdas.py --region us-east-1 --dry-run
+  python deploy/07_lambdas.py --region us-east-1
+  python deploy/07_lambdas.py --region us-east-1 --only driver
+"""
+import argparse
+import io
+import json
+import pathlib
+import sys
+import time
+import zipfile
+
+import boto3
+
+REPO = pathlib.Path(__file__).resolve().parent.parent
+CONTRACTS = REPO / "pipeline" / "contracts"
+
+LAMBDAS = {
+    "driver": {
+        "fn": "llmops-harness-driver",
+        "src": REPO / "orchestration" / "harness_driver" / "handler.py",
+        "role_param": "/llmops/iam/lambda_driver_arn",
+        "timeout": 900, "memory": 512,
+        "env_keys": ["RUNS_TABLE", "EVENTS_TABLE", "EVENT_BUS", "LLMOPS_SNS_TOPIC", "DATA_BUCKET"],
+    },
+    "start": {
+        "fn": "llmops-start-pipeline",
+        "src": REPO / "orchestration" / "start_pipeline" / "handler.py",
+        "role_param": "/llmops/iam/lambda_start_arn",
+        "timeout": 60, "memory": 256,
+        "env_keys": ["RUNS_TABLE", "EVENT_BUS", "DATA_BUCKET", "STATE_MACHINE_ARN"],
+    },
+    "resume": {
+        "fn": "llmops-resume-pipeline",
+        "src": REPO / "orchestration" / "resume_pipeline" / "handler.py",
+        "role_param": "/llmops/iam/lambda_resume_arn",
+        "timeout": 60, "memory": 256,
+        "env_keys": ["RUNS_TABLE", "EVENT_BUS"],
+    },
+    "webhook": {
+        "fn": "llmops-webhook",
+        "src": REPO / "orchestration" / "webhook" / "handler.py",
+        "role_param": "/llmops/iam/lambda_webhook_arn",
+        "timeout": 30, "memory": 256,
+        "env_keys": ["WEBHOOK_SECRET_ID", "START_PIPELINE_FN"],
+    },
+}
+
+STATE_MACHINE_NAME = "llmops-pipeline"
+
+
+def bundle(src: pathlib.Path) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.write(src, "handler.py")
+        z.write(CONTRACTS / "events.py", "events.py")
+        z.write(CONTRACTS / "report.py", "report.py")
+        z.write(CONTRACTS / "manifest.schema.json", "manifest.schema.json")
+    return buf.getvalue()
+
+
+def env_values(ssm, region, account, keys, extra):
+    bucket = ssm.get_parameter(Name="/llmops/storage/bucket")["Parameter"]["Value"]
+    base = {
+        "RUNS_TABLE": "llmops-pipeline-runs",
+        "EVENTS_TABLE": "llmops-stage-events",
+        "EVENT_BUS": "llmops-pipeline",
+        "DATA_BUCKET": bucket,
+        "LLMOPS_SNS_TOPIC": f"arn:aws:sns:{region}:{account}:llmops-escalations",
+        "STATE_MACHINE_ARN": f"arn:aws:states:{region}:{account}:stateMachine:{STATE_MACHINE_NAME}",
+        "WEBHOOK_SECRET_ID": "llmops/webhook",
+        "START_PIPELINE_FN": "llmops-start-pipeline",
+    }
+    base.update(extra or {})
+    return {k: base[k] for k in keys}
+
+
+def deploy_lambda(lam, ssm, region, account, key, cfg, dry):
+    role_arn = None if dry else ssm.get_parameter(Name=cfg["role_param"])["Parameter"]["Value"]
+    env = env_values(ssm, region, account, cfg["env_keys"], None) if not dry else {}
+    if dry:
+        return {"lambda": cfg["fn"], "would": "create/update", "env_keys": cfg["env_keys"]}
+    code = bundle(cfg["src"])
+    try:
+        lam.get_function(FunctionName=cfg["fn"])
+        lam.update_function_code(FunctionName=cfg["fn"], ZipFile=code)
+        waiter = lam.get_waiter("function_updated_v2")
+        waiter.wait(FunctionName=cfg["fn"])
+        lam.update_function_configuration(
+            FunctionName=cfg["fn"], Timeout=cfg["timeout"], MemorySize=cfg["memory"],
+            Environment={"Variables": env})
+        action = "updated"
+    except lam.exceptions.ResourceNotFoundException:
+        lam.create_function(
+            FunctionName=cfg["fn"], Runtime="python3.12", Role=role_arn,
+            Handler="handler.handler", Code={"ZipFile": code},
+            Timeout=cfg["timeout"], MemorySize=cfg["memory"],
+            Environment={"Variables": env},
+            Tags={"project": "llmops-agentic-system"})
+        action = "created"
+    return {"lambda": cfg["fn"], "action": action}
+
+
+def deploy_state_machine(sfn, ssm, region, account, dry):
+    asl = (REPO / "orchestration" / "state_machine.asl.json").read_text()
+    driver_arn = f"arn:aws:lambda:{region}:{account}:function:llmops-harness-driver"
+    asl = asl.replace("${HarnessDriverArn}", driver_arn)
+    asl = asl.replace("${EventBusName}", "llmops-pipeline")
+    if dry:
+        json.loads(asl)
+        return {"state_machine": STATE_MACHINE_NAME, "would": "create/update", "asl": "valid"}
+    role_arn = ssm.get_parameter(Name="/llmops/iam/lambda_start_arn")["Parameter"]["Value"]
+    # dedicated SFN role expected under /llmops/iam/sfn_arn; fall back to start role param name
+    try:
+        role_arn = ssm.get_parameter(Name="/llmops/iam/sfn_arn")["Parameter"]["Value"]
+    except ssm.exceptions.ParameterNotFound:
+        pass
+    sm_arn = f"arn:aws:states:{region}:{account}:stateMachine:{STATE_MACHINE_NAME}"
+    try:
+        sfn.describe_state_machine(stateMachineArn=sm_arn)
+        sfn.update_state_machine(stateMachineArn=sm_arn, definition=asl, roleArn=role_arn)
+        action = "updated"
+    except sfn.exceptions.StateMachineDoesNotExist:
+        sfn.create_state_machine(name=STATE_MACHINE_NAME, definition=asl,
+                                 roleArn=role_arn, type="STANDARD",
+                                 tags=[{"key": "project", "value": "llmops-agentic-system"}])
+        action = "created"
+    return {"state_machine": STATE_MACHINE_NAME, "action": action}
+
+
+def ensure_resume_rule(events, lam, region, account, dry):
+    """EventBridge rule: SageMaker Training Job State Change -> resume lambda.
+    Default bus (SageMaker service events land there, not on custom buses)."""
+    rule = "llmops-sagemaker-job-state"
+    pattern = {
+        "source": ["aws.sagemaker"],
+        "detail-type": ["SageMaker Training Job State Change"],
+        "detail": {"TrainingJobStatus": ["Completed", "Failed", "Stopped"]},
+    }
+    if dry:
+        return {"rule": rule, "would": "put_rule + target + permission"}
+    events.put_rule(Name=rule, EventPattern=json.dumps(pattern), State="ENABLED",
+                    Description="Resume llmops pipeline when a training job finishes")
+    fn_arn = f"arn:aws:lambda:{region}:{account}:function:llmops-resume-pipeline"
+    events.put_targets(Rule=rule, Targets=[{"Id": "resume", "Arn": fn_arn}])
+    try:
+        lam.add_permission(FunctionName="llmops-resume-pipeline",
+                           StatementId="eventbridge-sagemaker-state",
+                           Action="lambda:InvokeFunction",
+                           Principal="events.amazonaws.com",
+                           SourceArn=f"arn:aws:events:{region}:{account}:rule/{rule}")
+    except lam.exceptions.ResourceConflictException:
+        pass  # permission already exists
+    return {"rule": rule, "action": "ensured"}
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--region", required=True)
+    ap.add_argument("--only", action="append", choices=list(LAMBDAS))
+    ap.add_argument("--dry-run", action="store_true")
+    args = ap.parse_args()
+
+    lam = boto3.client("lambda", region_name=args.region)
+    ssm = boto3.client("ssm", region_name=args.region)
+    sfn = boto3.client("stepfunctions", region_name=args.region)
+    events = boto3.client("events", region_name=args.region)
+    account = "" if args.dry_run else boto3.client("sts", region_name=args.region) \
+        .get_caller_identity()["Account"]
+
+    targets = args.only or list(LAMBDAS)
+    results = [deploy_lambda(lam, ssm, args.region, account, k, LAMBDAS[k], args.dry_run)
+               for k in targets]
+    results.append(deploy_state_machine(sfn, ssm, args.region, account, args.dry_run))
+    results.append(ensure_resume_rule(events, lam, args.region, account, args.dry_run))
+    print(json.dumps({"results": results, "dry_run": args.dry_run}, indent=2, default=str))
+
+
+if __name__ == "__main__":
+    sys.exit(main())

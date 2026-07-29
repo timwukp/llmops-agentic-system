@@ -47,6 +47,9 @@ ENV = {
     "STATE_MACHINE_ARN": "arn:aws:states:us-east-1:123456789012:stateMachine:llmops",
     "WEBHOOK_SECRET_ID": "llmops/webhook",
     "START_PIPELINE_FN": "llmops-start-pipeline",
+    "HARNESS_ARN_LLMOPS_DATA_PREP": "arn:aws:bedrock-agentcore:us-east-1:123456789012:harness/llmops_data_prep-TESTSUFFIX",
+    "HARNESS_ARN_LLMOPS_FINETUNE": "arn:aws:bedrock-agentcore:us-east-1:123456789012:harness/llmops_finetune-TESTSUFFIX",
+    "HARNESS_ARN_LLMOPS_EVAL": "arn:aws:bedrock-agentcore:us-east-1:123456789012:harness/llmops_eval-TESTSUFFIX",
 }
 
 
@@ -275,6 +278,18 @@ class TestDriver:
         rejection = ac.calls[1]["messages"][0]["content"][0]["toolResult"]
         assert rejection["content"][0]["json"]["status"] == "rejected"
 
+    def test_gate_null_gate_passed_fails_closed(self):
+        """A gate stage whose agent omits/nulls gate_passed must NOT promote (fail closed)."""
+        ac = FakeAgentCore([
+            tool_use_stream("stage_complete",
+                            {"outputs": [], "metrics": {"gate_passed": None, "needs_human": True}}),
+            text_stream("ack")])
+        c = clients(ac)
+        out = driver.handler(driver_event(stage="eval", task="gate"), clients=c)
+        assert out["status"] == "completed"
+        payload = json.loads(c["sfn"].successes[0]["output"])
+        assert payload["gate_passed"] is False  # null != pass
+
     def test_gate_fail_emits_quality_gate_failed_and_flags_token(self):
         ac = FakeAgentCore([
             tool_use_stream("stage_complete",
@@ -311,11 +326,12 @@ class TestDriver:
         assert c["sfn"].failures[0]["error"] == "EscalatedToHuman"
 
     def test_missing_stage_complete_reasks_then_fails(self):
-        ac = FakeAgentCore([text_stream("done, I think"), text_stream("still no call")])
+        ac = FakeAgentCore([text_stream("done, I think"), text_stream("still no call"),
+                            text_stream("third strike")])
         c = clients(ac)
         out = driver.handler(driver_event(), clients=c)
         assert out["status"] == "failed"
-        assert len(ac.calls) == 2  # original + one re-ask
+        assert len(ac.calls) == 3  # original + two re-asks (continue-and-finish nudge, then final demand)
         assert "stage_complete" in ac.calls[1]["messages"][0]["content"][0]["text"]
         assert c["sfn"].failures[0]["error"] == "MissingStageComplete"
         assert any(e["DetailType"] == ev.PIPELINE_FAILED for e in c["events"].entries)
