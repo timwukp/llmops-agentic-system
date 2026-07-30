@@ -36,7 +36,10 @@ Inside a worker harness (drawn from the live configs):
 **Models**: teacher DeepSeek-R1 (Bedrock serverless) · student Qwen3-1.7B (SageMaker QLoRA → endpoint) ·
 harness loop `global.anthropic.claude-fable-5`.
 **State**: S3 `runs/<run_id>/manifest.json` · DynamoDB · shared AgentCore Memory.
-**Console**: bedrock-agentcore-agent-ops-console (reused, env-var wired).
+**Console**: a dedicated admin dashboard in this repo ([`deploy/console/`](deploy/console/)) — its own
+Lambda + HTTP API + Cognito stack, ported from
+[bedrock-agentcore-agent-ops-console](https://github.com/timwukp/bedrock-agentcore-agent-ops-console)
+rather than shared with it, so its telemetry can never mix with another system's.
 
 Key design decisions (full rationale in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)):
 
@@ -94,6 +97,35 @@ evidence during data generation.
    safety checks. **Gates**: student ≥ 0.80 × teacher, safety pass, p50 latency target
 4. **deploy** — merge adapters, SageMaker endpoint (ml.g5.xlarge), smoke test, Model Registry, teardown
 5. **monitor** — CloudWatch metrics, cost tracking, drift signals, idle-endpoint sweep
+
+## The admin dashboard
+
+One Lambda serves both the dashboard HTML (`GET /`) and its JSON API (`GET/POST /api/*`)
+behind an HTTP API Gateway, with Cognito auth: reads are public, every write carries a
+Bearer token. Deploy it with [`deploy/console/deploy.sh`](deploy/console/deploy.sh) — the
+script is idempotent, so re-running it updates in place.
+
+| Tab | What an operator does there |
+|---|---|
+| **Pipeline** | Watch the 9-stage Step Functions flow live, including the remediation-loop arrow; pick an execution to see gates, metrics, evidence, and the training job; start a run |
+| **Fleet** | Inspect the 6 `llmops_*` harnesses — status, model, mounted skills, limits |
+| **Observability** | Per-harness AgentCore metrics, daily volume, token spend, SageMaker training jobs and student endpoints |
+| **Evaluations** | Online eval configs with score gauges, plus batch evaluations |
+| **Optimizations** | Insights findings, then AWS-native prompt recommendations and Bedrock-drafted prompts — reviewed by a human, then applied via `UpdateHarness` |
+
+Two things it is deliberately strict about:
+
+- **Telemetry isolation.** Several AgentCore list APIs are account-wide, so a dashboard
+  that simply calls them will show *other* systems' harnesses, eval configs, and
+  recommendations. Every such call here filters on the `llmops_` name prefix. This was a
+  real bug, not a hypothetical: another console's `ui_qa_*` evaluations appeared on this
+  one until the filters went in.
+- **Human-in-the-loop writes.** Optimization recommendations are never auto-applied. The
+  dashboard drafts, an operator approves, and only then does `UpdateHarness` run.
+
+Full setup, auth model, and the AgentCore API constraints that shaped it (eval
+`serviceName` must be endpoint-qualified; `serviceNames` is capped at 1 per batch-eval
+call) are in [`deploy/console/README.md`](deploy/console/README.md).
 
 ## Repo map
 
