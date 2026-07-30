@@ -82,6 +82,60 @@ change (HxW) headers, and the re-renderer recomputes them from the actual
 transformed grid. Works for any 1×1–30×30 ARC grid and any number of train
 pairs.
 
+## Eval: verifiable, not judged
+
+The student is scored by **executing** what it writes. A generation counts as
+solved only when its `transform` reproduces every training pair in its prompt,
+cell for cell, in the same sandbox that gated the training data. No LLM judge,
+no ROUGE, no partial credit for code that merely looks plausible.
+
+Generation and scoring are separate processes on purpose:
+
+| Stage | Where | Input → output |
+|---|---|---|
+| `generate_student.py` | GPU (SageMaker) | `val_raw.jsonl` → `generations.jsonl` |
+| `eval_student.py score` | CPU (anywhere) | `generations.jsonl` → `eval_report.json` |
+
+The split means a scoring bug never costs GPU time to re-fix, and the scorer is
+testable with no torch installed. Scoring reconstructs ground-truth pairs from
+the prompt text itself, so a generations file carries only `task_id`, `variant`,
+and `generation`. Decoding is greedy (`--temperature 0`) so the gate is a number,
+not a distribution.
+
+**Format discipline.** Training targets are bare unfenced code, and
+`generate_student.py` renders eval prompts through the same
+`apply_chat_template` call training used. A mismatch here tanks the solve rate
+while the model is fine, so it is stated in code and covered by tests.
+
+### Trusting the scorer in both directions
+
+An eval that can be fooled manufactures confidence, so it is attacked from both
+sides before any student number is believed:
+
+```
+$ python eval_student.py self-test --val out/val_raw.jsonl --sample 80
+oracle: solved 80/80 (solve_rate 1.000, format 1.000)
+PASS — scorer credits every verified solution
+```
+
+The oracle direction feeds the *verified ground-truth* code back in as if the
+model had emitted it; anything below 1.000 means the scorer rejects known-correct
+solutions and would understate the model. The adversarial direction lives in
+`tests/test_eval_student.py` (23 tests): a wrong answer, a partially-correct
+answer, a hardcoded output that memorizes pair 1, crashing code, an infinite
+loop, a filesystem-escape attempt, a generation for an unknown task, and a
+sibling *variant* of the right task must all score 0 — that last one matters
+because variants share a `task_id` but need different code, so matching on
+`task_id` alone would be a silent leak. Prompt parsing is verified against all
+1,000 val rows (0 failures) and rejects any grid whose contents contradict its
+declared `HxW`.
+
+**Gate.** Relative, not absolute: `student_solve_rate >= 0.80 × teacher_solve_rate`
+on the same rows, because absolute ARC-AGI-2 solve rates are low for a 1.7B
+student. With no teacher baseline the gate reports `NO_TEACHER_BASELINE` and
+`passed: null` rather than claiming a pass. A 0% teacher makes a 0% student pass
+arithmetically — that is reported honestly instead of dressed up as quality.
+
 ## Files
 
 - `augment.py` — augmentation engine (multiprocessing; `--limit` for smoke
@@ -89,5 +143,8 @@ pairs.
 - `verify_sandbox.py` — sandboxed exec + exact grid compare (also reusable
   for eval)
 - `make_splits.py` — deterministic task-level split, TRL + raw formats
+- `generate_student.py` — GPU-side generation (greedy; writes incrementally so
+  an interrupted run stays scorable)
+- `eval_student.py` — `score` (execute + gate) and `self-test` (oracle check)
 - `out/` — `augmented.jsonl`, `train[.raw].jsonl`, `val[.raw].jsonl`,
   `augment_stats.json`, `split_stats.json`
