@@ -121,7 +121,7 @@ PASS — scorer credits every verified solution
 The oracle direction feeds the *verified ground-truth* code back in as if the
 model had emitted it; anything below 1.000 means the scorer rejects known-correct
 solutions and would understate the model. The adversarial direction lives in
-`tests/test_eval_student.py` (23 tests): a wrong answer, a partially-correct
+`tests/test_eval_student.py` (25 tests): a wrong answer, a partially-correct
 answer, a hardcoded output that memorizes pair 1, crashing code, an infinite
 loop, a filesystem-escape attempt, a generation for an unknown task, and a
 sibling *variant* of the right task must all score 0 — that last one matters
@@ -130,11 +130,29 @@ because variants share a `task_id` but need different code, so matching on
 1,000 val rows (0 failures) and rejects any grid whose contents contradict its
 declared `HxW`.
 
-**Gate.** Relative, not absolute: `student_solve_rate >= 0.80 × teacher_solve_rate`
-on the same rows, because absolute ARC-AGI-2 solve rates are low for a 1.7B
-student. With no teacher baseline the gate reports `NO_TEACHER_BASELINE` and
-`passed: null` rather than claiming a pass. A 0% teacher makes a 0% student pass
-arithmetically — that is reported honestly instead of dressed up as quality.
+### Gate — and what the baseline can honestly mean
+
+The gate is `student_solve_rate >= 0.80 × teacher_solve_rate` on the same rows,
+because absolute ARC-AGI-2 solve rates are low for a 1.7B student.
+
+**The trap in this particular val set:** all 1,000 rows exist *only because* a
+teacher solution was found and sandbox-verified for their source task — 40 of 40
+held-out tasks have `verified: true`. So a teacher re-measured on these rows
+scores ~1.0 **by construction**, and the "relative" gate silently degenerates into
+an absolute 80% bar. That is a selection effect in the data, not a property of the
+teacher, and a 0.80× label would imply a comparison it isn't making.
+
+A baseline is therefore only informative when it is measured on rows chosen
+*independently* of whether a solution was found — the untouched ARC-AGI-2
+evaluation split, not this one. The scorer enforces the honesty rather than
+trusting the reader to remember it: when a baseline is ≥ 0.99 (or exactly 0), the
+report carries a `baseline_caveat` spelling out what the gate is actually testing.
+With no baseline at all it reports `NO_TEACHER_BASELINE` / `passed: null` rather
+than claiming a pass.
+
+The absolute numbers to read alongside the gate are `solve_rate` (executable
+correctness) and `format_valid_rate` (did it emit a `transform` at all) — for a
+1.7B student on ARC-AGI-2, the second is the more informative early signal.
 
 ## Files
 

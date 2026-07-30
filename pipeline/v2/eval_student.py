@@ -162,17 +162,41 @@ def key_fields(key):
 
 
 def apply_gate(student: dict, teacher: dict | None, ratio: float) -> dict:
-    """Relative gate: absolute ARC-AGI-2 solve rates are low for a 1.7B student,
-    so the bar is a fraction of the teacher's rate on the same rows."""
+    """Gate the student against a teacher baseline measured on the same rows.
+
+    A caution about what the baseline can mean on THIS val set: every row exists
+    only because a teacher solution was found and sandbox-verified for its source
+    task, so a teacher re-measured here scores ~1.0 by construction and the
+    "relative" gate silently degenerates into an absolute `ratio` bar. That is a
+    selection effect in the data, not a property of the teacher.
+
+    So a baseline is only informative when it is measured on rows chosen
+    independently of whether a solution was found — e.g. the untouched ARC-AGI-2
+    evaluation split. When the baseline is >= `degenerate_above`, the report says
+    so in `baseline_caveat` instead of letting a 0.80x label imply a comparison
+    it isn't making.
+    """
+    degenerate_above = 0.99
     gate = {"gate_ratio": ratio, "student_solve_rate": student["solve_rate"]}
     if not teacher:
         gate.update(status="NO_TEACHER_BASELINE", passed=None)
         return gate
+
     t = teacher["solve_rate"]
     threshold = ratio * t
     gate.update(teacher_solve_rate=t, threshold=threshold,
                 passed=student["solve_rate"] >= threshold)
     gate["status"] = "PASSED" if gate["passed"] else "FAILED"
+
+    if t >= degenerate_above:
+        gate["baseline_caveat"] = (
+            f"teacher solve rate is {t:.3f}; on a val set built from verified "
+            f"solutions this is expected by construction, so the gate is really an "
+            f"absolute {threshold:.1%} bar, not a {ratio:.0%} comparison")
+    elif t == 0.0:
+        gate["baseline_caveat"] = (
+            "teacher solve rate is 0.000, so any student passes arithmetically; "
+            "the gate carries no quality signal")
     return gate
 
 

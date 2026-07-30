@@ -194,6 +194,22 @@ def test_zero_teacher_rate_does_not_make_every_student_pass_by_accident():
     gate = es.apply_gate(_rep(0.0), _rep(0.0), 0.80)
     assert gate["passed"] is True
     assert gate["threshold"] == 0.0
+    assert "no quality signal" in gate["baseline_caveat"]
+
+
+def test_perfect_teacher_baseline_is_flagged_as_degenerate():
+    """This val set only contains tasks with a verified solution, so a teacher
+    re-measured on it scores ~1.0 by construction and the 'relative' gate is
+    really an absolute bar. The report must say so rather than imply a comparison."""
+    gate = es.apply_gate(_rep(0.85), _rep(1.0), 0.80)
+    assert gate["passed"] is True
+    assert "by construction" in gate["baseline_caveat"]
+    assert "absolute 80.0% bar" in gate["baseline_caveat"]
+
+
+def test_an_informative_baseline_carries_no_caveat():
+    gate = es.apply_gate(_rep(0.20), _rep(0.35), 0.80)
+    assert "baseline_caveat" not in gate
 
 
 def test_empty_generations_report_is_zero_not_a_crash():
