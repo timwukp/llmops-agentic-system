@@ -78,7 +78,11 @@ def online_eval(ctl, region, harness, role_arn, dry):
         onlineEvaluationConfigName=name,
         rule={"samplingConfig": {"samplingPercentage": 100.0}},
         dataSourceConfig={"cloudWatchLogs": {
-            "logGroupNames": [log_group], "serviceNames": [runtime_name]}},
+            # serviceName must match the span resource's service.name, which is
+            # "<runtime-name>.DEFAULT" (endpoint-qualified) — the bare runtime
+            # name silently matches ZERO spans and the evaluator scores nothing
+            # forever ("awaiting traffic"). Live-diagnosed vs a working config.
+            "logGroupNames": [log_group], "serviceNames": [f"{runtime_name}.DEFAULT"]}},
         evaluators=[{"evaluatorId": e} for e in BUILTIN_EVALUATORS],
         evaluationExecutionRoleArn=role_arn,
         enableOnCreate=True,

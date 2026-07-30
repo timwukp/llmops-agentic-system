@@ -3,3 +3,4 @@ __pycache__/
 .venv/
 .DS_Store
 deploy/evidence/*.local.*
+pipeline/v2/out/
