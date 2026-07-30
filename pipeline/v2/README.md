@@ -190,12 +190,30 @@ all. Scored naively that reads as "the base model cannot write code" when the re
 cause is a decoding ceiling, which would inflate the apparent lift. Two mechanisms
 keep that visible instead of invisible:
 
-- `--thinking {auto,on,off}` forces Qwen3's `enable_thinking` template switch, so
+- `--thinking {auto,on,off}` passes Qwen3's `enable_thinking` template switch, so
   the fine-tuned and base runs can be rendered the same way. `auto` passes nothing
-  and leaves the template's own default alone; forcing a mode against a template
-  that predates the switch exits with an error rather than silently rendering the
-  other mode. The chosen value is recorded in `<out>.done` alongside `model_dir`,
-  `max_new_tokens`, and `temperature` — the settings a comparison has to match.
+  and leaves the template's own default alone. The chosen value is recorded in
+  `<out>.done` alongside `model_dir`, `max_new_tokens`, and `temperature` — the
+  settings a comparison has to match.
+
+  What the flag actually does, checked against the live Qwen3-1.7B template rather
+  than assumed: it reaches the template as a Jinja variable, and the template acts
+  on it **only to suppress** thinking —
+
+  ```jinja
+  {%- if enable_thinking is defined and enable_thinking is false %}
+      {{- '<think>\n\n</think>\n\n' }}
+  ```
+
+  So `off` prefills an empty think block, while `on` and `auto` render byte-identically;
+  `on` is a no-op on this model and the generator prints that rather than implying it
+  forced something. Worse, an unsupported flag **raises nothing** — `apply_chat_template`
+  forwards unknown kwargs into the Jinja context, so a template with no
+  `enable_thinking` in it accepts the flag in total silence and thinking is never
+  suppressed. `check_thinking_effect` therefore asks the template instead of trusting
+  it: it renders a probe both ways before the weights load, and a `--thinking off` that
+  changes nothing is fatal, because a lift comparison built on it would be measuring
+  two identically prompted runs.
 - Every generation carries `truncated` and `n_new_tokens`, and the scorer counts how
   many format failures hit the ceiling:
 

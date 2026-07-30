@@ -39,21 +39,56 @@ def build_prompt(tokenizer, prompt_text: str, thinking: str = "auto") -> str:
     with a long <think> chain and can spend the whole token budget there, emitting
     no `transform` at all. Scored naively that reads as "the base model can't write
     code", when the real cause is a decoding budget. "auto" leaves the template
-    default alone; "on"/"off" force it so both sides of a lift comparison are
-    rendered identically and the choice is recorded in the run metadata.
+    default alone; "on"/"off" pass the flag explicitly.
+
+    Verified against the real Qwen3-1.7B template (2026-07-31): the flag arrives as
+    a Jinja variable, and the template only acts on it to SUPPRESS thinking —
+    `enable_thinking=False` prefills an empty `<think></think>` pair, while True and
+    absent render byte-identically. So `off` is the only mode that changes anything
+    on this model, and a template that ignores the flag entirely accepts it in
+    silence. `check_thinking_effect` is what catches that; see its docstring.
     """
     messages = [{"role": "user", "content": prompt_text}]
     kwargs = {"tokenize": False, "add_generation_prompt": True}
     if thinking != "auto":
         kwargs["enable_thinking"] = thinking == "on"
-    try:
-        return tokenizer.apply_chat_template(messages, **kwargs)
-    except TypeError:
-        # Template predates enable_thinking; the caller's intent is unachievable
-        # here, so fail loudly rather than silently rendering the other mode.
+    return tokenizer.apply_chat_template(messages, **kwargs)
+
+
+def check_thinking_effect(tokenizer, thinking: str) -> dict | None:
+    """Confirm `--thinking` actually changes the rendering before spending GPU time.
+
+    An unsupported flag does NOT raise: `apply_chat_template(**kwargs)` forwards
+    extras into the Jinja context, so a template with no `enable_thinking` in it
+    renders exactly as if the flag were absent and reports nothing. Asking the
+    template a question is therefore the only honest check — render a probe both
+    ways and compare.
+
+    `off` that changes nothing is fatal: the suppression the caller asked for did
+    not happen, so a lift comparison would silently be measuring two identically
+    prompted runs. `on` that changes nothing is merely informational, because on
+    Qwen3 explicit-True and absent are the same string — the caller's intent is
+    satisfied, just not by the flag.
+    """
+    if thinking == "auto":
+        return None
+    probe = [{"role": "user", "content": "probe"}]
+    kw = {"tokenize": False, "add_generation_prompt": True}
+    default = tokenizer.apply_chat_template(probe, **kw)
+    forced = tokenizer.apply_chat_template(probe, enable_thinking=thinking == "on", **kw)
+    changed = forced != default
+
+    if not changed and thinking == "off":
         raise SystemExit(
-            f"--thinking {thinking} requested but this chat template does not "
-            f"accept enable_thinking; re-run with --thinking auto")
+            "--thinking off did not change the rendered prompt: this chat template "
+            "ignores enable_thinking, so thinking is NOT suppressed. Comparing this "
+            "run against another would measure nothing. Re-run with --thinking auto "
+            "and raise --max-new-tokens instead.")
+    if not changed:
+        print(f"[gen] note: --thinking {thinking} renders identically to the "
+              f"template default, so the flag is a no-op here (expected on Qwen3, "
+              f"whose template only acts on enable_thinking=False)", flush=True)
+    return {"thinking": thinking, "changed_rendering": changed}
 
 
 def main() -> int:
@@ -83,6 +118,11 @@ def main() -> int:
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"          # required for correct batched decoding
+    # Before loading weights: a --thinking flag the template ignores would make a
+    # lift comparison meaningless, and that is cheaper to learn now than after the
+    # model is resident and the run is hours in.
+    thinking_effect = check_thinking_effect(tokenizer, args.thinking)
+
     model = AutoModelForCausalLM.from_pretrained(
         args.model_dir, torch_dtype=torch.bfloat16, device_map="auto")
     model.eval()
@@ -136,6 +176,7 @@ def main() -> int:
     Path(args.out + ".done").write_text(json.dumps({
         "n_written": written, "n_truncated": n_truncated,
         "model_dir": args.model_dir, "thinking": args.thinking,
+        "thinking_changed_rendering": (thinking_effect or {}).get("changed_rendering"),
         "max_new_tokens": args.max_new_tokens, "temperature": args.temperature,
     }, indent=2))
     return 0
