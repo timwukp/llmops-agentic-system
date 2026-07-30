@@ -212,6 +212,43 @@ def test_an_informative_baseline_carries_no_caveat():
     assert "baseline_caveat" not in gate
 
 
+# --------------------------------------------- lift vs the un-fine-tuned model
+
+def _full(solve, fmt=1.0):
+    return {"solve_rate": solve, "format_valid_rate": fmt}
+
+
+def test_lift_measures_gain_over_the_same_model_before_fine_tuning():
+    lift = es.compute_lift(_full(0.30), _full(0.10))
+    assert lift["absolute_gain"] == pytest.approx(0.20)
+    assert lift["relative_gain"] == pytest.approx(2.0)
+    assert "improved" in lift["verdict"]
+
+
+def test_lift_names_a_regression_rather_than_reporting_a_negative_gain_quietly():
+    lift = es.compute_lift(_full(0.05), _full(0.20))
+    assert lift["absolute_gain"] == pytest.approx(-0.15)
+    assert lift["verdict"].startswith("REGRESSION")
+
+
+def test_lift_from_a_zero_base_reports_no_relative_gain_instead_of_dividing_by_zero():
+    lift = es.compute_lift(_full(0.10), _full(0.0))
+    assert lift["relative_gain"] is None
+    assert lift["absolute_gain"] == pytest.approx(0.10)
+
+
+def test_two_zero_solve_rates_redirect_to_format_validity():
+    """A 1.7B student on ARC-AGI-2 can legitimately score 0 both before and after.
+    Reporting a 0.0 gain would imply the question was settled; it wasn't."""
+    lift = es.compute_lift(_full(0.0, fmt=0.90), _full(0.0, fmt=0.10))
+    assert "cannot distinguish" in lift["verdict"]
+    assert "0.100 -> 0.900" in lift["verdict"]
+
+
+def test_lift_is_none_without_a_base_report():
+    assert es.compute_lift(_full(0.5), None) is None
+
+
 def test_empty_generations_report_is_zero_not_a_crash():
     rep = es.score_generations([], VAL)
     assert rep == {**rep, "n_solved": 0, "solve_rate": 0.0, "n_scored": 0}

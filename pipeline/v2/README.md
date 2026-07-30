@@ -154,6 +154,35 @@ The absolute numbers to read alongside the gate are `solve_rate` (executable
 correctness) and `format_valid_rate` (did it emit a `transform` at all) — for a
 1.7B student on ARC-AGI-2, the second is the more informative early signal.
 
+### Lift: the comparison that actually answers the question
+
+Pass `--base-report` (the **same** model scored *before* fine-tuning) and the
+report gains a `lift` block. This is the measurement that answers "did the
+distillation do anything", and unlike the teacher baseline it **cannot be inflated
+by how the val set was selected** — the selection effect that hands the teacher
+~1.0 applies identically to both sides, so it cancels. Same prompts, same greedy
+decoding, same executable scoring; only the weights differ.
+
+```
+$ python eval_student.py score --generations gen.jsonl --val out/val_raw.jsonl \
+    --out eval_report.json --base-report base_report.json --teacher-report teacher.json
+scored 30/30 generations
+  format-valid : 30 (100.0%)
+  solved       : 20 (66.7%)
+  gate         : FAILED
+  CAVEAT       : teacher solve rate is 1.000; on a val set built from verified
+                 solutions this is expected by construction, so the gate is
+                 really an absolute 80.0% bar, not a 80% comparison
+  vs base      : 0.0% -> 66.7% (+66.7%)
+  lift verdict : fine-tuning improved executable correctness
+```
+
+Three honesty cases are pinned by tests: a **regression** is named as one rather
+than reported as a quiet negative gain; a zero base reports `relative_gain: null`
+instead of dividing by zero; and when both solve rates are 0 — entirely possible
+for a 1.7B model here — the verdict redirects to `format_valid_rate` rather than
+letting a 0.0 gain imply the question was settled.
+
 ## Files
 
 - `augment.py` — augmentation engine (multiprocessing; `--limit` for smoke

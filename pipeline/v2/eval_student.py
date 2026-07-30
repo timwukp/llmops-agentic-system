@@ -200,6 +200,46 @@ def apply_gate(student: dict, teacher: dict | None, ratio: float) -> dict:
     return gate
 
 
+def compute_lift(student: dict, base: dict | None) -> dict | None:
+    """Compare the fine-tuned student against the SAME model before fine-tuning.
+
+    This is the measurement that actually answers "did the distillation do
+    anything", and unlike the teacher baseline it cannot be inflated by how the
+    val set was selected: the selection effect that hands the teacher ~1.0 applies
+    identically to both sides here, so it cancels.
+
+    Both rates come from the same prompts, the same greedy decoding, and the same
+    executable scoring — the only difference is the weights.
+    """
+    if not base:
+        return None
+    s, b = student["solve_rate"], base["solve_rate"]
+    lift = {
+        "base_solve_rate": b,
+        "student_solve_rate": s,
+        "absolute_gain": s - b,
+        "relative_gain": (s - b) / b if b else None,
+        "base_format_valid_rate": base.get("format_valid_rate"),
+        "student_format_valid_rate": student.get("format_valid_rate"),
+    }
+    if s > b:
+        lift["verdict"] = "fine-tuning improved executable correctness"
+    elif s == b:
+        lift["verdict"] = "no change in executable correctness"
+    else:
+        lift["verdict"] = "REGRESSION — fine-tuning made executable correctness worse"
+
+    # For a 1.7B model on ARC-AGI-2, both rates can legitimately be 0. Say so
+    # rather than reporting a 0.0 gain as though it settled the question.
+    if s == 0 and b == 0:
+        fs = student.get("format_valid_rate") or 0
+        fb = base.get("format_valid_rate") or 0
+        lift["verdict"] = ("both solve rates are 0.000, so solve rate cannot "
+                           "distinguish them; compare format_valid_rate instead "
+                           f"({fb:.3f} -> {fs:.3f})")
+    return lift
+
+
 def read_jsonl(path: str) -> list[dict]:
     with open(path) as fh:
         return [json.loads(line) for line in fh if line.strip()]
@@ -239,6 +279,9 @@ def main() -> int:
     ap.add_argument("--out", help="required for `score`")
     ap.add_argument("--teacher-report", default=None,
                     help="a prior eval_report.json to gate against")
+    ap.add_argument("--base-report", default=None,
+                    help="eval_report.json for the SAME model before fine-tuning; "
+                         "this is the comparison that measures distillation lift")
     ap.add_argument("--gate-ratio", type=float, default=0.80)
     ap.add_argument("--timeout-sec", type=int, default=5)
     ap.add_argument("--sample", type=int, default=60, help="self-test sample size")
@@ -253,7 +296,9 @@ def main() -> int:
 
     report = score_generations(read_jsonl(args.generations), val_rows, args.timeout_sec)
     teacher = json.loads(Path(args.teacher_report).read_text()) if args.teacher_report else None
+    base = json.loads(Path(args.base_report).read_text()) if args.base_report else None
     report["gate"] = apply_gate(report, teacher, args.gate_ratio)
+    report["lift"] = compute_lift(report, base)
 
     Path(args.out).write_text(json.dumps(report, indent=2))
 
@@ -261,6 +306,15 @@ def main() -> int:
     print(f"  format-valid : {report['n_format_valid']} ({report['format_valid_rate']:.1%})")
     print(f"  solved       : {report['n_solved']} ({report['solve_rate']:.1%})")
     print(f"  gate         : {report['gate']['status']}")
+    if report["gate"].get("baseline_caveat"):
+        print(f"  CAVEAT       : {report['gate']['baseline_caveat']}")
+    if report["lift"]:
+        print(f"  vs base      : {report['lift']['base_solve_rate']:.1%} -> "
+              f"{report['lift']['student_solve_rate']:.1%} "
+              f"({report['lift']['absolute_gain']:+.1%})")
+        print(f"  lift verdict : {report['lift']['verdict']}")
+    else:
+        print("  vs base      : not measured (pass --base-report for distillation lift)")
     return 0 if report["gate"].get("passed") is not False else 1
 
 
