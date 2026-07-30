@@ -1,7 +1,19 @@
-# Installed inside the SageMaker training job (HF DLC base image provides torch).
-transformers>=4.51
+# Installed inside the SageMaker training job (the DLC base image provides torch).
+#
+# FLOORS ONLY, no pins — this exact set is the confirmed-green recipe against
+# pytorch-training:2.6.0-gpu-py312-cu126-ubuntu22.04-sagemaker. Each floor was
+# established by a real failure, so do not lower them:
+#   transformers>=4.52    — below this, use_liger_kernel is not wired up
+#   bitsandbytes>=0.46.1  — earlier builds fail to load 4-bit NF4 on this DLC
+#   liger-kernel>=0.5.8   — REQUIRED: fused linear cross-entropy avoids
+#                           materializing [seq, 151936] fp32 logits (CUDA OOM at
+#                           7.31 GiB otherwise). Omitting it makes the trainer
+#                           die at startup with ImportError, since the code sets
+#                           use_liger_kernel=True.
+transformers>=4.52
 trl>=0.17
 peft>=0.15
-datasets>=3.0
-bitsandbytes>=0.45
-accelerate>=1.0
+accelerate>=1.6
+bitsandbytes>=0.46.1
+datasets>=3.5
+liger-kernel>=0.5.8
