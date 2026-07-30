@@ -112,7 +112,7 @@ def score_generations(generations: list[dict], val_rows: list[dict],
                       timeout_sec: int = 5) -> dict:
     """Execute every generation against its task's pairs; exact match only."""
     by_key = {(r["task_id"], r.get("variant", "")): r for r in val_rows}
-    results, n_solved, n_parsed = [], 0, 0
+    results, n_solved, n_parsed, n_truncated = [], 0, 0, 0
 
     for gen in generations:
         key = (gen["task_id"], gen.get("variant", ""))
@@ -123,8 +123,12 @@ def score_generations(generations: list[dict], val_rows: list[dict],
 
         code = extract_code(gen.get("generation", ""))
         if code is None:
+            # A generation that ran out of tokens mid-answer is a budget artefact,
+            # not evidence the model cannot write code. Keep the two apart.
+            n_truncated += bool(gen.get("truncated"))
             results.append({**key_fields(key), "status": "no_transform_emitted",
-                            "solved": False})
+                            "solved": False,
+                            "truncated": bool(gen.get("truncated"))})
             continue
         n_parsed += 1
 
@@ -146,15 +150,23 @@ def score_generations(generations: list[dict], val_rows: list[dict],
 
     scored = [r for r in results if "solved" in r]
     n = len(scored)
-    return {
+    report = {
         "n_generations": len(generations),
         "n_scored": n,
         "n_format_valid": n_parsed,
         "n_solved": n_solved,
+        "n_truncated_format_failures": n_truncated,
         "solve_rate": n_solved / n if n else 0.0,
         "format_valid_rate": n_parsed / n if n else 0.0,
         "results": results,
     }
+    if n_truncated:
+        report["format_caveat"] = (
+            f"{n_truncated} of the {n - n_parsed} format failures ran out of "
+            f"generation tokens mid-answer, so format_valid_rate "
+            f"({report['format_valid_rate']:.3f}) partly measures the token budget, "
+            f"not the model; raise --max-new-tokens before reading it as ability")
+    return report
 
 
 def key_fields(key):
@@ -305,6 +317,8 @@ def main() -> int:
     print(f"scored {report['n_scored']}/{report['n_generations']} generations")
     print(f"  format-valid : {report['n_format_valid']} ({report['format_valid_rate']:.1%})")
     print(f"  solved       : {report['n_solved']} ({report['solve_rate']:.1%})")
+    if report.get("format_caveat"):
+        print(f"  TRUNCATED    : {report['format_caveat']}")
     print(f"  gate         : {report['gate']['status']}")
     if report["gate"].get("baseline_caveat"):
         print(f"  CAVEAT       : {report['gate']['baseline_caveat']}")

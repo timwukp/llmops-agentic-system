@@ -249,6 +249,40 @@ def test_lift_is_none_without_a_base_report():
     assert es.compute_lift(_full(0.5), None) is None
 
 
+# ----------------------------------- truncation vs inability (lift confound)
+
+def test_a_truncated_format_failure_is_attributed_to_the_token_budget():
+    """A base Qwen3 can spend its whole budget on <think> and emit no transform.
+    Read naively that says "cannot write code"; it says "ran out of tokens"."""
+    rep = es.score_generations(
+        [{"task_id": "t1", "variant": "orig", "generation": "<think>hmm",
+          "truncated": True}], VAL)
+    assert rep["n_format_valid"] == 0
+    assert rep["n_truncated_format_failures"] == 1
+    assert rep["results"][0]["truncated"] is True
+    assert "token budget" in rep["format_caveat"]
+    assert "--max-new-tokens" in rep["format_caveat"]
+
+
+def test_an_untruncated_format_failure_carries_no_budget_excuse():
+    """The caveat must not fire for a model that simply refused to write code —
+    that would explain away a real failure."""
+    rep = es.score_generations(
+        [{"task_id": "t1", "variant": "orig", "generation": "I don't know."}], VAL)
+    assert rep["n_truncated_format_failures"] == 0
+    assert "format_caveat" not in rep
+
+
+def test_truncation_does_not_excuse_a_generation_that_did_emit_code():
+    """Truncated but parseable code is scored on its merits, not waved through."""
+    rep = es.score_generations(
+        [{"task_id": "t1", "variant": "orig", "truncated": True,
+          "generation": "def transform(grid):\n    return grid\n"}], VAL)
+    assert rep["n_format_valid"] == 1
+    assert rep["n_solved"] == 0
+    assert "format_caveat" not in rep
+
+
 def test_empty_generations_report_is_zero_not_a_crash():
     rep = es.score_generations([], VAL)
     assert rep == {**rep, "n_solved": 0, "solve_rate": 0.0, "n_scored": 0}

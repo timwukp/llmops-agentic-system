@@ -47,8 +47,9 @@ class _StubTokenizer:
     def __init__(self):
         self.chat_template_calls = []
 
-    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=False):
-        self.chat_template_calls.append((messages, add_generation_prompt))
+    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=False,
+                            **kw):
+        self.chat_template_calls.append((messages, add_generation_prompt, kw))
         return f"<|user|>{messages[0]['content']}<|assistant|>"
 
     def __call__(self, texts, return_tensors=None, padding=None, truncation=None,
@@ -178,9 +179,64 @@ def test_prompt_goes_through_the_chat_template_with_a_generation_prompt(gs, tmp_
     """Training used apply_chat_template; inference must too, or the student never
     sees the format it was trained on and the solve rate collapses for no reason."""
     _run(gs, tmp_path, ROWS[:1])
-    messages, add_gen = gs._stub_tokenizer.chat_template_calls[-1]
+    messages, add_gen, _ = gs._stub_tokenizer.chat_template_calls[-1]
     assert messages == [{"role": "user", "content": "puzzle 0"}]
     assert add_gen is True
+
+
+# ---------------------------------- thinking mode + truncation accounting
+
+def test_thinking_defaults_to_the_templates_own_behaviour():
+    """"auto" must not pass enable_thinking at all — passing False by default would
+    silently change how every model is prompted."""
+    tok = _StubTokenizer()
+    spec = importlib.util.spec_from_file_location(
+        "gs_bare", REPO / "pipeline/v2/generate_student.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    mod.build_prompt(tok, "puzzle", "auto")
+    assert tok.chat_template_calls[-1][2] == {}
+
+
+@pytest.mark.parametrize("mode,expected", [("on", True), ("off", False)])
+def test_thinking_can_be_forced_so_both_sides_of_a_lift_run_match(gs, tmp_path,
+                                                                 mode, expected):
+    _run(gs, tmp_path, ROWS[:1], "--thinking", mode)
+    assert gs._stub_tokenizer.chat_template_calls[-1][2] == {"enable_thinking": expected}
+
+
+def test_forcing_thinking_on_an_old_template_fails_loudly(gs):
+    """Silently rendering the OTHER mode would make a lift comparison measure the
+    template instead of the fine-tuning."""
+    class _OldTokenizer:
+        def apply_chat_template(self, messages, tokenize=False,
+                                add_generation_prompt=False):
+            return "rendered"
+    with pytest.raises(SystemExit, match="does not accept enable_thinking"):
+        gs.build_prompt(_OldTokenizer(), "puzzle", "off")
+    assert gs.build_prompt(_OldTokenizer(), "puzzle", "auto") == "rendered"
+
+
+def test_truncated_generations_are_flagged_for_the_scorer(gs, tmp_path):
+    """The stub emits 3 new tokens; a ceiling of 3 means it stopped because it ran
+    out, which the scorer must be able to tell apart from an unwilling model."""
+    got = _run(gs, tmp_path, ROWS[:1], "--max-new-tokens", "3")
+    assert got[0]["truncated"] is True and got[0]["n_new_tokens"] == 3
+
+    got = _run(gs, tmp_path, ROWS[:1], "--max-new-tokens", "64")
+    assert got[0]["truncated"] is False
+
+
+def test_done_marker_records_the_settings_a_lift_comparison_must_match(gs, tmp_path):
+    val = tmp_path / "v.jsonl"
+    val.write_text(json.dumps(ROWS[0]) + "\n")
+    out = tmp_path / "g.jsonl"
+    sys.argv = ["generate_student.py", "--model-dir", "/fake/base", "--val", str(val),
+                "--out", str(out), "--thinking", "off"]
+    assert gs.main() == 0
+    meta = json.loads((tmp_path / "g.jsonl.done").read_text())
+    assert meta["thinking"] == "off" and meta["model_dir"] == "/fake/base"
+    assert meta["n_written"] == 1 and meta["temperature"] == 0.0
 
 
 def test_output_is_scorable_by_the_eval_module(gs, tmp_path):

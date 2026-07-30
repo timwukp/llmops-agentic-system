@@ -183,6 +183,34 @@ instead of dividing by zero; and when both solve rates are 0 — entirely possib
 for a 1.7B model here — the verdict redirects to `format_valid_rate` rather than
 letting a 0.0 gain imply the question was settled.
 
+**Both runs must be prompted identically or the lift measures the prompt.** Qwen3
+is a thinking model, and the un-fine-tuned base will open with a long `<think>`
+chain — often spending the entire token budget there and emitting no `transform` at
+all. Scored naively that reads as "the base model cannot write code" when the real
+cause is a decoding ceiling, which would inflate the apparent lift. Two mechanisms
+keep that visible instead of invisible:
+
+- `--thinking {auto,on,off}` forces Qwen3's `enable_thinking` template switch, so
+  the fine-tuned and base runs can be rendered the same way. `auto` passes nothing
+  and leaves the template's own default alone; forcing a mode against a template
+  that predates the switch exits with an error rather than silently rendering the
+  other mode. The chosen value is recorded in `<out>.done` alongside `model_dir`,
+  `max_new_tokens`, and `temperature` — the settings a comparison has to match.
+- Every generation carries `truncated` and `n_new_tokens`, and the scorer counts how
+  many format failures hit the ceiling:
+
+```
+  format-valid : 5 (25.0%)
+  TRUNCATED    : 8 of the 15 format failures ran out of generation tokens
+                 mid-answer, so format_valid_rate (0.250) partly measures the
+                 token budget, not the model; raise --max-new-tokens before
+                 reading it as ability
+```
+
+The caveat fires only for failures that actually ran out of tokens — a model that
+simply refused to write code gets no budget excuse, and truncated-but-parseable code
+is still scored on its merits.
+
 ## Files
 
 - `augment.py` — augmentation engine (multiprocessing; `--limit` for smoke
