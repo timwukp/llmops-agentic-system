@@ -34,6 +34,10 @@ jobs:
           echo "dry-runs OK"
       - name: Unit tests
         run: python -m pytest tests/ -q --ignore=tests/golden
+
+      - name: Shell test suites (AWS stubbed, no network)
+        run: |
+          for f in tests/*.sh; do echo "== $f"; bash "$f"; done
       - name: SVG geometry check (if diagrams exist)
         run: |
           ls docs/architecture-*.svg 2>/dev/null && python tests/check_svg_geometry.py docs/architecture-*.svg || echo "no SVGs yet"
