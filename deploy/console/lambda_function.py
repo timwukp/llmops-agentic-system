@@ -22,6 +22,7 @@ import hashlib
 import json
 import os
 import secrets
+import time
 from datetime import datetime, timedelta, timezone
 
 import boto3
@@ -433,15 +434,26 @@ def evaluations():
             item["status"] = str(cfg.get("status", item["status"]))
         except Exception as e:
             item["detailError"] = str(e)[:150]
-        # recent scores from results log group (honest: empty until evaluator has scored traffic)
+        # recent scores from results log group (honest: empty until evaluator has scored traffic).
+        # filter_log_events without startTime can return an empty page + nextToken even when
+        # events exist — pass an explicit window AND follow the token (bounded) or scores
+        # that are really there render as "awaiting traffic".
         scores = []
         try:
-            ev = logsc.filter_log_events(logGroupName=EVAL_RESULTS_LG_PREFIX + cid, limit=50)
-            for e0 in ev.get("events", []):
-                try:
-                    scores.append(json.loads(e0["message"]))
-                except Exception:
-                    pass
+            now_ms = int(time.time() * 1000)
+            kw = {"logGroupName": EVAL_RESULTS_LG_PREFIX + cid, "limit": 50,
+                  "startTime": now_ms - 14 * 24 * 3600 * 1000, "endTime": now_ms + 60_000}
+            for _ in range(10):  # bounded pagination
+                ev = logsc.filter_log_events(**kw)
+                for e0 in ev.get("events", []):
+                    try:
+                        scores.append(json.loads(e0["message"]))
+                    except Exception:
+                        pass
+                tok = ev.get("nextToken")
+                if not tok or len(scores) >= 50:
+                    break
+                kw["nextToken"] = tok
             if not scores:
                 item["scoresNote"] = "evaluator ACTIVE — awaiting scored traffic (runs on next harness invocation)"
         except logsc.exceptions.ResourceNotFoundException:

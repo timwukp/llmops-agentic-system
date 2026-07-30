@@ -559,18 +559,52 @@ async function loadBatchEvals(){
   } catch(e){ $("batchEvals").innerHTML = `<span class="sub">error: ${esc(e)}</span>`; }
 }
 
+// POST helper: distinguishes auth expiry / HTTP errors / network failures so
+// handlers never render a bare "error:". Returns {ok, data} or {ok:false, msg}.
+async function postApi(path){
+  let resp;
+  try {
+    resp = await fetch(API+path,{method:"POST",headers:{"content-type":"application/json",...authHeaders()},body:"{}"});
+  } catch(e){ return {ok:false, msg:"network error: "+(e.message||String(e)||"request failed")}; }
+  const body = await resp.text().catch(()=> "");
+  if (resp.status===401 || resp.status===403) { SESSION = null; setAuthUi();
+    return {ok:false, msg:"session expired — sign in again"}; }
+  let data = null; try { data = JSON.parse(body); } catch(_){}
+  if (!resp.ok) return {ok:false, msg:"HTTP "+resp.status+": "+((data&&(data.error||data.message))||body||resp.statusText||"request failed").slice(0,160)};
+  return {ok:true, data: data||{}};
+}
+// Renders the fan-out {started:[{stage,id,status}], errors:[{stage,error}]} shape
+// (one batch evaluation per pipeline stage) — or a legacy single {id}/{error}.
+function fanoutSummary(r, verb){
+  if (r.started || r.errors) {
+    const ok = (r.started||[]).map(s=>s.stage).join(", ");
+    const bad = (r.errors||[]).map(e=>e.stage+": "+(e.error||"failed").slice(0,80)).join(" · ");
+    let msg = ok ? "⏳ "+verb+" "+(r.started||[]).length+" stage(s): "+ok : "";
+    if (bad) msg += (msg?" — ":"")+"failed → "+bad;
+    return msg || "nothing to score";
+  }
+  if (r.id) return "⏳ "+r.id+" "+verb+" "+(r.sessions||"?")+" session(s)…";
+  return "error: "+String(r.error||"unexpected response: "+JSON.stringify(r)).slice(0,160);
+}
 async function runBatchEval(){
   if (!await ensureToken()) { $("beMsg").textContent = "sign-in required"; return; }
   $("beMsg").textContent = "starting…";
-  const r = await fetch(API+"/api/batch-eval",{method:"POST",headers:{"content-type":"application/json",...authHeaders()},body:"{}"}).then(x=>x.json());
-  if (r.id) {
-    $("beMsg").textContent = "⏳ "+r.id+" scoring "+r.sessions+" session(s)…";
+  const res = await postApi("/api/batch-eval");
+  if (!res.ok) { $("beMsg").textContent = res.msg; return; }
+  const r = res.data;
+  $("beMsg").textContent = fanoutSummary(r, "scoring");
+  const ids = (r.started||[]).map(s=>s.id).filter(Boolean).concat(r.id?[r.id]:[]);
+  if (ids.length) {
     let n=0; const t=setInterval(async()=>{ n++; await loadBatchEvals();
-      const d = await fetch(API+"/api/batch-evals").then(x=>x.json());
-      const me = (d.batchEvaluations||[]).find(x=>x.id===r.id);
-      if ((me && me.status!=="PENDING" && me.status!=="IN_PROGRESS") || n>30) { clearInterval(t); $("beMsg").textContent = me?me.status:"done"; }
+      try {
+        const d = await fetch(API+"/api/batch-evals").then(x=>x.json());
+        const mine = (d.batchEvaluations||[]).filter(x=>ids.includes(x.id));
+        const pending = mine.filter(x=>x.status==="PENDING"||x.status==="IN_PROGRESS");
+        if ((mine.length && !pending.length) || n>30) { clearInterval(t);
+          $("beMsg").textContent = mine.length ? mine.map(x=>x.status).join(", ") : "done"; }
+      } catch(_){ if (n>30) clearInterval(t); }
     }, 10000);
-  } else { $("beMsg").textContent = "error: "+(r.error||"").slice(0,100); }
+  }
 }
 
 async function loadInsightsReports(){
@@ -602,9 +636,11 @@ async function loadInsightsReports(){
 async function runInsightsReport(){
   if (!await ensureToken()) { $("insMsg").textContent = "sign-in required"; return; }
   $("insMsg").textContent = "starting…";
-  const r = await fetch(API+"/api/insights-report",{method:"POST",headers:{"content-type":"application/json",...authHeaders()},body:"{}"}).then(x=>x.json());
-  $("insMsg").textContent = r.id ? "⏳ analyzing "+r.sessions+" session(s) (~2 min)" : "error: "+(r.error||"").slice(0,80);
-  if (r.id) setTimeout(loadInsightsReports, 90000);
+  const res = await postApi("/api/insights-report");
+  if (!res.ok) { $("insMsg").textContent = res.msg; return; }
+  const r = res.data;
+  $("insMsg").textContent = fanoutSummary(r, "analyzing") + ((r.started||[]).length||r.id ? " (~2 min)" : "");
+  if ((r.started||[]).length || r.id) setTimeout(loadInsightsReports, 90000);
   loadInsightsReports();
 }
 
