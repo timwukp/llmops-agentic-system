@@ -156,16 +156,17 @@
 
   <!-- Evaluations -->
   <div data-tab-panel="evals" class="card col-12"><h2>Evaluations (online)</h2><div id="evals"><span class="sub">loading&hellip;</span></div></div>
-  <div data-tab-panel="evals" class="card col-12"><h2>Insights &middot; AI session analysis</h2>
+
+  <!-- Optimizations -->
+  <div data-tab-panel="opts" class="card col-12"><h2>Step 1 &mdash; Insights &middot; AI session analysis</h2>
+    <div class="sub" style="margin:-6px 0 4px">insights feed the optimization loop: failure clusters &rarr; prompt recommendations</div>
     <div class="row" style="border-bottom:none;padding:2px 0 6px">
-      <span class="sub">clusters failures / intents / summaries across recent pipeline sessions</span>
+      <span class="sub">clusters failures / intents / summaries across recent pipeline sessions (built on batch evaluations of session traces)</span>
       <span style="white-space:nowrap"><button class="primary" onclick="runInsightsReport()" style="padding:4px 12px;font-size:12px">&#9654; Generate report now</button> <span id="insMsg" class="sub"></span></span>
     </div>
     <div id="insReports"><span class="sub">loading&hellip;</span></div>
   </div>
-
-  <!-- Optimizations -->
-  <div data-tab-panel="opts" class="card col-6"><h2>Recommendations &middot; AWS native</h2>
+  <div data-tab-panel="opts" class="card col-6"><h2>Step 2 &mdash; Recommendations &middot; AWS native</h2>
     <div id="natRecs"><span class="sub">loading&hellip;</span></div>
     <div class="flex" style="margin-top:10px">
       <select id="recHarness" style="max-width:220px"></select>
@@ -612,7 +613,8 @@ async function loadInsightsReports(){
     const d = await fetch(API+"/api/insights-reports").then(r=>r.json());
     const rs = d.reports||[];
     if (!rs.length) { $("insReports").innerHTML = `<div class="sub">no reports yet — generate one from recent sessions</div>`; return; }
-    const done = rs.find(r=>r.status==="COMPLETED");
+    // COMPLETED_WITH_ERRORS still carries full cluster content (some sessions failed analysis)
+    const done = rs.find(r=>String(r.status||"").startsWith("COMPLETED"));
     let head = `<div class="sub" style="margin:2px 0 8px">reports: `+rs.slice(0,4).map(r=>
       `<span class="mono">${esc(r.name)}</span> <span class="pill ${badge(r.status)}">${esc(r.status)}</span>`).join(" · ")+`</div>`;
     let cols = "";
