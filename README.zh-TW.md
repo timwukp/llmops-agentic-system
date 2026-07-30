@@ -34,7 +34,10 @@ Worker harness 內部（依照真實配置繪製）：
 **模型**：teacher DeepSeek-R1（Bedrock serverless）· student Qwen3-1.7B（SageMaker QLoRA → endpoint）·
 harness 主迴圈 `global.anthropic.claude-fable-5`。
 **狀態**：S3 `runs/<run_id>/manifest.json` · DynamoDB · 共享 AgentCore Memory。
-**控制台**：bedrock-agentcore-agent-ops-console（直接復用，環境變數接線）。
+**控制台**：本 repo 內的專屬管理儀表板（[`deploy/console/`](deploy/console/)）—— 自帶
+Lambda + HTTP API + Cognito 獨立棧，從
+[bedrock-agentcore-agent-ops-console](https://github.com/timwukp/bedrock-agentcore-agent-ops-console)
+移植而來，而非與其共用，因此遙測數據不可能與其他系統混淆。
 
 核心設計決策（完整論證見 [docs/ARCHITECTURE.zh-TW.md](docs/ARCHITECTURE.zh-TW.md)）：
 
@@ -84,6 +87,32 @@ checkpoint 並把它記入 manifest 作為標準實踐；發現 sandbox 禁用 `
    **門檻**：student ≥ 0.80 × teacher、安全通過、p50 延遲達標
 4. **deploy** —— 合併 adapter、SageMaker endpoint（ml.g5.xlarge）、冒煙測試、Model Registry、資源回收
 5. **monitor** —— CloudWatch 指標、成本追蹤、漂移信號、閒置 endpoint 巡查
+
+## 管理儀表板（Admin Dashboard）
+
+單一 Lambda 同時提供儀表板 HTML（`GET /`）與 JSON API（`GET/POST /api/*`），前置 HTTP API
+Gateway，搭配 Cognito 認證：讀取公開，所有寫入都必須帶 Bearer token。用
+[`deploy/console/deploy.sh`](deploy/console/deploy.sh) 部署 —— 腳本是冪等的，重跑即原地更新。
+
+| 頁籤 | 運維人員在這裡做什麼 |
+|---|---|
+| **Pipeline** | 即時觀看 9 階段 Step Functions 流程（含 remediation 迴圈箭頭）；點選某次執行查看門檻、指標、證據與訓練作業；發起新的 run |
+| **Fleet** | 檢視 6 個 `llmops_*` harness —— 狀態、模型、已掛載技能、各項限制 |
+| **Observability** | 各 harness 的 AgentCore 指標、每日用量、token 花費、SageMaker 訓練作業與 student endpoint |
+| **Evaluations** | 線上評估配置與分數儀表，以及批次評估 |
+| **Optimizations** | 先看 Insights 發現，再看 AWS 原生 prompt 建議與 Bedrock 起草的 prompt —— 經人工審核後才透過 `UpdateHarness` 套用 |
+
+有兩點是刻意做嚴的：
+
+- **遙測隔離。** AgentCore 有多個 list API 是帳號級全域的，儀表板若直接呼叫，就會顯示**別的**
+  系統的 harness、評估配置與建議。這裡每一個這類呼叫都用 `llmops_` 名稱前綴過濾。這是真實遇到
+  的 bug，不是假設：在加上過濾之前，另一個控制台的 `ui_qa_*` 評估確實出現在這個儀表板上。
+- **寫入必須人在迴圈中。** 優化建議絕不自動套用。儀表板負責起草，運維人員核准，之後才會執行
+  `UpdateHarness`。
+
+完整的部署步驟、認證模型，以及塑造了這套設計的 AgentCore API 限制（評估的 `serviceName` 必須
+帶 endpoint 後綴；每次批次評估呼叫的 `serviceNames` 上限為 1）都寫在
+[`deploy/console/README.md`](deploy/console/README.md)。
 
 ## Repo 結構
 
