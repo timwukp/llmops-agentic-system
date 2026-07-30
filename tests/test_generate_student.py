@@ -42,6 +42,9 @@ class _StubTokenizer:
     pad_token = None
     eos_token = "<eos>"
     pad_token_id = 0
+    # Distinct from pad_token_id on purpose: Qwen3's pad and eos differ (151643 vs
+    # 151645), and code that conflates them mis-trims batched output.
+    eos_token_id = 999
     padding_side = "right"
 
     def __init__(self):
@@ -74,20 +77,43 @@ class _StubShape(list):
         return (len(self), len(self[0]) if self else 0)
 
 
+class _StubSeqTensor(_StubSeq):
+    """A returned sequence, mimicking the torch tensor API the code uses.
+
+    Slicing a torch tensor yields a tensor, so the stub's slice must stay a stub —
+    a plain list back from `__getitem__` would lose `.tolist()` and only the real
+    torch path would be exercised.
+    """
+    def tolist(self):
+        return list(self)
+
+    def __getitem__(self, item):
+        got = super().__getitem__(item)
+        return _StubSeqTensor(got) if isinstance(item, slice) else got
+
+
 class _StubModel:
     device = "cpu"
+    # The real model carries one; the code reads it to learn every stop id.
+    generation_config = types.SimpleNamespace(eos_token_id=None)
 
     def __init__(self):
         self.generate_kwargs = []
+        self.moved_to = None
 
     def eval(self):
+        return self
+
+    def to(self, device):
+        self.moved_to = device
         return self
 
     def generate(self, **kw):
         self.generate_kwargs.append(kw)
         n = kw["input_ids"].shape[0]
         # Echo the 5 prompt ids, then 3 "generated" ids 900,901,902.
-        return [_StubSeq([100, 101, 102, 103, 104, 900, 901, 902]) for _ in range(n)]
+        return [_StubSeqTensor([100, 101, 102, 103, 104, 900, 901, 902])
+                for _ in range(n)]
 
 
 @pytest.fixture
@@ -96,7 +122,13 @@ def gs(monkeypatch):
     tok, model = _StubTokenizer(), _StubModel()
 
     torch = types.ModuleType("torch")
+    torch.__version__ = "2.6.0"
     torch.bfloat16 = "bfloat16"
+    torch.float32 = "float32"
+    # No GPU in the test env — the code must ask rather than assume, so the stub
+    # has to answer. `device_map="auto"` used to hide this question inside
+    # accelerate; a real CPU run proved accelerate is not installed there.
+    torch.cuda = types.SimpleNamespace(is_available=lambda: False)
 
     class _NoGrad:
         def __enter__(self): return None
@@ -105,6 +137,7 @@ def gs(monkeypatch):
     monkeypatch.setitem(sys.modules, "torch", torch)
 
     tf = types.ModuleType("transformers")
+    tf.__version__ = "4.52.0"
     tf.AutoTokenizer = types.SimpleNamespace(from_pretrained=lambda *a, **k: tok)
     tf.AutoModelForCausalLM = types.SimpleNamespace(from_pretrained=lambda *a, **k: model)
     monkeypatch.setitem(sys.modules, "transformers", tf)
@@ -298,6 +331,124 @@ def test_truncated_generations_are_flagged_for_the_scorer(gs, tmp_path):
 
     got = _run(gs, tmp_path, ROWS[:1], "--max-new-tokens", "64")
     assert got[0]["truncated"] is False
+
+
+# ------------------------------------------- batched output is a padded rectangle
+
+def test_a_row_that_stopped_on_eos_is_not_called_truncated():
+    """`generate` returns a rectangle: every row is padded out to the longest row's
+    length. Measured on a real batched run (2026-07-31) a row that stopped after 3
+    tokens came back with 10 ids, so a naive `len(new_ids) >= max_new_tokens` marked
+    a finished row as truncated — and the scorer would then excuse its format failure
+    as a token-budget artefact when the model simply wrote something unparseable."""
+    gs = _fresh()
+    # 3 real tokens, EOS, then pad filler out to the batch width of 10.
+    ids = [900, 901, 902, 999] + [0] * 6
+    assert gs.trim_new_tokens(ids, {999}, 0, 10) == (4, False)
+
+
+def test_a_row_that_genuinely_hit_the_ceiling_is_still_flagged():
+    """The fix must not silence the real signal it exists to report."""
+    gs = _fresh()
+    assert gs.trim_new_tokens(list(range(800, 810)), {999}, 0, 10) == (10, True)
+
+
+def test_trailing_pad_is_stripped_even_without_a_stop_token():
+    """A row can be padded without an EOS in it (another row stopped later and the
+    stop token got cut by the ceiling), so pad-stripping is a second, independent
+    signal — length comes from what the model actually emitted."""
+    gs = _fresh()
+    assert gs.trim_new_tokens([900, 901, 0, 0, 0], {999}, 0, 5) == (2, False)
+
+
+def test_pad_inside_real_output_is_not_stripped():
+    """Only a TRAILING run is filler; a pad id the model emitted mid-answer is
+    output, and eating it would shorten the count of a row that never stopped."""
+    gs = _fresh()
+    assert gs.trim_new_tokens([900, 0, 901, 0, 0], {999}, 0, 5) == (3, False)
+
+
+def test_stop_token_wins_over_pad_when_they_are_the_same_id():
+    """Some models reuse eos as pad. The stop signal must be read first, otherwise
+    every stopped row is stripped to length 0 and looks like it emitted nothing."""
+    gs = _fresh()
+    assert gs.trim_new_tokens([900, 901, 7, 7, 7], {7}, 7, 5) == (3, False)
+
+
+def test_batched_generation_flags_only_the_row_that_ran_out(gs, tmp_path,
+                                                            monkeypatch):
+    """End-to-end over main(): two rows in one batch, one stopping early. Only the
+    row that used the whole budget may be counted into the truncation total."""
+    def ragged(**kw):
+        gs._stub_model.generate_kwargs.append(kw)
+        prompt = [100, 101, 102, 103, 104]
+        return [_StubSeqTensor(prompt + [900, 901, 999, 0, 0]),   # stopped at 3
+                _StubSeqTensor(prompt + [910, 911, 912, 913, 914])]  # hit ceiling
+    monkeypatch.setattr(gs._stub_model, "generate", ragged)
+    got = _run(gs, tmp_path, ROWS[:2], "--batch-size", "2", "--max-new-tokens", "5")
+    assert [g["truncated"] for g in got] == [False, True]
+    assert [g["n_new_tokens"] for g in got] == [3, 5]
+    meta = json.loads((tmp_path / "gen.jsonl.done").read_text())
+    assert meta["n_truncated"] == 1
+
+
+@pytest.mark.parametrize("cfg_eos", [901, [901, 42]])
+def test_stop_ids_include_the_generation_configs_own_eos(gs, tmp_path, monkeypatch,
+                                                         cfg_eos):
+    """Qwen3's generation_config carries the halt token, as an int or a LIST, and it
+    can differ from the tokenizer's. A stop id the trimmer does not know about looks
+    like real output, so the row is measured longer than it is.
+
+    Id 901 is reachable ONLY through generation_config here (the stub tokenizer's eos
+    is 999 and never appears), so deleting that lookup fails this test — which is what
+    a mutation run confirmed the earlier version of it did not do."""
+    monkeypatch.setattr(gs._stub_model, "generation_config",
+                        types.SimpleNamespace(eos_token_id=cfg_eos))
+
+    def ragged(**kw):
+        gs._stub_model.generate_kwargs.append(kw)
+        # 900, then the config's stop id, then filler that is NOT pad (so pad
+        # stripping cannot rescue the count either).
+        return [_StubSeqTensor([100, 101, 102, 103, 104, 900, 901, 5, 5, 5])]
+    monkeypatch.setattr(gs._stub_model, "generate", ragged)
+    got = _run(gs, tmp_path, ROWS[:1], "--max-new-tokens", "5")
+    assert got[0]["n_new_tokens"] == 2 and got[0]["truncated"] is False
+
+
+# --------------------------------------------------- device and dtype resolution
+
+def test_cpu_gets_float32_because_bfloat16_on_cpu_is_unusable(gs):
+    torch = sys.modules["torch"]
+    device, kw = gs.resolve_device_and_dtype(torch, sys.modules["transformers"], "auto")
+    assert device == "cpu" and list(kw.values()) == ["float32"]
+
+
+def test_cuda_gets_bfloat16(gs, monkeypatch):
+    torch = sys.modules["torch"]
+    monkeypatch.setattr(torch, "cuda", types.SimpleNamespace(is_available=lambda: True))
+    device, kw = gs.resolve_device_and_dtype(torch, sys.modules["transformers"], "auto")
+    assert device == "cuda" and list(kw.values()) == ["bfloat16"]
+
+
+def test_the_dtype_kwarg_follows_the_installed_transformers_major(gs):
+    """`torch_dtype` was renamed to `dtype` in transformers 5, and the training
+    requirements pin only a FLOOR (>=4.52), so which name is correct is decided at
+    runtime by whatever the DLC installed."""
+    torch = sys.modules["torch"]
+    tf4 = types.SimpleNamespace(__version__="4.52.0")
+    tf5 = types.SimpleNamespace(__version__="5.14.1")
+    assert list(gs.resolve_device_and_dtype(torch, tf4, "cpu")[1]) == ["torch_dtype"]
+    assert list(gs.resolve_device_and_dtype(torch, tf5, "cpu")[1]) == ["dtype"]
+
+
+def test_the_model_is_moved_without_accelerate(gs, tmp_path):
+    """`device_map="auto"` makes accelerate a hard requirement — transformers raises
+    ValueError if it is missing, which is how a real CPU run failed on 2026-07-31.
+    A 1.7B model on one GPU gains nothing from it, so the model is moved explicitly."""
+    _run(gs, tmp_path, ROWS[:1])
+    assert gs._stub_model.moved_to == "cpu"
+    load_kw = getattr(gs._stub_model, "load_kwargs", None)
+    assert load_kw is None or "device_map" not in load_kw
 
 
 def test_done_marker_records_the_settings_a_lift_comparison_must_match(gs, tmp_path):

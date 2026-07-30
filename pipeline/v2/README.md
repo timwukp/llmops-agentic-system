@@ -229,6 +229,38 @@ The caveat fires only for failures that actually ran out of tokens — a model t
 simply refused to write code gets no budget excuse, and truncated-but-parseable code
 is still scored on its merits.
 
+### Dry-running the generator before it costs GPU time
+
+`generate_student.py` only ever runs after a multi-hour training job, on a machine the
+unit tests can't reach — so a crash in it is discovered at the most expensive possible
+moment. It therefore takes `--device cpu` and can be exercised against a tiny randomly
+initialised Qwen3 carrying the **real** Qwen3-1.7B tokenizer: real chat template, real
+`generate`, real batching, meaningless numbers. Doing that once (2026-07-31) found
+three defects that 19 passing unit tests had not:
+
+| Found by executing, missed by the stubs | Why the stubs missed it |
+|---|---|
+| `device_map="auto"` makes `accelerate` a hard requirement — `ValueError` at load, and no generation-side requirements file installs it | the stub model's `from_pretrained` ignored its kwargs |
+| `torch_dtype=` is renamed `dtype=` in transformers 5; the DLC pins only `transformers>=4.52`, so the correct name is a runtime fact | no real `from_pretrained` to warn |
+| with `--batch-size > 1`, `generate` returns a **padded rectangle**, so `len(new_ids)` is the batch maximum — a row that stopped after 3 tokens reported `truncated=True` at a ceiling of 10 | the stub returned fixed-length rows, so no batch was ever ragged |
+
+The third one mattered most: it fed rows that finished cleanly into the truncation
+caveat above, excusing format failures the token budget did not cause — the caveat
+would have argued against its own evidence. `trim_new_tokens` now measures each row
+from its stop token (or its trailing pad run) and is pinned by seven tests, each
+confirmed by mutation to fail when the behaviour it describes is removed.
+
+```
+$ python generate_student.py --model-dir /tmp/tinyqwen3 --val val_raw.jsonl \
+    --out gen.jsonl --max-new-tokens 8 --batch-size 3 --device cpu
+[gen] device=cpu dtype=torch.float32 torch=2.13.0 transformers=5.14.1
+[gen] stop ids [151645], pad 151643
+```
+
+The printed device/dtype/version line is part of the point: a lift comparison whose two
+halves loaded under different dtypes is not a comparison, and now that is visible in the
+log rather than inferred.
+
 ## Files
 
 - `augment.py` — augmentation engine (multiprocessing; `--limit` for smoke

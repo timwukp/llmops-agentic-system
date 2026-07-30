@@ -91,6 +91,60 @@ def check_thinking_effect(tokenizer, thinking: str) -> dict | None:
     return {"thinking": thinking, "changed_rendering": changed}
 
 
+def trim_new_tokens(new_ids: list[int], stop_ids: set[int], pad_id: int | None,
+                    max_new_tokens: int) -> tuple[int, bool]:
+    """Return this row's real new-token count and whether it hit the ceiling.
+
+    With `--batch-size > 1`, `generate` returns a rectangle: every row is padded out
+    to the LONGEST row's length, so `len(new_ids)` is the batch maximum, not the
+    row's own output length. Measured on a real batched run (2026-07-31): a row that
+    stopped after 3 tokens came back with 10 ids, i.e. `len(new_ids) >= max_new_tokens`
+    reported `truncated=True` for a row that had finished cleanly. Every such row
+    would then be counted into the scorer's "ran out of tokens" caveat and excuse a
+    format failure that the token budget did not cause.
+
+    Two signals give the true length, in this order:
+      1. a stop token in the row — everything after it is filler, so the row ended
+         on its own terms and is by definition NOT truncated;
+      2. otherwise a trailing run of pad ids — stripped, since the model emitted
+         nothing there. A pad id that is ALSO a stop id is handled by (1) first.
+
+    Only after that does `>= max_new_tokens` mean the ceiling was hit.
+    """
+    for i, tid in enumerate(new_ids):
+        if tid in stop_ids:
+            return i + 1, False
+    end = len(new_ids)
+    if pad_id is not None:
+        while end > 0 and new_ids[end - 1] == pad_id:
+            end -= 1
+    return end, end >= max_new_tokens
+
+
+def resolve_device_and_dtype(torch, transformers, requested: str) -> tuple[str, object]:
+    """Pick the device and load dtype, without dragging in `accelerate`.
+
+    `device_map="auto"` buys nothing for a 1.7B model on one GPU and turns
+    `accelerate` into a hard requirement (transformers raises if it is missing),
+    so the model is loaded plainly and moved with `.to(device)` instead. That also
+    makes a CPU dry-run possible, which is how the two bugs in this function's
+    first version were found before they could cost GPU time.
+
+    bfloat16 on CPU is unusably slow and unsupported for some kernels, so CPU gets
+    float32 — a dry-run checks the code path, never the numbers.
+
+    `dtype=` replaced `torch_dtype=` in transformers 5; passing the old name only
+    warns today, but the DLC installs `transformers>=4.52` with no upper pin, so
+    which name is correct is a runtime fact, not a build-time one.
+    """
+    device = requested
+    if requested == "auto":
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    dtype = torch.float32 if device == "cpu" else torch.bfloat16
+    major = int(transformers.__version__.split(".")[0])
+    return device, {"dtype" if major >= 5 else "torch_dtype": dtype}
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model-dir", required=True, help="merged model dir (or HF id)")
@@ -104,9 +158,13 @@ def main() -> int:
     ap.add_argument("--thinking", choices=["auto", "on", "off"], default="auto",
                     help="Qwen3 enable_thinking. Use the SAME value for the "
                          "fine-tuned and base runs of a lift comparison")
+    ap.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto",
+                    help="cpu is for dry-running this script's code path only; "
+                         "the numbers from a CPU run are not an eval")
     args = ap.parse_args()
 
     import torch
+    import transformers
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     rows = [json.loads(l) for l in open(args.val) if l.strip()]
@@ -123,9 +181,24 @@ def main() -> int:
     # model is resident and the run is hours in.
     thinking_effect = check_thinking_effect(tokenizer, args.thinking)
 
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_dir, torch_dtype=torch.bfloat16, device_map="auto")
+    device, dtype_kw = resolve_device_and_dtype(torch, transformers, args.device)
+    print(f"[gen] device={device} {list(dtype_kw)[0]}={list(dtype_kw.values())[0]} "
+          f"torch={torch.__version__} transformers={transformers.__version__}",
+          flush=True)
+    model = AutoModelForCausalLM.from_pretrained(args.model_dir, **dtype_kw)
+    model.to(device)
     model.eval()
+
+    # Qwen3 stops on <|im_end|> but ships several special ids; a stop token the
+    # trimmer does not know about looks like real output, so collect every id the
+    # model could legitimately halt on (generation_config wins where they differ).
+    stop_ids = {i for i in [tokenizer.eos_token_id] if i is not None}
+    gen_eos = getattr(model.generation_config, "eos_token_id", None)
+    if isinstance(gen_eos, int):
+        stop_ids.add(gen_eos)
+    elif isinstance(gen_eos, (list, tuple)):
+        stop_ids.update(i for i in gen_eos if isinstance(i, int))
+    print(f"[gen] stop ids {sorted(stop_ids)}, pad {tokenizer.pad_token_id}", flush=True)
 
     started = time.time()
     written = n_truncated = 0
@@ -145,17 +218,20 @@ def main() -> int:
 
             for row, seq in zip(batch, out):
                 # Slice off the prompt so only the completion is scored.
-                new_ids = seq[enc["input_ids"].shape[1]:]
+                new_ids = seq[enc["input_ids"].shape[1]:].tolist()
                 completion = tokenizer.decode(new_ids, skip_special_tokens=True)
                 # A run that hit the token ceiling looks identical to a model that
                 # cannot write code, so record it: the scorer's format failures can
-                # then be attributed to budget rather than ability.
-                truncated = len(new_ids) >= args.max_new_tokens
+                # then be attributed to budget rather than ability. Batched rows are
+                # padded to the batch maximum, so the count has to be measured, not
+                # taken from the tensor width.
+                n_new, truncated = trim_new_tokens(
+                    new_ids, stop_ids, tokenizer.pad_token_id, args.max_new_tokens)
                 n_truncated += truncated
                 fh.write(json.dumps({"task_id": row["task_id"],
                                      "variant": row.get("variant", ""),
                                      "generation": completion,
-                                     "n_new_tokens": len(new_ids),
+                                     "n_new_tokens": n_new,
                                      "truncated": bool(truncated)}) + "\n")
                 written += 1
             fh.flush()                        # partial file stays scorable
