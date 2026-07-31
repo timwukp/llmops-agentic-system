@@ -251,6 +251,62 @@ def test_the_reconcile_lambda_has_a_role_that_can_invoke_the_driver():
     assert "lambda:InvokeFunction" in acts
 
 
+# ── deployability: a config nothing deploys is a component that does not exist ──
+
+def _deploy_src(name):
+    return (REPO / "deploy" / name).read_text()
+
+
+def test_every_harness_config_on_disk_is_named_by_the_deploy_script():
+    """05_harnesses.py's AGENTS list is what a bare run creates and what --agent
+    validates against, so a config it does not name is a harness that silently never
+    exists. This was live: agents/finops/harness.json shipped complete, `--agent
+    finops` was rejected as an invalid choice, and the fleet stayed at six while
+    every doc said seven."""
+    on_disk = {p.parent.name for p in (REPO / "agents").glob("*/harness.json")}
+    # Read the list the script itself defines rather than re-parsing the source: a
+    # string-split parser has to model Python's comment and quoting rules, and the
+    # first version of this test silently dropped the very entry it was written to
+    # catch because a `#` comment sits inside the literal.
+    spec = importlib.util.spec_from_file_location(
+        "harnesses_deploy", REPO / "deploy/05_harnesses.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    missing = on_disk - set(mod.AGENTS)
+    assert not missing, f"harness configs with no deploy path: {missing}"
+
+
+def test_every_scheduled_function_is_one_the_lambda_deployer_creates():
+    """08_triggers.py schedules llmops-finops-daily against a function name. If
+    07_lambdas.py does not create that function the schedule fires daily into a
+    ResourceNotFound — visible only in the scheduler's own metrics, never in the
+    dashboard, so the auditor appears to be running while nothing runs."""
+    triggers, lambdas = _deploy_src("08_triggers.py"), _deploy_src("07_lambdas.py")
+    assert "llmops-finops-reconcile" in triggers, "test guards the wrong name"
+    assert '"fn": "llmops-finops-reconcile"' in lambdas, \
+        "scheduled function has no entry in LAMBDAS"
+
+
+def test_a_role_change_reaches_an_existing_function_not_only_a_new_one():
+    """update_function_configuration silently ignores a role it is not passed, so
+    without Role= a tightened role applies only to functions that do not exist yet:
+    every re-run reports "updated" while the live function keeps the role it was born
+    with. Measured live — llmops-finops-reconcile stayed on llmops-lambda-driver
+    across a successful "updated" run."""
+    src = _deploy_src("07_lambdas.py")
+    upd = src.split("update_function_configuration(", 1)[1].split(")", 1)[0]
+    assert "Role=role_arn" in upd, "role change would not reach an existing function"
+
+
+def test_the_auditor_lambda_runs_under_its_own_role_not_the_drivers():
+    """Reusing the driver role works and is what a first pass reaches for. It also
+    hands the auditor every permission the thing it audits has."""
+    src = _deploy_src("07_lambdas.py")
+    finops = src.split('"finops": {', 1)[1].split("},", 1)[0]
+    assert "/llmops/iam/lambda_finops_reconcile_arn" in finops
+    assert "/llmops/iam/lambda_driver_arn" not in finops
+
+
 # ── driver: publish_cost_report ───────────────────────────────────────────────
 def test_report_with_a_missing_s3_artifact_is_rejected_not_recorded():
     """Trust-but-verify, same as stage_complete: a report the agent claims but never
