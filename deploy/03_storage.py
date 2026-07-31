@@ -40,8 +40,14 @@ ESTIMATES_TABLE = "llmops-cost-estimates"
 #: #finding# rows from the finops agent. (PK, SK) mirrors llmops-stage-events so a
 #: range query by period is natural.
 ACTUALS_TABLE = "llmops-cost-actuals"
+#: Tasks-tab consultations (goal → plan → signed acceptance → dispatch). PITR on:
+#: the approval records inside are the "a human decided this" audit artifacts.
+TASKS_TABLE = "llmops-tasks"
 EVENT_BUS = "llmops-pipeline"
 SNS_TOPIC = "llmops-escalations"
+#: Asymmetric signing key for plan-acceptance records. The private half never leaves
+#: KMS hardware, which is what makes an approval unforgeable after the fact.
+APPROVAL_KEY_ALIAS = "alias/llmops-approval"
 RUNS_EXPIRE_DAYS = 90
 
 
@@ -143,6 +149,31 @@ def ensure_table(ddb, name, spec, dry, pitr=False):
             TableName=name,
             PointInTimeRecoverySpecification={"PointInTimeRecoveryEnabled": True})
     return "created"
+
+
+def ensure_approval_key(kms_client, account_id, dry):
+    """ECC_NIST_P256 SIGN_VERIFY key + alias, idempotent by alias lookup.
+
+    Key policy: root gets admin (losing key admin loses the audit trail's
+    verifiability); Sign is granted via IAM identity policies (the console role's),
+    which the default root-delegation policy permits; Verify/GetPublicKey likewise —
+    verification is meant to be broadly available, that is the point of signing.
+    """
+    try:
+        arn = kms_client.describe_key(KeyId=APPROVAL_KEY_ALIAS)["KeyMetadata"]["Arn"]
+        return "exists", arn
+    except Exception:
+        pass
+    if dry:
+        return "would create", ""
+    key = kms_client.create_key(
+        Description="llmops plan-acceptance signing key (Tasks tab approvals)",
+        KeyUsage="SIGN_VERIFY", KeySpec="ECC_NIST_P256",
+        Tags=[{"TagKey": TAG_KEY, "TagValue": TAG_VAL}])
+    arn = key["KeyMetadata"]["Arn"]
+    kms_client.create_alias(AliasName=APPROVAL_KEY_ALIAS,
+                            TargetKeyId=key["KeyMetadata"]["KeyId"])
+    return "created", arn
 
 
 def ensure_bus(events, dry):
@@ -264,9 +295,23 @@ def main():
         "schema": "PK project (S), SK sk = <period>#<run_id|audit|finding>#<...>, "
                   "on-demand, PITR on",
     }
+    results[TASKS_TABLE] = {
+        "status": ensure_table(ddb, TASKS_TABLE, {
+            "AttributeDefinitions": [
+                {"AttributeName": "id", "AttributeType": "S"},
+            ],
+            "KeySchema": [{"AttributeName": "id", "KeyType": "HASH"}],
+        }, args.dry_run, pitr=True),
+        "schema": "PK id (S, task- prefix), on-demand, PITR on; list via scan "
+                  "(deliberate simplification — consultation volumes are tiny)",
+    }
     results["event_bus"] = {"name": EVENT_BUS, "status": ensure_bus(events, args.dry_run)}
     status, topic_arn = ensure_topic(sns, topic_arn, args.dry_run)
     results["sns_topic"] = {"name": SNS_TOPIC, "status": status}
+    kms_client = safe_client("kms", args.region, args.dry_run)
+    key_status, key_arn = ensure_approval_key(kms_client, account_id, args.dry_run)
+    results["approval_key"] = {"alias": APPROVAL_KEY_ALIAS, "status": key_status,
+                               "arn": key_arn}
 
     params = {
         "bucket": bucket,
@@ -274,9 +319,12 @@ def main():
         "events_table": EVENTS_TABLE,
         "estimates_table": ESTIMATES_TABLE,
         "actuals_table": ACTUALS_TABLE,
+        "tasks_table": TASKS_TABLE,
         "event_bus": EVENT_BUS,
         "escalations_topic_arn": topic_arn,
     }
+    if key_arn:
+        params["approval_key_arn"] = key_arn
     if not args.dry_run:
         ssm = boto3.client("ssm", region_name=args.region)
         for k, v in params.items():

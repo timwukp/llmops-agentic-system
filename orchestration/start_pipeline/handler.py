@@ -54,28 +54,64 @@ def new_run_id() -> str:
     return f"run-{stamp}-{uuid.uuid4().hex[:8]}"
 
 
-def seed_manifest(run_id: str, trigger_source: str, params: dict, plan: dict | None) -> dict:
+def _as_obj(value, what: str) -> dict:
+    """Accept an object or a JSON string; anything else is an error, loudly.
+
+    The conductor's launch_run arguments are authored by a language model, and live it
+    passed `params` as a JSON string. `{**DEFAULT_PARAMS, **params}` on a str raises
+    "TypeError: 'str' object is not a mapping" -- start-pipeline 500s and the agent is
+    told only "did not return a run_id", so an approved plan silently never dispatches.
+    Coercing here (rather than tightening the prompt) fixes it for every caller.
+
+    Unparseable input raises: running with defaults would spend GPU money on
+    parameters no human approved."""
+    if value is None or value == "":
+        return {}
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{what} is a string but not valid JSON: {exc}") from exc
+        if not isinstance(parsed, dict):
+            raise ValueError(f"{what} must be a JSON object, got {type(parsed).__name__}")
+        return parsed
+    raise ValueError(f"{what} must be an object or a JSON string, "
+                     f"got {type(value).__name__}")
+
+
+def seed_manifest(run_id: str, trigger_source: str, params, plan,
+                  approval=None) -> dict:
+    params = _as_obj(params, "params")
+    plan = _as_obj(plan, "plan")
+    approval = _as_obj(approval, "approval")
     merged = {**DEFAULT_PARAMS, **(params or {})}
     return {
         "run_id": run_id,
         "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "trigger_source": trigger_source,
         "iteration": 0,
-        "models": {**DEFAULT_MODELS, **(params or {}).get("models", {})},
+        "models": {**DEFAULT_MODELS, **_as_obj(params.get("models"), "params.models")},
         "params": merged,
         "plan": plan or {},             # conductor-authored run plan, when present
+        # The signed human-acceptance record, stored verbatim like the plan: a run
+        # must carry its own proof of who approved it (and the budget_usd ceiling
+        # the monitor stage will one day enforce). Absent for non-conductor runs.
+        "approval": approval or {},
         "stages": {},
     }
 
 
 def handler(event, context=None, clients=None):
-    """event: {trigger_source, params?, plan?} — from any trigger or the conductor."""
+    """event: {trigger_source, params?, plan?, approval?} — from any trigger or the conductor."""
     c = clients or _clients()
     bucket = os.environ["DATA_BUCKET"]
 
     run_id = new_run_id()
     trigger_source = str(event.get("trigger_source", "unknown"))
-    manifest = seed_manifest(run_id, trigger_source, event.get("params"), event.get("plan"))
+    manifest = seed_manifest(run_id, trigger_source, event.get("params"), event.get("plan"),
+                             event.get("approval"))
     manifest_uri = f"s3://{bucket}/runs/{run_id}/manifest.json"
 
     c["s3"].put_object(
@@ -98,8 +134,13 @@ def handler(event, context=None, clients=None):
     execution = c["sfn"].start_execution(
         stateMachineArn=os.environ["STATE_MACHINE_ARN"],
         name=run_id,
+        # pipeline_mode rides in the execution input because the Choice state at
+        # the top of the machine cannot read the manifest from S3 — "full" runs
+        # every stage; "data_audit" is the conductor's cheap starter (audit the
+        # customer's data, report, stop before any GPU is provisioned).
         input=json.dumps({"run_id": run_id, "manifest_uri": manifest_uri,
-                          "iteration": 0}))
+                          "iteration": 0,
+                          "pipeline_mode": manifest["params"].get("pipeline_mode", "full")}))
 
     return {"run_id": run_id, "manifest_uri": manifest_uri,
             "execution_arn": execution["executionArn"]}
