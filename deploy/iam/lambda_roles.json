@@ -1,21 +1,23 @@
 {
-  "_comment": "Four Lambda execution roles for the orchestration spine, one per function, each least-privilege for exactly its job. deploy/01_iam.py creates roles llmops-lambda-<key> from the 'roles' map and substitutes <REGION>/<ACCOUNT_ID>/<DATA_BUCKET>. GOTCHAS baked in: (1) invoking a harness needs BOTH bedrock-agentcore:InvokeHarness on the harness/* ARN AND bedrock-agentcore:InvokeAgentRuntime on the runtime/harness_* ARN (the harness API is fronted by an agent runtime named harness_<name>_*; missing either => AccessDeniedException); (2) states:SendTaskSuccess/Failure/Heartbeat do not support resource-level permissions for waitForTaskToken callbacks, so Resource must be '*'; (3) ec2 ENI actions for VPC-attached Lambdas (prod) largely do not support resource-level permissions — kept as the standard AWSLambdaVPCAccessExecutionRole action set with Resource '*'; (4) Secrets Manager ARNs end in a random 6-char suffix, hence the trailing wildcard on the webhook secret.",
-
+  "_comment": "Four Lambda execution roles for the orchestration spine, one per function, each least-privilege for exactly its job. deploy/01_iam.py creates roles llmops-lambda-<key> from the 'roles' map and substitutes <REGION>/<ACCOUNT_ID>/<DATA_BUCKET>. GOTCHAS baked in: (1) invoking a harness needs BOTH bedrock-agentcore:InvokeHarness on the harness/* ARN AND bedrock-agentcore:InvokeAgentRuntime on the runtime/harness_* ARN (the harness API is fronted by an agent runtime named harness_<name>_*; missing either => AccessDeniedException); (2) states:SendTaskSuccess/Failure/Heartbeat do not support resource-level permissions for waitForTaskToken callbacks, so Resource must be '*'; (3) ec2 ENI actions for VPC-attached Lambdas (prod) largely do not support resource-level permissions \u2014 kept as the standard AWSLambdaVPCAccessExecutionRole action set with Resource '*'; (4) Secrets Manager ARNs end in a random 6-char suffix, hence the trailing wildcard on the webhook secret.",
   "trustPolicy": {
     "Version": "2012-10-17",
     "Statement": [
       {
         "Sid": "AllowLambdaToAssume",
         "Effect": "Allow",
-        "Principal": { "Service": "lambda.amazonaws.com" },
+        "Principal": {
+          "Service": "lambda.amazonaws.com"
+        },
         "Action": "sts:AssumeRole",
         "Condition": {
-          "StringEquals": { "aws:SourceAccount": "<ACCOUNT_ID>" }
+          "StringEquals": {
+            "aws:SourceAccount": "<ACCOUNT_ID>"
+          }
         }
       }
     ]
   },
-
   "sharedStatements": [
     {
       "Sid": "OwnLogGroupWrite",
@@ -40,7 +42,6 @@
       "Resource": "*"
     }
   ],
-
   "roles": {
     "driver": {
       "_comment": "harness-driver: invoked by Step Functions per stage; streams InvokeHarness, brokers inline-function toolUse<->toolResult, reports back via task token, re-invokes itself on checkpoint.",
@@ -78,7 +79,9 @@
             "_comment": "The driver services the finops agent's terminal tools, which write #finding# rows to the actuals table. Without this the audit's own findings fail with AccessDenied while the rest of the turn succeeds. Write-only on actuals: the driver records findings, it does not read the ledger back.",
             "Sid": "CostActualsWrite",
             "Effect": "Allow",
-            "Action": ["dynamodb:PutItem"],
+            "Action": [
+              "dynamodb:PutItem"
+            ],
             "Resource": "arn:aws:dynamodb:<REGION>:<ACCOUNT_ID>:table/llmops-cost-actuals"
           },
           {
@@ -117,16 +120,44 @@
             "Resource": "arn:aws:ssm:<REGION>:<ACCOUNT_ID>:parameter/llmops/harness/*"
           },
           {
-            "_comment": "trust-but-verify: the driver head_objects every S3 URI an agent claims in a terminal tool (stage_complete outputs, publish_cost_report report_uri, update_rate_card rates_uri) and reads the run manifest. head_object needs s3:GetObject. Without it verify_outputs sees AccessDenied as 'missing' and rejects every terminal call the agent makes, even when the artifact exists. Read-only, own data bucket only: the driver verifies artifacts, it does not write them.",
+            "_comment": "trust-but-verify: the driver head_objects every S3 URI an agent claims in a terminal tool (stage_complete outputs, publish_cost_report report_uri, update_rate_card rates_uri) and reads the run manifest. head_object needs s3:GetObject. Without it verify_outputs sees AccessDenied as 'missing' and rejects every terminal call the agent makes, even when the artifact exists. Read-only across the data bucket: for everything except its own one report, the driver verifies artifacts rather than writing them.",
             "Sid": "TrustButVerifyArtifactRead",
             "Effect": "Allow",
             "Action": "s3:GetObject",
             "Resource": "arn:aws:s3:::<DATA_BUCKET>/*"
+          },
+          {
+            "_comment": "The driver -- not the agent -- writes the canonical run report, on EVERY successful stage_complete (pipeline.contracts.report.write_run_report). The statement above used to be the driver's only S3 grant, and its own comment asserted the driver 'does not write them' while handle_stage_complete had been calling put_object all along: a comment describing an intention the code had outgrown. Live, data-prep finished teacher generation, called stage_complete, and the driver died on AccessDenied AFTER the spend -- the report was the one artifact the run existed to produce. Scoped to that single key rather than the bucket: a wildcard write would also let the driver rewrite the customer data and held-out acceptance sets it is deliberately limited to reading, which is how a pipeline destroys the evidence its own quality gates are judged against.",
+            "Sid": "PublishCanonicalRunReport",
+            "Effect": "Allow",
+            "Action": "s3:PutObject",
+            "Resource": "arn:aws:s3:::<DATA_BUCKET>/reports/run-latest/test-report-latest.json"
+          },
+          {
+            "_comment": "Servicing the conductor's launch_run: the driver invokes start-pipeline on the orchestrator's behalf. Without this, an orchestrator run with params.task=plan reaches the dispatch moment and dies on AccessDenied \u2014 the exact defect that made launch_run 'unsupported' for five phases.",
+            "Sid": "ConductorDispatch",
+            "Effect": "Allow",
+            "Action": "lambda:InvokeFunction",
+            "Resource": "arn:aws:lambda:<REGION>:<ACCOUNT_ID>:function:llmops-start-pipeline"
+          },
+          {
+            "_comment": "launch_run verifies the human-acceptance record's KMS signature before injecting it into a manifest. Verify only \u2014 the driver must never be able to MINT an approval, that power is the console's alone.",
+            "Sid": "ApprovalVerifyOnly",
+            "Effect": "Allow",
+            "Action": [
+              "kms:Verify",
+              "kms:DescribeKey"
+            ],
+            "Resource": "*",
+            "Condition": {
+              "StringLike": {
+                "kms:RequestAlias": "alias/llmops-approval"
+              }
+            }
           }
         ]
       }
     },
-
     "start": {
       "_comment": "start_pipeline: mints run_id, writes the initial S3 manifest, records the run in DDB, starts the state machine.",
       "permissionsPolicy": {
@@ -149,11 +180,17 @@
             "Effect": "Allow",
             "Action": "states:StartExecution",
             "Resource": "arn:aws:states:<REGION>:<ACCOUNT_ID>:stateMachine:llmops-pipeline*"
+          },
+          {
+            "Sid": "EmitPipelineStarted",
+            "_comment": "start_pipeline emits PIPELINE_STARTED on every run; without this the function wrote the manifest and the DDB row and THEN died with AccessDeniedException, which reached the conductor as the far less informative 'start-pipeline did not return a run_id'.",
+            "Effect": "Allow",
+            "Action": "events:PutEvents",
+            "Resource": "arn:aws:events:<REGION>:<ACCOUNT_ID>:event-bus/llmops-pipeline"
           }
         ]
       }
     },
-
     "resume": {
       "_comment": "resume_pipeline: EventBridge SageMaker job-state rule target; looks up the waiting task token by job name via the GSI, resumes the state machine.",
       "permissionsPolicy": {
@@ -169,6 +206,13 @@
             ]
           },
           {
+            "_comment": "After settling the token, the handler REMOVEs it so a duplicate EventBridge delivery cannot double-settle the same training job -- EventBridge is at-least-once, so that clear is the whole guard. Without UpdateItem the handler resumes the state machine and then dies on AccessDenied with the token still parked, leaving the guard permanently disarmed while the log shows a successful resume. Third instance of one defect class (start_pipeline's events:PutEvents, the driver's s3:PutObject); found by the guard added for the first two, not by another live failure.",
+            "Sid": "ClearSettledToken",
+            "Effect": "Allow",
+            "Action": "dynamodb:UpdateItem",
+            "Resource": "arn:aws:dynamodb:<REGION>:<ACCOUNT_ID>:table/llmops-pipeline-runs"
+          },
+          {
             "Sid": "TaskTokenCallbacks",
             "Effect": "Allow",
             "Action": [
@@ -181,16 +225,18 @@
         ]
       }
     },
-
     "finops_reconcile": {
-      "_comment": "finops_reconcile: EventBridge Scheduler target, daily 09:00 UTC. Picks the periods to reconcile and delegates the streaming turn loop to harness-driver. It reads billing itself for nothing — the agent does that through its own execution role; this Lambda only needs to choose periods and invoke.",
+      "_comment": "finops_reconcile: EventBridge Scheduler target, daily 09:00 UTC. Picks the periods to reconcile and delegates the streaming turn loop to harness-driver. It reads billing itself for nothing \u2014 the agent does that through its own execution role; this Lambda only needs to choose periods and invoke.",
       "permissionsPolicy": {
         "Version": "2012-10-17",
         "Statement": [
           {
             "Sid": "ListReconcileTargets",
             "Effect": "Allow",
-            "Action": ["dynamodb:Query", "dynamodb:Scan"],
+            "Action": [
+              "dynamodb:Query",
+              "dynamodb:Scan"
+            ],
             "Resource": [
               "arn:aws:dynamodb:<REGION>:<ACCOUNT_ID>:table/llmops-cost-estimates",
               "arn:aws:dynamodb:<REGION>:<ACCOUNT_ID>:table/llmops-cost-estimates/index/*",
@@ -201,7 +247,9 @@
             "_comment": "PutItem only, for the reserved #audit# row that makes a missed daily reconcile visible.",
             "Sid": "RecordAuditOutcome",
             "Effect": "Allow",
-            "Action": ["dynamodb:PutItem"],
+            "Action": [
+              "dynamodb:PutItem"
+            ],
             "Resource": "arn:aws:dynamodb:<REGION>:<ACCOUNT_ID>:table/llmops-cost-actuals"
           },
           {
@@ -219,7 +267,6 @@
         ]
       }
     },
-
     "webhook": {
       "_comment": "webhook: HMAC-verifies inbound GitHub/webhook calls using the shared secret, then invokes start_pipeline. No data-plane access of its own.",
       "permissionsPolicy": {

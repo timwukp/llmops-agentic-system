@@ -48,6 +48,16 @@
   input,select,textarea { font:inherit; background:var(--bg); color:var(--text);
                    border:1px solid var(--line); border-radius:7px; padding:7px; width:100%; }
   label { display:block; color:var(--muted); font-size:12px; margin:8px 0 3px; }
+  .chat { max-height:420px; overflow-y:auto; display:flex; flex-direction:column; gap:8px; padding:4px; }
+  .chat .msg { max-width:82%; padding:8px 12px; border-radius:12px; font-size:13px;
+               line-height:1.5; white-space:pre-wrap; word-break:break-word; }
+  .chat .m-user { align-self:flex-end; background:var(--panel2); border:1px solid var(--accent); }
+  .chat .m-assistant { align-self:flex-start; background:var(--panel2); border:1px solid var(--line); }
+  .chat .m-system { align-self:center; background:transparent; border:1px dashed var(--line);
+                    color:var(--muted); font-size:12px; }
+  .chat .m-pending { opacity:.55; }
+  .chat .who { font-size:10px; color:var(--muted); margin-bottom:2px; }
+  .plankv td:first-child { color:var(--muted); width:180px; }
   .flex { display:flex; gap:8px; align-items:center; }
   .stat { font-size:26px; font-weight:700; } .stat small { font-size:12px; color:var(--muted); font-weight:400; }
   nav.tabs { display:flex; gap:6px; padding:10px 24px 0; background:var(--panel);
@@ -100,6 +110,7 @@
 
 <nav class="tabs">
   <button data-tab="architecture" onclick="showTab('architecture')">Architecture</button>
+  <button data-tab="tasks" onclick="showTab('tasks')">Tasks</button>
   <button data-tab="pipeline" class="active" onclick="showTab('pipeline')">Pipeline</button>
   <button data-tab="fleet" onclick="showTab('fleet')">Fleet</button>
   <button data-tab="obs" onclick="showTab('obs')">Observability</button>
@@ -116,6 +127,39 @@
     <div class="stat" id="kpiRuns">&ndash;</div><small id="kpiRunsSub">recent runs in DynamoDB</small></div>
   <div data-tab-panel="all" class="card col-4"><h2>Executions</h2>
     <div class="stat" id="kpiExec">&ndash;</div><small id="kpiExecSub">Step Functions llmops-pipeline</small></div>
+
+  <!-- Tasks: goal-driven entry — consult the orchestrator, sign the plan -->
+  <div data-tab-panel="tasks" class="card col-12"><h2>Task lifecycle &middot; live</h2>
+    <div id="taskFlow"><span class="sub">select or create a task</span></div>
+  </div>
+
+  <div data-tab-panel="tasks" class="card col-4"><h2>Tasks</h2>
+    <div id="taskList"><span class="sub">loading&hellip;</span></div>
+    <label style="margin-top:12px">New task &middot; describe your goal</label>
+    <textarea id="taskGoal" rows="3" placeholder="e.g. I want a small private model that answers questions about our product manuals. Budget around $100."></textarea>
+    <div class="flex" style="margin-top:8px"><button class="primary" onclick="createTask()">Start consultation</button></div>
+    <div id="taskCreateMsg" class="sub" style="margin-top:6px"></div>
+  </div>
+
+  <div data-tab-panel="tasks" class="card col-8"><h2>Consultation &middot; llmops_orchestrator</h2>
+    <div id="taskChat" class="chat"><span class="sub">no task selected — the orchestrator is a pre-sales solution architect: it will ask about your data first, then propose a priced plan you can sign.</span></div>
+    <div class="flex" style="margin-top:10px">
+      <input id="taskMsg" placeholder="reply to the orchestrator&hellip;" style="flex:1" onkeydown="if(event.key==='Enter')sendTaskMsg()"/>
+      <button class="primary" id="taskSendBtn" onclick="sendTaskMsg()">Send</button>
+    </div>
+    <div id="taskChatMsg" class="sub" style="margin-top:6px"></div>
+  </div>
+
+  <div data-tab-panel="tasks" class="card col-12" id="taskPlanCard" style="display:none"><h2>Proposed plan &middot; requires your signature</h2>
+    <div id="taskPlanBody"></div>
+    <div class="flex" style="margin-top:12px;flex-wrap:wrap">
+      <button class="primary" onclick="acceptTask()">&#9997;&#65039; Accept &amp; sign</button>
+      <button onclick="taskFeedback()">Send feedback</button>
+      <button onclick="closeTask()">Close task</button>
+      <a id="taskApprovalLink" style="display:none" href="#" onclick="return viewApproval()"><button>View approval record</button></a>
+    </div>
+    <div id="taskPlanMsg" class="sub" style="margin-top:6px"></div>
+  </div>
 
   <!-- Architecture: what this system is and how it is wired -->
   <div data-tab-panel="architecture" class="card col-12"><h2>Solution architecture</h2>
@@ -965,7 +1009,8 @@ async function loadCost(){
     // 2 · approval queue
     $("cQueue").innerHTML = pend ? `<table><tr><th>Estimate</th><th>Requested by</th><th>Worst case</th><th>Why gated</th><th></th></tr>`+
       (es.pending||[]).map(p=>
-        `<tr><td class="mono">${esc(p.id)}<div class="sub">${esc(p.created_at||"")}</div></td>`+
+        `<tr><td class="mono">${esc(p.id)}<div class="sub">${esc(p.created_at||"")}</div>`+
+          (p.task_id?`<div class="sub"><a href="#" style="color:var(--accent)" onclick="showTab('tasks');selectTask(${jstr(p.task_id)});return false">task ${esc(p.task_id)}</a></div>`:"")+`</td>`+
         `<td>${esc(p.requested_by||"?")}<div class="sub">${esc((p.justification||"").slice(0,120))}</div></td>`+
         `<td class="mono">${usd(p.worst_case_usd)}<div class="sub">expected ${usd(p.total_usd)}</div></td>`+
         `<td class="sub">${((p.gate||{}).reasons||[]).map(esc).join("<br>")}</td>`+
@@ -1024,6 +1069,201 @@ async function loadCost(){
   } catch(e){ $("cRollup").innerHTML = `<span class="sub">cost error: ${esc(e)}</span>`; }
 }
 
+// ── Tasks: consult the orchestrator, sign the plan ────────────────────────────
+let TASK_SEL = null, taskTimer = null, TASK_CACHE = null;
+
+const TASK_STAGES = [
+  {key:"talk",   icon:"💬", label:"Requirements"},
+  {key:"design", icon:"📐", label:"Plan design"},
+  {key:"propose",icon:"📋", label:"Proposal"},
+  {key:"sign",   icon:"✍️", label:"Human sign-off"},
+  {key:"launch", icon:"🚀", label:"Dispatch"},
+  {key:"run",    icon:"⚙️", label:"Pipeline run"},
+  {key:"cost",   icon:"💰", label:"Cost watch"},
+];
+
+function taskStageStates(t){
+  // maps a task's status onto the 7 lifecycle nodes: done/active/idle
+  const s = t ? String(t.status||"") : "";
+  const done = [], activeSet = new Set();
+  const order = {drafting:0, thinking:0, data_audit:1, plan_proposed:2,
+                 pending_approval:3, accepting:4, dispatched:5, closed:0, error:0};
+  const pos = (s in order) ? order[s] : 0;
+  TASK_STAGES.forEach((st,i)=>{
+    if (i < pos) done.push(st.key);
+    if (i === pos && s !== "closed" && s !== "error") activeSet.add(st.key);
+  });
+  if (s === "dispatched") { activeSet.add("run"); activeSet.add("cost"); }
+  return {done, active: activeSet, status: s};
+}
+
+function renderTaskFlow(t){
+  const el = $("taskFlow");
+  if (!t){ el.innerHTML = '<span class="sub">select or create a task</span>'; return; }
+  const st = taskStageStates(t);
+  const NW = 132, GAP = 26, Y = 26, H = 62, STEP = NW + GAP;
+  const W = TASK_STAGES.length * STEP - GAP + 20, VH = 132;
+  let svg = `<svg class="flow" viewBox="0 0 ${W} ${VH}" role="img" aria-label="task lifecycle">`+
+    `<defs><marker id="tah" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L8,4 L0,8 Z" class="arrow"/></marker></defs>`;
+  TASK_STAGES.forEach((sd,i)=>{
+    const x = 10 + i*STEP;
+    const isDone = st.done.includes(sd.key), isActive = st.active.has(sd.key);
+    const c = isActive ? "#5b8cff" : isDone ? "#3ecf8e" : "#26305a";
+    if (i < TASK_STAGES.length-1)
+      svg += `<path class="wire" d="M${x+NW},${Y+H/2} H${x+STEP-5}" marker-end="url(#tah)"/>`;
+    svg += `<g class="node${isActive?" pulse":""}">`+
+      `<rect x="${x}" y="${Y}" width="${NW}" height="${H}" style="stroke:${c}" rx="10"/>`+
+      `<text x="${x+NW/2}" y="${Y+26}" text-anchor="middle" style="font-size:13px">${sd.icon} ${esc(sd.label)}</text>`+
+      `<text x="${x+NW/2}" y="${Y+44}" text-anchor="middle" class="tsub" style="font-size:10px;fill:var(--muted)">${isActive?esc(st.status):isDone?"done":""}</text></g>`;
+  });
+  svg += `</svg>`;
+  let note = "";
+  if (st.status === "pending_approval")
+    note = `<div class="sub" style="margin-top:6px;color:var(--amber)">over the spend limit — waiting for an approver on the <a href="#" onclick="showTab('cost');return false" style="color:var(--accent)">Cost tab</a></div>`;
+  if (st.status === "dispatched" && t.run_id)
+    note = `<div class="sub" style="margin-top:6px">run <a href="#" onclick="showTab('pipeline');loadRun('${esc(t.run_id)}');return false" style="color:var(--accent)" class="mono">${esc(t.run_id)}</a> dispatched — follow it on Pipeline / Cost</div>`;
+  if (st.status === "error")
+    note = `<div class="sub" style="margin-top:6px;color:var(--red)">error: ${esc(t.error_msg||"")}</div>`;
+  el.innerHTML = svg + note;
+}
+
+// minimal safe renderer: escape EVERYTHING first, then whitelist a few transforms
+function mdLite(s){
+  let h = esc(s);
+  h = h.replace(/```([\s\S]*?)```/g, (_,c)=>"<pre>"+c.trim()+"</pre>");
+  h = h.replace(/\*\*([^*\n]+)\*\*/g, "<b>$1</b>");
+  return h;
+}
+
+function renderChat(t){
+  const el = $("taskChat");
+  const msgs = (t && t.messages) || [];
+  if (!msgs.length){ el.innerHTML = '<span class="sub">no messages yet</span>'; return; }
+  el.innerHTML = msgs.map(m=>{
+    const role = m.role==="user"?"m-user":m.role==="assistant"?"m-assistant":"m-system";
+    const who = m.role==="assistant"?"orchestrator":(m.by||m.role);
+    return `<div class="msg ${role}"><div class="who">${esc(who)} · ${esc(String(m.at||"").slice(0,19))}</div>${mdLite(String(m.text||""))}</div>`;
+  }).join("") + (String(t.status)==="thinking"||String(t.status)==="accepting"
+    ? '<div class="msg m-system">orchestrator is thinking&hellip;</div>' : "");
+  el.scrollTop = el.scrollHeight;
+}
+
+function renderPlanCard(t){
+  const card = $("taskPlanCard"), body = $("taskPlanBody");
+  const show = t && ["plan_proposed","pending_approval","accepting","dispatched"].includes(String(t.status));
+  card.style.display = show ? "" : "none";
+  if (!show) return;
+  const gateNote = t.status==="plan_proposed"
+    ? '<div class="sub">signing means: you approve this exact plan (its hash is signed with the project KMS key). Under $2,000 it dispatches immediately; over, it goes to the Cost approval queue.</div>' : "";
+  body.innerHTML =
+    `<div style="font-size:14px;margin-bottom:8px">${mdLite(String(t.plan_summary||""))}</div>`+
+    `<table class="plankv"><tr><td>Estimated cost</td><td><b>${usd(t.cost_estimate_usd)}</b></td></tr>`+
+    `<tr><td>plan.json</td><td class="mono">${esc(t.plan_uri||"")}</td></tr>`+
+    `<tr><td>Status</td><td><span class="pill ${badge(t.status)}">${esc(t.status)}</span></td></tr>`+
+    (t.run_id?`<tr><td>Run</td><td class="mono">${esc(t.run_id)}</td></tr>`:"")+
+    `</table>` + gateNote;
+  $("taskApprovalLink").style.display = (t.approvals && t.approvals.length) ? "" : "none";
+}
+
+async function loadTasks(){
+  try {
+    const d = await fetch(API+"/api/tasks").then(r=>r.json());
+    const items = d.tasks||[];
+    $("taskList").innerHTML = items.length ? items.map(t=>
+      `<div class="row" style="cursor:pointer" onclick="selectTask('${esc(t.id)}')">`+
+      `<div style="min-width:0"><div style="font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(t.goal||t.id)}</div>`+
+      `<div class="sub">${esc(t.created_by||"")} · ${esc(String(t.updated_at||"").slice(0,16))}</div></div>`+
+      `<span class="pill ${badge(t.status)}">${esc(t.status)}</span></div>`).join("")
+      : '<span class="sub">no tasks yet — describe a goal below</span>';
+    if (TASK_SEL) await loadTaskDetail();
+  } catch(e){ $("taskList").innerHTML = `<span class="sub">error: ${esc(e)}</span>`; }
+}
+
+async function loadTaskDetail(){
+  if (!TASK_SEL) return;
+  try {
+    const t = await fetch(API+"/api/tasks/"+encodeURIComponent(TASK_SEL)).then(r=>r.json());
+    if (t.error) { $("taskChatMsg").textContent = t.error; return; }
+    TASK_CACHE = t;
+    renderTaskFlow(t); renderChat(t); renderPlanCard(t);
+    const busy = ["thinking","accepting"].includes(String(t.status));
+    $("taskSendBtn").disabled = busy;
+    tasksPoll(true, busy ? 3000 : 15000);
+  } catch(e){ $("taskChatMsg").textContent = "error: "+e; }
+}
+
+function selectTask(id){ TASK_SEL = id; TASK_CACHE = null; loadTaskDetail(); }
+
+function tasksPoll(on, ms){
+  if (taskTimer) { clearInterval(taskTimer); taskTimer = null; }
+  if (on) taskTimer = setInterval(loadTasks, ms||15000);
+}
+
+async function createTask(){
+  const goal = $("taskGoal").value.trim();
+  if (!goal) { $("taskCreateMsg").textContent = "describe your goal first"; return; }
+  const r = await postApi("/api/tasks", {goal});
+  $("taskCreateMsg").textContent = r.ok ? "consultation started" : r.msg;
+  if (r.ok && r.data.task) { $("taskGoal").value=""; TASK_SEL = r.data.task.id; loadTasks(); }
+}
+
+async function sendTaskMsg(){
+  if (!TASK_SEL) { $("taskChatMsg").textContent = "select a task first"; return; }
+  const text = $("taskMsg").value.trim();
+  if (!text) return;
+  // optimistic append; the poll reconciles
+  const el = $("taskChat");
+  el.insertAdjacentHTML("beforeend",
+    `<div class="msg m-user m-pending"><div class="who">you</div>${mdLite(text)}</div>`);
+  el.scrollTop = el.scrollHeight;
+  $("taskMsg").value = "";
+  const r = await postApi("/api/tasks/"+encodeURIComponent(TASK_SEL)+"/message", {text});
+  $("taskChatMsg").textContent = r.ok ? "" : r.msg;
+  if (r.ok) { tasksPoll(true, 3000); }
+}
+
+async function acceptTask(){
+  if (!TASK_SEL || !TASK_CACHE) return;
+  const c = TASK_CACHE;
+  if (!confirm("Sign and accept this plan?\n\nCost estimate: "+usd(c.cost_estimate_usd)
+      +"\nPlan: "+String(c.plan_summary||"").slice(0,300)
+      +"\n\nYour acceptance is recorded with a KMS digital signature.")) return;
+  const r = await postApi("/api/tasks/"+encodeURIComponent(TASK_SEL)+"/accept", {});
+  $("taskPlanMsg").textContent = r.ok
+    ? (r.data.status==="pending_approval"
+       ? "submitted for budget approval — see the Cost tab queue"
+       : "signed — dispatching through the pipeline")
+    : r.msg;
+  if (r.ok) tasksPoll(true, 3000);
+}
+
+async function taskFeedback(){
+  const fb = prompt("What should the orchestrator change about this plan?");
+  if (!fb || !fb.trim()) return;
+  const r = await postApi("/api/tasks/"+encodeURIComponent(TASK_SEL)+"/message", {text: fb.trim()});
+  $("taskPlanMsg").textContent = r.ok ? "feedback sent — the plan will be revised" : r.msg;
+  if (r.ok) tasksPoll(true, 3000);
+}
+
+async function closeTask(){
+  const reason = prompt("Reason for closing this task (required):");
+  if (!reason || !reason.trim()) return;
+  const r = await postApi("/api/tasks/"+encodeURIComponent(TASK_SEL)+"/close", {reason: reason.trim()});
+  $("taskPlanMsg").textContent = r.ok ? "task closed" : r.msg;
+  if (r.ok) loadTasks();
+}
+
+async function viewApproval(){
+  if (!TASK_SEL) return false;
+  try {
+    const d = await fetch(API+"/api/tasks/"+encodeURIComponent(TASK_SEL)+"/approval").then(r=>r.json());
+    alert("Approval records ("+(d.approvals||[]).length+")\n\nKey: "+(d.key_arn||d.key||"")
+      +"\n\n"+JSON.stringify(d.approvals||[], null, 1).slice(0, 1800)
+      +"\n\nVerify: "+(d.verify||""));
+  } catch(e){ alert("error: "+e); }
+  return false;
+}
+
 // ── architecture diagrams ─────────────────────────────────────────────────────
 // Served same-origin by this Lambda (bundled in the zip) so the CSP stays
 // connect-src 'self'. Inlined rather than <img> so the animated dashed wires run;
@@ -1060,6 +1300,8 @@ function showTab(t){
   localStorage.setItem("adminTab", t);
   pipePoll(t==="pipeline");
   if (t==="architecture") loadArch();
+  tasksPoll(t==="tasks");
+  if (t==="tasks") loadTasks();
   if (t==="pipeline") loadPipe().catch(console.error);
   if (t==="obs") { loadObs(); }
   if (t==="evals") loadEvals();
@@ -1069,7 +1311,7 @@ function showTab(t){
 
 // tab on load: ?tab= URL param > localStorage > architecture for first-time
 // visitors (the tab exists to explain the system), remembered tab afterwards
-const KNOWN_TABS = ["architecture","pipeline","fleet","obs","evals","opts","cost"];
+const KNOWN_TABS = ["architecture","tasks","pipeline","fleet","obs","evals","opts","cost"];
 const _urlTab = new URLSearchParams(location.search).get("tab");
 const _memTab = localStorage.getItem("adminTab");
 showTab(KNOWN_TABS.includes(_urlTab) ? _urlTab

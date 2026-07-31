@@ -762,8 +762,10 @@ def test_authed_user_denies_when_the_group_lookup_fails(console, monkeypatch):
 
     monkeypatch.setattr(console, "cognito", _Cog())
     monkeypatch.setattr(console, "COGNITO_POOL_ID", "us-east-1_test")
+    # sub joined the payload for approval-record identity; empty when Cognito
+    # returns no attributes — the assertion below pins groups=[] (the deny), not sub.
     u = console._authed_user({"authorization": "Bearer tok"})
-    assert u == {"username": "alice", "groups": []}
+    assert u == {"username": "alice", "groups": [], "sub": ""}
     # The caller then denies, because "we could not prove you are an approver" belongs
     # on the deny side.
     import cost_model

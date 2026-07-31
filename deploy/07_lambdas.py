@@ -31,7 +31,8 @@ LAMBDAS = {
         "src": REPO / "orchestration" / "harness_driver" / "handler.py",
         "role_param": "/llmops/iam/lambda_driver_arn",
         "timeout": 900, "memory": 512,
-        "env_keys": ["RUNS_TABLE", "EVENTS_TABLE", "EVENT_BUS", "LLMOPS_SNS_TOPIC", "DATA_BUCKET"],
+        "env_keys": ["RUNS_TABLE", "EVENTS_TABLE", "EVENT_BUS", "LLMOPS_SNS_TOPIC", "DATA_BUCKET",
+                     "START_FN"],
     },
     "start": {
         "fn": "llmops-start-pipeline",
@@ -85,6 +86,11 @@ def bundle(src: pathlib.Path) -> bytes:
         z.write(CONTRACTS / "events.py", "events.py")
         z.write(CONTRACTS / "report.py", "report.py")
         z.write(CONTRACTS / "manifest.schema.json", "manifest.schema.json")
+        # launch_run servicing + approval verification, shared verbatim with the
+        # console (its deploy.sh vendors the same file) so the two dispatch paths
+        # cannot drift. Vendored into every bundle: only the driver imports it,
+        # but a uniform bundle is one less special case in this function.
+        z.write(REPO / "orchestration" / "conductor_tools.py", "conductor_tools.py")
     return buf.getvalue()
 
 
@@ -99,6 +105,7 @@ def env_values(ssm, region, account, keys, extra):
         "STATE_MACHINE_ARN": f"arn:aws:states:{region}:{account}:stateMachine:{STATE_MACHINE_NAME}",
         "WEBHOOK_SECRET_ID": "llmops/webhook",
         "START_PIPELINE_FN": "llmops-start-pipeline",
+        "START_FN": "llmops-start-pipeline",   # driver's launch_run dispatch target
         "DRIVER_FN": "llmops-harness-driver",
         "ESTIMATES_TABLE": "llmops-cost-estimates",
         "ACTUALS_TABLE": "llmops-cost-actuals",
@@ -146,14 +153,37 @@ def deploy_state_machine(sfn, ssm, region, account, dry):
     asl = asl.replace("${HarnessDriverArn}", driver_arn)
     asl = asl.replace("${EventBusName}", "llmops-pipeline")
     if dry:
+        # json.loads only proves it is JSON. ASL rejects plenty of valid JSON -- an
+        # unsupported field, a bad JSONPath, an unknown SDK integration -- and does so
+        # at UpdateStateMachine time, i.e. in the middle of a real deploy. The
+        # ValidateStateMachineDefinition API is read-only and creates nothing, so the
+        # dry run can make the claim it was already printing.
         json.loads(asl)
-        return {"state_machine": STATE_MACHINE_NAME, "would": "create/update", "asl": "valid"}
-    role_arn = ssm.get_parameter(Name="/llmops/iam/lambda_start_arn")["Parameter"]["Value"]
-    # dedicated SFN role expected under /llmops/iam/sfn_arn; fall back to start role param name
-    try:
-        role_arn = ssm.get_parameter(Name="/llmops/iam/sfn_arn")["Parameter"]["Value"]
-    except ssm.exceptions.ParameterNotFound:
-        pass
+        try:
+            checked = sfn.validate_state_machine_definition(definition=asl,
+                                                            type="STANDARD")
+        except Exception as exc:  # no credentials / no network: say so, do not claim
+            return {"state_machine": STATE_MACHINE_NAME, "would": "create/update",
+                    "asl": "json-parses; ASL NOT validated",
+                    "validator_unreachable": f"{type(exc).__name__}: {exc}"}
+        diags = [f"[{d['severity']}] {d['code']} {d.get('location', '')}: {d['message']}"
+                 for d in checked.get("diagnostics", [])]
+        return {"state_machine": STATE_MACHINE_NAME, "would": "create/update",
+                "asl": checked["result"], "diagnostics": diags}
+    # The state machine's own role, published by 01_iam.py from iam/sfn_execution_role.json.
+    # The legacy /llmops/iam/sfn_arn name is still read as a fallback for accounts
+    # deployed before the role was declared in-repo; the start role is the last resort
+    # and is wrong (it cannot write the runs table), so it fails loudly at MarkRunFailed
+    # rather than silently granting the state machine the wrong identity.
+    for param in ("/llmops/iam/sfn_execution_arn", "/llmops/iam/sfn_arn",
+                  "/llmops/iam/lambda_start_arn"):
+        try:
+            role_arn = ssm.get_parameter(Name=param)["Parameter"]["Value"]
+            break
+        except ssm.exceptions.ParameterNotFound:
+            continue
+    else:
+        raise RuntimeError("no state machine role in SSM — run deploy/01_iam.py first")
     sm_arn = f"arn:aws:states:{region}:{account}:stateMachine:{STATE_MACHINE_NAME}"
     try:
         sfn.describe_state_machine(stateMachineArn=sm_arn)
