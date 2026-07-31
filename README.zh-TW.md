@@ -2,12 +2,12 @@
 
 **由 AWS Bedrock AgentCore Harness 自主運行的端到端 LLMOps 平台。**
 
-[English](README.md) · [架構](docs/ARCHITECTURE.zh-TW.md) · [安全](SECURITY.md) · [Agent 指引](AGENTS.md)
+[English](README.md) · [架構](docs/ARCHITECTURE.zh-TW.md) · [費用](docs/COST.zh-TW.md) · [安全](SECURITY.md) · [Agent 指引](AGENTS.md)
 
-六個 AI agent —— 指揮家（orchestrator）加上數據準備、微調、評估、部署、監控五位專家 —— 無人干預地執行完整 LLMOps 生命週期：
+七個 AI agent —— 指揮家（orchestrator）、數據準備、微調、評估、部署、監控五位階段專家，加上一位 FinOps 審計員 —— 無人干預地執行完整 LLMOps 生命週期：
 **teacher 大模型（Bedrock 上的 DeepSeek-R1）**生成訓練數據，**student 小模型（Qwen3-1.7B）**
 以 SageMaker 訓練作業做 QLoRA 微調，通過質量門檻評估後部署到 SageMaker endpoint 並持續監控 ——
-只有 agent 呼叫 `escalate_human` 時才需要人類介入。
+只有 agent 呼叫 `escalate_human`、或某次 run 的估算費用跨過 **$2000 審批閘門**時，才需要人類介入。
 
 > **TEST-PROVEN（以測試為證）**：下方每個階段門檻都是在真實 AWS 帳號上的真實調用，
 > 證據文件在 `deploy/evidence/`，結果彙總在 `docs/TEST_RESULTS.md`。
@@ -41,7 +41,7 @@ Lambda + HTTP API + Cognito 獨立棧，從
 
 核心設計決策（完整論證見 [docs/ARCHITECTURE.zh-TW.md](docs/ARCHITECTURE.zh-TW.md)）：
 
-- **6 個 harness（5 位階段專家 + 指揮家），而非巨型 agent** —— 各階段獨立掛載技能、獨立版本與 endpoint
+- **7 個 harness（5 位階段專家 + 指揮家 + FinOps 審計員），而非巨型 agent** —— 各階段獨立掛載技能、獨立版本與 endpoint
   釘選、獨立評估；爆炸半徑小。
 - **確定性主幹 + 智能 worker** —— 階段 DAG 不需要 LLM 判斷，因此編排用 Step Functions；
   智能封裝在每個階段內部。
@@ -97,10 +97,11 @@ Gateway，搭配 Cognito 認證：讀取公開，所有寫入都必須帶 Bearer
 | 頁籤 | 運維人員在這裡做什麼 |
 |---|---|
 | **Pipeline** | 即時觀看 9 階段 Step Functions 流程（含 remediation 迴圈箭頭）；點選某次執行查看門檻、指標、證據與訓練作業；發起新的 run |
-| **Fleet** | 檢視 6 個 `llmops_*` harness —— 狀態、模型、已掛載技能、各項限制 |
+| **Fleet** | 檢視 7 個 `llmops_*` harness —— 狀態、模型、已掛載技能、各項限制 |
 | **Observability** | 各 harness 的 AgentCore 指標、每日用量、token 花費、SageMaker 訓練作業與 student endpoint |
 | **Evaluations** | 線上評估配置與分數儀表，以及批次評估 |
 | **Optimizations** | 先看 Insights 發現，再看 AWS 原生 prompt 建議與 Bedrock 起草的 prompt —— 經人工審核後才透過 `UpdateHarness` 套用 |
+| **Cost** | 逐列估算一個 run 的費用、批准或駁回超過 $2000 的請求，再依專案／服務／run 對照估算讀取實際支出 —— 見 [docs/COST.zh-TW.md](docs/COST.zh-TW.md) |
 
 有兩點是刻意做嚴的：
 
@@ -117,8 +118,8 @@ Gateway，搭配 Cognito 認證：讀取公開，所有寫入都必須帶 Bearer
 ## Repo 結構
 
 ```
-agents/           6 個 harness 配置（5 個專家 + 指揮家）+ 提示詞
-orchestration/    狀態機 + 4 個 Lambda（driver / start / resume / webhook）
+agents/           7 個 harness 配置（5 個專家 + 指揮家 + finops 審計員）+ 提示詞
+orchestration/    狀態機 + 5 個 Lambda（driver / start / resume / webhook / finops）
 deploy/           編號冪等部署腳本 + 最小權限 IAM + 驗證證據
 pipeline/         訓練入口 + 契約（manifest schema、事件、報告）
 tests/            單元測試 · golden agent 測試 · e2e 驅動 · SVG 幾何檢查

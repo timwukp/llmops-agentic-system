@@ -2,14 +2,15 @@
 
 **An end-to-end LLMOps platform, run autonomously by AWS Bedrock AgentCore Harnesses.**
 
-[繁體中文](README.zh-TW.md) · [Architecture](docs/ARCHITECTURE.md) · [Security](SECURITY.md) · [Agent orientation](AGENTS.md)
+[繁體中文](README.zh-TW.md) · [Architecture](docs/ARCHITECTURE.md) · [Cost](docs/COST.md) · [Security](SECURITY.md) · [Agent orientation](AGENTS.md)
 
-Six AI agents — a conductor (orchestrator) plus data-prep, finetune, eval, deploy,
-monitor specialists — execute the full LLMOps
+Seven AI agents — a conductor (orchestrator), five stage specialists (data-prep, finetune,
+eval, deploy, monitor), and a FinOps auditor — execute the full LLMOps
 lifecycle without human intervention: a **teacher LLM (DeepSeek-R1 on Bedrock)** generates
 training data, a **student model (Qwen3-1.7B)** is QLoRA-fine-tuned as a SageMaker training
 job, evaluated against quality gates, deployed to a SageMaker endpoint, and monitored —
-with a human pulled in only when an agent calls `escalate_human`.
+with a human pulled in only when an agent calls `escalate_human`, or when a run's estimated
+cost crosses the **$2000 approval gate**.
 
 > **TEST-PROVEN**: every phase gate below is a real invocation on a real AWS account,
 > with evidence files in `deploy/evidence/` and results in `docs/TEST_RESULTS.md`.
@@ -43,8 +44,11 @@ rather than shared with it, so its telemetry can never mix with another system's
 
 Key design decisions (full rationale in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)):
 
-- **6 harnesses (5 per-stage specialists + a conductor), not a mega-agent** — per-stage skill mounting, versioning,
-  endpoint pins, and evaluations; small blast radius.
+- **7 harnesses (5 per-stage specialists + a conductor + a FinOps auditor), not a mega-agent** —
+  per-stage skill mounting, versioning, endpoint pins, and evaluations; small blast radius.
+- **The auditor is read-only on billing** — it reports and flags spend; it cannot stop a run.
+  An auditor with kill rights puts spend-control authority in the component whose job is to
+  observe. See [docs/COST.md](docs/COST.md).
 - **Deterministic spine, agentic workers** — the stage DAG needs no LLM judgment, so
   orchestration is Step Functions; intelligence lives inside each stage.
 - **Launch-and-release for training** — a harness never waits on an hours-long job:
@@ -108,10 +112,11 @@ script is idempotent, so re-running it updates in place.
 | Tab | What an operator does there |
 |---|---|
 | **Pipeline** | Watch the 9-stage Step Functions flow live, including the remediation-loop arrow; pick an execution to see gates, metrics, evidence, and the training job; start a run |
-| **Fleet** | Inspect the 6 `llmops_*` harnesses — status, model, mounted skills, limits |
+| **Fleet** | Inspect the 7 `llmops_*` harnesses — status, model, mounted skills, limits |
 | **Observability** | Per-harness AgentCore metrics, daily volume, token spend, SageMaker training jobs and student endpoints |
 | **Evaluations** | Online eval configs with score gauges, plus batch evaluations |
 | **Optimizations** | Insights findings, then AWS-native prompt recommendations and Bedrock-drafted prompts — reviewed by a human, then applied via `UpdateHarness` |
+| **Cost** | Estimate a run line by line, approve or reject anything over $2000, then read actual spend by project/service/run against the estimate — see [docs/COST.md](docs/COST.md) |
 
 Two things it is deliberately strict about:
 
@@ -130,8 +135,8 @@ call) are in [`deploy/console/README.md`](deploy/console/README.md).
 ## Repo map
 
 ```
-agents/           6 harness configs (5 specialists + conductor) + prompts
-orchestration/    state machine + 4 Lambdas (driver / start / resume / webhook)
+agents/           7 harness configs (5 specialists + conductor + finops auditor) + prompts
+orchestration/    state machine + 5 Lambdas (driver / start / resume / webhook / finops)
 deploy/           numbered idempotent provisioning scripts + least-priv IAM + evidence
 pipeline/         training entry point + contracts (manifest schema, events, report)
 tests/            unit tests · golden agent tests · e2e driver · SVG geometry check

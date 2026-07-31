@@ -5,9 +5,10 @@ created/deleted or a phase gate passes. Never record account IDs or full ARNs.
 
 ## Current phase
 
-**v1 COMPLETE** (all six phases passed 2026-07-28 → 2026-07-29). Next:
-v2 experiments — code-as-reasoning distillation + augmentation; Kimi K3
-teacher A/B (see docs/CASE_STUDY.md).
+**v1.1.0 — FinOps** (2026-07-31): cost estimation, the $2000 dual approval gate, and the
+7th runtime `llmops_finops`. v1 complete before it (all six phases 2026-07-28 → 2026-07-29).
+Next: v2 experiments — code-as-reasoning distillation + augmentation; Kimi K3 teacher A/B
+(see docs/CASE_STUDY.md).
 
 ## Phase gates
 
@@ -27,12 +28,12 @@ teacher A/B (see docs/CASE_STUDY.md).
 |---|---|---|---|
 | IAM roles ×8 | llmops-harness-execution, llmops-sagemaker-execution, llmops-{driver,start,resume,webhook}-lambda, llmops-sfn-execution, llmops-eval-execution, llmops-scheduler-invoke | deploy/01_iam.py + phase scripts | least-privilege, scoped to `llmops-*` |
 | S3 bucket | (name in SSM `/llmops/storage/bucket`) | deploy/03_storage.py | versioned, SSE-S3, PAB, runs/ 90d lifecycle |
-| DynamoDB ×2 | llmops-pipeline-runs (GSI job_name-index), llmops-stage-events | deploy/03_storage.py | PITR on |
+| DynamoDB ×4 | llmops-pipeline-runs (GSI job_name-index), llmops-stage-events, llmops-cost-estimates, llmops-cost-actuals | deploy/03_storage.py | PITR on; cost tables added v1.1.0 |
 | EventBridge | bus `llmops-pipeline` + rule `llmops-sagemaker-job-state` (default bus) | 03 + 07 | wake chain for launch-and-release |
 | SNS topic | llmops-escalations | deploy/03_storage.py | EscalatedToHuman notifications |
-| Harnesses ×6 | llmops_{data_prep,finetune,eval,deploy,monitor,orchestrator} | deploy/05_harnesses.py | full ids in SSM `/llmops/harness/*`; shared Memory attached; obs + online evals wired; currently on Opus 5 (Fable 5 fallback policy, AGENTS.md) |
-| AgentCore Memory | llmops_shared_memory (SEMANTIC + EPISODIC) | deploy/04_wire_memory.py | shared across all 6 harnesses |
-| Lambdas ×4 | llmops-{harness-driver,start-pipeline,resume-pipeline,webhook} | deploy/07_lambdas.py | driver: turn-continuation + auto model failover |
+| Harnesses ×7 | llmops_{data_prep,finetune,eval,deploy,monitor,orchestrator,finops} | deploy/05_harnesses.py | full ids in SSM `/llmops/harness/*`; shared Memory attached; obs + online evals wired; currently on Opus 5 (Fable 5 fallback policy, AGENTS.md) |
+| AgentCore Memory | llmops_shared_memory (SEMANTIC + EPISODIC) | deploy/04_wire_memory.py | shared across all 7 harnesses |
+| Lambdas ×5 | llmops-{harness-driver,start-pipeline,resume-pipeline,webhook,finops-reconcile} | deploy/07_lambdas.py | driver: turn-continuation + auto model failover |
 | Step Functions | llmops-pipeline (STANDARD) | deploy/07_lambdas.py | 9 states incl. remediation loop |
 | Triggers | scheduler `llmops-nightly` (DISABLED) · HTTP API `llmops-triggers` (/webhook, /runs) · secret `llmops/webhook` | deploy/08_triggers.py | endpoint in SSM `/llmops/triggers/api_endpoint` |
 | Admin console | `agent-cicd-admin` stack (Lambda+APIGW+DDB+Cognito) | ops-console deploy.sh | login secret `agent-admin/dashboard-login`; monitors orchestrator + finetune |
@@ -42,8 +43,17 @@ _Prod-only, not deployed: VPC + endpoints (deploy/02_network.py), harness.prod.j
 
 ## Standing cost posture
 
-Zero standing billable resources: no SageMaker endpoints, scheduler DISABLED,
+Zero standing billable resources: no SageMaker endpoints, pipeline scheduler DISABLED,
 serverless spine idles free. Total v1 build cost ≈ $12–15.
+
+v1.1.0 adds **one recurring cost**: the daily 09:00 UTC finops reconcile at
+**~$1.5–4.5/month** (~$0.05–0.15 per invocation). This is the only schedule in the platform
+that is enabled by default, because an auditor that only runs when someone remembers to run it
+does not audit anything. All of its AWS reads are read-only billing APIs at $0.
+
+Guardrails, in order of who acts first: the console's **$2000 dual gate** (single-run worst
+case, or project-to-date + this estimate), then the pre-existing account-level AWS Budget
+`bedrock-monthly-dev` at **$1000/month**. See docs/COST.md.
 
 ## Harness versions & endpoint pins
 
