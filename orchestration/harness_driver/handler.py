@@ -28,6 +28,7 @@ from typing import Optional
 
 import boto3
 from botocore.config import Config as BotoConfig
+from boto3.dynamodb.conditions import Key
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))  # repo layout
 try:
@@ -213,6 +214,75 @@ def _record_stage_event(ddb, run_id: str, stage: str, event_name: str, detail: d
         "sk": f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}#{stage}#{event_name}",
         "detail": json.dumps(detail, default=str),
     })
+
+
+#: A human verdict addressed to a run, parked where the run's own events live. The sk
+#: prefix keeps directives in one contiguous query range and out of the timeline the
+#: console renders.
+DIRECTIVE_SK = "directive#"
+
+
+def put_directive(ddb, run_id: str, decision: str, rationale: str = "",
+                  adjusted_params: dict | None = None, actor: str = "conductor"):
+    """Park a verdict where the agent working `run_id` will pick it up.
+
+    Until this existed, a stage agent could ASK a blocking question (checkpoint /
+    escalate_human) but nothing could ANSWER it: resolve_escalation wrote an
+    EscalationResolved stage-event that no reader consumed, so triage was advice
+    delivered into the void. Live, data-prep proved its own approved teacher budget
+    infeasible -- 13.5k output tokens per attempt against a plan that assumed 1,800 --
+    and then went on spending under that cap, because "continue" was the only answer
+    the driver knew how to give.
+    """
+    ddb.Table(os.environ["EVENTS_TABLE"]).put_item(Item={
+        "run_id": run_id,
+        "sk": f"{DIRECTIVE_SK}{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}",
+        "decision": decision,
+        "rationale": str(rationale)[:2000],
+        "adjusted_params": json.dumps(adjusted_params or {}, default=str),
+        "actor": actor,
+        "delivered": False,
+    })
+
+
+def take_directive(ddb, run_id: str) -> Optional[dict]:
+    """Pop the oldest undelivered directive for this run, or None.
+
+    Delivered exactly once, by a conditional update: a verdict redelivered on every
+    checkpoint reads as a fresh instruction each time, and an agent told "raise the cap
+    to $13" on every breath would raise it repeatedly. The condition also makes two
+    concurrent drivers safe -- the loser sees ConditionalCheckFailed and moves on.
+
+    Never raises. A directives lookup that fails must degrade to "no directive", not
+    stall a run that merely wanted another turn.
+    """
+    try:
+        table = ddb.Table(os.environ["EVENTS_TABLE"])
+        rows = table.query(
+            KeyConditionExpression=Key("run_id").eq(run_id)
+            & Key("sk").begins_with(DIRECTIVE_SK)).get("Items", [])
+        for row in sorted(rows, key=lambda r: r.get("sk", "")):
+            if not str(row.get("sk", "")).startswith(DIRECTIVE_SK) or row.get("delivered"):
+                continue
+            try:
+                table.update_item(
+                    Key={"run_id": run_id, "sk": row["sk"]},
+                    UpdateExpression="SET delivered = :t, delivered_at = :now",
+                    ConditionExpression="delivered = :f",
+                    ExpressionAttributeValues={
+                        ":t": True, ":f": False,
+                        ":now": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
+            except Exception:  # noqa: BLE001 — another driver claimed it first
+                continue
+            params = row.get("adjusted_params") or "{}"
+            return {"decision": row.get("decision", ""),
+                    "rationale": row.get("rationale", ""),
+                    "adjusted_params": (json.loads(params)
+                                        if isinstance(params, str) else dict(params)),
+                    "actor": row.get("actor", "conductor")}
+    except Exception:  # noqa: BLE001 — no directive beats a stalled run
+        return None
+    return None
 
 
 def _gate_event(metrics: dict) -> str:
@@ -517,7 +587,16 @@ def handler(event, context=None, clients=None):
                 # paid for (live: a budget escalation raised after a pilot found the
                 # plan's token estimate 6.5x low). Its own <60s guard was also dead
                 # code, since _out_of_time() fires at 850s remaining, far earlier.
-                messages = _tool_result_content(tu, {"status": "continue"})
+                #
+                # A checkpoint is also the DELIVERY point for a human verdict. It is
+                # the one moment a working agent is guaranteed to be listening, so a
+                # directive parked by resolve_escalation (or by an operator) rides back
+                # in the toolResult here. Without this the answer channel was
+                # write-only: the agent could ask and nothing could reply.
+                directive = take_directive(c["ddb"], event["run_id"])
+                messages = _tool_result_content(tu, {
+                    "status": "directive", "directive": directive} if directive
+                    else {"status": "continue"})
                 continue
             if name == "escalate_human":
                 handle_escalate(c, event, args)
@@ -530,11 +609,24 @@ def handler(event, context=None, clients=None):
                 # (stage-events) and emit the resolution event. Discovered unserviced
                 # by the same drift guard that found launch_run — a triage that ends
                 # in "unsupported" leaves the pipeline paused forever.
-                _record_stage_event(c["ddb"], args.get("run_id", event.get("run_id", "")),
+                #
+                # The audit record alone was still a verdict nobody heard: the waiting
+                # agent reads directives, not the timeline. So the decision is ALSO
+                # parked for delivery — addressed to the run being triaged, never to
+                # the conductor's own run, or it lands in the triager's mailbox and the
+                # stuck run waits forever.
+                subject = args.get("run_id") or ""
+                _record_stage_event(c["ddb"], subject or event.get("run_id", ""),
                                     "orchestrator", "EscalationResolved",
                                     {"decision": args.get("decision"),
                                      "rationale": str(args.get("rationale", ""))[:500],
                                      "adjusted_params": args.get("adjusted_params") or {}})
+                if subject:
+                    put_directive(c["ddb"], subject,
+                                  decision=str(args.get("decision", "")),
+                                  rationale=str(args.get("rationale", "")),
+                                  adjusted_params=args.get("adjusted_params") or {},
+                                  actor="conductor")
                 _invoke(c["agentcore"], event["harness_id"], sess,
                         _tool_result_content(tu, {"status": "recorded"}),
                         event.get("qualifier"))
