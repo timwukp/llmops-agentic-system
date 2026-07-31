@@ -144,6 +144,7 @@
           "arn:aws:s3:::<DATA_BUCKET>/skills-mirror/*",
           "arn:aws:s3:::<DATA_BUCKET>/finops/*",
           "arn:aws:s3:::<DATA_BUCKET>/contracts/*",
+          "arn:aws:s3:::<DATA_BUCKET>/pipeline/contracts/*",
           "arn:aws:s3:::<DATA_BUCKET>/cost/*"
         ]
       },
@@ -156,7 +157,7 @@
         "Condition": {
           "StringLike": {
             "s3:prefix": ["runs/*", "reports/*", "skills-mirror/*",
-                          "finops/*", "contracts/*", "cost/*"]
+                          "finops/*", "contracts/*", "pipeline/contracts/*", "cost/*"]
           }
         }
       },
