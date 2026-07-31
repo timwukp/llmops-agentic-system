@@ -113,6 +113,9 @@ def score_generations(generations: list[dict], val_rows: list[dict],
     """Execute every generation against its task's pairs; exact match only."""
     by_key = {(r["task_id"], r.get("variant", "")): r for r in val_rows}
     results, n_solved, n_parsed, n_truncated = [], 0, 0, 0
+    # Emitted a `def transform(` line that does not compile. Reported separately
+    # because it is neither "wrote nothing" nor "wrote a wrong program".
+    n_unparseable = 0
     # Counted across EVERY status, unlike output truncation. A row whose prompt was
     # cut never saw its whole task, so it can also come back format-valid and fail
     # verification -- that row looks like a wrong program when it is a wrong input.
@@ -128,14 +131,38 @@ def score_generations(generations: list[dict], val_rows: list[dict],
         n_prompt_cut += prompt_cut
 
         code = extract_code(gen.get("generation", ""))
-        if code is None:
+        # Code that does not COMPILE is a format failure, not a wrong answer.
+        # extract_code only regex-matches a `def transform(` line, so a body cut off
+        # mid-expression carries the signature and nothing runnable. Counting it
+        # format-valid inflates the two places that number is load-bearing: the
+        # verdict compute_lift falls back to when both solve rates are 0 (entirely
+        # expected for a 1.7B student here), and the pipeline's `format_validity:
+        # 0.95` gate. Measured against the real val set before this check existed:
+        # `def transform(grid):\n out = [[c for c in row] for row in gr` scored
+        # format_valid 1.000. Compiling here rather than in the sandbox keeps the
+        # distinction where it belongs -- a SyntaxError is a property of the text,
+        # not of any input pair, and the sandbox reports it once per pair as an
+        # execution error indistinguishable from a runtime crash.
+        syntax_err = None
+        if code is not None:
+            try:
+                compile(code, "<generation>", "exec")
+            except SyntaxError as exc:
+                syntax_err = f"{type(exc).__name__}: {exc.msg} (line {exc.lineno})"
+        if code is None or syntax_err:
             # A generation that ran out of tokens mid-answer is a budget artefact,
-            # not evidence the model cannot write code. Keep the two apart.
+            # not evidence the model cannot write code. Keep the two apart. This is
+            # the dominant source of unparseable code: the body stops mid-expression
+            # exactly because the budget ran out, so it earns the same caveat.
             n_truncated += bool(gen.get("truncated"))
-            results.append({**key_fields(key), "status": "no_transform_emitted",
+            n_unparseable += bool(syntax_err)
+            results.append({**key_fields(key),
+                            "status": "unparseable_code" if syntax_err
+                                      else "no_transform_emitted",
                             "solved": False,
                             "truncated": bool(gen.get("truncated")),
-                            "prompt_truncated": prompt_cut})
+                            "prompt_truncated": prompt_cut,
+                            "fail_reason": syntax_err})
             continue
         n_parsed += 1
 
@@ -172,6 +199,7 @@ def score_generations(generations: list[dict], val_rows: list[dict],
         "n_format_valid": n_parsed,
         "n_solved": n_solved,
         "n_truncated_format_failures": n_truncated,
+        "n_unparseable_code": n_unparseable,
         "n_prompt_truncated": n_prompt_cut,
         "solve_rate": n_solved / n if n else 0.0,
         "format_valid_rate": n_parsed / n if n else 0.0,

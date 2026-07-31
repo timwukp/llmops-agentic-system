@@ -115,6 +115,54 @@ def test_wrong_answer_fails():
     assert rep["n_format_valid"] == 1, "it parsed fine — it was simply wrong"
 
 
+def test_code_that_does_not_compile_is_a_format_failure_not_a_wrong_answer():
+    """`extract_code` only regex-matches a `def transform(` line, so a body that stops
+    mid-expression arrives here carrying the signature and nothing runnable.
+
+    Found by running negative controls against the real val set: a generation cut off
+    at `out = [[c for c in row] for row in gr` scored format_valid **1.000** over 200
+    rows. That inflates the two places the number is load-bearing — the verdict
+    `compute_lift` falls back to when both solve rates are 0 (entirely expected for a
+    1.7B student on ARC-AGI-2) and the pipeline's `format_validity: 0.95` gate — so a
+    model that emitted 200 unparseable stubs would have read as perfectly well-formed.
+    """
+    for code in ["def transform(grid)\n    return grid",              # missing colon
+                 "def transform(grid):\n    out = [[c for c in row",   # cut mid-expr
+                 "def transform(grid):\n    return (1,"]:              # unclosed paren
+        rep = score(f"```python\n{code}\n```")
+        assert rep["n_format_valid"] == 0, code
+        assert rep["n_unparseable_code"] == 1, code
+        assert rep["results"][0]["status"] == "unparseable_code", code
+        assert "SyntaxError" in rep["results"][0]["fail_reason"], code
+        assert rep["n_solved"] == 0, code
+
+
+def test_unparseable_code_is_distinct_from_emitting_no_code_at_all():
+    """Both are format failures, but they say different things about the model: one
+    tried and ran out, the other never wrote a `transform`. A single bucket would hide
+    which one a run is dominated by, and only the first is fixed by more tokens."""
+    nothing = score("I don't know how to solve this.")
+    broken = score("```python\ndef transform(grid)\n    return grid\n```")
+    assert nothing["results"][0]["status"] == "no_transform_emitted"
+    assert nothing["n_unparseable_code"] == 0
+    assert broken["results"][0]["status"] == "unparseable_code"
+    assert broken["n_unparseable_code"] == 1
+    assert nothing["n_format_valid"] == broken["n_format_valid"] == 0
+
+
+def test_valid_code_that_merely_crashes_at_runtime_stays_format_valid():
+    """The negative control for the compile check: it must reject only code that does
+    not PARSE. A NameError is a wrong program — the model wrote real Python and got the
+    answer wrong, which is exactly what `failed_verification` means. Folding it into
+    the format bucket would understate format validity as badly as the original bug
+    overstated it."""
+    rep = score("```python\ndef transform(grid):\n    return undefined_name(grid)\n```")
+    assert rep["n_format_valid"] == 1
+    assert rep["n_unparseable_code"] == 0
+    assert rep["results"][0]["status"] == "failed_verification"
+    assert rep["n_solved"] == 0
+
+
 def test_partially_correct_answer_gets_no_credit():
     """Correct on pair 1, wrong on pair 2. Exact match means all-or-nothing."""
     code = ("def transform(grid):\n"
