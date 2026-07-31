@@ -13,7 +13,12 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install deps
-        run: pip install -q "boto3>=1.43.51" pytest
+        # numpy is a real test dependency, not an optional one: the eval scorer runs
+        # candidate code through verify_sandbox.py, which imports numpy at module level.
+        # Without it pytest fails at COLLECTION and zero tests run — which is how PR #9
+        # went red while every test in it passed locally. torch/transformers stay out:
+        # the generation tests stub them deliberately so CI needs no GPU stack.
+        run: pip install -q "boto3>=1.43.51" pytest numpy
       - name: Compile all Python
         run: python -m py_compile $(git ls-files '*.py')
       - name: Validate harness configs (offline)
