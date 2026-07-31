@@ -236,11 +236,26 @@ def handle_job_launched(c, event, args) -> dict:
     return {"released": True}
 
 
+#: The finops agent is the one harness that is NOT a pipeline stage: it is invoked by
+#: the scheduler, not the state machine, so it has no task token, no run in the runs
+#: table, and no manifest to append to. Its terminal tools are its own.
+FINOPS_STAGE = "finops"
+FINOPS_TERMINAL_TOOLS = ("publish_cost_report", "update_rate_card", "flag_variance")
+
+
+def _is_finops(event) -> bool:
+    return event.get("stage") == FINOPS_STAGE
+
+
 def handle_escalate(c, event, args) -> dict:
     run_id = event["run_id"]
     c["sns"].publish(TopicArn=os.environ["LLMOPS_SNS_TOPIC"],
                      Subject=f"[llmops] escalation: {run_id}/{event['stage']}",
                      Message=json.dumps(args, indent=2, default=str))
+    if _is_finops(event):
+        # No runs-table row exists for an audit invocation; updating one would mint a
+        # phantom run that the console would then display alongside real pipeline runs.
+        return {"escalated": True}
     c["ddb"].Table(os.environ["RUNS_TABLE"]).update_item(
         Key={"run_id": run_id},
         UpdateExpression="SET #s = :v",
@@ -254,6 +269,72 @@ def handle_escalate(c, event, args) -> dict:
                                    error="EscalatedToHuman",
                                    cause=args.get("reason", "")[:250])
     return {"escalated": True}
+
+
+def handle_finops_tool(c, event, name: str, args: dict) -> dict:
+    """Service one of the finops agent's terminal tools.
+
+    Same trust-but-verify contract as ``stage_complete``: a claimed S3 artifact is
+    head_object'd before the call is accepted, because an agent that reports a report
+    it never wrote produces a dashboard panel pointing at a 404.
+
+    Two rejections are specific to cost data and are worth stating in code rather than
+    only in the prompt:
+
+    - A report for a period Cost Explorer still marks ``Estimated`` must declare
+      ``settlement: provisional``. A provisional number published as settled is how a
+      figure that will still move gets quoted as final.
+    - ``flag_variance`` must name a ``driver`` category. One aggregate percentage says
+      the estimate was wrong without saying what to fix, and the whole point of
+      reconciliation is that the next estimate is better.
+
+    Rejections come back as a toolResult so the agent can correct and re-call, exactly
+    as stage_complete's missing-output path does — the turn is not wasted.
+    """
+    period = event.get("params", {}).get("period", "")
+    project = event.get("params", {}).get("project", "")
+
+    if name == "publish_cost_report":
+        missing = verify_outputs(c["s3"], [args.get("report_uri", "")])
+        if missing:
+            return {"ok": False, "reason": f"report_uri not in S3: {missing}. "
+                                          "Write it and call publish_cost_report again."}
+        if args.get("settlement") not in ("provisional", "settled"):
+            return {"ok": False, "reason": "settlement must be 'provisional' or "
+                                          "'settled'; a period Cost Explorer flagged "
+                                          "Estimated is provisional."}
+    elif name == "flag_variance":
+        if not args.get("driver"):
+            return {"ok": False, "reason": "flag_variance needs 'driver': the single "
+                                          "category driving the delta. A percentage "
+                                          "alone does not say what to fix."}
+    elif name == "update_rate_card":
+        missing = verify_outputs(c["s3"], [args.get("rates_uri", "")])
+        if missing:
+            return {"ok": False, "reason": f"rates_uri not in S3: {missing}."}
+
+    # Audit trail keyed (project, period) so a missing daily reconcile is visible, and
+    # so the console can read a period's findings without scanning.
+    c["ddb"].Table(os.environ["ACTUALS_TABLE"]).put_item(Item={
+        "project": project or "unknown",
+        "sk": f"{period}#finding#{name}#{args.get('run_id', '-')}",
+        "task": event.get("task", ""),
+        "tool": name,
+        "detail": json.dumps(args, default=str)[:8000],
+    })
+
+    # A variance the agent flagged is a human-facing finding, not just a log line.
+    if name == "flag_variance":
+        try:
+            c["sns"].publish(
+                TopicArn=os.environ["LLMOPS_SNS_TOPIC"],
+                Subject=f"[llmops] cost variance: {args.get('run_id', '?')} "
+                        f"{args.get('variance_pct', '?')}%",
+                Message=json.dumps(args, indent=2, default=str))
+        except Exception as exc:  # noqa: BLE001 — a notify failure must not lose the row
+            print(f"[finops] variance notify failed: {exc}")
+
+    return {"ok": True, "tool": name, "args": args}
 
 
 #: Fallback chain for vendor-quota 5xx bursts (AGENTS.md: failover is a design layer).
@@ -394,6 +475,22 @@ def handler(event, context=None, clients=None):
                         _tool_result_content(tu["toolUseId"], {"status": "escalated"}),
                         event.get("qualifier"))
                 return {"status": "escalated"}
+            if name in FINOPS_TERMINAL_TOOLS and _is_finops(event):
+                result = handle_finops_tool(c, event, name, args)
+                if not result["ok"]:
+                    content = _tool_result_content(tu["toolUseId"], {
+                        "status": "rejected", "reason": result["reason"]})
+                    continue
+                # flag_variance is a FINDING, not the end of the task: an audit can
+                # flag several runs in one turn, so acknowledge and let it continue.
+                # The report/rate-card calls are terminal.
+                ack = _tool_result_content(tu["toolUseId"], {"status": "recorded"})
+                if name == "flag_variance":
+                    content = ack
+                    continue
+                _invoke(c["agentcore"], event["harness_id"], sess, ack,
+                        event.get("qualifier"))
+                return {"status": "completed", "tool": name, **result["args"]}
             # unknown tool — acknowledge and continue rather than dying
             content = _tool_result_content(tu["toolUseId"], {"status": "unsupported"})
             continue

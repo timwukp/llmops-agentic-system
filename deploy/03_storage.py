@@ -8,6 +8,8 @@ Creates (all tagged project=llmops-agentic-system):
   - DynamoDB llmops-pipeline-runs  (PK run_id S; GSI job_name-index on job_name S;
       on-demand; point-in-time recovery ON)
   - DynamoDB llmops-stage-events   (PK run_id S, SK sk S; on-demand)
+  - DynamoDB llmops-cost-estimates (PK id S; GSI project-created_at-index; PITR on)
+  - DynamoDB llmops-cost-actuals   (PK project S, SK sk S; PITR on)
   - EventBridge custom bus llmops-pipeline
   - SNS topic llmops-escalations
   - SSM parameters /llmops/storage/{bucket,runs_table,events_table,event_bus,escalations_topic_arn}
@@ -29,6 +31,14 @@ from botocore.exceptions import ClientError
 TAG_KEY, TAG_VAL = "project", "llmops-agentic-system"
 RUNS_TABLE = "llmops-pipeline-runs"
 EVENTS_TABLE = "llmops-stage-events"
+#: Cost estimates and their approval decisions. Separate from the console's generic
+#: table because an approval is an audit record: who asked, who approved, on what
+#: number, at what time. PITR is on for the same reason.
+ESTIMATES_TABLE = "llmops-cost-estimates"
+#: Reconciled actuals, one row per (period, run, category), plus reserved #audit#/
+#: #finding# rows from the finops agent. (PK, SK) mirrors llmops-stage-events so a
+#: range query by period is natural.
+ACTUALS_TABLE = "llmops-cost-actuals"
 EVENT_BUS = "llmops-pipeline"
 SNS_TOPIC = "llmops-escalations"
 RUNS_EXPIRE_DAYS = 90
@@ -182,6 +192,43 @@ def main():
         }, args.dry_run),
         "schema": "PK run_id (S), SK sk (S), on-demand",
     }
+    results[ESTIMATES_TABLE] = {
+        "status": ensure_table(ddb, ESTIMATES_TABLE, {
+            "AttributeDefinitions": [
+                {"AttributeName": "id", "AttributeType": "S"},
+                {"AttributeName": "project", "AttributeType": "S"},
+                {"AttributeName": "created_at", "AttributeType": "S"},
+            ],
+            "KeySchema": [{"AttributeName": "id", "KeyType": "HASH"}],
+            # The approval queue and the project rollup both read "this project's
+            # estimates, newest first". Without this GSI both would be table scans,
+            # and the queue is on the dashboard's default render path.
+            "GlobalSecondaryIndexes": [{
+                "IndexName": "project-created_at-index",
+                "KeySchema": [
+                    {"AttributeName": "project", "KeyType": "HASH"},
+                    {"AttributeName": "created_at", "KeyType": "RANGE"},
+                ],
+                "Projection": {"ProjectionType": "ALL"},
+            }],
+        }, args.dry_run, pitr=True),
+        "schema": "PK id (S), GSI project-created_at-index, on-demand, PITR on "
+                  "(approval decisions are audit records)",
+    }
+    results[ACTUALS_TABLE] = {
+        "status": ensure_table(ddb, ACTUALS_TABLE, {
+            "AttributeDefinitions": [
+                {"AttributeName": "project", "AttributeType": "S"},
+                {"AttributeName": "sk", "AttributeType": "S"},
+            ],
+            "KeySchema": [
+                {"AttributeName": "project", "KeyType": "HASH"},
+                {"AttributeName": "sk", "KeyType": "RANGE"},
+            ],
+        }, args.dry_run, pitr=True),
+        "schema": "PK project (S), SK sk = <period>#<run_id|audit|finding>#<...>, "
+                  "on-demand, PITR on",
+    }
     results["event_bus"] = {"name": EVENT_BUS, "status": ensure_bus(events, args.dry_run)}
     status, topic_arn = ensure_topic(sns, topic_arn, args.dry_run)
     results["sns_topic"] = {"name": SNS_TOPIC, "status": status}
@@ -190,6 +237,8 @@ def main():
         "bucket": bucket,
         "runs_table": RUNS_TABLE,
         "events_table": EVENTS_TABLE,
+        "estimates_table": ESTIMATES_TABLE,
+        "actuals_table": ACTUALS_TABLE,
         "event_bus": EVENT_BUS,
         "escalations_topic_arn": topic_arn,
     }

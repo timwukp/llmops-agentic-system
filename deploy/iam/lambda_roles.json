@@ -75,6 +75,13 @@
             ]
           },
           {
+            "_comment": "The driver services the finops agent's terminal tools, which write #finding# rows to the actuals table. Without this the audit's own findings fail with AccessDenied while the rest of the turn succeeds. Write-only on actuals: the driver records findings, it does not read the ledger back.",
+            "Sid": "CostActualsWrite",
+            "Effect": "Allow",
+            "Action": ["dynamodb:PutItem"],
+            "Resource": "arn:aws:dynamodb:<REGION>:<ACCOUNT_ID>:table/llmops-cost-actuals"
+          },
+          {
             "Sid": "PutPipelineEvents",
             "Effect": "Allow",
             "Action": "events:PutEvents",
@@ -156,6 +163,44 @@
               "states:SendTaskHeartbeat"
             ],
             "Resource": "*"
+          }
+        ]
+      }
+    },
+
+    "finops_reconcile": {
+      "_comment": "finops_reconcile: EventBridge Scheduler target, daily 09:00 UTC. Picks the periods to reconcile and delegates the streaming turn loop to harness-driver. It reads billing itself for nothing — the agent does that through its own execution role; this Lambda only needs to choose periods and invoke.",
+      "permissionsPolicy": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Sid": "ListReconcileTargets",
+            "Effect": "Allow",
+            "Action": ["dynamodb:Query", "dynamodb:Scan"],
+            "Resource": [
+              "arn:aws:dynamodb:<REGION>:<ACCOUNT_ID>:table/llmops-cost-estimates",
+              "arn:aws:dynamodb:<REGION>:<ACCOUNT_ID>:table/llmops-cost-estimates/index/*",
+              "arn:aws:dynamodb:<REGION>:<ACCOUNT_ID>:table/llmops-cost-actuals"
+            ]
+          },
+          {
+            "_comment": "PutItem only, for the reserved #audit# row that makes a missed daily reconcile visible.",
+            "Sid": "RecordAuditOutcome",
+            "Effect": "Allow",
+            "Action": ["dynamodb:PutItem"],
+            "Resource": "arn:aws:dynamodb:<REGION>:<ACCOUNT_ID>:table/llmops-cost-actuals"
+          },
+          {
+            "Sid": "InvokeHarnessDriver",
+            "Effect": "Allow",
+            "Action": "lambda:InvokeFunction",
+            "Resource": "arn:aws:lambda:<REGION>:<ACCOUNT_ID>:function:llmops-harness-driver"
+          },
+          {
+            "Sid": "AuditFailurePublish",
+            "Effect": "Allow",
+            "Action": "sns:Publish",
+            "Resource": "arn:aws:sns:<REGION>:<ACCOUNT_ID>:llmops-escalations"
           }
         ]
       }
