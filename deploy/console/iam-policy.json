@@ -153,18 +153,57 @@
       ]
     },
     {
+      "_comment": "Estimates and approval decisions: the console writes them. Actuals are written only by the finops agent via the driver, so the console reads them and never writes — a dashboard that can edit reconciled cost is not an audit trail.",
+      "Sid": "DDBCostEstimates",
+      "Effect": "Allow",
+      "Action": ["dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:GetItem", "dynamodb:Query", "dynamodb:Scan"],
+      "Resource": [
+        "arn:aws:dynamodb:REGION:ACCOUNT_ID:table/llmops-cost-estimates",
+        "arn:aws:dynamodb:REGION:ACCOUNT_ID:table/llmops-cost-estimates/index/*"
+      ]
+    },
+    {
+      "Sid": "DDBCostActualsRead",
+      "Effect": "Allow",
+      "Action": ["dynamodb:GetItem", "dynamodb:Query"],
+      "Resource": "arn:aws:dynamodb:REGION:ACCOUNT_ID:table/llmops-cost-actuals"
+    },
+    {
+      "_comment": "Read-only on billing, deliberately. ce:* and pricing:* have no resource-level ARNs so Resource must be * — the scoping is that only Get/List/Describe verbs appear here. budgets:DescribeBudgets surfaces the existing $1000 account guardrail rather than duplicating it.",
+      "Sid": "BillingRead",
+      "Effect": "Allow",
+      "Action": [
+        "ce:GetCostAndUsage",
+        "ce:GetCostAndUsageWithResources",
+        "ce:GetDimensionValues",
+        "ce:GetTags",
+        "ce:ListCostAllocationTags",
+        "pricing:GetProducts",
+        "pricing:GetAttributeValues",
+        "pricing:DescribeServices",
+        "budgets:DescribeBudgets"
+      ],
+      "Resource": "*"
+    },
+    {
       "Sid": "InvokeStartPipelineAndSelf",
       "Effect": "Allow",
       "Action": ["lambda:InvokeFunction"],
       "Resource": [
         "arn:aws:lambda:REGION:ACCOUNT_ID:function:llmops-start-pipeline",
+        "arn:aws:lambda:REGION:ACCOUNT_ID:function:llmops-finops-reconcile",
         "arn:aws:lambda:REGION:ACCOUNT_ID:function:llmops-admin"
       ]
     },
     {
+      "_comment": "AdminListGroupsForUser is required for the approver check: GetUser returns the username and attributes but NOT group membership, and a bearer access token carries no cognito:groups claim. Without this call the separation-of-duties gate has nothing to check.",
       "Sid": "CognitoAuth",
       "Effect": "Allow",
-      "Action": ["cognito-idp:InitiateAuth", "cognito-idp:GetUser"],
+      "Action": [
+        "cognito-idp:InitiateAuth",
+        "cognito-idp:GetUser",
+        "cognito-idp:AdminListGroupsForUser"
+      ],
       "Resource": "*"
     },
     {

@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
-"""08_triggers.py — wire the four pipeline triggers to start-pipeline.
+"""08_triggers.py — wire the four pipeline triggers to start-pipeline, plus the
+daily FinOps reconciliation schedule.
 
 1. EventBridge Scheduler: cron schedule (default DISABLED — enable when nightly
    runs are wanted) invoking llmops-start-pipeline with trigger_source=scheduler.
+1b. EventBridge Scheduler: llmops-finops-daily, cron(0 9 * * ? *), default ENABLED —
+   invokes llmops-finops-reconcile. Enabled by default because it only reads billing
+   APIs, and because a day skipped is a period left provisional.
 2. Webhook: API Gateway HTTP API -> llmops-webhook Lambda (HMAC verified inside);
    secret created in Secrets Manager if absent.
 3. Admin API: POST /runs on the same HTTP API -> llmops-start-pipeline directly
@@ -23,6 +27,7 @@ import sys
 import boto3
 
 SCHEDULE_NAME = "llmops-nightly"
+FINOPS_SCHEDULE_NAME = "llmops-finops-daily"
 API_NAME = "llmops-triggers"
 SECRET_ID = "llmops/webhook"
 
@@ -52,8 +57,53 @@ def ensure_schedule(sched, lam_arn, role_arn, enable, dry):
     return {"schedule": SCHEDULE_NAME, "action": action, "state": state}
 
 
+def ensure_finops_schedule(sched, lam_arn, role_arn, enable, dry):
+    """Daily cost reconciliation — ENABLED by default, unlike the nightly pipeline.
+
+    The nightly run is off by default because it spends GPU money. This one only reads
+    billing APIs, and its value comes from running every day: a period first read while
+    Cost Explorer still marks it Estimated stays provisional until something goes back
+    for it. Skipping days is how a dashboard ends up quoting provisional numbers.
+
+    09:00 UTC, ~9 h after the nightly pipeline's 03:00 start, so a run launched last
+    night has finished and its usage has begun landing in Cost Explorer.
+
+    NON-FLEXIBLE window on purpose: the reconcile Lambda derives its default period
+    from the current date, so a job drifting past midnight UTC would silently read a
+    different day than the one it was scheduled for.
+    """
+    state = "ENABLED" if enable else "DISABLED"
+    if dry:
+        return {"schedule": FINOPS_SCHEDULE_NAME,
+                "would": f"create/update cron(0 9 * * ? *) {state}"}
+    body = dict(
+        Name=FINOPS_SCHEDULE_NAME,
+        ScheduleExpression="cron(0 9 * * ? *)",  # 09:00 UTC daily
+        ScheduleExpressionTimezone="UTC",
+        FlexibleTimeWindow={"Mode": "OFF"},
+        Target={
+            "Arn": lam_arn,
+            "RoleArn": role_arn,
+            # Empty input: the Lambda picks the newly-settled period plus any period
+            # still provisional. Pinning a period here would freeze the schedule to a
+            # date and defeat the re-settlement pass.
+            "Input": json.dumps({"task": "reconcile"}),
+            "RetryPolicy": {"MaximumRetryAttempts": 2,
+                            "MaximumEventAgeInSeconds": 3600},
+        },
+        State=state,
+    )
+    try:
+        sched.create_schedule(**body)
+        action = "created"
+    except sched.exceptions.ConflictException:
+        sched.update_schedule(**body)
+        action = "updated"
+    return {"schedule": FINOPS_SCHEDULE_NAME, "action": action, "state": state}
+
+
 def ensure_scheduler_role(iam, region, account, dry):
-    """Role EventBridge Scheduler assumes to invoke start-pipeline."""
+    """Role EventBridge Scheduler assumes to invoke start-pipeline and finops-reconcile."""
     name = "llmops-scheduler-invoke"
     if dry:
         return None, {"role": name, "would": "create"}
@@ -63,7 +113,10 @@ def ensure_scheduler_role(iam, region, account, dry):
         "Condition": {"StringEquals": {"aws:SourceAccount": account}}}]}
     policy = {"Version": "2012-10-17", "Statement": [{
         "Effect": "Allow", "Action": "lambda:InvokeFunction",
-        "Resource": f"arn:aws:lambda:{region}:{account}:function:llmops-start-pipeline"}]}
+        "Resource": [
+            f"arn:aws:lambda:{region}:{account}:function:llmops-start-pipeline",
+            f"arn:aws:lambda:{region}:{account}:function:llmops-finops-reconcile",
+        ]}]}
     try:
         iam.create_role(RoleName=name, AssumeRolePolicyDocument=json.dumps(trust),
                         Tags=[{"Key": "project", "Value": "llmops-agentic-system"}])
@@ -129,6 +182,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--region", required=True)
     ap.add_argument("--enable-schedule", action="store_true")
+    # Read-only billing work, so it defaults ON; --no-finops-schedule turns it off.
+    ap.add_argument("--no-finops-schedule", action="store_true",
+                    help="create the daily cost reconciliation schedule DISABLED")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
@@ -146,6 +202,9 @@ def main():
     results.append(r)
     lam_arn = f"arn:aws:lambda:{region}:{account}:function:llmops-start-pipeline"
     results.append(ensure_schedule(sched, lam_arn, role_arn, args.enable_schedule, args.dry_run))
+    finops_arn = f"arn:aws:lambda:{region}:{account}:function:llmops-finops-reconcile"
+    results.append(ensure_finops_schedule(sched, finops_arn, role_arn,
+                                          not args.no_finops_schedule, args.dry_run))
     results.append(ensure_secret(sm, args.dry_run))
     api_res = ensure_api(apigw, lam, region, account, args.dry_run)
     results.append(api_res)
