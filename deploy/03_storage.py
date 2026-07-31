@@ -23,6 +23,7 @@ Usage:
 """
 import argparse
 import json
+import pathlib
 import sys
 
 import boto3
@@ -88,6 +89,32 @@ def ensure_bucket(s3, bucket, region, dry):
     s3.put_bucket_tagging(Bucket=bucket,
                           Tagging={"TagSet": [{"Key": TAG_KEY, "Value": TAG_VAL}]})
     return "exists" if exists else "created"
+
+
+def ensure_contracts(s3, bucket, dry):
+    """Upload pipeline/contracts/ to s3://<bucket>/contracts/.
+
+    The finops harness is told to "read pipeline/contracts/cost_model.py and call it
+    rather than recomputing costs in prose" -- a repo-relative path that means nothing
+    inside an AgentCore container, which has no checkout. Proven live on the first
+    pricing_refresh: the agent looked for the module on its filesystem, as an installed
+    package, and in S3, found none of the three, and fell back to applying the merge
+    precedence by hand -- stamping its own 37-SKU card `v1-DRAFT-noncanonical` because
+    the `fallback_static` tier lives inside the module it could not reach.
+
+    Uploading here rather than in a bespoke script keeps the module beside the buckets
+    and tables the rest of the pipeline reads: one place that answers "what state does
+    a fresh container start from". Lambdas keep vendoring the contracts into their zip
+    (07_lambdas.py) -- a Lambda has no network guarantee to S3 at import time, whereas
+    the harness does.
+    """
+    src = pathlib.Path(__file__).resolve().parent.parent / "pipeline" / "contracts"
+    files = sorted(p for p in src.glob("*") if p.is_file())
+    if dry:
+        return {"would": f"upload {len(files)} contract files", "to": f"s3://{bucket}/contracts/"}
+    for p in files:
+        s3.upload_file(str(p), bucket, f"contracts/{p.name}")
+    return {"uploaded": [p.name for p in files], "to": f"s3://{bucket}/contracts/"}
 
 
 def ensure_table(ddb, name, spec, dry, pitr=False):
@@ -164,6 +191,7 @@ def main():
         "settings": "versioning=on sse=AES256 public-access-block=ALL "
                     f"lifecycle=runs/ expire {RUNS_EXPIRE_DAYS}d",
     }
+    results["contracts"] = ensure_contracts(s3, bucket, args.dry_run)
     results[RUNS_TABLE] = {
         "status": ensure_table(ddb, RUNS_TABLE, {
             "AttributeDefinitions": [

@@ -12,6 +12,7 @@ import datetime
 import importlib.util
 import json
 import pathlib
+import re
 import sys
 
 import pytest
@@ -155,9 +156,18 @@ def test_harness_prompt_names_every_measured_hazard():
         assert phrase in prompt, phrase
 
 
+def _finops_prompt():
+    return HARNESS["systemPrompt"][0]["text"]
+
+
 def test_harness_points_at_the_canonical_cost_model_rather_than_prose_math():
-    prompt = HARNESS["systemPrompt"][0]["text"]
-    assert "pipeline/contracts/cost_model.py" in prompt
+    """The reference must be FETCHABLE, not merely present. A repo path satisfies "the
+    prompt names the module" while giving a container with no checkout nothing to open —
+    see test_the_canonical_cost_module_is_uploaded_where_the_prompt_says_to_fetch_it."""
+    prompt = _finops_prompt()
+    assert "cost_model.py" in prompt
+    assert "pipeline/contracts/cost_model.py" not in prompt, \
+        "a repo-relative path is unresolvable inside the harness container"
 
 
 def test_harness_name_and_tags_match_the_seventh_runtime():
@@ -305,6 +315,72 @@ def test_the_auditor_lambda_runs_under_its_own_role_not_the_drivers():
     finops = src.split('"finops": {', 1)[1].split("},", 1)[0]
     assert "/llmops/iam/lambda_finops_reconcile_arn" in finops
     assert "/llmops/iam/lambda_driver_arn" not in finops
+
+
+def _harness_s3(sid):
+    doc = json.loads((REPO / "deploy/iam/harness_execution_role.json").read_text())
+    for st in doc["permissionsPolicy"]["Statement"]:
+        if st.get("Sid") == sid:
+            return st
+    raise AssertionError(f"no statement {sid}")
+
+
+def test_every_s3_prefix_the_auditor_writes_is_one_its_role_can_write():
+    """Measured live on the first successful pricing_refresh: the agent derived a
+    complete 37-SKU rate card, then got AccessDenied writing
+    finops/rates/rate_card_latest.json, so it published nothing and stamped its own
+    output non-canonical. The role granted runs/, reports/ and skills-mirror/ only —
+    the whole feature ran to completion and threw its work away.
+
+    Asserted against the prompt's own URIs rather than a hardcoded list, so a future
+    prefix added to the prompt fails here instead of at 09:00 UTC in production.
+    """
+    prompt = _finops_prompt()
+    granted = {r.rsplit("/", 1)[0].split("/", 1)[-1]
+               for r in _harness_s3("S3PipelineObjects")["Resource"]}
+    for prefix in {u.split("/")[3] for u in re.findall(r"s3://<bucket>/\S+", prompt)}:
+        assert prefix in granted, f"prompt writes {prefix}/ but the role cannot"
+
+
+def test_the_list_prefixes_match_the_object_prefixes():
+    """ListBucket is condition-scoped, so a prefix granted for Get/Put but absent from
+    the condition can be read object-by-object and never enumerated. That reads as
+    "the rate card history is not there" when it is."""
+    objects = {r.rsplit("/", 1)[0].split("/", 1)[-1]
+               for r in _harness_s3("S3PipelineObjects")["Resource"]}
+    listed = {p.rstrip("/*") for p in
+              _harness_s3("S3PipelineList")["Condition"]["StringLike"]["s3:prefix"]}
+    assert objects == listed, f"asymmetric: objects={objects} list={listed}"
+
+
+def test_the_canonical_cost_module_is_uploaded_where_the_prompt_says_to_fetch_it():
+    """The prompt used to say "read pipeline/contracts/cost_model.py" — a repo-relative
+    path that means nothing inside an AgentCore container, which has no checkout. Live
+    result: the agent searched its filesystem, the installed packages, and S3, found the
+    module in none of them, and hand-applied the merge precedence instead, stamping its
+    card v1-DRAFT-noncanonical because the fallback_static tier lives inside the module.
+    A canonical implementation nothing distributes is not canonical."""
+    prompt = _finops_prompt()
+    assert "s3://<bucket>/contracts/cost_model.py" in prompt, \
+        "prompt must name a fetchable URI, not a repo path"
+    storage = _deploy_src("03_storage.py")
+    assert "def ensure_contracts" in storage and 'f"contracts/{p.name}"' in storage, \
+        "nothing uploads the contracts to the prefix the prompt reads"
+    assert "results[\"contracts\"]" in storage, "ensure_contracts is defined but never called"
+
+
+def test_the_price_list_coverage_rule_states_what_it_actually_cannot_price():
+    """The rule existed because Price List silently zero-prices models it does not
+    carry. Its DeepSeek-R1 example was wrong — the model attribute value is bare 'R1'
+    (provider=DeepSeek), so scanning for a name containing "DeepSeek-R1" finds nothing
+    and concludes absence. Verified 2026-07-31: R1 IS priced and matches our realized
+    rate to <0.001%; Claude Fable 5 / Opus 5 are NOT (newest Anthropic entries are
+    Claude 3). A hazard rule justified by a false example gets deleted by the next
+    reader who checks it."""
+    prompt = _finops_prompt()
+    rule = [p for p in prompt.split("\n\n") if "PRICE LIST" in p][0]
+    assert "Fable 5" in rule and "Opus 5" in rule, "must name what is unpriceable"
+    assert "cannot price DeepSeek-R1" not in rule, "falsified claim still in the prompt"
 
 
 # ── driver: publish_cost_report ───────────────────────────────────────────────
