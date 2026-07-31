@@ -146,6 +146,15 @@ def verify_code(code: str, pairs: list[dict], timeout_sec: int = 5) -> dict:
     Returns {"all_pass": bool, "n_pass": int, "n_pairs": int,
              "fail_reason": str|None}.
     """
+    # No pairs means nothing was verified, and "all of zero pairs passed" is
+    # vacuously true -- so the plain `n_pass == len(pairs)` below hands back
+    # all_pass=True for ANY code on a task whose pairs failed to parse, inflating
+    # every solve rate computed from it. An unverifiable task must not read as a
+    # solved one; refuse, and let the caller surface it as the data defect it is.
+    if not pairs:
+        return {"all_pass": False, "n_pass": 0, "n_pairs": 0,
+                "fail_reason": "no pairs to verify against"}
+
     n_pass = 0
     fail_reason = None
     for i, pair in enumerate(pairs):
