@@ -48,7 +48,13 @@ if ! aws iam get-role --role-name "$ROLE" >/dev/null 2>&1; then
     "Version":"2012-10-17","Statement":[{"Effect":"Allow",
     "Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
 fi
-sed "s/ACCOUNT_ID/$ACCOUNT_ID/g; s/REGION/$REGION/g" "$(dirname "$0")/iam-policy.json" > /tmp/llmops-admin-policy.json
+# `_comment` keys carry WHY each statement is scoped the way it is, which belongs
+# next to the statement rather than in a doc nobody opens when editing IAM. But IAM
+# rejects any key it does not know, failing the WHOLE document with "Syntax errors
+# in policy" — it does not name the offending key, so this cost a debugging round.
+# Strip them at apply time: the file keeps the rationale, IAM gets a clean policy.
+sed "s/ACCOUNT_ID/$ACCOUNT_ID/g; s/REGION/$REGION/g" "$(dirname "$0")/iam-policy.json" \
+  | jq 'del(.Statement[]._comment)' > /tmp/llmops-admin-policy.json
 aws iam put-role-policy --role-name "$ROLE" --policy-name LlmopsAdminPerms --policy-document file:///tmp/llmops-admin-policy.json
 
 # ── Cognito (admin login) ─────────────────────────────────────────────────────
@@ -118,6 +124,16 @@ case "$VENDORED" in
 esac
 cp "$(dirname "$0")/lambda_function.py" "$BUILD/lambda_function.py"
 cp "$(dirname "$0")/frontend.html" "$BUILD/frontend.html"   # read once at cold start by the handler
+# The gate arithmetic, vendored flat because the handler does `import cost_model`.
+# Without it every estimate refuses with 503 and the Cost tab reports the rate card
+# as unavailable -- which is the fail-closed behaviour working, but it means the tab
+# renders and does nothing. Measured on the first live deploy: the tab was up and
+# `rate_card.present` was false, so this copy is the difference between a visible
+# panel and a working one.
+cp "$(dirname "$0")/../../pipeline/contracts/cost_model.py" "$BUILD/cost_model.py"
+"$PY_FOR_BUILD" -c "import sys; sys.path.insert(0,'$BUILD'); import cost_model; \
+  assert hasattr(cost_model,'approval_decision'), 'cost_model missing approval_decision'; \
+  print('bundled cost_model OK')"
 (cd "$BUILD" && zip -rq /tmp/llmops-admin-dashboard.zip .)
 
 ENV_VARS="Variables={CONSOLE_TABLE=$TABLE,RUNS_TABLE=llmops-pipeline-runs,EVENTS_TABLE=llmops-stage-events,STATE_MACHINE=llmops-pipeline,START_FN=llmops-start-pipeline,DATA_BUCKET=$DATA_BUCKET,COGNITO_POOL_ID=$POOL_ID,COGNITO_CLIENT_ID=$CLIENT_ID,JUDGE_MODEL=$JUDGE_MODEL,SPANS_SINCE=$SPANS_SINCE,OPTIMIZE_HARNESS=$OPTIMIZE_HARNESS}"
