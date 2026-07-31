@@ -54,6 +54,25 @@ LAMBDAS = {
         "timeout": 30, "memory": 256,
         "env_keys": ["WEBHOOK_SECRET_ID", "START_PIPELINE_FN"],
     },
+    # The auditor's trigger. 08_triggers.py already schedules llmops-finops-daily
+    # against this function name, so omitting it here leaves a live EventBridge
+    # schedule pointing at a function that does not exist -- a daily failure that
+    # surfaces only in the scheduler's own metrics, never in the dashboard.
+    "finops": {
+        "fn": "llmops-finops-reconcile",
+        "src": REPO / "orchestration" / "finops_reconcile" / "handler.py",
+        # Its OWN role, not the driver's: iam/lambda_roles.json scopes
+        # finops_reconcile to Query/Scan + PutItem + InvokeFunction + Publish, which
+        # is strictly narrower than the driver's. Reusing the driver role works and
+        # is what a first pass reaches for -- it also hands the auditor every
+        # permission the thing it audits has.
+        "role_param": "/llmops/iam/lambda_finops_reconcile_arn",
+        # 60 s is enough: it lists runs and hands off asynchronously. The auditor's
+        # own multi-minute work happens in the harness, not here.
+        "timeout": 60, "memory": 256,
+        "env_keys": ["RUNS_TABLE", "DATA_BUCKET", "DRIVER_FN",
+                     "ESTIMATES_TABLE", "ACTUALS_TABLE", "PROJECT"],
+    },
 }
 
 STATE_MACHINE_NAME = "llmops-pipeline"
@@ -80,6 +99,10 @@ def env_values(ssm, region, account, keys, extra):
         "STATE_MACHINE_ARN": f"arn:aws:states:{region}:{account}:stateMachine:{STATE_MACHINE_NAME}",
         "WEBHOOK_SECRET_ID": "llmops/webhook",
         "START_PIPELINE_FN": "llmops-start-pipeline",
+        "DRIVER_FN": "llmops-harness-driver",
+        "ESTIMATES_TABLE": "llmops-cost-estimates",
+        "ACTUALS_TABLE": "llmops-cost-actuals",
+        "PROJECT": "llmops-agentic-system",
     }
     base.update(extra or {})
     return {k: base[k] for k in keys}
@@ -96,8 +119,14 @@ def deploy_lambda(lam, ssm, region, account, key, cfg, dry):
         lam.update_function_code(FunctionName=cfg["fn"], ZipFile=code)
         waiter = lam.get_waiter("function_updated_v2")
         waiter.wait(FunctionName=cfg["fn"])
+        # Role goes in the UPDATE too, not just the create. Without it a role change
+        # in LAMBDAS above applies only to functions that do not exist yet: every
+        # re-run reports "updated" while the live function keeps whatever role it was
+        # born with. That is silent in both directions -- a tightened role never takes
+        # effect, and nothing ever says so.
         lam.update_function_configuration(
-            FunctionName=cfg["fn"], Timeout=cfg["timeout"], MemorySize=cfg["memory"],
+            FunctionName=cfg["fn"], Role=role_arn,
+            Timeout=cfg["timeout"], MemorySize=cfg["memory"],
             Environment={"Variables": env})
         action = "updated"
     except lam.exceptions.ResourceNotFoundException:

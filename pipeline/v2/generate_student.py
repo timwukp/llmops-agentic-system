@@ -176,6 +176,17 @@ def main() -> int:
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"          # required for correct batched decoding
+    # Truncate from the LEFT, never the default right. Qwen3 renders the generation
+    # prompt (`<|im_end|>\n<|im_start|>assistant\n`) at the END of the string, so
+    # right-truncation deletes exactly the tokens that tell the model to start
+    # answering. Measured on the real Qwen3-1.7B tokenizer (2026-07-31): a
+    # 43,898-token prompt right-truncated to 8192 ends mid-word at
+    # `' grid1857 grid1858 grid185'` with no assistant turn at all, so the model
+    # continues the grid instead of transforming it and scores 0 -- and the
+    # `truncated` flag below cannot see it, because that flag measures the OUTPUT
+    # ceiling. Left-truncation keeps the tail intact and drops the oldest context,
+    # which is the loss that still leaves a scorable prompt.
+    tokenizer.truncation_side = "left"
     # Before loading weights: a --thinking flag the template ignores would make a
     # lift comparison meaningless, and that is cheaper to learn now than after the
     # model is resident and the run is hours in.
@@ -201,11 +212,24 @@ def main() -> int:
     print(f"[gen] stop ids {sorted(stop_ids)}, pad {tokenizer.pad_token_id}", flush=True)
 
     started = time.time()
-    written = n_truncated = 0
+    written = n_truncated = n_prompt_truncated = 0
     with open(args.out, "w") as fh:
         for start in range(0, len(rows), args.batch_size):
             batch = rows[start:start + args.batch_size]
             texts = [build_prompt(tokenizer, r["prompt"], args.thinking) for r in batch]
+            # Measure input truncation BEFORE it happens, per row. Left-truncation
+            # keeps the prompt scorable but still drops the oldest context, so a row
+            # that lost part of its task description is a data gap, not a model
+            # failure -- and nothing downstream can tell those apart unless the row
+            # says so. Counted from the un-padded, un-truncated encoding: the padded
+            # tensor's width is the batch maximum rather than any row's length, and
+            # the truncated one is 8192 by construction, so neither can answer
+            # "was this row cut". Encoded with the SAME defaults as the real call
+            # below -- an add_special_tokens=False probe would measure a shorter
+            # string than the one actually truncated and undercount rows sitting
+            # just over the line.
+            over = [len(tokenizer(t_)["input_ids"]) > 8192 for t_ in texts]
+            n_prompt_truncated += sum(over)
             enc = tokenizer(texts, return_tensors="pt", padding=True,
                             truncation=True, max_length=8192).to(model.device)
 
@@ -216,7 +240,7 @@ def main() -> int:
                     temperature=args.temperature if args.temperature > 0 else None,
                     pad_token_id=tokenizer.pad_token_id)
 
-            for row, seq in zip(batch, out):
+            for row, seq, prompt_cut in zip(batch, out, over):
                 # Slice off the prompt so only the completion is scored.
                 new_ids = seq[enc["input_ids"].shape[1]:].tolist()
                 completion = tokenizer.decode(new_ids, skip_special_tokens=True)
@@ -232,7 +256,8 @@ def main() -> int:
                                      "variant": row.get("variant", ""),
                                      "generation": completion,
                                      "n_new_tokens": n_new,
-                                     "truncated": bool(truncated)}) + "\n")
+                                     "truncated": bool(truncated),
+                                     "prompt_truncated": bool(prompt_cut)}) + "\n")
                 written += 1
             fh.flush()                        # partial file stays scorable
 
@@ -247,10 +272,21 @@ def main() -> int:
               f"{args.max_new_tokens}-token ceiling; their format failures are a "
               f"budget artefact, not evidence the model cannot write code",
               flush=True)
+    if n_prompt_truncated:
+        print(f"[gen] WARNING {n_prompt_truncated}/{written} prompts exceeded the "
+              f"8192-token input window and lost their OLDEST context to "
+              f"left-truncation; those rows were scored on an incomplete task "
+              f"description, so their failures are a data gap, not model ability",
+              flush=True)
     # Metadata a lift comparison must agree on: comparing a --thinking off run
     # against a --thinking auto one measures the template, not the fine-tuning.
     Path(args.out + ".done").write_text(json.dumps({
         "n_written": written, "n_truncated": n_truncated,
+        # Coverage, not just volume: a run where 40% of prompts lost context is a
+        # different measurement from one where none did, and a report stating only
+        # n_written implies a completeness it does not have.
+        "n_prompt_truncated": n_prompt_truncated,
+        "input_window": 8192, "truncation_side": tokenizer.truncation_side,
         "model_dir": args.model_dir, "thinking": args.thinking,
         "thinking_changed_rendering": (thinking_effect or {}).get("changed_rendering"),
         "max_new_tokens": args.max_new_tokens, "temperature": args.temperature,

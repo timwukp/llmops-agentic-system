@@ -12,6 +12,7 @@ import datetime
 import importlib.util
 import json
 import pathlib
+import re
 import sys
 
 import pytest
@@ -155,9 +156,18 @@ def test_harness_prompt_names_every_measured_hazard():
         assert phrase in prompt, phrase
 
 
+def _finops_prompt():
+    return HARNESS["systemPrompt"][0]["text"]
+
+
 def test_harness_points_at_the_canonical_cost_model_rather_than_prose_math():
-    prompt = HARNESS["systemPrompt"][0]["text"]
-    assert "pipeline/contracts/cost_model.py" in prompt
+    """The reference must be FETCHABLE, not merely present. A repo path satisfies "the
+    prompt names the module" while giving a container with no checkout nothing to open —
+    see test_the_canonical_cost_module_is_uploaded_where_the_prompt_says_to_fetch_it."""
+    prompt = _finops_prompt()
+    assert "cost_model.py" in prompt
+    assert "pipeline/contracts/cost_model.py" not in prompt, \
+        "a repo-relative path is unresolvable inside the harness container"
 
 
 def test_harness_name_and_tags_match_the_seventh_runtime():
@@ -249,6 +259,128 @@ def test_the_reconcile_lambda_has_a_role_that_can_invoke_the_driver():
     assert "finops_reconcile" in lam["roles"]
     acts = _actions(lam["roles"]["finops_reconcile"]["permissionsPolicy"])
     assert "lambda:InvokeFunction" in acts
+
+
+# ── deployability: a config nothing deploys is a component that does not exist ──
+
+def _deploy_src(name):
+    return (REPO / "deploy" / name).read_text()
+
+
+def test_every_harness_config_on_disk_is_named_by_the_deploy_script():
+    """05_harnesses.py's AGENTS list is what a bare run creates and what --agent
+    validates against, so a config it does not name is a harness that silently never
+    exists. This was live: agents/finops/harness.json shipped complete, `--agent
+    finops` was rejected as an invalid choice, and the fleet stayed at six while
+    every doc said seven."""
+    on_disk = {p.parent.name for p in (REPO / "agents").glob("*/harness.json")}
+    # Read the list the script itself defines rather than re-parsing the source: a
+    # string-split parser has to model Python's comment and quoting rules, and the
+    # first version of this test silently dropped the very entry it was written to
+    # catch because a `#` comment sits inside the literal.
+    spec = importlib.util.spec_from_file_location(
+        "harnesses_deploy", REPO / "deploy/05_harnesses.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    missing = on_disk - set(mod.AGENTS)
+    assert not missing, f"harness configs with no deploy path: {missing}"
+
+
+def test_every_scheduled_function_is_one_the_lambda_deployer_creates():
+    """08_triggers.py schedules llmops-finops-daily against a function name. If
+    07_lambdas.py does not create that function the schedule fires daily into a
+    ResourceNotFound — visible only in the scheduler's own metrics, never in the
+    dashboard, so the auditor appears to be running while nothing runs."""
+    triggers, lambdas = _deploy_src("08_triggers.py"), _deploy_src("07_lambdas.py")
+    assert "llmops-finops-reconcile" in triggers, "test guards the wrong name"
+    assert '"fn": "llmops-finops-reconcile"' in lambdas, \
+        "scheduled function has no entry in LAMBDAS"
+
+
+def test_a_role_change_reaches_an_existing_function_not_only_a_new_one():
+    """update_function_configuration silently ignores a role it is not passed, so
+    without Role= a tightened role applies only to functions that do not exist yet:
+    every re-run reports "updated" while the live function keeps the role it was born
+    with. Measured live — llmops-finops-reconcile stayed on llmops-lambda-driver
+    across a successful "updated" run."""
+    src = _deploy_src("07_lambdas.py")
+    upd = src.split("update_function_configuration(", 1)[1].split(")", 1)[0]
+    assert "Role=role_arn" in upd, "role change would not reach an existing function"
+
+
+def test_the_auditor_lambda_runs_under_its_own_role_not_the_drivers():
+    """Reusing the driver role works and is what a first pass reaches for. It also
+    hands the auditor every permission the thing it audits has."""
+    src = _deploy_src("07_lambdas.py")
+    finops = src.split('"finops": {', 1)[1].split("},", 1)[0]
+    assert "/llmops/iam/lambda_finops_reconcile_arn" in finops
+    assert "/llmops/iam/lambda_driver_arn" not in finops
+
+
+def _harness_s3(sid):
+    doc = json.loads((REPO / "deploy/iam/harness_execution_role.json").read_text())
+    for st in doc["permissionsPolicy"]["Statement"]:
+        if st.get("Sid") == sid:
+            return st
+    raise AssertionError(f"no statement {sid}")
+
+
+def test_every_s3_prefix_the_auditor_writes_is_one_its_role_can_write():
+    """Measured live on the first successful pricing_refresh: the agent derived a
+    complete 37-SKU rate card, then got AccessDenied writing
+    finops/rates/rate_card_latest.json, so it published nothing and stamped its own
+    output non-canonical. The role granted runs/, reports/ and skills-mirror/ only —
+    the whole feature ran to completion and threw its work away.
+
+    Asserted against the prompt's own URIs rather than a hardcoded list, so a future
+    prefix added to the prompt fails here instead of at 09:00 UTC in production.
+    """
+    prompt = _finops_prompt()
+    granted = {r.rsplit("/", 1)[0].split("/", 1)[-1]
+               for r in _harness_s3("S3PipelineObjects")["Resource"]}
+    for prefix in {u.split("/")[3] for u in re.findall(r"s3://<bucket>/\S+", prompt)}:
+        assert prefix in granted, f"prompt writes {prefix}/ but the role cannot"
+
+
+def test_the_list_prefixes_match_the_object_prefixes():
+    """ListBucket is condition-scoped, so a prefix granted for Get/Put but absent from
+    the condition can be read object-by-object and never enumerated. That reads as
+    "the rate card history is not there" when it is."""
+    objects = {r.rsplit("/", 1)[0].split("/", 1)[-1]
+               for r in _harness_s3("S3PipelineObjects")["Resource"]}
+    listed = {p.rstrip("/*") for p in
+              _harness_s3("S3PipelineList")["Condition"]["StringLike"]["s3:prefix"]}
+    assert objects == listed, f"asymmetric: objects={objects} list={listed}"
+
+
+def test_the_canonical_cost_module_is_uploaded_where_the_prompt_says_to_fetch_it():
+    """The prompt used to say "read pipeline/contracts/cost_model.py" — a repo-relative
+    path that means nothing inside an AgentCore container, which has no checkout. Live
+    result: the agent searched its filesystem, the installed packages, and S3, found the
+    module in none of them, and hand-applied the merge precedence instead, stamping its
+    card v1-DRAFT-noncanonical because the fallback_static tier lives inside the module.
+    A canonical implementation nothing distributes is not canonical."""
+    prompt = _finops_prompt()
+    assert "s3://<bucket>/contracts/cost_model.py" in prompt, \
+        "prompt must name a fetchable URI, not a repo path"
+    storage = _deploy_src("03_storage.py")
+    assert "def ensure_contracts" in storage and 'f"contracts/{p.name}"' in storage, \
+        "nothing uploads the contracts to the prefix the prompt reads"
+    assert "results[\"contracts\"]" in storage, "ensure_contracts is defined but never called"
+
+
+def test_the_price_list_coverage_rule_states_what_it_actually_cannot_price():
+    """The rule existed because Price List silently zero-prices models it does not
+    carry. Its DeepSeek-R1 example was wrong — the model attribute value is bare 'R1'
+    (provider=DeepSeek), so scanning for a name containing "DeepSeek-R1" finds nothing
+    and concludes absence. Verified 2026-07-31: R1 IS priced and matches our realized
+    rate to <0.001%; Claude Fable 5 / Opus 5 are NOT (newest Anthropic entries are
+    Claude 3). A hazard rule justified by a false example gets deleted by the next
+    reader who checks it."""
+    prompt = _finops_prompt()
+    rule = [p for p in prompt.split("\n\n") if "PRICE LIST" in p][0]
+    assert "Fable 5" in rule and "Opus 5" in rule, "must name what is unpriceable"
+    assert "cannot price DeepSeek-R1" not in rule, "falsified claim still in the prompt"
 
 
 # ── driver: publish_cost_report ───────────────────────────────────────────────
@@ -353,8 +485,9 @@ def test_rate_card_must_exist_in_s3_to_be_accepted():
 
 
 def test_rate_card_records_the_skus_it_could_not_price():
-    """The Price List API cannot price DeepSeek-R1 or Fable 5 on this account, so a
-    refresh reporting zero missing SKUs is the suspicious outcome, not the good one."""
+    """The Price List API cannot price Fable 5 or Opus 5 on this account — the harness
+    fleet's own models — so a refresh reporting zero missing SKUs is the suspicious
+    outcome, not the good one."""
     c = _clients()
     out = driver.handle_finops_tool(c, FINOPS_EVENT, "update_rate_card", {
         "rates_uri": RATES_URI, "n_rates": 7, "n_stale": 1,
@@ -511,3 +644,29 @@ def test_only_launched_or_reconciled_estimates_become_reconcile_targets():
         {"run_id": "run-wait", "status": "pending_approval", "project": "p"},
     ])})
     assert reconcile.runs_in_period(ddb, "p", "2026-07-29") == ["run-done", "run-live"]
+
+
+def test_iam_documents_survive_comment_stripping_as_printable_ascii():
+    """PutRolePolicy enforces printable ASCII and rejects the WHOLE document with
+    "Syntax errors in policy", naming no key. Two em dashes cost a deploy cycle once
+    (4d71d76) and masked a second defect while doing it.
+
+    Checked AFTER stripping _comment, because that is the document AWS actually sees:
+    the rationale keys are free to use whatever punctuation reads best, and this test
+    would be wrong to forbid it. What must be ASCII is everything that survives the
+    strip.
+    """
+    spec = importlib.util.spec_from_file_location("iam_deploy", REPO / "deploy/01_iam.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    for path in sorted((REPO / "deploy/iam").glob("*.json")):
+        doc = mod.substitute(json.loads(path.read_text()),
+                             {"<REGION>": "us-east-1", "<ACCOUNT_ID>": "123456789012",
+                              "<DATA_BUCKET>": "b", "<MEMORY_ID>": "m"})
+        # ensure_ascii=False is load-bearing: the default escapes every non-ASCII char
+        # to \uXXXX, so the check would be satisfied by construction and pass against
+        # the very document it exists to reject. The first version of this test did
+        # exactly that -- an em dash injected into a Sid was caught only by unrelated
+        # tests, while this one reported green.
+        bad = [c for c in json.dumps(doc, ensure_ascii=False) if not (32 <= ord(c) < 127)]
+        assert not bad, f"{path.name}: non-ASCII survives stripping: {set(bad)}"

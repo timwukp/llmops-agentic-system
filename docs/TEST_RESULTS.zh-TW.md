@@ -15,13 +15,14 @@
 | 3 — 訓練 | launch-and-release 產出 ModelTrained | ✅ PASSED | [VERIFICATION_phase3.md](../deploy/evidence/VERIFICATION_phase3.md) |
 | 4 — 評估 + 部署 | 門檻判決；endpoint 冒煙 + 回收 | ✅ 管線 PASSED（模型本身門檻 FAILED —— 見下） | [VERIFICATION_phase4.md](../deploy/evidence/VERIFICATION_phase4.md) |
 | 5 — 自主運行 | 全程無人 e2e：觸發 → 狀態機 → agents → 誠實終態 | ✅ PASSED | [VERIFICATION_phase5.md](../deploy/evidence/VERIFICATION_phase5.md) |
+| FinOps — 成本治理 | 第七個 runtime 上線；每個費率都帶來源；不發表任何猜測 | ⚠️ 部分通過 —— runtime 與算術已驗證；rate card 卡在一次 IAM apply | [VERIFICATION_finops.md](../deploy/evidence/VERIFICATION_finops.md) |
 
 ## 靜態與離線檢查（可重複，CI 強制）
 
 | 檢查 | 結果 | 復現方式 |
 |---|---|---|
-| 單元測試（契約、driver 迴圈、Lambda、狀態機文檔） | **30/30 通過** | `.venv/bin/python -m pytest tests/ -q --ignore=tests/golden` |
-| Harness 配置驗證（5 個專家 + 指揮家） | **6/6 `RESULT: OK`** | `python deploy/validate_config.py --config agents/<a>/harness.json` |
+| 單元測試（契約、成本模型、driver 迴圈、Lambda、狀態機文檔） | **274/274 通過** | `.venv/bin/python -m pytest tests/ -q --ignore=tests/golden` |
+| Harness 配置驗證（5 個專家 + 指揮家 + 審計員） | **7/7 `RESULT: OK`** | `python deploy/validate_config.py --config agents/<a>/harness.json` |
 | 架構 SVG 幾何檢查（虛線零交叉、零穿框） | **CLEAN** | `python tests/check_svg_geometry.py docs/architecture-*.svg` |
 | 遮蔽掃描（帳號 ID、憑證、帶帳號的 ARN） | CLEAN | `.github/workflows/redaction-check.yml` |
 
@@ -81,3 +82,55 @@ grid（管線與解析器沒問題）；而解釋一切的診斷指標是 ——
 
 整套 test-proven 記錄 —— 六個 agent、一個訓練完成的模型、一個部署又回收的
 endpoint、五輪 e2e 迭代 —— 花費大約等於一位人類 LLMOps 工程師一小時的成本。
+
+## FinOps —— 第七個 runtime,以及兩次失敗驗證了什麼(2026-07-31)
+
+完整記錄:[VERIFICATION_finops.md](../deploy/evidence/VERIFICATION_finops.md)。
+
+| 檢查 | 結果 | 重現方式 |
+|---|---|---|
+| 單元測試(全部套件,含 `test_cost_model.py` + `test_finops.py`) | **274 passed** | `.venv/bin/python -m pytest tests/ -q` |
+| Harness 配置驗證,7 個 agent | **`RESULT: OK`** | `python deploy/validate_config.py --config agents/finops/harness.json` |
+| 線上艦隊 | **7 個 harness READY** | 用 repo 內建 boto3 呼叫 `list_harnesses` |
+| 正典模組有散佈路徑 | 印出 `would upload 4 contract files` | `python deploy/03_storage.py --region us-east-1 --account-id 123456789012 --dry-run` |
+
+本次新增的每一道 guard 都做過 **mutation check**:逐一還原被斷言的行為,確認測試會
+失敗。一個「有這行為也過、沒這行為也過」的測試,不是測試。
+
+### 兩次失敗比通過更有價值
+
+**帳單讀取權被拒。** Auditor 回報*「已定價 SKU:0。未定價:全部」*,把既有 card 的
+新鮮度標為**未知**而非假設其新鮮,**拒絕**呼叫 `update_rate_card`,並指名了缺少的
+確切權限。
+
+**S3 與自己的算術模組都被拒。** 它推導出一張**完整的 37-SKU rate card,`unpriced: []`**,
+然後拒絕發表 —— 把自己的產出蓋上 `v1-DRAFT-noncanonical`,理由是 `fallback_static`
+那一層就住在它拿不到的模組裡面,並把這件事寫在回報的第一行。
+
+真正要命的失敗模式是:一張看起來很有信心、但下個月沒人能重現的 card。
+**有人會依據這些數字批准一筆 $2000 的支出。** Fail-closed 在無人設計過的條件下守住了。
+
+### 費率來源,實測
+
+CE 實現費率與 Price List 在兩邊都有的 5 個 SKU 上一致到 **<0.001%** —— 實現費率作為
+主要來源是可信的。但 us-east-1 的 Price List 裡所有 Anthropic 條目只有
+`Claude 2.0 · Claude 2.1 · Claude 3 Haiku · Claude 3 Sonnet · Claude Instant`:
+**沒有 Fable 5、沒有 Opus 5 —— 那正是 harness 艦隊自己的 LLM 用量、AgentCore 最大的
+一條線。** 只讀 Price List 的 refresh 會靜默地把它定價為 $0。
+
+這裡**修正**了一個規劃階段的結論:Price List *可以*定價 DeepSeek-R1。`model` 這個
+attribute 的值是裸的 **`R1`**(`provider=DeepSeek`),所以在 84 個值裡找「含
+DeepSeek-R1 的名字」必然找不到,然後誤判為不存在。
+
+### 四個只有真的去部署才找得到的缺陷
+
+每一個在 repo 裡都完整、有文件、有單元測試 —— 而且永遠不會被建立出來:
+harness 配置不在 `AGENTS` 名單裡;被排程的函式在 `LAMBDAS` 裡沒有條目(每天一次
+`ResourceNotFound`,只在 scheduler 自己的 metrics 裡看得到);
+`update_function_configuration` 從未傳入 `Role`,導致 role 變更只對「還不存在的函式」
+生效(**實測**:回報 `"updated"`,線上函式卻仍保留出生時的 role);以及執行角色
+沒有 `finops/*` 授權。
+
+**尚未發表:** rate card 與「用實測 **$10.77** 校驗估算器」都卡在一次 IAM apply。
+上述一切依 CE 自己的 `Estimated: true` 旗標都屬 `provisional` —— 把它當作已結算發表,
+正是 prompt 明令禁止的一件事。

@@ -16,13 +16,14 @@ page is its ledger.
 | 3 — training | ModelTrained via launch-and-release | ✅ PASSED | [VERIFICATION_phase3.md](../deploy/evidence/VERIFICATION_phase3.md) |
 | 4 — eval + deploy | gates decided; endpoint smoke + teardown | ✅ PASSED as a pipeline (model FAILED its gates — see below) | [VERIFICATION_phase4.md](../deploy/evidence/VERIFICATION_phase4.md) |
 | 5 — autonomy | hands-off e2e: trigger → state machine → agents → honest terminal state | ✅ PASSED | [VERIFICATION_phase5.md](../deploy/evidence/VERIFICATION_phase5.md) |
+| FinOps — cost governance | 7th runtime live; every rate carries its provenance; nothing publishes a guess | ⚠️ PARTIAL — runtime + arithmetic proven; rate card blocked on an IAM apply | [VERIFICATION_finops.md](../deploy/evidence/VERIFICATION_finops.md) |
 
 ## Static and offline checks (repeatable, CI-enforced)
 
 | Check | Result | How to reproduce |
 |---|---|---|
-| Unit tests (contracts, driver loop, Lambdas, state machine document) | **30/30 passed** | `.venv/bin/python -m pytest tests/ -q --ignore=tests/golden` |
-| Harness config validation (5 specialists + conductor) | **6/6 `RESULT: OK`** | `python deploy/validate_config.py --config agents/<a>/harness.json` |
+| Unit tests (contracts, cost model, driver loop, Lambdas, state machine document) | **274/274 passed** | `.venv/bin/python -m pytest tests/ -q --ignore=tests/golden` |
+| Harness config validation (5 specialists + conductor + auditor) | **7/7 `RESULT: OK`** | `python deploy/validate_config.py --config agents/<a>/harness.json` |
 | Architecture SVG geometry (no wire crossings, no wire through a card) | **CLEAN** | `python tests/check_svg_geometry.py docs/architecture-*.svg` |
 | Redaction scan (account IDs, credentials, account-bearing ARNs) | CLEAN | `.github/workflows/redaction-check.yml` |
 
@@ -88,3 +89,59 @@ FAILED; neither was adjusted to flatter the other.
 The entire test-proven record — six agents, a trained model, a deployed and
 torn-down endpoint, five e2e iterations — cost about as much as one hour of a
 human LLMOps engineer.
+
+## FinOps — the 7th runtime, and what two failures verified (2026-07-31)
+
+Full record: [VERIFICATION_finops.md](../deploy/evidence/VERIFICATION_finops.md).
+
+| Check | Result | How to reproduce |
+|---|---|---|
+| Unit tests (all suites, incl. `test_cost_model.py` + `test_finops.py`) | **274 passed** | `.venv/bin/python -m pytest tests/ -q` |
+| Harness config validation, 7 agents | **`RESULT: OK`** | `python deploy/validate_config.py --config agents/finops/harness.json` |
+| Live fleet | **7 harnesses READY** | `list_harnesses` via the repo's vendored boto3 |
+| Canonical module has a distribution path | prints `would upload 4 contract files` | `python deploy/03_storage.py --region us-east-1 --account-id 123456789012 --dry-run` |
+
+Every guard added in this work was **mutation-checked**: the asserted behaviour was
+reverted one at a time and the test confirmed to fail. A test that passes both with and
+against the behaviour it names is not a test.
+
+### Two failures worth more than the passes
+
+**Denied billing reads.** The auditor reported *"Priced SKUs: 0. Unpriced: all"*, stated
+the existing card's freshness as **unknown** rather than assuming, **declined** to call
+`update_rate_card`, and named the exact missing permissions.
+
+**Denied S3 and its own arithmetic module.** It derived a complete **37-SKU rate card with
+`unpriced: []`**, then refused to publish it — stamping its own output
+`v1-DRAFT-noncanonical` because the `fallback_static` tier lives inside the module it
+could not reach, and saying so in its first line.
+
+The failure mode that would have mattered is a confident-looking card nobody can
+regenerate next month. **Someone approves a $2000 run on these figures.** Fail-closed held
+under conditions nobody designed for.
+
+### Rate provenance, measured
+
+CE-realized and Price List agree to **<0.001%** on the 5 SKUs both carry — realized rates
+are trustworthy as primary. But every Anthropic entry in Price List for us-east-1 is
+`Claude 2.0 · Claude 2.1 · Claude 3 Haiku · Claude 3 Sonnet · Claude Instant`: **no
+Fable 5, no Opus 5 — the harness fleet's own LLM usage, the largest AgentCore line.** A
+Price-List-only refresh silently zero-prices it.
+
+A planning finding was **corrected** here: Price List *can* price DeepSeek-R1. The `model`
+attribute value is bare **`R1`** (`provider=DeepSeek`), so scanning 84 values for a name
+containing "DeepSeek-R1" finds nothing and wrongly concludes absence.
+
+### Four defects that only deploying could find
+
+Each was repo-complete, documented, unit-tested — and would never have been created:
+a harness config absent from `AGENTS`; a scheduled function with no `LAMBDAS` entry
+(a daily `ResourceNotFound` visible only in the scheduler's own metrics);
+`update_function_configuration` never passed `Role`, so a role change reached only
+functions that don't exist yet (**measured**: `"updated"` reported while the live function
+kept its birth role); and an execution role with no `finops/*` grant.
+
+**Not yet published:** the rate card and estimator validation against the measured
+**$10.77** ground truth are blocked on an IAM apply. Everything above is `provisional` by
+CE's own `Estimated: true` flag — publishing it as settled is the one thing the prompt
+forbids.

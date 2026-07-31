@@ -134,23 +134,28 @@
         }
       },
       {
+        "_comment": "finops/* and contracts/* are the audit runtime's two paths and were both missing until a live pricing_refresh proved it: the agent derived a complete 37-SKU rate card, then failed to write it (PutObject denied on finops/rates/rate_card_latest.json) AND failed to load the canonical cost_model.py (GetObject denied on contracts/), so it published nothing and stamped its own output non-canonical. A prefix nobody granted is a feature that runs to completion and then throws its work away.",
         "Sid": "S3PipelineObjects",
         "Effect": "Allow",
         "Action": ["s3:GetObject", "s3:PutObject"],
         "Resource": [
           "arn:aws:s3:::<DATA_BUCKET>/runs/*",
           "arn:aws:s3:::<DATA_BUCKET>/reports/*",
-          "arn:aws:s3:::<DATA_BUCKET>/skills-mirror/*"
+          "arn:aws:s3:::<DATA_BUCKET>/skills-mirror/*",
+          "arn:aws:s3:::<DATA_BUCKET>/finops/*",
+          "arn:aws:s3:::<DATA_BUCKET>/contracts/*"
         ]
       },
       {
+        "_comment": "The prefix list must match S3PipelineObjects: ListBucket is condition-scoped, so a prefix granted for Get/Put but absent here can be read object-by-object and never enumerated -- which is exactly the shape of 'the rate card history is there but the agent reports no card exists'.",
         "Sid": "S3PipelineList",
         "Effect": "Allow",
         "Action": ["s3:ListBucket"],
         "Resource": "arn:aws:s3:::<DATA_BUCKET>",
         "Condition": {
           "StringLike": {
-            "s3:prefix": ["runs/*", "reports/*", "skills-mirror/*"]
+            "s3:prefix": ["runs/*", "reports/*", "skills-mirror/*",
+                          "finops/*", "contracts/*"]
           }
         }
       },

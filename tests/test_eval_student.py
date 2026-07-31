@@ -288,5 +288,58 @@ def test_empty_generations_report_is_zero_not_a_crash():
     assert rep == {**rep, "n_solved": 0, "solve_rate": 0.0, "n_scored": 0}
 
 
+# ------------------------------------------- prompts the model never fully received
+
+def test_a_cut_prompt_gets_a_second_rate_over_rows_that_saw_the_whole_task():
+    """A row whose prompt was left-truncated lost its oldest context, so its failure
+    is a data gap rather than model ability. Reported ALONGSIDE solve_rate: dropping
+    those rows silently would inflate the headline, and reporting only the blended
+    figure hides that some rows were never given the question."""
+    rep = es.score_generations(
+        [{"task_id": "t1", "variant": "orig", "generation": CORRECT},
+         {"task_id": "t1", "variant": "orig", "generation": "def transform(g):\n    return g\n",
+          "prompt_truncated": True}], VAL)
+    assert rep["solve_rate"] == 0.5, "the blended rate must still be reported"
+    assert rep["n_prompt_truncated"] == 1
+    assert rep["n_scored_intact_prompts"] == 1
+    assert rep["solve_rate_intact_prompts"] == 1.0
+    assert "data gap" in rep["prompt_caveat"]
+
+
+def test_a_cut_prompt_that_parsed_and_then_failed_is_still_counted_as_cut():
+    """This is the case that looks least like a data problem: format-valid code that
+    fails verification reads as a wrong program when it is a wrong input."""
+    rep = es.score_generations(
+        [{"task_id": "t1", "variant": "orig", "prompt_truncated": True,
+          "generation": "def transform(g):\n    return g\n"}], VAL)
+    assert rep["n_format_valid"] == 1 and rep["n_solved"] == 0
+    assert rep["results"][0]["status"] == "failed_verification"
+    assert rep["results"][0]["prompt_truncated"] is True
+    assert rep["n_prompt_truncated"] == 1
+    assert rep["solve_rate_intact_prompts"] == 0.0
+    assert rep["n_scored_intact_prompts"] == 0
+
+
+def test_no_cut_prompts_means_no_caveat_and_no_second_rate():
+    """The caveat must not fire on a clean run — it would imply a gap that isn't
+    there and invite readers to discount a number that needs no discount."""
+    rep = score(CORRECT)
+    assert rep["n_prompt_truncated"] == 0
+    assert "prompt_caveat" not in rep
+    assert "solve_rate_intact_prompts" not in rep
+
+
+def test_a_prompt_with_no_pairs_is_excluded_rather_than_scored_either_way():
+    """Nothing was verified, so scoring it as solved credits the model for a data
+    defect and scoring it as failed blames the model for one. Neither is honest:
+    leave it out of the denominator and name the status."""
+    rep = es.score_generations(
+        [{"task_id": "bare", "variant": "orig", "generation": CORRECT}],
+        [{"task_id": "bare", "variant": "orig", "prompt": "Solve this task."}])
+    assert rep["results"][0]["status"] == "no_pairs_in_prompt"
+    assert "solved" not in rep["results"][0], "it must not enter the denominator"
+    assert rep["n_scored"] == 0 and rep["n_solved"] == 0
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))

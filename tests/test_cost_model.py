@@ -34,8 +34,8 @@ from pipeline.contracts.cost_model import (  # noqa: E402
 NOW = "2026-07-31T00:00:00Z"
 
 # The rate card as it really is on this account: SageMaker from the Price List API,
-# tokens from realized billing (the Price List API lists neither DeepSeek-R1 nor
-# Fable 5 — verified live, which is exactly why realized rates outrank it).
+# tokens from realized billing (the Price List API lists no Fable 5 or Opus 5 — the
+# harnesses' own models; verified live, which is exactly why realized rates outrank it).
 FULL_RATES = {
     sku_training("ml.g5.2xlarge"): {"unit_price": 1.515, "unit": "hours",
                                     "source": "price_list", "as_of": NOW},
@@ -128,7 +128,8 @@ def test_all_expected_categories_are_present(rates):
 
 # ── unpriced SKUs: the silent-$0 hazard ───────────────────────────────────────
 def test_unknown_sku_is_listed_not_silently_zeroed():
-    """The measured hazard: the Price List API has no DeepSeek-R1 price.
+    """The measured hazard: the Price List API has no Fable 5 or Opus 5 price, and any
+    rate feed can go stale for a SKU it once carried.
 
     A rate card that answers 0.0 for an unknown SKU prices the teacher at nothing and
     hands back a confident, badly-low total. The line must still appear (so the
@@ -445,8 +446,10 @@ def test_reconcile_reports_a_category_the_estimate_missed_entirely():
 
 # ── rate precedence and realized rates ────────────────────────────────────────
 def test_rate_precedence_prefers_realized_billing_over_price_list():
-    """The Price List API cannot price this pipeline's models at all, so our own bill
-    is the authority wherever both exist."""
+    """The Price List API cannot price the harness fleet's own models (Fable 5, Opus 5),
+    so our own bill is the authority wherever both exist. Where both DO exist they agree
+    to <0.001% (measured on 5 SKUs), so this precedence costs nothing when the feed is
+    right and saves the estimate when it is not."""
     merged = merge_rates(
         {"sku:a": {"unit_price": 9.0, "source": "price_list", "as_of": NOW}},
         {"sku:a": {"unit_price": 1.0, "source": "ce_realized", "as_of": NOW}},
@@ -514,9 +517,12 @@ def test_required_skus_follow_the_plans_models_and_instances():
     assert sku_tokens("us.anthropic.kimi-k3", "output") in req
 
 
-def test_pricing_refresh_without_deepseek_marks_it_missing_not_absent():
+def test_pricing_refresh_without_token_rates_marks_them_missing_not_absent():
     """The measured Price List gap: refreshing from Price List alone must leave the
-    teacher line visibly unpriced rather than dropping it from the estimate."""
+    token lines visibly unpriced rather than dropping them from the estimate. Named
+    generically because WHICH model the feed omits changes between refreshes -- it
+    omits Fable 5 and Opus 5 today and did price DeepSeek-R1 on 2026-07-31; the
+    behaviour under test is what happens to any absent rate."""
     price_list_only = RateCard({
         sku_training("ml.g5.2xlarge"): FULL_RATES[sku_training("ml.g5.2xlarge")],
         sku_inference("ml.g5.xlarge"): FULL_RATES[sku_inference("ml.g5.xlarge")]})

@@ -77,13 +77,23 @@ indistinguishable, which is exactly how a teacher model silently prices at nothi
 | Source | Precedence | Verified behaviour |
 |---|---|---|
 | `ce_realized` — our own bill: unit price = cost ÷ quantity | **1st** | Yields `USE1-DeepSeek-R1-input-tokens` at **$0.00135/1K** and output at **$0.0054/1K** |
-| `price_list` — AWS Price List API | 2nd | Gives ml.g5.2xlarge at **$1.515/h** exactly. But for `AmazonBedrock` its 84 model values top out at **Claude 3 Haiku / DeepSeek V3.2** |
+| `price_list` — AWS Price List API | 2nd | Gives ml.g5.2xlarge at **$1.515/h** exactly, and DeepSeek-R1 to within **<0.001%** of our realized rate. But every `AmazonBedrock` entry for `provider=Anthropic` is Claude 3 or older |
 | `fallback_static` | 3rd | Hand-entered, always labelled as such |
 
-**The Price List API cannot price this pipeline's models.** Queried live on 2026-07-31, it has
-no entry for DeepSeek-R1 and none for Fable 5 — the teacher and the harness model, i.e. the
-two largest token consumers in the system. A pricing refresh built only on Price List would
-return "success" and silently price the teacher at $0.
+**The Price List API cannot price the harness fleet's own models.** Queried live on
+2026-07-31, every `provider=Anthropic` entry for us-east-1 is `Claude 2.0 · Claude 2.1 ·
+Claude 3 Haiku · Claude 3 Sonnet · Claude Instant` — no Fable 5, no Opus 5. Those are the
+models the seven harnesses themselves run on, and the largest AgentCore line in the bill. A
+pricing refresh built only on Price List would return "success" and silently price the whole
+agent fleet at $0.
+
+It *can* price the teacher: DeepSeek-R1 comes back at $0.00135/$0.0054 per 1K, matching our
+realized rate to **<0.001%**. An earlier version of this document said otherwise, and the
+reason it was wrong is worth keeping: the `model` attribute value is bare **`R1`** (with
+`provider=DeepSeek`), so reading the 84 model values looking for a name containing
+"DeepSeek-R1" finds nothing and concludes absence. **Query with an explicit
+`Field=model,Value=R1` filter, not by eye.** Coverage is re-probed on every refresh, because
+which models the API carries is exactly what changes between refreshes.
 
 Hence the precedence: **realized billing outranks the published price list**, because our own
 invoice is the only source guaranteed to cover what we actually use. Price List is the

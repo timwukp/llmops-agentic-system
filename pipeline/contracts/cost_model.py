@@ -24,9 +24,12 @@ Measured facts this module is calibrated against (all verified on the live accou
   **$10.77**. That gives throughput 0.664 rows/s and ~670 s of fixed setup overhead
   (image pull, data download, model upload) — both used as defaults below, so the
   estimator reproduces a run whose actual cost is known.
-* The Price List API cannot price DeepSeek-R1 or Claude Fable 5 (its ``model``
-  attribute stops at Claude 3 / DeepSeek V3.2), so realized unit rates derived from
-  our own bill outrank it. Hence RATE_PRECEDENCE.
+* The Price List API cannot price Claude Fable 5 or Opus 5 — every ``provider=Anthropic``
+  entry for us-east-1 is Claude 3 or older. Those are the models the seven harnesses
+  themselves run on, i.e. the largest AgentCore line, so realized unit rates derived from
+  our own bill outrank it. Hence RATE_PRECEDENCE. (It *does* price DeepSeek-R1, to within
+  <0.001% of realized; an earlier note here said otherwise because the ``model`` attribute
+  value is bare ``R1`` with ``provider=DeepSeek``, which reading the model list misses.)
 
 Only stdlib (Lambda-safe, importable by the console zip and by pytest alike).
 """
@@ -94,9 +97,10 @@ class RateCard:
     Deliberately not a bare ``dict[str, float]``. A $0 rate from a stale pricing feed
     and a $0 rate from a genuinely free tier are indistinguishable once the provenance
     is dropped, and the first one silently zeroes a line item that really costs money
-    (measured: the Price List API returns nothing for DeepSeek-R1, this pipeline's
-    teacher). ``get()`` returning ``None`` for an unknown SKU — rather than 0.0 — is
-    the mechanism that forces the caller into ``unpriced``.
+    (measured: the Price List API returns nothing for Claude Fable 5 or Opus 5, the
+    models these harnesses themselves run on). ``get()`` returning ``None`` for an
+    unknown SKU — rather than 0.0 — is the mechanism that forces the caller into
+    ``unpriced``.
     """
 
     def __init__(self, rates: dict | None = None):
@@ -640,8 +644,9 @@ def realized_rates(ce_usage: Iterable[dict], as_of: str,
     """Derive unit prices from our own bill: unit_price = cost ÷ quantity.
 
     This is the authoritative rate source for anything we have already used, and the
-    only one that can price DeepSeek-R1 or Claude Fable 5 at all (the Price List API
-    lists neither — verified 2026-07-31). Zero-quantity groups are skipped rather
+    only one that can price Claude Fable 5 or Opus 5 at all — the models the harnesses
+    themselves run on (the Price List API lists neither; verified 2026-07-31, when it
+    *did* turn out to price DeepSeek-R1). Zero-quantity groups are skipped rather
     than divided by, because a $0/0 rate would silently price a real SKU at nothing.
     """
     card = RateCard()

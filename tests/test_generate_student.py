@@ -63,6 +63,14 @@ class _StubTokenizer:
 
     def __call__(self, texts, return_tensors=None, padding=None, truncation=None,
                  max_length=None):
+        # A single string is the un-padded measuring call, and the real tokenizer
+        # answers it with that row's OWN length -- which is the only way to learn
+        # whether a row was over the window, since the batched encoding below is
+        # padded to the batch maximum and truncated to max_length. Modelled as one
+        # token per character: crude, but it makes length a property of the text
+        # instead of a constant, and a constant cannot express "this row was cut".
+        if isinstance(texts, str):
+            return _StubTensorDict(input_ids=[100 + i for i in range(len(texts))])
         # Uniform prompt length so the slice offset is unambiguous.
         ids = [[100 + i for i in range(5)] for _ in texts]
         return _StubTensorDict(input_ids=_StubShape(ids))
@@ -476,6 +484,63 @@ def test_output_is_scorable_by_the_eval_module(gs, tmp_path):
     # The stub emits gibberish, so it must score 0 — but it must SCORE, not crash.
     assert rep["n_generations"] == 1
     assert rep["results"][0]["status"] == "no_transform_emitted"
+
+
+# ------------------------------------------------- input-window truncation reporting
+
+def test_prompts_are_truncated_from_the_left_not_the_right(gs, tmp_path):
+    """Right truncation deletes the generation prompt, which scores every long row 0.
+
+    Qwen3 renders `<|im_start|>assistant\\n` at the END of the string, so cutting
+    from the default right end removes exactly the tokens telling the model to
+    start answering — it continues the grid instead of transforming it. Measured on
+    the real Qwen3-1.7B tokenizer: a 43,898-token prompt right-truncated to 8192
+    ends mid-word with no assistant turn at all. Nothing else in the pipeline can
+    detect this: `truncated` measures the OUTPUT ceiling, so the run looks clean and
+    simply reports the model cannot solve long tasks.
+    """
+    _run(gs, tmp_path, ROWS[:1])
+    assert gs._stub_tokenizer.truncation_side == "left"
+
+
+def test_a_row_whose_prompt_exceeded_the_window_says_so(gs, tmp_path):
+    """Left truncation keeps the row scorable but still drops its oldest context.
+
+    That row was scored on an incomplete task description, so its failure is a data
+    gap rather than model ability — and the scorer cannot tell the two apart unless
+    the row carries the flag.
+    """
+    long_row = {"task_id": "big", "variant": "orig", "prompt": "x" * 9000}
+    got = _run(gs, tmp_path, [ROWS[0], long_row])
+    by_id = {g["task_id"]: g for g in got}
+    assert by_id["big"]["prompt_truncated"] is True
+    assert by_id["t0"]["prompt_truncated"] is False, "a short prompt must not be flagged"
+
+
+def test_the_done_marker_reports_truncation_coverage_not_just_volume(gs, tmp_path):
+    """A run where half the prompts lost context is a different measurement from one
+    where none did; `n_written` alone implies a completeness the run did not have."""
+    val = tmp_path / "v.jsonl"
+    val.write_text("".join(json.dumps(r) + "\n" for r in
+                            [ROWS[0], {"task_id": "big", "variant": "orig",
+                                       "prompt": "x" * 9000}]))
+    out = tmp_path / "g.jsonl"
+    sys.argv = ["generate_student.py", "--model-dir", "/fake", "--val", str(val),
+                "--out", str(out)]
+    assert gs.main() == 0
+    meta = json.loads((tmp_path / "g.jsonl.done").read_text())
+    assert meta["n_prompt_truncated"] == 1 and meta["n_written"] == 2
+    assert meta["input_window"] == 8192
+    assert meta["truncation_side"] == "left", "the done marker must record which end was cut"
+
+
+def test_truncation_is_counted_per_row_not_per_batch(gs, tmp_path):
+    """Batched rows are padded to the batch maximum, so the encoding's width says
+    nothing about any individual row — one long row must not flag its neighbours."""
+    rows = [ROWS[0], {"task_id": "big", "variant": "orig", "prompt": "x" * 9000},
+            ROWS[1]]
+    got = _run(gs, tmp_path, rows, "--batch-size", "3")   # all three in one batch
+    assert [g["prompt_truncated"] for g in got] == [False, True, False]
 
 
 if __name__ == "__main__":

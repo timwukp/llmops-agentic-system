@@ -245,8 +245,9 @@ def test_estimate_rejects_a_non_numeric_sample_count(wired):
 
 
 def test_unpriced_skus_are_reported_not_silently_zeroed(wired):
-    """The measured hazard: Price List has no DeepSeek-R1 or Fable 5 rate, so the
-    teacher and harness lines price at $0. That must be visible."""
+    """The measured hazard: Price List has no Fable 5 or Opus 5 rate, so the harness
+    lines price at $0, and any feed can drop a SKU it once carried. That must be
+    visible rather than silently summed as zero."""
     r = _mk_estimate(wired)
     unpriced = r["estimate"]["unpriced"]
     assert unpriced, "expected unpriced SKUs with a training-only rate card"

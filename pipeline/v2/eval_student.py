@@ -113,6 +113,10 @@ def score_generations(generations: list[dict], val_rows: list[dict],
     """Execute every generation against its task's pairs; exact match only."""
     by_key = {(r["task_id"], r.get("variant", "")): r for r in val_rows}
     results, n_solved, n_parsed, n_truncated = [], 0, 0, 0
+    # Counted across EVERY status, unlike output truncation. A row whose prompt was
+    # cut never saw its whole task, so it can also come back format-valid and fail
+    # verification -- that row looks like a wrong program when it is a wrong input.
+    n_prompt_cut = n_prompt_cut_solved = 0
 
     for gen in generations:
         key = (gen["task_id"], gen.get("variant", ""))
@@ -120,6 +124,8 @@ def score_generations(generations: list[dict], val_rows: list[dict],
         if row is None:
             results.append({**key_fields(key), "status": "no_matching_val_row"})
             continue
+        prompt_cut = bool(gen.get("prompt_truncated"))
+        n_prompt_cut += prompt_cut
 
         code = extract_code(gen.get("generation", ""))
         if code is None:
@@ -128,7 +134,8 @@ def score_generations(generations: list[dict], val_rows: list[dict],
             n_truncated += bool(gen.get("truncated"))
             results.append({**key_fields(key), "status": "no_transform_emitted",
                             "solved": False,
-                            "truncated": bool(gen.get("truncated"))})
+                            "truncated": bool(gen.get("truncated")),
+                            "prompt_truncated": prompt_cut})
             continue
         n_parsed += 1
 
@@ -137,13 +144,22 @@ def score_generations(generations: list[dict], val_rows: list[dict],
         except ValueError as exc:  # malformed prompt — surface, don't score
             results.append({**key_fields(key), "status": f"bad_prompt: {exc}"})
             continue
+        if not pairs:
+            # Parsed cleanly but yielded nothing to check against. Excluded from the
+            # denominator (no "solved" key) rather than counted as a failure:
+            # scoring it either way attributes a data defect to the model. The
+            # matching guard in verify_code stops the same case reading as SOLVED.
+            results.append({**key_fields(key), "status": "no_pairs_in_prompt"})
+            continue
 
         verdict = verify_code(code, pairs, timeout_sec=timeout_sec)
         solved = bool(verdict["all_pass"])
         n_solved += solved
+        n_prompt_cut_solved += (prompt_cut and solved)
         results.append({**key_fields(key),
                         "status": "solved" if solved else "failed_verification",
                         "solved": solved,
+                        "prompt_truncated": prompt_cut,
                         "pairs_passed": verdict["n_pass"],
                         "pairs_total": verdict["n_pairs"],
                         "fail_reason": verdict["fail_reason"]})
@@ -156,10 +172,31 @@ def score_generations(generations: list[dict], val_rows: list[dict],
         "n_format_valid": n_parsed,
         "n_solved": n_solved,
         "n_truncated_format_failures": n_truncated,
+        "n_prompt_truncated": n_prompt_cut,
         "solve_rate": n_solved / n if n else 0.0,
         "format_valid_rate": n_parsed / n if n else 0.0,
         "results": results,
     }
+    # The same rate over rows that saw their whole task. Reported ALONGSIDE
+    # solve_rate rather than instead of it: dropping the cut rows silently would
+    # inflate the headline, and reporting only the blended figure hides that some
+    # rows were never given the question. Both, plus the count, lets a reader see
+    # the size of the gap instead of taking a number on trust.
+    n_intact = n - n_prompt_cut
+    if n_prompt_cut:
+        report["solve_rate_intact_prompts"] = (
+            (n_solved - n_prompt_cut_solved) / n_intact if n_intact else 0.0)
+        report["n_scored_intact_prompts"] = n_intact
+        report["prompt_caveat"] = (
+            f"{n_prompt_cut}/{n} prompts exceeded the generator's 8192-token input "
+            f"window and lost their oldest context to left-truncation. Those rows "
+            f"were scored on an incomplete task description, so their failures are a "
+            f"data gap rather than model ability -- including any that parsed and "
+            f"then failed verification, which look like wrong programs but are wrong "
+            f"inputs. solve_rate_intact_prompts "
+            f"({report['solve_rate_intact_prompts']:.3f} over {n_intact} rows) is the "
+            f"figure to compare across runs; widen the window to remove the caveat "
+            f"instead of reading around it")
     if n_truncated:
         report["format_caveat"] = (
             f"{n_truncated} of the {n - n_parsed} format failures ran out of "

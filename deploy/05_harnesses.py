@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""05_harnesses.py — create/update the five worker harnesses from agents/*/harness.json.
+"""05_harnesses.py — create/update every harness from agents/*/harness.json.
 
 Thin orchestrator over the agentcore-harness-builder skill's create_harness.py /
 update_harness.py conventions: reads each config, strips `_`-prefixed comment keys,
@@ -11,7 +11,7 @@ OTEL_TRACES_SAMPLER=always_on (without it, evaluations/insights sit at zero).
 
 Usage:
   python deploy/05_harnesses.py --region us-east-1 --dry-run
-  python deploy/05_harnesses.py --region us-east-1                       # all five
+  python deploy/05_harnesses.py --region us-east-1                       # all seven
   python deploy/05_harnesses.py --region us-east-1 --agent data-prep     # one
   python deploy/05_harnesses.py --region us-east-1 --agent data-prep --prod  # harness.prod.json
 """
@@ -25,7 +25,11 @@ import time
 import boto3
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
-AGENTS = ["data-prep", "finetune", "eval", "deploy", "monitor", "orchestrator"]
+AGENTS = ["data-prep", "finetune", "eval", "deploy", "monitor", "orchestrator",
+          # The auditor. Listed here and not only in agents/ because this list is
+          # what --agent validates against and what a bare run creates: a config on
+          # disk that no script names is a harness that silently never exists.
+          "finops"]
 
 
 def strip_comments(obj):
