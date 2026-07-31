@@ -236,6 +236,49 @@
         "Effect": "Allow",
         "Action": "events:PutEvents",
         "Resource": "arn:aws:events:<REGION>:<ACCOUNT_ID>:event-bus/llmops-pipeline"
+      },
+      {
+        "_comment": "For llmops_finops (the audit runtime). READ-ONLY on billing, by design: an auditor able to change what it audits is not an auditor. Every verb here is Get/List/Describe -- notably NO ce:CreateCostCategoryDefinition, NO ce:UpdateCostAllocationTagsStatus, NO budgets:ModifyBudget. Resource must be * because ce:* and pricing:* have no resource-level ARNs; the scoping is the verb list. All six harnesses share this role, so the other five gain read-only billing visibility they do not use -- the alternative is a second execution role, which the harness create path does not support today.",
+        "Sid": "BillingReadOnlyForFinOps",
+        "Effect": "Allow",
+        "Action": [
+          "ce:GetCostAndUsage",
+          "ce:GetCostAndUsageWithResources",
+          "ce:GetDimensionValues",
+          "ce:GetTags",
+          "ce:GetCostForecast",
+          "ce:ListCostAllocationTags",
+          "pricing:GetProducts",
+          "pricing:GetAttributeValues",
+          "pricing:DescribeServices",
+          "budgets:DescribeBudgets"
+        ],
+        "Resource": "*"
+      },
+      {
+        "_comment": "The finops agent reads estimates to compare against, and reads/writes the actuals ledger it owns. It must NOT be able to change an approval decision, so no write verbs on llmops-cost-estimates -- an auditor that can flip a rejected estimate to approved has defeated the gate.",
+        "Sid": "CostLedgerForFinOps",
+        "Effect": "Allow",
+        "Action": [
+          "dynamodb:GetItem",
+          "dynamodb:Query",
+          "dynamodb:Scan"
+        ],
+        "Resource": [
+          "arn:aws:dynamodb:<REGION>:<ACCOUNT_ID>:table/llmops-cost-estimates",
+          "arn:aws:dynamodb:<REGION>:<ACCOUNT_ID>:table/llmops-cost-estimates/index/*"
+        ]
+      },
+      {
+        "Sid": "CostActualsLedgerForFinOps",
+        "Effect": "Allow",
+        "Action": [
+          "dynamodb:GetItem",
+          "dynamodb:Query",
+          "dynamodb:PutItem",
+          "dynamodb:UpdateItem"
+        ],
+        "Resource": "arn:aws:dynamodb:<REGION>:<ACCOUNT_ID>:table/llmops-cost-actuals"
       }
     ]
   }
