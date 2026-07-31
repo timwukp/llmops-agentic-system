@@ -99,6 +99,7 @@
 </header>
 
 <nav class="tabs">
+  <button data-tab="architecture" onclick="showTab('architecture')">Architecture</button>
   <button data-tab="pipeline" class="active" onclick="showTab('pipeline')">Pipeline</button>
   <button data-tab="fleet" onclick="showTab('fleet')">Fleet</button>
   <button data-tab="obs" onclick="showTab('obs')">Observability</button>
@@ -115,6 +116,53 @@
     <div class="stat" id="kpiRuns">&ndash;</div><small id="kpiRunsSub">recent runs in DynamoDB</small></div>
   <div data-tab-panel="all" class="card col-4"><h2>Executions</h2>
     <div class="stat" id="kpiExec">&ndash;</div><small id="kpiExecSub">Step Functions llmops-pipeline</small></div>
+
+  <!-- Architecture: what this system is and how it is wired -->
+  <div data-tab-panel="architecture" class="card col-12"><h2>Solution architecture</h2>
+    <div style="font-size:15px;font-weight:650;margin-bottom:6px">An autonomous LLMOps distillation pipeline, operated by agents</div>
+    <div class="sub" style="max-width:920px">Seven AWS Bedrock AgentCore harnesses run the full model-distillation lifecycle
+      &mdash; a teacher (DeepSeek-R1 on Bedrock) generates verified training data, a student (Qwen3-1.7B) is fine-tuned with QLoRA
+      on SageMaker, evaluated against verifiable gates, deployed, and monitored. A Step Functions spine dispatches five stage
+      workers; an orchestrator triages escalations before any human is paged; a FinOps auditor reconciles every dollar actually
+      spent against the estimate that was approved. This console is the human control plane over that loop.</div>
+    <div class="flex" style="margin-top:12px;flex-wrap:wrap">
+      <a href="https://github.com/timwukp/llmops-agentic-system" target="_blank" rel="noopener"><button class="primary">Repository &#8599;</button></a>
+      <a href="https://github.com/timwukp/llmops-agentic-system/blob/main/docs/ARCHITECTURE.md" target="_blank" rel="noopener"><button>Architecture docs &#8599;</button></a>
+      <a href="https://github.com/timwukp/llmops-agentic-system/blob/main/docs/COST.md" target="_blank" rel="noopener"><button>FinOps &amp; cost gates &#8599;</button></a>
+      <a href="https://github.com/timwukp/MLOps-agent-skills" target="_blank" rel="noopener"><button>Agent skills library &#8599;</button></a>
+    </div>
+  </div>
+
+  <div data-tab-panel="architecture" class="card col-12"><h2>High-level &middot; triggers &rarr; conductor &rarr; stage workers &rarr; AWS</h2>
+    <div id="archHigh"><span class="sub">loading diagram&hellip;</span></div>
+    <div class="sub" style="margin-top:8px">Four ways in (scheduler, GitHub Actions, admin API, webhook), one spine
+      (start_pipeline &rarr; Step Functions &rarr; harness-driver), five stage workers, and the audit plane at the bottom:
+      finops-daily fires the auditor every day at 09:00 UTC &mdash; it reads billing, reconciles, and cannot stop a run.</div>
+  </div>
+
+  <div data-tab-panel="architecture" class="card col-12"><h2>Low-level &middot; inside a worker harness</h2>
+    <div id="archLow"><span class="sub">loading diagram&hellip;</span></div>
+    <div class="sub" style="margin-top:8px">Each worker is a declarative AgentCore harness: Fable 5 in a microVM with shell +
+      code interpreter, skills mounted from git, shared cross-run memory, and inline functions (stage_complete, checkpoint,
+      job_launched, the finops audit tools) that the harness-driver Lambda services with a trust-but-verify contract &mdash;
+      a claimed S3 artifact is head-checked before the call is accepted.</div>
+  </div>
+
+  <div data-tab-panel="architecture" class="card col-12"><h2>This console &middot; how the dashboard itself is wired</h2>
+    <div id="archOps"><span class="sub">loading diagram&hellip;</span></div>
+    <div class="sub" style="margin-top:8px">One Lambda serves this page and its API. GETs are public, read-only aggregations;
+      every POST requires a Cognito token, and the $2,000 cost-approval gate is enforced server-side &mdash; the requester can
+      never approve their own estimate.</div>
+  </div>
+
+  <div data-tab-panel="architecture" class="card col-12"><h2>How to read the diagrams</h2>
+    <ul style="margin:0;padding-left:20px;color:var(--muted);font-size:13px;line-height:1.9">
+      <li><b style="color:var(--text)">Colors are layers</b> &mdash; purple: triggers &middot; blue: orchestration spine &middot; amber: agent harnesses &middot; green: AWS services &middot; red: human/ops surfaces.</li>
+      <li><b style="color:var(--text)">Animated dashes show flow direction</b> &mdash; the red loop on the high-level diagram is the self-remediation cycle: an eval gate failure re-dispatches finetune, at most 3 times, before escalating.</li>
+      <li><b style="color:var(--text)">Every card is a link</b> into the exact config or handler in the repository &mdash; the diagrams are generated from the live configs, not drawn aspirationally, and a layout test forbids crossing wires.</li>
+      <li><b style="color:var(--text)">The audit plane is outside the state machine on purpose</b> &mdash; reconciliation runs daily across many finished runs (Cost Explorer settles ~24h late), so it answers to the project, not to any single run, and its IAM is read-only on billing.</li>
+    </ul>
+  </div>
 
   <!-- Pipeline: stage-flow diagram -->
   <div data-tab-panel="pipeline" class="card col-12"><h2>Pipeline &middot; llmops-pipeline &middot; live stage flow</h2>
@@ -976,6 +1024,34 @@ async function loadCost(){
   } catch(e){ $("cRollup").innerHTML = `<span class="sub">cost error: ${esc(e)}</span>`; }
 }
 
+// ── architecture diagrams ─────────────────────────────────────────────────────
+// Served same-origin by this Lambda (bundled in the zip) so the CSP stays
+// connect-src 'self'. Inlined rather than <img> so the animated dashed wires run;
+// inlined into a shadow root because the SVGs use the same class names (.card,
+// .wire) and marker ids as this page's own CSS — direct innerHTML would collide.
+let archLoaded = false;
+async function inlineArchSvg(elId, path){
+  const el = $(elId);
+  try {
+    const r = await fetch(path);
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    let svg = await r.text();
+    svg = svg.replace(/<script[\s\S]*?<\/script\s*>/gi, "");
+    if (!svg.includes("<svg")) throw new Error("not an SVG");
+    const root = el.shadowRoot || el.attachShadow({mode:"open"});
+    root.innerHTML = "<style>:host{display:block}svg{width:100%;height:auto;display:block;border-radius:10px}</style>" + svg;
+  } catch(e){
+    el.innerHTML = '<span class="sub">diagram unavailable (' + esc(String(e.message||e).slice(0,80)) + ')</span>';
+  }
+}
+function loadArch(){
+  if (archLoaded) return;
+  archLoaded = true;
+  inlineArchSvg("archHigh", "/docs/architecture-high-level.svg");
+  inlineArchSvg("archLow", "/docs/architecture-low-level.svg");
+  inlineArchSvg("archOps", "/docs/architecture-console.svg");
+}
+
 // ── tabs (ported: persistence + poll only while active) ──────────────────────
 function showTab(t){
   document.querySelectorAll("[data-tab-panel]").forEach(el=>{
@@ -983,6 +1059,7 @@ function showTab(t){
   document.querySelectorAll("nav.tabs button").forEach(b=>b.classList.toggle("active", b.dataset.tab===t));
   localStorage.setItem("adminTab", t);
   pipePoll(t==="pipeline");
+  if (t==="architecture") loadArch();
   if (t==="pipeline") loadPipe().catch(console.error);
   if (t==="obs") { loadObs(); }
   if (t==="evals") loadEvals();
@@ -990,12 +1067,13 @@ function showTab(t){
   if (t==="cost") loadCost();
 }
 
-// tab on load: ?tab= URL param > localStorage > pipeline default
-const KNOWN_TABS = ["pipeline","fleet","obs","evals","opts","cost"];
+// tab on load: ?tab= URL param > localStorage > architecture for first-time
+// visitors (the tab exists to explain the system), remembered tab afterwards
+const KNOWN_TABS = ["architecture","pipeline","fleet","obs","evals","opts","cost"];
 const _urlTab = new URLSearchParams(location.search).get("tab");
 const _memTab = localStorage.getItem("adminTab");
 showTab(KNOWN_TABS.includes(_urlTab) ? _urlTab
-      : KNOWN_TABS.includes(_memTab) ? _memTab : "pipeline");
+      : KNOWN_TABS.includes(_memTab) ? _memTab : "architecture");
 setAuthUi();
 refresh();
 </script>

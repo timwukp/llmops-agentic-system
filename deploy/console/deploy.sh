@@ -124,6 +124,8 @@ case "$VENDORED" in
 esac
 cp "$(dirname "$0")/lambda_function.py" "$BUILD/lambda_function.py"
 cp "$(dirname "$0")/frontend.html" "$BUILD/frontend.html"   # read once at cold start by the handler
+# Architecture-tab diagrams, served same-origin (CSP is connect-src 'self').
+cp "$(dirname "$0")"/../../docs/architecture-{high-level,low-level,console}.svg "$BUILD/"
 # The gate arithmetic, vendored flat because the handler does `import cost_model`.
 # Without it every estimate refuses with 503 and the Cost tab reports the rate card
 # as unavailable -- which is the fail-closed behaviour working, but it means the tab

@@ -114,7 +114,14 @@ def ensure_contracts(s3, bucket, dry):
         return {"would": f"upload {len(files)} contract files", "to": f"s3://{bucket}/contracts/"}
     for p in files:
         s3.upload_file(str(p), bucket, f"contracts/{p.name}")
-    return {"uploaded": [p.name for p in files], "to": f"s3://{bucket}/contracts/"}
+        # Mirror under the repo-relative key too. The harness prompts cite the module
+        # as pipeline/contracts/cost_model.py (its path in the repo), and a live
+        # pricing_refresh showed the agent probing exactly that string as an S3 key
+        # before giving up. Two keys, one upload path — cheaper than arguing with
+        # every future prompt about which spelling is canonical.
+        s3.upload_file(str(p), bucket, f"pipeline/contracts/{p.name}")
+    return {"uploaded": [p.name for p in files],
+            "to": [f"s3://{bucket}/contracts/", f"s3://{bucket}/pipeline/contracts/"]}
 
 
 def ensure_table(ddb, name, spec, dry, pitr=False):

@@ -66,14 +66,14 @@ def wire(d, cls="wire", marker="ahB"):
     return f'  <path class="{cls}" d="{d}" marker-end="url(#{marker})"/>\n'
 
 
-# ================= HIGH-LEVEL (1240 x 700) =================
-W, H = 1240, 700
+# ================= HIGH-LEVEL (1240 x 780) =================
+W, H = 1240, 780
 CW, CH = 180, 56
 svg = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" font-family="system-ui,-apple-system,\'Segoe UI\',Roboto,sans-serif">']
 svg.append(STYLE)
 svg.append(f'  <rect class="bg" x="0" y="0" width="{W}" height="{H}" rx="16"/>')
 svg.append('  <text class="title" x="30" y="40" font-size="18">llmops-agentic-system — autonomous LLMOps on AgentCore</text>')
-svg.append('  <text class="sub" x="30" y="60">teacher DeepSeek-R1 (Bedrock) → student Qwen3-1.7B (SageMaker QLoRA) · click any card</text>')
+svg.append('  <text class="sub" x="30" y="60">teacher DeepSeek-R1 (Bedrock) → student Qwen3-1.7B (SageMaker QLoRA) · 7 harnesses · click any card</text>')
 
 # Column 1 (x=30): triggers, stacked
 trig_y = [92, 168, 244, 320]
@@ -83,6 +83,7 @@ trigs = [("⏰", "EventBridge Scheduler", "cron · nightly runs"),
          ("🪝", "Webhook", "HMAC-verified")]
 for (icon, name, sub), y in zip(trigs, trig_y):
     svg.append(card(30, y, CW, CH, "cTrig", icon, name, sub, "docs/TRIGGERS.md"))
+
 
 # Column 2 (x=286): conductor on top, then spine, stacked
 svg.append(card(286, 92, CW, CH, "cAgent", "🎼", "llmops_orchestrator", "goal → plan → dispatch · triage", "agents/orchestrator/harness.json"))
@@ -136,8 +137,20 @@ svg.append(wire(f"M{850+CW/2},{240+CH} L{850+CW/2},{505-4}", "wire", "ahB"))
 svg.append(wire(f"M{850},{505+CH/2} L{286+CW/2},{505+CH/2} L{286+CW/2},{282+CH+4}", "wire", "ahB").replace('marker-end="url(#ahB)"', 'marker-end="url(#ahB)"'))
 
 # Console (x=1080 vertical strip) reads everything — dim wires, no crossings (right margin corridor)
-svg.append(card(1040, 505, 186, CH, "cOps", "🖥️", "llmops-admin console", "obs · evals · optimizations", "deploy/console/wire_console.py"))
-svg.append(f'  <text class="sub" x="{1040+93}" y="{505-10}" text-anchor="middle" fill="#ff6b81">reads traces · reports · runs</text>')
+svg.append(card(1040, 505, 186, CH, "cOps", "🖥️", "llmops-admin console", "obs · evals · opts · cost", "deploy/console/README.md"))
+svg.append(f'  <text class="sub" x="{1040+93}" y="{505-10}" text-anchor="middle" fill="#ff6b81">reads traces · reports · runs · spend</text>')
+
+# ---- FinOps audit plane (its own row below the pipeline: it runs beside the
+# state machine, not inside it — daily, spanning many finished runs) ----
+svg.append(f'  <text class="bandT" x="30" y="550">AUDIT PLANE — reconciles what was actually spent · cannot stop a run · read-only billing IAM</text>')
+svg.append(card(30, 560, CW, CH, "cTrig", "⏰", "finops-daily", "cron 09:00 UTC · billing reads only", "docs/COST.md"))
+svg.append(card(286, 560, CW, CH, "cSpine", "🧮", "finops-reconcile λ", "period select · D-2 + re-settle", "orchestration/finops_reconcile/handler.py"))
+svg.append(card(560, 582, CW, CH, "cAgent", "🧾", "llmops_finops", "auditor · reconcile / rates / report", "agents/finops/harness.json"))
+svg.append(card(850, 582, CW, CH, "cAws", "💰", "Cost Explorer · Price List", "resource-level actuals · unit rates", "docs/COST.md"))
+svg.append(wire(f"M{30+CW},{560+CH/2} L{282},{560+CH/2}", "wireP", "ahP"))
+svg.append(wire(f"M{466},{560+CH/2} L{511},{560+CH/2} L{511},{582+CH/2} L{556},{582+CH/2}", "wireO", "ahO"))
+svg.append(f'  <text class="sub" x="511" y="{560+CH/2-8}" text-anchor="middle">via harness-driver λ</text>')
+svg.append(wire(f"M{740},{582+CH/2} L{846},{582+CH/2}", "wireG", "ahG"))
 
 # Self-iteration loop label (eval -> finetune remediation) — left-side corridor between columns
 svg.append(wire(f"M{560},{288+CH/2} L{540},{288+CH/2} L{540},{190+CH/2+16} L{556},{190+CH/2+16}", "wireR", "ahR"))
@@ -150,9 +163,9 @@ svg.append(wire(f"M{560+CW/2},{92} L{560+CW/2},{78} L{286+CW/2+30},{78} L{286+CW
 svg.append(f'  <text class="sub" x="{460}" y="{72}" text-anchor="middle" fill="#ff6b81">escalations → conductor triage first · page human only if needed</text>')
 
 # State band at bottom
-yb = 600
+yb = 680
 svg.append(f'  <rect class="band" x="30" y="{yb}" width="{W-60}" height="72" rx="14"/>')
-svg.append(f'  <text class="bandT" x="50" y="{yb+26}">STATE — S3 runs/&lt;run_id&gt;/manifest.json · DynamoDB runs + stage-events · shared AgentCore Memory · EventBridge bus llmops-pipeline</text>')
+svg.append(f'  <text class="bandT" x="50" y="{yb+26}">STATE — S3 runs/&lt;run_id&gt;/manifest.json · finops/rates rate card · DynamoDB runs + stage-events + cost-actuals + cost-estimates · shared Memory</text>')
 svg.append(f'  <text class="sub" x="50" y="{yb+48}">skills mounted from MLOps-agent-skills (git in dev, S3 mirror in prod) · VPC-isolated in production · least-privilege IAM · TEST-PROVEN gates per phase</text>')
 
 svg.append('</svg>')
@@ -175,7 +188,7 @@ svg.append('  <text class="bandT" x="306" y="128">AGENTCORE HARNESS SESSION (mic
 svg.append(card(316, 150, CW, CH, "cAgent", "🧠", "Fable 5 agent loop", "Strands · maxIterations 100", "agents/README.md"))
 svg.append(card(316, 260, CW, CH, "cDim", "📚", "mounted skills", "MLOps-agent-skills llmops/*", "agents/data-prep/harness.json"))
 svg.append(card(316, 370, CW, CH, "cDim", "🐚", "shell + code interpreter", "aws cli · python", "agents/README.md"))
-svg.append(card(660, 150, CW + 40, CH, "cOps", "🧩", "inline functions", "stage_complete · checkpoint · job_launched …", "agents/README.md"))
+svg.append(card(660, 150, CW + 40, CH, "cOps", "🧩", "inline functions", "stage_complete · job_launched · finops audit tools …", "agents/README.md"))
 svg.append(card(660, 260, CW + 40, CH, "cDim", "🗃️", "shared BYO memory", "SEMANTIC + EPISODIC · cross-run", "deploy/04_wire_memory.py"))
 svg.append(card(660, 370, CW + 40, CH, "cDim", "🛰️", "OTel traces", "always_on → console evals", "deploy/06_observability.py"))
 
@@ -200,4 +213,55 @@ svg.append(wire(f"M{660+CW+40},{260+CH/2} L{982},{260+CH/2}", "wireG", "ahG"))
 
 svg.append('</svg>')
 open(os.path.join(OUT, "architecture-low-level.svg"), "w").write("\n".join(svg))
+
+# ================= CONSOLE: the LLMOps Admin dashboard's own plumbing (1240 x 620) =================
+svg = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1240 620" font-family="system-ui,-apple-system,\'Segoe UI\',Roboto,sans-serif">']
+svg.append(STYLE)
+svg.append('  <rect class="bg" x="0" y="0" width="1240" height="620" rx="16"/>')
+svg.append('  <text class="title" x="30" y="40" font-size="18">LLMOps Admin console — one Lambda, read-mostly, server-enforced gates</text>')
+svg.append('  <text class="sub" x="30" y="60">deploy/console/ · self-contained HTML from cold start · public GETs, Cognito on every POST</text>')
+
+# Left column: the operator path in
+svg.append(card(30, 120, CW, CH, "cOps", "🧑‍💻", "Operator browser", "single HTML · no CDN · CSP self", "deploy/console/frontend.html"))
+svg.append(card(30, 240, CW, CH, "cTrig", "🚪", "HTTP API Gateway", "routes / and /api/*", "deploy/console/deploy.sh"))
+svg.append(card(30, 360, CW, CH, "cTrig", "🔐", "Cognito user pool", "sign-in · approver group", "docs/COST.md"))
+svg.append(wire(f"M{30+CW/2},{120+CH} L{30+CW/2},{240-4}", "wireP", "ahP"))
+svg.append(wire(f"M{30+CW/2},{240+CH} L{30+CW/2},{360-4}", "wireDim", "ahP").replace("wireDim", "wireP"))
+svg.append(f'  <text class="sub" x="{30+CW/2}" y="{360-10}" text-anchor="middle">POSTs carry access token</text>')
+
+# Center: the console Lambda
+svg.append(card(286, 240, CW+20, CH, "cSpine", "🖥️", "llmops-admin λ", "frontend + API in one handler", "deploy/console/lambda_function.py"))
+svg.append(wire(f"M{30+CW},{240+CH/2} L{282},{240+CH/2}", "wireP", "ahP"))
+
+# Read plane (top right): four sources, each its own corridor from the Lambda's top edge
+svg.append(f'  <text class="bandT" x="620" y="100">READ PLANE — public GETs, aggregated server-side</text>')
+reads = [("🛰️", "AgentCore planes", "fleet · evals · optimizations", "deploy/06_observability.py", 620, 120),
+         ("📈", "CloudWatch + spans", "metrics · aws/spans sessions", "deploy/06_observability.py", 620, 200),
+         ("🗄️", "DynamoDB", "runs · events · cost tables", "docs/COST.md", 620, 280),
+         ("🪣", "S3", "reports · finops/rates rate card", "docs/COST.md", 620, 360)]
+for icon, name, sub, href, x, y in reads:
+    svg.append(card(x, y, CW+20, CH, "cAws", icon, name, sub, href))
+lam_r = 286 + CW + 20
+# Corridor nesting so the fan-out never self-crosses: upward wires take corridors
+# nearest-first from the top, downward wires nearest-first from the bottom.
+corridors = [540, 556, 588, 572]
+for i, (_, _, _, _, x, y) in enumerate(reads):
+    corr = corridors[i]
+    src_y = 240 + 8 + i * 12
+    svg.append(wire(f"M{lam_r},{src_y} L{corr},{src_y} L{corr},{y+CH/2} L{x-4},{y+CH/2}", "wireG", "ahG"))
+
+# Write plane (bottom): the three POST actions and what stands between them and effect
+svg.append(f'  <text class="bandT" x="286" y="450">WRITE PLANE — every POST authed; the cost gate is enforced server-side, not in the UI</text>')
+WW = CW + 60  # write-plane cards carry longer route names
+svg.append(card(286, 470, WW, CH, "cOps", "▶️", "POST /runs", "start pipeline run", "orchestration/start_pipeline/handler.py"))
+svg.append(card(566, 470, WW, CH, "cOps", "⚖️", "POST /api/cost-approval", "approver group · never self-approve", "docs/COST.md"))
+svg.append(card(846, 470, WW, CH, "cOps", "💸", "POST /api/finops-run", "reconcile · pricing_refresh · report", "orchestration/finops_reconcile/handler.py"))
+lam_cx = 286 + (CW+20)/2
+svg.append(wire(f"M{lam_cx-40},{240+CH} L{lam_cx-40},{470-4}", "wireR", "ahR"))
+svg.append(wire(f"M{lam_cx+40},{240+CH} L{lam_cx+40},{440} L{566+WW/2},{440} L{566+WW/2},{470-4}", "wireR", "ahR"))
+svg.append(wire(f"M{286+CW+20},{240+CH/2+16} L{500},{240+CH/2+16} L{500},{424} L{846+WW/2},{424} L{846+WW/2},{470-4}", "wireR", "ahR"))
+svg.append(f'  <text class="sub" x="{846+WW/2}" y="{470+CH+22}" text-anchor="middle">async → finops-reconcile λ → harness-driver λ → llmops_finops</text>')
+
+svg.append('</svg>')
+open(os.path.join(OUT, "architecture-console.svg"), "w").write("\n".join(svg))
 print("SVGs written")
