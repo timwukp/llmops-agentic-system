@@ -156,15 +156,33 @@ PASS — scorer credits every verified solution
 
 The oracle direction feeds the *verified ground-truth* code back in as if the
 model had emitted it; anything below 1.000 means the scorer rejects known-correct
-solutions and would understate the model. The adversarial direction lives in
-`tests/test_eval_student.py` (25 tests): a wrong answer, a partially-correct
-answer, a hardcoded output that memorizes pair 1, crashing code, an infinite
-loop, a filesystem-escape attempt, a generation for an unknown task, and a
-sibling *variant* of the right task must all score 0 — that last one matters
-because variants share a `task_id` but need different code, so matching on
-`task_id` alone would be a silent leak. Prompt parsing is verified against all
-1,000 val rows (0 failures) and rejects any grid whose contents contradict its
-declared `HxW`.
+solutions and would understate the model. Measured over **all 1,000 val rows**:
+1000/1000, `format 1.000`.
+
+An oracle pass only proves the scorer does not *reject* correct code — not that it
+*discriminates*. The adversarial direction lives in `tests/test_eval_student.py`
+(40 tests): a wrong answer, a partially-correct answer, a hardcoded output that
+memorizes pair 1, crashing code, code that does not compile, an infinite loop, a
+filesystem-escape attempt, a generation for an unknown task, and a sibling
+*variant* of the right task must all score 0 — that last one matters because
+variants share a `task_id` but need different code, so matching on `task_id` alone
+would be a silent leak. Run as a spread over 200 real val rows, the separation is:
+
+| Control | solve_rate | format_valid_rate |
+|---|---|---|
+| oracle (verified code) | 1.000 | 1.000 |
+| identity `return grid` (valid, wrong) | 0.000 | 1.000 |
+| verified code, wrong task | 0.005 | 1.000 |
+| code that does not compile | 0.000 | 0.000 |
+| prose, no code block | 0.000 | 0.000 |
+
+Prompt parsing is verified against all 1,000 val rows (0 failures) and rejects any
+grid whose contents contradict its declared `HxW`.
+
+The single non-zero off-diagonal is real and expected: 1 of 200 ARC tasks is solved
+by another task's verified program, because some ARC transformations genuinely
+coincide on small grids. It is a property of the task set, not a scorer defect —
+worth stating so a future 0.005 floor is not mistaken for leakage.
 
 ### Gate — and what the baseline can honestly mean
 
@@ -187,8 +205,21 @@ With no baseline at all it reports `NO_TEACHER_BASELINE` / `passed: null` rather
 than claiming a pass.
 
 The absolute numbers to read alongside the gate are `solve_rate` (executable
-correctness) and `format_valid_rate` (did it emit a `transform` at all) — for a
-1.7B student on ARC-AGI-2, the second is the more informative early signal.
+correctness) and `format_valid_rate` (did it emit a `transform` that **compiles**)
+— for a 1.7B student on ARC-AGI-2, the second is the more informative early signal.
+
+`format_valid_rate` counts only code that parses, and `n_unparseable_code` reports
+the rest separately from `no_transform_emitted`. The distinction is not cosmetic:
+the two failures say different things about the model (one tried and ran out of
+tokens, the other never wrote a `transform`) and only the first is fixed by raising
+`--max-new-tokens`. This was a real defect, found by running the negative controls
+above rather than by any test: `extract_code` regex-matches a `def transform(` line,
+so a body cut off mid-expression carried the signature and scored `format_valid`
+**1.000** over 200 rows. A model emitting 200 unparseable stubs would have read as
+perfectly well-formed — through both the `format_validity: 0.95` pipeline gate and
+the verdict `compute_lift` falls back to when both solve rates are 0. Code that
+compiles and then crashes (`NameError`) stays format-valid: that is a wrong program,
+not a malformed one.
 
 ### Lift: the comparison that actually answers the question
 
