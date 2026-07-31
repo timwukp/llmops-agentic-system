@@ -93,6 +93,17 @@ try:
 except Exception as _e:  # zip built without frontend.html — fail visibly, not blank
     FRONTEND_HTML = f"<h1>frontend.html missing from bundle: {_e}</h1>"
 
+# ── architecture diagrams: bundled in the zip and served same-origin, because the
+# CSP is connect-src 'self' — the Architecture tab fetches these instead of GitHub ─
+ARCH_SVGS = {}
+for _name in ("architecture-high-level.svg", "architecture-low-level.svg",
+              "architecture-console.svg"):
+    try:
+        with open(os.path.join(_HERE, _name), encoding="utf-8") as _f:
+            ARCH_SVGS[f"/docs/{_name}"] = _f.read()
+    except Exception as _e:  # missing from the bundle — 404 with the reason, not a blank panel
+        ARCH_SVGS[f"/docs/{_name}"] = None
+
 _BUCKET_CACHE = None
 
 
@@ -1606,6 +1617,12 @@ def handler(event, context):
 
     if method == "GET" and path in ("/", "/index.html"):
         return _resp(200, FRONTEND_HTML, "text/html; charset=utf-8")
+
+    if method == "GET" and path in ARCH_SVGS:
+        svg = ARCH_SVGS[path]
+        if svg is None:
+            return _resp(404, {"error": f"{path} missing from the deployed bundle"})
+        return _resp(200, svg, "image/svg+xml; charset=utf-8")
 
     try:
         if method == "GET" and path == "/api/overview":

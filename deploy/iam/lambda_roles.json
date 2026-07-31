@@ -108,6 +108,20 @@
             "Effect": "Allow",
             "Action": "lambda:InvokeFunction",
             "Resource": "arn:aws:lambda:<REGION>:<ACCOUNT_ID>:function:llmops-harness-driver"
+          },
+          {
+            "_comment": "The state machine and the finops entry Lambda pass logical harness names (llmops_finops); the driver resolves them to full suffixed ids via SSM /llmops/harness/<agent>. Without this every invocation dies before InvokeHarness is even attempted.",
+            "Sid": "ResolveHarnessIdsFromSsm",
+            "Effect": "Allow",
+            "Action": "ssm:GetParameter",
+            "Resource": "arn:aws:ssm:<REGION>:<ACCOUNT_ID>:parameter/llmops/harness/*"
+          },
+          {
+            "_comment": "trust-but-verify: the driver head_objects every S3 URI an agent claims in a terminal tool (stage_complete outputs, publish_cost_report report_uri, update_rate_card rates_uri) and reads the run manifest. head_object needs s3:GetObject. Without it verify_outputs sees AccessDenied as 'missing' and rejects every terminal call the agent makes, even when the artifact exists. Read-only, own data bucket only: the driver verifies artifacts, it does not write them.",
+            "Sid": "TrustButVerifyArtifactRead",
+            "Effect": "Allow",
+            "Action": "s3:GetObject",
+            "Resource": "arn:aws:s3:::<DATA_BUCKET>/*"
           }
         ]
       }
