@@ -111,6 +111,40 @@ harness 一條同家族後備鏈（Fable 5 → Opus 5，零 prompt 改動，經 
 約 15 秒熱切換，session 存活）、混合模型配置分散配額壓力、driver 層對 5xx 特徵
 自動切換。
 
+## GPU 容量是另一條互不相干的隊列
+
+上一節的供應商配額限制 harness「思考」的速度；GPU 容量限制訓練能否「開始」，
+而且行為完全不同：對 `ml.g6.2xlarge` 發 `CreateTrainingJob` 會被接受，進入
+`InProgress` / `Pending`，訊息是 `"Training job waiting for capacity"`，然後就
+只是等 —— 可能幾分鐘，也可能幾小時，沒有錯誤可以反應，也讀不到排隊位置。v2
+這次的 g6 與 g5 兩個嘗試都 Pending 超過 20 分鐘。
+
+有兩個事實讓這件事可以低成本繞過。**Pending 期間不計費** —— 計費從 `Starting`
+（真正分配到機器）開始。而 SageMaker 訓練配額是**按機型分開**的：本帳號對
+`ml.g5.{xlarge…12xlarge}` 與 `ml.g6.{xlarge…12xlarge}` 每一種各有獨立的 1 個限額。
+這些是互相獨立的抽獎，所以把同一個 job 排進 N 個 pool 等於買 N 張彩券，而在它們
+都還在等的時候完全免費。
+
+代價是彩券可能**同時中獎**，而兩個各 9 小時、每小時約 $1.2–2 的 QLoRA 跑出同一個
+結果卻付兩倍錢。`pipeline/training/capacity_race_guard.sh` 每 60 秒輪詢一次，停掉
+除了第一個離開隊列者以外的所有候選。它的不變量值得寫清楚，因為搞反的代價是金錢
+而不只是「不對」：
+
+- 只要過了 `Pending`（`Starting`/`Downloading`/`Training`/`Uploading`）就算在跑 ——
+  若等到 `Training` 才算，會讓 `Downloading` 中的 job 悄悄計費。
+- `describe-training-job` 失敗（限流、暫時性錯誤）**跳過該輪**，而不是判為「沒在
+  跑」。把 API 錯誤當成沒在跑，正是 guard 停掉真正在訓練的那個 job 的原因。
+- 永不停掉最後一個候選，也永不停掉贏家。
+
+每個參賽者需要**自己的 checkpoint 前綴**。共用一個的話，輸家的部分 checkpoint 會
+被贏家 resume，兩次運行就被靜默混在一起。
+
+`tests/test_capacity_race_guard.sh` 用 `PATH` 上 stub 掉的 `aws` 驗證以上全部 ——
+不連網、不需帳號 —— 覆蓋 10 種狀態組合，包含同時中獎、手足已被停掉、以及
+describe 失敗這幾種。它立刻證明了自己的價值：抓到一個 `${losers[@]}` 在 `set -u`
+下的 unbound variable 崩潰，而它恰好只在「贏家已經沒有輸家可停」時觸發 ——
+也就是唯一必須正常運作的那種情況。
+
 ## v1 證明了什麼 —— v2 要做什麼
 
 **已證明：** 完整的自主閉環是真的。觸發 → 計劃 → 生成 → 整理 → 訓練

@@ -136,6 +136,46 @@ harness (Fable 5 → Opus 5, zero prompt changes, ~15 s hot-swap via
 `UpdateHarness`, sessions surviving), mixed model allocation to spread quota
 pressure, and driver-level auto-swap on the 5xx signature.
 
+## GPU capacity is a second, unrelated queue
+
+Model-vendor quota (above) limits how fast harnesses can *think*. GPU capacity
+limits whether training can *start at all*, and it behaves differently: a
+`CreateTrainingJob` for `ml.g6.2xlarge` is accepted, enters `InProgress` /
+`Pending` with `"Training job waiting for capacity"`, and then simply waits —
+for minutes or for hours, with no error to react to and no queue position to
+read. In the v2 run both the g6 and g5 attempts sat Pending for 20+ minutes.
+
+Two facts make this cheap to work around. **Pending time is unbilled** —
+billing starts at `Starting`, when an instance is actually allocated. And
+SageMaker training quotas are **per instance type**: this account holds a
+separate limit of 1 for each of `ml.g5.{xlarge…12xlarge}` and
+`ml.g6.{xlarge…12xlarge}`. Those are independent lotteries, so queueing the
+same job in N pools buys N tickets at zero cost while they all wait.
+
+The catch is that the tickets can win *simultaneously*, and two 9-hour QLoRA
+runs at ~$1.2–2/hr produce one result for twice the money.
+`pipeline/training/capacity_race_guard.sh` polls every 60s and stops every
+candidate except the first one to leave the queue. Its invariants are worth
+stating because getting them backwards is expensive rather than merely wrong:
+
+- Anything past `Pending` (`Starting`/`Downloading`/`Training`/`Uploading`)
+  counts as running — waiting for `Training` would let a `Downloading` job bill
+  unnoticed.
+- A failed `describe-training-job` (throttle, transient error) **skips the
+  round** rather than reading as "not running". Treating an API error as
+  not-running is how a guard stops the job that was actually training.
+- It never stops the last candidate, and never stops the winner.
+
+Each racer needs its **own checkpoint prefix**. Sharing one means the loser's
+partial checkpoint can be resumed by the winner, silently mixing two runs.
+
+`tests/test_capacity_race_guard.sh` exercises all of this with `aws` stubbed on
+`PATH` — no network, no account — across 10 state combinations including
+both-won-at-once, an already-stopped sibling, and the describe-failure case. It
+earned its keep immediately: it caught an `${losers[@]}`-under-`set -u`
+unbound-variable crash that fired precisely when a winner had no losers left to
+stop, i.e. in the one case that has to work.
+
 ## What v1 proved — and what v2 will do
 
 **Proved:** the full autonomous loop is real. Trigger → plan → generate →
