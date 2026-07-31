@@ -260,6 +260,25 @@ class TestContracts:
         with pytest.raises(ValueError):
             ev.emit_event("bus", "NotAnEvent", {}, client=FakeEvents())
 
+    def test_an_explicitly_passed_none_client_is_a_bug_not_a_request_for_a_real_one(self):
+        """``client=None`` used to mean "not supplied", so emit_event built a real
+        boto3 EventBridge client and put the event on the real bus.
+
+        A caller that writes ``client=None`` has a None where a client should be --
+        most often a test fake dict with ``"events": None`` for a client it believed
+        was never reached. Silently substituting production is the worst available
+        answer: on a laptop with credentials the call SUCCEEDS, so the test passes
+        while writing to the production bus, and the mistake surfaces only in CI as
+        NoCredentialsError from a stack frame that mentions neither the test nor the
+        bus. tests/test_finops.py did exactly this and emitted real PipelineFailed
+        events for six commits.
+
+        Omitting the argument still resolves a real client -- that is the Lambda path.
+        Passing None explicitly must fail, loudly, naming the caller's mistake.
+        """
+        with pytest.raises(ValueError, match="client=None"):
+            ev.emit_event("bus", ev.PIPELINE_FAILED, {"run_id": "r"}, client=None)
+
     def test_normalize_alias_drift(self):
         norm = normalize_stage_complete(
             {"stage": "eval", "task": "gate", "artifacts": "s3://b/one",
