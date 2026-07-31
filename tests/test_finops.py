@@ -485,8 +485,9 @@ def test_rate_card_must_exist_in_s3_to_be_accepted():
 
 
 def test_rate_card_records_the_skus_it_could_not_price():
-    """The Price List API cannot price DeepSeek-R1 or Fable 5 on this account, so a
-    refresh reporting zero missing SKUs is the suspicious outcome, not the good one."""
+    """The Price List API cannot price Fable 5 or Opus 5 on this account — the harness
+    fleet's own models — so a refresh reporting zero missing SKUs is the suspicious
+    outcome, not the good one."""
     c = _clients()
     out = driver.handle_finops_tool(c, FINOPS_EVENT, "update_rate_card", {
         "rates_uri": RATES_URI, "n_rates": 7, "n_stale": 1,
@@ -643,3 +644,29 @@ def test_only_launched_or_reconciled_estimates_become_reconcile_targets():
         {"run_id": "run-wait", "status": "pending_approval", "project": "p"},
     ])})
     assert reconcile.runs_in_period(ddb, "p", "2026-07-29") == ["run-done", "run-live"]
+
+
+def test_iam_documents_survive_comment_stripping_as_printable_ascii():
+    """PutRolePolicy enforces printable ASCII and rejects the WHOLE document with
+    "Syntax errors in policy", naming no key. Two em dashes cost a deploy cycle once
+    (4d71d76) and masked a second defect while doing it.
+
+    Checked AFTER stripping _comment, because that is the document AWS actually sees:
+    the rationale keys are free to use whatever punctuation reads best, and this test
+    would be wrong to forbid it. What must be ASCII is everything that survives the
+    strip.
+    """
+    spec = importlib.util.spec_from_file_location("iam_deploy", REPO / "deploy/01_iam.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    for path in sorted((REPO / "deploy/iam").glob("*.json")):
+        doc = mod.substitute(json.loads(path.read_text()),
+                             {"<REGION>": "us-east-1", "<ACCOUNT_ID>": "123456789012",
+                              "<DATA_BUCKET>": "b", "<MEMORY_ID>": "m"})
+        # ensure_ascii=False is load-bearing: the default escapes every non-ASCII char
+        # to \uXXXX, so the check would be satisfied by construction and pass against
+        # the very document it exists to reject. The first version of this test did
+        # exactly that -- an em dash injected into a Sid was caught only by unrelated
+        # tests, while this one reported green.
+        bad = [c for c in json.dumps(doc, ensure_ascii=False) if not (32 <= ord(c) < 127)]
+        assert not bad, f"{path.name}: non-ASCII survives stripping: {set(bad)}"

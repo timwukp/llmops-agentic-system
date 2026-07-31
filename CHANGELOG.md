@@ -41,10 +41,13 @@ human ran `describe-training-job` and multiplied by a rate recalled from memory.
 
 ### Verified facts that shaped the design (live, read-only, 2026-07-31)
 
-- **The Price List API prices neither DeepSeek-R1 nor Fable 5** — the teacher and harness models,
-  the two largest token consumers. Its `AmazonBedrock` model list tops out at Claude 3 Haiku /
-  DeepSeek V3.2. So realized billing rates (cost ÷ quantity from our own invoice) outrank the
-  published price list; Price List is the fallback for never-used resources.
+- **The Price List API cannot price Fable 5 or Opus 5** — the models the seven harnesses run
+  on, and the largest AgentCore line in the bill. Every `provider=Anthropic` entry for
+  us-east-1 is Claude 3 or older. So realized billing rates (cost ÷ quantity from our own
+  invoice) outrank the published price list; Price List is the fallback for never-used
+  resources. It *does* price DeepSeek-R1, to within <0.001% of our realized rate — an earlier
+  claim to the contrary was wrong because the `model` attribute value is bare `R1` (with
+  `provider=DeepSeek`), which eyeballing the model list misses. Query by filter, not by eye.
 - **Cost allocation tags are unusable today** — `project`/`Project` both Inactive, and a
   tag-filtered CE query returns **$0.00** for a day with real spend. Attribution is therefore by
   explicit resource match (`run_id` is already inside job and endpoint names), which needs no

@@ -24,9 +24,12 @@ Measured facts this module is calibrated against (all verified on the live accou
   **$10.77**. That gives throughput 0.664 rows/s and ~670 s of fixed setup overhead
   (image pull, data download, model upload) — both used as defaults below, so the
   estimator reproduces a run whose actual cost is known.
-* The Price List API cannot price DeepSeek-R1 or Claude Fable 5 (its ``model``
-  attribute stops at Claude 3 / DeepSeek V3.2), so realized unit rates derived from
-  our own bill outrank it. Hence RATE_PRECEDENCE.
+* The Price List API cannot price Claude Fable 5 or Opus 5 — every ``provider=Anthropic``
+  entry for us-east-1 is Claude 3 or older. Those are the models the seven harnesses
+  themselves run on, i.e. the largest AgentCore line, so realized unit rates derived from
+  our own bill outrank it. Hence RATE_PRECEDENCE. (It *does* price DeepSeek-R1, to within
+  <0.001% of realized; an earlier note here said otherwise because the ``model`` attribute
+  value is bare ``R1`` with ``provider=DeepSeek``, which reading the model list misses.)
 
 Only stdlib (Lambda-safe, importable by the console zip and by pytest alike).
 """

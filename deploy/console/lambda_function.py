@@ -1374,10 +1374,11 @@ def cost_overview(period_days=30):
 def rate_card_health(plan=None):
     """What the rate card knows and what it admits it does not.
 
-    This panel exists because the Price List API cannot price DeepSeek-R1 or Fable 5 on
-    this account (verified: `pricing get-attribute-values` for AmazonBedrock lists
-    neither). Without the panel, a stale feed prices the teacher at $0 and the estimate
-    is quietly, plausibly wrong.
+    This panel exists because the Price List API cannot price Fable 5 or Opus 5 on this
+    account (verified 2026-07-31: every `provider=Anthropic` entry for us-east-1 is
+    Claude 3 or older) — the models the harness fleet itself runs on. Without the panel,
+    a stale feed prices the agent fleet at $0 and the estimate is quietly, plausibly
+    wrong.
 
     Health is measured against the SKUs a real plan NEEDS, not against the card's own
     contents — a card with 40 irrelevant rates and no teacher price is not healthy, and

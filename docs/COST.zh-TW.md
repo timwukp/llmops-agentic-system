@@ -73,13 +73,21 @@ unpriced: ['agentcore:memory:short-term-events',
 | 來源 | 優先序 | 實測行為 |
 |---|---|---|
 | `ce_realized` —— 我們自己的帳單：單價 = 費用 ÷ 用量 | **第 1** | 得出 `USE1-DeepSeek-R1-input-tokens` 為 **$0.00135/1K**、output 為 **$0.0054/1K** |
-| `price_list` —— AWS Price List API | 第 2 | ml.g5.2xlarge 給出精準的 **$1.515/小時**。但查 `AmazonBedrock` 時，它的 84 個 model 值最新只到 **Claude 3 Haiku／DeepSeek V3.2** |
+| `price_list` —— AWS Price List API | 第 2 | ml.g5.2xlarge 給出精準的 **$1.515/小時**，DeepSeek-R1 也與我們的實際費率相差 **<0.001%**。但 `AmazonBedrock` 裡所有 `provider=Anthropic` 的條目都是 Claude 3 或更舊 |
 | `fallback_static` | 第 3 | 手動輸入，一律標記來源 |
 
-**Price List API 無法為這條流水線的模型定價。** 2026-07-31 實測查詢：它沒有 DeepSeek-R1
-的條目，也沒有 Fable 5 —— 也就是 teacher 與 harness 模型，系統裡兩個最大的 token 消耗
-者。一個只建立在 Price List 上的 pricing refresh 會回報「成功」，然後把 teacher 靜靜地
-定價為 $0。
+**Price List API 無法為 harness 艦隊自己的模型定價。** 2026-07-31 實測查詢：us-east-1 裡
+所有 `provider=Anthropic` 的條目只有 `Claude 2.0 · Claude 2.1 · Claude 3 Haiku ·
+Claude 3 Sonnet · Claude Instant` —— 沒有 Fable 5、沒有 Opus 5。那正是七個 harness 自己
+運行所用的模型，也是帳單裡 AgentCore 最大的一條線。一個只建立在 Price List 上的
+pricing refresh 會回報「成功」，然後把整個 agent 艦隊靜靜地定價為 $0。
+
+它*可以*為 teacher 定價：DeepSeek-R1 回傳 $0.00135/$0.0054 per 1K，與我們的實際費率相差
+**<0.001%**。本文件早先的版本說法相反，而它錯的原因值得留下：`model` 這個 attribute 的值
+是裸的 **`R1`**（搭配 `provider=DeepSeek`），所以肉眼掃過 84 個 model 值、找「含
+DeepSeek-R1 的名字」必然找不到，然後誤判為不存在。**要用明確的
+`Field=model,Value=R1` 過濾器去查，不要用眼睛看。** 每次 refresh 都會重新探測覆蓋率，
+因為「這個 API 收錄了哪些模型」正是兩次 refresh 之間會變的東西。
 
 因此優先序是：**實際帳單的費率高於公開價目表**，因為我們自己的發票是唯一保證涵蓋「我們
 真的用了什麼」的來源。Price List 是留給「從未使用過、因此不可能有實際費率」的資源的
