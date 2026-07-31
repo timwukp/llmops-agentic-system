@@ -41,13 +41,24 @@
       {
         "Sid": "CloseOutOwnRuns",
         "_comment": [
-          "UpdateItem only, on the runs table only. The state machine is not allowed to",
-          "create runs (that is start_pipeline's job) or delete them: its single write is",
-          "the terminal status of a run it is already executing."
+          "UpdateItem only, on the two tables that hold a lifecycle this execution ends.",
+          "The state machine is not allowed to create either record (start_pipeline mints",
+          "the run, the console mints the task) or delete them: its writes are terminal",
+          "statuses for work it is already executing.",
+          "",
+          "llmops-tasks is here because the conductor's task row had the same zombie hole",
+          "the run record had, one level up: MarkTaskDone/MarkTaskFailed close it out. Those",
+          "states Catch States.ALL so that a run with no task (schedule, webhook) does not",
+          "fail, which means a MISSING grant here is indistinguishable from a healthy no-op",
+          "-- the execution succeeds and the task stays 'dispatched' silently. Hence the",
+          "test that reads every TableName out of the ASL and requires it in this policy."
         ],
         "Effect": "Allow",
         "Action": "dynamodb:UpdateItem",
-        "Resource": "arn:aws:dynamodb:<REGION>:<ACCOUNT_ID>:table/llmops-pipeline-runs"
+        "Resource": [
+          "arn:aws:dynamodb:<REGION>:<ACCOUNT_ID>:table/llmops-pipeline-runs",
+          "arn:aws:dynamodb:<REGION>:<ACCOUNT_ID>:table/llmops-tasks"
+        ]
       }
     ]
   }

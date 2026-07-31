@@ -38,6 +38,16 @@ DEFAULT_PARAMS = {
     "gates": {"relative_solve_rate": 0.80, "format_validity": 0.95},
 }
 
+#: Sentinel for "this run was not dispatched from a conductor task".
+#
+# The state machine closes the conductor's llmops-tasks row when a run reaches a
+# terminal state, which means it reads $.task_id -- and a JSONPath that is not present
+# raises States.Runtime, which NO Catch can intercept (the run then dies before it can
+# self-close, strictly worse than the zombie task being fixed). Most runs have no task:
+# schedule and webhook triggers never went through a human plan approval. So the field
+# is always set, and the closer's ConditionExpression makes this value a no-op write.
+NO_TASK = "none"
+
 
 def _clients():
     region = os.environ.get("AWS_REGION", "us-east-1")
@@ -140,7 +150,11 @@ def handler(event, context=None, clients=None):
         # customer's data, report, stop before any GPU is provisioned).
         input=json.dumps({"run_id": run_id, "manifest_uri": manifest_uri,
                           "iteration": 0,
-                          "pipeline_mode": manifest["params"].get("pipeline_mode", "full")}))
+                          "pipeline_mode": manifest["params"].get("pipeline_mode", "full"),
+                          # The conductor task this run answers to, so the machine can
+                          # close that task out when the run ends -- it cannot read the
+                          # manifest from S3, same constraint as pipeline_mode above.
+                          "task_id": manifest["approval"].get("task_id") or NO_TASK}))
 
     return {"run_id": run_id, "manifest_uri": manifest_uri,
             "execution_arn": execution["executionArn"]}
