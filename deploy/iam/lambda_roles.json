@@ -206,6 +206,13 @@
             ]
           },
           {
+            "_comment": "After settling the token, the handler REMOVEs it so a duplicate EventBridge delivery cannot double-settle the same training job -- EventBridge is at-least-once, so that clear is the whole guard. Without UpdateItem the handler resumes the state machine and then dies on AccessDenied with the token still parked, leaving the guard permanently disarmed while the log shows a successful resume. Third instance of one defect class (start_pipeline's events:PutEvents, the driver's s3:PutObject); found by the guard added for the first two, not by another live failure.",
+            "Sid": "ClearSettledToken",
+            "Effect": "Allow",
+            "Action": "dynamodb:UpdateItem",
+            "Resource": "arn:aws:dynamodb:<REGION>:<ACCOUNT_ID>:table/llmops-pipeline-runs"
+          },
+          {
             "Sid": "TaskTokenCallbacks",
             "Effect": "Allow",
             "Action": [

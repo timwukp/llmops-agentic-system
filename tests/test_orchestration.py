@@ -1068,3 +1068,79 @@ def test_the_driver_role_can_write_the_report_the_driver_always_writes():
         f"scope the write to {REPORT_KEY}, the only object the driver publishes")
     assert "customer-data" not in resource and not resource.rstrip('"]').endswith("/*"), \
         "a bucket-wide write would let the driver rewrite the data it must only read"
+
+
+#: Handler-local boto3 calls (c["s3"].put_object(...)) mapped to the IAM action they
+#: need. Deliberately small: the point is not to model IAM, it is to catch a handler
+#: doing something its role never allowed.
+_IAM_FOR = {
+    ("s3", "put_object"): "s3:PutObject",
+    ("s3", "get_object"): "s3:GetObject",
+    ("s3", "head_object"): "s3:GetObject",
+    ("ddb", "put_item"): "dynamodb:PutItem",
+    ("ddb", "update_item"): "dynamodb:UpdateItem",
+    ("ddb", "get_item"): "dynamodb:GetItem",
+    ("ddb", "query"): "dynamodb:Query",
+    ("sns", "publish"): "sns:Publish",
+    ("events", "put_events"): "events:PutEvents",
+    ("lambda", "invoke"): "lambda:InvokeFunction",
+    ("sfn", "send_task_success"): "states:SendTaskSuccess",
+    ("sfn", "send_task_failure"): "states:SendTaskFailure",
+    ("sfn", "start_execution"): "states:StartExecution",
+    ("kms", "verify"): "kms:Verify",
+    ("kms", "sign"): "kms:Sign",
+}
+
+#: A handler that hands its injected client to a shared helper makes the call from
+#: another file, so a per-file scan of the handler sees nothing. That is exactly where
+#: the missing s3:PutObject hid: handle_stage_complete's only write is
+#: write_run_report(c["s3"], ...), one module over. Each entry names the client a
+#: handler passes out and the action the callee performs with it.
+_CLIENT_HANDOFFS = {
+    "orchestration/harness_driver/handler.py": [
+        ('write_run_report(c["s3"]', "s3:PutObject"),
+        ('conductor_tools.service_launch_run(\n', "kms:Verify"),
+    ],
+}
+
+
+@pytest.mark.parametrize("role,src", [
+    ("driver", "orchestration/harness_driver/handler.py"),
+    ("start", "orchestration/start_pipeline/handler.py"),
+    ("resume", "orchestration/resume_pipeline/handler.py"),
+    ("webhook", "orchestration/webhook/handler.py"),
+])
+def test_every_aws_call_a_handler_makes_is_in_its_role(role, src):
+    """Generalizes two separately-shipped defects into one guard.
+
+    start_pipeline shipped without events:PutEvents; the driver shipped without
+    s3:PutObject. Both were actions a handler performed unconditionally, both got as
+    far as doing real work before dying, and both were found by a live run rather than
+    by review. A grep for the call and a grep for the grant would have caught either in
+    a second, so do that on every handler, every time.
+
+    Includes calls made through injected clients (write_run_report(c["s3"], ...)) --
+    the driver's missing grant hid precisely there, invisible to a scan of the handler
+    file alone."""
+    text = (REPO / src).read_text()
+    needed = {}
+    for (client, method), action in _IAM_FOR.items():
+        for pattern in (f'c["{client}"].{method}(',
+                        f'c["{client}"].Table(os.environ[' ):
+            if pattern in text and client != "ddb":
+                needed[action] = f'c["{client}"].{method}(...)'
+        if client == "ddb" and f".{method}(" in text and 'c["ddb"]' in text:
+            needed[action] = f'a DynamoDB {method}'
+    for marker, action in _CLIENT_HANDOFFS.get(src, []):
+        if marker in text:
+            needed[action] = f"{marker.strip()}...) hands the client to a helper"
+
+    allowed = _allowed_actions(role)
+    def granted(action):
+        return action in allowed or any(
+            p.endswith("*") and action.startswith(p[:-1]) for p in allowed)
+
+    missing = {a: why for a, why in needed.items() if not granted(a)}
+    assert not missing, (
+        f"{src} performs actions the {role!r} role does not allow: {missing}. "
+        "The handler will do its work and then die on AccessDenied.")
