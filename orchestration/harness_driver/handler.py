@@ -24,7 +24,7 @@ import json
 import os
 import sys
 import time
-from typing import Any, Optional
+from typing import Optional
 
 import boto3
 from botocore.config import Config as BotoConfig
@@ -441,10 +441,10 @@ def handler(event, context=None, clients=None):
     # Continuation across Lambda invocations: one harness turn can run 840s and the
     # Lambda dies at 900s, so only ONE turn fits per invocation. Whenever the loop
     # would start another turn without enough time left, self-reinvoke carrying the
-    # pending content (session + task token survive; live-verified Sandbox.Timedout
+    # pending messages list (session + task token survive; live-verified Sandbox.Timedout
     # killed a run whose agent finished its work but never got to report it).
     if event.get("_continuation"):
-        content = event["_continuation"]
+        messages = event["_continuation"]
         stream_retried = bool(event.get("_stream_retried"))
         re_asks = int(event.get("_re_asks", 0))
     else:
@@ -458,7 +458,7 @@ def handler(event, context=None, clients=None):
     def _self_reinvoke():
         c["lambda"].invoke(
             FunctionName=context.function_name, InvocationType="Event",
-            Payload=json.dumps({**event, "_continuation": content,
+            Payload=json.dumps({**event, "_continuation": messages,
                                 "_stream_retried": stream_retried,
                                 "_re_asks": re_asks}, default=str))
         return {"status": "self_reinvoked_between_turns"}
@@ -582,7 +582,7 @@ def handler(event, context=None, clients=None):
                 # The report/rate-card calls are terminal.
                 ack = _tool_result_content(tu, {"status": "recorded"})
                 if name == "flag_variance":
-                    content = ack
+                    messages = ack
                     continue
                 _invoke(c["agentcore"], event["harness_id"], sess, ack,
                         event.get("qualifier"))

@@ -402,12 +402,52 @@
           }
         ]
       },
-      "Next": "Fail"
+      "Next": "MarkRunFailed"
     },
     "Fail": {
       "Type": "Fail",
       "Error": "PipelineFailed",
       "Cause": "Terminal failure or remediation budget exhausted \u2014 see EscalatedToHuman event, SNS, and DDB stage events."
+    },
+    "MarkRunFailed": {
+      "Type": "Task",
+      "Comment": "Close out the run record. Every Python writer of runs.status lives inside a stage Lambda, so a stage that CRASHES leaves the run at status=running forever while its execution is FAILED -- a zombie the console shows as live. The state machine is the only participant still alive when a stage dies, so it writes the terminal status itself, through the SDK integration rather than yet another Lambda. A rejected condition means the driver already wrote a RICHER terminal status (escalated) -- the Catch keeps it and carries on to Fail. Catching States.ALL also means a DDB outage cannot hang the execution: the run still ends FAILED, just without the marker.",
+      "Resource": "arn:aws:states:::aws-sdk:dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "llmops-pipeline-runs",
+        "Key": {
+          "run_id": {
+            "S.$": "$.run_id"
+          }
+        },
+        "UpdateExpression": "SET #s = :failed, failed_at = :now",
+        "ConditionExpression": "attribute_not_exists(#s) OR #s = :running",
+        "ExpressionAttributeNames": {
+          "#s": "status"
+        },
+        "ExpressionAttributeValues": {
+          ":failed": {
+            "S": "failed"
+          },
+          ":running": {
+            "S": "running"
+          },
+          ":now": {
+            "S.$": "$$.State.EnteredTime"
+          }
+        }
+      },
+      "ResultPath": null,
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": null,
+          "Next": "Fail"
+        }
+      ],
+      "Next": "Fail"
     }
   }
 }

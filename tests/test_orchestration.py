@@ -308,6 +308,52 @@ class TestDriver:
             "a mismatched toolUseId makes the runtime reject the resume"
         assert echo["input"] == {"outputs": [uri]}
 
+    def test_self_reinvoke_between_turns_carries_the_pending_messages(self):
+        """A harness turn can run 840s and the Lambda dies at 900s, so only one turn
+        fits per invocation: when time runs out the driver re-invokes itself carrying
+        the pending messages. That path had NO test, and a rename of the loop variable
+        (content -> messages, for the two-message resume contract) left the closure
+        referencing the old name -- "NameError: cannot access free variable 'content'"
+        killed a live run at DataPrepGenerate AFTER a correct dispatch. Anything the
+        state machine can reach needs coverage, especially the timeout paths that only
+        fire in production."""
+        class _Ctx:
+            function_name = "llmops-harness-driver"
+
+            def __init__(self):
+                self.calls = 0
+
+            def get_remaining_time_in_millis(self):
+                # plenty for turn 1, out of time before turn 2
+                self.calls += 1
+                return 900_000 if self.calls <= 1 else 10_000
+
+        class _Lam:
+            def __init__(self):
+                self.invocations = []
+
+            def invoke(self, **kw):
+                self.invocations.append(kw)
+                return {"StatusCode": 202}
+
+        # a checkpoint keeps the loop going, so turn 2 is attempted and hits the wall
+        ac = FakeAgentCore([tool_use_stream("checkpoint", {"next_action": "keep going"}),
+                            text_stream("never reached")])
+        c = clients(ac)
+        c["lambda"] = _Lam()
+        out = driver.handler(driver_event(), clients=c, context=_Ctx())
+
+        assert out["status"] == "self_reinvoked_between_turns"
+        payload = json.loads(c["lambda"].invocations[0]["Payload"])
+        cont = payload["_continuation"]
+        # the continuation is a full messages list, and it is the pending toolResult
+        # resume -- not a bare content block, or the resumed invocation re-sends the
+        # wrong shape and the harness rejects it
+        assert isinstance(cont, list) and cont, "continuation must carry the messages"
+        assert [m["role"] for m in cont] == ["assistant", "user"]
+        assert "toolUse" in cont[0]["content"][0]
+        assert "toolResult" in cont[1]["content"][0]
+
     def test_gate_null_gate_passed_fails_closed(self):
         """A gate stage whose agent omits/nulls gate_passed must NOT promote (fail closed)."""
         ac = FakeAgentCore([
@@ -578,9 +624,11 @@ class TestStateMachine:
         # remediation loops BACK to analysis -> eval, closing the self-iteration loop
         assert states["RemediateFinetune"]["Next"] == "FinetuneAnalyze"
         assert states["FinetuneAnalyze"]["Next"] == "EvalGate"
-        # budget exhausted -> escalate, never silent fail
+        # budget exhausted -> escalate, never silent fail; escalation now closes the
+        # run record out before failing (see MarkRunFailed)
         assert states["RemediationChoice"]["Default"] == "EscalateFail"
-        assert states["EscalateFail"]["Next"] == "Fail"
+        assert states["EscalateFail"]["Next"] == "MarkRunFailed"
+        assert states["MarkRunFailed"]["Next"] == "Fail"
 
     def test_every_harness_task_uses_task_token(self, asl):
         for name, st in asl["States"].items():
@@ -599,6 +647,66 @@ class TestStateMachine:
         for state in ("Complete", "EscalateFail"):
             detail_type = asl["States"][state]["Parameters"]["Entries"][0]["DetailType"]
             assert detail_type in ev.ALL_EVENTS
+
+    def test_a_crashed_stage_marks_the_run_failed_before_the_fail_state(self, asl):
+        """A stage Lambda that CRASHES never reaches the driver, so nothing in Python
+        writes a terminal status -- the run sits at status=running forever while its
+        execution is FAILED. Nine live runs were zombies this way. The state machine
+        itself has to close the record, because it is the only participant guaranteed
+        to still be alive when a stage dies.
+        """
+        states = asl["States"]
+        # Every stage Catch that gives up must pass through the marker rather than
+        # jumping to Fail. MarkRunFailed's own Catch is the one exception: it is the
+        # marker, and its fallback has nowhere left to go.
+        for name, st in states.items():
+            if name == "MarkRunFailed":
+                continue
+            for cat in st.get("Catch", []):
+                assert cat["Next"] != "Fail", (
+                    f"{name} catches straight to Fail -- the runs table would keep "
+                    "saying 'running' after the execution is FAILED")
+        assert states["EscalateFail"]["Next"] == "MarkRunFailed"
+        mark = states["MarkRunFailed"]
+        assert mark["Resource"] == "arn:aws:states:::aws-sdk:dynamodb:updateItem", (
+            "mark the run through the AWS SDK integration, not another Lambda: a "
+            "Lambda is the thing that just crashed")
+        assert mark["Parameters"]["Key"]["run_id"]["S.$"] == "$.run_id"
+        assert mark["Next"] == "Fail"
+
+    def test_marking_a_run_failed_never_overwrites_a_richer_terminal_status(self, asl):
+        """When the AGENT escalated, the driver already wrote status=escalated -- more
+        informative than 'failed'. The condition keeps it, and the Catch means a
+        rejected condition still reaches Fail instead of hanging the execution."""
+        mark = asl["States"]["MarkRunFailed"]
+        assert ":running" in mark["Parameters"]["ConditionExpression"] or \
+               "running" in json.dumps(mark["Parameters"]["ExpressionAttributeValues"])
+        assert mark["Catch"][0]["Next"] == "Fail"
+        assert "States.ALL" in mark["Catch"][0]["ErrorEquals"]
+
+    def test_the_asl_carries_no_fields_amazon_states_language_rejects(self, asl):
+        """`_comment` is this repo's convention for explaining a policy document, and it
+        is fine in the IAM JSONs -- ASL rejects it outright ("Field '_comment' is not
+        supported"), and only at UpdateStateMachine time. Offline is where that belongs."""
+        def walk(node, path):
+            if isinstance(node, dict):
+                for k, v in node.items():
+                    assert k != "_comment", f"ASL rejects _comment at {path}"
+                    walk(v, f"{path}/{k}")
+            elif isinstance(node, list):
+                for i, v in enumerate(node):
+                    walk(v, f"{path}[{i}]")
+        walk(asl, "")
+
+    def test_the_state_machine_role_can_write_the_status_it_is_now_asked_to_write(self):
+        """The grant and the ASL change are one fix: shipping the state without the
+        permission turns a zombie 'running' into a FAILED execution that fails one
+        state later, which is not an improvement."""
+        sfn = json.loads((REPO / "deploy/iam/sfn_execution_role.json").read_text())
+        acts = [a for st in sfn["permissionsPolicy"]["Statement"]
+                for a in ([st["Action"]] if isinstance(st["Action"], str) else st["Action"])]
+        assert "dynamodb:UpdateItem" in acts, (
+            "MarkRunFailed calls dynamodb:UpdateItem with this role")
 
     def test_teardown_always_follows_smoke_even_on_failure(self, asl):
         smoke = asl["States"]["SmokeTest"]

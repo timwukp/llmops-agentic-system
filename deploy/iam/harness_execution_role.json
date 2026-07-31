@@ -1,21 +1,23 @@
 {
-  "_comment": "Execution role for ALL 5 llmops worker harnesses (data-prep, finetune, eval, deploy, monitor). Extends deploy/iam/execution_role_base.json (the agentcore-harness-builder skill baseline) with the pipeline's needs: S3 run/report/skills-mirror prefixes, teacher-model Bedrock access (DeepSeek-R1), scoped SageMaker lifecycle + model registry, CloudWatch/Logs read for monitoring, and the llmops-pipeline event bus. Placeholders <REGION>, <ACCOUNT_ID>, <DATA_BUCKET>, <MEMORY_ID> are substituted by deploy/01_iam.py at deploy time (account id from sts get-caller-identity — never committed). SCOPING NOTE: the base's InvokeModel statement was foundation-model/* + inference-profile/* — here it is narrowed to exactly the models this pipeline uses (anthropic.* for the harness model global.anthropic.claude-sonnet-5 incl. cross-region routing targets, deepseek.r1* as the distillation teacher), so the teacher grant is NOT a duplicate statement but a narrowing of the base one. BYOMemory* statements are dropped by 01_iam.py unless --memory-id is passed (deploy/wire_memory.py re-adds them per-Memory later, matching the base's contract). Statements with Resource '*' (BaselineImagePull, BaselineTelemetry, SageMakerList, CloudWatchMetricsRead) are actions that do not support resource-level permissions.",
-
+  "_comment": "Execution role for ALL 5 llmops worker harnesses (data-prep, finetune, eval, deploy, monitor). Extends deploy/iam/execution_role_base.json (the agentcore-harness-builder skill baseline) with the pipeline's needs: S3 run/report/skills-mirror prefixes, teacher-model Bedrock access (DeepSeek-R1), scoped SageMaker lifecycle + model registry, CloudWatch/Logs read for monitoring, and the llmops-pipeline event bus. Placeholders <REGION>, <ACCOUNT_ID>, <DATA_BUCKET>, <MEMORY_ID> are substituted by deploy/01_iam.py at deploy time (account id from sts get-caller-identity \u2014 never committed). SCOPING NOTE: the base's InvokeModel statement was foundation-model/* + inference-profile/* \u2014 here it is narrowed to exactly the models this pipeline uses (anthropic.* for the harness model global.anthropic.claude-sonnet-5 incl. cross-region routing targets, deepseek.r1* as the distillation teacher), so the teacher grant is NOT a duplicate statement but a narrowing of the base one. BYOMemory* statements are dropped by 01_iam.py unless --memory-id is passed (deploy/wire_memory.py re-adds them per-Memory later, matching the base's contract). Statements with Resource '*' (BaselineImagePull, BaselineTelemetry, SageMakerList, CloudWatchMetricsRead) are actions that do not support resource-level permissions.",
   "trustPolicy": {
     "Version": "2012-10-17",
     "Statement": [
       {
         "Sid": "AllowAgentCoreToAssume",
         "Effect": "Allow",
-        "Principal": { "Service": "bedrock-agentcore.amazonaws.com" },
+        "Principal": {
+          "Service": "bedrock-agentcore.amazonaws.com"
+        },
         "Action": "sts:AssumeRole",
         "Condition": {
-          "StringEquals": { "aws:SourceAccount": "<ACCOUNT_ID>" }
+          "StringEquals": {
+            "aws:SourceAccount": "<ACCOUNT_ID>"
+          }
         }
       }
     ]
   },
-
   "permissionsPolicy": {
     "Version": "2012-10-17",
     "Statement": [
@@ -62,7 +64,10 @@
       {
         "Sid": "InvokeModel",
         "Effect": "Allow",
-        "Action": ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"],
+        "Action": [
+          "bedrock:InvokeModel",
+          "bedrock:InvokeModelWithResponseStream"
+        ],
         "Resource": [
           "arn:aws:bedrock:*::foundation-model/anthropic.*",
           "arn:aws:bedrock:*::foundation-model/deepseek.r1*",
@@ -137,7 +142,10 @@
         "_comment": "finops/* and contracts/* are the audit runtime's two paths and were both missing until a live pricing_refresh proved it: the agent derived a complete 37-SKU rate card, then failed to write it (PutObject denied on finops/rates/rate_card_latest.json) AND failed to load the canonical cost_model.py (GetObject denied on contracts/), so it published nothing and stamped its own output non-canonical. A prefix nobody granted is a feature that runs to completion and then throws its work away.",
         "Sid": "S3PipelineObjects",
         "Effect": "Allow",
-        "Action": ["s3:GetObject", "s3:PutObject"],
+        "Action": [
+          "s3:GetObject",
+          "s3:PutObject"
+        ],
         "Resource": [
           "arn:aws:s3:::<DATA_BUCKET>/runs/*",
           "arn:aws:s3:::<DATA_BUCKET>/reports/*",
@@ -145,24 +153,45 @@
           "arn:aws:s3:::<DATA_BUCKET>/finops/*",
           "arn:aws:s3:::<DATA_BUCKET>/contracts/*",
           "arn:aws:s3:::<DATA_BUCKET>/pipeline/contracts/*",
-          "arn:aws:s3:::<DATA_BUCKET>/cost/*"
+          "arn:aws:s3:::<DATA_BUCKET>/cost/*",
+          "arn:aws:s3:::<DATA_BUCKET>/models-mirror/*"
         ]
       },
       {
-        "_comment": "The prefix list must match S3PipelineObjects: ListBucket is condition-scoped, so a prefix granted for Get/Put but absent here can be read object-by-object and never enumerated -- which is exactly the shape of 'the rate card history is there but the agent reports no card exists'. cost/* joined both lists after the first live reconcile completed its evidence-gathering and then could not write cost/actuals-<period>.json — the docs/COST.md contract names cost/ as the actuals+report prefix, but only finops/ was ever granted.",
+        "Sid": "S3CustomerDataReadOnly",
+        "_comment": "The customer's own data: readable, never writable. Both prompts point data-prep at customer-data/ and nothing granted it, so the first real consult run dispatched, reached DataPrepGenerate and died on s3:ListBucket/GetObject without reading one task. Read-only because a pipeline that can rewrite the customer's data can destroy the held-out set its own gates are judged on.",
+        "Effect": "Allow",
+        "Action": [
+          "s3:GetObject"
+        ],
+        "Resource": "arn:aws:s3:::<DATA_BUCKET>/customer-data/*"
+      },
+      {
+        "_comment": "The prefix list must match S3PipelineObjects: ListBucket is condition-scoped, so a prefix granted for Get/Put but absent here can be read object-by-object and never enumerated -- which is exactly the shape of 'the rate card history is there but the agent reports no card exists'. cost/* joined both lists after the first live reconcile completed its evidence-gathering and then could not write cost/actuals-<period>.json \u2014 the docs/COST.md contract names cost/ as the actuals+report prefix, but only finops/ was ever granted.",
         "Sid": "S3PipelineList",
         "Effect": "Allow",
-        "Action": ["s3:ListBucket"],
+        "Action": [
+          "s3:ListBucket"
+        ],
         "Resource": "arn:aws:s3:::<DATA_BUCKET>",
         "Condition": {
           "StringLike": {
-            "s3:prefix": ["runs/*", "reports/*", "skills-mirror/*",
-                          "finops/*", "contracts/*", "pipeline/contracts/*", "cost/*"]
+            "s3:prefix": [
+              "runs/*",
+              "reports/*",
+              "skills-mirror/*",
+              "finops/*",
+              "contracts/*",
+              "pipeline/contracts/*",
+              "cost/*",
+              "models-mirror/*",
+              "customer-data/*"
+            ]
           }
         }
       },
       {
-        "_comment": "gen_ai.usage token spans land in the aws/spans log group (an AgentCore-managed group OUTSIDE /aws/bedrock-agentcore/*, so BaselineLogs does not cover it). The finops reconcile task needs to read them to attribute shared Bedrock inference-profile spend per session id — this account runs other agents on the same Claude profiles, so without spans the shared spend is unattributable and stays pending. Read-only, this one group.",
+        "_comment": "gen_ai.usage token spans land in the aws/spans log group (an AgentCore-managed group OUTSIDE /aws/bedrock-agentcore/*, so BaselineLogs does not cover it). The finops reconcile task needs to read them to attribute shared Bedrock inference-profile spend per session id \u2014 this account runs other agents on the same Claude profiles, so without spans the shared spend is unattributable and stays pending. Read-only, this one group.",
         "Sid": "SpansReadForCostAttribution",
         "Effect": "Allow",
         "Action": [
@@ -229,7 +258,9 @@
         "Action": "iam:PassRole",
         "Resource": "arn:aws:iam::<ACCOUNT_ID>:role/llmops-sagemaker-execution",
         "Condition": {
-          "StringEquals": { "iam:PassedToService": "sagemaker.amazonaws.com" }
+          "StringEquals": {
+            "iam:PassedToService": "sagemaker.amazonaws.com"
+          }
         }
       },
       {

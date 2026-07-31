@@ -12,6 +12,7 @@ dry-runs), then create-or-updates:
   llmops-lambda-start          <- iam/lambda_roles.json roles.start
   llmops-lambda-resume         <- iam/lambda_roles.json roles.resume
   llmops-lambda-webhook        <- iam/lambda_roles.json roles.webhook
+  llmops-sfn-execution         <- iam/sfn_execution_role.json (the state machine itself)
 
 Each role gets one inline policy named `llmops-permissions` and tag project=llmops-agentic-system.
 Role ARNs are published to SSM under /llmops/iam/<role>_arn for the later deploy steps.
@@ -82,6 +83,14 @@ def build_role_specs(mapping, memory_id):
     specs["llmops-sagemaker-execution"] = {
         "trust": substitute(sm["trustPolicy"], mapping),
         "policy": substitute(sm["permissionsPolicy"], mapping),
+    }
+
+    # The state machine's own role. Declared here rather than in lambda_roles.json
+    # because its trust policy names states.amazonaws.com, not lambda.
+    sfn = load_doc("sfn_execution_role.json")
+    specs["llmops-sfn-execution"] = {
+        "trust": substitute(sfn["trustPolicy"], mapping),
+        "policy": substitute(sfn["permissionsPolicy"], mapping),
     }
 
     lam = load_doc("lambda_roles.json")
