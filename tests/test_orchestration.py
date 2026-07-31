@@ -431,6 +431,85 @@ class TestDriver:
             f"{len(self_invokes)} self-invoke sites -- there must be exactly one, "
             "_self_reinvoke, so the handoff payload is defined in one place")
 
+    def test_a_crash_while_holding_the_task_token_fails_the_token_instead_of_parking_it(self):
+        """A synchronous stage invocation that raises is reported to Step Functions by
+        the Lambda integration itself, which is why the NameError above surfaced in
+        seconds. An ASYNCHRONOUS continuation has no such reporter: the state machine
+        is waiting on the task token, not on this invocation, so an exception here is
+        written to CloudWatch and to nobody else. The token parks until TimeoutSeconds
+        -- 7200s for DataPrepGenerate, six hours for FinetuneLaunch.
+
+        Live: the driver's missing s3:PutObject grant crashed the final
+        stage_complete of run-...-8b864805. The work was done and the report written
+        nowhere; the run then sat 'running' for 90 minutes holding a token, and the
+        two Lambda retries crashed the same way in the same silence. The AccessDenied
+        was one bug; the 90 minutes was this one.
+
+        So: whenever the driver holds a task token, an unexpected exception must fail
+        the token on the way out. The stage still fails -- it just fails in seconds,
+        with the real cause attached, and the state machine's own failure path (which
+        closes the run record out) runs immediately.
+        """
+        class _Ctx:
+            function_name = "llmops-harness-driver"
+            def get_remaining_time_in_millis(self):
+                return 900_000
+
+        uri = "s3://llmops-test/runs/r/out.json"
+
+        class _DeniedWrite(FakeS3):
+            """Reads fine, denies the report write -- the live shape exactly: the
+            agent's outputs verified, then put_object raised on the ONE key the
+            driver's role had no grant for."""
+            def put_object(self, Bucket, Key, Body, **kw):
+                raise RuntimeError(
+                    "An error occurred (AccessDenied) when calling the PutObject "
+                    f"operation: s3:PutObject on {Bucket}/{Key}")
+
+        ac = FakeAgentCore([tool_use_stream("stage_complete", {"outputs": [uri]}),
+                            text_stream("ack")])
+        c = clients(ac)
+        c["s3"] = _DeniedWrite(existing=[uri])
+        # the manifest must load, or the driver never reaches the report write --
+        # which is where the live grant was missing
+        c["s3"].objects["s3://llmops-data-test/runs/run-test-1/manifest.json"] = json.dumps(
+            {"run_id": "run-test-1", "stages": {}})
+        event = driver_event()
+        event["task_token"] = "tok-parked"
+
+        with pytest.raises(Exception):
+            driver.handler(event, clients=c, context=_Ctx())
+
+        failures = c["sfn"].failures
+        assert failures, (
+            "the driver crashed while holding a task token and told Step Functions "
+            "nothing -- the token parks until TimeoutSeconds (7200s for data-prep, "
+            "21600s for finetune) while the run record still says 'running'")
+        assert failures[0]["taskToken"] == "tok-parked"
+        cause = json.dumps(failures[0])
+        assert "AccessDenied" in cause or "PutObject" in cause, (
+            "the failure must carry the real cause; 'the stage failed' with the "
+            "reason only in CloudWatch is what made this take a night to find")
+
+    def test_a_crash_with_no_task_token_is_still_raised_to_the_caller(self):
+        """The console's dispatch path invokes the driver synchronously with no token.
+        Swallowing the exception there would turn a hard failure into a silent success,
+        which is worse than the parked token. Re-raise unless the token was settled."""
+        class _Boom(FakeS3):
+            def put_object(self, Bucket, Key, Body, **kw):
+                raise RuntimeError("kaboom")
+
+        ac = FakeAgentCore([tool_use_stream("stage_complete", {"outputs": ["s3://b/k"]}),
+                            text_stream("ack")])
+        c = clients(ac)
+        c["s3"] = _Boom(existing=["s3://b/k"])
+        c["s3"].objects["s3://llmops-data-test/runs/run-test-1/manifest.json"] = json.dumps(
+            {"run_id": "run-test-1", "stages": {}})
+        event = driver_event()
+        event.pop("task_token", None)
+        with pytest.raises(Exception, match="kaboom"):
+            driver.handler(event, clients=c, context=None)
+
     def test_gate_null_gate_passed_fails_closed(self):
         """A gate stage whose agent omits/nulls gate_passed must NOT promote (fail closed)."""
         ac = FakeAgentCore([
