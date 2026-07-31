@@ -388,6 +388,7 @@
     },
     "EscalateFail": {
       "Type": "Task",
+      "Comment": "ResultPath files the PutEvents response under a key instead of letting it become the whole state. Without it, a Task's result REPLACES its input -- and the next state, MarkRunFailed, reads $.run_id, which a PutEvents response does not contain. The zombie-closeout fix would have failed on a missing path at the exact moment it was needed, leaving the run at status=running: the bug it was written to fix.",
       "Resource": "arn:aws:states:::events:putEvents",
       "Parameters": {
         "Entries": [
@@ -402,6 +403,7 @@
           }
         ]
       },
+      "ResultPath": "$.escalate_fail",
       "Next": "MarkRunFailed"
     },
     "Fail": {
