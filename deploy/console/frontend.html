@@ -29,9 +29,10 @@
   .card { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:16px; }
   .card h2 { font-size:12px; text-transform:uppercase; letter-spacing:.06em;
              color:var(--muted); margin:0 0 12px; font-weight:600; }
-  .col-4 { grid-column:span 4; } .col-6 { grid-column:span 6; }
+  .col-4 { grid-column:span 4; } .col-5 { grid-column:span 5; }
+  .col-6 { grid-column:span 6; } .col-7 { grid-column:span 7; }
   .col-8 { grid-column:span 8; } .col-12 { grid-column:span 12; }
-  @media (max-width:900px){ .col-4,.col-6,.col-8 { grid-column:span 12; } }
+  @media (max-width:900px){ .col-4,.col-5,.col-6,.col-7,.col-8 { grid-column:span 12; } }
   .row { display:flex; align-items:center; justify-content:space-between; gap:10px;
          padding:8px 0; border-bottom:1px solid var(--line); }
   .row:last-child { border-bottom:0; }
@@ -103,12 +104,13 @@
   <button data-tab="obs" onclick="showTab('obs')">Observability</button>
   <button data-tab="evals" onclick="showTab('evals')">Evaluations</button>
   <button data-tab="opts" onclick="showTab('opts')">Optimizations</button>
+  <button data-tab="cost" onclick="showTab('cost')">Cost</button>
 </nav>
 
 <div class="wrap">
   <!-- KPIs -->
   <div data-tab-panel="all" class="card col-4"><h2>Harness fleet</h2>
-    <div class="stat" id="kpiFleet">&ndash;</div><small>llmops harnesses (target: 6 READY)</small></div>
+    <div class="stat" id="kpiFleet">&ndash;</div><small>llmops harnesses (target: 7 READY)</small></div>
   <div data-tab-panel="all" class="card col-4"><h2>Pipeline runs</h2>
     <div class="stat" id="kpiRuns">&ndash;</div><small id="kpiRunsSub">recent runs in DynamoDB</small></div>
   <div data-tab-panel="all" class="card col-4"><h2>Executions</h2>
@@ -142,7 +144,7 @@
   </div>
 
   <!-- Fleet -->
-  <div data-tab-panel="fleet" class="card col-12"><h2>Harness fleet &middot; 6 pipeline agents</h2><div id="fleet"><span class="sub">loading&hellip;</span></div></div>
+  <div data-tab-panel="fleet" class="card col-12"><h2>Harness fleet &middot; 6 pipeline agents + 1 finops auditor</h2><div id="fleet"><span class="sub">loading&hellip;</span></div></div>
 
   <!-- Observability -->
   <div data-tab-panel="obs" class="card col-12"><h2>Observability <span id="obsWin" class="mono">&middot; 24h</span></h2>
@@ -181,6 +183,66 @@
       <button onclick="genOpt()">&#10024; Draft new prompt</button>
       <span id="draftMsg" class="sub"></span>
     </div>
+  </div>
+
+  <!-- ═══ Cost (FinOps) ═══ -->
+  <!-- Panel order is the money's own order: what a run will cost, who must say yes,
+       what it did cost, how wrong the estimate was, and whether the rates behind all
+       four can be trusted. The last panel is not an afterthought — an unnoticed stale
+       rate makes the other four confidently wrong. -->
+  <div data-tab-panel="cost" class="card col-4"><h2>Project spend</h2>
+    <div class="stat" id="kpiCostTotal">&ndash;</div>
+    <small id="kpiCostSub">settled + provisional</small></div>
+  <div data-tab-panel="cost" class="card col-4"><h2>Awaiting approval</h2>
+    <div class="stat" id="kpiCostPending">&ndash;</div>
+    <small id="kpiCostPendingSub">estimates over the limit</small></div>
+  <div data-tab-panel="cost" class="card col-4"><h2>Rate card</h2>
+    <div class="stat" id="kpiRateCard">&ndash;</div>
+    <small id="kpiRateCardSub">priced SKUs</small></div>
+
+  <div data-tab-panel="cost" class="card col-5"><h2>1 &middot; Estimate a run &middot; before it spends</h2>
+    <div class="sub" style="margin:-6px 0 8px">priced from the rate card; nothing is launched by estimating</div>
+    <label>Sample count (rows to distil)</label><input id="cSamples" type="number" min="1" placeholder="2000" />
+    <label>Endpoint hours (0 if torn down immediately)</label><input id="cEndpointHours" type="number" min="0" step="0.5" placeholder="0" />
+    <label>Max remediation iterations (drives worst case)</label><input id="cMaxIter" type="number" min="1" max="10" placeholder="3" />
+    <label>Training instance</label><input id="cTrainInst" placeholder="ml.g5.2xlarge" />
+    <div class="flex" style="margin:6px 0 0;align-items:center">
+      <label style="margin:0"><input id="cKeepReasoning" type="checkbox" checked /> keep &lt;think&gt; chains</label>
+      <label style="margin:0"><input id="cTeardown" type="checkbox" checked /> tear down endpoint</label>
+    </div>
+    <div class="flex" style="margin-top:10px">
+      <button class="primary" onclick="estimateCost()">&#128200; Estimate</button>
+      <button onclick="submitForApproval()" id="cSubmitBtn" disabled>&#9993; Submit for approval</button>
+      <span id="cEstMsg" class="sub"></span>
+    </div>
+    <div id="cEstOut" style="margin-top:10px"></div>
+  </div>
+
+  <div data-tab-panel="cost" class="card col-7"><h2>2 &middot; Approval queue &middot; admin gate</h2>
+    <div class="sub" style="margin:-6px 0 8px">the server enforces this: approver group required, and the requester cannot approve their own estimate</div>
+    <div id="cQueue"><span class="sub">loading&hellip;</span></div>
+    <div id="cQueueMsg" class="sub" style="margin-top:8px"></div>
+  </div>
+
+  <div data-tab-panel="cost" class="card col-7"><h2>3 &middot; Actual spend by project &middot; itemised</h2>
+    <div class="sub" style="margin:-6px 0 8px">attributed by explicit resource match, never by service &mdash; this account also carries unrelated SageMaker spend</div>
+    <div id="cRollup"><span class="sub">loading&hellip;</span></div>
+  </div>
+
+  <div data-tab-panel="cost" class="card col-5"><h2>4 &middot; Estimate vs actual</h2>
+    <div class="sub" style="margin:-6px 0 8px">names the line that drove the miss, so the next estimate can be better</div>
+    <div id="cVariance"><span class="sub">loading&hellip;</span></div>
+  </div>
+
+  <div data-tab-panel="cost" class="card col-12"><h2>5 &middot; Rate card health &middot; can these numbers be trusted?</h2>
+    <div class="row" style="border-bottom:none;padding:2px 0 6px">
+      <span class="sub">the Price List API prices neither DeepSeek-R1 nor Fable 5 on this account, so rates are derived from realised billing; a missing rate silently prices a line at $0</span>
+      <span style="white-space:nowrap">
+        <button onclick="finopsRun('pricing_refresh')" style="padding:4px 12px;font-size:12px">&#8635; Refresh rates</button>
+        <button onclick="finopsRun('reconcile')" style="padding:4px 12px;font-size:12px">&#9878; Reconcile now</button>
+        <span id="cFinopsMsg" class="sub"></span></span>
+    </div>
+    <div id="cRates"><span class="sub">loading&hellip;</span></div>
   </div>
 </div>
 
@@ -562,14 +624,21 @@ async function loadBatchEvals(){
 
 // POST helper: distinguishes auth expiry / HTTP errors / network failures so
 // handlers never render a bare "error:". Returns {ok, data} or {ok:false, msg}.
-async function postApi(path){
+async function postApi(path, payload){
   let resp;
   try {
-    resp = await fetch(API+path,{method:"POST",headers:{"content-type":"application/json",...authHeaders()},body:"{}"});
+    resp = await fetch(API+path,{method:"POST",headers:{"content-type":"application/json",...authHeaders()},
+      body: JSON.stringify(payload||{})});
   } catch(e){ return {ok:false, msg:"network error: "+(e.message||String(e)||"request failed")}; }
   const body = await resp.text().catch(()=> "");
-  if (resp.status===401 || resp.status===403) { SESSION = null; setAuthUi();
+  // 401 means the token is gone; 403 means the token is FINE but this user lacks the
+  // right. Collapsing them would sign an approver out of a session that still works,
+  // and hide "you are not in the approver group" behind "session expired".
+  if (resp.status===401) { SESSION = null; setAuthUi();
     return {ok:false, msg:"session expired — sign in again"}; }
+  if (resp.status===403) {
+    let d=null; try { d = JSON.parse(body); } catch(_){}
+    return {ok:false, msg:"denied: "+((d&&d.error)||"forbidden").slice(0,200)}; }
   let data = null; try { data = JSON.parse(body); } catch(_){}
   if (!resp.ok) return {ok:false, msg:"HTTP "+resp.status+": "+((data&&(data.error||data.message))||body||resp.statusText||"request failed").slice(0,160)};
   return {ok:true, data: data||{}};
@@ -727,6 +796,186 @@ async function applyOpt(id){
   loadOpts();
 }
 
+// ── cost / FinOps ────────────────────────────────────────────────────────────
+// Every figure rendered here is labelled with its provenance and settlement state. A
+// confidently-wrong cost number is worse than an admitted unknown: someone approves
+// real spend on it.
+let _lastEstimate = null;
+const usd = (n) => "$"+(+n||0).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2});
+// A provisional figure will still move — Cost Explorer lags ~24 h — so it is never
+// rendered as if final.
+const settleBadge = (s) => s==="settled"
+  ? `<span class="pill ok">settled</span>`
+  : `<span class="pill warn" title="Cost Explorer still marks this period estimated — it will change">provisional</span>`;
+
+function estPlan(){
+  const p = {};
+  const num = (id) => { const v = $(id).value; return v==="" ? undefined : +v; };
+  p.sample_count   = num("cSamples");
+  p.endpoint_hours = num("cEndpointHours");
+  p.max_iterations = num("cMaxIter");
+  if ($("cTrainInst").value.trim()) p.training_instance = $("cTrainInst").value.trim();
+  p.keep_reasoning = $("cKeepReasoning").checked;
+  p.teardown       = $("cTeardown").checked;
+  Object.keys(p).forEach(k=>p[k]===undefined && delete p[k]);
+  return p;
+}
+
+async function estimateCost(){
+  if (!await ensureToken()) { $("cEstMsg").textContent = "sign-in required"; return; }
+  $("cEstMsg").textContent = "pricing…"; $("cSubmitBtn").disabled = true;
+  const res = await postApi("/api/cost-estimate", estPlan());
+  if (!res.ok) { $("cEstMsg").textContent = res.msg; $("cEstOut").innerHTML = ""; return; }
+  const d = res.data;
+  if (d.error) { $("cEstMsg").textContent = "error: "+String(d.error).slice(0,200); return; }
+  _lastEstimate = d;
+  const e = d.estimate||{}, g = d.gate||{};
+  const rows = (e.line_items||[]).map(l=>
+    `<tr><td>${esc(l.category)}</td><td class="mono">${esc(l.sku)}</td>`+
+    `<td class="mono">${(+l.quantity||0).toFixed(3)} ${esc(l.unit)}</td>`+
+    `<td class="mono">${l.unit_price==null?"—":usd(l.unit_price)}</td>`+
+    `<td class="mono">${usd(l.cost_usd)}</td>`+
+    `<td class="sub">${esc(l.rate_source||"unpriced")}</td></tr>`+
+    `<tr><td colspan="6" class="sub" style="padding-top:0">${esc(l.basis||"")}</td></tr>`).join("");
+  // The unpriced block is load-bearing. A $0 line from a missing rate and a $0 line
+  // from a free tier look identical on screen unless this says which it was.
+  const unpriced = (e.unpriced||[]).length
+    ? `<div class="pill err" style="margin:8px 0">${(e.unpriced||[]).length} UNPRICED SKU(s) — these lines are $0 because no rate exists, not because they are free</div>`+
+      `<div class="sub mono">${(e.unpriced||[]).map(esc).join("<br>")}</div>` : "";
+  const gateBox = g.approval_required
+    ? `<div class="pill err" style="margin:8px 0">Approval required</div><div class="sub">${(g.reasons||[]).map(esc).join("<br>")}</div>`
+    : `<div class="pill ok" style="margin:8px 0">Under the limit — may launch without approval</div>`;
+  $("cEstOut").innerHTML =
+    `<div class="flex" style="gap:20px;margin-bottom:6px">`+
+      `<div><div class="sub">expected</div><div class="stat" style="font-size:22px">${usd(e.total_usd)}</div></div>`+
+      `<div><div class="sub">worst case (gated on this)</div><div class="stat" style="font-size:22px">${usd(e.worst_case_usd)}</div></div>`+
+      `<div><div class="sub">confidence</div><div class="stat" style="font-size:22px">${esc(e.confidence||"?")}</div></div></div>`+
+    gateBox + unpriced +
+    `<table style="margin-top:8px"><tr><th>Category</th><th>SKU</th><th>Qty</th><th>Unit</th><th>Cost</th><th>Rate source</th></tr>${rows}</table>`+
+    ((e.assumptions||[]).length ? `<div class="sub" style="margin-top:8px"><b>Assumptions</b><br>${(e.assumptions||[]).map(esc).join("<br>")}</div>` : "");
+  $("cEstMsg").textContent = "✓ estimate "+d.estimate_id;
+  $("cSubmitBtn").disabled = false;
+  loadCost();
+}
+
+async function submitForApproval(){
+  if (!_lastEstimate) return;
+  if (!await ensureToken()) { $("cEstMsg").textContent = "sign-in required"; return; }
+  const why = prompt("Justification for this spend (the approver reads this):", "");
+  if (why===null) return;
+  const res = await postApi("/api/cost-approval-request",
+    {estimate_id:_lastEstimate.estimate_id, justification:why});
+  $("cEstMsg").textContent = res.ok ? "✓ submitted — awaiting an approver" : res.msg;
+  $("cSubmitBtn").disabled = true;
+  loadCost();
+}
+
+async function decideCost(id, decision){
+  if (!await ensureToken()) { $("cQueueMsg").textContent = "sign-in required"; return; }
+  let reason = "";
+  if (decision==="reject") {
+    reason = prompt("Reason for rejection (required — otherwise the requester just re-submits):", "");
+    if (!reason) { $("cQueueMsg").textContent = "rejection cancelled — a reason is required"; return; }
+  } else if (!confirm("Approve this spend? This authorises the run to launch.")) { return; }
+  const launch = decision==="approve" && confirm("Launch the pipeline run now as well?");
+  $("cQueueMsg").textContent = "submitting…";
+  const res = await postApi("/api/cost-approval", {estimate_id:id, decision, reason, launch});
+  if (!res.ok) { $("cQueueMsg").textContent = res.msg; return; }
+  const d = res.data;
+  $("cQueueMsg").textContent = "✓ "+esc(d.status||decision)
+    + (d.launch ? (d.launch.ok ? " — run launched" : " — launch failed: "+String(d.launch.error||"").slice(0,120)) : "");
+  loadCost();
+}
+
+async function finopsRun(task){
+  if (!await ensureToken()) { $("cFinopsMsg").textContent = "sign-in required"; return; }
+  $("cFinopsMsg").textContent = task+" starting…";
+  const res = await postApi("/api/finops-run", {task});
+  $("cFinopsMsg").textContent = res.ok
+    ? "⏳ "+task+" running — Cost Explorer lags ~24 h, so today's figures stay provisional"
+    : res.msg;
+}
+
+async function loadCost(){
+  try {
+    const [ov, es] = await Promise.all([
+      fetch(API+"/api/cost-overview").then(r=>r.json()),
+      fetch(API+"/api/cost-estimates").then(r=>r.json())]);
+
+    // KPIs — settled and provisional shown apart, never as one blended total.
+    $("kpiCostTotal").textContent = usd(ov.total_usd);
+    $("kpiCostSub").textContent = usd(ov.settled_usd)+" settled · "+usd(ov.provisional_usd)+" provisional";
+    const pend = (es.pending||[]).length;
+    $("kpiCostPending").textContent = String(pend);
+    const lim = es.limits||{};
+    $("kpiCostPendingSub").textContent = "limit "+usd(lim.single_usd)+" per run / "+usd(lim.cumulative_usd)+" cumulative";
+    const rc = ov.rate_card||{};
+    $("kpiRateCard").textContent = rc.present ? String(rc.n_rates||0) : "—";
+    $("kpiRateCardSub").textContent = !rc.present ? "no rate card — estimates unusable"
+      : rc.healthy ? "all required SKUs priced" : (rc.n_missing||0)+" required SKU(s) unpriced";
+
+    // 2 · approval queue
+    $("cQueue").innerHTML = pend ? `<table><tr><th>Estimate</th><th>Requested by</th><th>Worst case</th><th>Why gated</th><th></th></tr>`+
+      (es.pending||[]).map(p=>
+        `<tr><td class="mono">${esc(p.id)}<div class="sub">${esc(p.created_at||"")}</div></td>`+
+        `<td>${esc(p.requested_by||"?")}<div class="sub">${esc((p.justification||"").slice(0,120))}</div></td>`+
+        `<td class="mono">${usd(p.worst_case_usd)}<div class="sub">expected ${usd(p.total_usd)}</div></td>`+
+        `<td class="sub">${((p.gate||{}).reasons||[]).map(esc).join("<br>")}</td>`+
+        `<td style="white-space:nowrap">`+
+          `<button class="primary" style="padding:3px 10px;font-size:12px" onclick="decideCost(${jstr(p.id)},'approve')">Approve</button> `+
+          `<button style="padding:3px 10px;font-size:12px" onclick="decideCost(${jstr(p.id)},'reject')">Reject</button></td></tr>`).join("")+
+      `</table><div class="sub" style="margin-top:6px">Approver group: <span class="mono">${esc(lim.approver_group||"?")}</span> — these buttons are shown to everyone; the server is the gate.</div>`
+      : `<span class="sub">nothing awaiting approval</span>`;
+
+    // 3 · rollup, by category and by service
+    const cat = Object.entries(ov.by_category||{}).sort((a,b)=>b[1]-a[1]);
+    const svc = Object.entries(ov.by_service||{}).sort((a,b)=>b[1]-a[1]);
+    const run = Object.entries(ov.by_run||{}).sort((a,b)=>b[1]-a[1]);
+    const tbl = (title, rows) => `<div style="flex:1;min-width:200px"><div class="sub"><b>${title}</b></div>`+
+      (rows.length ? `<table>`+rows.map(([k,v])=>`<tr><td>${esc(k)}</td><td class="mono">${usd(v)}</td></tr>`).join("")+`</table>`
+                   : `<div class="sub">none</div>`)+`</div>`;
+    const budg = (ov.budgets||[]).map(b=>
+      `<tr><td>${esc(b.name)}</td><td class="mono">${usd(b.actual_usd)} / ${usd(b.limit_usd)}</td><td class="sub">${esc(b.time_unit||"")}</td></tr>`).join("");
+    $("cRollup").innerHTML =
+      `<div class="flex" style="gap:20px;align-items:flex-start;flex-wrap:wrap">`+
+        tbl("By category", cat)+tbl("By AWS service", svc)+tbl("By run", run)+`</div>`+
+      (budg ? `<div class="sub" style="margin-top:10px"><b>Account budgets</b> (a guardrail that already exists — not duplicated by this gate)</div><table>${budg}</table>` : "")+
+      `<div class="sub" style="margin-top:10px">${ov.n_line_items||0} line items · ${esc(ov.note||"")}</div>`;
+
+    // 4 · variance
+    const va = (es.variance||{}).variance||[];
+    $("cVariance").innerHTML = (va.length ? `<table><tr><th>Run</th><th>Est.</th><th>Actual</th><th>Δ</th><th>Driver</th></tr>`+
+      va.map(v=>`<tr><td class="mono">${esc(v.run_id)} ${settleBadge(v.settlement)}</td>`+
+        `<td class="mono">${usd(v.estimate_usd)}</td><td class="mono">${usd(v.actual_usd)}</td>`+
+        `<td class="mono">${v.variance_pct==null?"—":(v.variance_pct>0?"+":"")+v.variance_pct+"%"}</td>`+
+        `<td>${esc(v.driver||"—")}</td></tr>`+
+        `<tr><td colspan="5" class="sub" style="padding-top:0">${esc(v.verdict||"")}</td></tr>`).join("")+`</table>`
+      : `<span class="sub">no run has both an estimate and settled actuals yet</span>`)+
+      // Never silent about coverage: a variance table that omits unestimated runs
+      // implies a completeness it does not have.
+      (((es.variance||{}).n_unestimated||0) ? `<div class="pill warn" style="margin-top:8px">`+
+        `${(es.variance||{}).n_unestimated} run(s) with actual spend were never estimated</div>`+
+        `<div class="sub mono">${(((es.variance||{}).unestimated_runs)||[]).map(esc).join("<br>")}</div>` : "");
+
+    // 5 · rate card health
+    if (!rc.present) {
+      $("cRates").innerHTML = `<div class="pill err">${esc(rc.warning||"no rate card")}</div>`;
+    } else {
+      const bySrc = Object.entries(rc.by_source||{}).map(([k,v])=>`${esc(k)}: ${+v||0}`).join(" · ");
+      $("cRates").innerHTML =
+        `<div class="flex" style="gap:20px;flex-wrap:wrap">`+
+          `<div><div class="sub">priced SKUs</div><div class="stat" style="font-size:20px">${+rc.n_rates||0}</div></div>`+
+          `<div><div class="sub">required but missing</div><div class="stat" style="font-size:20px">${+rc.n_missing||0}</div></div>`+
+          `<div><div class="sub">oldest rate</div><div class="stat" style="font-size:20px">${esc(rc.oldest_as_of||"—")}</div></div>`+
+          `<div><div class="sub">sources</div><div class="stat" style="font-size:20px">${bySrc||"—"}</div></div></div>`+
+        ((rc.missing||[]).length ? `<div class="pill err" style="margin-top:8px">MISSING — every line using these prices at $0</div>`+
+          `<div class="sub mono">${(rc.missing||[]).map(esc).join("<br>")}</div>` : "")+
+        ((rc.stale||[]).length ? `<div class="pill warn" style="margin-top:8px">${(rc.stale||[]).length} rate(s) older than 30 days or undated</div>`+
+          `<div class="sub mono">${(rc.stale||[]).map(esc).join("<br>")}</div>` : "");
+    }
+  } catch(e){ $("cRollup").innerHTML = `<span class="sub">cost error: ${esc(e)}</span>`; }
+}
+
 // ── tabs (ported: persistence + poll only while active) ──────────────────────
 function showTab(t){
   document.querySelectorAll("[data-tab-panel]").forEach(el=>{
@@ -738,10 +987,11 @@ function showTab(t){
   if (t==="obs") { loadObs(); }
   if (t==="evals") loadEvals();
   if (t==="opts") loadOpts();
+  if (t==="cost") loadCost();
 }
 
 // tab on load: ?tab= URL param > localStorage > pipeline default
-const KNOWN_TABS = ["pipeline","fleet","obs","evals","opts"];
+const KNOWN_TABS = ["pipeline","fleet","obs","evals","opts","cost"];
 const _urlTab = new URLSearchParams(location.search).get("tab");
 const _memTab = localStorage.getItem("adminTab");
 showTab(KNOWN_TABS.includes(_urlTab) ? _urlTab

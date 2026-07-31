@@ -9,9 +9,9 @@
 
 ![低層架構](architecture-low-level.svg)
 
-## 1. 六個 harness（5 個專家 + 1 個指揮家），而非巨型 agent
+## 1. 七個 harness（5 個專家 + 1 個指揮家 + 1 個審計員），而非巨型 agent
 
-平台由六個 AgentCore Harness 組成：
+平台由七個 AgentCore Harness 組成：
 
 | Harness | 角色 | 任務 |
 |---|---|---|
@@ -21,6 +21,7 @@
 | `llmops_deploy` | 專家 | deploy, smoke, teardown |
 | `llmops_monitor` | 專家 | health, sweep, report |
 | `llmops_orchestrator` | **指揮家** | plan, triage, report |
+| `llmops_finops` | **審計員** | reconcile, pricing_refresh, report |
 
 為什麼不做一個掛滿所有技能、擁有所有權限的巨型 agent：
 
@@ -130,7 +131,7 @@ Phase 3 實測驗證（觀察到兩次 resume Lambda 調用：一次在早期失
 
 ## 6. 共享 BYO Memory —— 跨運行學習
 
-一個 AgentCore Memory（`llmops_shared_memory`，策略 **SEMANTIC + EPISODIC**）由六個
+一個 AgentCore Memory（`llmops_shared_memory`，策略 **SEMANTIC + EPISODIC**）由七個
 harness 共享，由 `deploy/04_wire_memory.py` 在建立後接線。每個 agent 的 `actorId`
 （= harness 名稱）為 namespace 分區，檢索仍可跨讀共享事實。刻意跳過
 USER_PREFERENCE/SUMMARIZATION 策略 —— 迴路中沒有人類用戶。
@@ -208,6 +209,30 @@ endpoints —— 無互聯網出口**（`deploy/02_network.py`）。兩個硬性
   （`deploy/05_mirror_skills.py`），而非 git 來源。
 - 這也是正確性問題而不只是連通性：git 技能來源只讀默認分支，main 分支漂移會靜默改變
   生產 agent 的行為。S3 鏡像釘死了生產 agent 實際運行的內容。
+
+## 12. 審計員在狀態機之外，而且是唯讀的
+
+`llmops_finops` 是唯一在 run 的階段序列中沒有位置的 harness，而這是從它工作的**形狀**推導
+出來的，不是品味問題。
+
+`llmops_monitor` 跑在狀態機**裡面**：每個 run 一次、在該 run 的生命週期內，回答「endpoint
+現在還活著嗎」。對帳在三個軸上都是相反的形狀 —— 它在 run **結束之後**才跑（Cost Explorer
+延遲約 24 小時）、它**橫跨多個** run、而且它對專案負責而不是對任何單一 run 負責。一個昨天
+就結束的 run，沒有任何活著的 agent 能去歸屬今天才結算的帳單；把這件事放進 `monitor`，就等
+於讓一個「屬於某個 run」的 agent 去讀其他 run 的資料。
+
+所以它坐在 `llmops_orchestrator` 旁邊、主幹之上：**指揮家決定要花什麼，審計員報告花了什麼。**
+
+它的 IAM 對帳務是唯讀的（`ce:Get*`、`pricing:*`、`budgets:DescribeBudgets`），且沒有終止任何
+東西的權限。有兩個理由，而第二個是承重的那個：
+
+- 審計員不能有能力改變它所審計的對象。
+- 停掉一個 run 是 orchestrator 透過 `page_human` 的權限。把終止權交給一個職責是**觀察**的
+  元件，會把支出控制的權限放錯位置 —— 而一個能對自己的發現直接動手的審計員，那些發現就
+  再也沒有獨立的檢查了。
+
+$2000 審批閘門住在 console 與 `cost_model.py`，不在審計員身上，理由相同：**衡量支出的東西，
+不是授權支出的東西。** 見 [COST.zh-TW.md](COST.zh-TW.md)。
 
 全程最小權限 IAM（無 `*FullAccess`），所有資源限定 `llmops-*` 範圍；本 repo 公開：
 任何地方不出現帳號 ID —— 部署腳本在運行時替換 `<ACCOUNT_ID>`，由 pre-commit hook 與

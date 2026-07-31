@@ -9,7 +9,7 @@ of compute and why" is a design decision, not an accident.
 | Stage | Compute form | Why this form |
 |---|---|---|
 | Teacher generation (distillation data) | **Bedrock serverless** (`us.deepseek.r1-v1:0` via `bedrock-runtime converse`) | Zero instances, zero endpoint management, per-token billing; data never leaves the AWS account. No notebook, no GPU to own. |
-| Agent runtimes (all 6 harnesses) | **AgentCore Harness microVMs** (CPU-only, managed) | The agents orchestrate; they never need GPUs themselves. |
+| Agent runtimes (all 7 harnesses) | **AgentCore Harness microVMs** (CPU-only, managed) | The agents orchestrate; they never need GPUs themselves. |
 | Student training (QLoRA SFT) | **SageMaker Training Job** (`create-training-job`, script mode) | Batch workload: instance spins up, trains, releases — billed 431s for the successful run. NOT a notebook (interactive, human-attended — wrong for autonomy) and NOT an endpoint (that's serving). |
 | Student inference (eval gates + smoke) | **SageMaker real-time endpoint** (DJL-LMI + vLLM) | Eval must measure the production path (HTTPS invoke, real p50 latency). Torn down after gates — no standing cost. |
 | Lambdas / Step Functions / EventBridge | Serverless spine | Deterministic control flow needs no LLM and no GPU. |
@@ -65,3 +65,24 @@ Fix: patch the artifact (remove the key) — but the durable rule is:
 **pin the SERVING stack's transformers family in mind when choosing the TRAINING
 stack's floors, or post-process artifacts for the serving container.** Recorded
 for the llm-deployment/llm-fine-tuning skill feedback PRs.
+
+## FinOps — the cost of knowing the cost
+
+The auditor is the cheapest component in the platform and the only one that runs on a schedule
+regardless of whether a pipeline run happens.
+
+| Item | Cost |
+|---|---|
+| `llmops_finops` per invocation | ~$0.05–0.15 (Fable 5 tokens + AgentCore vCPU/GB-hours) |
+| Daily 09:00 UTC reconcile | **~$1.5–4.5/month** — the recurring commitment |
+| Cost Explorer / Price List / Budgets reads | $0 (read-only APIs, within free request tiers) |
+| Two DynamoDB tables (on-demand) | cents/month at this write volume |
+
+The per-invocation figure is not the number that matters. A daily schedule is a **monthly
+subscription**, and that is the one to judge — the same reasoning the estimator applies to a
+run's `worst_case_usd` rather than its expected total.
+
+For scale: this project's whole month-to-date spend was **~$10–15** when the auditor was added,
+against an account total of **$27,491** belonging mostly to unrelated work. That ratio is why
+attribution is by explicit resource match and never by service — see [COST.md](COST.md).
+

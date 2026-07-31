@@ -10,9 +10,9 @@ Every decision below was validated by a real invocation on a real AWS account
 
 ![Low-level architecture](architecture-low-level.svg)
 
-## 1. Six harnesses (5 specialists + 1 conductor), not a mega-agent
+## 1. Seven harnesses (5 specialists + 1 conductor + 1 auditor), not a mega-agent
 
-The platform is six AgentCore Harnesses:
+The platform is seven AgentCore Harnesses:
 
 | Harness | Role | Tasks |
 |---|---|---|
@@ -22,6 +22,7 @@ The platform is six AgentCore Harnesses:
 | `llmops_deploy` | specialist | deploy, smoke, teardown |
 | `llmops_monitor` | specialist | health, sweep, report |
 | `llmops_orchestrator` | **conductor** | plan, triage, report |
+| `llmops_finops` | **auditor** | reconcile, pricing_refresh, report |
 
 Why not one mega-agent with all the skills and all the permissions:
 
@@ -142,7 +143,7 @@ append-only. Consequences, all live-proven:
 ## 6. Shared BYO Memory — cross-run learning
 
 One AgentCore Memory (`llmops_shared_memory`, strategies **SEMANTIC + EPISODIC**) is
-shared by all six harnesses, wired post-create by `deploy/04_wire_memory.py`. Per-agent
+shared by all seven harnesses, wired post-create by `deploy/04_wire_memory.py`. Per-agent
 `actorId` (= harness name) partitions namespaces while retrieval can still cross-read
 shared facts. USER_PREFERENCE/SUMMARIZATION strategies are deliberately skipped — there
 is no human user in the loop.
@@ -229,6 +230,33 @@ functions:
 - That is also correctness, not just connectivity: the git skill source reads the default
   branch only, so main-branch drift would silently change production agent behavior.
   The S3 mirror pins what production agents actually run.
+
+## 12. The auditor is outside the state machine, and read-only
+
+`llmops_finops` is the only harness with no place in a run's stage sequence, and that follows
+from the shape of its job rather than from taste.
+
+`llmops_monitor` runs *inside* the state machine: per-run, within a run's lifetime, answering
+"is the endpoint alive now". Reconciliation is the opposite shape on all three axes — it runs
+**after** the run is over (Cost Explorer lags ~24 h), it spans **many** runs, and it answers to
+the project rather than to any one run. A run that finished yesterday has no live agent to
+attribute today's settled bill, so putting this in `monitor` would mean a per-run agent reaching
+across other runs' data.
+
+So it sits beside `llmops_orchestrator`, above the spine: **the conductor decides what to spend,
+the auditor reports what was spent.**
+
+Its IAM is read-only on billing (`ce:Get*`, `pricing:*`, `budgets:DescribeBudgets`) and it has no
+authority to terminate anything. Two reasons, and the second is the load-bearing one:
+
+- An auditor must not be able to change what it audits.
+- Stopping a run is the orchestrator's authority via `page_human`. Giving kill rights to the
+  component whose job is to *observe* puts spend-control authority in the wrong place — and an
+  auditor that can act on its own findings has no independent check on those findings.
+
+The $2000 approval gate lives in the console and `cost_model.py`, not in the auditor, for the
+same reason: the thing that measures spend is not the thing that authorises it.
+See [COST.md](COST.md).
 
 Least-privilege IAM throughout (no `*FullAccess`), all resources scoped to `llmops-*`,
 and this being a public repo: no account IDs anywhere — deploy scripts substitute

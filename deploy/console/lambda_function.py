@@ -34,6 +34,18 @@ ACCOUNT_ID = os.environ.get("ACCOUNT_ID") or boto3.client("sts", region_name=REG
 CONSOLE_TABLE = os.environ.get("CONSOLE_TABLE", "LlmopsAdminRuns")   # optimization drafts (opt- prefix)
 RUNS_TABLE = os.environ.get("RUNS_TABLE", "llmops-pipeline-runs")    # pipeline runs (PK run_id)
 EVENTS_TABLE = os.environ.get("EVENTS_TABLE", "llmops-stage-events") # stage events (PK run_id, SK sk)
+ESTIMATES_TABLE = os.environ.get("ESTIMATES_TABLE", "llmops-cost-estimates")  # PK id
+ACTUALS_TABLE = os.environ.get("ACTUALS_TABLE", "llmops-cost-actuals")        # PK project, SK sk
+FINOPS_FN = os.environ.get("FINOPS_FN", "llmops-finops-reconcile")
+PROJECT = os.environ.get("PROJECT", "llmops-agentic-system")
+#: Approval fires when EITHER this run's worst case exceeds the single-run limit, OR
+#: project-to-date actual + this estimate exceeds the cumulative one. Two independent
+#: limits, because a stream of $500 runs is the same $2000 exposure as one $2000 run.
+APPROVAL_LIMIT_USD = float(os.environ.get("APPROVAL_LIMIT_USD", "2000"))
+CUMULATIVE_LIMIT_USD = float(os.environ.get("CUMULATIVE_LIMIT_USD", "2000"))
+#: Cognito group whose members may approve. Membership is checked server-side on every
+#: approval call; hiding the button in the UI is not a control.
+APPROVER_GROUP = os.environ.get("APPROVER_GROUP", "llmops-approver")
 STATE_MACHINE = os.environ.get("STATE_MACHINE", "llmops-pipeline")
 SM_ARN = f"arn:aws:states:{REGION}:{ACCOUNT_ID}:stateMachine:{STATE_MACHINE}"
 START_FN = os.environ.get("START_FN", "llmops-start-pipeline")
@@ -60,12 +72,17 @@ _ddb = boto3.resource("dynamodb", region_name=REGION)
 console_tbl = _ddb.Table(CONSOLE_TABLE) if CONSOLE_TABLE else None
 runs_tbl = _ddb.Table(RUNS_TABLE) if RUNS_TABLE else None
 events_tbl = _ddb.Table(EVENTS_TABLE) if EVENTS_TABLE else None
+estimates_tbl = _ddb.Table(ESTIMATES_TABLE) if ESTIMATES_TABLE else None
+actuals_tbl = _ddb.Table(ACTUALS_TABLE) if ACTUALS_TABLE else None
 
 EVAL_RESULTS_LG_PREFIX = "/aws/bedrock-agentcore/evaluations/results/"
 
-# The 6 pipeline harnesses. Runtime name = "harness_" + harnessName.
+# The 7 harnesses. Runtime name = "harness_" + harnessName. llmops_finops is the audit
+# runtime: it sits beside llmops_orchestrator above the state machine rather than inside
+# it, so it appears in the fleet view but never in a run's stage sequence.
 HARNESS_NAMES = ["llmops_data_prep", "llmops_finetune", "llmops_eval",
-                 "llmops_deploy", "llmops_monitor", "llmops_orchestrator"]
+                 "llmops_deploy", "llmops_monitor", "llmops_orchestrator",
+                 "llmops_finops"]
 WATCHED_RUNTIMES = [f"harness_{n}" for n in HARNESS_NAMES]
 
 # ── frontend: read ONCE at cold start (replaces the source repo's inline string) ─
@@ -863,6 +880,51 @@ def start_run(body):
                 pass
     if body.get("note"):
         params["note"] = str(body["note"])[:200]
+
+    # ── the cost gate ────────────────────────────────────────────────────────
+    # An estimate_id is optional: every run before this feature launched without one,
+    # and keeping that path legal is what lets the variance report state honestly what
+    # fraction of spend was never estimated. But when one IS supplied, it is the gate.
+    est = None
+    if body.get("estimate_id"):
+        est = _get_estimate(body["estimate_id"])
+        if not est:
+            return {"error": "unknown estimate_id", "status_code": 400}
+        status = est.get("status")
+        try:
+            gate = json.loads(est.get("gate", "{}"))
+        except Exception:
+            gate = {}
+        # Re-derive the gate at launch time. The estimate may have been priced when
+        # project-to-date was low; launching it a week later is a different exposure,
+        # and a gate that trusts a stale verdict is no gate.
+        fresh = gate_decision(_f(est.get("worst_case_usd")))
+        needs_approval = bool(gate.get("approval_required")
+                              or fresh.get("approval_required"))
+        cm = _cost_model()
+        if needs_approval:
+            # Delegated so the console and the pipeline agree on what "may launch"
+            # means; a second copy of this rule is a copy that can drift.
+            ok = cm.can_launch(est) if cm else {
+                "ok": False, "code": 503,
+                "error": "cost model unavailable — cannot verify the approval status"}
+            if not ok.get("ok"):
+                return {"error": (ok.get("error", "not launchable") + ". "
+                                  + "; ".join(fresh.get("reasons", []))),
+                        "status_code": int(ok.get("code", 409)), "gate": fresh}
+        elif status in ("rejected", "launched"):
+            # Terminal both ways even under the limit: a rejection must not be
+            # re-launched, and re-launching an already-launched estimate would attach
+            # two runs to one approval and double-count it in the variance report.
+            return {"error": f"estimate is {status} and cannot launch",
+                    "status_code": 409}
+        for k in ("task_count", "sample_count"):
+            if k not in params:
+                try:
+                    params[k] = int(json.loads(est.get("plan", "{}")).get(k))
+                except Exception:
+                    pass
+
     payload = {"trigger_source": "console", "params": params}
     r = lam.invoke(FunctionName=START_FN, InvocationType="RequestResponse",
                    Payload=json.dumps(payload).encode())
@@ -872,7 +934,546 @@ def start_run(body):
         out = {"note": "started (no parseable response)"}
     if r.get("FunctionError"):
         return {"error": f"start-pipeline failed: {json.dumps(out, default=str)[:300]}"}
+
+    if est is not None and estimates_tbl:
+        # Stamp the run back onto the estimate. Without this link the variance report
+        # has an estimate and an actual it cannot join, which is the whole point.
+        try:
+            estimates_tbl.update_item(
+                Key={"id": est["id"]},
+                UpdateExpression=("SET #s = :s, run_id = :r, sfn_execution_arn = :a, "
+                                  "launched_at = :t"),
+                ExpressionAttributeNames={"#s": "status"},
+                ExpressionAttributeValues={
+                    ":s": "launched",
+                    ":r": str(out.get("run_id") or out.get("runId") or ""),
+                    ":a": str(out.get("execution_arn")
+                              or out.get("executionArn") or ""),
+                    ":t": datetime.now(timezone.utc).isoformat()})
+        except Exception as e:
+            # The run is already going; failing the response here would tell the caller
+            # the launch failed when it did not. Log loudly instead.
+            print(f"[finops] could not stamp estimate {est['id']}: {e}")
+            out["warning"] = "run started but the estimate record was not updated"
+        out["estimate_id"] = est["id"]
     return {"ok": True, "result": out}
+
+
+# ── FinOps: estimates, the dual approval gate, actuals rollup ─────────────────
+# Design premise for everything below: an estimate is a guess, but an *actual* must
+# never be a guess. Every figure returned carries where it came from and whether it has
+# settled, because a confidently-wrong cost number is worse than an admitted unknown —
+# someone approves real spend on it.
+
+def _cost_model():
+    """Import the canonical estimator lazily.
+
+    The zip may be built without pipeline/ (the console deploys independently of the
+    pipeline package). Failing here must degrade the Cost tab, not 500 the whole
+    dashboard, so the caller turns None into a visible 'estimator unavailable'.
+    """
+    try:
+        import sys
+        for cand in (os.path.join(_HERE, "pipeline", "contracts"),
+                     os.path.join(_HERE, "contracts"), _HERE):
+            if cand not in sys.path:
+                sys.path.insert(0, cand)
+        import cost_model  # noqa: PLC0415 — deliberately lazy
+        return cost_model
+    except Exception as e:
+        print(f"[finops] cost_model unavailable: {e}")
+        return None
+
+
+def _rate_card():
+    """Latest rate card from S3 as a RateCard, or None.
+
+    Never fabricate rates on a read failure — an empty card makes every SKU 'unpriced',
+    which is visibly not-an-estimate; a silently-substituted default would produce a
+    plausible wrong number instead. Returning None rather than an empty RateCard keeps
+    "we could not read the card" distinguishable from "the card is empty".
+    """
+    cm = _cost_model()
+    if cm is None:
+        return None
+    try:
+        o = s3.get_object(Bucket=data_bucket(),
+                          Key="finops/rates/rate_card_latest.json")
+        doc = json.loads(o["Body"].read())
+        return cm.RateCard(doc.get("rates", doc))
+    except Exception as e:
+        print(f"[finops] no rate card: {e}")
+        return None
+
+
+def _f(v, default=0.0):
+    """DynamoDB gives Decimal; JSON needs float. Decimal survives json.dumps only via
+    the default= hook, which would stringify it and break arithmetic in the browser."""
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def project_to_date_usd(project=None):
+    """Actual settled+provisional spend recorded for this project, all periods.
+
+    Reads the ledger the finops agent writes. Audit/finding rows are skipped: they are
+    the agent's own notes, and summing them would double-count the very variances they
+    describe.
+    """
+    if not actuals_tbl:
+        return 0.0, 0
+    total, n = 0.0, 0
+    try:
+        resp = actuals_tbl.query(
+            KeyConditionExpression=Key("project").eq(project or PROJECT))
+        for it in resp.get("Items", []):
+            sk = str(it.get("sk", ""))
+            if "#audit#" in sk or "#finding#" in sk:
+                continue
+            total += _f(it.get("cost_usd"))
+            n += 1
+    except Exception as e:
+        print(f"[finops] project_to_date failed: {e}")
+    return round(total, 2), n
+
+
+def gate_decision(worst_case_usd, project=None):
+    """The dual threshold, delegated to cost_model.approval_decision.
+
+    Deliberately not re-implemented here. The gate arithmetic is already tested in
+    tests/test_cost_model.py, and a second copy in the console is a copy that can drift
+    — the drifting one being the one that actually guards the launch button.
+    """
+    cm = _cost_model()
+    ptd, _ = project_to_date_usd(project)
+    if cm is None:
+        # Fail CLOSED. With no estimator we cannot prove the run is under the limit, so
+        # "we could not check" must land on the require-approval side.
+        return {"approval_required": True, "project_to_date_usd": ptd,
+                "gating_usd": _f(worst_case_usd), "status": "pending_approval",
+                "reasons": ["cost model unavailable — cannot verify the spend limit, "
+                            "so approval is required"]}
+    return cm.approval_decision({"worst_case_usd": _f(worst_case_usd)},
+                                project_to_date_usd=ptd,
+                                single_run_limit_usd=APPROVAL_LIMIT_USD,
+                                cumulative_limit_usd=CUMULATIVE_LIMIT_USD)
+
+
+def create_estimate(body, username, now_iso):
+    """Price a draft plan and record it, with its gate verdict already computed."""
+    cm = _cost_model()
+    if cm is None:
+        return {"error": "estimator unavailable: cost_model.py not in this bundle",
+                "status_code": 503}
+    # Only keys estimate_run actually reads are forwarded, so a typo in the form does
+    # not become a silently-ignored field that the operator believes was priced.
+    INT_KEYS = ("sample_count", "task_count", "max_iterations", "n_stages")
+    FLOAT_KEYS = ("endpoint_hours", "train_rows", "minutes_per_stage")
+    STR_KEYS = ("training_instance", "inference_instance", "teacher_model",
+                "harness_model")
+    BOOL_KEYS = ("keep_reasoning", "teardown")
+    plan = {}
+    for k in INT_KEYS:
+        if body.get(k) not in (None, ""):
+            try:
+                plan[k] = int(body[k])
+            except Exception:
+                return {"error": f"{k} must be an integer", "status_code": 400}
+    for k in FLOAT_KEYS:
+        if body.get(k) not in (None, ""):
+            try:
+                plan[k] = float(body[k])
+            except Exception:
+                return {"error": f"{k} must be a number", "status_code": 400}
+    for k in STR_KEYS:
+        if body.get(k):
+            plan[k] = str(body[k])[:120]
+    for k in BOOL_KEYS:
+        if k in body:
+            plan[k] = bool(body[k])
+    if not (plan.get("sample_count") or plan.get("train_rows")):
+        return {"error": "sample_count (or train_rows) is required — with neither, the "
+                         "training line is $0 and the total is not an estimate",
+                "status_code": 400}
+
+    card = _rate_card()
+    if card is None:
+        # Refuse rather than return a $0-with-warnings total. A number on a screen gets
+        # quoted; an explicit refusal does not.
+        return {"error": "no rate card available — run pricing_refresh before "
+                         "estimating; without rates every line would price at $0",
+                "status_code": 503}
+    try:
+        est = cm.estimate_run(plan, card)
+    except Exception as e:
+        return {"error": f"estimate failed: {str(e)[:300]}", "status_code": 400}
+
+    worst = _f(est.get("worst_case_usd"))
+    gate = gate_decision(worst)
+    eid = "est-" + secrets.token_hex(8)
+    item = {
+        "id": eid, "project": PROJECT, "created_at": now_iso,
+        "requested_by": username or "anonymous",
+        "plan": json.dumps(plan, default=str),
+        # Numbers stored as strings, not Decimal: DynamoDB rejects float, and the whole
+        # doc is round-tripped through json anyway.
+        "estimate": json.dumps(est, default=str)[:380000],
+        "total_usd": str(round(_f(est.get("total_usd")), 4)),
+        "worst_case_usd": str(round(worst, 4)),
+        "confidence": str(est.get("confidence", "unknown")),
+        "n_unpriced": len(est.get("unpriced", []) or []),
+        # draft = priced but not submitted. Submitting is a separate, explicit act, so a
+        # user exploring numbers never accidentally files an approval request.
+        "status": "draft",
+        "gate": json.dumps(gate, default=str),
+        # The rates live at estimate time, so a variance months later can be re-derived
+        # against what was known then. Storing only "latest" makes old misses
+        # unexplainable — the estimate looks wrong when the rate card simply moved.
+        "rate_card_as_of": str(rate_card_health(plan).get("oldest_as_of") or ""),
+    }
+    if estimates_tbl:
+        estimates_tbl.put_item(Item=item)
+    return {"ok": True, "estimate_id": eid, "estimate": est, "gate": gate,
+            "rate_card": rate_card_health(plan), "plan": plan}
+
+
+def _get_estimate(estimate_id):
+    if not (estimates_tbl and estimate_id):
+        return None
+    try:
+        return estimates_tbl.get_item(Key={"id": str(estimate_id)}).get("Item")
+    except Exception as e:
+        print(f"[finops] get estimate failed: {e}")
+        return None
+
+
+def request_approval(body, username, now_iso):
+    """Move a draft to pending_approval. Only a draft may be submitted."""
+    eid = str(body.get("estimate_id", ""))
+    item = _get_estimate(eid)
+    if not item:
+        return {"error": "unknown estimate_id", "status_code": 404}
+    if item.get("status") != "draft":
+        # Re-submitting a decided estimate would let a rejection be quietly retried
+        # until someone approves it — the same estimate, a different approver, no record
+        # that it was already refused.
+        return {"error": f"estimate is {item.get('status')}, not draft",
+                "status_code": 409}
+    estimates_tbl.update_item(
+        Key={"id": eid},
+        UpdateExpression=("SET #s = :s, requested_by = :u, requested_at = :t, "
+                          "justification = :j"),
+        ExpressionAttributeNames={"#s": "status"},
+        ExpressionAttributeValues={
+            ":s": "pending_approval", ":u": username or "anonymous", ":t": now_iso,
+            ":j": str(body.get("justification", ""))[:1000]})
+    return {"ok": True, "estimate_id": eid, "status": "pending_approval"}
+
+
+def decide_approval(body, user, now_iso):
+    """Approve or reject. Enforces separation of duties server-side.
+
+    Three checks, each of which has to be here rather than in the UI:
+      1. approver-group membership — a hidden button is not an access control;
+      2. approved_by != requested_by — self-approval defeats the whole gate;
+      3. status must still be pending_approval — otherwise a decision can be replayed
+         over an earlier one.
+    """
+    username = (user or {}).get("username", "")
+    groups = (user or {}).get("groups", []) or []
+    eid = str(body.get("estimate_id", ""))
+    decision = str(body.get("decision", "")).lower()
+    if decision not in ("approve", "reject"):
+        return {"error": "decision must be 'approve' or 'reject'", "status_code": 400}
+    item = _get_estimate(eid)
+    if not item:
+        return {"error": "unknown estimate_id", "status_code": 404}
+
+    cm = _cost_model()
+    if cm is None:
+        # No estimator means the separation-of-duties rules cannot be evaluated. Deny;
+        # an approval granted because the checker was missing is worse than no approval.
+        return {"error": "cost model unavailable — cannot validate the approval",
+                "status_code": 503}
+    verdict = cm.check_approval(item, username, groups,
+                               required_group=APPROVER_GROUP)
+    if not verdict.get("allowed"):
+        return {"error": verdict.get("error", "not allowed"),
+                "status_code": int(verdict.get("code", 403))}
+    reason = str(body.get("reason", ""))[:1000]
+    if decision == "reject" and not reason:
+        # A rejection with no reason cannot be acted on: the requester learns only that
+        # someone said no, and re-submits the same estimate.
+        return {"error": "a rejection needs a reason", "status_code": 400}
+
+    new_status = "approved" if decision == "approve" else "rejected"
+    estimates_tbl.update_item(
+        Key={"id": eid},
+        UpdateExpression=("SET #s = :s, approved_by = :u, decided_at = :t, "
+                          "decision_reason = :r"),
+        ExpressionAttributeNames={"#s": "status"},
+        ExpressionAttributeValues={":s": new_status, ":u": username, ":t": now_iso,
+                                   ":r": reason})
+    out = {"ok": True, "estimate_id": eid, "status": new_status,
+           "approved_by": username}
+    if decision == "approve" and body.get("launch"):
+        launch = start_run({"estimate_id": eid, "note": f"approved by {username}"})
+        # The nested status_code is dropped deliberately: the approval itself succeeded
+        # and is recorded, so this response is a 200 carrying a launch error, not a
+        # failed approval. Returning 4xx here would suggest the approval did not land.
+        launch.pop("status_code", None)
+        out["launch"] = launch
+    return out
+
+
+def cost_estimates(limit=50):
+    """Estimates newest-first, plus the pending-approval queue."""
+    items = []
+    if estimates_tbl:
+        try:
+            r = estimates_tbl.query(
+                IndexName="project-created_at-index",
+                KeyConditionExpression=Key("project").eq(PROJECT),
+                ScanIndexForward=False, Limit=int(limit))
+            items = r.get("Items", [])
+        except Exception as e:
+            # A brand-new deployment has the table but an unbackfilled GSI; scanning is
+            # correct here rather than showing an empty queue, which would read as
+            # "nothing awaiting approval".
+            print(f"[finops] GSI query failed, falling back to scan: {e}")
+            try:
+                items = estimates_tbl.scan(Limit=int(limit)).get("Items", [])
+            except Exception as e2:
+                print(f"[finops] estimates scan failed: {e2}")
+    out = []
+    for it in items:
+        try:
+            est = json.loads(it.get("estimate", "{}"))
+        except Exception:
+            est = {}
+        try:
+            gate = json.loads(it.get("gate", "{}"))
+        except Exception:
+            gate = {}
+        out.append({
+            "id": it.get("id"), "status": it.get("status"),
+            "created_at": it.get("created_at"),
+            "requested_by": it.get("requested_by"), "approved_by": it.get("approved_by"),
+            "decided_at": it.get("decided_at"),
+            "decision_reason": it.get("decision_reason"),
+            "justification": it.get("justification"),
+            "total_usd": _f(it.get("total_usd")),
+            "worst_case_usd": _f(it.get("worst_case_usd")),
+            "confidence": it.get("confidence"),
+            "n_unpriced": int(_f(it.get("n_unpriced"))),
+            "rate_card_as_of": it.get("rate_card_as_of"),
+            "run_id": it.get("run_id"), "sfn_execution_arn": it.get("sfn_execution_arn"),
+            "line_items": est.get("line_items", []),
+            "subtotals": est.get("subtotals", {}),
+            "unpriced": est.get("unpriced", []),
+            "assumptions": est.get("assumptions", []),
+            "gate": gate,
+        })
+    out.sort(key=lambda x: str(x.get("created_at") or ""), reverse=True)
+    return {"estimates": out,
+            "pending": [e for e in out if e["status"] == "pending_approval"],
+            "limits": {"single_usd": APPROVAL_LIMIT_USD,
+                       "cumulative_usd": CUMULATIVE_LIMIT_USD,
+                       "approver_group": APPROVER_GROUP}}
+
+
+def cost_overview(period_days=30):
+    """Project rollup: actual by service and category, with settlement state.
+
+    Two numbers no dashboard should merge: settled and provisional. Cost Explorer lags
+    ~24 h, so the trailing days will move. Showing one blended total invites quoting a
+    figure that has not landed.
+    """
+    rows, audit = [], []
+    if actuals_tbl:
+        try:
+            r = actuals_tbl.query(
+                KeyConditionExpression=Key("project").eq(PROJECT),
+                ScanIndexForward=False, Limit=2000)
+            for it in r.get("Items", []):
+                sk = str(it.get("sk", ""))
+                if "#audit#" in sk or "#finding#" in sk:
+                    audit.append({"sk": sk, "task": it.get("task"),
+                                  "tool": it.get("tool"), "status": it.get("status")})
+                    continue
+                parts = sk.split("#")
+                rows.append({
+                    "period": parts[0] if parts else "",
+                    "run_id": parts[1] if len(parts) > 1 else "",
+                    "category": parts[2] if len(parts) > 2 else it.get("category", ""),
+                    "service": it.get("service", ""),
+                    "resource_id": it.get("resource_id", ""),
+                    "cost_usd": _f(it.get("cost_usd")),
+                    "quantity": _f(it.get("quantity")),
+                    "unit": it.get("unit", ""),
+                    "settlement": it.get("settlement", "provisional"),
+                    "rate_source": it.get("rate_source", ""),
+                })
+        except Exception as e:
+            print(f"[finops] actuals query failed: {e}")
+
+    by_cat, by_svc, by_run, by_period = {}, {}, {}, {}
+    settled = provisional = 0.0
+    for r in rows:
+        c = r["cost_usd"]
+        by_cat[r["category"] or "unknown"] = round(
+            by_cat.get(r["category"] or "unknown", 0.0) + c, 4)
+        by_svc[r["service"] or "unknown"] = round(
+            by_svc.get(r["service"] or "unknown", 0.0) + c, 4)
+        if r["run_id"]:
+            by_run[r["run_id"]] = round(by_run.get(r["run_id"], 0.0) + c, 4)
+        by_period[r["period"]] = round(by_period.get(r["period"], 0.0) + c, 4)
+        if r["settlement"] == "settled":
+            settled += c
+        else:
+            provisional += c
+
+    budgets = []
+    try:
+        b = boto3.client("budgets", region_name=REGION)
+        for bd in b.describe_budgets(AccountId=ACCOUNT_ID, MaxResults=20).get("Budgets", []):
+            budgets.append({
+                "name": bd.get("BudgetName"),
+                "limit_usd": _f((bd.get("BudgetLimit") or {}).get("Amount")),
+                "actual_usd": _f(((bd.get("CalculatedSpend") or {}).get("ActualSpend")
+                                  or {}).get("Amount")),
+                "time_unit": bd.get("TimeUnit"),
+            })
+    except Exception as e:
+        # An account guardrail we cannot read is worth saying so about, not hiding.
+        print(f"[finops] budgets unavailable: {e}")
+
+    return {
+        "project": PROJECT,
+        "total_usd": round(settled + provisional, 2),
+        "settled_usd": round(settled, 2),
+        "provisional_usd": round(provisional, 2),
+        "n_line_items": len(rows),
+        "by_category": by_cat, "by_service": by_svc,
+        "by_run": dict(sorted(by_run.items(), key=lambda kv: -kv[1])[:25]),
+        "by_period": dict(sorted(by_period.items(), reverse=True)[:int(period_days)]),
+        "line_items": rows[:400],
+        "audit_rows": audit[:50],
+        "budgets": budgets,
+        "limits": {"single_usd": APPROVAL_LIMIT_USD,
+                   "cumulative_usd": CUMULATIVE_LIMIT_USD},
+        "note": ("Attribution is by explicit resource match (training-job/llmops-*, "
+                 "manifest endpoints, spans by session id) — never by service, because "
+                 "this account also carries unrelated SageMaker spend. Cost Explorer "
+                 "lags ~24h, so provisional figures will still move."),
+    }
+
+
+def rate_card_health(plan=None):
+    """What the rate card knows and what it admits it does not.
+
+    This panel exists because the Price List API cannot price DeepSeek-R1 or Fable 5 on
+    this account (verified: `pricing get-attribute-values` for AmazonBedrock lists
+    neither). Without the panel, a stale feed prices the teacher at $0 and the estimate
+    is quietly, plausibly wrong.
+
+    Health is measured against the SKUs a real plan NEEDS, not against the card's own
+    contents — a card with 40 irrelevant rates and no teacher price is not healthy, and
+    only `required_skus_for` can tell the difference.
+    """
+    cm = _cost_model()
+    card = _rate_card()
+    if cm is None:
+        return {"present": False, "warning": "cost model unavailable in this bundle"}
+    if card is None:
+        return {"present": False, "healthy": False,
+                "warning": "no rate card in S3 — run pricing_refresh; until then every "
+                           "SKU is unpriced and estimates are not usable"}
+    out = cm.rate_card_health(card, cm.required_skus_for(plan or {}))
+    out["present"] = True
+    return out
+
+
+def cost_variance(estimates=None, overview=None):
+    """Estimate vs actual per run, naming the driving category rather than one aggregate %.
+
+    A single "we were 40% off" tells nobody what to fix; the next estimate is only better
+    if the miss is attributed to a line — so this delegates to cost_model.reconcile,
+    which is where that attribution lives and is tested.
+
+    Both inputs are injectable so the caller can reuse reads it already made; recomputing
+    them would double the DynamoDB queries behind one page render.
+    """
+    cm = _cost_model()
+    ests = (estimates if estimates is not None
+            else cost_estimates(limit=100)["estimates"])
+    ov = overview if overview is not None else cost_overview()
+
+    # Per-run, per-category actuals, assembled from the same rows the rollup used.
+    by_run_cat = {}
+    settle = {}
+    for r in ov.get("line_items", []):
+        rid = r.get("run_id")
+        if not rid:
+            continue
+        cat = by_run_cat.setdefault(rid, {})
+        cat[r.get("category") or "unknown"] = round(
+            cat.get(r.get("category") or "unknown", 0.0) + _f(r.get("cost_usd")), 6)
+        # A run is only settled if EVERY row for it is: one provisional row means the
+        # total can still move, and calling that settled is the error this guards.
+        if r.get("settlement") != "settled":
+            settle[rid] = "provisional"
+        else:
+            settle.setdefault(rid, "settled")
+
+    out = []
+    for e in ests:
+        rid = e.get("run_id")
+        if not rid or rid not in by_run_cat:
+            continue
+        actual = {"subtotals": by_run_cat[rid],
+                  "total_usd": round(sum(by_run_cat[rid].values()), 6),
+                  "settlement": settle.get(rid, "provisional")}
+        est_doc = {"subtotals": e.get("subtotals") or {},
+                   "total_usd": e.get("total_usd", 0.0)}
+        rec = (cm.reconcile(est_doc, actual) if cm else
+               {"estimate_usd": e.get("total_usd"), "actual_usd": actual["total_usd"],
+                "verdict": "cost model unavailable — cannot attribute the variance"})
+        rec.update({"run_id": rid, "estimate_id": e.get("id"),
+                    "confidence": e.get("confidence")})
+        out.append(rec)
+
+    matched = {o["run_id"] for o in out}
+    unestimated = [r for r in by_run_cat if r not in matched]
+    return {"variance": out,
+            # Stated explicitly: a variance report silent about unestimated spend
+            # implies full coverage it does not have. Runs launched without an estimate
+            # are legal — that is how every run worked before this feature.
+            "unestimated_runs": sorted(unestimated)[:50],
+            "n_unestimated": len(unestimated)}
+
+
+def finops_run(body):
+    """Trigger reconcile / pricing_refresh / report on demand (the schedule is daily)."""
+    task = str(body.get("task", "reconcile"))
+    if task not in ("reconcile", "pricing_refresh", "report"):
+        return {"error": f"unknown task {task}", "status_code": 400}
+    payload = {"task": task, "project": PROJECT, "sync": False}
+    if body.get("period"):
+        payload["period"] = str(body["period"])
+    try:
+        r = lam.invoke(FunctionName=FINOPS_FN, InvocationType="Event",
+                       Payload=json.dumps(payload).encode())
+        # Named invoke_status, NOT status_code: _resp_result treats status_code as the
+        # HTTP status to return, and Lambda's async 202 would silently become this
+        # route's response code.
+        return {"ok": True, "task": task, "invoke_status": r.get("StatusCode"),
+                "note": "async — watch the rollup; Cost Explorer lags ~24 h"}
+    except Exception as e:
+        return {"error": f"could not invoke {FINOPS_FN}: {str(e)[:300]}",
+                "status_code": 502}
 
 
 # ── HTTP glue (ported: security headers, auth, response helper) ───────────────
@@ -908,6 +1509,24 @@ def _resp(code, body, ctype="application/json"):
             "body": body if isinstance(body, str) else json.dumps(body, default=str)}
 
 
+def _resp_result(result):
+    """Let a handler choose its own status code without knowing about HTTP.
+
+    The cost handlers return {"error": ..., "status_code": 400|403|409}. Flattening those
+    to 200-with-an-error-body would make a denied approval indistinguishable from a
+    granted one to anything but a human reading the JSON — and audit tooling reads
+    status codes.
+
+    Only an EXPLICIT status_code is honoured; anything else stays 200. Inferring 400
+    from the presence of an "error" key would silently re-code the seven pre-existing
+    POST routes, whose frontend handlers all read `j.error` off a 200.
+    """
+    if isinstance(result, dict) and result.get("status_code"):
+        code = int(result.pop("status_code"))
+        return _resp(code, result)
+    return _resp(200, result)
+
+
 def cognito_login(username, password):
     """Exchange username/password for a Cognito access token (USER_PASSWORD_AUTH)."""
     if not COGNITO_CLIENT_ID:
@@ -924,18 +1543,41 @@ def cognito_login(username, password):
         return {"error": str(e)[:200]}
 
 
-def _authed(headers):
-    """Cognito access token in Authorization: Bearer, validated server-side via
-    GetUser (checks signature/expiry/revocation)."""
+def _authed_user(headers):
+    """Return {"username", "groups"} for a valid token, else None.
+
+    GetUser validates the token server-side (signature, expiry, revocation) and returns
+    the username — but NOT group membership, and a bearer *access* token carries no
+    cognito:groups claim either. So the approver check needs a second call,
+    AdminListGroupsForUser. Getting this wrong would leave the separation-of-duties gate
+    with nothing to check: it would read as enforced while approving everything.
+
+    A groups lookup that fails yields an EMPTY group list rather than an exception. The
+    caller then denies, because "we could not prove you are an approver" must land on
+    the deny side; a throttled Cognito call must not become an approval.
+    """
     h = {k.lower(): v for k, v in (headers or {}).items()}
     auth = h.get("authorization", "")
-    if auth.startswith("Bearer ") and COGNITO_POOL_ID:
-        try:
-            cognito.get_user(AccessToken=auth[7:].strip())
-            return True
-        except Exception:
-            return False
-    return False
+    if not (auth.startswith("Bearer ") and COGNITO_POOL_ID):
+        return None
+    try:
+        who = cognito.get_user(AccessToken=auth[7:].strip())
+    except Exception:
+        return None
+    username = who.get("Username", "")
+    groups = []
+    try:
+        g = cognito.admin_list_groups_for_user(UserPoolId=COGNITO_POOL_ID,
+                                               Username=username, Limit=60)
+        groups = [x.get("GroupName", "") for x in g.get("Groups", [])]
+    except Exception as e:
+        print(f"[auth] group lookup failed for {username}: {e}")
+    return {"username": username, "groups": groups}
+
+
+def _authed(headers):
+    """Thin bool wrapper so the pre-existing POST routes keep their exact contract."""
+    return _authed_user(headers) is not None
 
 
 def handler(event, context):
@@ -984,6 +1626,17 @@ def handler(event, context):
         if method == "GET" and path == "/api/optimizations":
             return _resp(200, {"recommendations": list_optimizations(),
                                "native": list_native_recommendations()})
+        if method == "GET" and path == "/api/cost-overview":
+            out = cost_overview(qs.get("days", 30))
+            out["rate_card"] = rate_card_health()
+            return _resp(200, out)
+        if method == "GET" and path == "/api/cost-estimates":
+            out = cost_estimates(qs.get("limit", 50))
+            # Reuses the reads above rather than re-querying both tables — one page
+            # render should not cost four DynamoDB queries where two suffice.
+            out["variance"] = cost_variance(estimates=out["estimates"],
+                                            overview=cost_overview())
+            return _resp(200, out)
 
         raw = event.get("body") or "{}"
         if event.get("isBase64Encoded"):
@@ -996,11 +1649,24 @@ def handler(event, context):
         if method == "POST" and path == "/api/login":
             return _resp(200, cognito_login(str(body.get("username", "")), str(body.get("password", ""))))
         if method == "POST":
-            if not _authed(headers):
+            # One auth call for every POST, resolved to a user rather than a bool: the
+            # cost routes need the username (self-approval check) and the groups
+            # (approver check), and re-calling Cognito per route would double the
+            # latency of the approval click for no benefit.
+            user = _authed_user(headers)
+            if user is None:
                 return _resp(401, {"error": "unauthorized"})
             now = datetime.now(timezone.utc).isoformat()
             if path == "/api/start-run":
-                return _resp(200, start_run(body))
+                return _resp_result(start_run(body))
+            if path == "/api/cost-estimate":
+                return _resp_result(create_estimate(body, user["username"], now))
+            if path == "/api/cost-approval-request":
+                return _resp_result(request_approval(body, user["username"], now))
+            if path == "/api/cost-approval":
+                return _resp_result(decide_approval(body, user, now))
+            if path == "/api/finops-run":
+                return _resp_result(finops_run(body))
             if path == "/api/batch-eval":
                 return _resp(200, start_batch_eval())
             if path == "/api/insights-report":
