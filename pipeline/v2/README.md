@@ -70,10 +70,46 @@ ever appears in val. Outputs TRL messages format (`train.jsonl`,
 | Rejected (verify-fail) | 0 (0.0%) |
 | Train rows / tasks | 20,225 / 809 |
 | Val rows / tasks | 1,000 / 40 |
-| Median prompt+code tokens (chars/4) | 1,134 (p90 2,114, max 5,656) |
+| Median prompt+code tokens (Qwen3 tokenizer) | 2,298 (p90 5,285, p99 9,097, max 12,967) |
 | Full-run wall time (8 workers) | ~108 s |
 
 Per-transform counts live in `out/augment_stats.json`.
+
+Those token counts are measured with the real `Qwen/Qwen3-1.7B` tokenizer over all
+20,225 train rows, not estimated. An earlier version of this table used the usual
+`chars / 4` rule of thumb and understated every figure by 2.0–2.5× (it reported
+median 1,134 / p90 2,114 / max 5,656). The rule fails badly on this specific
+domain: ARC prompts are space-separated single digits, where one token covers
+about two characters rather than four. Anything sized from the estimate — a
+`max_length`, a `max_new_tokens`, a cost projection — would have been wrong by
+more than a factor of two, so the measurement is worth its one-off cost.
+
+### The `max_length` cliff (read this before setting `--max-length`)
+
+At the `max_length 4096` used by the 2026-07-31 training run, `--drop-overlong`
+discards **3,603 train rows (17.8%)** and **125 val rows (12.5%)**. Those rows are
+not a random sample, and the reason is structural: a row's length is set almost
+entirely by its grid size, and all 25 variants of a source task share that size
+(the augmentation group permutes colors and rotates, which cannot change the cell
+count). So dropping is effectively **all-or-nothing per source task**, and it
+removes the largest grids first:
+
+| Split | Rows dropped | Source tasks *entirely* removed |
+|---|---|---|
+| train | 3,603 / 20,225 (17.8%) | **131 / 809 (16.2%)** |
+| val | 125 / 1,000 (12.5%) | **5 / 40 (12.5%)** |
+
+Two consequences worth stating plainly rather than discovering later:
+
+- A `eval_loss` or `solve_rate` from that configuration covers **35 val tasks, not
+  40**, and the 5 missing ones are the hardest-to-render (largest) tasks in the
+  held-out set. Reported without this note, a deliberate configuration choice reads
+  as a model deficiency.
+- The student is never shown a large grid at all, so it cannot be expected to
+  generalize to one. Raising `max_length` to 8192 would recover most of the gap
+  (p90 is 5,285, p99 9,097) at roughly 2× attention memory per sample — the
+  compensating knob is `per_device_batch_size` with `gradient_accumulation` raised
+  to hold the effective batch size fixed.
 
 ## Size-generic note
 
