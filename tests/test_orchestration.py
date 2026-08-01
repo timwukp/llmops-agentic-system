@@ -804,6 +804,29 @@ class TestConductorDispatch:
         m2 = start_pipeline.seed_manifest("run-y", "scheduler", {}, None)
         assert m2["approval"] == {}
 
+def _deploy_src(name):
+    return (REPO / "deploy" / name).read_text()
+
+
+def test_escalations_reach_a_human_or_the_deploy_says_they_do_not():
+    """escalate_human publishes to llmops-escalations, and the topic had ZERO
+    subscribers -- every escalation the pipeline has ever raised went into the void.
+    An escalation nobody receives is worse than no escalation: the agent stops, the
+    run waits, and the design says a human was asked.
+
+    The deploy cannot invent an email address, so the contract is: accept one when
+    offered (--escalation-email, idempotent), and when the topic has no subscriber at
+    all, say so loudly in the output instead of reporting the topic as simply "exists".
+    """
+    storage = _deploy_src("03_storage.py")
+    assert "escalation-email" in storage, (
+        "no way to subscribe anyone to the escalation topic at deploy time")
+    assert "subscribe" in storage, "the flag must actually call sns.subscribe"
+    assert "NO SUBSCRIBERS" in storage, (
+        "a topic with no subscribers must be reported as a warning, not as 'exists' -- "
+        "silence is what let this go unnoticed across every phase")
+
+
 def test_start_pipeline_role_can_emit_the_event_its_handler_always_emits():
     """start_pipeline calls ev.emit_event(PIPELINE_STARTED) on every single run, but
     its role shipped without events:PutEvents -- so the function got as far as writing

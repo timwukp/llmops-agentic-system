@@ -189,18 +189,53 @@ def ensure_bus(events, dry):
     return "created"
 
 
-def ensure_topic(sns, topic_arn, dry):
+def ensure_topic(sns, topic_arn, dry, email=None):
+    """Create the escalation topic and make sure SOMEONE is listening.
+
+    The topic existed from Phase 3 with zero subscribers, so every escalation the
+    pipeline raised -- an agent stopping to ask a human about a budget overrun, a
+    quality gate failing, a remediation budget exhausted -- published successfully
+    into nothing. An escalation nobody receives is worse than none at all: the run
+    waits and the design claims a human was asked.
+
+    The deploy cannot invent an address, so: subscribe one when given (idempotent --
+    SNS ignores a repeat of the same endpoint), and when nobody at all is subscribed,
+    say so in the output rather than reporting the topic as healthy.
+    """
+    status = "exists"
+    arn = topic_arn
     try:
         sns.get_topic_attributes(TopicArn=topic_arn)
-        return "exists", topic_arn
     except Exception:
-        pass
+        if dry:
+            return {"status": "would create", "arn": topic_arn}
+        # create_topic is itself idempotent by name
+        arn = sns.create_topic(Name=SNS_TOPIC,
+                               Tags=[{"Key": TAG_KEY, "Value": TAG_VAL}])["TopicArn"]
+        status = "created"
+
     if dry:
-        return "would create", topic_arn
-    # create_topic is itself idempotent by name
-    arn = sns.create_topic(Name=SNS_TOPIC,
-                           Tags=[{"Key": TAG_KEY, "Value": TAG_VAL}])["TopicArn"]
-    return "created", arn
+        return {"status": status, "arn": arn,
+                "subscribers": f"would subscribe {email}" if email else "unchanged"}
+
+    subs = sns.list_subscriptions_by_topic(TopicArn=arn).get("Subscriptions", [])
+    existing = {s.get("Endpoint") for s in subs}
+    if email and email not in existing:
+        sns.subscribe(TopicArn=arn, Protocol="email", Endpoint=email,
+                      ReturnSubscriptionArn=True)
+        subs.append({"Endpoint": email, "SubscriptionArn": "pending confirmation"})
+
+    note = f"{len(subs)} subscriber(s)"
+    if not subs:
+        note = ("NO SUBSCRIBERS -- every escalate_human call publishes into the void. "
+                "Re-run with --escalation-email <addr> so a human actually hears them.")
+    # A subscription stays PendingConfirmation until the recipient clicks the link;
+    # reporting it as subscribed would be the same silence in a new place.
+    pending = [s["Endpoint"] for s in subs
+               if str(s.get("SubscriptionArn", "")).lower().find("pending") >= 0]
+    if pending:
+        note += f" (awaiting email confirmation: {', '.join(pending)})"
+    return {"status": status, "arn": arn, "subscribers": note}
 
 
 def main():
@@ -208,6 +243,9 @@ def main():
     ap.add_argument("--region", required=True)
     ap.add_argument("--account-id", help="skip STS (offline dry-run) and use this account id")
     ap.add_argument("--bucket", help="bucket name (default llmops-agentic-<acct>-<region>)")
+    ap.add_argument("--escalation-email",
+                    help="subscribe this address to llmops-escalations (idempotent). "
+                         "Without a subscriber, escalate_human publishes into the void.")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
@@ -306,8 +344,10 @@ def main():
                   "(deliberate simplification — consultation volumes are tiny)",
     }
     results["event_bus"] = {"name": EVENT_BUS, "status": ensure_bus(events, args.dry_run)}
-    status, topic_arn = ensure_topic(sns, topic_arn, args.dry_run)
-    results["sns_topic"] = {"name": SNS_TOPIC, "status": status}
+    topic = ensure_topic(sns, topic_arn, args.dry_run, args.escalation_email)
+    topic_arn = topic["arn"]
+    results["sns_topic"] = {"name": SNS_TOPIC, "status": topic["status"],
+                            "subscribers": topic.get("subscribers", "")}
     kms_client = safe_client("kms", args.region, args.dry_run)
     key_status, key_arn = ensure_approval_key(kms_client, account_id, args.dry_run)
     results["approval_key"] = {"alias": APPROVAL_KEY_ALIAS, "status": key_status,
