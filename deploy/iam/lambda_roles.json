@@ -267,6 +267,35 @@
         ]
       }
     },
+    "monitor_sweep": {
+      "_comment": "monitor_sweep: EventBridge Scheduler target, daily 08:00 UTC. Same shape and same reasoning as finops_reconcile above -- it reads no metrics and lists no endpoints itself; the agent does that through its own execution role. This Lambda only builds the payload, invokes the driver, and records that a sweep happened. A SEPARATE role rather than a reuse of the driver's, for the reason finops_reconcile spells out: reusing the driver role works on the first try and hands a scheduled cost-control probe every permission the pipeline it probes has.",
+      "permissionsPolicy": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "_comment": "PutItem only, for the single sweep# row that makes a MISSED sweep visible -- the same argument as finops_reconcile's reserved #audit# row. The failure mode worth engineering against is not a sweep that reports badly, it is a sweep that quietly stopped happening; a cost control nobody can tell has stopped is not a control.",
+            "Sid": "RecordSweepOutcome",
+            "Effect": "Allow",
+            "Action": [
+              "dynamodb:PutItem"
+            ],
+            "Resource": "arn:aws:dynamodb:<REGION>:<ACCOUNT_ID>:table/llmops-stage-events"
+          },
+          {
+            "Sid": "InvokeHarnessDriver",
+            "Effect": "Allow",
+            "Action": "lambda:InvokeFunction",
+            "Resource": "arn:aws:lambda:<REGION>:<ACCOUNT_ID>:function:llmops-harness-driver"
+          },
+          {
+            "Sid": "SweepFailurePublish",
+            "Effect": "Allow",
+            "Action": "sns:Publish",
+            "Resource": "arn:aws:sns:<REGION>:<ACCOUNT_ID>:llmops-escalations"
+          }
+        ]
+      }
+    },
     "webhook": {
       "_comment": "webhook: HMAC-verifies inbound GitHub/webhook calls using the shared secret, then invokes start_pipeline. No data-plane access of its own.",
       "permissionsPolicy": {

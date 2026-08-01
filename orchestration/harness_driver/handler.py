@@ -332,6 +332,52 @@ def _gate_event(metrics: dict) -> str:
     return ev.QUALITY_GATE_PASSED if metrics.get("gate_passed") else ev.QUALITY_GATE_FAILED
 
 
+def _health_event(metrics: dict) -> Optional[str]:
+    """DriftDetected on a monitor health task, or nothing.
+
+    DRIFT_DETECTED has been declared in events.py since Phase 1 and emitted by NOTHING,
+    while the monitor prompt tells the agent to put its finding in
+    ``metrics.drift_detected`` "so the orchestrator can emit the event" — naming an emitter
+    that does not exist. Nobody noticed because no monitor task had ever been dispatched;
+    the promise and its absence were unobservable at the same time.
+
+    It belongs here, not in the agent: emitting is the driver's job for every other stage
+    (STAGE_EVENT_MAP), the harness role's PutEvents grant is scoped to this bus for exactly
+    this reason, and an agent that self-reports an event can emit one for work it did not
+    verify.
+
+    Strict truthiness, deliberately matching the eval gate rather than ``bool()``: this
+    event is the only signal a human gets that a deployed model has started behaving
+    differently. ``is True`` means an absent or null finding stays silent instead of a
+    string like "unknown" or "none" — which is truthy — announcing drift that nobody
+    observed. The failure directions are asymmetric but both are real, so the rule is that
+    the agent must say ``true`` to be heard.
+    """
+    return ev.DRIFT_DETECTED if metrics.get("drift_detected") is True else None
+
+
+def _stamp_dispatch(norm: dict, stage: str, task: str) -> dict:
+    """Overwrite the agent's echoed stage/task with what was actually DISPATCHED.
+
+    ``normalize_stage_complete`` reads stage and task out of the agent's tool args, which
+    is right for everything else in the payload -- outputs, metrics and evidence are the
+    agent's findings and nobody else can supply them. Stage and task are the opposite kind
+    of fact: the driver was told both in its own invocation event, so the agent's copy is
+    at best a restatement and at worst wrong. Both live monitor sweeps recorded
+    ``"task": ""`` because the agent simply omitted the field, and the run's row then said
+    a monitor stage completed without saying WHICH of health/sweep/report did -- the exact
+    ambiguity #58 existed to remove. It is not cosmetic: the console derives which
+    (stage, task) pairs a run executed from this field (``_session_ids``), so an empty
+    task quietly widens to "any task of that stage".
+
+    The dispatch wins on principle, not just because the echo happened to be empty here:
+    an agent that echoes ``task: "report"`` on a sweep invocation would otherwise file its
+    sweep findings under a task that never ran.
+    """
+    return {**norm, "stage": stage or norm.get("stage", ""),
+            "task": task or norm.get("task", "")}
+
+
 def handle_stage_complete(c, event, args) -> dict:
     """Verify → normalize → canonical publish → events → settle token."""
     run_id, stage, task = event["run_id"], event["stage"], event["task"]
@@ -341,10 +387,13 @@ def handle_stage_complete(c, event, args) -> dict:
     if missing:
         return {"ok": False, "missing_outputs": missing}
 
-    _record_stage_event(c["ddb"], run_id, stage, "stage_complete", norm)
+    _record_stage_event(c["ddb"], run_id, stage, "stage_complete",
+                        _stamp_dispatch(norm, stage, task))
 
     if stage == "eval" and task == "gate":
         detail_type = _gate_event(norm.get("metrics", {}))
+    elif stage == "monitor" and task == "health":
+        detail_type = _health_event(norm.get("metrics", {}))
     else:
         detail_type = STAGE_EVENT_MAP.get((stage, task))
     if detail_type:

@@ -180,3 +180,107 @@ def test_no_doc_claims_a_file_that_does_not_exist():
         "docs cite repo paths that do not exist: "
         + "; ".join(f"{p} (in {', '.join(sorted(set(d)))})" for p, d in sorted(cited.items()))
         + ". Either build the file, or say plainly that it does not exist yet.")
+
+
+# ── the counts that describe the spine, derived from the spine ─────────────────
+# The "8 harness-task states on the happy path" claim in both ARCHITECTURE variants, and
+# PROJECT_STATE's "9 states" and "Lambdas ×5", were all true when written and all became
+# false by addition -- silently, in two languages, exactly like the test count above. Every
+# one of them is derivable from the source it describes, so derive it.
+
+def _happy_path_harness_states() -> int:
+    """Harness-task states a successful default-mode run passes through.
+
+    Walks the ASL from StartAt on the success edges rather than counting Task states,
+    because `DataAudit` (audit mode only) and `RemediateFinetune` (gate-fail loop only) are
+    real states that no happy-path run touches -- and the docs make the claim about the
+    happy path specifically.
+
+    "Happy path" is a two-part definition and the Choices need both halves: default
+    pipeline mode (so PipelineModeChoice and RemediationChoice take their Default, skipping
+    the audit branch and the remediation loop) AND the quality gate passing -- where the
+    pass is the explicit `gate_passed: true` BRANCH and the Default is the failure edge.
+    Taking Default everywhere walks the failure path out of QualityGateChoice and counts 5.
+    """
+    asl = json.loads((REPO / "orchestration/state_machine.asl.json").read_text())
+    states, seen, count = asl["States"], set(), 0
+    cur = asl["StartAt"]
+    while cur and cur not in seen:
+        seen.add(cur)
+        st = states[cur]
+        payload = (st.get("Parameters") or {}).get("Payload") or {}
+        if payload.get("stage") and payload.get("task"):
+            count += 1
+        if st["Type"] != "Choice":
+            cur = st.get("Next")
+            continue
+        passing = [ch["Next"] for ch in st["Choices"]
+                   if ch.get("Variable", "").endswith("gate_passed")
+                   and ch.get("BooleanEquals") is True]
+        cur = passing[0] if passing else st.get("Default")
+    return count
+
+
+def test_the_documented_happy_path_state_count_matches_the_state_machine():
+    """Both ARCHITECTURE variants said 8; MonitorHealth and MonitorReport made it 10.
+
+    A wrong count here is not cosmetic: it is how the monitor harness stayed undispatched
+    for the platform's whole life while the docs described it as a stage. The prose was
+    read as evidence that the wiring existed.
+    """
+    n = _happy_path_harness_states()
+    docs = {"ARCHITECTURE.md": r"\*\*(\d+) harness-task states",
+            "ARCHITECTURE.zh-TW.md": r"\*\*(\d+) 個 harness 任務狀態"}
+    for name, pattern in docs.items():
+        text = (REPO / "docs" / name).read_text()
+        claims = re.findall(pattern, text)
+        assert claims, f"{name}: no harness-task-state count claim left to check"
+        for c in claims:
+            assert int(c) == n, f"{name} claims {c} happy-path harness states, the ASL has {n}"
+
+
+def test_the_documented_state_and_lambda_counts_match_the_deployers():
+    """PROJECT_STATE's infrastructure table is the one-screen answer to "what is running".
+
+    It said 9 states and 5 Lambdas while the ASL had 24 and LAMBDAS had 6. Both drifted by
+    addition, which is the only way this table ever goes wrong and the way no reader can
+    detect: a number that was once measured looks measured forever.
+    """
+    text = (REPO / "PROJECT_STATE.md").read_text()
+    n_states = len(json.loads(
+        (REPO / "orchestration/state_machine.asl.json").read_text())["States"])
+    claimed = re.findall(r"\| (\d+) states", text)
+    assert claimed, "PROJECT_STATE.md no longer states a state count"
+    for c in claimed:
+        assert int(c) == n_states, f"PROJECT_STATE claims {c} states, the ASL has {n_states}"
+
+    lambdas = (REPO / "deploy/07_lambdas.py").read_text()
+    n_fns = len(re.findall(r'^\s{8}"fn": "llmops-', lambdas, re.M))
+    assert n_fns, "could not count LAMBDAS entries -- did the table's shape change?"
+    claimed_fns = re.findall(r"\| Lambdas ×(\d+)", text)
+    assert claimed_fns, "PROJECT_STATE.md no longer states a Lambda count"
+    for c in claimed_fns:
+        assert int(c) == n_fns, f"PROJECT_STATE claims ×{c} Lambdas, LAMBDAS has {n_fns}"
+
+
+def test_every_schedule_the_deployer_creates_is_named_in_the_cost_posture():
+    """The cost posture called the finops reconcile "one recurring cost" and "the only
+    schedule enabled by default". The sweep schedule made both false the moment it landed.
+
+    This is the doc claim with money attached: a reader deciding whether this platform is
+    safe to leave running reads this paragraph and nothing else. A schedule that is ENABLED
+    by default and absent from it is a standing charge nobody was told about.
+    """
+    triggers = (REPO / "deploy/08_triggers.py").read_text()
+    names = set(re.findall(r'^[A-Z_]*SCHEDULE_NAME = "([a-z-]+)"', triggers, re.M))
+    assert names, "no schedule names found in 08_triggers.py"
+    # A schedule created DISABLED by default is not a standing cost, so it need not appear.
+    enabled = {n for n in names if n != "llmops-nightly"}
+    text = (REPO / "PROJECT_STATE.md").read_text()
+    posture = text.split("## Standing cost posture")[1].split("\n## ")[0]
+    for name in sorted(enabled):
+        stem = name.replace("llmops-", "").replace("-daily", "").replace("-", " ")
+        assert name in posture or stem in posture, (
+            f"{name} is ENABLED by default and the standing cost posture never mentions "
+            f"it; the paragraph a reader uses to decide what this platform costs to leave "
+            "running has to name every schedule that runs on its own")

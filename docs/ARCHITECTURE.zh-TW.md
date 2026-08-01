@@ -49,16 +49,42 @@ LLM 判斷。因此編排採用 **Step Functions Standard 狀態機**，智能�
 讓 LLM 決定「下一個階段是什麼」只會給系統中唯一不需要不確定性的部分添加不確定性、
 成本和故障模式。
 
-狀態機（`orchestration/state_machine.asl.json`）在正常路徑上有 **8 個 harness 任務狀態**
+狀態機（`orchestration/state_machine.asl.json`）在正常路徑上有 **10 個 harness 任務狀態**
 —— 每個都是帶 `waitForTaskToken` 的 harness driver Lambda 調用 —— 外加只在迴路中出現的
-`RemediateFinetune`：
+`RemediateFinetune`，以及只在審計模式出現的 `DataAudit`：
 
 ```
 DataPrepGenerate → DataPrepCurate → FinetuneLaunch → FinetuneAnalyze → EvalGate
                                                         │（門檻失敗）
                               RemediateFinetune ←───────┘   …門檻通過則：
-                                                     Deploy → SmokeTest → Teardown
+             Deploy → SmokeTest → MonitorHealth → Teardown → MonitorReport
 ```
+
+兩個 monitor 狀態的位置是由工作本身的形狀決定的，不是喜好問題。**`MonitorHealth`** 必須在
+端點還存在時讀 CloudWatch，而 `Teardown` 在每條路徑上都會刪掉它（包含 `SmokeTest` 的
+`Catch`）—— 刪除之後 `GetMetricData` 回傳的空序列，跟一個健康但閒置的端點完全無法區分，
+所以這兩個狀態之間是唯一能回答這個問題的窗口。它不作為門檻：它的 `Catch` 同樣指向
+`Teardown`，因為一次失敗的指標讀取絕不能把它正在觀測的端點卡在原地 —— 不管我們有沒有量到，
+孤兒端點都在計費。**`MonitorReport`** 排在 `Teardown` 之後，因為它整合的是*已完成*的
+manifest —— 更早寫的報告會漏掉它本來要確認的 teardown —— 而它的 `Catch` 指向 `Complete`：
+敘事是交付物，run 的終態是事實。
+
+第三個 monitor 任務 **`sweep`** 刻意留在狀態機*之外*，跑在 08:00 UTC 的排程上
+（`llmops-monitor-sweep-daily` → `llmops-monitor-sweep`）。它獵捕的是*其他* run 留下的端點，
+包括那些崩潰、因此從未走到任何能檢查的狀態的 run —— 一個綁定單一 run 的 agent 無法替其他
+run 回答。這個帳號本身就是證據：唯一還站著的端點
+`jumpstart-dft-hf-asr-whisper-large-v2` 從 2024-04-11 起 InService，完全沒有 `project`
+標籤，所以永遠不會有哪個 run 對它負責；也因此它的 `ListTags` 權限必須是帳號層級的
+（`Resource: "*"`）。這條邊界是**讀取放到帳號層級、寫入只限 `llmops-*`** ——
+`ListEndpoints`/`ListTags`/`DescribeEndpoint`/`DescribeEndpointConfig` 都在 `"*"` 上，
+所有的變更操作仍然窄範圍：sweep 能把一個它動不了的孤兒端點**完整刻畫出來**。這條線之所以
+畫在「讀 vs 寫」而不是畫在 `Describe`，是第一次實測 sweep 逼出來的。它找到了那個端點，
+然後在自己的輸出裡記下一條權限缺口：`DescribeEndpoint` 當時被限縮到 `endpoint/llmops-*`，
+所以它唯一標記出來的那個端點背後的機型讀不到，於是它的頭條數字（約 $1106/月、自 2024-04-11
+起累計約 $30.6k）是**猜** JumpStart 預設機型猜出來的。**一個頭條數字是假設的成本發現，
+owner 可以理直氣壯地不理它** —— 而那個數字就是這條發現的全部價值。看起來最順手的修法
+（把 lifecycle 那條 statement 放寬）會把 `DeleteEndpoint` 在整個帳號範圍交給一個
+prompt 明文禁止它刪東西的 agent。
 
 再加上路由用的控制狀態：`QualityGateChoice`（門檻通過 → Deploy，否則進補救）、
 `RemediationChoice`（iteration < 3 → 補救，否則升級人類）、`IncrementIteration`（Pass），
@@ -100,6 +126,16 @@ Agent 不用自由文本「彙報」—— driver 只信任結構化的 inline-f
 | `job_launched` | 長作業已發起（SageMaker 訓練） | launch-and-release：把 Step Functions task token 按 job name 停放進 DynamoDB，釋放 session（§4） |
 | `checkpoint` | 回合預算將盡，進度已持久化 | 在同一 session 重新調用以繼續（Lambda 本身臨界時自我重調） |
 | `escalate_human` | 預算或權限耗盡 | SNS 通知、運行標記 `escalated`、發 `EscalatedToHuman` 事件、task token 置失敗 |
+
+在這個契約裡，**跑的是哪個 stage、哪個 task，是 driver 的事實，不是 agent 的**。outputs、
+metrics、evidence 都該由 agent 回報 —— 沒有別人知道。`stage` 和 `task` 剛好相反：driver 自己
+的 invocation event 就帶著這兩個值，agent 那份充其量是覆述。過去這裡記的是 agent 那一份，於是
+前兩次實測的 monitor sweep 都寫下 `"task": ""` —— 因為 agent 根本沒填這個欄位 —— 留下一列說
+「某個 monitor stage 完成了」，卻沒說是 health/sweep/report 裡的**哪一個**：正是 §2 那條 sweep
+接線要消除的歧義，只是在下一層又長回來。這也不只是好看的問題：console 是從這個欄位推導一次 run
+實際跑過哪些 `(stage, task)` 組合的，而空的 task 會match**任何**同 stage 的 task，於是一次
+sweep 的證據可能被借給一次從未發生的 health 檢查。現在是**派發值覆蓋** agent 的覆述，而不是
+只在空白時補上 —— 因為危險的不是漏填的 task，而是填錯又填得很有自信的那個。
 
 **指揮家契約**（`llmops_orchestrator`）：`launch_run`（經 start-pipeline 派發計劃好的
 run）、`resolve_escalation`（政策範圍內第一線處置：調參重跑階段、跳過、有記錄的重試）、
@@ -298,11 +334,16 @@ endpoints —— 無互聯網出口**。
 `llmops_finops` 是唯一在 run 的階段序列中沒有位置的 harness，而這是從它工作的**形狀**推導
 出來的，不是品味問題。
 
-`llmops_monitor` 跑在狀態機**裡面**：每個 run 一次、在該 run 的生命週期內，回答「endpoint
-現在還活著嗎」。對帳在三個軸上都是相反的形狀 —— 它在 run **結束之後**才跑（Cost Explorer
-延遲約 24 小時）、它**橫跨多個** run、而且它對專案負責而不是對任何單一 run 負責。一個昨天
-就結束的 run，沒有任何活著的 agent 能去歸屬今天才結算的帳單；把這件事放進 `monitor`，就等
-於讓一個「屬於某個 run」的 agent 去讀其他 run 的資料。
+`llmops_monitor` 的 `health` 和 `report` 任務跑在狀態機**裡面**：每個 run 一次、在該 run 的
+生命週期內，回答「endpoint 現在還活著嗎」。對帳在三個軸上都是相反的形狀 —— 它在 run
+**結束之後**才跑（Cost Explorer 延遲約 24 小時）、它**橫跨多個** run、而且它對專案負責而不是
+對任何單一 run 負責。一個昨天就結束的 run，沒有任何活著的 agent 能去歸屬今天才結算的帳單；
+把這件事放進 `monitor`，就等於讓一個「屬於某個 run」的 agent 去讀其他 run 的資料。
+
+同樣這三個軸，也把 monitor 自己的 `sweep` 任務放到了排程上而不是主幹裡 —— 這正是「這是形狀
+的論證、不是按 harness 劃分的論證」最清楚的證據：孤兒端點屬於一個已經結束的 run，而且往往是
+*崩潰*的那種，因此從未走到任何能檢查的狀態。同一個 harness 的兩個任務落在邊界的兩側，各自
+由「它的問題是關於什麼」決定位置。
 
 所以它坐在 `llmops_orchestrator` 旁邊、主幹之上：**指揮家決定要花什麼，審計員報告花了什麼。**
 

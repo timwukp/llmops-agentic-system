@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""07_lambdas.py — package and deploy the 5 spine Lambdas + the state machine.
+"""07_lambdas.py — package and deploy the 6 spine Lambdas + the state machine.
 
 Each Lambda bundle = its handler.py + the contracts (events.py, report.py,
 manifest.schema.json) vendored flat so the `except ImportError` fallback path
@@ -77,6 +77,23 @@ LAMBDAS = {
         "timeout": 60, "memory": 256,
         "env_keys": ["RUNS_TABLE", "DATA_BUCKET", "DRIVER_FN",
                      "ESTIMATES_TABLE", "ACTUALS_TABLE", "PROJECT"],
+    },
+    # The orphan hunter. Its trigger is created by 08_triggers.py, so the same rule the
+    # finops entry above records applies verbatim: omit this and the deploy leaves a live
+    # EventBridge schedule pointing at a function that does not exist.
+    #
+    # In the state machine for `health` and `report`, OUT of it for `sweep`: a sweep looks
+    # for endpoints left behind by OTHER runs, including runs that crashed and therefore
+    # never reached any state that could have looked. A run-scoped agent cannot answer for
+    # other runs -- the same shape argument that put the auditor outside the spine.
+    "monitor_sweep": {
+        "fn": "llmops-monitor-sweep",
+        "src": REPO / "orchestration" / "monitor_sweep" / "handler.py",
+        "role_param": "/llmops/iam/lambda_monitor_sweep_arn",
+        # 60 s: it builds one payload and hands off asynchronously. The sweep's own
+        # multi-minute CloudWatch work happens in the harness, not here.
+        "timeout": 60, "memory": 256,
+        "env_keys": ["EVENTS_TABLE", "DATA_BUCKET", "DRIVER_FN", "PROJECT"],
     },
 }
 

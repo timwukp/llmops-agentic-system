@@ -55,16 +55,47 @@ and intelligence lives *inside* each stage. An LLM deciding "what stage comes ne
 add nondeterminism, cost, and failure modes to the one part of the system that benefits
 from having none.
 
-The state machine (`orchestration/state_machine.asl.json`) has **8 harness-task states
+The state machine (`orchestration/state_machine.asl.json`) has **10 harness-task states
 on the happy path** — each a `waitForTaskToken` Lambda invocation of the harness driver
-— plus the loop-only `RemediateFinetune`:
+— plus the loop-only `RemediateFinetune` and the audit-only `DataAudit`:
 
 ```
 DataPrepGenerate → DataPrepCurate → FinetuneLaunch → FinetuneAnalyze → EvalGate
                                                         │ (gate fail)
                               RemediateFinetune ←───────┘   … then, on gate pass:
-                                                     Deploy → SmokeTest → Teardown
+             Deploy → SmokeTest → MonitorHealth → Teardown → MonitorReport
 ```
+
+The two monitor states are placed by the shape of their work, not by taste.
+**`MonitorHealth`** must read CloudWatch *while the endpoint exists*, and `Teardown`
+deletes it on every path including `SmokeTest`'s `Catch` — after the delete,
+`GetMetricData` returns an empty series indistinguishable from a healthy idle endpoint, so
+the window between those two states is the only one in which the question can be answered
+at all. It gates nothing: its `Catch` also goes to `Teardown`, because a metric read that
+fails must never strand the endpoint it was watching, and an orphaned endpoint bills
+whether or not we managed to measure it. **`MonitorReport`** runs after `Teardown` because
+it consolidates the *finished* manifest — a report composed earlier would omit the teardown
+it exists to confirm — and its `Catch` goes to `Complete`: the narrative is a deliverable,
+the run's terminal state is a fact.
+
+The third monitor task, **`sweep`**, is deliberately *outside* the state machine, on an
+08:00 UTC schedule (`llmops-monitor-sweep-daily` → `llmops-monitor-sweep`). It hunts
+endpoints left running by *other* runs, including runs that crashed and so never reached
+any state that could have looked — a run-scoped agent cannot answer for other runs. The
+account proves the point: its only standing endpoint,
+`jumpstart-dft-hf-asr-whisper-large-v2`, has been InService since 2024-04-11 with no
+`project` tag at all, so no run will ever be responsible for it and its `ListTags` grant
+must be account-wide (`Resource: "*"`). The boundary is **read account-wide, mutate
+`llmops-*` only** — `ListEndpoints`/`ListTags`/`DescribeEndpoint`/`DescribeEndpointConfig`
+on `"*"`, every mutation still scoped: the sweep can fully characterise an orphan it cannot
+touch. The first live sweep is why the line falls at read-vs-mutate rather than at
+`Describe`. It found that endpoint, then filed its own permission gap — `DescribeEndpoint`
+was scoped to `endpoint/llmops-*`, so the instance type behind the one endpoint it flagged
+was unreadable and its headline number (~$1106/month, ~$30.6k since 2024-04-11) went out as
+a guess at the JumpStart default. **A cost finding whose figure is an assumption is one the
+owner can correctly dismiss**, and the figure is the entire value of the finding. The
+tempting fix — widening the lifecycle statement — would have handed `DeleteEndpoint` over
+the whole account to an agent whose prompt forbids deleting anything.
 
 plus the control states that route between them: `QualityGateChoice` (gate pass → Deploy,
 else remediation), `RemediationChoice` (iteration < 3 → remediate, else escalate),
@@ -109,6 +140,19 @@ calls, which are the sole channel by which an agent affects the pipeline.
 | `job_launched` | long job launched (SageMaker training) | launch-and-release: park the Step Functions task token in DynamoDB keyed by job name; release the session (§4) |
 | `checkpoint` | turn budget nearing, progress persisted | re-invoke the same session to continue (self-reinvoke if the Lambda itself is near its limit) |
 | `escalate_human` | out of budget or out of authority | SNS notification, run marked `escalated`, `EscalatedToHuman` event, task token failed |
+
+Inside that contract, **which stage and task ran is the driver's fact, not the agent's.**
+Outputs, metrics and evidence are the agent's to report — nobody else knows them. `stage`
+and `task` are the opposite: the driver was handed both in its own invocation event, so the
+agent's copy is a restatement at best. It used to be recorded anyway, and the first two live
+monitor sweeps filed `"task": ""` because the agent simply omitted the field — leaving a row
+that said a monitor stage completed without saying *which* of health/sweep/report did, which
+is the ambiguity §2's sweep wiring exists to remove, reintroduced one layer down. Not
+cosmetic either: the console derives which `(stage, task)` pairs a run executed from this
+field, and an empty task matches **any** task of that stage, so a sweep could lend its
+evidence to a health check that never ran. The dispatch now overwrites the echo rather than
+filling it in when blank, because the dangerous case is not the omitted task but the
+confidently wrong one.
 
 **Conductor contract** (`llmops_orchestrator`): `launch_run` (dispatch a planned run via
 start-pipeline), `resolve_escalation` (first-line triage within policy: relaunch a stage
@@ -339,12 +383,18 @@ optimization:
 `llmops_finops` is the only harness with no place in a run's stage sequence, and that follows
 from the shape of its job rather than from taste.
 
-`llmops_monitor` runs *inside* the state machine: per-run, within a run's lifetime, answering
-"is the endpoint alive now". Reconciliation is the opposite shape on all three axes — it runs
-**after** the run is over (Cost Explorer lags ~24 h), it spans **many** runs, and it answers to
-the project rather than to any one run. A run that finished yesterday has no live agent to
-attribute today's settled bill, so putting this in `monitor` would mean a per-run agent reaching
-across other runs' data.
+`llmops_monitor`'s `health` and `report` tasks run *inside* the state machine: per-run, within a
+run's lifetime, answering "is the endpoint alive now". Reconciliation is the opposite shape on all
+three axes — it runs **after** the run is over (Cost Explorer lags ~24 h), it spans **many** runs,
+and it answers to the project rather than to any one run. A run that finished yesterday has no live
+agent to attribute today's settled bill, so putting this in `monitor` would mean a per-run agent
+reaching across other runs' data.
+
+The same three axes put monitor's own `sweep` task on a schedule rather than in the spine, which
+is the clearest proof this is a shape argument and not a per-harness one: an orphaned endpoint
+belongs to a run that has already ended — often one that *crashed*, and so never reached any state
+that could have looked. Two tasks of one harness, on opposite sides of the boundary, each placed by
+what its question is about.
 
 So it sits beside `llmops_orchestrator`, above the spine: **the conductor decides what to spend,
 the auditor reports what was spent.**

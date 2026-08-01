@@ -33,9 +33,9 @@ Next: v2 experiments — code-as-reasoning distillation + augmentation; Kimi K3 
 | SNS topic | llmops-escalations | deploy/03_storage.py | EscalatedToHuman notifications |
 | Harnesses ×7 | llmops_{data_prep,finetune,eval,deploy,monitor,orchestrator,finops} | deploy/05_harnesses.py | full ids in SSM `/llmops/harness/*`; shared Memory attached; obs + online evals wired; currently on Opus 5 (Fable 5 fallback policy, AGENTS.md) |
 | AgentCore Memory | llmops_shared_memory (SEMANTIC + EPISODIC) | deploy/04_wire_memory.py | shared across all 7 harnesses |
-| Lambdas ×5 | llmops-{harness-driver,start-pipeline,resume-pipeline,webhook,finops-reconcile} | deploy/07_lambdas.py | driver: turn-continuation + auto model failover |
-| Step Functions | llmops-pipeline (STANDARD) | deploy/07_lambdas.py | 9 states incl. remediation loop |
-| Triggers | scheduler `llmops-nightly` (DISABLED) · HTTP API `llmops-triggers` (/webhook, /runs) · secret `llmops/webhook` | deploy/08_triggers.py | endpoint in SSM `/llmops/triggers/api_endpoint` |
+| Lambdas ×6 | llmops-{harness-driver,start-pipeline,resume-pipeline,webhook,finops-reconcile,monitor-sweep} | deploy/07_lambdas.py | driver: turn-continuation + auto model failover; monitor-sweep: own least-privilege role |
+| Step Functions | llmops-pipeline (STANDARD) | deploy/07_lambdas.py | 24 states; 10 harness tasks on the happy path incl. MonitorHealth/MonitorReport, plus the remediation loop |
+| Triggers | scheduler `llmops-nightly` (DISABLED) · `llmops-finops-daily` (ENABLED, 09:00 UTC) · `llmops-monitor-sweep-daily` (ENABLED, 08:00 UTC) · HTTP API `llmops-triggers` (/webhook, /runs) · secret `llmops/webhook` | deploy/08_triggers.py | endpoint in SSM `/llmops/triggers/api_endpoint`; both daily schedules use FlexibleTimeWindow OFF (each derives its period/id from the current date) |
 | Admin console | `agent-cicd-admin` stack (Lambda+APIGW+DDB+Cognito) | ops-console deploy.sh | login secret `agent-admin/dashboard-login`; monitors orchestrator + finetune |
 | Online evals | one config per harness (Correctness/GoalSuccessRate/ToolSelectionAccuracy, 100% sampling) | deploy/06_observability.py --evals | role llmops-eval-execution |
 
@@ -49,10 +49,20 @@ revisions named `harness.prod.json` files that have never existed._
 Zero standing billable resources: no SageMaker endpoints, pipeline scheduler DISABLED,
 serverless spine idles free. Total v1 build cost ≈ $12–15.
 
-v1.1.0 adds **one recurring cost**: the daily 09:00 UTC finops reconcile at
-**~$1.5–4.5/month** (~$0.05–0.15 per invocation). This is the only schedule in the platform
-that is enabled by default, because an auditor that only runs when someone remembers to run it
-does not audit anything. All of its AWS reads are read-only billing APIs at $0.
+Two recurring costs, both agent-turn cost only — every AWS API either of them calls is $0:
+
+- the daily **09:00 UTC finops reconcile** at **~$1.5–4.5/month** (~$0.05–0.15 per invocation),
+  reading read-only billing APIs;
+- the daily **08:00 UTC monitor sweep** at **~$1–3/month**, reading `sagemaker:ListEndpoints`,
+  `ListTags` and CloudWatch metrics.
+
+These are the only two schedules enabled by default (`llmops-nightly` stays DISABLED because it
+spends GPU money), for the same reason in both cases: a control that only runs when someone
+remembers to run it is not a control. The sweep runs an hour ahead of the reconcile so what is
+still standing is reported before the auditor tallies what was spent. Each writes one row per
+invocation — `sweep#…` in `llmops-stage-events`, `#audit#` in `llmops-cost-actuals` — so a
+schedule that silently *stopped* is visible; a cost control nobody can tell has stopped is not a
+control either.
 
 Guardrails, in order of who acts first: the console's **$2000 dual gate** (single-run worst
 case, or project-to-date + this estimate), then the pre-existing account-level AWS Budget
