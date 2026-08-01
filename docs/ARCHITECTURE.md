@@ -135,6 +135,22 @@ that can still act — `launch_run` to relaunch the work carrying the adjusted p
 being fixed is a silent no-op, and withholding a verdict on a transient DynamoDB error
 would invent a second one in the same direction.
 
+**An escape hatch must be serviced on the path that uses it.** That rejection names two
+paths, and one of them was not wired. `page_human` was declared on the orchestrator
+harness from Phase 5 on and handled only by the console's chat worker — but a triage is
+never a chat: an `EscalatedToHuman` event routes to the *driver*, and there `page_human`
+fell through to the unknown-tool branch and answered `{"status": "unsupported"}`. No SNS,
+no event, no owner told. Measured live on 2026-08-01 at 13:45Z, with the fix above already
+deployed: the conductor was correctly told its verdict was undeliverable and to use
+`launch_run` or `page_human`, so it re-called `resolve_escalation`, was rejected again,
+wrote `plan.json` and `relaunch-plan.json` to S3, and the turn ended — **zero runs
+dispatched, zero pages sent.** The previous drift guard passed because it asked whether a
+declared tool was serviced *anywhere*; the console qualified, and only the driver runs a
+triage. The guard is now per-path and derives the tool list from the prompt's own triage
+clause, so a protocol that grows a third exit cannot leave it half-wired. A page is also
+now rejected unless it carries both `situation` and `recommendation`: paging an owner with
+the problem and none of the analysis leaves them exactly where they started.
+
 If a turn ends *without* an inline-function call (models sometimes narrate completion but
 skip the structured call), the driver re-asks up to 2 times in the same session, then
 fails the stage as `MissingStageComplete` — narration is never promoted to success.

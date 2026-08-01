@@ -121,6 +121,20 @@ token 是同一個形狀：**寫入被授權了，但到不了。** 現在 `put_
 **刻意**算作可投遞：要修的缺陷就是靜默無操作，若因為一次暫時性 DynamoDB 錯誤就扣住裁決，
 等於朝同一個方向又造出第二個。
 
+**逃生口必須在真正會用到它的那條路徑上被服務。** 上面那個駁回指出了兩條路，而其中一條
+根本沒接線。`page_human` 從 Phase 5 就宣告在 orchestrator harness 上，卻只有 console 的
+chat worker 處理它 —— 但 triage 從來不是 chat：`EscalatedToHuman` 事件路由到的是
+**driver**，而在 driver 上 `page_human` 落到了未知工具分支，回答
+`{"status": "unsupported"}`。沒有 SNS、沒有事件、沒有任何人被通知。2026-08-01 13:45Z
+實測，而且是在上面那個修復**已經部署之後**：指揮家被正確告知裁決無法投遞、應改用
+`launch_run` 或 `page_human`，於是它改為再次呼叫 `resolve_escalation`、再次被駁回、
+把 `plan.json` 與 `relaunch-plan.json` 寫到 S3，然後那一輪就結束了 ——
+**零次派發、零次呼叫人類。** 舊的漂移守護測試之所以通過，是因為它只問一個被宣告的工具
+有沒有在**任何地方**被服務；console 讓它成立，而只有 driver 會跑 triage。現在守護測試
+改為**逐路徑**，並且從 prompt 自己的 triage 條款推導工具清單，所以協議日後多長出第三個
+出口，也不可能只接一半。此外，一次 page 若沒有同時帶 `situation` 與 `recommendation`
+就會被駁回：把問題丟給 owner 而不附上你已經做完的分析，等於讓他們留在原地。
+
 若一輪結束時*沒有* inline-function 呼叫（模型有時會口頭宣稱完成卻漏掉結構化呼叫），
 driver 在同一 session 內最多追問 2 次，然後以 `MissingStageComplete` 判定階段失敗 ——
 口頭敘述永遠不會被晉升為成功。
