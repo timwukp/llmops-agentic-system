@@ -60,6 +60,38 @@ THROUGHPUT_PROVENANCE = ("throughput 0.664 rows/s and 670 s setup overhead measu
                          "the 2026-07-31 ml.g5.2xlarge run (16,550 rows / 24,924 s, "
                          "$10.77 billed)")
 
+#: Teacher OUTPUT tokens per sample for a reasoning model that keeps its <think> chains.
+#:
+#: Measured, and it had to be: the old defaults were 700 x reasoning_multiplier 4.0
+#: = 2,800, which understated DeepSeek-R1 by 4.7x. That is not an academic error --
+#: it is why run-20260731T183103Z-8b864805 promised 160 samples and stopped at 70.
+#: The plan's caps ($7.56 on the teacher line, 950k output tokens) were computed from
+#: 2,800/sample, so they were infeasible for the sample count the same plan promised,
+#: and the run hit them at 44% coverage having done nothing wrong.
+#:
+#: Three independent checkpoints of that run, all within 3% of each other:
+#:      24 attempts ->   323,226 out tokens = 13,468/attempt
+#:      36 attempts ->   471,496 out tokens = 13,097/attempt
+#:      70 attempts ->   922,088 out tokens = 13,173/attempt
+#: (DeepSeek-R1, maxTokens=32768, temp=0.6, keep_reasoning=true, HumanEval-style tasks)
+#:
+#: Split base x multiplier rather than one number, because keep_reasoning=False really
+#: does remove the <think> chains: 1,050 is the non-reasoning body, 12.5x is what the
+#: retained reasoning costs on top. 1050 * 12.5 = 13,125, inside the measured band.
+MEASURED_REASONING_OUTPUT_TOKENS = 13_125
+MEASURED_NONREASONING_OUTPUT_TOKENS = 1_050.0
+MEASURED_REASONING_MULTIPLIER = 12.5
+#: Input side, same run: 48,324 tokens / 24 attempts = 2,014. The old 1,500 was low by
+#: a third -- small in dollars next to the output side, but there is no reason to keep
+#: a guess when the measurement is in the same manifest.
+MEASURED_INPUT_TOKENS_PER_SAMPLE = 2_014.0
+#: Carried into the assumptions so an estimate says where its biggest number came from.
+TEACHER_TOKEN_PROVENANCE = (
+    "teacher output 13,125 tokens/sample (1,050 base x 12.5 reasoning) and input "
+    "2,014 tokens/sample measured on run-20260731T183103Z-8b864805 (DeepSeek-R1, "
+    "maxTokens=32768, keep_reasoning=true): 922,088 output tokens over 70 attempts, "
+    "stable to within 3% at 24/36/70 attempts")
+
 #: Categories the remediation loop can re-run. The state machine's
 #: RemediateFinetune → FinetuneAnalyze cycle repeats training and the finetune agent's
 #: turns, but NOT data generation (the dataset already exists) — so applying
@@ -265,10 +297,13 @@ def estimate_run(plan: dict, rates: RateCard | dict) -> dict:
     teacher = str(plan.get("teacher_model") or (plan.get("models") or {}).get("teacher")
                   or "us.deepseek.r1-v1:0")
     if sample_count:
-        in_tok = float(plan.get("teacher_input_tokens_per_sample", 1500))
-        base_out = float(plan.get("teacher_output_tokens_per_sample", 700))
+        in_tok = float(plan.get("teacher_input_tokens_per_sample",
+                                MEASURED_INPUT_TOKENS_PER_SAMPLE))
+        base_out = float(plan.get("teacher_output_tokens_per_sample",
+                                  MEASURED_NONREASONING_OUTPUT_TOKENS))
         keep_reasoning = bool(plan.get("keep_reasoning", True))
-        reasoning_mult = float(plan.get("reasoning_multiplier", 4.0))
+        reasoning_mult = float(plan.get("reasoning_multiplier",
+                                        MEASURED_REASONING_MULTIPLIER))
         out_tok = base_out * (reasoning_mult if keep_reasoning else 1.0)
         items.append(_line(
             "bedrock_teacher", sku_tokens(teacher, "input"),
@@ -286,6 +321,20 @@ def estimate_run(plan: dict, rates: RateCard | dict) -> dict:
             f"keep_reasoning={keep_reasoning} -> teacher output tokens "
             f"x{reasoning_mult:g}" if keep_reasoning else
             "keep_reasoning=False -> no <think> chains kept, teacher output un-multiplied")
+        # State the provenance whenever the estimate is actually resting on the measured
+        # numbers. If a plan overrides them, say THAT instead -- silently attributing a
+        # caller's override to our measurement is how a guess inherits credibility.
+        if (base_out == MEASURED_NONREASONING_OUTPUT_TOKENS
+                and reasoning_mult == MEASURED_REASONING_MULTIPLIER
+                and in_tok == MEASURED_INPUT_TOKENS_PER_SAMPLE):
+            assumptions.append(TEACHER_TOKEN_PROVENANCE)
+        else:
+            assumptions.append(
+                f"teacher tokens OVERRIDDEN by the plan ({in_tok:g} in / {base_out:g} out "
+                f"x{reasoning_mult:g}), not the measured "
+                f"{MEASURED_INPUT_TOKENS_PER_SAMPLE:g}/"
+                f"{MEASURED_NONREASONING_OUTPUT_TOKENS:g}"
+                f"x{MEASURED_REASONING_MULTIPLIER:g}")
 
     # 4. AgentCore runtime: the harnesses' own compute, one billed session per stage.
     stages = int(plan.get("n_stages", 9) or 0)

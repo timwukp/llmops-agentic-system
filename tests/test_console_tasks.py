@@ -15,6 +15,7 @@ import hashlib
 import importlib.util
 import json
 import pathlib
+import re
 import sys
 import types
 
@@ -1009,3 +1010,461 @@ def test_signature_field_is_excluded_from_the_signed_digest():
     signed = conductor_tools.sign_record(kmsf, rec)
     # verifying uses only SIGNED_KEYS, so the signature's presence must not change it
     assert conductor_tools.record_sha256(signed) == conductor_tools.record_sha256(rec)
+
+
+# ── the lifecycle flow must know every status something can write ─────────────
+
+def test_the_lifecycle_flow_renders_every_terminal_status_the_pipeline_writes():
+    """The state machine now closes tasks, and it writes statuses the UI never saw.
+
+    taskStageStates() maps a status onto the 7 lifecycle nodes via an `order`
+    lookup with `(s in order) ? order[s] : 0` -- so an UNKNOWN status silently
+    becomes position 0 and the task renders as *active at Requirements*. A run
+    that finished an hour ago would look like a consultation that had barely
+    started, which is worse than the zombie 'dispatched' the closers were added
+    to fix: that at least said something true.
+
+    The statuses are read out of the ASL closers rather than listed here, so
+    adding a third closer (or renaming a status) fails this instead of quietly
+    reintroducing the mis-render.
+    """
+    asl = json.loads((REPO / "orchestration/state_machine.asl.json").read_text())
+    written = set()
+    for st in asl["States"].values():
+        p = st.get("Parameters", {})
+        if p.get("TableName") != "llmops-tasks":
+            continue
+        for name, val in p.get("ExpressionAttributeValues", {}).items():
+            # only the values the UpdateExpression assigns to #s (status)
+            if f"#s = {name}" in p.get("UpdateExpression", ""):
+                written.add(val["S"])
+    assert written, "no llmops-tasks closer found -- did the state names change?"
+
+    front = (REPO / "deploy/console/frontend.html").read_text()
+    order = front[front.index("const order = {"):]
+    order = order[:order.index("};") + 1]
+    missing = sorted(s for s in written if f"{s}:" not in order)
+    assert not missing, (
+        f"the state machine writes task status {missing} but taskStageStates()'s "
+        "order map has no entry, so `(s in order) ? order[s] : 0` renders a "
+        "finished task as active at the first node")
+
+
+# ── the stage flow must not call a budget stop a failure ──────────────────────
+
+def _fake_sfn_history(events, exec_status, run_id="run-x", definition=None):
+    asl = definition if definition is not None else json.dumps(
+        json.loads((REPO / "orchestration/state_machine.asl.json").read_text()))
+
+    class _Sfn:
+        def describe_execution(self, executionArn):
+            return {"status": exec_status, "input": json.dumps({"run_id": run_id}),
+                    "startDate": "s", "stopDate": "e"}
+
+        def get_execution_history(self, **kw):
+            return {"events": events}
+
+        def describe_state_machine(self, stateMachineArn):
+            return {"definition": asl}
+    return _Sfn()
+
+
+#: The live history of run-20260731T183103Z-8b864805, event for event (verified against
+#: GetExecutionHistory: 16 events). The .waitForTaskToken task TIMED OUT after 7200s
+#: with States.Timeout, the Catch ran EscalateFail, and MarkRunFailed then died on
+#: States.Runtime because EscalateFail had no ResultPath at the time.
+#:
+#: What the agent was doing is NOT visible here and that is the whole lesson: the
+#: manifest's last entry is complete-at-cap and stage-events holds two stage_complete
+#: rows (19:23:49, 19:26:20). The driver crashed writing the canonical report -- it had
+#: no s3:PutObject until 19:30 -- BEFORE it settled the token. So the stage finished and
+#: the token parked. A timeout is a crash, not a question.
+_LIVE_TIMEOUT_HISTORY = [
+    {"stateEnteredEventDetails": {"name": "DataPrepGenerate"}},
+    {"taskTimedOutEventDetails": {"error": "States.Timeout"}},
+    {"stateExitedEventDetails": {"name": "DataPrepGenerate"}},
+    {"stateEnteredEventDetails": {"name": "EscalateFail"}},
+    {"stateExitedEventDetails": {"name": "EscalateFail"}},
+    {"stateEnteredEventDetails": {"name": "MarkRunFailed"}},
+]
+
+#: The same shape, but the driver reported the error handle_escalate sends when the
+#: agent called escalate_human. This -- not the state name -- is an escalation.
+_ESCALATED_HISTORY = [
+    {"stateEnteredEventDetails": {"name": "DataPrepGenerate"}},
+    {"taskFailedEventDetails": {"error": "EscalatedToHuman",
+                                "cause": "teacher token cap infeasible; options A-D"}},
+    {"stateExitedEventDetails": {"name": "DataPrepGenerate"}},
+    {"stateEnteredEventDetails": {"name": "EscalateFail"}},
+    {"stateExitedEventDetails": {"name": "EscalateFail"}},
+    {"stateEnteredEventDetails": {"name": "MarkRunFailed"}},
+]
+
+
+def test_a_stage_that_asked_a_human_is_not_painted_as_a_crash(console, monkeypatch):
+    """A stage that stopped to ASK something is waiting on us, not broken.
+
+    The signal is the driver's own error string (handle_escalate sends
+    error="EscalatedToHuman"), because that is the only place the two cases differ.
+    """
+    monkeypatch.setattr(console, "sfn", _fake_sfn_history(_ESCALATED_HISTORY, "FAILED"))
+    out = console.pipeline_detail("run-asked")
+    gen = next(s for s in out["stages"] if s["key"] == "data-prep-generate")
+    assert out["escalated"] is True
+    assert gen["status"] == "escalated", (
+        f"the stage that escalated for a human decision reads {gen['status']!r}; "
+        "'failed' sends the operator to debug a stage that did the right thing")
+
+
+def test_reaching_escalatefail_is_not_by_itself_an_escalation(console, monkeypatch):
+    """The trap that a first pass at this fell into, kept as a test.
+
+    EscalateFail is the Catch target of 9 of the 11 stages, so EVERY crash routes
+    through it. Deriving `escalated` from `name in TERMINAL_FAIL_STATES` therefore
+    painted crashes amber -- and the crash test written alongside it passed only
+    because its hand-written history omitted EscalateFail, which no real crashed run
+    does. This is the live run: it timed out, it never asked anything, it is red.
+    """
+    states = json.loads((REPO / "orchestration/state_machine.asl.json").read_text())["States"]
+    catchers = [n for n, st in states.items()
+                if any(c.get("Next") == "EscalateFail" for c in st.get("Catch", []))]
+    assert len(catchers) > 1, (
+        f"EscalateFail is the catch-all for {catchers}; a single-stage EscalateFail "
+        "would make the state name a valid escalation signal, and this test moot")
+
+    monkeypatch.setattr(console, "sfn", _fake_sfn_history(_LIVE_TIMEOUT_HISTORY, "FAILED"))
+    out = console.pipeline_detail("run-20260731T183103Z-8b864805")
+    gen = next(s for s in out["stages"] if s["key"] == "data-prep-generate")
+    assert out["escalated"] is False, (
+        "EscalateFail ran because the Catch fired, not because anyone was asked")
+    assert gen["status"] == "failed", (
+        "States.Timeout is a crash: the driver died writing the report before it "
+        "settled the token. Amber would tell the operator to wait for nothing")
+
+
+def test_a_genuine_crash_still_reads_failed(console, monkeypatch):
+    """The counterweight: softening the escalation case must not soften a real crash."""
+    crash = [{"stateEnteredEventDetails": {"name": "FinetuneLaunch"}},
+             {"taskFailedEventDetails": {"error": "DriverCrashed", "cause": "boom"}},
+             {"stateEnteredEventDetails": {"name": "EscalateFail"}}]
+    monkeypatch.setattr(console, "sfn", _fake_sfn_history(crash, "FAILED"))
+    out = console.pipeline_detail("run-crash")
+    ft = next(s for s in out["stages"] if s["key"] == "finetune-launch")
+    assert out["escalated"] is False
+    assert ft["status"] == "failed", "a crash with no escalation must still read failed"
+
+
+def test_one_stage_asking_does_not_repaint_another_stages_crash(console, monkeypatch):
+    """The status is per stage, so it must be decided from THAT stage's error.
+
+    A run-wide `escalated` flag repaints every stopped stage the same colour: one
+    stage politely asking a question would hide a different stage's crash behind
+    amber, which is the original bug with the sign flipped.
+    """
+    mixed = [{"stateEnteredEventDetails": {"name": "DataPrepGenerate"}},
+             {"taskFailedEventDetails": {"error": "EscalatedToHuman", "cause": "budget?"}},
+             {"stateExitedEventDetails": {"name": "DataPrepGenerate"}},
+             {"stateEnteredEventDetails": {"name": "FinetuneLaunch"}},
+             {"taskFailedEventDetails": {"error": "DriverCrashed", "cause": "AccessDenied"}}]
+    monkeypatch.setattr(console, "sfn", _fake_sfn_history(mixed, "FAILED"))
+    out = console.pipeline_detail("run-mixed")
+    by = {s["key"]: s for s in out["stages"]}
+    assert by["finetune-launch"]["status"] == "failed", (
+        "the crashed stage must stay red even though another stage escalated")
+
+
+# ── the hover card: visibility into what is behind each stage box ─────────────
+
+#: The live suffixes, as SSM and AgentCore actually report them (verified 2026-08-01
+#: against get-parameters-by-path and list-agent-runtimes).
+#:
+#: The shapes matter and are NOT symmetric -- copied here verbatim because a fixture
+#: that guesses them tests the guess, not the pipeline:
+#:     agentRuntimeName = "harness_llmops_data_prep"             (no suffix; not unique)
+#:     agentRuntimeId   = "harness_llmops_data_prep-D8SPwm7Kog"  (the real identity)
+#:     SSM value        = "llmops_data_prep-KuSKXUaxyP"          (what the driver invokes)
+#: The SSM and runtime suffixes differ in the real account, so they differ here too.
+_LIVE_SSM_SUFFIX = {"llmops_data_prep": "KuSKXUaxyP", "llmops_finetune": "xXl7jsACZO",
+                    "llmops_eval": "iuIIs96fFM", "llmops_deploy": "nLLNWairTc",
+                    "llmops_orchestrator": "GsIqHZ4viJ", "llmops_monitor": "YCXC5hcXzu",
+                    "llmops_finops": "eDJtU9PvKh"}
+_LIVE_RT_SUFFIX = {"llmops_data_prep": "D8SPwm7Kog", "llmops_finetune": "toAA4REpAu",
+                   "llmops_eval": "rjwDnkFGr2", "llmops_deploy": "6xUSao73Lp",
+                   "llmops_orchestrator": "2sx6hzCapx", "llmops_monitor": "XsSfiw3c52",
+                   "llmops_finops": "7X1rk8DHKz"}
+
+
+def _stub_identity(console, monkeypatch, *, ssm_ok=True, rt_ok=True, fleet_ok=True,
+                   rt_present=True):
+    """Stub the three AWS reads harness_identity() makes, shaped like the live ones."""
+    # Both caches, or a later denial path is served the earlier healthy answer and the
+    # denial tests pass without exercising a denial. This is not test bookkeeping: the
+    # same leak in a warm Lambda serves a 40-minute-old status as if it were live.
+    console._HARNESS_ID_CACHE.clear()
+    console._FLEET_WIDE_CACHE.clear()
+
+    class _Ssm:
+        def get_parameter(self, Name):
+            if not ssm_ok:
+                raise RuntimeError("AccessDenied: ssm:GetParameter")
+            agent = Name.rsplit("/", 1)[-1]
+            logical = "llmops_" + agent.replace("-", "_")
+            return {"Parameter": {"Value": f"{logical}-{_LIVE_SSM_SUFFIX[logical]}"}}
+
+    class _Ctl:
+        def list_agent_runtimes(self, **kw):
+            if not rt_ok:
+                raise RuntimeError("AccessDenied: ListAgentRuntimes")
+            if not rt_present:
+                return {"agentRuntimes": [{"agentRuntimeName": "someone_elses_agent",
+                                           "agentRuntimeId": "someone_elses_agent-zzz",
+                                           "status": "READY"}]}
+            return {"agentRuntimes": [
+                {"agentRuntimeName": f"harness_{lg}",
+                 "agentRuntimeId": f"harness_{lg}-{sfx}",
+                 "agentRuntimeVersion": "8", "status": "READY"}
+                for lg, sfx in _LIVE_RT_SUFFIX.items()]}
+
+    monkeypatch.setattr(console, "ssm", _Ssm())
+    monkeypatch.setattr(console, "ctl", _Ctl())
+
+    def _fleet():
+        if not fleet_ok:
+            raise RuntimeError("AccessDenied: ListHarnesses")
+        return [{"name": lg, "id": f"{lg}-{_LIVE_SSM_SUFFIX[lg]}", "status": "READY",
+                 "version": "7", "model": "global.anthropic.claude-sonnet-5"}
+                for lg in _LIVE_SSM_SUFFIX]
+    monkeypatch.setattr(console, "list_fleet", _fleet)
+
+
+def test_the_stage_hover_config_comes_from_the_deployed_definition(console, monkeypatch):
+    """The card answers "which AgentCore runtime is behind this box, with what timeout".
+
+    It is read from DescribeStateMachine, not hardcoded in the console: a second copy
+    would answer for whatever the console was packaged with, and a stale answer here is
+    undetectable by the operator asking the question.
+    """
+    console._STAGE_CFG_CACHE.clear()
+    _stub_identity(console, monkeypatch)
+    monkeypatch.setattr(console, "sfn", _fake_sfn_history(_ESCALATED_HISTORY, "FAILED"))
+    out = console.pipeline_detail("run-asked")
+    by = {s["key"]: s for s in out["stages"]}
+
+    asl = json.loads((REPO / "orchestration/state_machine.asl.json").read_text())["States"]
+    for state, key in console.STATE_TO_STAGE.items():
+        pay = (asl[state].get("Parameters") or {}).get("Payload") or {}
+        if not pay.get("harness_id"):
+            continue
+        hid = pay["harness_id"]
+        cfg = by[key]["config"]
+        assert cfg["harnessId"] == hid, f"{key}: wrong harness id"
+        assert state in cfg["states"], f"{key}: {state} missing from states"
+        if asl[state].get("TimeoutSeconds"):
+            assert cfg["timeoutSeconds"] == asl[state]["TimeoutSeconds"]
+
+        # The identity must be RESOLVED, not assembled. Note what is NOT asserted here:
+        # `cfg["runtime"] == "harness_" + hid` is true either way, because that string
+        # really is the runtime's display name -- which is exactly why the old test
+        # passed while the console verified nothing. The suffixed id and the SSM harness
+        # id are unforgeable by concatenation, so they are what this pins.
+        assert cfg["harnessFullId"] == f"{hid}-{_LIVE_SSM_SUFFIX[hid]}"
+        assert cfg["runtimeId"] == f"harness_{hid}-{_LIVE_RT_SUFFIX[hid]}"
+        assert cfg["runtimeStatus"] == "READY", "runtime health is not reported"
+        assert cfg["harnessStatus"] == "READY" and cfg["model"], "harness health missing"
+
+
+def test_the_hover_card_says_unresolved_rather_than_inventing_a_runtime(console, monkeypatch):
+    """No live runtime matches -> say so. The failure mode this replaces is worse than
+    a blank: a synthesized name looks authoritative, so an operator chasing an outage
+    searches the console for an ARN that does not exist and concludes their own eyes
+    are wrong. Everything else on the card must still render."""
+    console._STAGE_CFG_CACHE.clear()
+    _stub_identity(console, monkeypatch, rt_present=False)
+    monkeypatch.setattr(console, "sfn", _fake_sfn_history([], "SUCCEEDED"))
+    cfg = console.stage_config()["data-prep-generate"]
+    assert cfg["runtime"] == "unresolved", cfg.get("runtime")
+    assert "runtimeId" not in cfg, "no id may be reported for a runtime we did not find"
+    # still useful: the facts that DID resolve are all present
+    assert cfg["harnessFullId"].startswith("llmops_data_prep-")
+    assert cfg["timeoutSeconds"] == 7200 and cfg["harnessStatus"] == "READY"
+
+
+def test_a_cached_harness_status_expires_instead_of_being_served_forever(console, monkeypatch):
+    """Health is a claim about NOW, so it must not be cached without a clock.
+
+    The first cut of harness_identity() cached its result keyed only by harness id, with
+    no expiry. Lambda containers live for tens of minutes, so a hover card would keep
+    rendering "READY" for a harness that had since gone UPDATING or failed -- a stale
+    read presented as a live one, which is the same lie as the concatenated runtime name
+    this function was written to remove. Two things are pinned: that a status CHANGE
+    becomes visible after the TTL, and that the TTL is short enough (<= one 30s poll of
+    the flow diagram, i.e. <= 60s) to be worth calling live.
+    """
+    assert console._HARNESS_ID_TTL_S <= 60.0, "a status this stale is not a status"
+
+    clock = {"t": 1_000.0}
+    monkeypatch.setattr(console.time, "time", lambda: clock["t"])
+    _stub_identity(console, monkeypatch)
+    first = console.harness_identity("llmops_data_prep")
+    assert first["harnessStatus"] == "READY"
+
+    # The fleet now reports the harness as UPDATING. Same container, same cache.
+    monkeypatch.setattr(console, "list_fleet",
+                        lambda: [{"name": "llmops_data_prep", "id": "llmops_data_prep-x",
+                                  "status": "UPDATING", "model": "m", "version": "9"}])
+    clock["t"] += console._HARNESS_ID_TTL_S / 2.0
+    assert console.harness_identity("llmops_data_prep")["harnessStatus"] == "READY", \
+        "within the TTL the cache is expected to serve -- that is what it is for"
+    clock["t"] += console._HARNESS_ID_TTL_S
+    assert console.harness_identity("llmops_data_prep")["harnessStatus"] == "UPDATING", \
+        "past the TTL the card is still reporting a status the fleet no longer has"
+
+
+def test_the_card_does_not_list_the_whole_account_once_per_stage_box(console, monkeypatch):
+    """ListAgentRuntimes and list_fleet answer for the ACCOUNT, so asking per box asks
+    the same question four times and bills for four.
+
+    list_fleet is the costly one -- ListHarnesses plus a GetHarness each, ~8 calls -- and
+    the 9 boxes carry 4 distinct harness ids, so the naive version made ~40 calls where
+    10 do. On the diagram's 30s poll that is a self-inflicted throttling risk on the
+    operator's only live view of the pipeline.
+    """
+    calls = {"fleet": 0, "runtimes": 0}
+    _stub_identity(console, monkeypatch)
+    real_fleet, real_ctl = console.list_fleet, console.ctl
+
+    monkeypatch.setattr(console, "list_fleet",
+                        lambda: (calls.__setitem__("fleet", calls["fleet"] + 1),
+                                 real_fleet())[1])
+
+    class _Ctl:
+        def list_agent_runtimes(self, **kw):
+            calls["runtimes"] += 1
+            return real_ctl.list_agent_runtimes(**kw)
+    monkeypatch.setattr(console, "ctl", _Ctl())
+
+    console._STAGE_CFG_CACHE.clear()
+    monkeypatch.setattr(console, "sfn", _fake_sfn_history([], "SUCCEEDED"))
+    cfgs = console.stage_config()
+    distinct = {c["harnessId"] for c in cfgs.values()
+                if isinstance(c, dict) and c.get("harnessId")}
+    assert len(distinct) > 1, "fixture must span several harness ids or this proves nothing"
+    assert calls["fleet"] == 1, f"list_fleet called {calls['fleet']}x for one render"
+    assert calls["runtimes"] == 1, f"ListAgentRuntimes called {calls['runtimes']}x"
+
+
+def test_the_remediation_stage_reports_both_states_it_can_run_as(console, monkeypatch):
+    """RemediateFinetune and FinetuneLaunch map to ONE box. Whichever the dict happens
+    to visit second must not overwrite the first, or the card names the wrong state for
+    half the runs -- silently, since both are plausible."""
+    console._STAGE_CFG_CACHE.clear()
+    monkeypatch.setattr(console, "sfn", _fake_sfn_history([], "SUCCEEDED"))
+    cfg = console.stage_config()["finetune-launch"]
+    assert set(cfg["states"]) == {"FinetuneLaunch", "RemediateFinetune"}, cfg["states"]
+
+
+def test_a_hover_card_never_breaks_the_flow_diagram(console, monkeypatch):
+    """If DescribeStateMachine is denied or the definition is unparseable, the stage
+    flow itself must still render. A tooltip is an enhancement; taking the operator's
+    only live view of the pipeline down to serve one would be a bad trade."""
+    console._STAGE_CFG_CACHE.clear()
+
+    class _Broken:
+        def describe_execution(self, executionArn):
+            return {"status": "SUCCEEDED", "input": "{}", "startDate": "s", "stopDate": "e"}
+
+        def get_execution_history(self, **kw):
+            return {"events": []}
+
+        def describe_state_machine(self, stateMachineArn):
+            raise RuntimeError("AccessDenied: states:DescribeStateMachine")
+    monkeypatch.setattr(console, "sfn", _Broken())
+    out = console.pipeline_detail("run-x")
+    assert len(out["stages"]) == len(console.STAGE_FLOW), "the flow must still render"
+    assert "_error" in console.stage_config(), "and it must SAY the config is missing"
+
+    # Same contract for the identity lookups, which are three MORE ways to fail: SSM,
+    # ListAgentRuntimes and the fleet listing. Each is denied independently here
+    # because a role can hold one grant and not the others, and any single denial
+    # taking down the flow diagram would be the same bad trade as above.
+    for kw, note in (({"ssm_ok": False}, "harnessIdError"),
+                     ({"rt_ok": False}, "runtimeError"),
+                     ({"fleet_ok": False}, "fleetError")):
+        console._STAGE_CFG_CACHE.clear()
+        _stub_identity(console, monkeypatch, **kw)
+        monkeypatch.setattr(console, "sfn", _fake_sfn_history([], "SUCCEEDED"))
+        out = console.pipeline_detail("run-x")
+        assert len(out["stages"]) == len(console.STAGE_FLOW), f"{kw}: flow broke"
+        cfg = console.stage_config()["data-prep-generate"]
+        assert note in cfg, f"{kw}: the card must say why, not omit silently"
+        # a denial on one lookup must not blank the others
+        assert cfg["timeoutSeconds"] == 7200, f"{kw}: lost the ASL config too"
+
+
+def test_every_field_the_hover_card_renders_is_supplied_by_the_api(console, monkeypatch):
+    """stageTipRows() reads st.<field> and st.config.<field>. A field the API never
+    sends renders as a silently-absent row, so the card quietly loses the very fact
+    the operator hovered to find."""
+    console._STAGE_CFG_CACHE.clear()
+    _stub_identity(console, monkeypatch)
+    monkeypatch.setattr(console, "sfn", _fake_sfn_history(_ESCALATED_HISTORY, "FAILED"))
+    out = console.pipeline_detail("run-asked")
+    gen = next(s for s in out["stages"] if s["key"] == "data-prep-generate")
+
+    front = (REPO / "deploy/console/frontend.html").read_text()
+    body = front[front.index("function stageTipRows"):front.index("function showStageTip")]
+    stage_fields = set(re.findall(r"\bst\.([A-Za-z_]\w*)", body)) - {"config"}
+    cfg_fields = set(re.findall(r"\bc\.([A-Za-z_]\w*)", body)) - {"_error"}
+    assert stage_fields, "regex found no st.<field> reads -- did the function move?"
+    missing = sorted(f for f in stage_fields if f not in gen)
+    assert not missing, f"the card renders st.{missing} but pipeline_detail never sends it"
+
+    # Union across stages, not one stage: heartbeatSeconds exists only on the two
+    # long-running SageMaker states, so requiring every field on data-prep would force
+    # a fake key onto stages that genuinely do not have one.
+    every_cfg = set()
+    for s in out["stages"]:
+        every_cfg |= set(s["config"])
+    # ...and across the DENIAL paths too, because the *Error notes only exist when a
+    # lookup fails. Unioning real code paths rather than exempting those names keeps the
+    # guard honest: a misspelled c.runtimeErorr in the card still fails here, which an
+    # exemption list would have waved through.
+    for kw in ({"ssm_ok": False}, {"rt_ok": False}, {"fleet_ok": False}):
+        console._STAGE_CFG_CACHE.clear()
+        _stub_identity(console, monkeypatch, **kw)
+        for s in console.pipeline_detail("run-asked")["stages"]:
+            every_cfg |= set(s["config"])
+    missing = sorted(f for f in cfg_fields if f not in every_cfg)
+    assert not missing, f"the card renders config.{missing} but stage_config never sets it"
+
+
+def test_the_frontend_has_a_colour_for_every_status_the_api_can_return():
+    """stageColor() ends in `return "#5a6491"; // pending`, so an unknown status is
+    painted as PENDING -- the exact opposite of what an escalation means. Adding
+    'escalated' server-side without adding it here would have turned a red-but-wrong
+    node into a grey-and-invisible one, which is worse: nobody chases grey.
+    """
+    src = (REPO / "deploy/console/lambda_function.py").read_text()
+    # Scope to pipeline_detail AND its nested _stop_status: the console assigns plenty
+    # of `status = "..."` for TASK records too, and those are the Tasks tab's business.
+    # Sliced to the next TOP-LEVEL def so the nested helper stays inside.
+    fn = src[src.index("def pipeline_detail("):]
+    fn = fn[:fn.index("\ndef ", 1)]
+    # Any bare string literal the function can hand back as a stage status. Written
+    # against literals rather than one expression's syntax: the previous version
+    # matched the exact `"x" if escalated else "y"` ternary and broke the moment that
+    # per-run flag was replaced by a per-stage helper -- a guard that fails on a
+    # refactor of the thing it guards teaches people to delete guards.
+    produced = set(re.findall(r'status = "([a-z-]+)"', fn))
+    produced |= set(re.findall(r'return "([a-z-]+)" if ', fn))
+    produced |= set(re.findall(r'else "([a-z-]+)"', fn))
+    assert {"failed", "escalated", "succeeded", "running"} <= produced, (
+        f"only found statuses {sorted(produced)} -- the extraction missed some, so this "
+        "test would pass with an uncoloured status live")
+    front = (REPO / "deploy/console/frontend.html").read_text()
+    body = front[front.index("function stageColor("):]
+    body = body[:body.index("\n}")]
+    missing = sorted(s for s in produced if f'"{s}"' not in body)
+    assert not missing, (
+        f"pipeline_detail can return stage status {missing}, and stageColor() has no "
+        "branch for it, so it falls through to the pending colour")

@@ -310,12 +310,34 @@ def handle_stage_complete(c, event, args) -> dict:
                       client=c["events"])
 
     # Canonical report — the driver writes it; never rely on the agent's upload.
-    manifest = _load_manifest(c["s3"], event["manifest_uri"])
-    if manifest:
-        manifest.setdefault("stages", {})[stage] = {
-            "status": "completed", "outputs": norm["outputs"],
-            "metrics": norm.get("metrics", {}), "evidence": norm.get("evidence", "")}
-        write_run_report(c["s3"], os.environ["DATA_BUCKET"], manifest)
+    #
+    # ISOLATED from the token settle below, because it used to sit directly in front of
+    # it and that cost a run. Live, data-prep finished teacher generation at its cap,
+    # called stage_complete (twice, at 19:23:49 and 19:26:20), and this write died on
+    # AccessDenied -- the driver had no s3:PutObject until 19:30. The exception left
+    # send_task_success unreached, so the token parked for the full 7200s TimeoutSeconds
+    # and the console showed "Data Prep · Generate failed" for work that was DONE and
+    # verified on S3.
+    #
+    # The report is a dashboard convenience; the token is the pipeline's only way to
+    # learn that a paid-for stage succeeded. Nothing about the former may be allowed to
+    # withhold the latter -- so it degrades to a reported warning instead of a 2-hour
+    # silence. The IAM gap is fixed too, but the ordering hazard is the general bug: any
+    # future failure in this write (throttling, a bucket policy, a KMS denial) would
+    # have bought the same outcome.
+    report_error = None
+    try:
+        manifest = _load_manifest(c["s3"], event["manifest_uri"])
+        if manifest:
+            manifest.setdefault("stages", {})[stage] = {
+                "status": "completed", "outputs": norm["outputs"],
+                "metrics": norm.get("metrics", {}), "evidence": norm.get("evidence", "")}
+            write_run_report(c["s3"], os.environ["DATA_BUCKET"], manifest)
+    except Exception as exc:  # noqa: BLE001 — never withhold the token for a report
+        report_error = f"{type(exc).__name__}: {exc}"
+        print(f"[driver] canonical report FAILED for {run_id}/{stage}: {report_error}")
+        _record_stage_event(c["ddb"], run_id, stage, "report_write_failed",
+                            {"error": report_error})
 
     if event.get("task_token"):
         metrics = norm.get("metrics", {})
@@ -327,9 +349,12 @@ def handle_stage_complete(c, event, args) -> dict:
             payload["gate_passed"] = metrics.get("gate_passed") is True
         else:
             payload["gate_passed"] = bool(metrics.get("gate_passed", True))
+        if report_error:
+            payload["report_write_failed"] = report_error
         c["sfn"].send_task_success(taskToken=event["task_token"],
                                    output=json.dumps(payload, default=str))
-    return {"ok": True, "normalized": norm}
+    return {"ok": True, "normalized": norm,
+            **({"report_error": report_error} if report_error else {})}
 
 
 def handle_job_launched(c, event, args) -> dict:
