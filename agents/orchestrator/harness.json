@@ -200,6 +200,13 @@
         "url": "https://github.com/timwukp/MLOps-agent-skills",
         "path": "skills/llmops/llm-cost-optimization"
       }
+    },
+    {
+      "_comment": "DATA DISCOVERY is step 0 of this agent's own consult protocol -- it opens every consultation by asking about the customer's dataset, its provenance, its PII disposition, and how a held-out set will be kept honest. Until now the skill that knows how to ask those questions was mounted only on the data-prep worker, which does not run until AFTER a plan has been priced and signed. So the agent doing the asking had no guidance and the agent with the guidance had nothing left to ask. Mounted here too, not moved: data-prep still needs it to do the work.",
+      "git": {
+        "url": "https://github.com/timwukp/MLOps-agent-skills",
+        "path": "skills/llmops/llm-data-preparation"
+      }
     }
   ],
   "_memory_note": "Shared BYO memory llmops_shared_memory attached post-create by deploy/04_wire_memory.py (actorId = harness name). The conductor READS the specialists' learnings and WRITES planning/triage judgments.",

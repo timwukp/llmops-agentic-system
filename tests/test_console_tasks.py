@@ -1920,3 +1920,367 @@ def test_the_deploy_reports_cors_on_its_own_line(storage):
     src = (REPO / "deploy/03_storage.py").read_text()
     main = src[src.index("def main("):]
     assert '"cors": ensure_cors(' in main
+
+
+# ── the session: login, reload-survival, sign-out ──────────────────────────────
+# Before this block the whole auth path had zero test coverage, which is how the
+# refresh-logout bug shipped: the access token lived in one JS variable and a reload
+# wiped it, so "signed in" lasted exactly as long as the page did. The fix is an
+# httpOnly refresh cookie, and each of its properties (httpOnly, Secure, SameSite,
+# narrow Path, cleared-on-failure, revoked-on-sign-out) is a separate assertion below —
+# a cookie that survives a reload but is readable by script would be the bug traded for
+# a worse one.
+
+class _CognitoAuth:
+    """Enough of cognito-idp to exercise both auth flows and revocation.
+
+    Refresh tokens are tracked as a live set, so revocation is observable: a revoked
+    token must make REFRESH_TOKEN_AUTH fail, which is the only thing that makes
+    sign-out more than a cosmetic cookie delete.
+    """
+
+    class exceptions:
+        class NotAuthorizedException(Exception):
+            pass
+
+    def __init__(self, password="pw-correct"):
+        self.password = password
+        self.live_refresh = set()
+        self.revoked = []
+        self.auth_calls = []
+        self.n = 0
+
+    def initiate_auth(self, ClientId, AuthFlow, AuthParameters):
+        self.auth_calls.append((AuthFlow, dict(AuthParameters)))
+        self.n += 1
+        if AuthFlow == "USER_PASSWORD_AUTH":
+            if AuthParameters.get("PASSWORD") != self.password:
+                raise self.exceptions.NotAuthorizedException("bad password")
+            rt = f"refresh-{self.n}"
+            self.live_refresh.add(rt)
+            return {"AuthenticationResult": {"AccessToken": f"access-{self.n}",
+                                             "ExpiresIn": 28800, "RefreshToken": rt}}
+        if AuthFlow == "REFRESH_TOKEN_AUTH":
+            rt = AuthParameters.get("REFRESH_TOKEN", "")
+            if rt not in self.live_refresh:
+                raise self.exceptions.NotAuthorizedException("Refresh Token has been revoked")
+            # Cognito returns NO new refresh token here (rotation off) — modelled, so a
+            # test cannot accidentally depend on one appearing.
+            return {"AuthenticationResult": {"AccessToken": f"access-{self.n}",
+                                             "ExpiresIn": 28800}}
+        raise AssertionError(f"unexpected auth flow {AuthFlow}")
+
+    def revoke_token(self, Token, ClientId):
+        self.revoked.append(Token)
+        self.live_refresh.discard(Token)
+        return {}
+
+
+@pytest.fixture
+def auth(console, monkeypatch):
+    """The console with a working Cognito and the session routes reachable."""
+    cog = _CognitoAuth()
+    monkeypatch.setattr(console, "cognito", cog)
+    monkeypatch.setattr(console, "COGNITO_CLIENT_ID", "client-test")
+    monkeypatch.setattr(console, "COGNITO_POOL_ID", "us-east-1_test")
+    monkeypatch.setattr(console, "data_bucket", lambda: "test-bucket")
+    return types.SimpleNamespace(console=console, cog=cog)
+
+
+def _post(console, path, body=None, cookies=None):
+    """Drive handler() the way API Gateway does, payload format 2.0.
+
+    Deliberately through handler() rather than the helpers: format 2.0 carries cookies in
+    event["cookies"] (a list) and Set-Cookie in the response's "cookies" key, NOT in
+    headers. A test that called cognito_refresh() directly would pass while the live
+    route read a cookie that is never there.
+    """
+    ev = {"requestContext": {"http": {"method": "POST", "path": path,
+                                      "sourceIp": "10.0.0.9"}},
+          "headers": {}, "body": json.dumps(body or {})}
+    if cookies is not None:
+        ev["cookies"] = list(cookies)
+    return console.handler(ev, None)
+
+
+def _set_cookies(resp):
+    return list(resp.get("cookies") or [])
+
+
+def _cookie_named(resp, name):
+    for c in _set_cookies(resp):
+        if c.split("=", 1)[0] == name:
+            return c
+    return ""
+
+
+def test_login_returns_a_token_and_sets_the_refresh_cookie(auth):
+    r = _post(auth.console, "/api/login", {"username": "admin", "password": "pw-correct"})
+    assert r["statusCode"] == 200
+    body = json.loads(r["body"])
+    assert body["accessToken"] == "access-1" and body["expiresIn"] == 28800
+    c = _cookie_named(r, auth.console.REFRESH_COOKIE)
+    assert c, f"login must set {auth.console.REFRESH_COOKIE}; got {_set_cookies(r)}"
+    assert "refresh-1" in c
+
+
+def test_the_refresh_token_never_reaches_the_response_body(auth):
+    """The entire point of the cookie. A refresh token in the JSON body is readable by
+    any script on the page, which would make the httpOnly flag decorative: an XSS bug
+    would harvest 30 days of re-issue instead of one 8-hour access token."""
+    r = _post(auth.console, "/api/login", {"username": "admin", "password": "pw-correct"})
+    raw = r["body"]
+    assert "refresh-1" not in raw, "the refresh token must not be in the response body"
+    assert "refreshToken" not in json.loads(raw)
+
+
+def test_the_refresh_cookie_is_unreachable_from_script_and_from_other_sites(auth):
+    """Three flags, three distinct attacks, so three assertions rather than one regex.
+
+    HttpOnly: script cannot read it (the XSS blast radius).
+    Secure: it never rides a plaintext hop.
+    SameSite=Strict: no other origin can make the browser attach it — the CSRF answer
+    for a route whose entire input is a cookie.
+    """
+    r = _post(auth.console, "/api/login", {"username": "admin", "password": "pw-correct"})
+    c = _cookie_named(r, auth.console.REFRESH_COOKIE)
+    assert "HttpOnly" in c
+    assert "Secure" in c
+    assert "SameSite=Strict" in c
+
+
+def test_the_refresh_cookie_is_scoped_to_the_route_that_consumes_it(auth):
+    """Path=/api/refresh means the browser never attaches the 30-day credential to
+    /api/tasks, /api/cost-approval or the dashboard HTML. A Path=/ cookie would ride
+    along on every request for no benefit, widening where it can leak."""
+    r = _post(auth.console, "/api/login", {"username": "admin", "password": "pw-correct"})
+    c = _cookie_named(r, auth.console.REFRESH_COOKIE)
+    assert f"Path={auth.console.REFRESH_COOKIE_PATH}" in c
+    assert auth.console.REFRESH_COOKIE_PATH == "/api/refresh"
+    # ...and the revoke route must path-match it, or sign-out arrives with no cookie to
+    # revoke and silently degrades to a client-side forget.
+    assert "/api/refresh/revoke".startswith(auth.console.REFRESH_COOKIE_PATH)
+
+
+def test_a_failed_login_sets_no_cookie(auth):
+    """A cookie holding "" would be a session by another name: /api/refresh would find
+    the cookie present, call Cognito with an empty token, and answer 401 — turning a
+    typo'd password into a doomed round-trip on every later page load."""
+    r = _post(auth.console, "/api/login", {"username": "admin", "password": "wrong"})
+    assert json.loads(r["body"])["error"] == "invalid username or password"
+    assert _set_cookies(r) == []
+
+
+def test_a_reload_restores_the_session_without_a_password(auth):
+    """The bug, stated as a test: sign in, throw the page away, and come back with only
+    the cookie. Before the fix there was nothing to come back with."""
+    login = _post(auth.console, "/api/login", {"username": "admin", "password": "pw-correct"})
+    cookie = _cookie_named(login, auth.console.REFRESH_COOKIE).split(";")[0]
+    r = _post(auth.console, "/api/refresh", cookies=[cookie])
+    assert r["statusCode"] == 200
+    assert json.loads(r["body"])["accessToken"].startswith("access-")
+    assert ("REFRESH_TOKEN_AUTH", {"REFRESH_TOKEN": "refresh-1"}) in auth.cog.auth_calls
+
+
+def test_refresh_reads_the_cookie_from_where_api_gateway_puts_it(auth):
+    """Payload format 2.0 delivers cookies in event["cookies"], never in headers.
+    Reading headers["cookie"] would pass any hand-written test and find nothing live —
+    and the symptom would be "the fix didn't work", with no error anywhere.
+
+    Both halves use a token that is genuinely VALID, which is what makes this test able
+    to fail. The first draft sent a bogus token and asserted 401 on both channels — but a
+    header-reading implementation also answers 401 for a bogus token (it just finds
+    nothing), so the test passed with the guard removed. Only a live token distinguishes
+    "read it and Cognito said no" from "never read it at all".
+    (Verified by patching the reader over to headers, 2026-08-01.)
+    """
+    login = _post(auth.console, "/api/login", {"username": "admin", "password": "pw-correct"})
+    cookie = _cookie_named(login, auth.console.REFRESH_COOKIE).split(";")[0]
+    assert "refresh-1" in cookie
+    # the right channel: a valid token restores the session
+    assert _post(auth.console, "/api/refresh", cookies=[cookie])["statusCode"] == 200
+    # the wrong channel: the SAME valid token in a header must not be honoured
+    ev = {"requestContext": {"http": {"method": "POST", "path": "/api/refresh"}},
+          "headers": {"cookie": cookie}, "body": "{}"}
+    r = auth.console.handler(ev, None)
+    assert r["statusCode"] == 401 and json.loads(r["body"])["error"] == "no session"
+
+
+def test_refresh_without_a_cookie_is_401_and_never_calls_cognito(auth):
+    """A first-time visitor must not cost a Cognito round-trip on page load — the page
+    calls this route unconditionally."""
+    r = _post(auth.console, "/api/refresh")
+    assert r["statusCode"] == 401
+    assert json.loads(r["body"])["error"] == "no session"
+    assert auth.cog.auth_calls == []
+
+
+def test_a_rejected_refresh_cookie_is_cleared_so_it_cannot_fail_forever(auth):
+    """A refresh token Cognito rejects will be rejected on every future reload. Leaving
+    it makes each page load pay a doomed round-trip; clearing it means the next load
+    goes straight to the sign-in prompt."""
+    r = _post(auth.console, "/api/refresh", cookies=["llmops_rt=refresh-bogus"])
+    assert r["statusCode"] == 401
+    c = _cookie_named(r, auth.console.REFRESH_COOKIE)
+    assert "Max-Age=0" in c, f"a rejected cookie must be expired; got {c!r}"
+    assert f"Path={auth.console.REFRESH_COOKIE_PATH}" in c, \
+        "cleared with a different Path, the browser keeps the original alongside it"
+
+
+def test_sign_out_revokes_the_token_server_side_and_clears_the_cookie(auth):
+    """Without RevokeToken, sign-out on a shared machine only hides the credential:
+    the refresh token stays valid in Cognito for the rest of its 30 days."""
+    login = _post(auth.console, "/api/login", {"username": "admin", "password": "pw-correct"})
+    cookie = _cookie_named(login, auth.console.REFRESH_COOKIE).split(";")[0]
+    r = _post(auth.console, "/api/refresh/revoke", cookies=[cookie])
+    assert r["statusCode"] == 200 and json.loads(r["body"])["revoked"] is True
+    assert auth.cog.revoked == ["refresh-1"]
+    assert "Max-Age=0" in _cookie_named(r, auth.console.REFRESH_COOKIE)
+    # ...and the revoked cookie no longer restores anything.
+    assert _post(auth.console, "/api/refresh", cookies=[cookie])["statusCode"] == 401
+
+
+def test_sign_out_still_clears_the_cookie_when_revocation_fails(auth, monkeypatch):
+    """A sign-out that reports failure and leaves the browser signed in is worse than one
+    that clears locally while an unreachable token runs out its window."""
+    def _boom(**kw):
+        raise RuntimeError("ThrottlingException")
+    monkeypatch.setattr(auth.cog, "revoke_token", _boom)
+    r = _post(auth.console, "/api/refresh/revoke", cookies=["llmops_rt=refresh-1"])
+    assert r["statusCode"] == 200 and json.loads(r["body"])["revoked"] is False
+    assert "Max-Age=0" in _cookie_named(r, auth.console.REFRESH_COOKIE)
+
+
+def test_the_session_routes_are_the_only_unauthenticated_posts(console):
+    """Structural, because this is the one place in the file where being above the auth
+    check is CORRECT — which makes it the easiest place for a fourth route to be added
+    above it by accident and become an unauthenticated write."""
+    src = (REPO / "deploy/console/lambda_function.py").read_text()
+    pre_auth = src.split("if user is None")[0]
+    # everything from the body parse to the auth check: the unauthenticated zone
+    zone = pre_auth[pre_auth.index('raw = event.get("body")'):]
+    paths = set(re.findall(r'path == "(/api/[^"]+)"', zone))
+    assert paths == {"/api/login", "/api/refresh", "/api/refresh/revoke"}, \
+        f"unauthenticated POST routes drifted: {sorted(paths)}"
+
+
+def test_a_non_session_post_is_unaffected_by_the_cookie(auth):
+    """The cookie authenticates the session routes and nothing else. If a Bearer-less
+    POST to /api/tasks started succeeding because a cookie was present, the cookie would
+    have quietly become a second credential on every write route."""
+    r = _post(auth.console, "/api/tasks", {"goal": "x"}, cookies=["llmops_rt=refresh-1"])
+    assert r["statusCode"] == 401
+
+
+def test_cookies_are_absent_from_responses_that_set_none(auth):
+    """Format 2.0 accepts the key only as a list; emitting "cookies": [] or None on every
+    response would add a field to all 40-odd routes to prove one route works."""
+    r = _post(auth.console, "/api/tasks", {"goal": "x"})
+    assert "cookies" not in r
+    ok = auth.console._resp(200, {"a": 1})
+    assert "cookies" not in ok
+
+
+def test_set_cookie_rides_the_payload_2_0_cookies_list_not_a_header(auth):
+    """Duplicated in headers AND cookies, a browser could apply the value twice; put
+    only in headers, format 2.0 drops it when there is more than one. This asserts the
+    single correct channel."""
+    r = _post(auth.console, "/api/login", {"username": "admin", "password": "pw-correct"})
+    assert isinstance(r.get("cookies"), list)
+    hdrs = {k.lower() for k in r["headers"]}
+    assert "set-cookie" not in hdrs
+
+
+def test_login_without_cognito_configured_sets_no_cookie(console, monkeypatch):
+    """Unconfigured must fail closed. The tuple return exists so this path cannot
+    accidentally return a cookie built from a missing token."""
+    monkeypatch.setattr(console, "COGNITO_CLIENT_ID", "")
+    out, rt = console.cognito_login("admin", "pw")
+    assert out == {"error": "Cognito not configured"} and rt == ""
+    assert console.cognito_refresh("refresh-1")["error"] == "Cognito not configured"
+
+
+def test_the_console_role_may_revoke_a_refresh_token(console):
+    """boto3 signs RevokeToken with this role's credentials, so IAM authorizes it even
+    though Cognito accepts unauthenticated callers. Without the grant, sign-out clears
+    the cookie and silently fails to invalidate anything — the failure is a print in a
+    log, not an error the user sees."""
+    doc = json.loads((REPO / "deploy/console/iam-policy.json").read_text())
+    st = next(s for s in doc["Statement"] if s.get("Sid") == "CognitoAuth")
+    for action in ("cognito-idp:InitiateAuth", "cognito-idp:RevokeToken"):
+        assert action in st["Action"], action
+
+
+def test_the_deploy_reports_the_client_settings_the_session_depends_on(console):
+    """ALLOW_REFRESH_TOKEN_AUTH missing = every reload forces a re-login, with no error
+    anywhere. Token revocation off = sign-out cannot invalidate. Both are client-level,
+    so the existing pool-level drift query cannot see them."""
+    src = (REPO / "deploy/console/deploy.sh").read_text()
+    assert "describe-user-pool-client" in src
+    assert "ALLOW_REFRESH_TOKEN_AUTH" in src.split("describe-user-pool-client")[1]
+    assert "EnableTokenRevocation" in src
+
+
+# ── the browser half: what a reload actually does ─────────────────────────────
+
+def test_the_page_restores_its_session_on_load(auth):
+    """Without a call at load time the server half is dead code and the bug is unfixed.
+    setAuthUi() alone renders "Sign in" and stops there.
+
+    Asserted against COMMENT-STRIPPED source. The first draft searched the init block's
+    raw text, which passed with the call deleted because the comment above it still said
+    "restoreSession()" -- a test satisfied by prose describing the code it is meant to
+    check. (Verified by deleting the call, 2026-08-01.)
+    """
+    front = (REPO / "deploy/console/frontend.html").read_text()
+    assert "async function restoreSession()" in front
+    assert '"/api/refresh"' in front
+    code = "\n".join(ln for ln in front.splitlines() if not ln.lstrip().startswith("//"))
+    init = code[code.rindex("setAuthUi();"):]
+    assert "restoreSession()" in init, "restoreSession must be CALLED during page init"
+
+
+def test_an_expired_access_token_does_not_throw_away_the_refresh_cookie(auth):
+    """The subtlest way to reintroduce the bug: reuse signOut() for token expiry. The
+    access token lasts 8 hours and the session 30 days, so treating expiry as sign-out
+    would revoke a good session eight hours into it."""
+    front = (REPO / "deploy/console/frontend.html").read_text()
+    assert "function clearSession()" in front
+    # signOut is the only thing allowed to hit the revoke route
+    revoke_users = [ln for ln in front.splitlines() if "/api/refresh/revoke" in ln]
+    assert len(revoke_users) == 1, revoke_users
+    sign_out = front[front.index("function signOut()"):]
+    sign_out = sign_out[:sign_out.index("\n}")]
+    assert "/api/refresh/revoke" in sign_out
+    # the 401 handler and the expiry check must both use clearSession, not signOut
+    for marker in ("if (resp.status===401) { clearSession();",
+                   "Date.now() > SESSION.exp) clearSession();"):
+        assert marker in front, marker
+    assert 'r.error==="unauthorized") { signOut()' not in front
+
+
+def test_ensureToken_tries_the_cookie_before_prompting_for_a_password(auth):
+    """A password prompt the cookie could have avoided is the user-visible symptom of
+    this whole bug. Order matters: restoreSession must come before signIn."""
+    front = (REPO / "deploy/console/frontend.html").read_text()
+    body = front[front.index("async function ensureToken()"):]
+    body = body[:body.index("\n}")]
+    assert body.index("restoreSession()") < body.index("signIn()"), body
+
+
+def test_the_session_fetches_send_the_cookie(auth):
+    """fetch() omits cookies unless credentials is set. Without this the cookie is set
+    by login and then never sent back — the feature silently does nothing."""
+    front = (REPO / "deploy/console/frontend.html").read_text()
+    for route in ("/api/login", "/api/refresh", "/api/refresh/revoke"):
+        i = front.index('API+"' + route + '"')
+        assert 'credentials:"same-origin"' in front[i:i + 200], route
+
+
+def test_the_in_memory_token_comment_still_describes_the_truth(auth):
+    """The comment at the top of the auth block was the diagnosis for this bug ("a
+    reload costs one sign-in"). Left unchanged it would now be a false claim sitting
+    directly above the code that contradicts it."""
+    front = (REPO / "deploy/console/frontend.html").read_text()
+    assert "A reload costs one sign-in" not in front
+    assert "httpOnly refresh cookie" in front
