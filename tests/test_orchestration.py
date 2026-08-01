@@ -893,6 +893,89 @@ class TestStateMachine:
         assert smoke["Next"] == "Teardown"
         assert smoke["Catch"][0]["Next"] == "Teardown"  # endpoint never orphaned
 
+    def test_every_state_on_the_failure_path_still_has_the_run_id_to_close_out(self, asl):
+        """MarkRunFailed reads `$.run_id`, so every state between the crash and it has
+        to leave `$.run_id` in the state. A Task with no ResultPath REPLACES its input
+        with the API response -- EscalateFail's response is a PutEvents result, which
+        has no run_id at all, so the marker would fail on a missing path and the run
+        would stay 'running' exactly as before the fix.
+
+        This is what the earlier zombie-closeout test missed: it checked that the
+        marker asks for `$.run_id`, never that `$.run_id` is still there to be asked
+        for. That distinction is invisible until a real stage crashes.
+        """
+        states = asl["States"]
+        # Walk backwards from the marker: everything that can reach it must preserve
+        # the state, not overwrite it.
+        feeders = [n for n, st in states.items()
+                   if st.get("Next") == "MarkRunFailed"
+                   or any(c["Next"] == "MarkRunFailed" for c in st.get("Catch", []))]
+        assert feeders, "nothing routes to MarkRunFailed"
+        for name in feeders:
+            st = states[name]
+            if st["Type"] != "Task":
+                continue
+            rp = st.get("ResultPath", "__absent__")
+            assert rp != "__absent__", (
+                f"{name} has no ResultPath, so its API response replaces the state and "
+                "$.run_id is gone by the time MarkRunFailed reads it")
+            assert rp is None or rp.startswith("$."), (
+                f"{name} writes its result to {rp!r}, which does not keep $.run_id")
+
+    def test_a_stage_catch_keeps_the_run_id_it_was_given(self, asl):
+        """The Catch side of the same rule: `ResultPath: "$.error"` files the error
+        under a key and leaves the rest of the state alone. Omitting it (or using
+        "$") swaps the whole state for {Error, Cause}."""
+        for name, st in asl["States"].items():
+            for cat in st.get("Catch", []):
+                if cat["Next"] == "Fail":
+                    continue  # Fail needs nothing from the state
+                rp = cat.get("ResultPath", "__absent__")
+                assert rp not in ("__absent__", "$"), (
+                    f"{name}'s catch to {cat['Next']} replaces the state with the error "
+                    "object, discarding $.run_id and $.iteration")
+
+    def test_the_starter_supplies_every_top_level_path_the_machine_reads(self, asl):
+        """A missing input field raises States.Runtime, which no Catch can intercept.
+
+        Live-verified while proving the closeout fix: an execution started without
+        manifest_uri died with "The JSONPath '$.manifest_uri' ... could not be found"
+        straight to ExecutionFailed -- no EscalateFail, no MarkRunFailed, run left at
+        status=running. Every other failure mode in this machine routes through the
+        closeout; this one cannot, so the only defense is that the sole writer of the
+        execution input always supplies these fields.
+        """
+        top_level = set()
+        def walk(node):
+            if isinstance(node, dict):
+                for k, v in node.items():
+                    if k.endswith(".$") and isinstance(v, str) and v.startswith("$."):
+                        head = v[2:].split(".")[0].split("[")[0]
+                        if head and not head.startswith("$"):
+                            top_level.add(head)
+                    elif k == "Variable" and isinstance(v, str) and v.startswith("$."):
+                        continue  # Choice states guard with IsPresent; see PipelineModeChoice
+                    else:
+                        walk(v)
+            elif isinstance(node, list):
+                for v in node:
+                    walk(v)
+        walk(asl["States"])
+        # Paths the stages write themselves (ResultPath keys) are not the starter's job.
+        produced = {st["ResultPath"][2:].split(".")[0]
+                    for st in asl["States"].values()
+                    if isinstance(st.get("ResultPath"), str) and st["ResultPath"] != "$"}
+        produced.add("error")
+        required = top_level - produced
+        src = (REPO / "orchestration/start_pipeline/handler.py").read_text()
+        start_input = src[src.index("input=json.dumps("):]
+        start_input = start_input[:start_input.index("\n\n")]
+        for field in sorted(required):
+            assert f'"{field}"' in start_input, (
+                f"the machine reads $.{field} but start_pipeline's execution input does "
+                f"not set it; a missing path raises the uncatchable States.Runtime and "
+                "the run can never self-close")
+
 
 class TestConductorDispatch:
     """launch_run — declared in the orchestrator's harness.json since Phase 5,
