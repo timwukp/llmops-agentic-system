@@ -13,10 +13,19 @@ corruptions live:
      commit produced, which is NOT the local HEAD~1 (different sha, and possibly a
      different tree if an earlier push mangled something). Diffing against the
      wrong base makes the push silently incomplete.
+  3. A ref read believed on its first answer. GET /git/ref is eventually consistent:
+     seconds after a branch is created it still 404s. Read once and a second push
+     concludes the branch does not exist, bases its commit on the DEFAULT BRANCH, and
+     tries to create the ref -- which would drop every commit already on the branch.
+     Observed 2026-08-01 replaying three commits: push 2 took the create path and was
+     saved only by POST /git/refs answering 422 "Reference already exists". A PATCH
+     there instead would have silently orphaned push 1. So the read is retried, and a
+     422 on create is treated as what it is -- proof the ref exists -- not as fatal.
 
-So this reads modes from git instead of assuming them, and diffs against the
-branch's actual remote head instead of assuming the local parent matches it. A
-rename becomes delete-old + add-new; a deletion becomes a null-sha tree entry.
+So this reads modes from git instead of assuming them, diffs against the branch's
+actual remote head instead of assuming the local parent matches it, and never
+concludes "no such branch" from a single 404. A rename becomes delete-old + add-new;
+a deletion becomes a null-sha tree entry.
 
 Run: .venv/bin/python tools/push_via_api.py --branch <branch> [--dry-run]
 """
@@ -27,6 +36,7 @@ import base64
 import json
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 
@@ -124,12 +134,16 @@ class GitHub:
         self.repo, self.token = repo, token
 
     def call(self, path: str, data=None, method: str | None = None,
-             absent_ok: bool = False):
+             absent_ok: bool = False, conflict_ok: bool = False):
         """Call the API. `absent_ok` turns a 404 into None instead of exiting.
 
         Only the ref lookup passes absent_ok: "this branch does not exist yet" is a
         normal state for the first push of a PR branch, whereas a 404 on a blob or
         tree write is a real failure and must still be fatal.
+
+        `conflict_ok` turns a 422 into None, and only the ref CREATE passes it: a 422
+        there means the ref already exists, which contradicts the 404 we based the
+        create on and is a recoverable disagreement rather than a failure.
         """
         req = urllib.request.Request(
             f"{API}/repos/{self.repo}{path}",
@@ -144,8 +158,27 @@ class GitHub:
         except urllib.error.HTTPError as exc:
             if exc.code == 404 and absent_ok:
                 return None
+            if exc.code == 422 and conflict_ok:
+                return None
             raise SystemExit(f"GitHub {exc.code} on {method or 'GET'} {path}: "
                              f"{exc.read().decode()[:500]}") from exc
+
+    def read_ref(self, branch: str, attempts: int = 4, sleep=time.sleep):
+        """Read a branch ref, retrying the 404.
+
+        GET /git/ref is eventually consistent. Believing a single 404 makes the very
+        next push after a branch is created decide the branch does not exist -- and
+        then base its commit on the default branch, discarding everything already
+        pushed. A 404 that is real (a genuinely new branch) costs a few seconds of
+        retry once; a 404 that is stale, believed, costs commits.
+        """
+        for i in range(attempts):
+            ref = self.call(f"/git/ref/heads/{branch}", absent_ok=True)
+            if ref is not None:
+                return ref
+            if i + 1 < attempts:
+                sleep(2 ** i)
+        return None
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -165,7 +198,7 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("no token from `gh auth token`")
     gh = GitHub(repo, token)
 
-    ref = gh.call(f"/git/ref/heads/{args.branch}", absent_ok=True)
+    ref = gh.read_ref(args.branch)
     creating = ref is None
     if creating:
         # First push of a PR branch. The old code took the 404 as fatal and every new
@@ -231,8 +264,17 @@ def main(argv: list[str] | None = None) -> int:
     if creating:
         # POST /git/refs with a full ref name creates; PATCH would 404 on a ref that
         # does not exist yet, which is the whole reason this branch of the code exists.
-        gh.call("/git/refs", {"ref": f"refs/heads/{args.branch}",
-                              "sha": commit["sha"]})
+        if gh.call("/git/refs", {"ref": f"refs/heads/{args.branch}",
+                                 "sha": commit["sha"]}, conflict_ok=True) is None:
+            # 422: the ref exists after all, so the 404 that put us here was stale and
+            # the commit just built is parented on the wrong base. Refuse rather than
+            # PATCH -- pointing the branch at this commit would drop every commit
+            # already on it. Re-running now succeeds, because the ref read will find it.
+            raise SystemExit(
+                f"{args.branch} already exists on the remote, but the ref read said it "
+                f"did not, so commit {commit['sha'][:10]} was built on the wrong base "
+                f"({remote_sha[:10]}). Nothing was moved -- that commit is unreferenced "
+                "and harmless. Re-run this command; the ref is visible now.")
     else:
         gh.call(f"/git/refs/heads/{args.branch}", {"sha": commit["sha"]},
                 method="PATCH")
