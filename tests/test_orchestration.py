@@ -10,6 +10,7 @@ Run: .venv/bin/python -m pytest tests/test_orchestration.py -q
 """
 from __future__ import annotations
 
+import fnmatch
 import importlib.util
 import json
 import re
@@ -336,6 +337,59 @@ class TestContracts:
         write_run_report(s3, "llmops-data-test", {"run_id": "r1", "stages": {}})
         assert ("s3://llmops-data-test/reports/run-latest/test-report-latest.json"
                 in s3.objects)
+
+    def test_two_parallel_runs_do_not_overwrite_each_others_report(self):
+        """The report is the one artifact a run exists to produce; it must survive a
+        neighbour.
+
+        Every run wrote reports/run-latest/test-report-latest.json, full stop. Serial
+        runs made that look fine for months. The moment two run in parallel -- which is
+        what this platform is FOR (finetune one model while distilling another) -- the
+        second silently destroyed the first's report, and no one could tell which run the
+        survivor described, because the key is the same string either way.
+        """
+        s3 = FakeS3()
+        write_run_report(s3, "b", {"run_id": "run-A", "stages": {"eval": {"status": "completed"}}})
+        write_run_report(s3, "b", {"run_id": "run-B", "stages": {"eval": {"status": "failed"}}})
+
+        a = json.loads(s3.objects["s3://b/reports/run-A/test-report.json"])
+        b = json.loads(s3.objects["s3://b/reports/run-B/test-report.json"])
+        assert a["run_id"] == "run-A" and b["run_id"] == "run-B", \
+            "a run's own report must describe that run"
+        assert a["pass_counts"]["passed"] == 1 and b["pass_counts"]["failed"] == 1, \
+            "run-B's write overwrote run-A's durable report"
+        # The alias still exists and names the run it came from, so a reader of the
+        # convenience key can tell WHICH run it is looking at rather than guessing.
+        alias = json.loads(s3.objects["s3://b/reports/run-latest/test-report-latest.json"])
+        assert alias["run_id"] == "run-B"
+
+    def test_a_denied_alias_write_does_not_lose_the_report(self):
+        """Order matters: durable copy first, alias best-effort.
+
+        If the alias were written first, or its failure raised, then an IAM gap on ONE
+        convenience key would fail a run whose real report had already been written --
+        reintroducing the exact failure this came from (the driver dying on AccessDenied
+        after the teacher tokens were already paid for).
+        """
+        class _AliasDenied(FakeS3):
+            def put_object(self, **kw):
+                if kw["Key"] == "reports/run-latest/test-report-latest.json":
+                    raise RuntimeError("AccessDenied: s3:PutObject on the alias")
+                return super().put_object(**kw)
+
+        s3 = _AliasDenied()
+        rep = write_run_report(s3, "b", {"run_id": "run-A", "stages": {}})
+        assert "s3://b/reports/run-A/test-report.json" in s3.objects, \
+            "the durable report must be written even when the alias is denied"
+        assert "alias_error" in rep and "AccessDenied" in rep["alias_error"], \
+            "a swallowed alias failure reads as 'no run has finished', a different claim"
+        assert rep["report_key"] == "reports/run-A/test-report.json"
+
+    def test_a_blank_run_id_falls_back_to_the_alias_not_a_blank_key(self):
+        """reports//test-report.json is worse than the shared alias: nobody reads it."""
+        from pipeline.contracts.report import REPORT_KEY, report_key_for
+        assert report_key_for("") == REPORT_KEY
+        assert report_key_for(None) == REPORT_KEY
 
 
 # ---------------------------------------------------------------------------
@@ -1486,24 +1540,52 @@ def test_the_driver_role_can_write_the_report_the_driver_always_writes():
     invocation retried. The agent's report was the one thing the run existed to
     produce.
 
-    The write is scoped to the exact key the report lives at, not the bucket: the
-    driver publishes one canonical document, and a wildcard would also let it rewrite
-    the customer data and held-out sets it is supposed to only read."""
+    The write is scoped to the reports prefix, not the bucket. This test used to pin the
+    single literal key REPORT_KEY, which was right when the driver published exactly one
+    object and wrong once it published one per run -- so it is written against the
+    GUARANTEE (the driver may write reports and nothing else) rather than against the
+    string, or the next legitimate key change breaks it again."""
     allowed = _allowed_actions("driver")
     assert "s3:PutObject" in allowed, (
-        "handle_stage_complete writes reports/run-latest/test-report-latest.json on "
-        "every stage_complete; without PutObject every stage dies after doing its work")
+        "handle_stage_complete writes a run report on every stage_complete; without "
+        "PutObject every stage dies after doing its work")
     doc = json.loads((REPO / "deploy/iam/lambda_roles.json").read_text())
     writes = [st for st in doc["roles"]["driver"]["permissionsPolicy"]["Statement"]
               if "s3:PutObject" in ([st.get("Action")] if isinstance(st.get("Action"), str)
                                     else st.get("Action", []))]
-    assert len(writes) == 1, "one statement owns the driver's single write"
-    resource = json.dumps(writes[0]["Resource"])
-    from pipeline.contracts.report import REPORT_KEY
-    assert REPORT_KEY in resource, (
-        f"scope the write to {REPORT_KEY}, the only object the driver publishes")
-    assert "customer-data" not in resource and not resource.rstrip('"]').endswith("/*"), \
-        "a bucket-wide write would let the driver rewrite the data it must only read"
+    assert len(writes) == 1, "one statement owns the driver's report write"
+    resources = writes[0]["Resource"]
+    resources = [resources] if isinstance(resources, str) else resources
+
+    from pipeline.contracts.report import REPORT_KEY, report_key_for
+
+    # Object-key patterns this statement permits, i.e. the part after "<bucket>/".
+    # fnmatch, not hand-rolled prefix arithmetic: an IAM resource is a glob, and a helper
+    # clever enough to parse one is clever enough to crash on the very input it is meant
+    # to reject (this assertion's first draft raised IndexError on a bucket-wide grant --
+    # a test that fails for the wrong reason is a test that will pass for the wrong one).
+    patterns = [r.split(":::", 1)[1].split("/", 1)[1] if "/" in r.split(":::", 1)[1] else ""
+                for r in resources]
+
+    def _permitted(key):
+        return any(p and fnmatch.fnmatch(key, p) for p in patterns)
+
+    # Every key the writer can actually produce must be permitted -- the per-run object
+    # and the alias. Derived from report_key_for() rather than restating the shape, so a
+    # change to the key fails HERE, at the grant, instead of live on AccessDenied after
+    # the stage has already been paid for.
+    for key in (report_key_for("run-20260731T183103Z-8b864805"), REPORT_KEY):
+        assert _permitted(key), f"the driver writes {key} but no statement allows it"
+
+    # The property the narrow scope exists for, unchanged by widening to a prefix: a
+    # pipeline that can rewrite the customer's data can destroy the held-out set its own
+    # quality gates are judged against. These are the bucket's real top-level prefixes.
+    for forbidden in ("customer-data/held-out.jsonl", "runs/r/manifest.json",
+                      "contracts/x.json", "plans/p.json", "code/train.py",
+                      "tasks/t.json", "finops/rates.json"):
+        assert not _permitted(forbidden), (
+            f"the driver must not be able to write {forbidden}; the grant has widened "
+            "past the reports prefix")
 
 
 #: Handler-local boto3 calls (c["s3"].put_object(...)) mapped to the IAM action they
