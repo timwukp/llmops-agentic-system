@@ -3008,6 +3008,84 @@ def test_the_prompt_sends_the_customer_to_the_drop_zone_not_to_a_bucket(console)
         f"the frontend posts {posted.group(1)!r}, which the prompt does not describe"
 
 
+def test_the_agent_is_handed_its_prices_instead_of_fetching_them(console, monkeypatch):
+    """Found by tracing a slow turn, and it was two defects wearing one coat.
+
+    The prompt said "read s3://<bucket>/finops/rates/rate_card_latest.json FIRST". That
+    costs a whole model round-trip: the agent must answer with a tool call, the harness
+    runs it, then the model is invoked AGAIN with the result. X-Ray on one 60.6s turn
+    (trace 1-6a6d85b1-58ce7d6d0f1c9b177edeeb12) put 8.39s in the call that only decided
+    to run a shell and 44.76s in the call that finally answered -- the round-trip IS the
+    latency, and TTFT (51.5s) dwarfed generation (1.6s).
+
+    And it did not even work. Traces 1-6a6d85d0-... and 1-6a6d85c5-... show the agent
+    fetching litellm's model_prices_and_context_window.json from raw.githubusercontent.com
+    instead of our card, so it paid for the round-trip AND quoted the customer a third
+    party's list prices rather than what this account is actually billed.
+
+    So: the console must PUT the rates in the invocation, and the prompt must price from
+    there and be told not to go fetch prices. Both halves are asserted, plus the join
+    between them -- a prompt naming params.rate_card while the console sends
+    params.rates is two correct-looking halves that never meet."""
+    prompt = "\n".join(b.get("text", "") for b in json.loads(
+        (REPO / "agents/orchestrator/harness.json").read_text())["systemPrompt"])
+
+    # -- the prompt half -------------------------------------------------------
+    assert "params.rate_card" in prompt, \
+        "the prompt must price from the injected card"
+    assert "rate_card_latest.json" not in prompt, \
+        "the prompt must no longer send the agent to S3 for prices -- that is the " \
+        "round-trip this change removes"
+    low = prompt.lower()
+    assert "do not run a shell" in low or "do not fetch" in low, \
+        "the prompt must forbid fetching prices, or the agent keeps doing what it did"
+    assert "litellm" in low, \
+        "name the wrong source it actually used; a generic 'use our rates' did not stop it"
+
+    # -- the console half, and the join ----------------------------------------
+    # Read the key the console really sets rather than trusting the comment: this is the
+    # exact drift that makes both halves look right and never meet.
+    src = _strip_comments((REPO / "deploy/console/lambda_function.py").read_text())
+    turn = src[src.index("def run_task_turn("):]
+    turn = turn[:turn.index("\ndef ")]
+    m = re.search(r'params\[\s*"([^"]+)"\s*\]\s*=\s*card', turn)
+    assert m, "run_task_turn must put the rate card into params"
+    assert f"params.{m.group(1)}" in prompt, (
+        f"the console sends params[{m.group(1)!r}] but the prompt reads "
+        f"params.rate_card -- the halves do not meet")
+
+    # The card must be built per turn from S3, not captured once at module import: a
+    # snapshot would go stale the next time pricing_refresh publishes new rates.
+    assert re.search(r"card\s*=\s*rate_card_for_prompt\(\)", turn), \
+        "the card must be read inside the turn"
+
+    # -- the shape the prompt promises is the shape that is sent ---------------
+    doc = {"generated_at": "2026-07-31",
+           "rate_precedence": ["ce_realized", "price_list", "fallback_static"],
+           "rates": {"sagemaker:training:ml.g5.2xlarge": {
+               "unit_price": 1.515, "unit": "hours", "source": "ce_realized",
+               "realized_from": {"basis": "provenance the agent never quotes"}}}}
+    monkeypatch.setattr(console, "_rate_card_doc", lambda: doc)
+    out = console.rate_card_for_prompt()
+    assert set(out) == {"generated_at", "rate_precedence", "rates"}
+    entry = out["rates"]["sagemaker:training:ml.g5.2xlarge"]
+    assert entry == {"unit_price": 1.515, "unit": "hours", "source": "ce_realized"}, \
+        "only unit_price/unit/source belong in the prompt -- every injected byte is " \
+        "billed on every turn, and realized_from is 8KB the agent never quotes"
+    for field in ("unit_price", "unit", "source", "generated_at"):
+        assert field in prompt, \
+            f"the prompt must name {field}, or the agent cannot read what it is handed"
+
+    # An unreadable card must be distinguishable from a free one. Returning {} here
+    # would reach the agent as "rates exist and are empty" and invite an invented price.
+    monkeypatch.setattr(console, "_rate_card_doc", lambda: None)
+    assert console.rate_card_for_prompt() is None
+    monkeypatch.setattr(console, "_rate_card_doc", lambda: {"rates": {}})
+    assert console.rate_card_for_prompt() is None
+    assert "if params.rate_card is absent" in prompt.lower(), \
+        "the prompt must say what to do when no card arrives"
+
+
 def test_choices_render_only_from_the_latest_agent_turn():
     """A menu from three turns ago answers a question that has already been answered;
     clicking it sends the consultation backwards."""
