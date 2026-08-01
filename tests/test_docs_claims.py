@@ -143,6 +143,74 @@ def test_the_skill_source_claims_match_the_harness_configs():
         "Update the docs and this guard together.")
 
 
+#: Docs whose §2 states how many harness-task states the happy path has, and names them.
+DOC_SPINE_CLAIMS = (REPO / "docs" / "ARCHITECTURE.md",
+                    REPO / "docs" / "ARCHITECTURE.zh-TW.md")
+
+
+def _happy_path_harness_states() -> list[str]:
+    """Walk the ASL from the full-pipeline entry to Complete, gate PASSING every time.
+
+    Derived rather than listed because the list is exactly what drifted: `EvalGenerate`
+    was inserted between `FinetuneAnalyze` and `EvalGate` and both ARCHITECTURE variants
+    went on saying 8 states and drawing analyze → gate. A hardcoded expectation here
+    would need the same edit as the prose, so it would drift in the same commit and
+    guard nothing.
+
+    "Gate passing" is what makes this the HAPPY path: taking the Choice's pass branch
+    skips remediation, so the walk terminates instead of looping.
+    """
+    asl = json.loads((REPO / "orchestration" / "state_machine.asl.json").read_text())
+    states = asl["States"]
+    node, order, seen = states["PipelineModeChoice"]["Default"], [], set()
+    while node and node not in seen:
+        seen.add(node)
+        st = states[node]
+        payload = (st.get("Parameters") or {}).get("Payload") or {}
+        if "harness_id" in payload:
+            order.append(node)
+        if st["Type"] == "Choice":
+            # The happy path is the branch that leads onward, not back into remediation.
+            nxt = next((c["Next"] for c in st["Choices"]
+                        if c.get("BooleanEquals") is True), st.get("Default"))
+        else:
+            nxt = st.get("Next")
+        node = nxt
+    assert len(order) >= 5, f"walked only {order} -- the traversal is broken, not the docs"
+    return order
+
+
+def test_the_documented_spine_matches_the_state_machine():
+    """ARCHITECTURE §2's count AND its diagram must come from the ASL.
+
+    Two separate claims, both checkable, and the second is the one that matters: a
+    reader who trusts the arrow `FinetuneAnalyze → EvalGate` concludes the gate is
+    evaluated by whatever analysis produced, i.e. that no separate generation step
+    exists. That was true of the DIAGRAM and false of the pipeline's intent for as long
+    as `evaluate` was declared and dispatched by nothing. So the state names are checked
+    in ORDER, not merely for presence -- a diagram may not draw a hop that the machine
+    does not have, nor omit one it does.
+    """
+    order = _happy_path_harness_states()
+    for doc in DOC_SPINE_CLAIMS:
+        text = doc.read_text()
+        assert re.search(rf"\*\*{len(order)} (?:harness-task states|個 harness 任務狀態)",
+                         text), (
+            f"{doc.name} §2 does not state the happy path's harness-task state count "
+            f"({len(order)}: {order}) in the form this guard reads. Deleting the phrase "
+            "removes the check rather than satisfying it.")
+        # The arrows are ASCII, so positions in the raw text ARE the drawn order.
+        at = [text.find(n) for n in order]
+        missing = [n for n, i in zip(order, at) if i < 0]
+        assert not missing, (
+            f"{doc.name} never names these happy-path states: {missing}. A stage absent "
+            "from the diagram reads as a stage that does not exist.")
+        assert at == sorted(at), (
+            f"{doc.name} draws the spine as "
+            f"{[n for _, n in sorted(zip(at, order))]} but the ASL runs it as {order}. "
+            "An out-of-order diagram misstates which state's output the next one reads.")
+
+
 def test_no_doc_claims_a_file_that_does_not_exist():
     """Seven docs pointed at two files that were never committed on any branch.
 
