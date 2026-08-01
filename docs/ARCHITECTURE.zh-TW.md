@@ -128,6 +128,19 @@ prompt 明文禁止它刪東西的 agent。
   「兩張表都沒有痕跡」，所以現在**兩條路徑**都會把升級記進 stage-events，並帶上 `run_row`
   說明走的是哪一條。這筆寫入屬於記帳，且被包住：events 表寫失敗絕不能扣住 SNS 通知或
   `EscalatedToHuman` 事件。
+- **一次升級的各條通道是獨立的，而那條「送不到任何人」的絕不能當成閘門。**
+  `handle_escalate` 用四種方式通知：SNS 寄給人、stage event 給 console 時間軸、bus 上的
+  `EscalatedToHuman` 給 conductor、以及 `send_task_failure` 放掉狀態機。而 SNS publish 原本是
+  **第一個** 敘述且沒有包起來，所以一次 publish 失敗會把其他三個一起帶走 —— 包括那個 settle，
+  於是一個已經升級的 run 上還掛著活的 task token，只能等該 stage 自己的 timeout
+  （data_prep 7200s、finetune 21600s）才被釋放。而這在**這個**呼叫上是最糟的閘門選擇：
+  **`llmops-escalations` 的訂閱者是零**，SNS 正是那條已知送不到任何人的通道。
+  `deploy/03_storage.py` 的 `ensure_topic` 會把它報成
+  `NO SUBSCRIBERS — every escalate_human call publishes into the void`，而不是把 topic
+  報成健康，因為部署沒辦法憑空發明一個地址；解法是 `--escalation-email <addr>`，在有人提供
+  之前，runtime 必須假設那條通道是死的。現在每一種通知都各自被包住並記錄，順序依「失去它的
+  代價」遞增排列：先 SNS、再時間軸那一列、再 bus 事件，最後才是 token settle —— 好讓即使所有
+  通知都失敗，它仍然會發生。
 - **deploy 之後必然執行 `Teardown`** —— 即使 `SmokeTest` 失敗，其 `Catch` 也先路由到
   `Teardown`。孤兒 endpoint 是第一大成本風險（Phase 4 就在帳號裡發現一個無關的
   endpoint 自 2024-04 起一直 InService）。

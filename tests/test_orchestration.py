@@ -824,6 +824,66 @@ class TestDriver:
             "the event has to say whether a run row was closed too, or a reader cannot "
             "tell an escalated run from an escalating non-run")
 
+    # ---- one dead escalation channel must not close the others -----------------
+    #
+    # The channels are independent by design and the ordering used to say otherwise:
+    # SNS was the FIRST statement in handle_escalate and unwrapped, so a failed publish
+    # took the stage event, the bus event and the task-token settle with it. And SNS is
+    # the channel with a known-zero audience -- llmops-escalations has no subscribers
+    # live, which ensure_topic reports rather than papering over, because a deploy
+    # cannot invent an address. The one channel that reaches nobody was gating the two
+    # that work.
+
+    def test_a_dead_sns_topic_does_not_take_the_whole_escalation_with_it(self):
+        """The live shape of this: zero subscribers today, and a publish can fail outright
+        (topic deleted, throttle, IAM drift). The verdict still has to reach the conductor
+        on the bus, the timeline still has to show it, and the token still has to settle."""
+        c = clients()
+        c["ddb"].Table(ENV["RUNS_TABLE"]).put_item(
+            Item={"run_id": "run-real-3", "status": "running"})
+
+        def boom(**kw):
+            raise RuntimeError("Topic does not exist")
+        c["sns"].publish = boom
+        out = self._escalate(c, driver_event(run_id="run-real-3"))
+        assert out == {"escalated": True}
+        assert any(e["DetailType"] == ev.ESCALATED_TO_HUMAN for e in c["events"].entries)
+        assert [i for i in c["ddb"].Table(ENV["EVENTS_TABLE"]).items
+                if i["sk"].endswith("#escalated")]
+        assert c["ddb"].Table(ENV["RUNS_TABLE"]).get_item(
+            Key={"run_id": "run-real-3"})["Item"]["status"] == "escalated"
+        assert c["sfn"].failures, "the task token was never settled"
+
+    def test_a_failed_bus_emit_still_settles_the_task_token(self):
+        """The expensive half. The settle is what releases the state machine; skipping it
+        because a PutEvents failed parks a live token on a run that has already escalated,
+        and the only thing that frees it is the stage's own timeout -- 7200s for data_prep,
+        21600s for finetune. That is the zombie #52 and MarkRunFailed exist to prevent,
+        re-entered through the notification path."""
+        c = clients()
+
+        def boom(**kw):
+            raise RuntimeError("bus unreachable")
+        c["events"].put_events = boom
+        out = self._escalate(c, driver_event(run_id="run-real-4"))
+        assert out == {"escalated": True}
+        assert c["sfn"].failures and c["sfn"].failures[0]["error"] == "EscalatedToHuman"
+
+    def test_the_finops_audit_path_survives_a_dead_topic_too(self):
+        """The audit path returns before the bus and the settle, so SNS is its ONLY
+        channel -- which makes it the one place where an unwrapped publish would turn a
+        cost finding into a raised exception out of the auditor rather than a logged
+        miss. It still must not raise."""
+        c = clients()
+
+        def boom(**kw):
+            raise RuntimeError("Topic does not exist")
+        c["sns"].publish = boom
+        out = self._escalate(c, driver_event(run_id="finops-2026-08-02", stage="finops",
+                                            task="audit", task_token=""))
+        assert out == {"escalated": True}
+        assert c["ddb"].Table(ENV["RUNS_TABLE"]).items == []
+
     def test_a_failed_timeline_write_never_withholds_the_escalation(self):
         """Bookkeeping must not be able to swallow the alert. The stage event is the
         record; SNS and the bus event are how a human finds out. If the record fails,

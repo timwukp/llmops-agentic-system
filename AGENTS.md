@@ -140,6 +140,14 @@ versions and introspects the live CreateHarness/UpdateHarness schemas.
   `handle_escalate` wrote no stage event at all — so check what a conditional write was
   standing in for before you make it conditional. The escalation is now recorded in
   `llmops-stage-events` on both paths, wrapped, so a failed record cannot withhold the alert.
+- **Notify on independent channels, and never let the weakest one gate the rest.** The
+  driver's escalate path publishes to SNS, writes a stage event, emits `EscalatedToHuman`,
+  and settles the task token. The SNS publish was first and unwrapped, so one failed publish
+  cost all four — including the settle, which parks a live token until the stage timeout.
+  And **`llmops-escalations` has zero subscribers**, so that was the channel with a
+  known-zero audience gating the ones that work (`ensure_topic` in `deploy/03_storage.py`
+  says so out loud instead of reporting the topic healthy; fix with `--escalation-email`).
+  Wrap each notification separately and order them so the state-releasing call is last.
 - **Observability**: `OTEL_TRACES_SAMPLER=always_on` env var is mandatory or
   evaluations/insights sit at zero forever. X-Ray delivery takes no `outputFormat`.
 - **Turn budget**: harness `timeoutSeconds` is 840 here (driver Lambda caps at 900s).

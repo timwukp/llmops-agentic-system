@@ -607,6 +607,51 @@ case("driver: a failed timeline write takes the escalation alert down with it",
      "orchestration/harness_driver/handler.py", m48,
      ["tests/test_orchestration.py::TestDriver::test_a_failed_timeline_write_never_withholds_the_escalation"])
 
+# ── the escalation channels must be independent ───────────────────────────────────────
+#
+# 49. SNS goes back to being unwrapped and first, which is where it was: a failed publish
+#     then takes the bus event, the stage event and the token settle with it. And SNS is the
+#     channel with a KNOWN-ZERO audience (llmops-escalations has no subscribers live), so
+#     this makes the one channel that reaches nobody the gate on the two that work.
+def m49(t):
+    old = ('    try:\n'
+           '        c["sns"].publish(TopicArn=os.environ["LLMOPS_SNS_TOPIC"],\n'
+           '                         Subject=f"[llmops] escalation: {run_id}/{event[\'stage\']}",\n'
+           '                         Message=json.dumps(args, indent=2, default=str))\n'
+           '    except Exception as exc:  # noqa: BLE001 — one dead channel must not close the rest\n'
+           '        print(f"[driver] SNS publish failed for the escalation of {run_id}: {exc}")\n')
+    assert old in t, "the escalate SNS publish guard has moved; re-anchor this mutation"
+    return t.replace(old,
+                     '    c["sns"].publish(TopicArn=os.environ["LLMOPS_SNS_TOPIC"],\n'
+                     '                     Subject=f"[llmops] escalation: {run_id}/{event[\'stage\']}",\n'
+                     '                     Message=json.dumps(args, indent=2, default=str))\n', 1)
+case("driver: a dead SNS topic takes the whole escalation down with it",
+     "orchestration/harness_driver/handler.py", m49,
+     ["tests/test_orchestration.py::TestDriver::test_a_dead_sns_topic_does_not_take_the_whole_escalation_with_it",
+      "tests/test_orchestration.py::TestDriver::test_the_finops_audit_path_survives_a_dead_topic_too"])
+
+# 50. The bus emit is unwrapped again, so a failed PutEvents skips the task-token settle and
+#     parks a live token on a run that has already escalated -- freed only by the stage's own
+#     timeout, hours later. #52's zombie, re-entered through the notification path.
+def m50(t):
+    old = ('    try:\n'
+           '        ev.emit_event(os.environ["EVENT_BUS"], ev.ESCALATED_TO_HUMAN,\n')
+    assert old in t, "the escalate bus-emit guard has moved; re-anchor this mutation"
+    marker = '    except Exception as exc:  # noqa: BLE001 — see below: the token must still settle'
+    assert marker in t, "the escalate bus-emit except clause has moved; re-anchor this mutation"
+    head, _, tail = t.partition(marker)
+    # drop the try/except wrapper: dedent the emit and delete the handler block
+    head = head.replace(old, '    ev.emit_event(os.environ["EVENT_BUS"], ev.ESCALATED_TO_HUMAN,\n', 1)
+    head = head.replace('                      {"run_id": run_id, "stage": event["stage"],\n'
+                        '                       "reason": args.get("reason", "")}, client=c["events"])\n',
+                        '                  {"run_id": run_id, "stage": event["stage"],\n'
+                        '                   "reason": args.get("reason", "")}, client=c["events"])\n', 1)
+    rest = tail.partition('    if event.get("task_token"):')[2]
+    return head + '    if event.get("task_token"):' + rest
+case("driver: a failed bus emit skips the task-token settle, parking it until the timeout",
+     "orchestration/harness_driver/handler.py", m50,
+     ["tests/test_orchestration.py::TestDriver::test_a_failed_bus_emit_still_settles_the_task_token"])
+
 
 failed = []
 for name, rel, mutate, tests in CASES:

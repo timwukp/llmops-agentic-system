@@ -587,10 +587,27 @@ def _is_condition_failure(exc) -> bool:
 
 
 def handle_escalate(c, event, args) -> dict:
+    """Raise a stage's escalation to a human, on every channel that still works.
+
+    The channels are deliberately independent, and the ordering matters. SNS used to be
+    the first statement here and unwrapped, so a failed publish took the stage event, the
+    bus event AND the task-token settle down with it -- the run would then sit at
+    `running` holding a live token until the state machine's timeout, hours later, over a
+    notification. That is the worst possible thing to gate on this particular call:
+    `llmops-escalations` has **zero subscribers** live, so SNS is the one channel already
+    known to reach nobody, and `ensure_topic` in deploy/03_storage.py reports it as
+    "NO SUBSCRIBERS -- every escalate_human call publishes into the void" precisely
+    because the deploy cannot invent an address. A channel that today delivers to no one
+    must not be able to silence the two that do deliver: the stage event the console
+    renders, and the EscalatedToHuman event the conductor triages off the bus.
+    """
     run_id = event["run_id"]
-    c["sns"].publish(TopicArn=os.environ["LLMOPS_SNS_TOPIC"],
-                     Subject=f"[llmops] escalation: {run_id}/{event['stage']}",
-                     Message=json.dumps(args, indent=2, default=str))
+    try:
+        c["sns"].publish(TopicArn=os.environ["LLMOPS_SNS_TOPIC"],
+                         Subject=f"[llmops] escalation: {run_id}/{event['stage']}",
+                         Message=json.dumps(args, indent=2, default=str))
+    except Exception as exc:  # noqa: BLE001 — one dead channel must not close the rest
+        print(f"[driver] SNS publish failed for the escalation of {run_id}: {exc}")
     if _is_finops(event):
         # No runs-table row exists for an audit invocation; updating one would mint a
         # phantom run that the console would then display alongside real pipeline runs.
@@ -614,9 +631,17 @@ def handle_escalate(c, event, args) -> dict:
                              "task": event.get("task", ""), "run_row": run_row})
     except Exception as exc:  # noqa: BLE001 — never withhold an escalation for a log
         print(f"[driver] could not record the escalation of {run_id}: {exc}")
-    ev.emit_event(os.environ["EVENT_BUS"], ev.ESCALATED_TO_HUMAN,
-                  {"run_id": run_id, "stage": event["stage"],
-                   "reason": args.get("reason", "")}, client=c["events"])
+    try:
+        ev.emit_event(os.environ["EVENT_BUS"], ev.ESCALATED_TO_HUMAN,
+                      {"run_id": run_id, "stage": event["stage"],
+                       "reason": args.get("reason", "")}, client=c["events"])
+    except Exception as exc:  # noqa: BLE001 — see below: the token must still settle
+        # The settle is what releases the state machine. Letting a failed PutEvents skip
+        # it would park a live task token on a run that has already escalated, and the
+        # only thing that ever frees it is the stage's own timeout (7200s for data_prep,
+        # 21600s for finetune) -- the zombie that MarkRunDone/MarkRunFailed and #52 all
+        # exist to prevent, re-entered through the notification path.
+        print(f"[driver] could not emit {ev.ESCALATED_TO_HUMAN} for {run_id}: {exc}")
     if event.get("task_token"):
         c["sfn"].send_task_failure(taskToken=event["task_token"],
                                    error="EscalatedToHuman",

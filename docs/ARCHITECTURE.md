@@ -146,6 +146,21 @@ Two spine details that are policy, not plumbing:
   anywhere" for a sweep, so the escalation is now recorded in stage-events on **both** paths,
   carrying `run_row` to say which one ran. That write is bookkeeping and is wrapped: a
   failing events table must never withhold the SNS page or the `EscalatedToHuman` event.
+- **An escalation's channels are independent, and the one that reaches nobody must not be
+  the gate.** `handle_escalate` notifies four ways: SNS to a human, a stage event for the
+  console timeline, `EscalatedToHuman` on the bus for the conductor, and `send_task_failure`
+  to release the state machine. The SNS publish was the **first** statement and unwrapped,
+  so a failed publish took all three of the others with it — including the settle, leaving a
+  live task token on a run that had already escalated, freed only by the stage's own timeout
+  (7200s for data_prep, 21600s for finetune). That is the worst possible thing to gate on
+  *this* call: **`llmops-escalations` has zero subscribers**, so SNS is the one channel
+  already known to deliver to no one. `ensure_topic` in `deploy/03_storage.py` reports it as
+  `NO SUBSCRIBERS — every escalate_human call publishes into the void` rather than calling
+  the topic healthy, because a deploy cannot invent an address; the fix is
+  `--escalation-email <addr>`, and until someone supplies one the runtime has to assume that
+  channel is dead. Each notification is now wrapped and logged on its own, in ascending
+  order of what it costs to lose: SNS, then the timeline row, then the bus event, and the
+  token settle last so it happens even when every notification failed.
 - **`Teardown` always runs after deploy** — even when `SmokeTest` fails, its `Catch`
   routes to `Teardown` first. Orphaned endpoints are the #1 cost risk (Phase 4 found an
   unrelated endpoint in the account that had been InService since 2024-04).
