@@ -1274,25 +1274,6 @@ def _cost_model():
         return None
 
 
-def _rate_card_doc():
-    """The rate-card DOCUMENT from S3 as a plain dict, or None.
-
-    Separate from _rate_card() because RateCard keeps only the SKU table: the document's
-    generated_at / rate_precedence / health fields do not survive the constructor. A
-    caller that needs them (rate_card_for_prompt) cannot get them from a RateCard, and
-    reaching for a `.doc` attribute that does not exist fails SILENTLY through getattr —
-    which would make the console tell every customer it cannot quote prices.
-    """
-    try:
-        o = s3.get_object(Bucket=data_bucket(),
-                          Key="finops/rates/rate_card_latest.json")
-        doc = json.loads(o["Body"].read())
-        return doc if isinstance(doc, dict) else None
-    except Exception as e:
-        print(f"[finops] no rate card: {e}")
-        return None
-
-
 def _rate_card():
     """Latest rate card from S3 as a RateCard, or None.
 
@@ -1304,14 +1285,17 @@ def _rate_card():
     cm = _cost_model()
     if cm is None:
         return None
-    doc = _rate_card_doc()
-    if doc is None:
+    try:
+        o = s3.get_object(Bucket=data_bucket(),
+                          Key="finops/rates/rate_card_latest.json")
+        # RateCard unwraps the document itself now. Repeating doc.get("rates", doc)
+        # here is how the knowledge stayed in ONE caller while every other caller --
+        # including an agent following the orchestrator prompt's instruction to read
+        # this exact file -- died on a ValueError from dict('rate_card').
+        return cm.RateCard(json.loads(o["Body"].read()))
+    except Exception as e:
+        print(f"[finops] no rate card: {e}")
         return None
-    # RateCard unwraps the document itself now. Repeating doc.get("rates", doc)
-    # here is how the knowledge stayed in ONE caller while every other caller --
-    # including an agent following the orchestrator prompt's instruction to read
-    # this exact file -- died on a ValueError from dict('rate_card').
-    return cm.RateCard(doc)
 
 
 def _f(v, default=0.0):
@@ -1769,48 +1753,6 @@ def rate_card_health(plan=None):
     return out
 
 
-def rate_card_for_prompt():
-    """The rate card as a compact dict to hand the orchestrator IN its invocation.
-
-    The consult prompt used to say "read s3://<bucket>/finops/rates/rate_card_latest.json
-    FIRST". That cost a whole model round-trip -- the agent had to answer with a tool call,
-    wait, then be re-invoked with the result -- and X-Ray showed the round-trip is where
-    the latency lives: on one measured 60.6s turn, 8.4s went to the call that only decided
-    to run a shell, and 44.8s to the call that finally answered. Worse, the agent did not
-    reliably obey: traces 1-6a6d85d0-... and 1-6a6d85c5-... show it fetching litellm's
-    model_prices_and_context_window.json from raw.githubusercontent.com instead, so it was
-    paying for a round-trip AND quoting the customer prices from a third party's file.
-
-    Handing it the rates removes both failures at once. The card is read here, at invoke
-    time, from the same S3 object _rate_card() uses -- so this is not a snapshot baked into
-    a prompt that goes stale the next time pricing_refresh runs.
-
-    Only unit_price/unit/source per SKU: the full document is 10463 bytes of provenance
-    (realized_from bases, usage types, CE windows) the agent does not quote, and every
-    injected byte is billed on every turn. 16 SKUs compact to ~1.8 KB.
-
-    Returns None when the card is unreadable -- the caller must then say it cannot quote
-    prices, exactly as the prompt already required. An empty dict here would read as "no
-    rates exist" and invite an invented number.
-
-    Reads the DOCUMENT, not a RateCard: the constructor keeps only the SKU table, so
-    generated_at / rate_precedence do not survive it, and there is no `.doc` attribute to
-    reach back through. getattr(card, "doc", None) returns None silently -- which would
-    ship a console that tells every customer it cannot quote prices.
-    """
-    doc = _rate_card_doc() or {}
-    rates = doc.get("rates") or {}
-    if not rates:
-        return None
-    return {
-        "generated_at": doc.get("generated_at", ""),
-        "rate_precedence": doc.get("rate_precedence", []),
-        "rates": {k: {"unit_price": v.get("unit_price"), "unit": v.get("unit"),
-                      "source": v.get("source")}
-                  for k, v in rates.items() if isinstance(v, dict)},
-    }
-
-
 def cost_variance(estimates=None, overview=None):
     """Estimate vs actual per run, naming the driving category rather than one aggregate %.
 
@@ -1957,9 +1899,15 @@ def _user_may_task(user):
     return DS_GROUP in groups or APPROVER_GROUP in groups
 
 
-def _append_messages(task_id, msgs, extra_update="", extra_names=None, extra_values=None):
+def _append_messages(task_id, msgs, extra_update="", extra_names=None, extra_values=None,
+                     drop_partial=False):
     """Append to the messages list atomically-enough (single writer per task is
-    enforced by the thinking-status lock at the route layer)."""
+    enforced by the thinking-status lock at the route layer).
+
+    drop_partial removes the streamed draft in the SAME write that commits the real
+    message. Two writes would leave a window in which a poll (every 3s during a turn)
+    sees both, and the customer watches the reply appear twice.
+    """
     names = {"#m": "messages"}
     values = {":new": msgs, ":empty": [], ":t": _now_iso()}
     expr = "SET #m = list_append(if_not_exists(#m, :empty), :new), updated_at = :t"
@@ -1967,6 +1915,8 @@ def _append_messages(task_id, msgs, extra_update="", extra_names=None, extra_val
         expr += ", " + extra_update
         names.update(extra_names or {})
         values.update(extra_values or {})
+    if drop_partial:
+        expr += " REMOVE partial_reply"
     tasks_tbl.update_item(Key={"id": task_id}, UpdateExpression=expr,
                           ExpressionAttributeNames=names,
                           ExpressionAttributeValues=values)
@@ -2465,6 +2415,41 @@ _DISPATCH_RE_ASK = (
     "function NOW, exactly once, with {plan_uri, params, cost_estimate_usd}, using "
     "the plan_uri you wrote. Emit only that tool call.")
 
+# How often the in-flight reply is written for the browser to see. The frontend polls
+# every 3s while a turn is running (frontend.html: busy ? 3000 : 15000), so a shorter
+# flush buys nothing a customer can perceive and costs a DynamoDB write per flush.
+_STREAM_FLUSH_S = 2.0
+
+
+def _stream_sink(task_id):
+    """A throttled progress writer for the in-flight reply.
+
+    Writes to a SEPARATE `partial_reply` attribute, never into `messages`. Appending
+    real messages as the text grows would put half-sentences into the transcript the
+    next turn replays to the agent (_replay_context) and into the record an approval is
+    signed against — the reply must enter `messages` exactly once, whole, at the end.
+    partial_reply is display-only scaffolding and is cleared when the turn lands.
+
+    Returns None when the flush interval has not elapsed, so the caller need not track
+    time itself. The closure holds the last-write time; there is one sink per turn and
+    one writer per task (the thinking-status lock at the route layer).
+    """
+    state = {"at": 0.0, "n": 0}
+
+    def sink(text_so_far):
+        now = time.time()
+        if now - state["at"] < _STREAM_FLUSH_S:
+            return
+        state["at"] = now
+        state["n"] += 1
+        tasks_tbl.update_item(
+            Key={"id": task_id},
+            UpdateExpression="SET partial_reply = :p, updated_at = :t",
+            ExpressionAttributeValues={":p": str(text_so_far)[:8000], ":t": _now_iso()})
+
+    sink.flushes = lambda: state["n"]
+    return sink
+
 
 def run_task_turn(task_id, accept=False):
     """One orchestrator turn: send pending user/system messages, service tools,
@@ -2495,17 +2480,6 @@ def run_task_turn(task_id, accept=False):
                 or task.get("plan_uri") or f"s3://{b}/tasks/{task_id}/plan.json")
     params = {"task": "consult", "task_id": task_id,
               "plan_uri": str(plan_uri), "bucket": b, "region": REGION}
-    # Hand the agent its prices instead of making it fetch them. The prompt used to say
-    # "read s3://<bucket>/finops/rates/rate_card_latest.json FIRST", which cost a whole
-    # model round-trip per turn -- and X-Ray shows the round-trip IS the latency (one
-    # measured 60.6s turn: 8.4s for the call that only decided to run a shell, 44.8s for
-    # the call that finally answered). It also did not work: the agent fetched litellm's
-    # price file off raw.githubusercontent.com instead, so it paid for the round-trip AND
-    # quoted the customer a third party's prices. Read fresh here every turn, so this is
-    # not a snapshot that goes stale when pricing_refresh next runs.
-    card = rate_card_for_prompt()
-    if card:
-        params["rate_card"] = card
     envelope = json.dumps({"run_id": f"task-{task_id}", "stage": "consult",
                            "manifest_uri": "", "params": params}, default=str)
     if approval_ctx:
@@ -2530,6 +2504,7 @@ def run_task_turn(task_id, accept=False):
     messages = _chat_user_text(body_text)
 
     collected_text = []
+    sink = _stream_sink(task_id)
     tool_rounds = 0
     re_asks = 0          # only spent on a turn that OWES a tool call (see below)
     stream_retried = False
@@ -2560,14 +2535,22 @@ def run_task_turn(task_id, accept=False):
                 _task_fail(task_id, f"invoke failed: {e}")
                 return
 
-        out = _drain_chat(resp)
+        # Show the reply as it arrives. The prefix carries text from earlier rounds of
+        # this same turn, or a tool round would appear to erase what the agent already
+        # said in front of the customer.
+        prefix = "\n".join(t for t in collected_text if t)
+        out = _drain_chat(resp, on_text=(
+            lambda s, _p=prefix: sink((_p + "\n" + s) if _p else s)))
         # One line per turn. The first diagnosis of a stalled dispatch had NOTHING to
         # read here — the task record showed the symptom and the logs showed only
         # billing REPORTs, so the cause had to be inferred twice.
+        # flushes= is here because its absence cost a diagnosis: the first live check saw
+        # no partial_reply and this line could not say whether the sink never fired or the
+        # 3s poll simply missed a short turn. Those need opposite fixes.
         print(f"[task-chat] {task_id} accept={accept} sess={sess} "
               f"stop={out['stop_reason']} tool={(out['tool_use'] or {}).get('name')} "
               f"text={len(out['text'] or '')}b err={out['error']} "
-              f"rounds={tool_rounds} re_asks={re_asks}")
+              f"rounds={tool_rounds} re_asks={re_asks} flushes={sink.flushes()}")
         if out["text"]:
             collected_text.append(out["text"])
 
@@ -2719,29 +2702,54 @@ def run_task_turn(task_id, accept=False):
                        ":ce": str(trailer["cost_estimate_usd"])[:50]})
         _task_event(task_id, "PlanProposed", "orchestrator",
                     {"cost": str(trailer["cost_estimate_usd"])})
+    # The streamed draft dies in the same write that commits the real message, so a poll
+    # can never catch both and render the reply twice.
     if new_msgs:
-        _append_messages(task_id, new_msgs, update, names, values)
+        _append_messages(task_id, new_msgs, update, names, values, drop_partial=True)
     else:
         tasks_tbl.update_item(Key={"id": task_id},
-                              UpdateExpression=f"SET {update}, updated_at = :t",
+                              UpdateExpression=f"SET {update}, updated_at = :t "
+                                               f"REMOVE partial_reply",
                               ExpressionAttributeNames=names,
                               ExpressionAttributeValues={**values, ":t": _now_iso()})
 
 
 def _task_fail(task_id, msg):
     tasks_tbl.update_item(Key={"id": task_id},
-                          UpdateExpression="SET #s = :s, error_msg = :e, updated_at = :t",
+                          UpdateExpression="SET #s = :s, error_msg = :e, updated_at = :t "
+                                           "REMOVE partial_reply",
                           ExpressionAttributeNames={"#s": "status"},
                           ExpressionAttributeValues={":s": "error", ":e": str(msg)[:300],
                                                      ":t": _now_iso()})
     _task_event(task_id, "TurnFailed", "worker", {"error": str(msg)[:200]})
 
 
-def _drain_chat(resp):
-    """Ported from the driver's _drain — same stream shape, same tolerance."""
+def _drain_chat(resp, on_text=None):
+    """Ported from the driver's _drain — same stream shape, same tolerance.
+
+    on_text(joined_text_so_far) is called as deltas arrive, so the customer can watch
+    the reply build instead of staring at "thinking…" for the whole turn. MEASURED on
+    the live orchestrator harness: the first text delta landed at 8.4s of a 24.65s turn
+    and the 214 deltas spread over 16.04s — 65% of wall clock. The stream was always
+    incremental; the buffering was ours, right here, in a list nobody could see.
+
+    The sink is called at most every _STREAM_FLUSH_S seconds (see _stream_sink): one
+    DynamoDB write per delta would be 214 writes for that turn, which is both throttling
+    risk and a cost nobody asked for.
+
+    A sink that raises must not kill the turn — a failed progress write is cosmetic, but
+    losing the reply is not. So it is called defensively.
+    """
     text, tool_use, stop_reason, error = [], None, None, None
     try:
         for ev_ in resp.get("stream", []):
+            if on_text is not None and "contentBlockDelta" in ev_:
+                d_ = ev_["contentBlockDelta"].get("delta", {})
+                if "text" in d_:
+                    try:
+                        on_text("".join(text) + d_["text"])
+                    except Exception as sink_exc:
+                        print(f"[task-chat] progress sink failed (ignored): {sink_exc}")
             if "contentBlockDelta" in ev_:
                 delta = ev_["contentBlockDelta"].get("delta", {})
                 if "text" in delta:
