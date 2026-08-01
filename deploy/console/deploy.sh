@@ -105,6 +105,16 @@ else
     || echo "  WARNING: self-signup is ENABLED on this pool — any stranger can register and, because the dashboard accepts any valid token from it, gain every write endpoint"
 fi
 
+# ── Cognito groups (idempotent): approver gates spend, datascience may consult ─
+for G in llmops-approver llmops-datascience; do
+  aws cognito-idp get-group --user-pool-id "$POOL_ID" --group-name "$G" --region "$REGION" >/dev/null 2>&1 || \
+    aws cognito-idp create-group --user-pool-id "$POOL_ID" --group-name "$G" --region "$REGION" \
+      --description "llmops console authorization group" >/dev/null
+  # admin sits in both: may consult AND approve (but never self-approve — server rule)
+  aws cognito-idp admin-add-user-to-group --user-pool-id "$POOL_ID" --username admin \
+    --group-name "$G" --region "$REGION" 2>/dev/null || true
+done
+
 # ── package: vendor boto3 (Lambda's builtin may predate AgentCore harness APIs) ─
 BUILD=$(mktemp -d)
 # AgentCore batch-eval/recommendation APIs need boto3 >= 1.43.51, which requires
@@ -136,16 +146,25 @@ cp "$(dirname "$0")/../../pipeline/contracts/cost_model.py" "$BUILD/cost_model.p
 "$PY_FOR_BUILD" -c "import sys; sys.path.insert(0,'$BUILD'); import cost_model; \
   assert hasattr(cost_model,'approval_decision'), 'cost_model missing approval_decision'; \
   print('bundled cost_model OK')"
+# The Tasks tab's dispatch path (launch_run servicing + approval signing) is the SAME
+# module the harness driver uses — vendored, like cost_model, so the two callers
+# cannot drift apart.
+cp "$(dirname "$0")/../../orchestration/conductor_tools.py" "$BUILD/conductor_tools.py"
+"$PY_FOR_BUILD" -c "import sys; sys.path.insert(0,'$BUILD'); import conductor_tools; \
+  assert hasattr(conductor_tools,'service_launch_run'), 'conductor_tools missing service_launch_run'; \
+  print('bundled conductor_tools OK')"
 (cd "$BUILD" && zip -rq /tmp/llmops-admin-dashboard.zip .)
 
-ENV_VARS="Variables={CONSOLE_TABLE=$TABLE,RUNS_TABLE=llmops-pipeline-runs,EVENTS_TABLE=llmops-stage-events,STATE_MACHINE=llmops-pipeline,START_FN=llmops-start-pipeline,DATA_BUCKET=$DATA_BUCKET,COGNITO_POOL_ID=$POOL_ID,COGNITO_CLIENT_ID=$CLIENT_ID,JUDGE_MODEL=$JUDGE_MODEL,SPANS_SINCE=$SPANS_SINCE,OPTIMIZE_HARNESS=$OPTIMIZE_HARNESS}"
+ENV_VARS="Variables={CONSOLE_TABLE=$TABLE,RUNS_TABLE=llmops-pipeline-runs,EVENTS_TABLE=llmops-stage-events,TASKS_TABLE=llmops-tasks,STATE_MACHINE=llmops-pipeline,START_FN=llmops-start-pipeline,DATA_BUCKET=$DATA_BUCKET,COGNITO_POOL_ID=$POOL_ID,COGNITO_CLIENT_ID=$CLIENT_ID,JUDGE_MODEL=$JUDGE_MODEL,SPANS_SINCE=$SPANS_SINCE,OPTIMIZE_HARNESS=$OPTIMIZE_HARNESS,LLMOPS_SNS_TOPIC=arn:aws:sns:$REGION:$ACCOUNT_ID:llmops-escalations,APPROVAL_KEY=alias/llmops-approval,DS_GROUP=llmops-datascience}"
 
+# timeout 900: one orchestrator consultation turn can stream for up to 840s; the
+# old 300 killed the worker mid-turn and left the task stuck in 'thinking'.
 if aws lambda get-function --function-name "$FN" --region "$REGION" >/dev/null 2>&1; then
   aws lambda update-function-code --function-name "$FN" --zip-file fileb:///tmp/llmops-admin-dashboard.zip --region "$REGION" >/dev/null
   aws lambda wait function-updated --function-name "$FN" --region "$REGION"
-  aws lambda update-function-configuration --function-name "$FN" --environment "$ENV_VARS" --region "$REGION" >/dev/null
+  aws lambda update-function-configuration --function-name "$FN" --environment "$ENV_VARS" --timeout 900 --region "$REGION" >/dev/null
 else
-  aws lambda create-function --function-name "$FN" --runtime python3.12 --timeout 300 --memory-size 512 \
+  aws lambda create-function --function-name "$FN" --runtime python3.12 --timeout 900 --memory-size 512 \
     --role "arn:aws:iam::$ACCOUNT_ID:role/$ROLE" --handler lambda_function.handler \
     --zip-file fileb:///tmp/llmops-admin-dashboard.zip --environment "$ENV_VARS" --region "$REGION" >/dev/null
 fi

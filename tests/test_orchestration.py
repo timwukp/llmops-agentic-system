@@ -275,8 +275,38 @@ class TestDriver:
         out = driver.handler(driver_event(), clients=c)
         # first claim rejected, second (empty-but-valid) accepted
         assert out["status"] == "completed"
-        rejection = ac.calls[1]["messages"][0]["content"][0]["toolResult"]
-        assert rejection["content"][0]["json"]["status"] == "rejected"
+        # messages == [assistant toolUse echo, user toolResult] -- the resume
+        # contract; the result is in the LAST message, not the first.
+        rejection = ac.calls[1]["messages"][-1]["content"][0]["toolResult"]
+        # text block, not a json block: the harness runtime rejects content_type json
+        body = json.loads(rejection["content"][0]["text"])
+        assert body["status"] == "rejected"
+
+    def test_tool_result_resume_echoes_the_tooluse_first(self):
+        """InvokeHarness resumes a paused inline function only when handed BOTH an
+        assistant message echoing the toolUse and a user message with the matching
+        toolResult. A lone toolResult is rejected with "The number of toolResult
+        blocks at messages.N.content exceeds the number of toolUse blocks of previous
+        turn" -- the runtime's history has no call to answer. Live, that broke four
+        consecutive dispatch sessions on the console's copy of this loop; here it hid
+        behind the stream-retry, a rejected result looking like stream death."""
+        uri = "s3://llmops-data-test/runs/run-test-1/raw/data.jsonl"
+        ac = FakeAgentCore([
+            tool_use_stream("stage_complete", {"outputs": [uri]}),
+            text_stream("ack")])
+        s3 = FakeS3()
+        s3.objects[uri] = b"{}"
+        c = clients(ac, s3)
+        driver.handler(driver_event(), clients=c)
+
+        resume = ac.calls[1]["messages"]
+        assert [m["role"] for m in resume] == ["assistant", "user"]
+        echo = resume[0]["content"][0]["toolUse"]
+        result = resume[1]["content"][0]["toolResult"]
+        assert echo["name"] == "stage_complete"
+        assert echo["toolUseId"] == result["toolUseId"], \
+            "a mismatched toolUseId makes the runtime reject the resume"
+        assert echo["input"] == {"outputs": [uri]}
 
     def test_gate_null_gate_passed_fails_closed(self):
         """A gate stage whose agent omits/nulls gate_passed must NOT promote (fail closed)."""
@@ -332,7 +362,7 @@ class TestDriver:
         out = driver.handler(driver_event(), clients=c)
         assert out["status"] == "failed"
         assert len(ac.calls) == 3  # original + two re-asks (continue-and-finish nudge, then final demand)
-        assert "stage_complete" in ac.calls[1]["messages"][0]["content"][0]["text"]
+        assert "stage_complete" in ac.calls[1]["messages"][-1]["content"][0]["text"]
         assert c["sfn"].failures[0]["error"] == "MissingStageComplete"
         assert any(e["DetailType"] == ev.PIPELINE_FAILED for e in c["events"].entries)
 
@@ -364,6 +394,37 @@ class TestStartPipeline:
         sfn_input = json.loads(c["sfn"].executions[0]["input"])
         assert sfn_input["iteration"] == 0
         assert any(e["DetailType"] == ev.PIPELINE_STARTED for e in c["events"].entries)
+
+    def test_params_and_plan_arriving_as_json_strings_are_parsed(self):
+        """The orchestrator is a language model filling in an inline function's
+        arguments, and live it passed `params` as a JSON *string* rather than an
+        object. seed_manifest did `{**DEFAULT_PARAMS, **params}`, which on a str
+        raises "TypeError: 'str' object is not a mapping" -- start-pipeline 500s, the
+        toolResult says only "did not return a run_id", and a signed, approved plan
+        never dispatches. Coerce at the boundary: this is the one place that knows
+        both shapes are possible."""
+        c = {"s3": FakeS3(), "ddb": FakeDDB(), "sfn": FakeSfn(), "events": FakeEvents()}
+        out = start_pipeline.handler(
+            {"trigger_source": "conductor",
+             "params": json.dumps({"sample_count": 500, "pipeline_mode": "data_audit"}),
+             "plan": json.dumps({"goal": "distill ARC solver"})}, clients=c)
+        assert out["run_id"].startswith("run-")
+        manifest = json.loads(next(iter(c["s3"].objects.values())))
+        assert manifest["params"]["sample_count"] == 500
+        assert manifest["params"]["keep_reasoning"] is True   # defaults still merge
+        assert manifest["plan"]["goal"] == "distill ARC solver"
+        # and the mode still reaches the Choice state, which reads the execution input
+        assert json.loads(c["sfn"].executions[0]["input"])["pipeline_mode"] == "data_audit"
+
+    def test_unparseable_params_string_is_not_silently_dropped(self):
+        """A string that is not JSON must fail loudly, not vanish into defaults --
+        silently running with default params would spend GPU money on a plan nobody
+        approved."""
+        c = {"s3": FakeS3(), "ddb": FakeDDB(), "sfn": FakeSfn(), "events": FakeEvents()}
+        with pytest.raises(ValueError, match="params"):
+            start_pipeline.handler(
+                {"trigger_source": "conductor", "params": "not json at all"},
+                clients=c)
 
     def test_conductor_plan_and_param_overrides_flow_into_manifest(self):
         c = {"s3": FakeS3(), "ddb": FakeDDB(), "sfn": FakeSfn(), "events": FakeEvents()}
@@ -543,3 +604,91 @@ class TestStateMachine:
         smoke = asl["States"]["SmokeTest"]
         assert smoke["Next"] == "Teardown"
         assert smoke["Catch"][0]["Next"] == "Teardown"  # endpoint never orphaned
+
+
+class TestConductorDispatch:
+    """launch_run — declared in the orchestrator's harness.json since Phase 5,
+    serviced nowhere until the Tasks-tab work. These tests pin the fix and the
+    drift guards that would have caught the original gap."""
+
+    def test_driver_knows_launch_run(self):
+        src = (REPO / "orchestration/harness_driver/handler.py").read_text()
+        assert 'name == "launch_run"' in src, (
+            "the driver must service launch_run — for five phases it fell through "
+            "to the unknown-tool 'unsupported' branch and every conductor plan died")
+
+    def test_orchestrator_harness_tools_are_all_serviced_somewhere(self):
+        """Drift guard both directions: every inline function the orchestrator
+        declares must be handled by the console chat worker or the driver."""
+        h = json.loads((REPO / "agents/orchestrator/harness.json").read_text())
+        declared = {t["name"] for t in h["tools"] if t["type"] == "inline_function"}
+        driver_src = (REPO / "orchestration/harness_driver/handler.py").read_text()
+        console_src = (REPO / "deploy/console/lambda_function.py").read_text()
+        serviced = {name for name in declared
+                    if f'"{name}"' in driver_src or f'"{name}"' in console_src}
+        missing = declared - serviced
+        assert not missing, (f"harness declares tools nobody services: {missing} — "
+                             "they would all return 'unsupported' at runtime")
+
+    def test_orchestrator_prompt_carries_the_consult_contract(self):
+        h = json.loads((REPO / "agents/orchestrator/harness.json").read_text())
+        prompt = h["systemPrompt"][0]["text"]
+        for marker in ("consult", "PLAN ACCEPTED", "rate_card", "DATA DISCOVERY"):
+            assert marker in prompt, f"consult-mode contract lost its {marker!r} clause"
+
+    def test_orchestrator_model_is_pinned_to_fable(self):
+        """The conductor is the pre-sales brain; a quiet downgrade to a smaller
+        model is a product change, not a config tweak — pin it."""
+        h = json.loads((REPO / "agents/orchestrator/harness.json").read_text())
+        assert h["model"]["bedrockModelConfig"]["modelId"] == "global.anthropic.claude-fable-5"
+
+    def test_data_prep_prompt_carries_audit_and_mirror_tasks(self):
+        h = json.loads((REPO / "agents/data-prep/harness.json").read_text())
+        prompt = h["systemPrompt"][0]["text"]
+        assert '"audit"' in prompt and '"mirror_model"' in prompt
+        # supply-chain non-negotiables spelled out where the agent reads them
+        assert "safetensors" in prompt and "Hugging Face" in prompt
+
+    def test_state_machine_data_audit_short_path(self):
+        asl = json.loads((REPO / "orchestration/state_machine.asl.json").read_text())
+        assert asl["StartAt"] == "PipelineModeChoice"
+        choice = asl["States"]["PipelineModeChoice"]
+        # IsPresent guard: executions started without the field must not crash
+        assert choice["Choices"][0]["And"][0]["IsPresent"] is True
+        assert choice["Default"] == "DataPrepGenerate"
+        audit = asl["States"]["DataAudit"]
+        assert audit["Parameters"]["Payload"]["task"] == "audit"
+        assert audit["Parameters"]["Payload"]["harness_id"] == "llmops_data_prep"
+        # the audit run must complete WITHOUT reaching any GPU stage
+        assert audit["Next"] == "Complete"
+
+    def test_manifest_stores_the_approval_block_verbatim(self):
+        m = start_pipeline.seed_manifest("run-x", "conductor", {}, {"p": 1},
+                                         {"approved_by": "alice", "budget_usd": 50})
+        assert m["approval"] == {"approved_by": "alice", "budget_usd": 50}
+        # and absent approval stays an empty dict, not a KeyError for readers
+        m2 = start_pipeline.seed_manifest("run-y", "scheduler", {}, None)
+        assert m2["approval"] == {}
+
+def test_start_pipeline_role_can_emit_the_event_its_handler_always_emits():
+    """start_pipeline calls ev.emit_event(PIPELINE_STARTED) on every single run, but
+    its role shipped without events:PutEvents -- so the function got as far as writing
+    the manifest and the DDB row, then died with AccessDeniedException. Live, that
+    surfaced as "start-pipeline did not return a run_id" and left orphan manifests for
+    runs that never started. Every action a handler unconditionally performs must be
+    in its role."""
+    doc = json.loads((REPO / "deploy/iam/lambda_roles.json").read_text())
+    stmts = doc["roles"]["start"]["permissionsPolicy"]["Statement"]
+    allowed = set()
+    for st in stmts:
+        if st.get("Effect") != "Allow":
+            continue
+        acts = st.get("Action")
+        allowed.update([acts] if isinstance(acts, str) else acts)
+    assert "events:PutEvents" in allowed, \
+        "start_pipeline emits PIPELINE_STARTED on every run"
+    bus = [st for st in stmts
+           if "events:PutEvents" in ([st.get("Action")] if isinstance(st.get("Action"), str)
+                                     else st.get("Action", []))][0]
+    assert "llmops-pipeline" in json.dumps(bus["Resource"]), \
+        "scope PutEvents to the project bus, not *"

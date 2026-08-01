@@ -33,9 +33,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))  # repo 
 try:
     from pipeline.contracts import events as ev
     from pipeline.contracts.report import normalize_stage_complete, write_run_report
+    from orchestration import conductor_tools
 except ImportError:  # Lambda bundle layout (contracts vendored alongside)
     import events as ev  # type: ignore
     from report import normalize_stage_complete, write_run_report  # type: ignore
+    import conductor_tools  # type: ignore
 
 # (stage, task) -> EventBridge detail-type. eval/gate resolved dynamically.
 STAGE_EVENT_MAP = {
@@ -72,6 +74,19 @@ def _clients():
     }
 
 
+def _kms(c: dict):
+    """KMS client for approval-signature verification, created on first use.
+
+    Not in _clients() because only the launch_run path needs it, and the unit-test
+    fake client dicts predate it — a lazy accessor means they keep working and a
+    test can inject c["kms"] to stub verification.
+    """
+    if "kms" not in c:
+        region = os.environ.get("AWS_REGION", "us-east-1")
+        c["kms"] = boto3.client("kms", region_name=region)
+    return c["kms"]
+
+
 _arn_cache: dict = {}
 
 
@@ -97,9 +112,12 @@ def _resolve_harness_arn(harness_id: str) -> str:
     return _arn_cache[harness_id]
 
 
-def _invoke(ac, harness_id: str, sess: str, content: list, qualifier: Optional[str]):
+def _invoke(ac, harness_id: str, sess: str, messages: list, qualifier: Optional[str]):
+    """`messages` is the full messages list -- a resume needs two entries (assistant
+    toolUse echo + user toolResult), so this can no longer wrap a single content
+    block. See _tool_result_content."""
     kwargs = dict(harnessArn=_resolve_harness_arn(harness_id), runtimeSessionId=sess,
-                  messages=[{"role": "user", "content": content}])
+                  messages=messages)
     if qualifier:
         kwargs["qualifier"] = qualifier
     return ac.invoke_harness(**kwargs)
@@ -136,10 +154,34 @@ def _drain(resp) -> dict:
             "stop_reason": stop_reason, "error": error}
 
 
-def _tool_result_content(tool_use_id: str, payload: dict) -> list:
-    return [{"toolResult": {"toolUseId": tool_use_id,
-                            "content": [{"json": payload}],
-                            "status": "success"}}]
+def _user_text(text: str) -> list:
+    """A plain user turn as a messages list."""
+    return [{"role": "user", "content": [{"text": text}]}]
+
+
+def _tool_result_content(tool_use: dict, payload: dict) -> list:
+    """Resume a paused inline function: echo the toolUse, THEN answer it.
+
+    Two messages, per the InvokeHarness pause/resume contract -- an assistant message
+    replaying the emitted toolUse, then a user message with the matching toolResult.
+    A lone toolResult is rejected ("The number of toolResult blocks at
+    messages.N.content exceeds the number of toolUse blocks of previous turn"),
+    because the history handed to the runtime contains no call to answer. Found live
+    on the console's dispatch path, where it broke four sessions in a row; here the
+    same bug hid behind the stream-retry, a rejected result looking like stream death.
+
+    JSON travels in a TEXT block: `json` blocks come back as
+    "runtimeClientError ... content_type=<json_> | unsupported type"."""
+    return [
+        {"role": "assistant", "content": [{"toolUse": {
+            "toolUseId": tool_use["toolUseId"],
+            "name": tool_use["name"],
+            "input": tool_use.get("input") or {}}}]},
+        {"role": "user", "content": [{"toolResult": {
+            "toolUseId": tool_use["toolUseId"],
+            "content": [{"text": json.dumps(payload, default=str)}],
+            "status": "success"}}]},
+    ]
 
 
 def verify_outputs(s3, outputs: list) -> list:
@@ -406,7 +448,7 @@ def handler(event, context=None, clients=None):
         stream_retried = bool(event.get("_stream_retried"))
         re_asks = int(event.get("_re_asks", 0))
     else:
-        content = [{"text": json.dumps(payload, default=str)}]
+        messages = _user_text(json.dumps(payload, default=str))
         stream_retried = False
         re_asks = 0  # up to 2: continue-and-finish nudge, then final demand
 
@@ -427,7 +469,7 @@ def handler(event, context=None, clients=None):
         if not first_turn and _out_of_time():
             return _self_reinvoke()
         first_turn = False
-        resp = _invoke(c["agentcore"], event["harness_id"], sess, content,
+        resp = _invoke(c["agentcore"], event["harness_id"], sess, messages,
                        event.get("qualifier"))
         out = _drain(resp)
 
@@ -436,29 +478,34 @@ def handler(event, context=None, clients=None):
             stream_retried = True
             if _is_model_5xx(out["error"]):
                 _maybe_failover_model(c, event)  # vendor-quota burst: hot-swap model
-            content = [{"text": "The stream was interrupted. Continue from where "
-                                "you left off; call your pending inline function."}]
+            messages = _user_text("The stream was interrupted. Continue from where "
+                                  "you left off; call your pending inline function.")
             continue
 
         tu = out["tool_use"]
+        # Only a stopReason of "tool_use" means the harness is WAITING for a result.
+        # A toolUse block riding along with end_turn was already serviced inside the
+        # harness; replying to it makes the next ConverseStream invalid with
+        # "toolResult blocks ... exceeds the number of toolUse blocks of previous
+        # turn" (found live on the console's dispatch path, same shape here).
         if tu and out["stop_reason"] == "tool_use":
             name, args = tu["name"], tu.get("input") or {}
             if name == "stage_complete":
                 result = handle_stage_complete(c, event, args)
                 if not result["ok"]:
-                    content = _tool_result_content(tu["toolUseId"], {
+                    messages = _tool_result_content(tu, {
                         "status": "rejected",
                         "reason": f"claimed outputs missing from S3: {result['missing_outputs']}. "
                                   "Write them and call stage_complete again."})
                     continue
                 _invoke(c["agentcore"], event["harness_id"], sess,
-                        _tool_result_content(tu["toolUseId"], {"status": "acknowledged"}),
+                        _tool_result_content(tu, {"status": "acknowledged"}),
                         event.get("qualifier"))
                 return {"status": "completed", **result["normalized"]}
             if name == "job_launched":
                 handle_job_launched(c, event, args)
                 _invoke(c["agentcore"], event["harness_id"], sess,
-                        _tool_result_content(tu["toolUseId"], {"status": "released"}),
+                        _tool_result_content(tu, {"status": "released"}),
                         event.get("qualifier"))
                 return {"status": "released", "job_name": args.get("job_name")}
             if name == "checkpoint":
@@ -467,24 +514,73 @@ def handler(event, context=None, clients=None):
                                        InvocationType="Event",
                                        Payload=json.dumps({**event, "_resumed": True}))
                     return {"status": "self_reinvoked"}
-                content = _tool_result_content(tu["toolUseId"], {"status": "continue"})
+                messages = _tool_result_content(tu, {"status": "continue"})
                 continue
             if name == "escalate_human":
                 handle_escalate(c, event, args)
                 _invoke(c["agentcore"], event["harness_id"], sess,
-                        _tool_result_content(tu["toolUseId"], {"status": "escalated"}),
+                        _tool_result_content(tu, {"status": "escalated"}),
                         event.get("qualifier"))
                 return {"status": "escalated"}
+            if name == "resolve_escalation":
+                # Conductor triage verdict: record it where the escalation lives
+                # (stage-events) and emit the resolution event. Discovered unserviced
+                # by the same drift guard that found launch_run — a triage that ends
+                # in "unsupported" leaves the pipeline paused forever.
+                _record_stage_event(c["ddb"], args.get("run_id", event.get("run_id", "")),
+                                    "orchestrator", "EscalationResolved",
+                                    {"decision": args.get("decision"),
+                                     "rationale": str(args.get("rationale", ""))[:500],
+                                     "adjusted_params": args.get("adjusted_params") or {}})
+                _invoke(c["agentcore"], event["harness_id"], sess,
+                        _tool_result_content(tu, {"status": "recorded"}),
+                        event.get("qualifier"))
+                return {"status": "resolved", "decision": args.get("decision"),
+                        "run_id": args.get("run_id")}
+            if name == "write_report":
+                # trust-but-verify, same as every artifact claim
+                missing = verify_outputs(c["s3"], [args.get("report_uri", "")])
+                if missing:
+                    messages = _tool_result_content(tu, {
+                        "status": "rejected",
+                        "reason": f"report_uri not in S3: {missing}. Write it first."})
+                    continue
+                _invoke(c["agentcore"], event["harness_id"], sess,
+                        _tool_result_content(tu, {"status": "recorded"}),
+                        event.get("qualifier"))
+                return {"status": "completed", "report_uri": args.get("report_uri"),
+                        "headline": str(args.get("headline", ""))[:300]}
+            if name == "launch_run":
+                # The conductor's dispatch tool, serviced through the same shared
+                # module the console's Tasks tab uses — one implementation, no drift.
+                # From Phase 5 until this branch existed, launch_run fell through to
+                # the unknown-tool fallthrough below and every conductor plan died
+                # with {"status": "unsupported"}.
+                result = conductor_tools.service_launch_run(
+                    c["lambda"], c["s3"], _kms(c), args,
+                    os.environ.get("START_FN", "llmops-start-pipeline"),
+                    expected=(event.get("params") or {}).get("approval_context"))
+                if not result["ok"]:
+                    messages = _tool_result_content(tu, {
+                        "status": "rejected", "reason": result["reason"]})
+                    continue
+                _invoke(c["agentcore"], event["harness_id"], sess,
+                        _tool_result_content(tu, {
+                            "status": "dispatched", "run_id": result["run_id"]}),
+                        event.get("qualifier"))
+                return {"status": "dispatched", "run_id": result["run_id"],
+                        "manifest_uri": result["manifest_uri"],
+                        "execution_arn": result["execution_arn"]}
             if name in FINOPS_TERMINAL_TOOLS and _is_finops(event):
                 result = handle_finops_tool(c, event, name, args)
                 if not result["ok"]:
-                    content = _tool_result_content(tu["toolUseId"], {
+                    messages = _tool_result_content(tu, {
                         "status": "rejected", "reason": result["reason"]})
                     continue
                 # flag_variance is a FINDING, not the end of the task: an audit can
                 # flag several runs in one turn, so acknowledge and let it continue.
                 # The report/rate-card calls are terminal.
-                ack = _tool_result_content(tu["toolUseId"], {"status": "recorded"})
+                ack = _tool_result_content(tu, {"status": "recorded"})
                 if name == "flag_variance":
                     content = ack
                     continue
@@ -492,13 +588,13 @@ def handler(event, context=None, clients=None):
                         event.get("qualifier"))
                 return {"status": "completed", "tool": name, **result["args"]}
             # unknown tool — acknowledge and continue rather than dying
-            content = _tool_result_content(tu["toolUseId"], {"status": "unsupported"})
+            messages = _tool_result_content(tu, {"status": "unsupported"})
             continue
 
         # Stream ended without a tool call.
         if re_asks < 2:
             re_asks += 1
-            content = [{"text": RE_ASK}]
+            messages = _user_text(RE_ASK)
             continue
 
         # Re-asks exhausted → treat as stage failure.

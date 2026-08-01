@@ -57,6 +57,11 @@ SPANS_SINCE = os.environ.get("SPANS_SINCE", "2026-07-28T12:00:00Z")  # OTEL_TRAC
 OPTIMIZE_HARNESS = os.environ.get("OPTIMIZE_HARNESS", "llmops_orchestrator")
 ALLOWED_ORIGIN = os.environ.get("ALLOWED_ORIGIN", "")  # same-origin by default — leave empty
 
+TASKS_TABLE = os.environ.get("TASKS_TABLE", "llmops-tasks")            # PK id (task- prefix)
+DS_GROUP = os.environ.get("DS_GROUP", "llmops-datascience")            # may create/chat tasks
+APPROVAL_KEY = os.environ.get("APPROVAL_KEY", "alias/llmops-approval") # KMS signing key
+LLMOPS_SNS_TOPIC = os.environ.get("LLMOPS_SNS_TOPIC", "")
+
 ctl = boto3.client("bedrock-agentcore-control", region_name=REGION)
 data = boto3.client("bedrock-agentcore", region_name=REGION)
 s3 = boto3.client("s3", region_name=REGION)
@@ -74,6 +79,23 @@ runs_tbl = _ddb.Table(RUNS_TABLE) if RUNS_TABLE else None
 events_tbl = _ddb.Table(EVENTS_TABLE) if EVENTS_TABLE else None
 estimates_tbl = _ddb.Table(ESTIMATES_TABLE) if ESTIMATES_TABLE else None
 actuals_tbl = _ddb.Table(ACTUALS_TABLE) if ACTUALS_TABLE else None
+tasks_tbl = _ddb.Table(TASKS_TABLE) if TASKS_TABLE else None
+kms = boto3.client("kms", region_name=REGION)
+sns = boto3.client("sns", region_name=REGION)
+# Chat turns stream for minutes; the default 60s read timeout kills them and an
+# auto-retry silently re-runs a whole turn — same hard-won config as the driver's.
+from botocore.config import Config as _BotoConfig
+agentcore_chat = boto3.client(
+    "bedrock-agentcore", region_name=REGION,
+    config=_BotoConfig(read_timeout=870, connect_timeout=30, retries={"max_attempts": 0}))
+
+try:
+    import conductor_tools  # vendored into the zip beside cost_model.py
+except ImportError:  # repo layout (unit tests)
+    import sys as _sys
+    _sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                     "..", "..", "orchestration"))
+    import conductor_tools  # type: ignore
 
 EVAL_RESULTS_LG_PREFIX = "/aws/bedrock-agentcore/evaluations/results/"
 
@@ -1229,6 +1251,62 @@ def decide_approval(body, user, now_iso):
                                    ":r": reason})
     out = {"ok": True, "estimate_id": eid, "status": new_status,
            "approved_by": username}
+
+    task_id = str(item.get("task_id") or "")
+    if task_id:
+        # A Tasks-tab plan behind this estimate. The dispatch must go through the
+        # orchestrator's launch_run (supreme directive: through the pipeline), not
+        # start_run — and the approver's decision is itself a signed audit record.
+        task = _task_get(task_id)
+        if task:
+            prev = (task.get("approvals") or [None])[-1]
+            rec2 = {
+                "task_id": task_id, "plan_uri": str(task.get("plan_uri", "")),
+                "plan_sha256": str((prev or {}).get("plan_sha256", "")),
+                "cost_estimate_usd": str(task.get("cost_estimate_usd", "")),
+                "gate": {"approval_required": True,
+                         # str(): DynamoDB rejects floats, and the signature
+                         # canonicalizes with default=str anyway
+                         "single_run_limit_usd": str(APPROVAL_LIMIT_USD),
+                         "cumulative_limit_usd": str(CUMULATIVE_LIMIT_USD)},
+                "decision": "accepted" if decision == "approve" else "rejected",
+                "approved_by": username, "cognito_sub": str((user or {}).get("sub", "")),
+                "source_ip": str((user or {}).get("source_ip", "")),
+                "approved_at": now_iso,
+                "prev_event_sha256": conductor_tools.chain_hash(prev),
+            }
+            signed2 = conductor_tools.sign_record(kms, rec2, APPROVAL_KEY)
+            s3.put_object(Bucket=data_bucket(),
+                          Key=f"tasks/{task_id}/approval-{decision}.json",
+                          Body=json.dumps(signed2, indent=2).encode(),
+                          ContentType="application/json")
+            if decision == "approve":
+                accept_msg = {"role": "system",
+                              "text": f"PLAN ACCEPTED by {username} (record "
+                                      f"{signed2['record_sha256'][:12]}) at {now_iso}. "
+                                      "Budget approval granted. Dispatch the run now: call "
+                                      "launch_run exactly once with the plan_uri you wrote.",
+                              "at": now_iso, "by": "system"}
+                _append_messages(task_id, [accept_msg],
+                                 "#s = :s, approvals = list_append(if_not_exists(approvals, :e), :a)",
+                                 {"#s": "status"}, {":s": "accepting", ":a": [signed2], ":e": []})
+                _task_event(task_id, "BudgetApproved", username, {"estimate_id": eid})
+                _enqueue_task_turn(task_id, accept=True)
+                out["task"] = {"id": task_id, "status": "accepting"}
+            else:
+                # rejection is feedback, not a tombstone: feed the reason back to the
+                # orchestrator so it can revise the plan
+                fb = {"role": "user",
+                      "text": f"[budget approval REJECTED by {username}] {reason}",
+                      "at": now_iso, "by": username}
+                _append_messages(task_id, [fb],
+                                 "#s = :s, approvals = list_append(if_not_exists(approvals, :e), :a)",
+                                 {"#s": "status"}, {":s": "thinking", ":a": [signed2], ":e": []})
+                _task_event(task_id, "BudgetRejected", username, {"reason": reason[:200]})
+                _enqueue_task_turn(task_id)
+                out["task"] = {"id": task_id, "status": "thinking"}
+        return out
+
     if decision == "approve" and body.get("launch"):
         launch = start_run({"estimate_id": eid, "note": f"approved by {username}"})
         # The nested status_code is dropped deliberately: the approval itself succeeded
@@ -1488,6 +1566,685 @@ def finops_run(body):
                 "status_code": 502}
 
 
+# ── Tasks: goal-driven entry — human ⇄ orchestrator consultation ──────────────
+# A task is a consultation with the llmops_orchestrator (pre-sales solution
+# architect): the human states a goal, the agent guides requirements (data first),
+# proposes a signed-off-able plan, and dispatches through the pipeline only after
+# a human's KMS-signed acceptance. The DDB record is the source of truth for the
+# conversation; the AgentCore session is a cache of it that may die (900s idle).
+
+TASK_ACTIVE = ("thinking", "accepting")           # one in-flight turn per task
+TASK_TERMINAL = ("dispatched", "closed", "error")
+STALE_TURN_MIN = 20                               # zombie 'thinking' escape hatch
+
+
+def _now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _task_get(task_id):
+    if not tasks_tbl:
+        return None
+    return tasks_tbl.get_item(Key={"id": task_id}).get("Item")
+
+
+def _task_event(task_id, event_name, actor, detail=None):
+    """Audit + flow-diagram feed, one write: the same stage-events table the
+    pipeline uses, keyed by the task id, drives both the lifecycle SVG and the
+    'who did what when' question."""
+    if not events_tbl:
+        return
+    try:
+        events_tbl.put_item(Item={
+            "run_id": task_id,
+            "sk": f"{_now_iso()}#task#{event_name}",
+            "stage": "task", "event_name": event_name,
+            "detail": json.dumps({"actor": actor, **(detail or {})}, default=str)[:2000]})
+    except Exception:
+        pass  # an audit-log write must never take the user action down with it
+
+
+def _transcript_append(task_id, entries):
+    """Append-only full-text audit copy in S3. DDB truncation never loses history."""
+    b = data_bucket()
+    key = f"tasks/{task_id}/transcript.jsonl"
+    try:
+        old = s3.get_object(Bucket=b, Key=key)["Body"].read()
+    except Exception:
+        old = b""
+    lines = b"".join(json.dumps(e, default=str).encode() + b"\n" for e in entries)
+    s3.put_object(Bucket=b, Key=key, Body=old + lines, ContentType="application/json")
+
+
+def _task_session(task):
+    return session_id(f"task-{task['id']}", "consult", f"s{int(task.get('session_seq', 0))}")
+
+
+def _user_may_task(user):
+    groups = (user or {}).get("groups", []) or []
+    return DS_GROUP in groups or APPROVER_GROUP in groups
+
+
+def _append_messages(task_id, msgs, extra_update="", extra_names=None, extra_values=None):
+    """Append to the messages list atomically-enough (single writer per task is
+    enforced by the thinking-status lock at the route layer)."""
+    names = {"#m": "messages"}
+    values = {":new": msgs, ":empty": [], ":t": _now_iso()}
+    expr = "SET #m = list_append(if_not_exists(#m, :empty), :new), updated_at = :t"
+    if extra_update:
+        expr += ", " + extra_update
+        names.update(extra_names or {})
+        values.update(extra_values or {})
+    tasks_tbl.update_item(Key={"id": task_id}, UpdateExpression=expr,
+                          ExpressionAttributeNames=names,
+                          ExpressionAttributeValues=values)
+    _transcript_append(task_id, msgs)
+
+
+def create_task(body, user):
+    if not _user_may_task(user):
+        return {"error": f"membership in {DS_GROUP} or {APPROVER_GROUP} required",
+                "status_code": 403}
+    goal = str(body.get("goal", "")).strip()
+    if not goal:
+        return {"error": "goal is required", "status_code": 400}
+    task_id = "task-" + secrets.token_hex(8)
+    now = _now_iso()
+    first = {"role": "user", "text": goal[:8000], "at": now,
+             "by": user["username"]}
+    item = {"id": task_id, "status": "thinking", "created_by": user["username"],
+            "created_at": now, "updated_at": now, "goal": goal[:500],
+            "messages": [first], "plan_uri": "", "plan_summary": "",
+            "cost_estimate_usd": "", "run_id": "", "session_seq": 0,
+            "error_msg": ""}
+    tasks_tbl.put_item(Item=item)
+    _transcript_append(task_id, [first])
+    _task_event(task_id, "TaskCreated", user["username"], {"goal": goal[:200]})
+    _enqueue_task_turn(task_id)
+    return {"ok": True, "task": item}
+
+
+def _enqueue_task_turn(task_id, accept=False):
+    if SELF_FUNCTION:
+        lam.invoke(FunctionName=SELF_FUNCTION, InvocationType="Event",
+                   Payload=json.dumps({"mode": "task-chat", "task_id": task_id,
+                                       "accept": accept}).encode())
+
+
+def list_tasks(limit=25):
+    items = []
+    if tasks_tbl:
+        items = tasks_tbl.scan(Limit=int(limit)).get("Items", [])
+    items.sort(key=lambda i: str(i.get("updated_at", "")), reverse=True)
+    return {"tasks": [{k: i.get(k, "") for k in
+                       ("id", "status", "goal", "created_by", "cost_estimate_usd",
+                        "run_id", "updated_at", "plan_summary")} for i in items]}
+
+
+def get_task(task_id):
+    item = _task_get(task_id)
+    if not item:
+        return {"error": "unknown task", "status_code": 404}
+    out = json.loads(json.dumps(item, default=str))
+    # event timeline feeds the lifecycle flow diagram
+    try:
+        evs = events_tbl.query(KeyConditionExpression=Key("run_id").eq(task_id),
+                               ScanIndexForward=True).get("Items", [])
+        out["events"] = [{"sk": str(e.get("sk", "")),
+                          "event_name": str(e.get("event_name", "")),
+                          "detail": str(e.get("detail", ""))[:500]} for e in evs]
+    except Exception:
+        out["events"] = []
+    return out
+
+
+def post_task_message(task_id, body, user):
+    if not _user_may_task(user):
+        return {"error": f"membership in {DS_GROUP} or {APPROVER_GROUP} required",
+                "status_code": 403}
+    text = str(body.get("text", "")).strip()
+    if not text:
+        return {"error": "text is required", "status_code": 400}
+    task = _task_get(task_id)
+    if not task:
+        return {"error": "unknown task", "status_code": 404}
+    status = str(task.get("status", ""))
+    if status in TASK_TERMINAL:
+        return {"error": f"task is {status}; open a new task", "status_code": 409}
+    if status in TASK_ACTIVE:
+        # zombie escape: a worker that crashed leaves 'thinking' behind forever
+        updated = str(task.get("updated_at", ""))
+        try:
+            age_min = (datetime.now(timezone.utc)
+                       - datetime.fromisoformat(updated)).total_seconds() / 60
+        except Exception:
+            age_min = STALE_TURN_MIN + 1
+        if age_min < STALE_TURN_MIN:
+            return {"error": "a turn is already in flight; wait for the reply",
+                    "status_code": 409}
+    msg = {"role": "user", "text": text[:8000], "at": _now_iso(),
+           "by": user["username"]}
+    _append_messages(task_id, [msg], "#s = :s", {"#s": "status"}, {":s": "thinking"})
+    _task_event(task_id, "MessageSent", user["username"])
+    _enqueue_task_turn(task_id)
+    return {"ok": True, "status": "thinking"}
+
+
+def accept_task(task_id, user):
+    """The human signs. Gate decides direct dispatch vs the Cost approval queue.
+
+    The approval record is the accountability artifact: canonical JSON of what was
+    approved, hash-chained to the previous audit event, KMS-signed so it can be
+    verified by a third party without trusting this system. See conductor_tools.
+    """
+    task = _task_get(task_id)
+    if not task:
+        return {"error": "unknown task", "status_code": 404}
+    if str(task.get("status")) != "plan_proposed":
+        return {"error": f"task is {task.get('status')}, not plan_proposed — nothing "
+                         "to accept (no replay over a decided task)", "status_code": 409}
+    if not task.get("plan_uri") or task.get("cost_estimate_usd") in ("", None):
+        return {"error": "no priced plan on record; ask the orchestrator to propose one",
+                "status_code": 409}
+
+    username = user["username"]
+    groups = user.get("groups", []) or []
+    fresh = gate_decision(task["cost_estimate_usd"])
+    needs_approval = bool(fresh.get("approval_required"))
+
+    # Same membership bar either way (datascience or approver may sign). What the
+    # gate changes is the CONSEQUENCE of signing: under-limit dispatches now;
+    # over-limit only submits to the Cost queue, where decide_approval enforces the
+    # approver group and requester != approver — that is the real spend control.
+    if not _user_may_task(user):
+        return {"error": "not authorized", "status_code": 403}
+
+    # plan_sha256 binds the signature to THIS plan's exact bytes
+    b = data_bucket()
+    uri = str(task["plan_uri"])
+    try:
+        plan_raw = s3.get_object(Bucket=b, Key=uri[5:].partition("/")[2])["Body"].read()
+    except Exception as e:
+        return {"error": f"plan_uri unreadable: {e}", "status_code": 409}
+    plan_sha = hashlib.sha256(plan_raw).hexdigest()
+
+    prev = (task.get("approvals") or [{}])[-1] if task.get("approvals") else None
+    record = {
+        "task_id": task_id, "plan_uri": uri, "plan_sha256": plan_sha,
+        "cost_estimate_usd": str(task["cost_estimate_usd"]),
+        "gate": {"approval_required": needs_approval,
+                 # str(): DynamoDB rejects floats in the stored approval record
+                 "single_run_limit_usd": str(APPROVAL_LIMIT_USD),
+                 "cumulative_limit_usd": str(CUMULATIVE_LIMIT_USD)},
+        "decision": "submitted" if needs_approval else "accepted",
+        "approved_by": username, "cognito_sub": str(user.get("sub", "")),
+        "source_ip": str(user.get("source_ip", "")), "approved_at": _now_iso(),
+        "prev_event_sha256": conductor_tools.chain_hash(prev),
+    }
+    signed = conductor_tools.sign_record(kms, record, APPROVAL_KEY)
+    s3.put_object(Bucket=b, Key=f"tasks/{task_id}/approval.json",
+                  Body=json.dumps(signed, indent=2).encode(),
+                  ContentType="application/json")
+
+    if needs_approval:
+        # into the existing Cost-tab queue; decide_approval routes back here on approve
+        eid = "est-task-" + secrets.token_hex(5)
+        estimates_tbl.put_item(Item={
+            "id": eid, "project": PROJECT, "created_at": _now_iso(),
+            "status": "pending_approval", "requested_by": task["created_by"],
+            "requested_at": _now_iso(), "worst_case_usd": str(task["cost_estimate_usd"]),
+            "task_id": task_id,
+            "justification": f"Tasks-tab plan {task_id}: {str(task.get('plan_summary'))[:300]}"})
+        tasks_tbl.update_item(
+            Key={"id": task_id},
+            UpdateExpression="SET #s = :s, approvals = list_append(if_not_exists(approvals, :e), :a), "
+                             "estimate_id = :eid, updated_at = :t",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={":s": "pending_approval", ":a": [signed],
+                                       ":e": [], ":eid": eid, ":t": _now_iso()})
+        _task_event(task_id, "ApprovalRequested", username,
+                    {"estimate_id": eid, "cost": str(task["cost_estimate_usd"])})
+        return {"ok": True, "status": "pending_approval", "estimate_id": eid,
+                "note": "over the spend limit — an approver must decide on the Cost tab"}
+
+    # under the limit: signed acceptance dispatches immediately
+    accept_msg = {"role": "system",
+                  "text": f"PLAN ACCEPTED by {username} (record {signed['record_sha256'][:12]}) "
+                          f"at {record['approved_at']}. Dispatch the run now: call launch_run "
+                          f"exactly once with the plan_uri you wrote.",
+                  "at": _now_iso(), "by": "system"}
+    _append_messages(task_id, [accept_msg],
+                     "#s = :s, approvals = list_append(if_not_exists(approvals, :e), :a)",
+                     {"#s": "status"},
+                     {":s": "accepting", ":a": [signed], ":e": []})
+    # shadow estimate so finops variance covers ALL conductor runs
+    try:
+        estimates_tbl.put_item(Item={
+            "id": "est-task-" + secrets.token_hex(5), "project": PROJECT,
+            "created_at": _now_iso(), "status": "launched",
+            "requested_by": task["created_by"],
+            "worst_case_usd": str(task["cost_estimate_usd"]), "task_id": task_id,
+            "justification": f"shadow estimate (under-limit Tasks acceptance {task_id})"})
+    except Exception:
+        pass
+    _task_event(task_id, "PlanAccepted", username,
+                {"record_sha256": signed["record_sha256"], "cost": record["cost_estimate_usd"]})
+    _enqueue_task_turn(task_id, accept=True)
+    return {"ok": True, "status": "accepting"}
+
+
+def close_task(task_id, body, user):
+    task = _task_get(task_id)
+    if not task:
+        return {"error": "unknown task", "status_code": 404}
+    reason = str(body.get("reason", "")).strip()
+    if not reason:
+        return {"error": "a close needs a reason", "status_code": 400}
+    username = user["username"]
+    groups = user.get("groups", []) or []
+    if username != str(task.get("created_by")) and APPROVER_GROUP not in groups:
+        return {"error": "only the creator or an approver may close", "status_code": 403}
+    if str(task.get("status")) in TASK_TERMINAL:
+        return {"error": f"task already {task.get('status')}", "status_code": 409}
+    msg = {"role": "system", "text": f"Task closed by {username}: {reason[:500]}",
+           "at": _now_iso(), "by": username}
+    _append_messages(task_id, [msg], "#s = :s, closed_reason = :r",
+                     {"#s": "status"}, {":s": "closed", ":r": reason[:500]})
+    _task_event(task_id, "TaskClosed", username, {"reason": reason[:200]})
+    return {"ok": True, "status": "closed"}
+
+
+def task_approval(task_id):
+    """The auditor's endpoint: records + chain + how to verify independently."""
+    task = _task_get(task_id)
+    if not task:
+        return {"error": "unknown task", "status_code": 404}
+    approvals = json.loads(json.dumps(task.get("approvals") or [], default=str))
+    key_arn = ""
+    try:
+        key_arn = kms.describe_key(KeyId=APPROVAL_KEY)["KeyMetadata"]["Arn"]
+    except Exception:
+        pass
+    return {"task_id": task_id, "approvals": approvals, "key": APPROVAL_KEY,
+            "key_arn": key_arn,
+            "verify": "recompute SHA-256 over the canonical JSON of the signed keys "
+                      "(sorted, compact), then kms verify --key-id <key_arn> "
+                      "--message-type DIGEST --signing-algorithm ECDSA_SHA_256; or "
+                      "export the public key once and verify offline"}
+
+
+# ── Tasks: the async chat worker ──────────────────────────────────────────────
+
+_TRAILER_KEYS = ("plan_uri", "plan_summary", "cost_estimate_usd")
+
+
+def _parse_plan_trailer(text):
+    """The consult protocol ends a proposal with one fenced json block. Tolerant
+    parse: last {...} span inside the last fence, else the last {...} in the text."""
+    candidate = text
+    if "```" in text:
+        parts = text.split("```")
+        for part in reversed(parts):
+            if "{" in part:
+                candidate = part
+                break
+    try:
+        start = candidate.index("{")
+        end = candidate.rindex("}") + 1
+        obj = json.loads(candidate[start:end])
+    except Exception:
+        return None
+    if not isinstance(obj, dict) or not all(k in obj for k in _TRAILER_KEYS):
+        return None
+    return {k: obj[k] for k in _TRAILER_KEYS}
+
+
+def _replay_context(task):
+    """A fresh session gets a compact reconstruction: the plan state + recent turns.
+    The DDB record is the truth; the session is a cache that died."""
+    msgs = json.loads(json.dumps(task.get("messages") or [], default=str))
+    recent = msgs[-12:]
+    lines = ["[session restarted — conversation summary follows]",
+             f"Task goal: {task.get('goal', '')}"]
+    if task.get("plan_summary"):
+        lines.append(f"Current proposed plan: {task['plan_summary']} "
+                     f"(plan_uri {task.get('plan_uri')}, "
+                     f"cost ${task.get('cost_estimate_usd')})")
+    for m in recent:
+        lines.append(f"{m.get('role')}: {str(m.get('text'))[:1500]}")
+    return "\n".join(lines)
+
+
+_DISPATCH_RE_ASK = (
+    "Your turn ended without calling launch_run, but the plan is ACCEPTED and signed "
+    "— describing the dispatch is not dispatching it. Call the launch_run inline "
+    "function NOW, exactly once, with {plan_uri, params, cost_estimate_usd}, using "
+    "the plan_uri you wrote. Emit only that tool call.")
+
+
+def run_task_turn(task_id, accept=False):
+    """One orchestrator turn: send pending user/system messages, service tools,
+    record the assistant reply. Mirrors the driver's loop, minus task tokens."""
+    task = _task_get(task_id)
+    if not task:
+        return
+    b = data_bucket()
+    hid = _resolve_harness_id(OPTIMIZE_HARNESS)
+    msgs = json.loads(json.dumps(task.get("messages") or [], default=str))
+    # everything after the last assistant message is this turn's input
+    last_a = max((i for i, m in enumerate(msgs) if m.get("role") == "assistant"),
+                 default=-1)
+    pending = msgs[last_a + 1:]
+    pending_text = "\n\n".join(str(m.get("text", "")) for m in pending) or "(continue)"
+
+    approvals = json.loads(json.dumps(task.get("approvals") or [], default=str))
+    approval_ctx = ({"approval": approvals[-1],
+                     "cost_estimate_usd": task.get("cost_estimate_usd")}
+                    if accept and approvals else None)
+
+    # The default is where to WRITE a new plan; once a plan exists the signed
+    # approval's URI is authoritative. Live, the agent wrote its plan under runs/
+    # and then stalled reconciling that against a tasks/ default it was handed at
+    # dispatch time — a plan_uri the human did not sign is the wrong plan by
+    # definition, so never suggest one.
+    plan_uri = (((approval_ctx or {}).get("approval") or {}).get("plan_uri")
+                or task.get("plan_uri") or f"s3://{b}/tasks/{task_id}/plan.json")
+    params = {"task": "consult", "task_id": task_id,
+              "plan_uri": str(plan_uri), "bucket": b, "region": REGION}
+    envelope = json.dumps({"run_id": f"task-{task_id}", "stage": "consult",
+                           "manifest_uri": "", "params": params}, default=str)
+    if approval_ctx:
+        # An accept turn must always SEE its acceptance. On a resent turn (the first
+        # attempt failed) the acceptance sits before the agent's last reply, so the
+        # slice above yields "(continue)" and the agent is asked to dispatch by a
+        # message that is no longer in front of it. Restate it from the record —
+        # the DDB approval is the truth, not the chat scrollback.
+        appr = approval_ctx["approval"]
+        pending_text = (
+            f"PLAN ACCEPTED by {appr.get('approved_by')} "
+            f"(record {str(appr.get('record_sha256', ''))[:12]}) at "
+            f"{appr.get('approved_at')}. The approved plan is {plan_uri} "
+            f"(plan_sha256 {str(appr.get('plan_sha256', ''))[:12]}, "
+            f"${appr.get('cost_estimate_usd')}). Call launch_run exactly once with "
+            f"that plan_uri now.\n\n" + pending_text)
+
+    sess = _task_session(task)
+    fresh_session = int(task.get("session_seq", 0)) > 0 and last_a >= 0
+    body_text = (envelope + "\n\n" + (_replay_context(task) + "\n\n" if fresh_session else "")
+                 + pending_text)
+    messages = _chat_user_text(body_text)
+
+    collected_text = []
+    tool_rounds = 0
+    re_asks = 0          # only spent on a turn that OWES a tool call (see below)
+    stream_retried = False
+    arn = f"arn:aws:bedrock-agentcore:{REGION}:{ACCOUNT_ID}:harness/{hid}"
+    while True:
+        try:
+            resp = agentcore_chat.invoke_harness(
+                harnessArn=arn, runtimeSessionId=sess, messages=messages)
+        except Exception as e:
+            err = str(e)
+            if "session" in err.lower() and int(task.get("session_seq", 0)) < 50:
+                # session idled out (900s) — bump seq, replay, retry once
+                tasks_tbl.update_item(Key={"id": task_id},
+                                      UpdateExpression="SET session_seq = session_seq + :one",
+                                      ExpressionAttributeValues={":one": 1})
+                task = _task_get(task_id)
+                sess = _task_session(task)
+                messages = _chat_user_text(envelope + "\n\n"
+                                           + _replay_context(task) + "\n\n"
+                                           + pending_text)
+                try:
+                    resp = agentcore_chat.invoke_harness(
+                        harnessArn=arn, runtimeSessionId=sess, messages=messages)
+                except Exception as e2:
+                    _task_fail(task_id, f"invoke failed after session retry: {e2}")
+                    return
+            else:
+                _task_fail(task_id, f"invoke failed: {e}")
+                return
+
+        out = _drain_chat(resp)
+        # One line per turn. The first diagnosis of a stalled dispatch had NOTHING to
+        # read here — the task record showed the symptom and the logs showed only
+        # billing REPORTs, so the cause had to be inferred twice.
+        print(f"[task-chat] {task_id} accept={accept} sess={sess} "
+              f"stop={out['stop_reason']} tool={(out['tool_use'] or {}).get('name')} "
+              f"text={len(out['text'] or '')}b err={out['error']} "
+              f"rounds={tool_rounds} re_asks={re_asks}")
+        if out["text"]:
+            collected_text.append(out["text"])
+
+        if out["error"] and not out["tool_use"] and not stream_retried:
+            # Involuntary stream death mid-drain — routine in production, and the
+            # driver has salvaged it since Phase 5 with a same-session retry. The
+            # chat worker did not, so a connection reset during an accept turn
+            # surfaced as "the agent refused to dispatch": a false accusation
+            # against the agent for a network event.
+            stream_retried = True
+            messages = _chat_user_text(
+                "The stream was interrupted. Continue from where you left off; "
+                "call your pending inline function.")
+            continue
+
+        if (out["stop_reason"] == "content_filtered" and not out["text"]
+                and not out["tool_use"]):
+            # The model was BLOCKED, not disobedient. Re-asking cannot help (nothing
+            # can leave that session) and calling it "the agent didn't dispatch"
+            # points the operator at the wrong thing entirely.
+            _task_fail(task_id, "the model's reply was blocked (stopReason="
+                                "content_filtered); no output could be produced. "
+                                "Rephrase and resend, or start a fresh session.")
+            return
+
+        tu = out["tool_use"]
+
+        # Service a tool call only when the harness STOPPED for one. A toolUse block
+        # can also stream alongside end_turn — that is a call the harness already ran
+        # itself (live: `shell`), and answering it makes the next ConverseStream
+        # invalid ("toolResult blocks ... exceeds the number of toolUse blocks of
+        # previous turn"), which killed three accept turns in a row. An accept turn
+        # that ends this way still owes a dispatch; the re-ask below asks in text.
+        if tu and out["stop_reason"] == "tool_use":
+            tool_rounds += 1
+            if tool_rounds > 8:
+                # A run that was already launched is spending money right now.
+                # Calling the task `error` would hide it from the operator — the cap
+                # stops the conversation, it does not undo the dispatch.
+                if _task_get(task_id).get("run_id"):
+                    print(f"[task-chat] {task_id} hit the round cap after dispatch; "
+                          "keeping status=dispatched")
+                    break
+                _task_fail(task_id, "tool loop exceeded 8 rounds")
+                return
+            name, args = tu["name"], tu.get("input") or {}
+            if name == "checkpoint":
+                messages = _chat_tool_result(tu, {"status": "continue"})
+                continue
+            if name == "page_human":
+                if LLMOPS_SNS_TOPIC:
+                    try:
+                        sns.publish(TopicArn=LLMOPS_SNS_TOPIC,
+                                    Subject=f"[llmops task {task_id}] orchestrator paged a human",
+                                    Message=json.dumps(args, default=str)[:1500])
+                    except Exception:
+                        pass
+                _task_event(task_id, "HumanPaged", "orchestrator", args)
+                messages = _chat_tool_result(tu, {"status": "paged"})
+                continue
+            if name == "launch_run":
+                already = _task_get(task_id).get("run_id")
+                if already:
+                    # "exactly once" cannot be left to the prompt: a second call
+                    # would start a second GPU run against one signed approval.
+                    # Answer with the run it already has, so the agent reports that
+                    # run rather than trying again.
+                    messages = _chat_tool_result(tu, {
+                        "status": "already_dispatched", "run_id": str(already),
+                        "reason": "this plan was already dispatched; one acceptance "
+                                  "authorizes exactly one run. Report this run_id."})
+                    continue
+                if not accept:
+                    messages = _chat_tool_result(tu, {
+                        "status": "rejected",
+                        "reason": "No PLAN ACCEPTED message has been issued. Do not "
+                                  "dispatch — propose the plan and wait for the human."})
+                    continue
+                result = conductor_tools.service_launch_run(
+                    lam, s3, kms, {**args, "approval": (approval_ctx or {}).get("approval")},
+                    START_FN, expected=approval_ctx)
+                if not result["ok"]:
+                    # The reason travels inside a toolResult the operator never sees.
+                    # Without it in the log, a rejected dispatch and a dispatch that
+                    # was never attempted look identical from outside.
+                    print(f"[task-chat] {task_id} launch_run REJECTED: "
+                          f"{result['reason']}")
+                    messages = _chat_tool_result(tu, {
+                        "status": "rejected", "reason": result["reason"]})
+                    continue
+                tasks_tbl.update_item(
+                    Key={"id": task_id},
+                    UpdateExpression="SET #s = :s, run_id = :r, execution_arn = :x, updated_at = :t",
+                    ExpressionAttributeNames={"#s": "status"},
+                    ExpressionAttributeValues={":s": "dispatched", ":r": result["run_id"],
+                                               ":x": result.get("execution_arn", ""),
+                                               ":t": _now_iso()})
+                _task_event(task_id, "RunDispatched", "orchestrator",
+                            {"run_id": result["run_id"]})
+                messages = _chat_tool_result(tu, {
+                    "status": "dispatched", "run_id": result["run_id"]})
+                continue
+            messages = _chat_tool_result(tu, {"status": "unsupported"})
+            continue
+
+        # No tool call. For most consult turns that IS the turn: the agent asked the
+        # customer a question and it is the human's move. But an accept turn owes a
+        # launch_run, and the live smoke run showed the model narrating "Dispatching
+        # exactly once with that URI:" and then stopping — the missing-signal failure
+        # the driver has re-asked for since Phase 5. Marking that an error strands a
+        # signed approval and blames the agent for what one nudge would have fixed.
+        owes_dispatch = accept and str(_task_get(task_id).get("status", "")) != "dispatched"
+        if owes_dispatch and re_asks < 2:
+            re_asks += 1
+            messages = _chat_user_text(_DISPATCH_RE_ASK)
+            continue
+
+        break  # the turn is genuinely done
+
+    reply = "\n".join(t for t in collected_text if t).strip()
+    task = _task_get(task_id)  # re-read: launch_run may have set dispatched
+    now_status = str(task.get("status", ""))
+    new_msgs = []
+    if reply:
+        new_msgs.append({"role": "assistant", "text": reply[:8000], "at": _now_iso(),
+                         "by": "orchestrator"})
+
+    trailer = _parse_plan_trailer(reply) if reply else None
+    if now_status == "dispatched":
+        final_status = "dispatched"
+    elif accept:
+        # accepted but the agent never dispatched — that is an error, not drafting
+        final_status, err = "error", "accepted plan was not dispatched by the agent"
+        tasks_tbl.update_item(Key={"id": task_id},
+                              UpdateExpression="SET error_msg = :e",
+                              ExpressionAttributeValues={":e": err})
+    elif trailer:
+        final_status = "plan_proposed"
+    else:
+        final_status = "drafting"
+
+    update = "#s = :s"
+    names = {"#s": "status"}
+    values = {":s": final_status}
+    if trailer:
+        update += ", plan_uri = :pu, plan_summary = :ps, cost_estimate_usd = :ce"
+        values.update({":pu": str(trailer["plan_uri"])[:500],
+                       ":ps": str(trailer["plan_summary"])[:2000],
+                       ":ce": str(trailer["cost_estimate_usd"])[:50]})
+        _task_event(task_id, "PlanProposed", "orchestrator",
+                    {"cost": str(trailer["cost_estimate_usd"])})
+    if new_msgs:
+        _append_messages(task_id, new_msgs, update, names, values)
+    else:
+        tasks_tbl.update_item(Key={"id": task_id},
+                              UpdateExpression=f"SET {update}, updated_at = :t",
+                              ExpressionAttributeNames=names,
+                              ExpressionAttributeValues={**values, ":t": _now_iso()})
+
+
+def _task_fail(task_id, msg):
+    tasks_tbl.update_item(Key={"id": task_id},
+                          UpdateExpression="SET #s = :s, error_msg = :e, updated_at = :t",
+                          ExpressionAttributeNames={"#s": "status"},
+                          ExpressionAttributeValues={":s": "error", ":e": str(msg)[:300],
+                                                     ":t": _now_iso()})
+    _task_event(task_id, "TurnFailed", "worker", {"error": str(msg)[:200]})
+
+
+def _drain_chat(resp):
+    """Ported from the driver's _drain — same stream shape, same tolerance."""
+    text, tool_use, stop_reason, error = [], None, None, None
+    try:
+        for ev_ in resp.get("stream", []):
+            if "contentBlockDelta" in ev_:
+                delta = ev_["contentBlockDelta"].get("delta", {})
+                if "text" in delta:
+                    text.append(delta["text"])
+            if "contentBlockStart" in ev_:
+                start = ev_["contentBlockStart"].get("start", {})
+                if "toolUse" in start:
+                    tool_use = {"toolUseId": start["toolUse"].get("toolUseId"),
+                                "name": start["toolUse"].get("name"), "input": ""}
+            if tool_use is not None and "contentBlockDelta" in ev_:
+                delta = ev_["contentBlockDelta"].get("delta", {})
+                if "toolUse" in delta:
+                    tool_use["input"] += delta["toolUse"].get("input", "")
+            if "messageStop" in ev_:
+                stop_reason = ev_["messageStop"].get("stopReason")
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+    if tool_use is not None and isinstance(tool_use.get("input"), str):
+        try:
+            tool_use["input"] = json.loads(tool_use["input"] or "{}")
+        except json.JSONDecodeError:
+            tool_use["input"] = {"_raw": tool_use["input"]}
+    return {"text": "".join(text), "tool_use": tool_use,
+            "stop_reason": stop_reason, "error": error}
+
+
+def _chat_user_text(text):
+    """A plain user turn, as the messages list invoke_harness wants."""
+    return [{"role": "user", "content": [{"text": text}]}]
+
+
+def _chat_tool_result(tool_use, payload):
+    """Resume a paused inline function: echo the toolUse, THEN answer it.
+
+    The InvokeHarness pause/resume contract is two messages -- an assistant message
+    replaying the toolUse block the agent emitted, and a user message carrying the
+    matching toolResult. Sending the toolResult by itself gets the whole turn
+    rejected with "The number of toolResult blocks at messages.N.content exceeds the
+    number of toolUse blocks of previous turn": in the history the runtime is handed,
+    nothing ever called the tool being answered. That killed every dispatch attempt
+    across four sessions, and it fails identically for a well-formed stopReason=
+    tool_use turn, so it is the message shape and nothing about the model.
+
+    The payload rides in a TEXT block, not a `json` block -- the runtime rejects
+    those with "content_type=<json_> | unsupported type". JSON-in-text is accepted
+    everywhere and stays machine-readable on the model's side."""
+    return [
+        {"role": "assistant", "content": [{"toolUse": {
+            "toolUseId": tool_use["toolUseId"],
+            "name": tool_use["name"],
+            "input": tool_use.get("input") or {}}}]},
+        {"role": "user", "content": [{"toolResult": {
+            "toolUseId": tool_use["toolUseId"],
+            "content": [{"text": json.dumps(payload, default=str)}],
+            "status": "success"}}]},
+    ]
+
+
 # ── HTTP glue (ported: security headers, auth, response helper) ───────────────
 # CSP: the dashboard is one self-contained HTML document served by this Lambda.
 # 'unsafe-inline' is unavoidable today (inline <script> + onclick handlers); CSP is
@@ -1584,7 +2341,11 @@ def _authed_user(headers):
         groups = [x.get("GroupName", "") for x in g.get("Groups", [])]
     except Exception as e:
         print(f"[auth] group lookup failed for {username}: {e}")
-    return {"username": username, "groups": groups}
+    # sub: the immutable Cognito identity behind the (renameable) username — the
+    # approval records bind signatures to it so accountability survives a rename.
+    sub = next((a.get("Value", "") for a in who.get("UserAttributes", [])
+                if a.get("Name") == "sub"), "")
+    return {"username": username, "groups": groups, "sub": sub}
 
 
 def _authed(headers):
@@ -1593,6 +2354,15 @@ def _authed(headers):
 
 
 def handler(event, context):
+    # Async self-invocation path (task-chat worker)
+    if isinstance(event, dict) and event.get("mode") == "task-chat":
+        try:
+            run_task_turn(event.get("task_id", ""), bool(event.get("accept")))
+        except Exception as e:
+            if event.get("task_id"):
+                _task_fail(event["task_id"], f"worker crashed: {e}")
+        return {"ok": True}
+
     # Async self-invocation path (optimization draft worker)
     if isinstance(event, dict) and event.get("mode") == "optimize":
         try:
@@ -1655,6 +2425,14 @@ def handler(event, context):
             out["variance"] = cost_variance(estimates=out["estimates"],
                                             overview=cost_overview())
             return _resp(200, out)
+        if method == "GET" and path == "/api/tasks":
+            return _resp(200, list_tasks(qs.get("limit", 25)))
+        if method == "GET" and path.startswith("/api/tasks/"):
+            seg = path[len("/api/tasks/"):].split("/")
+            if len(seg) == 1:
+                return _resp_result(get_task(seg[0]))
+            if len(seg) == 2 and seg[1] == "approval":
+                return _resp_result(task_approval(seg[0]))
 
         raw = event.get("body") or "{}"
         if event.get("isBase64Encoded"):
@@ -1674,7 +2452,21 @@ def handler(event, context):
             user = _authed_user(headers)
             if user is None:
                 return _resp(401, {"error": "unauthorized"})
+            # source IP rides into approval records: who signed, from where
+            user["source_ip"] = rc.get("sourceIp", "")
             now = datetime.now(timezone.utc).isoformat()
+            if path == "/api/tasks":
+                return _resp_result(create_task(body, user))
+            if path.startswith("/api/tasks/"):
+                seg = path[len("/api/tasks/"):].split("/")
+                if len(seg) == 2:
+                    tid, action = seg
+                    if action == "message":
+                        return _resp_result(post_task_message(tid, body, user))
+                    if action == "accept":
+                        return _resp_result(accept_task(tid, user))
+                    if action == "close":
+                        return _resp_result(close_task(tid, body, user))
             if path == "/api/start-run":
                 return _resp_result(start_run(body))
             if path == "/api/cost-estimate":

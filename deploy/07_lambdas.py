@@ -31,7 +31,8 @@ LAMBDAS = {
         "src": REPO / "orchestration" / "harness_driver" / "handler.py",
         "role_param": "/llmops/iam/lambda_driver_arn",
         "timeout": 900, "memory": 512,
-        "env_keys": ["RUNS_TABLE", "EVENTS_TABLE", "EVENT_BUS", "LLMOPS_SNS_TOPIC", "DATA_BUCKET"],
+        "env_keys": ["RUNS_TABLE", "EVENTS_TABLE", "EVENT_BUS", "LLMOPS_SNS_TOPIC", "DATA_BUCKET",
+                     "START_FN"],
     },
     "start": {
         "fn": "llmops-start-pipeline",
@@ -85,6 +86,11 @@ def bundle(src: pathlib.Path) -> bytes:
         z.write(CONTRACTS / "events.py", "events.py")
         z.write(CONTRACTS / "report.py", "report.py")
         z.write(CONTRACTS / "manifest.schema.json", "manifest.schema.json")
+        # launch_run servicing + approval verification, shared verbatim with the
+        # console (its deploy.sh vendors the same file) so the two dispatch paths
+        # cannot drift. Vendored into every bundle: only the driver imports it,
+        # but a uniform bundle is one less special case in this function.
+        z.write(REPO / "orchestration" / "conductor_tools.py", "conductor_tools.py")
     return buf.getvalue()
 
 
@@ -99,6 +105,7 @@ def env_values(ssm, region, account, keys, extra):
         "STATE_MACHINE_ARN": f"arn:aws:states:{region}:{account}:stateMachine:{STATE_MACHINE_NAME}",
         "WEBHOOK_SECRET_ID": "llmops/webhook",
         "START_PIPELINE_FN": "llmops-start-pipeline",
+        "START_FN": "llmops-start-pipeline",   # driver's launch_run dispatch target
         "DRIVER_FN": "llmops-harness-driver",
         "ESTIMATES_TABLE": "llmops-cost-estimates",
         "ACTUALS_TABLE": "llmops-cost-actuals",
