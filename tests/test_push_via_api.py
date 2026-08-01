@@ -9,6 +9,7 @@ Run: .venv/bin/python -m pytest tests/test_push_via_api.py -q
 """
 from __future__ import annotations
 
+import base64
 import importlib.util
 import pathlib
 import sys
@@ -186,6 +187,7 @@ class FakeGH:
         self.calls = []                 # (method, path, data)
         self.stale_reads = stale_reads  # ref GETs to answer 404 despite the ref existing
         self.slept = []                 # backoff delays, so a retry loop is observable
+        self.created_commits = []       # every POST /git/commits payload, in order
 
     # read_ref lives on the real GitHub class, so the double must provide it too.
     # Delegating keeps the RETRY POLICY under test instead of reimplemented here — a
@@ -231,11 +233,24 @@ class FakeGH:
                 raise SystemExit(f"GitHub 404 on GET {path}")
             return {"tree": {"sha": f"tree-of-{sha}"}}
         if path == "/git/blobs":
-            return {"sha": "blob-sha"}
+            # Keyed by content so a test can prove which commit a blob was read from:
+            # replaying commit 1 with HEAD's content is a silent lie about what commit 1
+            # did, and a constant sha here would hide it.
+            return {"sha": f"blob-of-{data['content'][:24]}"}
         if path == "/git/trees":
+            # Every tree answers "local-tree" so the parity check at the end of main()
+            # is satisfied; the check itself has its own test with its own double.
             return {"sha": "local-tree"}
         if path == "/git/commits":
-            return {"sha": "new-commit"}
+            # Distinct shas, because a replay of N commits must CHAIN: commit 2's parent
+            # is commit 1's sha, and a constant here would make a tool that parented
+            # everything on the base look correct. The first keeps the name the
+            # single-commit tests already assert on.
+            sha = "new-commit" if not self.created_commits \
+                else f"new-commit-{len(self.created_commits) + 1}"
+            self.created_commits.append({"sha": sha, **data})
+            self.commits.add(sha)
+            return {"sha": sha}
         if path == "/git/refs" and method == "POST":
             name = data["ref"][len("refs/"):]
             if name in self.refs:
@@ -253,8 +268,18 @@ class FakeGH:
 
 
 def _run_main(monkeypatch, gh, *, branch, parent="parentsha", commit_count="7",
-              ops=(":100644 100644 aaa bbb M", "pipeline/contracts/report.py")):
-    """Drive main() with fake git + fake HTTP; return (exit code, gh)."""
+              ops=(":100644 100644 aaa bbb M", "pipeline/contracts/report.py"),
+              revs=None, messages=None, extra_argv=()):
+    """Drive main() with fake git + fake HTTP; return (exit code, gh).
+
+    `revs` is the local commit list the tool would replay (oldest first, as
+    `rev-list --reverse` returns it); it defaults to a single commit, "headsha".
+    `messages` maps a rev to its full message, so a test can prove each remote commit
+    carries its OWN message rather than HEAD's.
+    """
+    revs = list(revs) if revs is not None else ["headsha"]
+    messages = messages or {}
+
     def fake_git(*args, binary=False):
         if args[0] == "config":
             return "https://github.com/acme/llmops.git"
@@ -266,12 +291,20 @@ def _run_main(monkeypatch, gh, *, branch, parent="parentsha", commit_count="7",
             return "local-tree"
         if args[:2] == ("rev-list", "--count"):
             return commit_count
+        if args[:2] == ("rev-list", "--reverse"):
+            return " ".join(revs)
         if args[0] == "diff":
             return raw(*ops) if binary else ""
         if args[0] == "show":
-            return b"content" if binary else "content"
+            # "<rev>:<path>" -- content is per-rev so a test can prove the blob comes
+            # from the commit being replayed, not from HEAD.
+            rev = args[1].split(":", 1)[0]
+            return f"content-of-{rev}".encode() if binary else f"content-of-{rev}"
         if args[0] == "log":
-            return "a commit message"
+            # ("log", "-1", "--format=%B"|"%s"[, rev])
+            rev = args[3] if len(args) > 3 else "headsha"
+            msg = messages.get(rev, f"a commit message for {rev}")
+            return msg.splitlines()[0] if args[2] == "--format=%s" else msg
         raise AssertionError(f"unexpected git {args}")
 
     monkeypatch.setattr(push, "git", fake_git)
@@ -280,7 +313,7 @@ def _run_main(monkeypatch, gh, *, branch, parent="parentsha", commit_count="7",
     # returncode 0 == "the base commit is already local", so no fetch is attempted.
     monkeypatch.setattr(push.subprocess, "run", lambda *a, **k: type(
         "R", (), {"returncode": 0, "stdout": "tok\n"})())
-    return push.main(["--branch", branch]), gh
+    return push.main(["--branch", branch, *extra_argv]), gh
 
 
 def test_a_branch_that_does_not_exist_yet_is_created_not_404ed(monkeypatch):
@@ -367,6 +400,8 @@ def test_a_first_push_still_verifies_the_tree_matches_local_head(monkeypatch):
             return "a-different-tree"  # remote tree will be "local-tree"
         if args[:2] == ("rev-list", "--count"):
             return "7"
+        if args[:2] == ("rev-list", "--reverse"):
+            return "headsha"
         if args[0] == "diff":
             return raw(":100644 100644 aaa bbb M", "a.py") if binary else ""
         if args[0] == "show":
@@ -457,3 +492,115 @@ def test_conflict_ok_is_confined_to_the_ref_create(monkeypatch):
     assert src.count("conflict_ok=True") == 1, "exactly one caller may swallow a 422"
     create = src[src.index('gh.call("/git/refs"'):]
     assert "conflict_ok=True" in create[:300]
+
+
+# ── one remote commit per local commit ────────────────────────────────────────
+# Found live on 2026-08-01. Two local commits went up as ONE remote commit (`3b62181`)
+# carrying only HEAD's message; the rationale for the first change -- the measurement
+# that justified it -- was simply absent from the remote. The tool reported "tree matches
+# local HEAD exactly" and was telling the truth: the final tree is identical whether you
+# replay the commits or squash them, so tree parity cannot see this. That is why these
+# tests assert on the COMMIT CHAIN, not on the tree.
+
+def test_two_local_commits_land_as_two_remote_commits_with_their_own_messages(
+        monkeypatch):
+    """The defect, stated as a test: N local commits must not collapse into one.
+
+    Squashing loses every message but the last. On this repo each commit body carries
+    the measurement that justified the change, so the loss is of evidence a reviewer
+    needs, not of formatting.
+    """
+    gh = FakeGH({"heads/main": "mainsha", "heads/feat/x": "remotesha"},
+                commits=["parentsha", "remotesha"])
+    rc, gh = _run_main(monkeypatch, gh, branch="feat/x",
+                       revs=["c1sha", "c2sha"],
+                       messages={"c1sha": "First change\n\nmeasured 21.7s of 29.6s.",
+                                 "c2sha": "Second change\n\nfound in the live line."})
+    assert rc == 0
+    assert len(gh.created_commits) == 2, (
+        f"two local commits must produce two remote commits, not "
+        f"{len(gh.created_commits)}: squashing discards the earlier message")
+    msgs = [c["message"] for c in gh.created_commits]
+    assert msgs[0].startswith("First change"), (
+        f"the first remote commit must carry the FIRST local message: {msgs!r}")
+    assert "measured 21.7s of 29.6s." in msgs[0], (
+        "the body is where the justifying measurement lives; a subject-only replay "
+        "loses exactly the part worth keeping")
+    assert msgs[1].startswith("Second change"), f"messages out of order: {msgs!r}"
+
+
+def test_the_replayed_commits_chain_instead_of_all_parenting_on_the_base(monkeypatch):
+    """Each replayed commit's parent must be the previous one.
+
+    Parenting all of them on the remote base would create N sibling commits and leave
+    the branch pointing at one, silently dropping the others -- the same class of loss
+    as the squash, arrived at from the opposite direction.
+    """
+    gh = FakeGH({"heads/main": "mainsha", "heads/feat/x": "remotesha"},
+                commits=["parentsha", "remotesha"])
+    rc, gh = _run_main(monkeypatch, gh, branch="feat/x", revs=["c1sha", "c2sha", "c3sha"])
+    assert rc == 0
+    # The double must hand out DISTINCT shas or this test cannot tell a chain from a
+    # fan: with one constant sha, parenting everything on the base yields the same
+    # `parents` list as a real chain, and a control that made the double constant passed
+    # every assertion below. The apparatus requirement is asserted, not assumed.
+    made = [c["sha"] for c in gh.created_commits]
+    assert len(set(made)) == len(made) == 3, (
+        f"the double must give each created commit its own sha, or a chain and a fan "
+        f"are indistinguishable here: {made!r}")
+    parents = [c["parents"] for c in gh.created_commits]
+    assert parents[0] == ["remotesha"], (
+        f"the first replayed commit sits on the remote head: {parents!r}")
+    assert parents[1] == [gh.created_commits[0]["sha"]], (
+        f"commit 2 must be a child of commit 1, not a sibling: {parents!r}")
+    assert parents[2] == [gh.created_commits[1]["sha"]], (
+        f"commit 3 must be a child of commit 2: {parents!r}")
+    # And the branch must end up on the LAST one, not the first.
+    assert gh.refs["heads/feat/x"] == gh.created_commits[-1]["sha"], (
+        "the branch must point at the tip of the replayed chain")
+
+
+def test_each_replayed_commit_carries_its_own_content_not_heads(monkeypatch):
+    """A file changed twice must show its INTERMEDIATE content in the intermediate
+    commit. Reading blobs from HEAD makes commit 1 claim a change it did not make --
+    the history then reads as if the final state existed from the start, which is worse
+    than a squash because it looks like real history and is not."""
+    gh = FakeGH({"heads/main": "mainsha", "heads/feat/x": "remotesha"},
+                commits=["parentsha", "remotesha"])
+    rc, gh = _run_main(monkeypatch, gh, branch="feat/x", revs=["c1sha", "c2sha"])
+    assert rc == 0
+    # FakeGH keys blob shas by content, and fake_git returns "content-of-<rev>".
+    blob_shas = [c[2]["content"] for c in gh.calls
+                 if c[1] == "/git/blobs" and c[0] == "POST"]
+    decoded = [base64.b64decode(b).decode() for b in blob_shas]
+    assert decoded == ["content-of-c1sha", "content-of-c2sha"], (
+        f"each commit's blob must be read from that commit: {decoded!r}")
+
+
+def test_an_explicit_message_still_squashes_deliberately(monkeypatch):
+    """--message is the caller SAYING "one commit, this text". Replaying N commits and
+    stamping the same override on each would be worse than the squash it replaces."""
+    gh = FakeGH({"heads/main": "mainsha", "heads/feat/x": "remotesha"},
+                commits=["parentsha", "remotesha"])
+    rc, gh = _run_main(monkeypatch, gh, branch="feat/x", revs=["c1sha", "c2sha"],
+                       extra_argv=["--message", "one deliberate commit"])
+    assert rc == 0
+    assert len(gh.created_commits) == 1, (
+        "an explicit --message asks for a single commit; N commits with one message "
+        "repeated is not what the caller requested")
+    assert gh.created_commits[0]["message"] == "one deliberate commit"
+
+
+def test_the_plan_names_every_commit_it_will_replay(monkeypatch, capsys):
+    """A dry run that prints only the file list cannot show a squash. The live squash
+    went unnoticed precisely because the output looked identical either way."""
+    gh = FakeGH({"heads/main": "mainsha", "heads/feat/x": "remotesha"},
+                commits=["parentsha", "remotesha"])
+    _run_main(monkeypatch, gh, branch="feat/x", revs=["c1sha", "c2sha"],
+              messages={"c1sha": "First change\n\nbody", "c2sha": "Second change\n\nbody"},
+              extra_argv=["--dry-run"])
+    out = capsys.readouterr().out
+    assert "2 commits" in out, f"the plan must say how many commits it replays: {out!r}"
+    assert "First change" in out and "Second change" in out, (
+        f"each commit's subject must be visible before anything is pushed: {out!r}")
+    assert not gh.created_commits, "--dry-run must not create commits"
