@@ -2050,3 +2050,73 @@ def test_the_skill_sync_lands_before_any_source_is_switched(storage_mod):
                 assert path.startswith("skills/"), (
                     f"{cfg.parent.name} mounts {uri}, which is not under the skills/ "
                     "prefix ensure_skills mirrors, so nothing keeps it in sync")
+
+
+def _harness_role_statements():
+    doc = json.loads((REPO / "deploy/iam/harness_execution_role.json").read_text())
+    return doc["permissionsPolicy"]["Statement"]
+
+
+def _prefix_is_granted(action, prefix):
+    """Does any statement allow `action` on <bucket>/<prefix>...? Returns the Sids."""
+    hits = []
+    for st in _harness_role_statements():
+        if st.get("Effect") != "Allow":
+            continue
+        actions = st["Action"]
+        if action not in ([actions] if isinstance(actions, str) else actions):
+            continue
+        res = st.get("Resource")
+        for r in [res] if isinstance(res, str) else (res or []):
+            _, _, tail = r.partition("<DATA_BUCKET>/")
+            if tail and prefix.startswith(tail.rstrip("*")):
+                hits.append(st.get("Sid"))
+    return hits
+
+
+def test_the_role_that_fetches_a_skill_at_session_start_can_read_the_mirror(storage_mod):
+    """The read-back inside ensure_skills proves the object is fetchable BY THE DEPLOYER.
+
+    That is not the claim that matters. An s3 skill source is fetched at session start by
+    the harness execution role, and this was measured live: after the mirror uploaded 66
+    files and head_object confirmed all 11 SKILL.md keys under my admin credentials,
+    `simulate_principal_policy` for llmops-harness-execution on
+    skills/llmops/llm-agent-orchestration/SKILL.md returned **implicitDeny**. The role file
+    granted `skills-mirror/*` -- a prefix that has never held a single object -- and not
+    the `skills/*` prefix the sync actually writes. Switching a source then would have been
+    accepted by UpdateHarness, reported READY, and failed every session afterwards.
+
+    Derived from ensure_skills' own key layout rather than a literal, so renaming the
+    prefix fails here instead of at session start.
+    """
+    key = f"{sorted(storage_mod.mounted_skills(REPO))[0]}/SKILL.md"
+    assert _prefix_is_granted("s3:GetObject", key), (
+        f"no statement lets the harness role GET {key}; an s3 skill source is fetched "
+        "under that role at session start, not under the deployer's credentials")
+
+
+def test_the_skill_mirror_is_listable_because_a_source_fetches_a_tree_not_one_object():
+    """ListBucket here is condition-scoped, and this repo has already been bitten by a
+    prefix granted for GetObject but absent from that condition: readable object-by-object,
+    never enumerable, which surfaced as 'the rate card history is there but the agent
+    reports no card exists'. A skill source resolves a whole directory, so the same gap
+    would strand it."""
+    for st in _harness_role_statements():
+        if st.get("Sid") == "S3PipelineList":
+            prefixes = st["Condition"]["StringLike"]["s3:prefix"]
+            assert "skills/*" in prefixes, (
+                f"skills/* is missing from the ListBucket condition {prefixes}; the "
+                "objects would be individually readable and the tree still unlistable")
+            return
+    raise AssertionError("no S3PipelineList statement")
+
+
+def test_the_agents_cannot_write_the_skill_tree_they_are_judged_against():
+    """Read-only on purpose, and NOT folded into S3PipelineObjects, which carries
+    PutObject alongside GetObject. An agent that can rewrite its own skill tree can
+    rewrite the instructions it is evaluated against on the next session -- the same
+    reasoning that keeps customer-data/ read-only for the pipeline."""
+    assert not _prefix_is_granted("s3:PutObject", "skills/llmops/x/SKILL.md"), (
+        "the harness role can WRITE the skill mirror; the skills grant must be "
+        "GetObject-only and separate from the read/write pipeline prefixes")
+    assert not _prefix_is_granted("s3:DeleteObject", "skills/llmops/x/SKILL.md")
