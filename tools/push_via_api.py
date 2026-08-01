@@ -22,10 +22,19 @@ corruptions live:
      there instead would have silently orphaned push 1. So the read is retried, and a
      422 on create is treated as what it is -- proof the ref exists -- not as fatal.
 
+  4. One commit for N local commits. Building a single commit from one base..HEAD diff
+     and giving it HEAD's message silently discards every earlier message. Observed
+     2026-08-01: two commits went up as `3b62181` carrying only the second's message,
+     and the tree-parity check passed -- the final tree is identical whether you replay
+     the commits or squash them, so that check is blind to this by construction. On a
+     repo whose commit bodies carry the measurements justifying each change, that is
+     evidence being dropped, not formatting.
+
 So this reads modes from git instead of assuming them, diffs against the branch's
-actual remote head instead of assuming the local parent matches it, and never
-concludes "no such branch" from a single 404. A rename becomes delete-old + add-new;
-a deletion becomes a null-sha tree entry.
+actual remote head instead of assuming the local parent matches it, never concludes
+"no such branch" from a single 404, and replays each local commit as its own remote
+commit with its own message. A rename becomes delete-old + add-new; a deletion becomes
+a null-sha tree entry.
 
 Run: .venv/bin/python tools/push_via_api.py --branch <branch> [--dry-run]
 """
@@ -235,48 +244,89 @@ def main(argv: list[str] | None = None) -> int:
                          "store even after a fetch; cannot diff against it")
 
     head = git("rev-parse", "HEAD")
-    ops = parse_raw_diff(git("diff", "--raw", "-z", "-M", remote_sha, head, binary=True))
-    if not ops:
+    # One remote commit per local commit. The old code built a SINGLE commit from one
+    # base..HEAD diff and gave it HEAD's message, so pushing two local commits landed
+    # as one whose message described only the second -- the rationale for the first was
+    # simply gone from the remote, and the tree-parity check below could not see it
+    # because the final tree is identical either way. Observed 2026-08-01 pushing the
+    # task-chat round-trip work: two commits became `3b62181` carrying the second
+    # message, and the reviewer of that PR would never learn why the first change was
+    # made. Message loss is not a rendering detail; on a repo where every commit body
+    # carries the measurement that justified it, it is the loss of the evidence.
+    #
+    # --message is an explicit override, so it still squashes: the caller has said what
+    # the single resulting commit should say.
+    if args.message:
+        locals_ = [head]
+    else:
+        locals_ = git("rev-list", "--reverse", f"{remote_sha}..{head}").split()
+        if not locals_:
+            # HEAD is an ancestor of the remote head (or the same commit). There may
+            # still be a tree difference if the remote was built by an earlier squash,
+            # so fall back to one commit rather than reporting nothing to do.
+            locals_ = [head]
+
+    plan_ops = {}
+    prev = remote_sha
+    for c in locals_:
+        plan_ops[c] = parse_raw_diff(git("diff", "--raw", "-z", "-M", prev, c,
+                                         binary=True))
+        prev = c
+    if not any(plan_ops.values()):
         print(f"remote {args.branch} already matches HEAD tree; nothing to push")
         return 0
 
     verb = "create from" if creating else "advance"
-    print(f"{repo} {args.branch}: {verb} {remote_sha[:10]} -> tree of {head[:10]}")
-    for op in ops:
-        moved = f" (was {op['old_path']})" if op["old_path"] else ""
-        chmod = f" mode {op['old_mode']}->{op['new_mode']}" \
-            if op["old_mode"] != op["new_mode"] and op["status"] != "D" else ""
-        print(f"  {op['status']} {op['path']}{moved}{chmod}")
+    print(f"{repo} {args.branch}: {verb} {remote_sha[:10]} -> tree of {head[:10]} "
+          f"({len(locals_)} commit{'s' if len(locals_) != 1 else ''})")
+    for c in locals_:
+        subject = git("log", "-1", "--format=%s", c)
+        print(f"  {c[:10]} {subject}")
+        for op in plan_ops[c]:
+            moved = f" (was {op['old_path']})" if op["old_path"] else ""
+            chmod = f" mode {op['old_mode']}->{op['new_mode']}" \
+                if op["old_mode"] != op["new_mode"] and op["status"] != "D" else ""
+            print(f"    {op['status']} {op['path']}{moved}{chmod}")
     if args.dry_run:
         return 0
 
-    def upload_blob(path: str) -> str:
-        content = git("show", f"{head}:{path}", binary=True)
-        return gh.call("/git/blobs", {
-            "content": base64.b64encode(content).decode(), "encoding": "base64"})["sha"]
+    def uploader(commit_ish: str):
+        def upload_blob(path: str) -> str:
+            # Content comes from the commit being replayed, not from HEAD: a file that
+            # changed twice would otherwise have HEAD's content in the FIRST commit,
+            # making the intermediate commit a lie about what it did.
+            content = git("show", f"{commit_ish}:{path}", binary=True)
+            return gh.call("/git/blobs", {
+                "content": base64.b64encode(content).decode(),
+                "encoding": "base64"})["sha"]
+        return upload_blob
 
-    entries = tree_entries(ops, upload_blob)
-    base_tree = gh.call(f"/git/commits/{remote_sha}")["tree"]["sha"]
-    tree = gh.call("/git/trees", {"base_tree": base_tree, "tree": entries})["sha"]
-    message = args.message or git("log", "-1", "--format=%B")
-    commit = gh.call("/git/commits", {"message": message, "tree": tree,
-                                     "parents": [remote_sha]})
+    parent_sha, tree = remote_sha, None
+    for c in locals_:
+        entries = tree_entries(plan_ops[c], uploader(c))
+        base_tree = gh.call(f"/git/commits/{parent_sha}")["tree"]["sha"]
+        tree = gh.call("/git/trees", {"base_tree": base_tree,
+                                      "tree": entries})["sha"] if entries else base_tree
+        message = args.message or git("log", "-1", "--format=%B", c)
+        commit = gh.call("/git/commits", {"message": message, "tree": tree,
+                                         "parents": [parent_sha]})
+        parent_sha = commit["sha"]
     if creating:
         # POST /git/refs with a full ref name creates; PATCH would 404 on a ref that
         # does not exist yet, which is the whole reason this branch of the code exists.
         if gh.call("/git/refs", {"ref": f"refs/heads/{args.branch}",
-                                 "sha": commit["sha"]}, conflict_ok=True) is None:
+                                 "sha": parent_sha}, conflict_ok=True) is None:
             # 422: the ref exists after all, so the 404 that put us here was stale and
             # the commit just built is parented on the wrong base. Refuse rather than
             # PATCH -- pointing the branch at this commit would drop every commit
             # already on it. Re-running now succeeds, because the ref read will find it.
             raise SystemExit(
                 f"{args.branch} already exists on the remote, but the ref read said it "
-                f"did not, so commit {commit['sha'][:10]} was built on the wrong base "
+                f"did not, so commit {parent_sha[:10]} was built on the wrong base "
                 f"({remote_sha[:10]}). Nothing was moved -- that commit is unreferenced "
                 "and harmless. Re-run this command; the ref is visible now.")
     else:
-        gh.call(f"/git/refs/heads/{args.branch}", {"sha": commit["sha"]},
+        gh.call(f"/git/refs/heads/{args.branch}", {"sha": parent_sha},
                 method="PATCH")
 
     local_tree = git("rev-parse", f"{head}^{{tree}}")
@@ -284,7 +334,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"WARNING: pushed tree {tree[:10]} != local tree {local_tree[:10]}; "
               "the remote does not match your working commit", file=sys.stderr)
         return 1
-    print(f"pushed {commit['sha'][:10]}; tree matches local HEAD exactly")
+    print(f"pushed {parent_sha[:10]}; tree matches local HEAD exactly "
+          f"({len(locals_)} commit{'s' if len(locals_) != 1 else ''})")
     return 0
 
 
