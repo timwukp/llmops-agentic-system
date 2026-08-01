@@ -1387,6 +1387,47 @@ class TestConductorDispatch:
         for marker in ("consult", "PLAN ACCEPTED", "rate_card", "DATA DISCOVERY"):
             assert marker in prompt, f"consult-mode contract lost its {marker!r} clause"
 
+    def test_the_agent_that_asks_about_data_has_the_skill_that_knows_how(self):
+        """DATA DISCOVERY is step 0 of the orchestrator's consult protocol: it opens every
+        consultation by asking about the dataset, its provenance, its PII disposition, and
+        how a held-out set stays honest. The skill that knows how to ask those questions
+        was mounted only on data-prep -- which does not run until AFTER a plan is priced
+        and signed. So the agent doing the asking had no guidance, and the agent holding
+        the guidance had nothing left to ask.
+
+        Asserted on both harnesses: it is a MOUNT, not a move. data-prep still needs it to
+        do the work the answers describe.
+        """
+        def skill_paths(agent):
+            h = json.loads((REPO / f"agents/{agent}/harness.json").read_text())
+            return {s.get("git", {}).get("path", "") for s in (h.get("skills") or [])}
+
+        want = "skills/llmops/llm-data-preparation"
+        assert want in skill_paths("orchestrator"), (
+            "the orchestrator asks the data-discovery questions with no data-prep skill "
+            "behind it")
+        assert want in skill_paths("data-prep"), (
+            f"{want} was MOVED off data-prep rather than also mounted -- the worker that "
+            "actually prepares the data lost its guidance")
+
+    def test_harness_comments_never_reach_the_agentcore_api(self):
+        """The harness JSONs carry _comment keys explaining why each block is shaped the
+        way it is, which belongs next to the block rather than in a doc nobody opens. But
+        an unknown key fails the whole call -- the same class of failure that cost a
+        debugging round on the console IAM policy. Both apply paths must strip them
+        RECURSIVELY, since the comments sit nested inside skills[] and tools[] too.
+        """
+        for mod in ("05_harnesses.py", "update_harness.py"):
+            src = (REPO / "deploy" / mod).read_text()
+            assert "startswith(\"_\")" in src, f"{mod} does not strip _-prefixed keys"
+            # recursive: the stripper must call itself on nested values
+            fn = src[src.index("def strip_comments" if "def strip_comments" in src
+                               else "def _strip_comments"):]
+            fn = fn[:fn.index("\n\n\n")] if "\n\n\n" in fn else fn
+            assert fn.count("strip_comments(") >= 3, (
+                f"{mod}'s stripper does not recurse, so a _comment nested in skills[] or "
+                "tools[] still reaches the API and fails the whole call")
+
     def test_orchestrator_model_is_pinned_to_fable(self):
         """The conductor is the pre-sales brain; a quiet downgrade to a smaller
         model is a product change, not a config tweak — pin it."""

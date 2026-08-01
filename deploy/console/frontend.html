@@ -353,20 +353,50 @@
 <script>
 const API = "";  // same-origin
 // The Cognito access token lives in this in-memory variable ONLY — deliberately not in
-// localStorage/sessionStorage. A reload costs one sign-in and buys the property that
-// there is nothing on disk to steal. Read-only browsing needs no sign-in at all.
+// localStorage/sessionStorage, so there is nothing on disk to steal. What survives a
+// reload instead is an httpOnly refresh cookie (set by /api/login, readable only by
+// /api/refresh) — script cannot touch it, so an XSS bug costs an attacker one 8-hour
+// access token rather than 30 days of re-issue. Read-only browsing needs no sign-in.
 let SESSION = null;
 function authHeaders(){ return SESSION ? {"authorization": "Bearer "+SESSION.token} : {}; }
 function setAuthUi(){
   const b = $("loginBtn");
   if (b) b.textContent = SESSION ? ("admin · sign out") : "Sign in";
 }
-function signOut(){ SESSION = null; setAuthUi(); }
+// Two ways to lose a session, and they must NOT be the same function.
+// clearSession(): this access token is no longer usable (expired, or a 401 came back).
+//   The refresh cookie stays, so the next action silently re-mints a token.
+// signOut(): the human asked to leave. Revoke server-side and drop the cookie.
+// Collapsing these would make an 8-hour token expiry destroy the 30-day session —
+// i.e. it would reintroduce the exact re-login-on-refresh bug this code fixes.
+function clearSession(){ SESSION = null; setAuthUi(); }
+function signOut(){
+  clearSession();
+  // Not awaited: the UI is already signed out, and a slow Cognito RevokeToken must not
+  // make the button feel broken. The cookie is cleared by the response either way.
+  fetch(API+"/api/refresh/revoke",{method:"POST",credentials:"same-origin"}).catch(()=>{});
+}
+// Turn the refresh cookie back into an access token. Silent on failure by design: for a
+// first-time visitor, or 30 days after the last sign-in, "no session" is the normal
+// answer and an alert would be noise on every fresh page load.
+async function restoreSession(){
+  const r = await fetch(API+"/api/refresh",{method:"POST",credentials:"same-origin"})
+    .then(x=>x.json()).catch(()=>({error:"network"}));
+  if (r && r.accessToken) {
+    // user is left null: /api/refresh proves a valid session, not WHICH name typed the
+    // password. Defaulting it to "admin" would put a guess into any future audit or
+    // "signed in as" surface, and nothing reads this field today.
+    SESSION = {token:r.accessToken, exp: Date.now()+(r.expiresIn-60)*1000, user:null};
+  }
+  setAuthUi();
+  return !!SESSION;
+}
 async function signIn(){
   if (SESSION) { if (confirm("Sign out?")) signOut(); return true; }
   const u = prompt("Admin username:", "admin"); if (!u) return false;
   const p = prompt("Password:"); if (!p) return false;
-  const r = await fetch(API+"/api/login",{method:"POST",headers:{"content-type":"application/json"},
+  const r = await fetch(API+"/api/login",{method:"POST",credentials:"same-origin",
+    headers:{"content-type":"application/json"},
     body:JSON.stringify({username:u.trim(), password:p})}).then(x=>x.json()).catch(e=>({error:String(e)}));
   if (r.accessToken) {
     SESSION = {token:r.accessToken, exp: Date.now()+(r.expiresIn-60)*1000, user:u.trim()};
@@ -375,8 +405,9 @@ async function signIn(){
   alert("Login failed: "+(r.error||"unknown")); return false;
 }
 async function ensureToken(){
-  if (SESSION && SESSION.exp && Date.now() > SESSION.exp) SESSION = null;  // expired → re-auth
+  if (SESSION && SESSION.exp && Date.now() > SESSION.exp) clearSession();  // expired
   if (SESSION) return true;
+  if (await restoreSession()) return true;  // cookie may still be good — no prompt
   return await signIn();
 }
 const $ = (id) => document.getElementById(id);
@@ -815,8 +846,10 @@ async function postApi(path, payload){
   // 401 means the token is gone; 403 means the token is FINE but this user lacks the
   // right. Collapsing them would sign an approver out of a session that still works,
   // and hide "you are not in the approver group" behind "session expired".
-  if (resp.status===401) { SESSION = null; setAuthUi();
-    return {ok:false, msg:"session expired — sign in again"}; }
+  if (resp.status===401) { clearSession();
+    // clearSession, not signOut: the refresh cookie is probably still good, so "try
+    // again" costs one silent /api/refresh in ensureToken rather than a password prompt.
+    return {ok:false, msg:"session expired — try again"}; }
   if (resp.status===403) {
     let d=null; try { d = JSON.parse(body); } catch(_){}
     return {ok:false, msg:"denied: "+((d&&d.error)||"forbidden").slice(0,200)}; }
@@ -960,8 +993,10 @@ async function genOpt(){
         }
       }, 5000);
     } else {
-      if (r.error==="unauthorized") { signOut();
-        $("draftMsg").textContent = "session expired — click again to sign in"; }
+      // clearSession, not signOut: an expired access token must not revoke the refresh
+      // cookie, or one 8-hour expiry throws away a 30-day session.
+      if (r.error==="unauthorized") { clearSession();
+        $("draftMsg").textContent = "session expired — click again to retry"; }
       else $("draftMsg").textContent = "error: "+(r.error||JSON.stringify(r)).slice(0,80);
     }
   } catch(e){ $("draftMsg").textContent = "error: "+e; }
@@ -1436,6 +1471,12 @@ const _memTab = localStorage.getItem("adminTab");
 showTab(KNOWN_TABS.includes(_urlTab) ? _urlTab
       : KNOWN_TABS.includes(_memTab) ? _memTab : "architecture");
 setAuthUi();
+// Restore the signed-in session from the httpOnly refresh cookie. Fire-and-forget, and
+// deliberately NOT awaited: every GET route is public, so the page must render its data
+// without waiting on auth — an /api/refresh that hangs would otherwise hold the whole
+// dashboard blank. setAuthUi() above renders "Sign in"; restoreSession() corrects the
+// button when the cookie turns out to be good.
+restoreSession().catch(()=>{});
 refresh();
 </script>
 </body>

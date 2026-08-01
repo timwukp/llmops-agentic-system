@@ -23,7 +23,9 @@ OPTIMIZE_HARNESS="${OPTIMIZE_HARNESS:-llmops_orchestrator}"
 # COGNITO_TIER=ESSENTIALS to opt out, accepting that credential stuffing is then unmitigated.
 COGNITO_TIER="${COGNITO_TIER:-PLUS}"
 PASSWORD_MIN_LENGTH="${PASSWORD_MIN_LENGTH:-20}"
-# Caps how fast anyone can grind POST /api/login, the only unauthenticated write route.
+# Caps how fast anyone can grind POST /api/login. It is the only unauthenticated route
+# that takes a guessable secret; /api/refresh and /api/refresh/revoke are also
+# unauthenticated but consume an httpOnly cookie, which is not something to brute-force.
 API_RATE_LIMIT="${API_RATE_LIMIT:-20}"         # steady-state requests/second
 API_BURST_LIMIT="${API_BURST_LIMIT:-40}"       # burst bucket
 
@@ -103,6 +105,20 @@ else
     || echo "  note: password minimum is $CUR_MINLEN (want >= $PASSWORD_MIN_LENGTH)"
   [ "$CUR_ADMINONLY" = "True" ] \
     || echo "  WARNING: self-signup is ENABLED on this pool — any stranger can register and, because the dashboard accepts any valid token from it, gain every write endpoint"
+  # The session routes need two CLIENT-level settings that the pool-level query above
+  # cannot see. Neither failure is visible in the UI: without ALLOW_REFRESH_TOKEN_AUTH
+  # every page reload silently drops back to a password prompt (the exact bug the refresh
+  # cookie exists to fix), and without token revocation sign-out clears the cookie while
+  # leaving the 30-day refresh token usable in Cognito. Reported, not "fixed": as with
+  # update-user-pool above, update-user-pool-client has PUT semantics.
+  read -r CUR_FLOWS CUR_REVOKE < <(aws cognito-idp describe-user-pool-client \
+    --user-pool-id "$POOL_ID" --client-id "$CLIENT_ID" --region "$REGION" --output text \
+    --query 'UserPoolClient.[join(`,`,ExplicitAuthFlows),EnableTokenRevocation]' \
+    2>/dev/null || echo "? ?")
+  case "$CUR_FLOWS" in *ALLOW_REFRESH_TOKEN_AUTH*) ;; *)
+    echo "  note: client lacks ALLOW_REFRESH_TOKEN_AUTH — POST /api/refresh will fail, so every page reload forces a re-login" ;; esac
+  [ "$CUR_REVOKE" = "True" ] \
+    || echo "  note: token revocation is off on this client — sign-out clears the cookie but cannot invalidate the refresh token"
 fi
 
 # ── Cognito groups (idempotent): approver gates spend, datascience may consult ─

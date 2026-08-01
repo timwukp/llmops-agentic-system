@@ -7,8 +7,12 @@ dashboard HTML (GET /) and the JSON API (GET/POST /api/*). Design and most of th
 code are ported from bedrock-agentcore-agent-ops-console
 (github.com/timwukp/bedrock-agentcore-agent-ops-console).
 
-Auth model (ported): GET routes are public read-only; every POST except /api/login
-requires a Cognito access token (validated server-side via cognito-idp GetUser).
+Auth model (ported): GET routes are public read-only; every POST except the three
+session routes (/api/login, /api/refresh, /api/refresh/revoke) requires a Cognito access
+token (validated server-side via cognito-idp GetUser). Those three are unauthenticated
+because they establish, restore and end a session -- demanding a live token to recover
+from having lost one is circular. Reload survival rides on an httpOnly refresh cookie
+scoped to Path=/api/refresh, which page script cannot read.
 
 The frontend ships as frontend.html in the same zip and is read ONCE at cold start
 into a module global — no giant inline HTML string in this file.
@@ -2694,7 +2698,7 @@ _SEC_HEADERS = {
 }
 
 
-def _resp(code, body, ctype="application/json"):
+def _resp(code, body, ctype="application/json", cookies=None):
     headers = {"content-type": ctype}
     headers.update(_SEC_HEADERS)
     headers["content-security-policy"] = _csp()
@@ -2705,8 +2709,15 @@ def _resp(code, body, ctype="application/json"):
                         "access-control-allow-methods": "GET,POST,OPTIONS",
                         "access-control-allow-headers": "content-type,authorization",
                         "vary": "origin"})
-    return {"statusCode": code, "headers": headers,
-            "body": body if isinstance(body, str) else json.dumps(body, default=str)}
+    out = {"statusCode": code, "headers": headers,
+           "body": body if isinstance(body, str) else json.dumps(body, default=str)}
+    # Payload format 2.0 takes Set-Cookie as a LIST under "cookies", not as a header:
+    # a "set-cookie" key in `headers` is silently dropped when there is more than one,
+    # and the refresh-cookie feature would look like a browser bug. The key is omitted
+    # entirely when there are no cookies so every existing response byte is unchanged.
+    if cookies:
+        out["cookies"] = list(cookies)
+    return out
 
 
 def _resp_result(result):
@@ -2728,19 +2739,114 @@ def _resp_result(result):
 
 
 def cognito_login(username, password):
-    """Exchange username/password for a Cognito access token (USER_PASSWORD_AUTH)."""
+    """Exchange username/password for a Cognito access token (USER_PASSWORD_AUTH).
+
+    Returns (response_body, refresh_token). The refresh token is returned SEPARATELY,
+    never inside the body, because the body is JSON that page script reads: the whole
+    point of the refresh cookie is that a 30-day credential is unreachable from script,
+    and a single forgotten `del body["refreshToken"]` would undo that silently. A tuple
+    cannot be leaked by forgetting to strip a key.
+    """
     if not COGNITO_CLIENT_ID:
-        return {"error": "Cognito not configured"}
+        return {"error": "Cognito not configured"}, ""
     try:
         r = cognito.initiate_auth(ClientId=COGNITO_CLIENT_ID, AuthFlow="USER_PASSWORD_AUTH",
                                   AuthParameters={"USERNAME": username, "PASSWORD": password})
         a = r["AuthenticationResult"]
-        return {"accessToken": a["AccessToken"], "expiresIn": a["ExpiresIn"],
-                "refreshToken": a.get("RefreshToken", "")}
+        return ({"accessToken": a["AccessToken"], "expiresIn": a["ExpiresIn"]},
+                a.get("RefreshToken", ""))
     except cognito.exceptions.NotAuthorizedException:
-        return {"error": "invalid username or password"}
+        return {"error": "invalid username or password"}, ""
+    except Exception as e:
+        return {"error": str(e)[:200]}, ""
+
+
+# The refresh cookie is scoped to this path and nothing else. Every other API route
+# authenticates with a Bearer access token in a header, so no other route has any use
+# for the cookie -- and a cookie the browser never attaches to /api/tasks cannot be
+# replayed against /api/tasks. /api/refresh/revoke path-matches this prefix (RFC 6265
+# path-match), which is what lets sign-out revoke the token server-side instead of
+# merely forgetting it client-side.
+REFRESH_COOKIE = "llmops_rt"
+REFRESH_COOKIE_PATH = "/api/refresh"
+# Cognito's refresh validity (30 days on this pool) is the real authority; this is only
+# how long the browser bothers to keep the cookie. If the two ever disagree, the worst
+# case is one /api/refresh returning 401 and the user signing in -- so this number is
+# allowed to be approximate, and deliberately is not read back from Cognito on the login
+# hot path.
+REFRESH_COOKIE_MAX_AGE_S = int(os.environ.get("REFRESH_COOKIE_MAX_AGE_S", 30 * 24 * 3600))
+
+
+def _refresh_cookie(token, max_age=None):
+    """Serialise the refresh cookie. HttpOnly+Secure+SameSite=Strict, all three needed.
+
+    HttpOnly is the feature: script cannot read it, so an XSS bug costs the attacker one
+    8-hour access token instead of 30 days of re-issue. Secure keeps it off any plaintext
+    hop. SameSite=Strict means no other site can make the browser attach it, which is the
+    CSRF answer for a route whose whole input is a cookie.
+    """
+    age = REFRESH_COOKIE_MAX_AGE_S if max_age is None else int(max_age)
+    return (f"{REFRESH_COOKIE}={token}; Path={REFRESH_COOKIE_PATH}; Max-Age={age}; "
+            "HttpOnly; Secure; SameSite=Strict")
+
+
+def _clear_refresh_cookie():
+    """Expire the cookie. Same name+path, or the browser keeps the original alongside."""
+    return _refresh_cookie("", max_age=0)
+
+
+def _event_cookie(event, name):
+    """Read one cookie from a payload-format-2.0 event.
+
+    2.0 hands cookies over as a list of "k=v" strings in event["cookies"], NOT in the
+    headers dict. Reading headers["cookie"] here would work in a hand-written test and
+    return nothing in production.
+    """
+    for raw in (event.get("cookies") or []):
+        k, _, v = str(raw).partition("=")
+        if k.strip() == name:
+            return v.strip()
+    return ""
+
+
+def cognito_refresh(refresh_token):
+    """Mint a fresh access token from the refresh cookie (REFRESH_TOKEN_AUTH).
+
+    A failure here is NOT an error to surface as 500: an expired or revoked refresh token
+    is the normal end of a 30-day session, and the client's correct response is to show
+    the sign-in prompt. So this returns {"error": ...} and the route answers 401.
+    """
+    if not COGNITO_CLIENT_ID:
+        return {"error": "Cognito not configured"}
+    if not refresh_token:
+        return {"error": "no session"}
+    try:
+        r = cognito.initiate_auth(ClientId=COGNITO_CLIENT_ID, AuthFlow="REFRESH_TOKEN_AUTH",
+                                  AuthParameters={"REFRESH_TOKEN": refresh_token})
+        a = r["AuthenticationResult"]
+        # REFRESH_TOKEN_AUTH returns no new refresh token (rotation is off), so the
+        # cookie is left exactly as it is rather than being rewritten with "".
+        return {"accessToken": a["AccessToken"], "expiresIn": a["ExpiresIn"]}
     except Exception as e:
         return {"error": str(e)[:200]}
+
+
+def cognito_revoke(refresh_token):
+    """Best-effort RevokeToken on sign-out; the cookie is cleared either way.
+
+    Token revocation is enabled on this pool, so revoking kills the whole token family.
+    If the call fails we still clear the cookie: a sign-out that reports failure and
+    leaves the browser signed in is worse than one that reports success while an
+    unreachable token stays technically valid for its remaining window.
+    """
+    if not (refresh_token and COGNITO_CLIENT_ID):
+        return False
+    try:
+        cognito.revoke_token(Token=refresh_token, ClientId=COGNITO_CLIENT_ID)
+        return True
+    except Exception as e:
+        print(f"[auth] revoke_token failed: {e}")
+        return False
 
 
 def _authed_user(headers):
@@ -2874,7 +2980,26 @@ def handler(event, context):
         except Exception:
             body = {}
         if method == "POST" and path == "/api/login":
-            return _resp(200, cognito_login(str(body.get("username", "")), str(body.get("password", ""))))
+            out, rt = cognito_login(str(body.get("username", "")), str(body.get("password", "")))
+            # The cookie is set only on success. Setting it on a failed login would be a
+            # cookie holding "" that a later /api/refresh would treat as a session.
+            return _resp(200, out, cookies=[_refresh_cookie(rt)] if rt else None)
+        # Restore a session after a page reload. Unauthenticated by design -- the cookie
+        # IS the credential, and requiring a Bearer token here would mean needing a live
+        # session to recover from having lost one.
+        if method == "POST" and path == "/api/refresh":
+            out = cognito_refresh(_event_cookie(event, REFRESH_COOKIE))
+            if out.get("error"):
+                # Clear the cookie on failure: a refresh token Cognito rejects will be
+                # rejected on every reload forever, and leaving it makes each page load
+                # pay a doomed Cognito round-trip.
+                return _resp(401, out, cookies=[_clear_refresh_cookie()])
+            return _resp(200, out)
+        # Sign-out. Also unauthenticated: the access token may already be expired, and
+        # refusing to revoke a session because it is too old to prove is backwards.
+        if method == "POST" and path == "/api/refresh/revoke":
+            revoked = cognito_revoke(_event_cookie(event, REFRESH_COOKIE))
+            return _resp(200, {"revoked": revoked}, cookies=[_clear_refresh_cookie()])
         if method == "POST":
             # One auth call for every POST, resolved to a user rather than a bool: the
             # cost routes need the username (self-approval check) and the groups

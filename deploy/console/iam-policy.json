@@ -234,11 +234,12 @@
       ]
     },
     {
-      "_comment": "AdminListGroupsForUser is required for the approver check: GetUser returns the username and attributes but NOT group membership, and a bearer access token carries no cognito:groups claim. Without this call the separation-of-duties gate has nothing to check.",
+      "_comment": "AdminListGroupsForUser is required for the approver check: GetUser returns the username and attributes but NOT group membership, and a bearer access token carries no cognito:groups claim. Without this call the separation-of-duties gate has nothing to check. RevokeToken is what makes sign-out mean something: the refresh cookie is cleared client-side regardless, but without this grant the 30-day refresh token stays valid in Cognito for its whole window, so a sign-out on a shared machine would be cosmetic. These operations accept unauthenticated callers, but boto3 signs them with this role's credentials, and a signed request IS authorized against IAM -- so the grant is required, not decorative. InitiateAuth covers both USER_PASSWORD_AUTH (login) and REFRESH_TOKEN_AUTH (session restore); it is one action, not two.",
       "Sid": "CognitoAuth",
       "Effect": "Allow",
       "Action": [
         "cognito-idp:InitiateAuth",
+        "cognito-idp:RevokeToken",
         "cognito-idp:GetUser",
         "cognito-idp:AdminListGroupsForUser"
       ],
