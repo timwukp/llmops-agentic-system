@@ -2462,6 +2462,11 @@ def run_task_turn(task_id, accept=False):
 
     collected_text = []
     tool_rounds = 0
+    # What the HARNESS spent, accumulated across every invoke this turn makes. Separate
+    # from tool_rounds, which counts only the inline functions WE service: a turn using
+    # skills logged rounds=0 while actually making 3 model round-trips, so one counter
+    # was being read as if it were the other.
+    model_rounds = harness_tool_calls = model_ms = in_tok = out_tok = 0
     re_asks = 0          # only spent on a turn that OWES a tool call (see below)
     stream_retried = False
     arn = f"arn:aws:bedrock-agentcore:{REGION}:{ACCOUNT_ID}:harness/{hid}"
@@ -2492,13 +2497,35 @@ def run_task_turn(task_id, accept=False):
                 return
 
         out = _drain_chat(resp)
+        model_rounds += out["rounds"]
+        harness_tool_calls += len(out["harness_tools"])
+        model_ms += out["model_ms"]
+        in_tok += out["in_tok"]
+        out_tok += out["out_tok"]
         # One line per turn. The first diagnosis of a stalled dispatch had NOTHING to
         # read here — the task record showed the symptom and the logs showed only
         # billing REPORTs, so the cause had to be inferred twice.
+        #
+        # `serviced=` is the old `rounds=` renamed. The name was the defect: it counted
+        # only inline functions WE answer, so a turn that made 3 model round-trips and 2
+        # internal shell calls logged `rounds=0`, and that zero was read as "the agent
+        # did no work". model_rounds/htools/model_ms come off the stream itself and are
+        # what a latency question actually needs -- on the measured turn, model_ms was
+        # 21.7s of a 29.6s wall clock, i.e. the round-trips ARE the turn.
+        #
+        # `tool=` names only a call we OWE, for the same reason. A toolUse block also
+        # streams alongside end_turn for a tool the harness already ran itself (see the
+        # servicing condition below, which deliberately skips those), and the live line
+        # read `stop=end_turn tool=shell` -- indistinguishable from a call we failed to
+        # answer. Those calls are in htools=, where they belong.
+        owed = (out["tool_use"] or {}).get("name") \
+            if out["stop_reason"] == "tool_use" else None
         print(f"[task-chat] {task_id} accept={accept} sess={sess} "
-              f"stop={out['stop_reason']} tool={(out['tool_use'] or {}).get('name')} "
+              f"stop={out['stop_reason']} tool={owed} "
               f"text={len(out['text'] or '')}b err={out['error']} "
-              f"rounds={tool_rounds} re_asks={re_asks}")
+              f"serviced={tool_rounds} model_rounds={model_rounds} "
+              f"htools={out['harness_tools']} model_ms={model_ms} "
+              f"tok={in_tok}/{out_tok} re_asks={re_asks}")
         if out["text"]:
             collected_text.append(out["text"])
 
@@ -2669,10 +2696,39 @@ def _task_fail(task_id, msg):
 
 
 def _drain_chat(resp):
-    """Ported from the driver's _drain — same stream shape, same tolerance."""
+    """Ported from the driver's _drain — same stream shape, same tolerance.
+
+    Also counts what the HARNESS did on its own, which this function used to throw
+    away. One InvokeHarness call is not one model round-trip: the harness runs its own
+    agent loop, and each internal tool call (a skill read, `shell`, the browser) costs a
+    further model round-trip that never reaches our servicing loop. Measured on the
+    orchestrator with a skill-reading prompt, ONE invoke carried:
+
+        messageStart(assistant) -> toolUse shell -> messageStop tool_use -> metadata
+        messageStart(user)      -> messageStop tool_result
+        messageStart(assistant) -> toolUse shell -> messageStop tool_use -> metadata
+        messageStart(user)      -> messageStop tool_result
+        messageStart(assistant) -> messageStop end_turn                  -> metadata
+
+    Three round-trips, two internal shell calls, latencyMs 6973 + 7764 + 6950 = 21.7s of
+    a 29.6s turn. The old log line reported `rounds=0` for exactly that turn, because it
+    only counted rounds WE serviced and this turn ended in end_turn.
+
+    Round-trips are counted from assistant `messageStart`, which is what a round-trip IS.
+    `metadata` is counted separately rather than trusted as a proxy: the two agreed 3-to-3
+    when measured, and logging both means a future divergence shows up instead of being
+    silently absorbed by whichever one this code happened to pick.
+    """
     text, tool_use, stop_reason, error = [], None, None, None
+    rounds = meta_n = in_tok = out_tok = model_ms = 0
+    harness_tools = []
     try:
         for ev_ in resp.get("stream", []):
+            if "messageStart" in ev_:
+                # user messageStart events are the harness feeding a toolResult back to
+                # itself; only an assistant message is the model being asked again.
+                if ev_["messageStart"].get("role") == "assistant":
+                    rounds += 1
             if "contentBlockDelta" in ev_:
                 delta = ev_["contentBlockDelta"].get("delta", {})
                 if "text" in delta:
@@ -2680,6 +2736,7 @@ def _drain_chat(resp):
             if "contentBlockStart" in ev_:
                 start = ev_["contentBlockStart"].get("start", {})
                 if "toolUse" in start:
+                    harness_tools.append(start["toolUse"].get("name"))
                     tool_use = {"toolUseId": start["toolUse"].get("toolUseId"),
                                 "name": start["toolUse"].get("name"), "input": ""}
             if tool_use is not None and "contentBlockDelta" in ev_:
@@ -2688,6 +2745,13 @@ def _drain_chat(resp):
                     tool_use["input"] += delta["toolUse"].get("input", "")
             if "messageStop" in ev_:
                 stop_reason = ev_["messageStop"].get("stopReason")
+            if "metadata" in ev_:
+                meta_n += 1
+                usage = ev_["metadata"].get("usage") or {}
+                in_tok += int(usage.get("inputTokens") or 0)
+                out_tok += int(usage.get("outputTokens") or 0)
+                model_ms += int((ev_["metadata"].get("metrics") or {})
+                                .get("latencyMs") or 0)
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
     if tool_use is not None and isinstance(tool_use.get("input"), str):
@@ -2696,7 +2760,9 @@ def _drain_chat(resp):
         except json.JSONDecodeError:
             tool_use["input"] = {"_raw": tool_use["input"]}
     return {"text": "".join(text), "tool_use": tool_use,
-            "stop_reason": stop_reason, "error": error}
+            "stop_reason": stop_reason, "error": error,
+            "rounds": rounds, "meta_n": meta_n, "harness_tools": harness_tools,
+            "in_tok": in_tok, "out_tok": out_tok, "model_ms": model_ms}
 
 
 def _chat_user_text(text):
