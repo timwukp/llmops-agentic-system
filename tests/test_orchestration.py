@@ -63,6 +63,26 @@ def env(monkeypatch):
 # ---------------------------------------------------------------------------
 # Fakes
 # ---------------------------------------------------------------------------
+def _cond_matches(cond, item) -> bool:
+    """Evaluate the subset of boto3 Key conditions this suite builds.
+
+    The stub used to ignore KeyConditionExpression entirely and hand back every row,
+    which let a query addressed to one run see another run's items -- precisely the
+    mis-delivery the directive tests are here to catch. A fake that answers every
+    question the same way cannot fail the test that matters."""
+    expr = cond.get_expression()
+    op, values = expr["operator"], expr["values"]
+    if op == "AND":
+        return all(_cond_matches(v, item) for v in values)
+    name, target = values[0].name, values[1]
+    actual = item.get(name)
+    if op == "=":
+        return actual == target
+    if op == "begins_with":
+        return str(actual).startswith(str(target))
+    raise AssertionError(f"fake table cannot evaluate operator {op!r}")
+
+
 class FakeTable:
     def __init__(self):
         self.items, self.updates = [], []
@@ -73,9 +93,40 @@ class FakeTable:
 
     def update_item(self, **kw):
         self.updates.append(kw)
+        # Apply simple `SET a = :x, b = :y` so a read-after-write sees the write. The
+        # delivered-once guarantee is enforced by a ConditionExpression, so a stub that
+        # recorded updates without applying them made an every-checkpoint replay look
+        # like correct behaviour.
+        target = None
+        for item in self.items:
+            if all(item.get(k) == v for k, v in (kw.get("Key") or {}).items()):
+                target = item
+                break
+        if target is None:
+            return {}
+        vals = kw.get("ExpressionAttributeValues") or {}
+        cond = kw.get("ConditionExpression")
+        if isinstance(cond, str) and "=" in cond:
+            attr, _, placeholder = (p.strip() for p in cond.partition("="))
+            if target.get(attr) != vals.get(placeholder):
+                raise Exception("ConditionalCheckFailedException")
+        expr = kw.get("UpdateExpression", "")
+        if expr.upper().startswith("SET"):
+            for clause in expr[3:].split(","):
+                lhs, _, rhs = (p.strip() for p in clause.partition("="))
+                if rhs in vals:
+                    target[lhs] = vals[rhs]
+        return {}
 
     def query(self, **kw):
-        return {"Items": self.query_result}
+        # query_result is the scripted-GSI path (resume_pipeline looks a run up by job
+        # name). With nothing scripted, a query reads back what was written, filtered by
+        # the key condition -- the directive channel writes and re-reads this table.
+        if self.query_result:
+            return {"Items": self.query_result}
+        cond = kw.get("KeyConditionExpression")
+        items = [i for i in self.items if cond is None or _cond_matches(cond, i)]
+        return {"Items": items}
 
 
 class FakeDDB:
@@ -426,6 +477,109 @@ class TestDriver:
         assert out["status"] == "escalated"
         assert c["sns"].published and c["sfn"].failures
         assert c["sfn"].failures[0]["error"] == "EscalatedToHuman"
+
+    def test_a_checkpoint_delivers_any_human_directive_waiting_for_this_run(self):
+        """A stage agent's only way to ask a blocking question mid-run is checkpoint,
+        and the driver answered it {"status": "continue"} unconditionally -- so a human
+        answer had NO path back to the agent that asked.
+
+        Live consequence: data-prep piloted teacher generation, measured 13.5k output
+        tokens/attempt against the approved plan's assumed 1,800, wrote a four-option
+        budget escalation, and then kept spending under the cap it had just proven
+        infeasible -- because "continue" was the only word the driver could say. The
+        conductor's resolve_escalation wrote an EscalationResolved stage-event that
+        nothing read: a verdict into the void, the same shape as the escalation SNS
+        topic with no subscribers.
+
+        A checkpoint is now the delivery point: pending directives for this run ride
+        back in the toolResult, so the agent learns the verdict on its next breath."""
+        ac = FakeAgentCore([tool_use_stream("checkpoint", {"progress_uri": "s3://b/p.json"}),
+                            tool_use_stream("stage_complete", {"outputs": []}),
+                            text_stream("ack")])
+        c = clients(ac)
+        driver.put_directive(c["ddb"], "run-test-1", decision="option_A",
+                             rationale="teacher line item raised to $13; lower the "
+                                       "coverage gate to 25% and say so in the report",
+                             adjusted_params={"teacher_cap_usd": 13},
+                             actor="tmwu")
+        driver.handler(driver_event(), clients=c)
+
+        answer = json.loads(
+            ac.calls[1]["messages"][-1]["content"][0]["toolResult"]["content"][0]["text"])
+        assert answer["status"] == "directive", \
+            "a checkpoint with a directive waiting must not answer a bare 'continue'"
+        d = answer["directive"]
+        assert d["decision"] == "option_A"
+        assert "coverage gate" in d["rationale"]
+        assert d["adjusted_params"] == {"teacher_cap_usd": 13}
+        assert d["actor"] == "tmwu"
+
+    def test_a_directive_is_delivered_once_so_it_cannot_be_replayed_forever(self):
+        """Two checkpoints in one turn must not see the same verdict twice: a directive
+        redelivered every checkpoint reads as a fresh instruction each time, and an
+        agent told "raise the cap to $13" on every breath will raise it repeatedly."""
+        ac = FakeAgentCore([tool_use_stream("checkpoint", {"progress_uri": "s3://b/1.json"}),
+                            tool_use_stream("checkpoint", {"progress_uri": "s3://b/2.json"}),
+                            tool_use_stream("stage_complete", {"outputs": []}),
+                            text_stream("ack")])
+        c = clients(ac)
+        driver.put_directive(c["ddb"], "run-test-1", decision="option_A", rationale="go")
+        driver.handler(driver_event(), clients=c)
+
+        first = json.loads(
+            ac.calls[1]["messages"][-1]["content"][0]["toolResult"]["content"][0]["text"])
+        second = json.loads(
+            ac.calls[2]["messages"][-1]["content"][0]["toolResult"]["content"][0]["text"])
+        assert first["status"] == "directive"
+        assert second["status"] == "continue", \
+            "the second checkpoint replayed an already-delivered directive"
+
+    def test_a_checkpoint_with_no_directive_still_just_continues(self):
+        """The common case must stay free of ceremony -- and must not break when the
+        directives table is unreachable, or a DDB hiccup would stall every run that
+        merely wanted another turn."""
+        ac = FakeAgentCore([tool_use_stream("checkpoint", {"progress_uri": "s3://b/p.json"}),
+                            tool_use_stream("stage_complete", {"outputs": []}),
+                            text_stream("ack")])
+        c = clients(ac)
+        out = driver.handler(driver_event(), clients=c)
+        answer = json.loads(
+            ac.calls[1]["messages"][-1]["content"][0]["toolResult"]["content"][0]["text"])
+        assert answer == {"status": "continue"}
+        assert out["status"] == "completed"
+
+    def test_resolve_escalation_writes_a_directive_the_waiting_agent_can_read(self):
+        """resolve_escalation is the conductor's verdict tool. It recorded a stage-event
+        and stopped there -- audit trail, no delivery. It must now also put the verdict
+        on the channel a paused agent actually reads, or triage remains advice nobody
+        hears."""
+        ac = FakeAgentCore([
+            tool_use_stream("resolve_escalation",
+                            {"run_id": "run-stuck-9", "decision": "option_B",
+                             "rationale": "3 attempts/task approved at ~$39",
+                             "adjusted_params": {"teacher_cap_usd": 39}}),
+            text_stream("ack")])
+        c = clients(ac)
+        out = driver.handler(driver_event(stage="orchestrator", task="triage",
+                                          run_id="run-orch-1"), clients=c)
+        assert out["status"] == "resolved"
+        pending = driver.take_directive(c["ddb"], "run-stuck-9")
+        assert pending, "the verdict never reached the run it was about"
+        assert pending["decision"] == "option_B"
+        assert pending["adjusted_params"] == {"teacher_cap_usd": 39}
+
+    def test_a_verdict_is_addressed_to_the_run_it_is_about_not_the_triaging_run(self):
+        """The orchestrator triages OTHER runs: its own run_id must never be the
+        delivery address, or the verdict lands in the conductor's own mailbox and the
+        stuck run waits forever."""
+        ac = FakeAgentCore([
+            tool_use_stream("resolve_escalation",
+                            {"run_id": "run-stuck-9", "decision": "abort"}),
+            text_stream("ack")])
+        c = clients(ac)
+        driver.handler(driver_event(stage="orchestrator", task="triage",
+                                    run_id="run-orch-1"), clients=c)
+        assert driver.take_directive(c["ddb"], "run-orch-1") is None
 
     def test_missing_stage_complete_reasks_then_fails(self):
         ac = FakeAgentCore([text_stream("done, I think"), text_stream("still no call"),
@@ -782,6 +936,28 @@ class TestConductorDispatch:
         assert '"audit"' in prompt and '"mirror_model"' in prompt
         # supply-chain non-negotiables spelled out where the agent reads them
         assert "safetensors" in prompt and "Hugging Face" in prompt
+
+    def test_every_agent_that_can_checkpoint_is_told_a_directive_can_arrive(self):
+        """The directive channel is only useful if the agent recognizes the answer.
+
+        An agent whose tool description promises only {"status":"continue"} has no
+        reason to read a directive payload, and the verdict is delivered to a reader
+        that ignores it — the same write-only failure one layer up. So every harness
+        declaring checkpoint must document the directive shape, and the shape it
+        documents must be the one the driver actually sends."""
+        driver_src = (REPO / "orchestration/harness_driver/handler.py").read_text()
+        assert '"status": "directive", "directive": directive' in driver_src
+
+        for path in sorted((REPO / "agents").glob("*/harness.json")):
+            h = json.loads(path.read_text())
+            for t in h.get("tools", []):
+                if t.get("name") != "checkpoint":
+                    continue
+                desc = t["config"]["inlineFunction"]["description"]
+                for key in ("directive", "decision", "adjusted_params"):
+                    assert key in desc, (
+                        f"{path.parent.name}'s checkpoint never mentions {key!r} — the "
+                        "agent cannot act on an answer it was never told to expect")
 
     def test_state_machine_data_audit_short_path(self):
         asl = json.loads((REPO / "orchestration/state_machine.asl.json").read_text())
