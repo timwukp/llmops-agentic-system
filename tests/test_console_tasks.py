@@ -15,6 +15,7 @@ import hashlib
 import importlib.util
 import json
 import pathlib
+import re
 import sys
 import types
 
@@ -1047,3 +1048,89 @@ def test_the_lifecycle_flow_renders_every_terminal_status_the_pipeline_writes():
         f"the state machine writes task status {missing} but taskStageStates()'s "
         "order map has no entry, so `(s in order) ? order[s] : 0` renders a "
         "finished task as active at the first node")
+
+
+# ── the stage flow must not call a budget stop a failure ──────────────────────
+
+def _fake_sfn_history(events, exec_status, run_id="run-x"):
+    class _Sfn:
+        def describe_execution(self, executionArn):
+            return {"status": exec_status, "input": json.dumps({"run_id": run_id}),
+                    "startDate": "s", "stopDate": "e"}
+
+        def get_execution_history(self, **kw):
+            return {"events": events}
+    return _Sfn()
+
+
+#: The live history of run-20260731T183103Z-8b864805, event for event. DataPrepGenerate
+#: was entered and exited (the .waitForTaskToken task TIMED OUT after 7200s), the Catch
+#: ran EscalateFail, and MarkRunFailed then died on States.Runtime because EscalateFail
+#: had no ResultPath at the time -- so the execution is FAILED with only these states.
+_LIVE_TIMEOUT_HISTORY = [
+    {"stateEnteredEventDetails": {"name": "DataPrepGenerate"}},
+    {"stateExitedEventDetails": {"name": "DataPrepGenerate"}},
+    {"stateEnteredEventDetails": {"name": "EscalateFail"}},
+    {"stateExitedEventDetails": {"name": "EscalateFail"}},
+    {"stateEnteredEventDetails": {"name": "MarkRunFailed"}},
+]
+
+
+def test_a_stage_that_escalated_is_not_painted_as_a_crash(console, monkeypatch):
+    """"Data Prep · Generate failed" was the first thing the operator saw, and it was
+    not what happened. The agent hit the teacher-token cap the human had approved,
+    wrote status=complete-at-cap, escalated with four costed options, and waited. The
+    turnaround is a BUDGET STOP awaiting a decision, not a crash.
+
+    The console inferred "failed" from execution shape alone: entered-but-terminal, or
+    last_entered on a non-SUCCEEDED execution. Both were true here. Painting that red
+    tells the operator to go debug a stage that behaved exactly as designed, and buries
+    the thing that actually needs them -- an unanswered question with money attached.
+
+    EscalateFail is in the history precisely BECAUSE the stage escalated, so the
+    distinction is already available; it was just not used.
+    """
+    monkeypatch.setattr(console, "sfn", _fake_sfn_history(_LIVE_TIMEOUT_HISTORY, "FAILED"))
+    out = console.pipeline_detail("run-20260731T183103Z-8b864805")
+    gen = next(s for s in out["stages"] if s["key"] == "data-prep-generate")
+    assert out["escalated"] is True, "EscalateFail ran; the run escalated by definition"
+    assert gen["status"] == "escalated", (
+        f"the stage that escalated for a human decision reads {gen['status']!r}; "
+        "'failed' sends the operator to debug a stage that did the right thing")
+
+
+def test_a_genuine_crash_still_reads_failed(console, monkeypatch):
+    """The counterweight: softening the escalation case must not soften a real crash.
+
+    A stage that dies without EscalateFail (no escalation, nobody asked anything) on a
+    FAILED execution is exactly the zombie case the closers exist for, and it must stay
+    red -- otherwise the fix above trades a false alarm for a missed one.
+    """
+    crash = [{"stateEnteredEventDetails": {"name": "FinetuneLaunch"}}]  # entered, never exited
+    monkeypatch.setattr(console, "sfn", _fake_sfn_history(crash, "FAILED"))
+    out = console.pipeline_detail("run-crash")
+    ft = next(s for s in out["stages"] if s["key"] == "finetune-launch")
+    assert out["escalated"] is False
+    assert ft["status"] == "failed", "a crash with no escalation must still read failed"
+
+
+def test_the_frontend_has_a_colour_for_every_status_the_api_can_return():
+    """stageColor() ends in `return "#5a6491"; // pending`, so an unknown status is
+    painted as PENDING -- the exact opposite of what an escalation means. Adding
+    'escalated' server-side without adding it here would have turned a red-but-wrong
+    node into a grey-and-invisible one, which is worse: nobody chases grey.
+    """
+    src = (REPO / "deploy/console/lambda_function.py").read_text()
+    # Scope to pipeline_detail: the console assigns plenty of `status = "..."` for
+    # TASK records too, and those are the Tasks tab's business, not this flow's.
+    fn = src[src.index("def pipeline_detail("):]
+    fn = fn[:fn.index("\ndef ")]
+    produced = set(re.findall(r'status = "([a-z-]+)"', fn))
+    produced |= set(re.findall(r'"([a-z-]+)" if escalated else "([a-z-]+)"', fn)[0])
+    front = (REPO / "deploy/console/frontend.html").read_text()
+    body = front[front.index("function stageColor("):]
+    body = body[:body.index("\n}")]
+    missing = sorted(s for s in produced if f'"{s}"' not in body)
+    assert not missing, (
+        f"pipeline_detail can return stage status {missing}, and stageColor() has no "
+        "branch for it, so it falls through to the pending colour")
