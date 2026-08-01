@@ -372,6 +372,128 @@ def m29(t):
 case("mount guard: skill_paths reads git paths only", "tests/test_orchestration.py", m29,
      ["tests/test_orchestration.py::TestConductorDispatch::test_the_agent_that_asks_about_data_has_the_skill_that_knows_how"])
 
+# ── #61: the live bus vs the bytes about to ship ───────────────────────────────
+# The driver was deployed WITHOUT triage_event_from_bus while llmops-escalation-triage was
+# ENABLED and targeting it, so every escalation arrived as a raw EventBridge envelope and
+# died on KeyError: 'run_id'. Every offline guard stayed green, because they compare this
+# tree's declarations against this tree's deployer -- and the branch that overwrote the
+# driver carried neither the declaration, nor the rule, nor the translator, which is
+# perfectly self-consistent. These controls break each half of the new deploy-time check.
+
+# 30. The regression itself: delete the translator from the driver.
+def m30(t):
+    old = "def triage_event_from_bus(record: dict, bucket: str) -> dict:"
+    assert old in t, "the translator's signature has moved; re-anchor this mutation"
+    return t.replace(old, "def _unused_translator(record: dict, bucket: str) -> dict:", 1)
+case("driver: the bus envelope translator is gone", "orchestration/harness_driver/handler.py",
+     m30,
+     # Both of these read handler.py from disk, which is what makes them controllable from
+     # here. This mutation renames only the DEFINITION and leaves the call site, so the
+     # source still CONTAINS the name -- and the check's first version grepped for the bare
+     # name and passed, on a handler that would raise NameError on the first escalation.
+     # That is why live_bus_translator_gap looks for `def <name>(`; the shape is also
+     # asserted directly by test_a_call_site_without_a_definition_does_not_satisfy_the_check,
+     # which builds the mutated source in-process rather than from this file.
+     ["tests/test_orchestration.py::test_the_real_driver_source_can_read_the_real_live_rule",
+      "tests/test_orchestration.py::test_every_declared_translator_exists_in_the_handler_it_names"])
+
+# 31. The entry-point dispatch, without which the translator exists and is never called --
+#     the function would be present in the zip and the channel still dead. A grep for the
+#     name alone cannot tell these apart, which is why there is a behavioural test too.
+def m31(t):
+    old = '    if event.get("detail-type") == ev.ESCALATED_TO_HUMAN and "detail" in event:'
+    assert old in t, "the bus-delivery branch has moved; re-anchor this mutation"
+    return t.replace(old, '    if False:', 1)
+case("driver: the entry point stops recognising a bus delivery",
+     "orchestration/harness_driver/handler.py", m31,
+     ["tests/test_orchestration.py::test_the_driver_recognises_a_bus_delivery_at_its_entry_point"])
+
+# 32. The check warns instead of refusing. The deploy then reports success while the
+#     channel is dead -- the same reason config_subst.resolve() raises: an unresolved token
+#     and an unreadable envelope are both accepted by the API and both fail out of sight.
+def m32(t):
+    old = "        if blocking:\n            raise SystemExit("
+    assert old in t, "the refusal has moved; re-anchor this mutation"
+    return t.replace(old, "        if blocking:\n            print(", 1)
+case("deployer: the bus/translator check warns instead of refusing", "deploy/07_lambdas.py",
+     m32,
+     ["tests/test_orchestration.py::test_the_deploy_refuses_rather_than_warns_when_the_translator_is_missing"])
+
+# 33. An unreachable bus reported as clean. This is the failure mode the guard was built to
+#     prevent, reintroduced inside the guard: [] would make "no rules disagree" and "I could
+#     not look" identical -- exactly the confusion #59 was about.
+def m33(t):
+    old = '        return [{"unchecked": f"{type(exc).__name__}: {exc}"}]'
+    assert old in t, "the unreachable-bus branch has moved; re-anchor this mutation"
+    return t.replace(old, "        return []", 1)
+case("deployer: an unreachable bus is reported as clean", "deploy/07_lambdas.py", m33,
+     ["tests/test_orchestration.py::test_an_unreachable_bus_is_reported_as_unchecked_not_as_clean"])
+
+# 34. The check stops being scoped to the function being deployed, so every Lambda deploy is
+#     gated on every rule on the bus. A guard that blocks correct deploys is one people
+#     route around, which costs more than it saves.
+def m34(t):
+    old = '        mine = [t for t in targets if t.get("Arn", "").endswith(f":function:{fn}")]'
+    assert old in t, "the target scoping has moved; re-anchor this mutation"
+    return t.replace(old, "        mine = targets", 1)
+case("deployer: the check is no longer scoped to the deployed function",
+     "deploy/07_lambdas.py", m34,
+     ["tests/test_orchestration.py::test_a_rule_targeting_a_different_function_is_not_this_deploys_problem"])
+
+# 35. A DISABLED rule blocks the deploy. It cannot invoke anything, so this is a false
+#     positive -- and false positives are how a deploy-time gate gets deleted.
+def m35(t):
+    old = '        if rule.get("State") != "ENABLED":\n            continue'
+    assert old in t, "the ENABLED filter has moved; re-anchor this mutation"
+    return t.replace(old, "        if False:\n            continue", 1)
+case("deployer: a disabled rule blocks the deploy", "deploy/07_lambdas.py", m35,
+     ["tests/test_orchestration.py::test_a_disabled_rule_delivers_nothing_and_blocks_nothing"])
+
+# 36. The InputTransformer alternative is ignored. EventBridge has already reshaped the
+#     event, so demanding the Python function blocks a correct deploy.
+def m36(t):
+    old = '            if any(t.get("InputTransformer") or t.get("Input") for t in mine):'
+    assert old in t, "the InputTransformer branch has moved; re-anchor this mutation"
+    return t.replace(old, "            if False:", 1)
+case("deployer: an InputTransformer no longer substitutes for a translator",
+     "deploy/07_lambdas.py", m36,
+     ["tests/test_orchestration.py::test_an_input_transformer_on_the_rule_removes_the_need_for_a_translator"])
+
+# 37. The driver is no longer marked as bus-delivered, so the check never runs for the one
+#     function it exists to protect. This is how the guard dies quietly: nothing fails, and
+#     the next branch to drop the translator ships exactly as this one did.
+def m37(t):
+    old = '        "bus_delivered": "llmops-pipeline",'
+    assert old in t, "the driver's bus_delivered marker has moved; re-anchor this mutation"
+    return t.replace(old, "", 1)
+case("deployer: the driver is no longer checked against the bus at all",
+     "deploy/07_lambdas.py", m37,
+     ["tests/test_orchestration.py::test_only_the_bus_delivered_lambda_is_checked_against_the_bus"])
+
+# 38. A live rule for a detail-type nothing declares a translator for is passed silently.
+#     That is how the NEXT version of this defect arrives -- a new rule at the driver for an
+#     event no branch handles, which is the same crash by a different route.
+def m38(t):
+    old = ('                gaps.append({"rule": rule["Name"], "detail_type": detail_type,\n'
+           '                             "problem": "no translator declared in BUS_DELIVERY_TRANSLATORS"})\n'
+           '                continue')
+    assert old in t, "the undeclared-detail-type branch has moved; re-anchor this mutation"
+    return t.replace(old, "                continue", 1)
+case("deployer: an undeclared detail-type on a live rule passes silently",
+     "deploy/07_lambdas.py", m38,
+     ["tests/test_orchestration.py::test_a_live_rule_for_an_undeclared_detail_type_is_itself_reported"])
+
+# 39. The two contracts drift apart: an event declared to need a rule to the driver, with no
+#     translator declared for it. That is the half-built channel #59 found, mirrored.
+def m39(t):
+    old = "BUS_DELIVERY_TRANSLATORS: dict = {\n    ESCALATED_TO_HUMAN: \"triage_event_from_bus\",\n}"
+    assert old in t, "BUS_DELIVERY_TRANSLATORS has moved; re-anchor this mutation"
+    return t.replace(old, "BUS_DELIVERY_TRANSLATORS: dict = {}", 1)
+case("contracts: a ruled event has no declared translator", "pipeline/contracts/events.py",
+     m39,
+     ["tests/test_orchestration.py::test_the_translator_declaration_covers_every_event_that_needs_a_rule"])
+
+
 failed = []
 for name, rel, mutate, tests in CASES:
     p = REPO / rel

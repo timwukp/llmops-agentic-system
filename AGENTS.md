@@ -114,6 +114,16 @@ versions and introspects the live CreateHarness/UpdateHarness schemas.
   resolves a whole tree, so Get without List strands it), and deliberately separate from
   `S3PipelineObjects`, which carries `PutObject`: an agent that can write its own skill
   tree can rewrite the instructions it is judged against next session.
+- **A Lambda that is an EventBridge target cannot be deployed from a branch that does
+  not know the rule exists.** The driver shipped without `triage_event_from_bus` while
+  `llmops-escalation-triage` was ENABLED and targeting it; every escalation then arrived
+  as a raw envelope and died on `KeyError: 'run_id'`. Every offline guard stayed green,
+  because they compare `EVENTS_NEEDING_A_RULE` against the rules *this tree's* deployer
+  builds — a branch missing the declaration AND the rule AND the translator is
+  self-consistent. Only the bus knows what is live, so `07_lambdas.py` asks it at deploy
+  time (`live_bus_translator_gap`) and raises rather than warns. `BUS_DELIVERY_TRANSLATORS`
+  in `pipeline/contracts/events.py` declares which function reads which detail-type; an
+  `InputTransformer` on the rule's target is the accepted alternative.
 - **Observability**: `OTEL_TRACES_SAMPLER=always_on` env var is mandatory or
   evaluations/insights sit at zero forever. X-Ray delivery takes no `outputFormat`.
 - **Turn budget**: harness `timeoutSeconds` is 840 here (driver Lambda caps at 900s).

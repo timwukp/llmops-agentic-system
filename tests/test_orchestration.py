@@ -58,6 +58,10 @@ ENV = {
     # and conftest.py refuses the socket -- which is the guard working: a driver test that
     # reached the real control plane would be a test of production.
     "HARNESS_ARN_LLMOPS_MONITOR": "arn:aws:bedrock-agentcore:us-east-1:123456789012:harness/llmops_monitor-TESTSUFFIX",
+    # The conductor is a driver target too, since an EscalatedToHuman event routes a
+    # triage to it. Without the override _resolve_harness_arn would reach SSM, i.e. the
+    # network, which conftest refuses.
+    "HARNESS_ARN_LLMOPS_ORCHESTRATOR": "arn:aws:bedrock-agentcore:us-east-1:123456789012:harness/llmops_orchestrator-TESTSUFFIX",
 }
 
 
@@ -3287,3 +3291,504 @@ def test_the_deployer_resolves_placeholders_before_sending_a_config(harnesses_mo
         uri = (skill.get("s3") or {}).get("uri")
         if uri:
             assert uri.startswith("s3://bkt/"), f"{uri} was not substituted"
+
+
+# ---------------------------------------------------------------------------
+# Escalation routing: the bus had ZERO rules for five phases (#59)
+# ---------------------------------------------------------------------------
+def _deploy_src_orch(name):
+    return (REPO / "deploy" / name).read_text()
+
+
+def _lambdas_mod():
+    return _load("deploy_lambdas_triage", "deploy/07_lambdas.py")
+
+
+def _triage_rule_pattern():
+    """The rule pattern as the deployer would actually PUT it, via --dry-run."""
+    mod = _lambdas_mod()
+    return mod.ensure_triage_rule(None, None, "us-east-1", "123456789012",
+                                  True)["pattern"]
+
+
+def test_every_event_that_needs_a_listener_has_a_rule():
+    """The allowlist guard, and the reason this task existed.
+
+    The llmops-pipeline bus carried ZERO rules while EscalatedToHuman was emitted from
+    three places and documented as routing to the conductor. On a live bus "no rule" and
+    "rule missing" look identical -- there is no failure, no metric, no log line; the
+    event simply lands and nothing happens. So the decision about which detail-types
+    need a listener is DECLARED in the contracts (EVENTS_NEEDING_A_RULE) and checked
+    against the rules the deployer builds.
+
+    Not a count: a count passes when a rule is added for the wrong detail-type.
+    """
+    src = _deploy_src_orch("07_lambdas.py")
+    # Every detail-type any rule in the deployer matches on, read from the source so a
+    # rule added for the wrong event cannot satisfy this by arithmetic.
+    matched = {getattr(ev, n) for n in re.findall(r'"detail-type": \[ev\.(\w+)\]', src)}
+    assert matched, "guard reads the wrong thing: found no rule detail-types at all"
+    declared = {v for k, v in vars(ev).items()
+                if k.isupper() and isinstance(v, str)}
+    needed = set(ev.EVENTS_NEEDING_A_RULE)
+    missing = needed - matched
+    assert not missing, (
+        f"{missing} is in EVENTS_NEEDING_A_RULE but no rule in 07_lambdas.py matches "
+        "that detail-type; the event would land on the bus and nothing would happen")
+    assert needed <= declared, "EVENTS_NEEDING_A_RULE names an event not in events.py"
+
+
+def test_every_emitted_detail_type_is_either_ruled_or_declared_fire_and_forget():
+    """The other direction: an event emitted somewhere in the repo with no rule must be
+    a DECISION, not an oversight. Fire-and-forget is fine -- most of the vocabulary is
+    audit trail and console timeline -- but it has to be visible as a choice, which
+    EVENTS_NEEDING_A_RULE's absence records. This fails when someone adds an emitter for
+    a detail-type that plainly wants a listener and nobody notices."""
+    emitted = set()
+    for rel in ("orchestration/harness_driver/handler.py",
+                "orchestration/start_pipeline/handler.py",
+                "orchestration/resume_pipeline/handler.py"):
+        src = (REPO / rel).read_text()
+        emitted |= {getattr(ev, n) for n in re.findall(r"ev\.([A-Z_]+)", src)
+                    if isinstance(getattr(ev, n, None), str) and getattr(ev, n) in ev.ALL_EVENTS}
+    asl = (REPO / "orchestration/state_machine.asl.json").read_text()
+    emitted |= set(re.findall(r'"DetailType": "(\w+)"', asl))
+    unknown = emitted - set(ev.ALL_EVENTS)
+    assert not unknown, f"emitted detail-types not in ALL_EVENTS: {unknown}"
+    # Nothing to assert about the fire-and-forget ones beyond that they are known --
+    # the point of the pair is that EVENTS_NEEDING_A_RULE is the only place the
+    # distinction lives, so the previous test is what has teeth.
+    assert ev.ESCALATED_TO_HUMAN in emitted
+
+
+def test_the_triage_rule_is_on_the_custom_bus_not_the_default_one():
+    """The SageMaker rule uses the DEFAULT bus because service events land there and
+    cannot be moved. Copying that shape for a pipeline event gives a rule that is live,
+    healthy in the console, and matches nothing forever: llmops.pipeline events are put
+    on llmops-pipeline."""
+    mod = _lambdas_mod()
+
+    class _Events:
+        def __init__(self):
+            self.rules, self.targets = [], []
+
+        def put_rule(self, **kw):
+            self.rules.append(kw)
+
+        def put_targets(self, **kw):
+            self.targets.append(kw)
+
+    class _Lam:
+        exceptions = type("E", (), {"ResourceConflictException": Exception})
+
+        def add_permission(self, **kw):
+            self.perm = kw
+
+    events, lam = _Events(), _Lam()
+    mod.ensure_triage_rule(events, lam, "us-east-1", "123456789012", False)
+    assert events.rules[0]["EventBusName"] == "llmops-pipeline", \
+        "the triage rule was created on the default bus; it would match nothing"
+    assert events.targets[0]["EventBusName"] == "llmops-pipeline", \
+        "put_targets without EventBusName targets a same-named rule on the DEFAULT bus"
+    assert events.targets[0]["Targets"][0]["Arn"].endswith("llmops-harness-driver")
+    # The permission's SourceArn must name the bus too: rule/<bus>/<name>, not rule/<name>.
+    assert "rule/llmops-pipeline/llmops-escalation-triage" in lam.perm["SourceArn"]
+
+
+def test_the_triage_rule_source_and_detail_type_come_from_the_contracts():
+    """A rule whose source disagrees with the emitter by one character matches nothing
+    and looks healthy. Both sides must read the same constant."""
+    pattern = _triage_rule_pattern()
+    assert pattern["source"] == [ev.EVENT_SOURCE]
+    assert pattern["detail-type"] == [ev.ESCALATED_TO_HUMAN]
+
+
+def test_a_triage_cannot_trigger_another_triage():
+    """handle_page_human emitted EscalatedToHuman until this change, so the first rule to
+    route that detail-type to triage would have looped: escalate -> triage -> page ->
+    triage, each lap paying for a real harness turn. Two independent defences, because
+    the loop is expensive and silent: page_human now emits OwnerPaged, and the rule
+    excludes the conductor's own stage."""
+    pattern = _triage_rule_pattern()
+    assert pattern["detail"]["stage"] == [{"anything-but": ["orchestrator"]}], \
+        "the rule does not exclude orchestrator-stage escalations"
+    handler_src = (REPO / "orchestration/harness_driver/handler.py").read_text()
+    page = handler_src.split("def handle_page_human", 1)[1].split("\ndef ", 1)[0]
+    assert "ev.OWNER_PAGED" in page, "page_human still emits the triage trigger"
+    assert "ev.ESCALATED_TO_HUMAN" not in page, \
+        "page_human emits EscalatedToHuman; the triage rule would feed itself"
+
+
+def test_the_informational_model_failover_is_not_an_escalation():
+    """_maybe_failover_model hot-swaps the model and the retry CONTINUES -- nobody needs
+    to decide anything. It said so in a reason string ("informational, pipeline
+    continuing"), which was harmless only while the bus had no rules: an EventBridge
+    pattern cannot read prose, so a rule on EscalatedToHuman would have paged the
+    conductor about a run that had just healed itself. The discrimination has to live in
+    the detail-type, where a rule can see it."""
+    src = (REPO / "orchestration/harness_driver/handler.py").read_text()
+    fn = src.split("def _maybe_failover_model", 1)[1].split("\ndef ", 1)[0]
+    assert "ev.MODEL_FAILED_OVER" in fn
+    assert "ev.ESCALATED_TO_HUMAN" not in fn, \
+        "a self-healed failover still emits the triage trigger"
+
+
+def test_every_escalation_emitter_carries_the_stage_the_rule_filters_on():
+    """The rule uses `anything-but`, which does NOT match an event lacking the key at
+    all. So an emitter that omits `stage` is dropped silently -- the same invisible
+    no-match this whole task is about, reintroduced from the emitter side. Both live
+    emitters are checked: the driver's handle_escalate and the ASL's EscalateFail, which
+    carried only run_id and iteration until this change."""
+    pattern = _triage_rule_pattern()
+    assert "anything-but" in json.dumps(pattern), "guard reads the wrong pattern shape"
+    src = (REPO / "orchestration/harness_driver/handler.py").read_text()
+    esc = src.split("def handle_escalate", 1)[1].split("\ndef ", 1)[0]
+    assert '"stage"' in esc, "handle_escalate's event detail has no stage key"
+    asl = json.loads((REPO / "orchestration/state_machine.asl.json").read_text())
+    detail = asl["States"]["EscalateFail"]["Parameters"]["Entries"][0]["Detail"]
+    assert "stage" in detail, (
+        "EscalateFail emits no stage, so anything-but cannot match it: every terminal "
+        "pipeline failure -- the escalations that most need a triager -- would be dropped")
+
+
+def test_the_bus_event_becomes_a_driver_invocation_the_driver_can_run():
+    """The translation, asserted against the fields _run_stage actually dereferences.
+    An invocation missing any of these raises KeyError inside the driver, i.e. after the
+    event is already consumed."""
+    record = {"detail-type": "EscalatedToHuman", "source": "llmops.pipeline",
+              "detail": {"run_id": "run-abc", "stage": "data-prep",
+                         "reason": "teacher budget infeasible", "iteration": 2}}
+    inv = driver.triage_event_from_bus(record, "llmops-data-test")
+    for key in ("run_id", "stage", "task", "manifest_uri", "harness_id"):
+        assert inv[key], f"{key} missing from the translated invocation"
+    assert inv["task"] == "triage"
+    assert inv["harness_id"] == "llmops_orchestrator"
+    assert inv["params"]["escalation"]["run_id"] == "run-abc"
+    assert inv["params"]["escalation"]["reason"] == "teacher budget infeasible"
+    # No task token: an EventBridge delivery has nothing to strand.
+    assert "task_token" not in inv
+
+
+def test_the_triage_runs_under_its_own_run_id_not_the_escalated_runs():
+    """The subtle one, and the reason a synthetic id is worth the confusion it costs.
+
+    take_directive() is keyed on event["run_id"] and its ONLY caller is the checkpoint
+    branch. A triage invoked under the subject's id would pop the subject's own parked
+    verdict -- the one the conductor is in the middle of writing -- and receive it as a
+    directive from an accountable human. The conductor would be answering itself.
+
+    handle_escalate and handle_job_launched also write the runs table keyed on that id,
+    so a triage that escalated in turn would overwrite the SUBJECT run's status."""
+    inv = driver.triage_event_from_bus(
+        {"detail-type": "EscalatedToHuman", "detail": {"run_id": "run-abc"}},
+        "llmops-data-test")
+    assert inv["run_id"] != "run-abc", (
+        "the triage runs under the escalated run's id: its first checkpoint would eat "
+        "the verdict it just parked for that run")
+    assert "run-abc" in inv["run_id"], "the triage id should still name its subject"
+    # The manifest is the SUBJECT's -- a triage has none of its own, and reading the
+    # stuck run's manifest is the first thing the prompt's triage clause asks for.
+    assert inv["manifest_uri"] == "s3://llmops-data-test/runs/run-abc/manifest.json"
+
+
+def test_an_escalation_with_no_run_id_is_rejected_not_triaged():
+    """Nothing to triage, and a manifest URI built from an empty id would point at
+    s3://bucket/runs//manifest.json -- a 404 the conductor would report as "no manifest"
+    rather than as a malformed event."""
+    with pytest.raises(ValueError):
+        driver.triage_event_from_bus({"detail-type": "EscalatedToHuman",
+                                      "detail": {"stage": "eval"}}, "b")
+
+
+def test_the_driver_recognises_a_bus_delivery_at_its_entry_point():
+    """handler() must translate before anything dereferences event["stage"], and must
+    recognise the envelope by its OWN keys rather than by a missing task token: plenty of
+    legitimate driver invocations (finops, console dispatch) carry no token."""
+    seen = {}
+
+    def _fake_run_stage(event, context=None, c=None):
+        seen.update(event)
+        return {"status": "ok"}
+
+    real = driver._run_stage
+    try:
+        driver._run_stage = _fake_run_stage
+        out = driver.handler({"detail-type": "EscalatedToHuman", "source": "llmops.pipeline",
+                              "detail": {"run_id": "run-xyz", "stage": "finetune"}},
+                             None, clients())
+    finally:
+        driver._run_stage = real
+    assert out == {"status": "ok"}
+    assert seen["task"] == "triage", "the bus envelope reached _run_stage untranslated"
+    assert seen["params"]["escalation"]["run_id"] == "run-xyz"
+
+
+def test_a_state_machine_payload_is_not_mistaken_for_a_bus_delivery():
+    """The negative half: a normal stage invocation must pass through untouched."""
+    seen = {}
+
+    def _fake_run_stage(event, context=None, c=None):
+        seen.update(event)
+        return {"status": "ok"}
+
+    real = driver._run_stage
+    try:
+        driver._run_stage = _fake_run_stage
+        driver.handler(driver_event(), None, clients())
+    finally:
+        driver._run_stage = real
+    assert seen["task"] == "generate" and seen["stage"] == "data-prep"
+
+
+def test_the_triage_rule_is_deployable_on_its_own_and_in_a_bare_run(monkeypatch, capsys):
+    """Same --only contract as every other target (#51): the rule must be shippable
+    without redeploying the driver, and a bare run must not skip it."""
+    mod = _lambdas_mod()
+    monkeypatch.setattr(mod.boto3, "client", lambda svc, **kw: object())
+    monkeypatch.setattr(sys, "argv", ["07_lambdas.py", "--region", "us-east-1",
+                                      "--dry-run", "--only", "triage_rule"])
+    mod.main()
+    report = json.loads(capsys.readouterr().out)
+    assert report["targets"] == ["triage_rule"]
+    assert [r.get("rule") for r in report["results"]] == ["llmops-escalation-triage"]
+    assert not [r for r in report["results"] if "lambda" in r or "state_machine" in r]
+    assert "triage_rule" in mod.NON_LAMBDA_TARGETS, "a bare run would skip the rule"
+
+
+# ---------------------------------------------------------------------------
+# The live bus vs the bytes about to ship (#61)
+# ---------------------------------------------------------------------------
+# #59 built the escalation channel; a later deploy from a DIFFERENT branch overwrote the
+# driver with a build that had no triage_event_from_bus, while llmops-escalation-triage
+# stayed ENABLED and pointed at it. Every escalation then reached the driver as a raw
+# EventBridge envelope and died on KeyError: 'run_id' before any handler branch ran.
+#
+# Every guard above stayed green, and that is the part worth fixing rather than the
+# missing function: they compare EVENTS_NEEDING_A_RULE against the rules THIS TREE's
+# deployer builds, so a branch carrying neither the declaration, nor the rule, nor the
+# translator is perfectly self-consistent. A tree cannot know what is live on the bus.
+# So the check moved to deploy time, where both facts are available at once.
+
+class _FakeEvents:
+    """Minimal EventBridge stand-in: rules and targets, per bus."""
+
+    def __init__(self, rules):
+        self._rules = rules  # {bus: [ {Name, State, EventPattern, Targets} ]}
+
+    def list_rules(self, EventBusName):
+        return {"Rules": [{k: v for k, v in r.items() if k != "Targets"}
+                          for r in self._rules.get(EventBusName, [])]}
+
+    def list_targets_by_rule(self, Rule, EventBusName):
+        for r in self._rules.get(EventBusName, []):
+            if r["Name"] == Rule:
+                return {"Targets": r.get("Targets", [])}
+        return {"Targets": []}
+
+
+DRIVER_FN = "llmops-harness-driver"
+_TRIAGE_ARN = f"arn:aws:lambda:us-east-1:123456789012:function:{DRIVER_FN}"
+
+
+def _triage_rule_live(state="ENABLED", targets=None, detail_types=None):
+    return {"llmops-pipeline": [{
+        "Name": "llmops-escalation-triage",
+        "State": state,
+        "EventPattern": json.dumps({
+            "source": [ev.EVENT_SOURCE],
+            "detail-type": detail_types or [ev.ESCALATED_TO_HUMAN],
+            "detail": {"stage": [{"anything-but": ["orchestrator"]}]}}),
+        "Targets": targets if targets is not None else [{"Id": "triage",
+                                                        "Arn": _TRIAGE_ARN}],
+    }]}
+
+
+def test_the_real_driver_source_can_read_the_real_live_rule():
+    """The regression itself: today's handler.py against today's rule shape.
+
+    Reads the actual file rather than a fixture, so deleting the translator fails here.
+    """
+    mod = _lambdas_mod()
+    src = (REPO / "orchestration/harness_driver/handler.py").read_text()
+    gaps = mod.live_bus_translator_gap(_FakeEvents(_triage_rule_live()), src,
+                                       DRIVER_FN, "llmops-pipeline")
+    assert gaps == [], f"the driver cannot read a live rule's envelope: {gaps}"
+
+
+def test_a_driver_without_the_translator_is_a_gap_the_deploy_can_see():
+    """The branch that caused this: the rule is live, the handler has no translator.
+
+    Simulated by stripping the function name from the source, which is precisely the
+    state the deployed zip was in -- verified live by downloading it: the translator
+    string was absent while _stamp_dispatch was present.
+    """
+    mod = _lambdas_mod()
+    src = (REPO / "orchestration/harness_driver/handler.py").read_text()
+    without = src.replace("triage_event_from_bus", "some_other_function")
+    assert "triage_event_from_bus" not in without
+    gaps = mod.live_bus_translator_gap(_FakeEvents(_triage_rule_live()), without,
+                                       DRIVER_FN, "llmops-pipeline")
+    assert len(gaps) == 1, gaps
+    assert gaps[0]["rule"] == "llmops-escalation-triage"
+    assert gaps[0]["detail_type"] == ev.ESCALATED_TO_HUMAN
+    assert "triage_event_from_bus" in gaps[0]["problem"]
+
+
+def test_the_deploy_refuses_rather_than_warns_when_the_translator_is_missing():
+    """A warning is useless here: the deploy reports success and the channel is dead.
+
+    Same rule as config_subst.resolve() -- an unresolved token and an unreadable envelope
+    are both accepted by the API and both fail later, out of sight of the person
+    deploying.
+    """
+    mod = _lambdas_mod()
+    tmp = REPO / "tests" / "_tmp_driver_no_translator.py"
+    tmp.write_text((REPO / "orchestration/harness_driver/handler.py").read_text()
+                   .replace("triage_event_from_bus", "gone"))
+    try:
+        cfg = dict(mod.LAMBDAS["driver"], src=tmp)
+        with pytest.raises(SystemExit) as exc:
+            mod.deploy_lambda(None, None, "us-east-1", "123456789012", "driver", cfg,
+                              False, _FakeEvents(_triage_rule_live()))
+        # The message has to name the function AND the rule: "deploy failed" sends
+        # someone reading Lambda logs, and the fault is on the bus.
+        assert "llmops-harness-driver" in str(exc.value)
+        assert "llmops-escalation-triage" in str(exc.value)
+    finally:
+        tmp.unlink()
+
+
+def test_a_dry_run_never_reaches_the_bus_check():
+    """--dry-run must stay offline; conftest refuses the socket, so this also proves the
+    check is not on the path that reports what WOULD happen."""
+    mod = _lambdas_mod()
+
+    class _Boom:
+        def list_rules(self, **kw):
+            raise AssertionError("a dry run called EventBridge")
+
+    out = mod.deploy_lambda(None, None, "us-east-1", "", "driver",
+                            mod.LAMBDAS["driver"], True, _Boom())
+    assert out["would"] == "create/update"
+
+
+def test_an_input_transformer_on_the_rule_removes_the_need_for_a_translator():
+    """The two are alternatives, and the check must know it.
+
+    #59 chose Python over an InputTransformer deliberately (a transformer referencing a
+    path an event lacks drops it silently). But if a rule DOES carry one, EventBridge has
+    already reshaped the event and demanding the Python function would block a correct
+    deploy -- a guard that cries wolf gets bypassed, which costs more than it saves.
+    """
+    mod = _lambdas_mod()
+    src = "no translator here at all"
+    transformed = [{"Id": "triage", "Arn": _TRIAGE_ARN,
+                    "InputTransformer": {"InputPathsMap": {"r": "$.detail.run_id"},
+                                         "InputTemplate": '{"run_id": <r>}'}}]
+    assert mod.live_bus_translator_gap(
+        _FakeEvents(_triage_rule_live(targets=transformed)), src, DRIVER_FN,
+        "llmops-pipeline") == []
+
+
+def test_a_disabled_rule_delivers_nothing_and_blocks_nothing():
+    """A DISABLED rule cannot invoke anything, so it must not hold up a deploy."""
+    mod = _lambdas_mod()
+    assert mod.live_bus_translator_gap(
+        _FakeEvents(_triage_rule_live(state="DISABLED")), "no translator", DRIVER_FN,
+        "llmops-pipeline") == []
+
+
+def test_a_rule_targeting_a_different_function_is_not_this_deploys_problem():
+    """Scoped to the function being deployed. Otherwise every Lambda deploy is gated on
+    every rule on the bus, and the check becomes something people pass with --force."""
+    mod = _lambdas_mod()
+    other = [{"Id": "x", "Arn": "arn:aws:lambda:us-east-1:123456789012:function:other"}]
+    assert mod.live_bus_translator_gap(
+        _FakeEvents(_triage_rule_live(targets=other)), "no translator", DRIVER_FN,
+        "llmops-pipeline") == []
+
+
+def test_a_live_rule_for_an_undeclared_detail_type_is_itself_reported():
+    """The other direction: a rule delivering something no translator is declared for.
+
+    This is how the NEXT version of this defect arrives -- someone adds a rule pointing
+    at the driver for a detail-type nobody wrote a branch for. The handler receives an
+    envelope it has no branch for, which is the same crash by a different route, so the
+    check names it instead of silently passing an unknown.
+    """
+    mod = _lambdas_mod()
+    gaps = mod.live_bus_translator_gap(
+        _FakeEvents(_triage_rule_live(detail_types=["SomeNewEvent"])),
+        (REPO / "orchestration/harness_driver/handler.py").read_text(),
+        DRIVER_FN, "llmops-pipeline")
+    assert [g["detail_type"] for g in gaps] == ["SomeNewEvent"]
+    assert "BUS_DELIVERY_TRANSLATORS" in gaps[0]["problem"]
+
+
+def test_an_unreachable_bus_is_reported_as_unchecked_not_as_clean():
+    """No credentials, no bus, an API error: say the check did not happen.
+
+    Returning [] would make an unreachable bus indistinguishable from an agreeing one --
+    the exact "no rule and rule missing look identical" confusion #59 was about, moved
+    into the guard built to prevent it. The deploy proceeds (a network blip must not
+    block shipping) but says so on stderr.
+    """
+    mod = _lambdas_mod()
+
+    class _Down:
+        def list_rules(self, **kw):
+            raise RuntimeError("bus unreachable")
+
+    gaps = mod.live_bus_translator_gap(_Down(), "src", DRIVER_FN, "llmops-pipeline")
+    assert len(gaps) == 1 and "unchecked" in gaps[0]
+    assert "bus unreachable" in gaps[0]["unchecked"]
+
+
+def test_only_the_bus_delivered_lambda_is_checked_against_the_bus():
+    """Exactly one of the six spine Lambdas is an EventBridge target; the rest are
+    invoked by Step Functions, the console or a schedule. Marking them all would gate
+    unrelated deploys on the bus and dilute the signal."""
+    mod = _lambdas_mod()
+    marked = {k for k, v in mod.LAMBDAS.items() if v.get("bus_delivered")}
+    assert marked == {"driver"}, marked
+    assert mod.LAMBDAS["driver"]["bus_delivered"] == "llmops-pipeline"
+
+
+def test_every_declared_translator_exists_in_the_handler_it_names():
+    """BUS_DELIVERY_TRANSLATORS is a promise about code; check it against the code.
+
+    Declaring a translator that does not exist would make the deploy-time check pass on a
+    name nobody implemented -- the guard would then be asserting its own spelling.
+    """
+    src = (REPO / "orchestration/harness_driver/handler.py").read_text()
+    for detail_type, fname in ev.BUS_DELIVERY_TRANSLATORS.items():
+        assert f"def {fname}(" in src, (
+            f"{detail_type} declares translator {fname}(), absent from the driver")
+        assert hasattr(driver, fname), f"{fname} is not importable from the driver"
+
+
+def test_the_translator_declaration_covers_every_event_that_needs_a_rule():
+    """The two contracts have to agree: an event that needs a rule to the driver needs a
+    way for the driver to read it. Declaring the rule without the translator is exactly
+    the half-built channel #59 found, and #61 was its mirror image."""
+    for detail_type in ev.EVENTS_NEEDING_A_RULE:
+        assert detail_type in ev.BUS_DELIVERY_TRANSLATORS, (
+            f"{detail_type} is routed to a Lambda by a rule but no translator is "
+            "declared for it; the delivery would arrive as a raw envelope")
+
+
+def test_a_call_site_without_a_definition_does_not_satisfy_the_check():
+    """The check looks for `def <name>(`, not the bare name, and a negative control is why.
+
+    Renaming only the DEFINITION leaves the call site behind, and a bare-substring check
+    passed on that source -- a handler that would raise NameError on the first escalation.
+    A call to a function nobody defines is worse than no call: it fails at the same place
+    for a reason one step further from the fix.
+    """
+    mod = _lambdas_mod()
+    src = (REPO / "orchestration/harness_driver/handler.py").read_text().replace(
+        "def triage_event_from_bus(", "def _renamed_translator(", 1)
+    assert "triage_event_from_bus" in src, "the call site should still be there"
+    gaps = mod.live_bus_translator_gap(_FakeEvents(_triage_rule_live()), src,
+                                       DRIVER_FN, "llmops-pipeline")
+    assert len(gaps) == 1 and "triage_event_from_bus" in gaps[0]["problem"], gaps

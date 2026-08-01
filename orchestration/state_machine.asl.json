@@ -546,7 +546,9 @@
             "EventBusName": "${EventBusName}",
             "Detail": {
               "run_id.$": "$.run_id",
-              "iteration.$": "$.iteration"
+              "iteration.$": "$.iteration",
+              "stage": "pipeline",
+              "reason": "Terminal failure or remediation budget exhausted -- see the stage events for the failing stage."
             }
           }
         ]

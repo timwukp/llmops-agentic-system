@@ -29,7 +29,7 @@ Next: v2 experiments — code-as-reasoning distillation + augmentation; Kimi K3 
 | IAM roles ×8 | llmops-harness-execution, llmops-sagemaker-execution, llmops-{driver,start,resume,webhook}-lambda, llmops-sfn-execution, llmops-eval-execution, llmops-scheduler-invoke | deploy/01_iam.py + phase scripts | least-privilege, scoped to `llmops-*` |
 | S3 bucket | (name in SSM `/llmops/storage/bucket`) | deploy/03_storage.py | versioned, SSE-S3, PAB, runs/ 90d lifecycle |
 | DynamoDB ×4 | llmops-pipeline-runs (GSI job_name-index), llmops-stage-events, llmops-cost-estimates, llmops-cost-actuals | deploy/03_storage.py | PITR on; cost tables added v1.1.0 |
-| EventBridge | bus `llmops-pipeline` + rule `llmops-sagemaker-job-state` (default bus) | 03 + 07 | wake chain for launch-and-release |
+| EventBridge | bus `llmops-pipeline` + rule `llmops-sagemaker-job-state` (default bus) + rule `llmops-escalation-triage` (custom bus) | 03 + 07 | wake chain for launch-and-release; triage rule routes `EscalatedToHuman` → driver as `task=triage` (the custom bus carried ZERO rules until v1.1.x) |
 | SNS topic | llmops-escalations | deploy/03_storage.py | EscalatedToHuman notifications |
 | Harnesses ×7 | llmops_{data_prep,finetune,eval,deploy,monitor,orchestrator,finops} | deploy/05_harnesses.py | full ids in SSM `/llmops/harness/*`; shared Memory attached; obs + online evals wired; currently on Opus 5 (Fable 5 fallback policy, AGENTS.md) |
 | AgentCore Memory | llmops_shared_memory (SEMANTIC + EPISODIC) | deploy/04_wire_memory.py | shared across all 7 harnesses |
