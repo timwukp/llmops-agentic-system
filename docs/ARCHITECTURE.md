@@ -73,6 +73,22 @@ else remediation), `RemediationChoice` (iteration < 3 → remediate, else escala
 
 Two spine details that are policy, not plumbing:
 
+- **Both records are closed on both paths.** A run writes two records — its own row in
+  `llmops-pipeline-runs` and the originating task's row in `llmops-tasks` — and each path
+  has now been caught closing only one of them. The failure path (`EscalateFail` →
+  `MarkRunFailed` → `MarkTaskFailed`) closed the run but not the task, which left
+  `task-58ecde82adcd73bf` at `dispatched` for a day. Then the success path: `runs.status`
+  was only ever written `running` (start-pipeline), `escalated` (the driver), or `failed`
+  (`MarkRunFailed`) — **nothing wrote `completed`**, so every successful run stayed a
+  zombie, exactly what `MarkRunFailed` exists to prevent on the other branch. It was
+  invisible because until `run-20260801T062313Z-4d3e2e69` **no execution had ever
+  succeeded** (6 failed, 1 aborted); that run's task row closed correctly at 06:34:43Z
+  while its run row still read `running` five hours later. `Complete` → **`MarkRunDone`**
+  → `MarkTaskDone` closes it, conditional on `attribute_not_exists(status) OR status =
+  running` so it can never overwrite a richer verdict, and its `Catch` falls through to
+  `MarkTaskDone` for the same reason `MarkRunFailed`'s does — failing to close one record
+  must not leave the other open. Guarded by property-based tests that derive the closers
+  from the ASL rather than naming them.
 - **`Teardown` always runs after deploy** — even when `SmokeTest` fails, its `Catch`
   routes to `Teardown` first. Orphaned endpoints are the #1 cost risk (Phase 4 found an
   unrelated endpoint in the account that had been InService since 2024-04).

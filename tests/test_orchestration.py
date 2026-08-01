@@ -1150,6 +1150,79 @@ class TestStateMachine:
             "MarkRunFailed's Catch must lead to Fail: a rejected condition is not a "
             "success, and a dead end would hang the execution instead of failing it")
 
+    def test_a_successful_run_is_closed_out_too_not_only_a_failed_one(self, asl):
+        """The failure path was fixed and the success path was not, and the asymmetry
+        survived precisely because it could not be seen: runs.status is written 'running'
+        by start_pipeline, 'escalated' by the driver, 'failed' by MarkRunFailed -- and
+        'completed' by nothing at all. stage_complete updates the manifest and settles the
+        task token; it never touches the run's own status.
+
+        So a run that SUCCEEDED sat at status=running forever, the same zombie
+        MarkRunFailed exists to prevent, on the other branch. It stayed invisible because
+        no execution had ever succeeded before: run-20260801T062313Z-4d3e2e69 was the
+        first, and five hours after it finished its task row read 'completed' while its
+        run row still read 'running'.
+
+        Asserted as a property of the success path rather than by naming the state, so
+        rerouting Complete elsewhere cannot quietly drop the closer.
+        """
+        states = asl["States"]
+        closers = [n for n, st in states.items()
+                   if st.get("Resource", "").endswith("dynamodb:updateItem")
+                   and st["Parameters"]["TableName"] == "llmops-pipeline-runs"
+                   and "completed" in json.dumps(
+                       st["Parameters"]["ExpressionAttributeValues"])]
+        assert closers, (
+            "no state writes status=completed to llmops-pipeline-runs; a successful run "
+            "stays at 'running' forever and the console shows it as still in flight")
+        for name in closers:
+            assert _reaches(states, "Complete", name) or name == "Complete", (
+                f"{name} writes the completed status but the success path never reaches "
+                "it, so the run record is still never closed")
+        # And it must not turn a successful pipeline into a failed execution.
+        for name in closers:
+            assert _terminals_from(states, name) == {"Succeed"}, (
+                f"{name} can end the execution somewhere other than Succeed; closing a "
+                "record is bookkeeping and must never change the run's verdict")
+
+    def test_closing_a_successful_run_never_overwrites_a_richer_status(self, asl):
+        """Mirrors the MarkRunFailed guard. The driver may already have written
+        'escalated' -- more informative than 'completed' -- and a DDB outage must not
+        fail an execution whose pipeline genuinely succeeded."""
+        states = asl["States"]
+        closer = next(n for n, st in states.items()
+                      if st.get("Resource", "").endswith("dynamodb:updateItem")
+                      and st["Parameters"]["TableName"] == "llmops-pipeline-runs"
+                      and "completed" in json.dumps(
+                          st["Parameters"]["ExpressionAttributeValues"]))
+        params = states[closer]["Parameters"]
+        assert "running" in json.dumps(params["ExpressionAttributeValues"]), (
+            "the write must be conditional on the run still being 'running', or it "
+            "would clobber the driver's richer 'escalated'")
+        assert "States.ALL" in states[closer]["Catch"][0]["ErrorEquals"]
+        assert _terminals_from(states, states[closer]["Catch"][0]["Next"]) == {"Succeed"}
+
+    def test_both_records_are_closed_on_both_paths(self, asl):
+        """The run record and the task record are separate records with separate reasons
+        to go stale, and each path has now been caught missing one of them: the failure
+        path closed the run but not the task (task-58ecde82adcd73bf sat at 'dispatched'
+        for a day), the success path closed the task but not the run. Assert the full
+        2x2 rather than the one cell that was most recently broken.
+        """
+        states = asl["States"]
+        for start, table, want in (("Complete", "llmops-pipeline-runs", "completed"),
+                                   ("Complete", "llmops-tasks", "completed"),
+                                   ("EscalateFail", "llmops-pipeline-runs", "failed"),
+                                   ("EscalateFail", "llmops-tasks", "failed")):
+            hit = [n for n, st in states.items()
+                   if st.get("Resource", "").endswith("dynamodb:updateItem")
+                   and st["Parameters"]["TableName"] == table
+                   and want in json.dumps(st["Parameters"]["ExpressionAttributeValues"])
+                   and _reaches(states, start, n)]
+            assert hit, (
+                f"nothing reachable from {start} writes {want!r} to {table}; that record "
+                "stays open and the console keeps showing finished work as in flight")
+
     def test_the_asl_carries_no_fields_amazon_states_language_rejects(self, asl):
         """`_comment` is this repo's convention for explaining a policy document, and it
         is fine in the IAM JSONs -- ASL rejects it outright ("Field '_comment' is not
