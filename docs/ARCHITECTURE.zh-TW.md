@@ -106,6 +106,21 @@ run）、`resolve_escalation`（政策範圍內第一線處置：調參重跑階
 `page_human`（**僅限**超出其權限的決策 —— 預算超支、共享資源刪除、業務取捨 ——
 附決策簡報：情勢、選項、建議）、`write_report`（發布跨運行運維彙總），加 `checkpoint`。
 
+**裁決要嘛被投遞，要嘛可見地無法投遞 —— 絕不靜默歸檔。** 回答通道
+（`put_directive` → `checkpoint` 分支的 `take_directive`）**只有一個讀者**：一個
+*活著的* driver invocation。所以「已投遞」不是寫入的屬性，而是「將來會不會有人去讀」的
+屬性 —— 而 `resolve_escalation` 過去兩種情況都回 `{"status": "resolved"}`。這正是那筆
+data-prep 預算 escalation 懸了三天的原因：`run-20260729T104648Z-41631739` 早已是
+`escalated`，它的 task token 已被 `handle_escalate` 置失敗、execution 也在 11:19:55Z
+FAILED，所以今天去 triage 它**會回報成功、然後什麼都不會發生**。那個為了回答 escalation
+而存在的工具，回答不了*那一筆* escalation，而且沒有告訴任何人。這與 §4 那個滯留的 task
+token 是同一個形狀：**寫入被授權了，但到不了。** 現在 `put_directive` 會先查該 run 的
+狀態；終態 run 的裁決仍然會被寫下（決定本身就是證據，即使沒人照它行動），但標記
+`deliverable: false`，並且**在同一輪把呼叫駁回**，明確指出仍然能動的路徑 ——
+用 `launch_run` 帶著 adjusted params 重跑，或 `page_human`。讀不到或不存在的 run 列
+**刻意**算作可投遞：要修的缺陷就是靜默無操作，若因為一次暫時性 DynamoDB 錯誤就扣住裁決，
+等於朝同一個方向又造出第二個。
+
 若一輪結束時*沒有* inline-function 呼叫（模型有時會口頭宣稱完成卻漏掉結構化呼叫），
 driver 在同一 session 內最多追問 2 次，然後以 `MissingStageComplete` 判定階段失敗 ——
 口頭敘述永遠不會被晉升為成功。
