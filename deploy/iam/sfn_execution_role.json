@@ -1,0 +1,54 @@
+{
+  "_comment": [
+    "llmops-sfn-execution -- the state machine's own role. It existed live from Phase 3 but",
+    "was declared NOWHERE in this repo: created by hand, never reconciled by 01_iam.py, and",
+    "listed in PROJECT_STATE.md as if 01_iam.py owned it. Undeclared infrastructure is a",
+    "role nobody can review and nobody can rebuild -- a fresh-account deploy would have",
+    "produced a pipeline whose state machine could not start.",
+    "",
+    "The DynamoDB grant is what lets the state machine close out its own runs. Until it",
+    "existed, a stage Lambda that CRASHED (as opposed to escalating politely) left the run",
+    "at status=running forever, because every Python writer of that field lives inside the",
+    "Lambda that just died. Nine live runs were zombies this way."
+  ],
+  "trustPolicy": {
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Sid": "AllowStatesToAssume",
+        "Effect": "Allow",
+        "Principal": {"Service": "states.amazonaws.com"},
+        "Action": "sts:AssumeRole",
+        "Condition": {"StringEquals": {"aws:SourceAccount": "<ACCOUNT_ID>"}}
+      }
+    ]
+  },
+  "permissionsPolicy": {
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Sid": "InvokeSpineLambdas",
+        "Effect": "Allow",
+        "Action": "lambda:InvokeFunction",
+        "Resource": "arn:aws:lambda:<REGION>:<ACCOUNT_ID>:function:llmops-*"
+      },
+      {
+        "Sid": "EmitPipelineEvents",
+        "Effect": "Allow",
+        "Action": "events:PutEvents",
+        "Resource": "arn:aws:events:<REGION>:<ACCOUNT_ID>:event-bus/llmops-pipeline"
+      },
+      {
+        "Sid": "CloseOutOwnRuns",
+        "_comment": [
+          "UpdateItem only, on the runs table only. The state machine is not allowed to",
+          "create runs (that is start_pipeline's job) or delete them: its single write is",
+          "the terminal status of a run it is already executing."
+        ],
+        "Effect": "Allow",
+        "Action": "dynamodb:UpdateItem",
+        "Resource": "arn:aws:dynamodb:<REGION>:<ACCOUNT_ID>:table/llmops-pipeline-runs"
+      }
+    ]
+  }
+}

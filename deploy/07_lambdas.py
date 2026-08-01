@@ -155,12 +155,20 @@ def deploy_state_machine(sfn, ssm, region, account, dry):
     if dry:
         json.loads(asl)
         return {"state_machine": STATE_MACHINE_NAME, "would": "create/update", "asl": "valid"}
-    role_arn = ssm.get_parameter(Name="/llmops/iam/lambda_start_arn")["Parameter"]["Value"]
-    # dedicated SFN role expected under /llmops/iam/sfn_arn; fall back to start role param name
-    try:
-        role_arn = ssm.get_parameter(Name="/llmops/iam/sfn_arn")["Parameter"]["Value"]
-    except ssm.exceptions.ParameterNotFound:
-        pass
+    # The state machine's own role, published by 01_iam.py from iam/sfn_execution_role.json.
+    # The legacy /llmops/iam/sfn_arn name is still read as a fallback for accounts
+    # deployed before the role was declared in-repo; the start role is the last resort
+    # and is wrong (it cannot write the runs table), so it fails loudly at MarkRunFailed
+    # rather than silently granting the state machine the wrong identity.
+    for param in ("/llmops/iam/sfn_execution_arn", "/llmops/iam/sfn_arn",
+                  "/llmops/iam/lambda_start_arn"):
+        try:
+            role_arn = ssm.get_parameter(Name=param)["Parameter"]["Value"]
+            break
+        except ssm.exceptions.ParameterNotFound:
+            continue
+    else:
+        raise RuntimeError("no state machine role in SSM — run deploy/01_iam.py first")
     sm_arn = f"arn:aws:states:{region}:{account}:stateMachine:{STATE_MACHINE_NAME}"
     try:
         sfn.describe_state_machine(stateMachineArn=sm_arn)
