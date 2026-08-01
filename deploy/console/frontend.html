@@ -29,11 +29,10 @@
   .card { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:16px; }
   .card h2 { font-size:12px; text-transform:uppercase; letter-spacing:.06em;
              color:var(--muted); margin:0 0 12px; font-weight:600; }
-  .col-3 { grid-column:span 3; } .col-4 { grid-column:span 4; }
-  .col-5 { grid-column:span 5; } .col-6 { grid-column:span 6; }
-  .col-7 { grid-column:span 7; } .col-8 { grid-column:span 8; }
-  .col-9 { grid-column:span 9; } .col-12 { grid-column:span 12; }
-  @media (max-width:900px){ .col-3,.col-4,.col-5,.col-6,.col-7,.col-8,.col-9 { grid-column:span 12; } }
+  .col-4 { grid-column:span 4; } .col-5 { grid-column:span 5; }
+  .col-6 { grid-column:span 6; } .col-7 { grid-column:span 7; }
+  .col-8 { grid-column:span 8; } .col-12 { grid-column:span 12; }
+  @media (max-width:900px){ .col-4,.col-5,.col-6,.col-7,.col-8 { grid-column:span 12; } }
   .row { display:flex; align-items:center; justify-content:space-between; gap:10px;
          padding:8px 0; border-bottom:1px solid var(--line); }
   .row:last-child { border-bottom:0; }
@@ -49,84 +48,6 @@
   input,select,textarea { font:inherit; background:var(--bg); color:var(--text);
                    border:1px solid var(--line); border-radius:7px; padding:7px; width:100%; }
   label { display:block; color:var(--muted); font-size:12px; margin:8px 0 3px; }
-  /* ── single-thread task view ──────────────────────────────────────────────
-     One conversation, one composer. The old layout had a task list with its own
-     textarea beside a chat with its own input, and nothing on screen said which
-     box created a thread and which continued one -- two typing targets read as a
-     bug. The rail selects; the thread is where everything happens. */
-  .threads { max-height:520px; overflow-y:auto; }
-  .threads .th { padding:8px 10px; border-radius:8px; cursor:pointer; margin-bottom:4px;
-                 border:1px solid transparent; }
-  .threads .th:hover { background:var(--panel2); }
-  .threads .th.sel { background:var(--panel2); border-color:var(--accent); }
-  .threads .th .thgoal { font-size:12.5px; font-weight:600; overflow:hidden;
-                         text-overflow:ellipsis; white-space:nowrap; }
-  /* The status strip replaces a full-width lifecycle card. The SVG logic is reused
-     verbatim -- only the box it renders into got shorter, so a reader sees the
-     conversation first and the machinery second. */
-  .stagestrip { display:flex; align-items:center; gap:6px; flex-wrap:wrap; font-size:11px;
-                color:var(--muted); padding:2px 0 8px; border-bottom:1px solid var(--line);
-                margin-bottom:10px; }
-  .stagestrip .sg { display:flex; align-items:center; gap:4px; padding:2px 8px;
-                    border-radius:20px; border:1px solid var(--line); background:var(--panel2); }
-  .stagestrip .sg.done { color:var(--green); border-color:rgba(62,207,142,.4); }
-  .stagestrip .sg.act { color:var(--accent); border-color:var(--accent); }
-  .stagestrip .sgsep { color:var(--line); }
-  /* Chips: the first turn is one click. Without them an empty composer asks the
-     customer to invent the shape of a request they have never made before. */
-  .chips { display:flex; gap:6px; flex-wrap:wrap; margin-bottom:8px; }
-  .chips button { font-size:12px; padding:5px 11px; border-radius:20px; text-align:left; }
-  /* An artifact is a message that is not prose: the plan, the readiness table, the
-     approval record. It sits IN the thread, where the turn that produced it is. */
-  .chat .m-artifact { align-self:stretch; max-width:100%; background:var(--panel2);
-                      border:1px solid var(--accent); }
-  .chat .m-artifact .arth { font-size:11px; text-transform:uppercase; letter-spacing:.05em;
-                            color:var(--muted); font-weight:600; margin-bottom:6px; }
-  .chat .m-artifact pre { max-height:260px; overflow:auto; }
-  .chat { max-height:460px; overflow-y:auto; display:flex; flex-direction:column; gap:8px; padding:4px; }
-  .chat .msg { max-width:82%; padding:8px 12px; border-radius:12px; font-size:13px;
-               line-height:1.5; white-space:pre-wrap; word-break:break-word; }
-  .chat .m-user { align-self:flex-end; background:var(--panel2); border:1px solid var(--accent); }
-  .chat .m-assistant { align-self:flex-start; background:var(--panel2); border:1px solid var(--line); }
-  .chat .m-system { align-self:center; background:transparent; border:1px dashed var(--line);
-                    color:var(--muted); font-size:12px; }
-  .chat .m-pending { opacity:.55; }
-  .chat .who { font-size:10px; color:var(--muted); margin-bottom:2px; }
-  .plankv td:first-child { color:var(--muted); width:180px; }
-  /* In-thread prompt, replacing window.prompt()/alert(). A browser prompt cannot be
-     styled, cannot be cancelled without losing what was typed, and blocks the poll
-     that keeps the thread live; an alert dumping 1800 chars of signed JSON was the
-     least product-like thing on the tab. */
-  .inlineask { border:1px solid var(--accent); border-radius:10px; padding:10px;
-               background:var(--panel2); margin-top:8px; }
-  .inlineask .askq { font-size:12px; color:var(--muted); margin-bottom:6px; }
-  /* Upload. Before this existed the console's IAM could write only tasks/* and this
-     page had no file input at all, so the orchestrator opened every consultation by
-     asking "where is your data (an S3 URI under customer-data/)" -- a question the
-     product could not help answer. The bytes go browser -> S3 against a presigned
-     PUT; only the signature comes from the Lambda. */
-  .dropzone { border:1.5px dashed var(--line); border-radius:10px; padding:12px 14px;
-              text-align:center; font-size:12.5px; color:var(--muted); cursor:pointer;
-              margin-top:10px; }
-  .dropzone:hover, .dropzone.over { border-color:var(--accent); background:var(--panel2);
-                                    color:var(--text); }
-  /* A real dataset is large and a browser fetch() reports no upload progress, so the
-     PUT goes through XMLHttpRequest to drive this bar. Without it a multi-GB upload
-     is indistinguishable from a hang, and the customer retries on top of it. */
-  .dropzone .bar { height:6px; border-radius:3px; background:var(--panel2); margin-top:8px;
-                   overflow:hidden; border:1px solid var(--line); }
-  .dropzone .bar i { display:block; height:100%; background:var(--accent); width:0;
-                     transition:width .15s linear; }
-  /* Readiness. Every unanswered field is SHOWN as unanswered: a blank row reads as
-     "fine", and the entire purpose of the panel is which questions nobody answered. */
-  .readiness { border:1px solid var(--line); border-radius:10px; background:var(--panel2);
-               padding:8px 10px; margin-bottom:10px; font-size:12px; }
-  .readiness .rdhead { display:flex; align-items:center; gap:8px; cursor:pointer; }
-  .readiness table { width:100%; border-collapse:collapse; margin-top:8px; }
-  .readiness td { padding:4px 6px; border-top:1px solid var(--line); vertical-align:top; }
-  .readiness td.rdlabel { color:var(--muted); width:190px; }
-  .readiness .rdno { color:var(--amber); }
-  .readiness .rdwhy { color:var(--muted); font-size:11px; display:block; margin-top:2px; }
   .flex { display:flex; gap:8px; align-items:center; }
   .stat { font-size:26px; font-weight:700; } .stat small { font-size:12px; color:var(--muted); font-weight:400; }
   nav.tabs { display:flex; gap:6px; padding:10px 24px 0; background:var(--panel);
@@ -158,14 +79,6 @@
   .flow .pulse { animation:pipepulse 1.1s ease-in-out infinite; }
   @keyframes pipepulse { 0%,100%{ opacity:1; } 50%{ opacity:.25; } }
   .flow .looplbl { fill:#8592c0; font:600 11px system-ui,-apple-system,sans-serif; letter-spacing:.04em; }
-  /* hover affordance: without it the card appears with no hint the box was hoverable */
-  .flow .node:hover rect, .flow .node:focus rect { fill:#222d55; stroke-width:2.5; }
-  .flow .node:focus { outline:none; }
-  /* fixed, not absolute: the flow card scrolls horizontally on narrow screens and an
-     absolutely-positioned card would be clipped by its overflow container. */
-  #stageTip { position:fixed; z-index:60; display:none; max-width:400px; padding:10px 12px;
-    background:#141c38; border:1px solid #32406f; border-radius:8px; font-size:12px;
-    box-shadow:0 8px 28px rgba(0,0,0,.55); pointer-events:none; }
   #runDetail { margin-top:12px; background:var(--panel2); border:1px solid var(--line);
                border-radius:10px; padding:12px 14px; }
   .obsrow2 { display:grid; grid-template-columns:2fr 1fr; gap:10px; }
@@ -187,7 +100,6 @@
 
 <nav class="tabs">
   <button data-tab="architecture" onclick="showTab('architecture')">Architecture</button>
-  <button data-tab="tasks" onclick="showTab('tasks')">Tasks</button>
   <button data-tab="pipeline" class="active" onclick="showTab('pipeline')">Pipeline</button>
   <button data-tab="fleet" onclick="showTab('fleet')">Fleet</button>
   <button data-tab="obs" onclick="showTab('obs')">Observability</button>
@@ -204,44 +116,6 @@
     <div class="stat" id="kpiRuns">&ndash;</div><small id="kpiRunsSub">recent runs in DynamoDB</small></div>
   <div data-tab-panel="all" class="card col-4"><h2>Executions</h2>
     <div class="stat" id="kpiExec">&ndash;</div><small id="kpiExecSub">Step Functions llmops-pipeline</small></div>
-
-  <!-- Tasks: goal-driven entry — consult the orchestrator, sign the plan.
-       One thread, like a Claude Code session: the rail picks a conversation, the
-       conversation holds everything about it (status, plan, uploads, approvals),
-       and a single composer either starts a new consultation or continues the
-       selected one. -->
-  <div data-tab-panel="tasks" class="card col-3"><h2>Consultations</h2>
-    <button class="primary" style="width:100%;margin-bottom:10px" onclick="newThread()">+ New consultation</button>
-    <div id="taskList" class="threads"><span class="sub">loading&hellip;</span></div>
-  </div>
-
-  <div data-tab-panel="tasks" class="card col-9"><h2 id="taskThreadTitle">Consultation &middot; llmops_orchestrator</h2>
-    <div id="taskStrip" class="stagestrip"><span class="sub">new consultation &mdash; describe your goal below</span></div>
-    <div id="taskReadiness"></div>
-    <div id="taskChat" class="chat"></div>
-    <div id="taskChoices" class="chips" style="margin-top:10px"></div>
-    <div id="taskChips" class="chips" style="margin-top:10px"></div>
-    <div id="taskAsk"></div>
-    <!-- Upload: the bytes go browser -> S3 against a presigned PUT, so a multi-GB
-         dataset never passes through API Gateway (6 MB cap) or this Lambda. Hidden
-         until a consultation exists, because the key is customer-data/<task_id>/... -
-         there is no prefix to write into before then. -->
-    <div id="taskDrop" class="dropzone" style="display:none"
-         ondragover="dropOver(event,true)" ondragleave="dropOver(event,false)"
-         ondrop="dropFiles(event)" onclick="$('taskFile').click()">
-      <input type="file" id="taskFile" style="display:none" onchange="pickFiles(event)"/>
-      <div id="taskDropMsg">&#128193; Drop your dataset here, or click to choose a file</div>
-      <div class="sub" style="margin-top:3px">jsonl &middot; json &middot; csv &middot; tsv &middot; txt &middot; parquet &middot; zip &middot; gz &mdash; up to 5 GiB. It uploads straight into this consultation's own S3 prefix, and the URI is posted into the conversation so the orchestrator can audit it.</div>
-      <div id="taskUpBar" class="bar" style="display:none"><i id="taskUpFill"></i></div>
-    </div>
-    <div class="flex" style="margin-top:8px;align-items:flex-end">
-      <textarea id="taskMsg" rows="2" style="flex:1"
-        onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();composerSend();}"></textarea>
-      <button class="primary" id="taskSendBtn" onclick="composerSend()">Send</button>
-    </div>
-    <div id="taskChatMsg" class="sub" style="margin-top:6px"></div>
-    <div id="taskActions" class="flex" style="margin-top:10px;flex-wrap:wrap"></div>
-  </div>
 
   <!-- Architecture: what this system is and how it is wired -->
   <div data-tab-panel="architecture" class="card col-12"><h2>Solution architecture</h2>
@@ -297,11 +171,7 @@
       <span id="pipeHead" class="sub">loading&hellip;</span>
     </div>
     <div id="pipeViz"></div>
-    <div class="sub" style="margin-top:8px">Hover (or tab to) any stage box for the live
-      configuration behind it &mdash; AgentCore runtime, harness id, timeout, retry and
-      error routing, read from the <b>deployed</b> state machine definition.</div>
   </div>
-  <div id="stageTip" role="tooltip"></div>
 
   <!-- Pipeline: recent runs + start run -->
   <div data-tab-panel="pipeline" class="card col-8"><h2>Recent runs &middot; click for detail</h2><div id="runsList"><span class="sub">loading&hellip;</span></div></div>
@@ -427,50 +297,20 @@
 <script>
 const API = "";  // same-origin
 // The Cognito access token lives in this in-memory variable ONLY — deliberately not in
-// localStorage/sessionStorage, so there is nothing on disk to steal. What survives a
-// reload instead is an httpOnly refresh cookie (set by /api/login, readable only by
-// /api/refresh) — script cannot touch it, so an XSS bug costs an attacker one 8-hour
-// access token rather than 30 days of re-issue. Read-only browsing needs no sign-in.
+// localStorage/sessionStorage. A reload costs one sign-in and buys the property that
+// there is nothing on disk to steal. Read-only browsing needs no sign-in at all.
 let SESSION = null;
 function authHeaders(){ return SESSION ? {"authorization": "Bearer "+SESSION.token} : {}; }
 function setAuthUi(){
   const b = $("loginBtn");
   if (b) b.textContent = SESSION ? ("admin · sign out") : "Sign in";
 }
-// Two ways to lose a session, and they must NOT be the same function.
-// clearSession(): this access token is no longer usable (expired, or a 401 came back).
-//   The refresh cookie stays, so the next action silently re-mints a token.
-// signOut(): the human asked to leave. Revoke server-side and drop the cookie.
-// Collapsing these would make an 8-hour token expiry destroy the 30-day session —
-// i.e. it would reintroduce the exact re-login-on-refresh bug this code fixes.
-function clearSession(){ SESSION = null; setAuthUi(); }
-function signOut(){
-  clearSession();
-  // Not awaited: the UI is already signed out, and a slow Cognito RevokeToken must not
-  // make the button feel broken. The cookie is cleared by the response either way.
-  fetch(API+"/api/refresh/revoke",{method:"POST",credentials:"same-origin"}).catch(()=>{});
-}
-// Turn the refresh cookie back into an access token. Silent on failure by design: for a
-// first-time visitor, or 30 days after the last sign-in, "no session" is the normal
-// answer and an alert would be noise on every fresh page load.
-async function restoreSession(){
-  const r = await fetch(API+"/api/refresh",{method:"POST",credentials:"same-origin"})
-    .then(x=>x.json()).catch(()=>({error:"network"}));
-  if (r && r.accessToken) {
-    // user is left null: /api/refresh proves a valid session, not WHICH name typed the
-    // password. Defaulting it to "admin" would put a guess into any future audit or
-    // "signed in as" surface, and nothing reads this field today.
-    SESSION = {token:r.accessToken, exp: Date.now()+(r.expiresIn-60)*1000, user:null};
-  }
-  setAuthUi();
-  return !!SESSION;
-}
+function signOut(){ SESSION = null; setAuthUi(); }
 async function signIn(){
   if (SESSION) { if (confirm("Sign out?")) signOut(); return true; }
   const u = prompt("Admin username:", "admin"); if (!u) return false;
   const p = prompt("Password:"); if (!p) return false;
-  const r = await fetch(API+"/api/login",{method:"POST",credentials:"same-origin",
-    headers:{"content-type":"application/json"},
+  const r = await fetch(API+"/api/login",{method:"POST",headers:{"content-type":"application/json"},
     body:JSON.stringify({username:u.trim(), password:p})}).then(x=>x.json()).catch(e=>({error:String(e)}));
   if (r.accessToken) {
     SESSION = {token:r.accessToken, exp: Date.now()+(r.expiresIn-60)*1000, user:u.trim()};
@@ -479,9 +319,8 @@ async function signIn(){
   alert("Login failed: "+(r.error||"unknown")); return false;
 }
 async function ensureToken(){
-  if (SESSION && SESSION.exp && Date.now() > SESSION.exp) clearSession();  // expired
+  if (SESSION && SESSION.exp && Date.now() > SESSION.exp) SESSION = null;  // expired → re-auth
   if (SESSION) return true;
-  if (await restoreSession()) return true;  // cookie may still be good — no prompt
   return await signIn();
 }
 const $ = (id) => document.getElementById(id);
@@ -565,84 +404,11 @@ function stageColor(st){
   if (st==="running") return "#f5b342";
   if (st==="succeeded") return "#3ecf8e";
   if (st==="failed") return "#ff6b6b";
-  // amber, not red: the stage stopped to ask a human something (a budget cap, a
-  // gate it will not cross unattended). Waiting on us, not broken. Falling through
-  // to the default would have painted it as "pending" — the opposite of urgent.
-  if (st==="escalated") return "#f5b342";
   if (st==="skipped") return "#3a4577";
   return "#5a6491";  // pending
 }
-// Hover card for a stage node: what is actually behind this box. The operator's
-// question on seeing a red or amber node is "whose code is this, and how was it
-// configured" -- the answer used to require reading the ASL in another window.
-// Every value is server-supplied (config read from the DEPLOYED definition, runtime
-// facts from the execution history), so the card cannot claim a setting the live
-// pipeline does not have.
-function stageTipRows(st){
-  const c = st.config||{}, rows = [];
-  const add = (k,v)=>{ if(v!==undefined && v!==null && v!=="") rows.push([k,String(v)]); };
-  add("status", st.status);
-  // "unresolved" is a real answer and must look different from a name: it means no
-  // live AgentCore runtime matched this harness. The runtime NAME is not unique
-  // (harness_llmops_data_prep) -- the id is (…-D8SPwm7Kog), so both are shown: the
-  // name to recognise, the id to grep logs and match ARNs with.
-  add("AgentCore runtime", c.runtime==="unresolved" ? "unresolved (no live match)" : c.runtime);
-  add("runtime id", c.runtimeId);
-  add("runtime status", c.runtimeStatus);
-  add("runtime version", c.runtimeVersion);
-  add("harness id", c.harnessId);
-  add("harness (deployed)", c.harnessFullId);   // the suffixed id the driver invokes
-  add("harness status", c.harnessStatus);
-  add("model", c.model);
-  add("harness version", c.harnessVersion);
-  add("stage · task", c.stage && c.task ? c.stage+" · "+c.task : null);
-  add("SFN state", (c.states||[]).join(" | "));
-  add("driver λ", c.lambda);
-  // Seconds are what the ASL says; minutes are what a human reasons in. A 7200 that
-  // the operator has to divide is a number they will misread once and never trust.
-  if (c.timeoutSeconds) add("timeout", c.timeoutSeconds+"s ("+Math.round(c.timeoutSeconds/60)+" min)");
-  if (c.heartbeatSeconds) add("heartbeat", c.heartbeatSeconds+"s");
-  if (c.maxAttempts) add("retries", c.maxAttempts+" (service errors only)");
-  add("on error", (c.catch||[]).join(" -> "));
-  add("attempts this run", st.attempts>1 ? st.attempts+" (remediation loop)" : st.attempts);
-  add("entered", st.enteredAt);
-  add("exited", st.exitedAt);
-  add("error", st.error);
-  add("cause", st.cause);
-  // Partial-resolution notes: a field that could not be read says why, rather than
-  // being silently absent (absent reads as "not applicable", which is a different claim).
-  if (c.harnessIdError) add("harness id unresolved", c.harnessIdError);
-  if (c.runtimeError) add("runtime lookup failed", c.runtimeError);
-  if (c.fleetError) add("harness health unavailable", c.fleetError);
-  if (c._error) add("config unavailable", c._error);
-  return rows;
-}
-function showStageTip(evt, key){
-  const st = (window._PIPE_STAGES||[]).find(s=>s.key===key);
-  if (!st) return;
-  const el = $("stageTip"); if (!el) return;
-  el.innerHTML = `<div style="font-weight:600;margin-bottom:6px">${esc(st.label)}</div>`+
-    stageTipRows(st).map(([k,v])=>
-      `<div style="display:flex;gap:8px;line-height:1.5"><span class="sub" style="min-width:112px">${esc(k)}</span>`+
-      `<span class="mono" style="word-break:break-all">${esc(v)}</span></div>`).join("");
-  el.style.display = "block";
-  moveStageTip(evt);
-}
-function moveStageTip(evt){
-  const el = $("stageTip"); if (!el || el.style.display!=="block") return;
-  // Flip before the right edge rather than after: a card that opens off-screen is a
-  // card the operator cannot read, and the widest values here are full ARNs.
-  const pad = 14, w = el.offsetWidth||320, h = el.offsetHeight||120;
-  let x = evt.clientX + pad, y = evt.clientY + pad;
-  if (x + w > window.innerWidth - 8) x = evt.clientX - w - pad;
-  if (y + h > window.innerHeight - 8) y = Math.max(8, evt.clientY - h - pad);
-  el.style.left = x+"px"; el.style.top = y+"px";
-}
-function hideStageTip(){ const el=$("stageTip"); if (el) el.style.display="none"; }
-
 function renderPipe(d){
   const stages = d.stages||[];
-  window._PIPE_STAGES = stages;   // the hover handlers read the same objects, not a copy
   const NW=128, GAP=18, Y=40, H=72, STEP=NW+GAP;
   const W = stages.length*STEP-GAP+20, VH=205;
   let svg = `<svg class="flow" viewBox="0 0 ${W} ${VH}" role="img" aria-label="LLMOps pipeline stage flow">`+
@@ -652,11 +418,7 @@ function renderPipe(d){
     const x = xs[i], c = stageColor(st.status), live = st.status==="running";
     if (i<stages.length-1)
       svg += `<path class="wire" d="M${x+NW},${Y+H/2} H${x+STEP-5}" marker-end="url(#pah)"/>`;
-    // Hover target is the whole <g>, so the label text counts too -- a card that only
-    // opens on the 1px rect border is a card nobody discovers.
-    svg += `<g class="node" style="cursor:help" onmouseenter="showStageTip(event,${jstr(st.key)})"`+
-      ` onmousemove="moveStageTip(event)" onmouseleave="hideStageTip()"`+
-      ` tabindex="0" onfocus="showStageTip(event,${jstr(st.key)})" onblur="hideStageTip()">`+
+    svg += `<g class="node">`+
       `<rect x="${x}" y="${Y}" width="${NW}" height="${H}" style="stroke:${c}"/>`+
       `<circle cx="${x+14}" cy="${Y+14}" r="5" fill="${c}"${live?' class="pulse"':''}/>`+
       `<text x="${x+NW/2}" y="${Y+34}" text-anchor="middle" style="font-size:11.5px">${esc(st.label)}</text>`+
@@ -920,10 +682,8 @@ async function postApi(path, payload){
   // 401 means the token is gone; 403 means the token is FINE but this user lacks the
   // right. Collapsing them would sign an approver out of a session that still works,
   // and hide "you are not in the approver group" behind "session expired".
-  if (resp.status===401) { clearSession();
-    // clearSession, not signOut: the refresh cookie is probably still good, so "try
-    // again" costs one silent /api/refresh in ensureToken rather than a password prompt.
-    return {ok:false, msg:"session expired — try again"}; }
+  if (resp.status===401) { SESSION = null; setAuthUi();
+    return {ok:false, msg:"session expired — sign in again"}; }
   if (resp.status===403) {
     let d=null; try { d = JSON.parse(body); } catch(_){}
     return {ok:false, msg:"denied: "+((d&&d.error)||"forbidden").slice(0,200)}; }
@@ -1067,10 +827,8 @@ async function genOpt(){
         }
       }, 5000);
     } else {
-      // clearSession, not signOut: an expired access token must not revoke the refresh
-      // cookie, or one 8-hour expiry throws away a 30-day session.
-      if (r.error==="unauthorized") { clearSession();
-        $("draftMsg").textContent = "session expired — click again to retry"; }
+      if (r.error==="unauthorized") { signOut();
+        $("draftMsg").textContent = "session expired — click again to sign in"; }
       else $("draftMsg").textContent = "error: "+(r.error||JSON.stringify(r)).slice(0,80);
     }
   } catch(e){ $("draftMsg").textContent = "error: "+e; }
@@ -1132,20 +890,9 @@ async function estimateCost(){
   const unpriced = (e.unpriced||[]).length
     ? `<div class="pill err" style="margin:8px 0">${(e.unpriced||[]).length} UNPRICED SKU(s) — these lines are $0 because no rate exists, not because they are free</div>`+
       `<div class="sub mono">${(e.unpriced||[]).map(esc).join("<br>")}</div>` : "";
-  // Three states, not two. "Over budget" and "under budget" are different facts from
-  // "we could not price it", and in advisory mode none of them blocks the launch — so
-  // the box reports which one it is instead of implying permission. Collapsing the
-  // unknown into "under" would render an unchecked run as a reassuring green pill.
-  const over = g.over_budget || g.reasons || [];
-  const gateBox = g.budget_unknown
-    ? `<div class="pill warn" style="margin:8px 0">Budget NOT checked — no rate card</div>`+
-      `<div class="sub">${(g.notes||[]).map(esc).join("<br>")}</div>`
-    : g.approval_required
-    ? `<div class="pill err" style="margin:8px 0">Approval required (blocking mode)</div><div class="sub">${over.map(esc).join("<br>")}</div>`
-    : over.length
-    ? `<div class="pill warn" style="margin:8px 0">Over budget — advisory, not blocked</div>`+
-      `<div class="sub">${over.map(esc).join("<br>")}</div>`
-    : `<div class="pill ok" style="margin:8px 0">Within budget</div>`;
+  const gateBox = g.approval_required
+    ? `<div class="pill err" style="margin:8px 0">Approval required</div><div class="sub">${(g.reasons||[]).map(esc).join("<br>")}</div>`
+    : `<div class="pill ok" style="margin:8px 0">Under the limit — may launch without approval</div>`;
   $("cEstOut").innerHTML =
     `<div class="flex" style="gap:20px;margin-bottom:6px">`+
       `<div><div class="sub">expected</div><div class="stat" style="font-size:22px">${usd(e.total_usd)}</div></div>`+
@@ -1218,8 +965,7 @@ async function loadCost(){
     // 2 · approval queue
     $("cQueue").innerHTML = pend ? `<table><tr><th>Estimate</th><th>Requested by</th><th>Worst case</th><th>Why gated</th><th></th></tr>`+
       (es.pending||[]).map(p=>
-        `<tr><td class="mono">${esc(p.id)}<div class="sub">${esc(p.created_at||"")}</div>`+
-          (p.task_id?`<div class="sub"><a href="#" style="color:var(--accent)" onclick="showTab('tasks');selectTask(${jstr(p.task_id)});return false">task ${esc(p.task_id)}</a></div>`:"")+`</td>`+
+        `<tr><td class="mono">${esc(p.id)}<div class="sub">${esc(p.created_at||"")}</div></td>`+
         `<td>${esc(p.requested_by||"?")}<div class="sub">${esc((p.justification||"").slice(0,120))}</div></td>`+
         `<td class="mono">${usd(p.worst_case_usd)}<div class="sub">expected ${usd(p.total_usd)}</div></td>`+
         `<td class="sub">${((p.gate||{}).reasons||[]).map(esc).join("<br>")}</td>`+
@@ -1278,661 +1024,6 @@ async function loadCost(){
   } catch(e){ $("cRollup").innerHTML = `<span class="sub">cost error: ${esc(e)}</span>`; }
 }
 
-// ── Tasks: consult the orchestrator, sign the plan ────────────────────────────
-let TASK_SEL = null, taskTimer = null, TASK_CACHE = null;
-
-const TASK_STAGES = [
-  {key:"talk",   icon:"💬", label:"Requirements"},
-  {key:"design", icon:"📐", label:"Plan design"},
-  {key:"propose",icon:"📋", label:"Proposal"},
-  {key:"sign",   icon:"✍️", label:"Human sign-off"},
-  {key:"launch", icon:"🚀", label:"Dispatch"},
-  {key:"run",    icon:"⚙️", label:"Pipeline run"},
-  {key:"cost",   icon:"💰", label:"Cost watch"},
-];
-
-function taskStageStates(t){
-  // maps a task's status onto the 7 lifecycle nodes: done/active/idle
-  const s = t ? String(t.status||"") : "";
-  const done = [], activeSet = new Set();
-  // completed/failed are written by the state machine itself (MarkTaskDone /
-  // MarkTaskFailed), not by this console — a run reaching a terminal state closes
-  // the task it was dispatched from. They sit at the last node: the order is
-  // walked to the END, so every node before it reads done.
-  const order = {drafting:0, thinking:0, data_audit:1, plan_proposed:2,
-                 pending_approval:3, accepting:4, dispatched:5,
-                 completed:6, failed:6, closed:0, error:0};
-  // Terminal statuses light nothing: a task that has ENDED is not in flight, and
-  // an unknown status must not fall through to 0 and render a finished task as
-  // active at "Requirements".
-  const TERMINAL = ["closed", "error", "completed", "failed"];
-  const pos = (s in order) ? order[s] : 0;
-  TASK_STAGES.forEach((st,i)=>{
-    if (i < pos) done.push(st.key);
-    if (i === pos && !TERMINAL.includes(s)) activeSet.add(st.key);
-  });
-  if (s === "completed") done.push(TASK_STAGES[TASK_STAGES.length-1].key);
-  if (s === "dispatched") { activeSet.add("run"); activeSet.add("cost"); }
-  return {done, active: activeSet, status: s};
-}
-
-// The note is the part of the lifecycle display that carries information the stage
-// icons cannot: which run, why it failed, who is holding the approval. Kept as its
-// own function because it is the same prose whether it sits under a diagram or a
-// strip -- collapsing the diagram must not quietly drop the reason a task ended.
-function taskFlowNote(t, st){
-  if (st.status === "pending_approval")
-    return `<div class="sub" style="color:var(--amber)">over the spend limit — waiting for an approver on the <a href="#" onclick="showTab('cost');return false" style="color:var(--accent)">Cost tab</a></div>`;
-  // The run link belongs on every status that HAS a run, not just dispatched:
-  // after the state machine closes the task, the run is the only place the reason
-  // lives, so that is exactly when a reader needs the link most.
-  if (["dispatched","completed","failed"].includes(st.status) && t.run_id){
-    const verb = st.status === "completed" ? "completed"
-               : st.status === "failed" ? "ended failed" : "dispatched";
-    const tail = st.status === "dispatched" ? " — follow it on Pipeline / Cost"
-               : ` at ${esc(t.closed_at || "an unrecorded time")} — see Pipeline / Cost`;
-    const col = st.status === "failed" ? "var(--red)" : "var(--muted)";
-    return `<div class="sub" style="color:${col}">run <a href="#" onclick="showTab('pipeline');loadRun('${esc(t.run_id)}');return false" style="color:var(--accent)" class="mono">${esc(t.run_id)}</a> ${verb}${tail}</div>`;
-  }
-  if (st.status === "error")
-    return `<div class="sub" style="color:var(--red)">error: ${esc(t.error_msg||"")}</div>`;
-  return "";
-}
-
-// The 7-node SVG was 1100px wide in a full-width card ABOVE the conversation, so the
-// machinery outranked the conversation on screen and, in col-9, would not fit at all.
-// Same stages, same taskStageStates() mapping, same note -- rendered as one line.
-function renderTaskFlow(t){
-  const el = $("taskStrip");
-  if (!t){
-    el.innerHTML = '<span class="sub">new consultation &mdash; describe your goal below</span>';
-    return;
-  }
-  const st = taskStageStates(t);
-  const pills = TASK_STAGES.map(sd=>{
-    const isDone = st.done.includes(sd.key), isActive = st.active.has(sd.key);
-    const cls = isActive ? "sg act" : isDone ? "sg done" : "sg";
-    return `<span class="${cls}" title="${esc(sd.label)}">${sd.icon} ${esc(sd.label)}`+
-      `${isActive?" &middot; "+esc(st.status):isDone?" &check;":""}</span>`;
-  }).join('<span class="sgsep">&rsaquo;</span>');
-  const note = taskFlowNote(t, st);
-  el.innerHTML = pills + (note ? `<div style="flex-basis:100%;margin-top:6px">${note}</div>` : "");
-}
-
-// minimal safe renderer: escape EVERYTHING first, then whitelist a few transforms
-function mdLite(s){
-  let h = esc(s);
-  h = h.replace(/```([\s\S]*?)```/g, (_,c)=>"<pre>"+c.trim()+"</pre>");
-  h = h.replace(/\*\*([^*\n]+)\*\*/g, "<b>$1</b>");
-  return h;
-}
-
-// The plan is an ARTIFACT of the conversation, not a separate screen. It used to
-// live in a full-width card below the thread, which put its "$" figure a scroll
-// away from the turn that justified it; here it is a bubble at the point the
-// orchestrator produced it, with its own signing button attached.
-const PLAN_STATUSES = ["plan_proposed","pending_approval","accepting","dispatched"];
-
-// The artifact carries no status line of its own: it is re-rendered from the task on
-// every poll, so anything written into it would be wiped a second later. Outcomes go
-// to #taskChatMsg and #taskAsk, which live outside the re-rendered region -- which is
-// also why the in-thread ask widget is not inside .chat.
-function planArtifactHtml(t){
-  if (!t || !PLAN_STATUSES.includes(String(t.status))) return "";
-  const gateNote = t.status==="plan_proposed"
-    ? '<div class="sub" style="margin-top:8px">signing means: you approve this exact plan (its hash is signed with the project KMS key). Under $2,000 it dispatches immediately; over, it goes to the Cost approval queue.</div>' : "";
-  const signBtn = t.status==="plan_proposed"
-    ? '<div class="flex" style="margin-top:10px"><button class="primary" onclick="acceptTask()">&#9997;&#65039; Accept &amp; sign</button></div>' : "";
-  return `<div class="msg m-artifact"><div class="arth">Proposed plan &middot; requires your signature</div>`+
-    `<div style="font-size:13.5px;margin-bottom:8px">${mdLite(String(t.plan_summary||""))}</div>`+
-    `<table class="plankv"><tr><td>Estimated cost</td><td><b>${usd(t.cost_estimate_usd)}</b></td></tr>`+
-    `<tr><td>plan.json</td><td class="mono">${esc(t.plan_uri||"")}</td></tr>`+
-    `<tr><td>Status</td><td><span class="pill ${badge(t.status)}">${esc(t.status)}</span></td></tr>`+
-    (t.run_id?`<tr><td>Run</td><td class="mono">${esc(t.run_id)}</td></tr>`:"")+
-    `</table>${gateNote}${signBtn}</div>`;
-    // No status line of its own: the artifact is re-rendered from the task on every
-    // poll, so anything written into it would be wiped a second later. Outcomes go to
-    // #taskChatMsg, which lives outside the re-rendered region.
-}
-
-// ── agent choices as buttons (consult protocol step 3b) ───────────────────────
-// The priced MENU the orchestrator offers ("Starter audit / Set menu / A la carte")
-// was plain prose the customer had to retype, word for word, to pick one. Step 3b
-// lets a turn append a SECOND fenced json block, {"choices":[{"label","value"}]},
-// and this renders it as buttons whose value is sent verbatim.
-//
-// Degrades silently, deliberately: a turn without the block renders exactly as
-// before, so an agent that ignores step 3b is not a broken tab. Every failure mode
-// here -- no fence, unparseable json, wrong shape, a label that is not a string --
-// ends as "no buttons", never as an error in the customer's face.
-function parseChoices(text){
-  const out = [];
-  const parts = String(text||"").split("```");
-  // odd indices are fenced bodies; 0,2,4… are the prose between fences
-  for (let i=1; i<parts.length; i+=2){
-    const b = parts[i].replace(/^[A-Za-z0-9]*\s*\n/, "");   // drop a "json" info string
-    let obj = null;
-    try { obj = JSON.parse(b.slice(b.indexOf("{"), b.lastIndexOf("}")+1)); } catch(_){ continue; }
-    if (!obj || !Array.isArray(obj.choices)) continue;      // the plan trailer lands here
-    obj.choices.forEach(c=>{
-      if (!c || typeof c.label !== "string" || typeof c.value !== "string") return;
-      if (!c.label.trim() || !c.value.trim()) return;
-      out.push({label: c.label.slice(0,90), value: c.value.slice(0,2000)});
-    });
-  }
-  return out;
-}
-
-// The block is an accelerator, not prose, so it is stripped from what the chat
-// shows: leaving the raw json in the bubble means the customer reads the same menu
-// twice, once as unusable JSON.
-function stripChoiceFences(text){
-  const parts = String(text||"").split("```");
-  let out = parts[0];
-  for (let i=1; i<parts.length; i+=2){
-    // A truncated turn ends mid-fence. Appending the "```" that closes it would put
-    // characters in the transcript the agent never wrote, so an unterminated tail is
-    // passed through exactly as received.
-    if (i === parts.length-1) { out += "```" + parts[i]; break; }
-    const keep = parseChoices("```"+parts[i]+"```").length === 0;
-    if (keep) out += "```" + parts[i] + "```";
-    out += parts[i+1];
-  }
-  return out;
-}
-
-let CHOICES = [];
-// Only the LAST assistant turn's choices are offered. A menu from three turns ago
-// answers a question that has already been answered, and clicking it would send the
-// consultation backwards.
-function renderChoices(t){
-  const el = $("taskChoices");
-  CHOICES = [];
-  if (!t) { el.innerHTML = ""; return; }
-  const msgs = (t.messages||[]).filter(m=>m.role==="assistant");
-  if (!msgs.length) { el.innerHTML = ""; return; }
-  CHOICES = parseChoices(String(msgs[msgs.length-1].text||""));
-  if (!CHOICES.length) { el.innerHTML = ""; return; }
-  el.innerHTML = '<span class="sub" style="width:100%">pick one, or just reply in your own words:</span>'
-    + CHOICES.map((c,i)=>`<button class="primary" onclick="useChoice(${i})">${esc(c.label)}</button>`).join("");
-}
-// Sends immediately: the whole point is saving the retype. The value goes through
-// sendTaskMsg, so it appears in the thread as a message the customer sent -- a
-// silent side-channel reply would leave the transcript lying about who said what.
-function useChoice(i){
-  const c = CHOICES[i];
-  if (!c) return;
-  $("taskChoices").innerHTML = "";
-  return sendTaskMsg(c.value);
-}
-
-// ── data readiness panel ──────────────────────────────────────────────────────
-// Answered from plan.json via /readiness, not from the chat, because the plan is the
-// artifact the customer signs. Collapsed by default so it does not push the
-// conversation down, and the open/closed state survives the 3s poll.
-let READY_OPEN = false, READY_KEY = null, READY_DATA = null;
-function readinessToggle(){ READY_OPEN = !READY_OPEN; renderReadiness(TASK_CACHE); }
-
-async function loadReadiness(t){
-  // Re-fetch only when something that could change the answers changed. The thread
-  // polls every 3s while a turn is in flight; re-reading plan.json from S3 on every
-  // one of those would be a GET per 3 seconds per open browser tab for a file that
-  // changes once per proposal.
-  const key = t ? [t.id, t.plan_uri||"", t.status||""].join("|") : null;
-  if (!t) { READY_KEY = null; $("taskReadiness").innerHTML = ""; return; }
-  if (key === READY_KEY) return;
-  READY_KEY = key;
-  try {
-    const d = await fetch(API+"/api/tasks/"+encodeURIComponent(t.id)+"/readiness").then(r=>r.json());
-    READY_DATA = d && !d.error ? d : null;
-  } catch(_){ READY_DATA = null; }
-  renderReadiness(t);
-}
-
-function renderReadiness(t){
-  const el = $("taskReadiness");
-  if (!t || !READY_DATA) { el.innerHTML = ""; return; }
-  const d = READY_DATA;
-  const fields = d.fields || [];
-  const missing = fields.length - (d.answered||0);
-  const cls = missing ? "warn" : "ok";
-  const rows = READY_OPEN ? `<table>` + fields.map(f=>
-      `<tr><td class="rdlabel">${esc(f.label)}</td><td>`+
-      (f.answered
-        ? `<span class="mono">${esc(String(f.value).slice(0,200))}</span>`
-        // "— not answered yet" spelled out, with WHY it matters. A blank cell reads
-        // as "fine", and the customer signs a plan whose data questions are open.
-        : `<span class="rdno">&mdash; not answered yet</span><span class="rdwhy">${esc(f.why)}</span>`)+
-      `</td></tr>`).join("") + `</table>`
-    + (d.note ? `<div class="sub" style="margin-top:6px">${esc(d.note)}</div>` : "")
-    + (d.plan_uri ? `<div class="sub mono" style="margin-top:4px">${esc(d.plan_uri)}</div>` : "")
-    : "";
-  el.innerHTML = `<div class="readiness"><div class="rdhead" onclick="readinessToggle()">`+
-    `<span>${READY_OPEN?"&#9662;":"&#9656;"}</span><b>Data readiness</b>`+
-    `<span class="pill ${cls}">${d.answered||0}/${fields.length} answered</span>`+
-    (missing ? `<span class="sub">${missing} question${missing===1?"":"s"} still open</span>` : "")+
-    `</div>${rows}</div>`;
-}
-
-// ── dataset upload: browser -> S3, presigned ──────────────────────────────────
-// The statuses the server refuses an upload URL for (data_upload_url returns 409 on
-// TASK_TERMINAL + TASK_SETTLED). Kept identical here so the tab never offers a drop
-// zone whose first click is guaranteed to fail.
-const UPLOAD_CLOSED = ["dispatched","closed","error","completed","failed"];
-let UPLOADING = false;
-
-// The announcement the orchestrator has not been told yet, as {task_id, text}.
-//
-// Found by a live run, and it silently LOST an upload. The server allows an upload URL
-// during a turn (rightly -- a 5 GiB PUT should not wait on a 60s agent turn) but
-// post_task_message 409s while one is in flight ("a turn is already in flight"). So a
-// file dropped while the orchestrator was still answering went to S3, the auto-post was
-// refused, and uploadDataset then overwrote the error with "uploaded <key>" -- the
-// customer read success, the agent never heard about the data, and the next question was
-// still "where is your data?". Bytes on disk that no one knows about are worse than a
-// failed upload, which at least gets retried.
-//
-// So the announcement is queued instead of dropped, and delivered by loadTaskDetail the
-// moment the task stops being busy. It is one slot, not a list: the same file announced
-// twice is noise, and only the newest upload matters.
-let PENDING_POST = null;
-
-function renderDrop(t){
-  const el = $("taskDrop");
-  // No task means no customer-data/<task_id>/ prefix to write into, so there is
-  // nowhere for the file to go: describe the goal first, then upload.
-  const show = !!t && !UPLOAD_CLOSED.includes(String(t.status||""));
-  el.style.display = show ? "" : "none";
-}
-
-function dropOver(ev, on){
-  ev.preventDefault();
-  $("taskDrop").classList.toggle("over", !!on);
-}
-function dropFiles(ev){
-  ev.preventDefault();
-  $("taskDrop").classList.remove("over");
-  const f = ev.dataTransfer && ev.dataTransfer.files && ev.dataTransfer.files[0];
-  if (f) uploadDataset(f);
-}
-function pickFiles(ev){
-  const f = ev.target.files && ev.target.files[0];
-  // Cleared so choosing the SAME file twice fires change again (a retry after a
-  // failed upload is the common case, and it would otherwise appear to do nothing).
-  ev.target.value = "";
-  if (f) uploadDataset(f);
-}
-
-function upProgress(pct, label){
-  $("taskUpBar").style.display = pct == null ? "none" : "";
-  if (pct != null) $("taskUpFill").style.width = Math.max(0, Math.min(100, pct)) + "%";
-  $("taskDropMsg").innerHTML = label
-    ? esc(label)
-    : "&#128193; Drop your dataset here, or click to choose a file";
-}
-
-// XMLHttpRequest, not fetch: fetch cannot report upload progress, and a 5 GiB PUT
-// with no progress is indistinguishable from a hang -- the customer retries on top
-// of the upload already running.
-function putWithProgress(url, file, headers){
-  return new Promise((resolve)=>{
-    const xhr = new XMLHttpRequest();
-    xhr.open("PUT", url, true);
-    Object.keys(headers).forEach(k=>xhr.setRequestHeader(k, headers[k]));
-    xhr.upload.onprogress = (e)=>{
-      if (e.lengthComputable) upProgress(e.loaded/e.total*100,
-        "uploading " + file.name + " — " + Math.round(e.loaded/e.total*100) + "%");
-    };
-    xhr.onload = ()=>resolve(xhr.status>=200 && xhr.status<300
-      ? {ok:true}
-      // S3 answers a rejected PUT with an XML <Message>; surfacing it beats "failed".
-      : {ok:false, msg:"S3 refused the upload (HTTP "+xhr.status+")"+
-          (xhr.responseText ? ": "+String(xhr.responseText).replace(/<[^>]+>/g," ").trim().slice(0,160) : "")});
-    // A CORS preflight failure arrives here as a zero-information error event, so the
-    // message has to name the cause the browser will not: it is the bucket's CORS
-    // rule or the page's CSP connect-src, not the signature.
-    xhr.onerror = ()=>resolve({ok:false, msg:"the browser could not reach S3 — the bucket's CORS rule or this page's connect-src is blocking it, not the signature"});
-    xhr.onabort = ()=>resolve({ok:false, msg:"upload cancelled"});
-    xhr.send(file);
-  });
-}
-
-function humanBytes(n){
-  const u = ["B","KiB","MiB","GiB"];
-  let i = 0, v = Number(n)||0;
-  while (v >= 1024 && i < u.length-1) { v /= 1024; i++; }
-  return (i ? v.toFixed(1) : String(v)) + " " + u[i];
-}
-
-async function uploadDataset(file){
-  if (!TASK_SEL) { $("taskChatMsg").textContent = "describe your goal first — the upload lands in this consultation's own prefix"; return; }
-  // One at a time: two concurrent uploads share one progress bar and one status line,
-  // so the second would silently overwrite the first's reporting.
-  if (UPLOADING) { $("taskChatMsg").textContent = "an upload is already running"; return; }
-  UPLOADING = true;
-  $("taskChatMsg").textContent = "";
-  upProgress(0, "requesting an upload URL for " + file.name + "…");
-  try {
-    const r = await postApi("/api/data-upload-url",
-      {task_id: TASK_SEL, filename: file.name, content_length: file.size});
-    if (!r.ok) { upProgress(null, null); $("taskChatMsg").textContent = r.msg; return; }
-    const d = r.data;
-    // These two headers are signed INTO the URL (ContentType + ServerSideEncryption),
-    // so they must be sent with exactly the values the server signed. Sending the
-    // browser's own guess at content-type instead is a SignatureDoesNotMatch.
-    const put = await putWithProgress(d.url, file,
-      {"content-type": d.content_type, "x-amz-server-side-encryption": "AES256"});
-    if (!put.ok) { upProgress(null, null); $("taskChatMsg").textContent = put.msg; return; }
-    upProgress(null, null);
-    // The auto-post is what makes the upload VISIBLE to the agent instead of a silent
-    // side-effect in a bucket. Row count is deliberately not claimed here: counting
-    // lines would mean reading the whole file in the browser, and the data-prep audit
-    // reads it anyway -- a guessed count in the transcript is worse than no count.
-    const note = "data uploaded: " + d.uri + " (" + humanBytes(file.size) + ", "
-      + d.content_type + "). Please audit it and tell me what is still missing.";
-    const sent = await sendTaskMsg(note);
-    // Never report plain success on a refused announcement: the file is in the bucket but
-    // the agent does not know, so say which of the two happened.
-    if (sent.ok) { $("taskChatMsg").textContent = "uploaded " + d.key; }
-    else {
-      PENDING_POST = {task_id: TASK_SEL, text: note};
-      $("taskChatMsg").textContent = "uploaded " + d.key
-        + " — telling the orchestrator as soon as it finishes the current reply";
-    }
-  } catch(e){
-    upProgress(null, null);
-    $("taskChatMsg").textContent = "upload error: " + (e && e.message ? e.message : String(e));
-  } finally { UPLOADING = false; }
-}
-
-function renderChat(t){
-  const el = $("taskChat");
-  if (!t){
-    el.innerHTML = '<span class="sub">The orchestrator is a pre-sales solution architect: it asks about your data first, then proposes a priced plan you can sign. Describe a goal below to start.</span>';
-    return;
-  }
-  const msgs = t.messages || [];
-  const body = msgs.map(m=>{
-    const role = m.role==="user"?"m-user":m.role==="assistant"?"m-assistant":"m-system";
-    const who = m.role==="assistant"?"orchestrator":(m.by||m.role);
-    const text = m.role==="assistant" ? stripChoiceFences(String(m.text||"")) : String(m.text||"");
-    return `<div class="msg ${role}"><div class="who">${esc(who)} · ${esc(String(m.at||"").slice(0,19))}</div>${mdLite(text)}</div>`;
-  }).join("");
-  el.innerHTML = (body || '<span class="sub">no messages yet</span>')
-    + planArtifactHtml(t)
-    + (String(t.status)==="thinking"||String(t.status)==="accepting"
-       ? '<div class="msg m-system">orchestrator is thinking&hellip;</div>' : "");
-  el.scrollTop = el.scrollHeight;
-}
-
-// Actions that act on the whole thread rather than on the plan bubble. Rendered from
-// the task so a closed thread does not offer "Close task", and the approval record
-// button appears only once there is a record to show.
-function renderTaskActions(t){
-  const el = $("taskActions");
-  if (!t){ el.innerHTML = ""; return; }
-  const s = String(t.status||"");
-  const terminal = ["closed","completed","failed","error"].includes(s);
-  let html = "";
-  if (PLAN_STATUSES.includes(s) && s === "plan_proposed")
-    html += `<button onclick="taskFeedback()">Send feedback on the plan</button>`;
-  if (!terminal) html += `<button onclick="closeTask()">Close consultation</button>`;
-  if (t.approvals && t.approvals.length)
-    html += `<button onclick="viewApproval()">View approval record</button>`;
-  el.innerHTML = html;
-}
-
-async function loadTasks(){
-  try {
-    const d = await fetch(API+"/api/tasks").then(r=>r.json());
-    const items = d.tasks||[];
-    $("taskList").innerHTML = items.length ? items.map(t=>
-      `<div class="th${t.id===TASK_SEL?" sel":""}" onclick="selectTask('${esc(t.id)}')">`+
-      `<div class="thgoal">${esc(t.goal||t.id)}</div>`+
-      `<div class="sub" style="display:flex;justify-content:space-between;gap:6px;margin-top:3px">`+
-      `<span style="overflow:hidden;text-overflow:ellipsis">${esc(String(t.updated_at||"").slice(0,16))}</span>`+
-      `<span class="pill ${badge(t.status)}">${esc(t.status)}</span></div></div>`).join("")
-      : '<span class="sub">no consultations yet — describe a goal in the composer</span>';
-    if (TASK_SEL) await loadTaskDetail();
-  } catch(e){ $("taskList").innerHTML = `<span class="sub">error: ${esc(e)}</span>`; }
-}
-
-async function loadTaskDetail(){
-  if (!TASK_SEL) return;
-  try {
-    const t = await fetch(API+"/api/tasks/"+encodeURIComponent(TASK_SEL)).then(r=>r.json());
-    if (t.error) { $("taskChatMsg").textContent = t.error; return; }
-    TASK_CACHE = t;
-    renderThread(t);
-    const busy = ["thinking","accepting"].includes(String(t.status));
-    $("taskSendBtn").disabled = busy;
-    tasksPoll(true, busy ? 3000 : 15000);
-    flushPendingPost(t);   // an upload announced during a turn is delivered here
-  } catch(e){ $("taskChatMsg").textContent = "error: "+e; }
-}
-
-// One render for the whole thread. The old code called three renderers from two
-// places and it was possible for the strip and the plan to disagree about which
-// task they were showing; now the panel has exactly one entry point.
-function renderThread(t){
-  renderTaskFlow(t); renderChat(t); renderTaskActions(t); renderChips(t);
-  renderChoices(t); renderDrop(t); renderReadiness(t);
-  // Fire-and-forget: the readiness fetch must not delay the thread paint, and it
-  // no-ops unless the plan or the status actually moved.
-  loadReadiness(t);
-  $("taskThreadTitle").textContent = t
-    ? "Consultation · " + String(t.goal || t.id).slice(0, 70)
-    : "New consultation · llmops_orchestrator";
-  $("taskMsg").placeholder = t
-    ? "reply to the orchestrator… (Enter to send, Shift+Enter for a newline)"
-    : "describe your goal — e.g. a small private model that answers questions about our product manuals, budget around $100";
-}
-
-function selectTask(id){
-  TASK_SEL = id; TASK_CACHE = null;
-  // The readiness answers belong to the task that was open, not to this one: keeping
-  // them would show the previous consultation's data questions under a new title.
-  READY_DATA = null; READY_KEY = null;
-  $("taskChatMsg").textContent = ""; $("taskAsk").innerHTML = "";
-  loadTasks();          // repaint the rail so the selected thread is highlighted
-  loadTaskDetail();
-}
-
-// Deselect rather than create: a new consultation exists once its goal is typed,
-// so this clears the panel and lets the one composer do the creating.
-function newThread(){
-  TASK_SEL = null; TASK_CACHE = null;
-  READY_DATA = null; READY_KEY = null;
-  $("taskChatMsg").textContent = ""; $("taskAsk").innerHTML = "";
-  renderThread(null);
-  loadTasks();
-  $("taskMsg").focus();
-}
-
-function tasksPoll(on, ms){
-  if (taskTimer) { clearInterval(taskTimer); taskTimer = null; }
-  if (on) taskTimer = setInterval(loadTasks, ms||15000);
-}
-
-// Starter prompts. The first turn of a consultation is the hardest one to write --
-// an empty box asks the customer to guess what kind of ask this system takes. Shown
-// only on a new thread; inside a conversation the orchestrator is already asking.
-const TASK_CHIPS = [
-  "I want a small private model that answers questions about our product manuals. Budget around $100.",
-  "Audit my dataset before I commit any budget — tell me if it is good enough to train on.",
-  "We have support tickets in S3 and want a cheaper model to draft replies. What would that cost?",
-];
-function renderChips(t){
-  const el = $("taskChips");
-  if (t) { el.innerHTML = ""; return; }
-  el.innerHTML = '<span class="sub" style="width:100%">start from one of these, or write your own:</span>'
-    + TASK_CHIPS.map((c,i)=>`<button onclick="useChip(${i})">${esc(c.length>72?c.slice(0,70)+"…":c)}</button>`).join("");
-}
-function useChip(i){
-  const c = TASK_CHIPS[i];
-  if (!c) return;
-  $("taskMsg").value = c;
-  $("taskMsg").focus();
-}
-
-// The single composer, and the whole point of the merge: with no thread selected it
-// CREATES, with one selected it CONTINUES. Two boxes could not express that -- one
-// of them was always the wrong place to type.
-async function composerSend(){
-  const text = $("taskMsg").value.trim();
-  if (!text) { $("taskChatMsg").textContent = TASK_SEL ? "" : "describe your goal first"; return; }
-  if (!TASK_SEL) return createTask(text);
-  // Cleared HERE, not inside sendTaskMsg: a choice button and the upload auto-post
-  // also call sendTaskMsg, and clearing there would silently delete a half-written
-  // reply the customer had in the box.
-  $("taskMsg").value = "";
-  return sendTaskMsg(text);
-}
-
-async function createTask(goal){
-  const r = await postApi("/api/tasks", {goal});
-  $("taskChatMsg").textContent = r.ok ? "consultation started" : r.msg;
-  if (r.ok && r.data.task) {
-    $("taskMsg").value = "";
-    TASK_SEL = r.data.task.id;
-    loadTasks();
-  }
-}
-
-// Returns {ok, msg}. The result is load-bearing for the upload auto-post, which has to
-// queue its announcement when the send is refused rather than assume it landed.
-async function sendTaskMsg(text){
-  if (!TASK_SEL) { const m = "select a consultation first";
-    $("taskChatMsg").textContent = m; return {ok:false, msg:m}; }
-  // optimistic append; the poll reconciles
-  const el = $("taskChat");
-  el.insertAdjacentHTML("beforeend",
-    `<div class="msg m-user m-pending"><div class="who">you</div>${mdLite(text)}</div>`);
-  el.scrollTop = el.scrollHeight;
-  // The composer is NOT cleared here -- composerSend clears its own box before
-  // calling. A choice button and the upload auto-post also send through this
-  // function, and neither of them should erase text the customer is still writing.
-  const r = await postApi("/api/tasks/"+encodeURIComponent(TASK_SEL)+"/message", {text});
-  $("taskChatMsg").textContent = r.ok ? "" : r.msg;
-  if (r.ok) { tasksPoll(true, 3000); }
-  return {ok: !!r.ok, msg: r.msg || ""};
-}
-
-// Deliver a queued upload announcement once the orchestrator's turn has ended. Called
-// from loadTaskDetail, which already knows whether the task is busy.
-async function flushPendingPost(t){
-  const p = PENDING_POST;
-  // Task-scoped, and matched against the RECORD's id rather than only TASK_SEL: a note
-  // about task A's dataset must never be posted into task B because the customer
-  // switched threads while the turn was running. Not cleared by selectTask/newThread --
-  // the note belongs to its task, so switching away and back still delivers it.
-  if (!p || !t || p.task_id !== String(t.id||"")) return;
-  if (["thinking","accepting"].includes(String(t.status))) return;
-  // Cleared BEFORE the await: the 3s poll can re-enter this while the post is in
-  // flight, and the same announcement twice is the "already in flight" error again.
-  PENDING_POST = null;
-  // Posted to p.task_id explicitly, not through sendTaskMsg's TASK_SEL: the target is
-  // the task the file was uploaded to, whatever the rail is showing now.
-  const r = await postApi("/api/tasks/"+encodeURIComponent(p.task_id)+"/message",
-                          {text: p.text});
-  // Put it back on a refusal so a lost race retries rather than dropping the note.
-  if (!r.ok) { PENDING_POST = p; return; }
-  $("taskChatMsg").textContent = "the orchestrator has been told about your upload";
-  tasksPoll(true, 3000);
-}
-
-// ── in-thread asks, replacing window.prompt()/alert()/confirm() ───────────────
-// A native prompt() is unstyleable, throws away what was typed if the user
-// mis-clicks, and blocks the interval that keeps the thread live -- so the page
-// freezes mid-consultation. This renders the question into the thread instead, and
-// keeps the typed text on screen while the request is in flight.
-let ASK_CB = null;
-function askInThread(question, placeholder, label, cb){
-  ASK_CB = cb;
-  $("taskAsk").innerHTML =
-    `<div class="inlineask"><div class="askq">${esc(question)}</div>`+
-    `<textarea id="askInput" rows="2" placeholder="${esc(placeholder||"")}"></textarea>`+
-    `<div class="flex" style="margin-top:8px"><button class="primary" onclick="askSubmit()">${esc(label||"Send")}</button>`+
-    `<button onclick="askCancel()">Cancel</button>`+
-    `<span id="askMsg" class="sub"></span></div></div>`;
-  $("askInput").focus();
-}
-function askCancel(){ ASK_CB = null; $("taskAsk").innerHTML = ""; }
-async function askSubmit(){
-  const v = ($("askInput") ? $("askInput").value : "").trim();
-  if (!v) { $("askMsg").textContent = "required"; return; }
-  const cb = ASK_CB;
-  if (!cb) return;
-  $("askMsg").textContent = "sending…";
-  const msg = await cb(v);
-  // Only tear the widget down on success: on failure the text stays on screen, which
-  // is the behaviour prompt() could never give.
-  if (msg === true) { ASK_CB = null; $("taskAsk").innerHTML = ""; }
-  else $("askMsg").textContent = String(msg || "failed");
-}
-
-async function acceptTask(){
-  if (!TASK_SEL || !TASK_CACHE) return;
-  const c = TASK_CACHE;
-  askInThread(
-    "Sign and accept this plan? Estimated cost " + usd(c.cost_estimate_usd)
-      + ". Your acceptance is recorded with a KMS digital signature — type ACCEPT to confirm.",
-    "ACCEPT", "✍️ Sign", async (v)=>{
-      if (v.trim().toUpperCase() !== "ACCEPT") return "type ACCEPT to confirm";
-      const r = await postApi("/api/tasks/"+encodeURIComponent(TASK_SEL)+"/accept", {});
-      if (!r.ok) return r.msg;
-      $("taskChatMsg").textContent = r.data.status==="pending_approval"
-        ? "submitted for budget approval — see the Cost tab queue"
-        : "signed — dispatching through the pipeline";
-      tasksPoll(true, 3000);
-      return true;
-    });
-}
-
-async function taskFeedback(){
-  if (!TASK_SEL) return;
-  askInThread("What should the orchestrator change about this plan?",
-    "e.g. drop the held-out set to 10% and re-price", "Send feedback", async (v)=>{
-      const r = await postApi("/api/tasks/"+encodeURIComponent(TASK_SEL)+"/message", {text: v});
-      if (!r.ok) return r.msg;
-      $("taskChatMsg").textContent = "feedback sent — the plan will be revised";
-      tasksPoll(true, 3000);
-      return true;
-    });
-}
-
-async function closeTask(){
-  if (!TASK_SEL) return;
-  askInThread("Reason for closing this consultation (required — it is recorded on the task):",
-    "e.g. the customer went with an off-the-shelf model", "Close consultation", async (v)=>{
-      const r = await postApi("/api/tasks/"+encodeURIComponent(TASK_SEL)+"/close", {reason: v});
-      if (!r.ok) return r.msg;
-      $("taskChatMsg").textContent = "consultation closed";
-      loadTasks();
-      return true;
-    });
-}
-
-// The approval record is evidence, so it belongs in the thread where it can be read,
-// scrolled and copied. alert() truncated it at 1800 chars and could not be copied
-// out of on most browsers -- for a KMS signature that is the one thing you need.
-async function viewApproval(){
-  if (!TASK_SEL) return false;
-  const el = $("taskAsk");
-  try {
-    const d = await fetch(API+"/api/tasks/"+encodeURIComponent(TASK_SEL)+"/approval").then(r=>r.json());
-    el.innerHTML = `<div class="inlineask"><div class="askq">Approval records (${(d.approvals||[]).length})`+
-      ` &middot; key <span class="mono">${esc(d.key_arn||d.key||"")}</span></div>`+
-      `<pre style="max-height:260px;overflow:auto">${esc(JSON.stringify(d.approvals||[], null, 1))}</pre>`+
-      (d.verify?`<div class="sub" style="margin-top:6px">verify: <span class="mono">${esc(d.verify)}</span></div>`:"")+
-      `<div class="flex" style="margin-top:8px"><button onclick="askCancel()">Close</button></div></div>`;
-  } catch(e){
-    el.innerHTML = `<div class="inlineask"><div class="askq">could not load the approval record: ${esc(String(e))}</div>`+
-      `<div class="flex"><button onclick="askCancel()">Close</button></div></div>`;
-  }
-  return false;
-}
-
 // ── architecture diagrams ─────────────────────────────────────────────────────
 // Served same-origin by this Lambda (bundled in the zip) so the CSP stays
 // connect-src 'self'. Inlined rather than <img> so the animated dashed wires run;
@@ -1969,8 +1060,6 @@ function showTab(t){
   localStorage.setItem("adminTab", t);
   pipePoll(t==="pipeline");
   if (t==="architecture") loadArch();
-  tasksPoll(t==="tasks");
-  if (t==="tasks") loadTasks();
   if (t==="pipeline") loadPipe().catch(console.error);
   if (t==="obs") { loadObs(); }
   if (t==="evals") loadEvals();
@@ -1980,18 +1069,12 @@ function showTab(t){
 
 // tab on load: ?tab= URL param > localStorage > architecture for first-time
 // visitors (the tab exists to explain the system), remembered tab afterwards
-const KNOWN_TABS = ["architecture","tasks","pipeline","fleet","obs","evals","opts","cost"];
+const KNOWN_TABS = ["architecture","pipeline","fleet","obs","evals","opts","cost"];
 const _urlTab = new URLSearchParams(location.search).get("tab");
 const _memTab = localStorage.getItem("adminTab");
 showTab(KNOWN_TABS.includes(_urlTab) ? _urlTab
       : KNOWN_TABS.includes(_memTab) ? _memTab : "architecture");
 setAuthUi();
-// Restore the signed-in session from the httpOnly refresh cookie. Fire-and-forget, and
-// deliberately NOT awaited: every GET route is public, so the page must render its data
-// without waiting on auth — an /api/refresh that hangs would otherwise hold the whole
-// dashboard blank. setAuthUi() above renders "Sign in"; restoreSession() corrects the
-// button when the cookie turns out to be good.
-restoreSession().catch(()=>{});
 refresh();
 </script>
 </body>

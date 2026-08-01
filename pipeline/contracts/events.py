@@ -58,44 +58,21 @@ ALL_EVENTS: tuple = (
 EVENT_SOURCE = "llmops.pipeline"
 
 
-class _Unset:
-    """Sentinel so an OMITTED client can be told apart from an explicit None."""
-
-    def __repr__(self) -> str:  # pragma: no cover - debugging aid
-        return "<unset>"
-
-
-_UNSET = _Unset()
-
-
 def emit_event(
     bus: str,
     detail_type: str,
     detail: dict,
-    client: Optional[Any] = _UNSET,
+    client: Optional[Any] = None,
     source: str = EVENT_SOURCE,
 ) -> dict:
     """Put a single event on the given EventBridge bus.
 
-    ``client`` is injectable for tests; when the argument is OMITTED a fresh boto3
-    client is created (region resolved from the Lambda environment).
-
-    Passing ``client=None`` explicitly is rejected rather than treated as omission.
-    A None where a client belongs is a caller bug -- typically a test fake dict with
-    ``"events": None`` for a client the author believed was never reached. Quietly
-    substituting a production client there is the most expensive possible answer: on
-    a developer machine with credentials the PutEvents SUCCEEDS, so the test passes
-    while writing to the real bus, and the mistake shows up only in CI as a
-    NoCredentialsError deep in botocore that names neither the test nor the bus.
+    ``client`` is injectable for tests; when omitted a fresh boto3 client is
+    created (region resolved from the Lambda environment).
     """
     if detail_type not in ALL_EVENTS:
         raise ValueError(f"Unknown detail-type {detail_type!r}; add it to events.py first")
-    if client is None:
-        raise ValueError(
-            "emit_event got client=None. Pass a real or fake EventBridge client, or "
-            "omit the argument entirely to resolve one from the environment. An "
-            "explicit None is almost always an unstubbed client in a test fake.")
-    if client is _UNSET:  # pragma: no cover - real AWS path
+    if client is None:  # pragma: no cover - real AWS path
         import boto3
 
         client = boto3.client("events")

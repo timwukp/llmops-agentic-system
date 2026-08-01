@@ -95,7 +95,7 @@
       "name": "checkpoint",
       "config": {
         "inlineFunction": {
-          "description": "Persist progress and yield the turn when the ~13-minute budget nears. You will be re-invoked in the same session to continue. A checkpoint is also how a HUMAN DIRECTIVE reaches you: if an operator or the conductor has answered a question you raised, the result comes back as {\"status\":\"directive\", \"directive\":{decision, rationale, adjusted_params, actor}} instead of {\"status\":\"continue\"}. A directive is an instruction from the accountable human — follow it, record it in your progress file and your stage summary, and treat adjusted_params as overriding the approved plan for those fields only. If you are blocked on a decision only a human can make, write the options out, then checkpoint and keep checkpointing: that is the channel the answer arrives on.",
+          "description": "Persist progress and yield the turn when the ~13-minute budget nears. You will be re-invoked in the same session to continue.",
           "inputSchema": {
             "type": "object",
             "properties": {

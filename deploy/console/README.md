@@ -22,21 +22,9 @@ once at cold start (no giant inline HTML string in the handler).
 ## Auth model (ported)
 
 - All `GET` routes are public read-only (demo-friendly; nothing sensitive is returned).
-- Every `POST` except `/api/login`, `/api/refresh` and `/api/refresh/revoke` requires a
-  Cognito access token (`Authorization: Bearer ...`), validated server-side via
-  `cognito-idp GetUser`. The three exceptions are unauthenticated *because* they are the
-  routes that establish, restore or end a session — requiring a live token to recover
-  from having lost one is circular.
-- The browser keeps the access token in memory only — never in localStorage.
-- Session survival across a page reload comes from an **httpOnly refresh cookie**
-  (`llmops_rt`, `Path=/api/refresh`, `Secure`, `SameSite=Strict`), set by `/api/login`
-  and exchanged for a new access token by `/api/refresh`. Page script cannot read it, so
-  an XSS bug costs one 8-hour access token rather than 30 days of re-issue, and the
-  narrow `Path` means the browser never attaches it to any other route.
-- `/api/refresh/revoke` (sign-out) calls Cognito `RevokeToken` and expires the cookie.
-  An *expired access token* must never take this path: it clears the in-memory token
-  only, so the next action silently re-mints one. Conflating the two would recreate the
-  re-login-on-every-refresh behaviour this design fixes.
+- Every `POST` except `/api/login` requires a Cognito access token
+  (`Authorization: Bearer ...`), validated server-side via `cognito-idp GetUser`.
+- The browser keeps the token in memory only — never in localStorage.
 
 ## Deploy
 

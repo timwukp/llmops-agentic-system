@@ -1,10 +1,7 @@
 """Canonical run-report writer + stage_complete normalizer.
 
-Each run publishes its report under its own key, plus a stable alias:
-    s3://<bucket>/reports/<run_id>/test-report.json      (durable, per run)
-    s3://<bucket>/reports/run-latest/test-report-latest.json  (alias, last run wins)
-The alias was once the only key, which meant two concurrent runs destroyed each
-other's report — see report_key_for().
+The ops console reads exactly one contract file per run:
+    s3://<bucket>/reports/run-latest/test-report-latest.json
 The harness driver is the only writer — agents CLAIM results via the
 stage_complete inline function, the driver verifies and publishes the
 canonical report (orchestrator-side canonical publish; trust but verify).
@@ -22,29 +19,8 @@ import datetime
 import json
 from typing import Any
 
-#: The stable "most recent run" alias. Kept because it is a published contract (the
-#: driver IAM statement, docs/evidence and this module's own docstring all name it), but
-#: it is an ALIAS now, not the only copy -- see report_key_for().
+#: Where the ops console expects the canonical report.
 REPORT_KEY = "reports/run-latest/test-report-latest.json"
-
-
-def report_key_for(run_id: str) -> str:
-    """The per-run report key. One object per run, so two runs cannot overwrite.
-
-    REPORT_KEY was the only key: EVERY run wrote reports/run-latest/test-report-latest.json,
-    so with two runs in flight the second silently destroyed the first's report -- the one
-    artifact a run exists to produce -- and left no way to tell which run the survivor
-    described, because the alias is the same string either way. The platform is meant to
-    run parallel tasks (finetune one model while distilling another), so this was a
-    correctness bug waiting on a second concurrent run, not a hypothetical.
-
-    A falsy run_id returns the alias rather than minting reports/run-/...: a report filed
-    under a blank run id is worse than one filed under the shared alias, because at least
-    the alias is a key someone is looking at.
-    """
-    if not run_id:
-        return REPORT_KEY
-    return f"reports/{run_id}/test-report.json"
 
 # Accepted aliases, in priority order (canonical name first).
 _OUTPUT_KEYS = ("outputs", "artifacts", "output", "artifact_uris", "s3_uris")
@@ -162,34 +138,16 @@ def build_run_report(manifest: dict) -> dict:
 
 
 def write_run_report(s3: Any, bucket: str, manifest: dict) -> dict:
-    """Build the report from the manifest and publish it, per run AND to the alias.
-
-    Two writes on purpose, in this order:
-
-    1. ``reports/<run_id>/test-report.json`` -- the durable copy. This one is the record;
-       it is never overwritten by another run, so a parallel run cannot destroy it.
-    2. ``reports/run-latest/test-report-latest.json`` -- the published alias, for whoever
-       just wants "the last run". Best effort: if the alias write is denied the run must
-       NOT fail, because the durable copy already succeeded and the report exists. The
-       reverse order would reintroduce exactly the bug being fixed -- an alias failure
-       taking down a run whose report was already safely written.
-
-    The alias failure is reported in the returned document rather than swallowed: a
-    silently absent alias reads as "no run has finished", which is a different claim.
+    """Build the report from the manifest and publish it to the console key.
 
     ``s3`` is an injected boto3 S3 client (injectable for tests).
     Returns the report document that was written.
     """
     report = build_run_report(manifest)
-    body = json.dumps(report, indent=2, default=str).encode("utf-8")
-    run_key = report_key_for(str(manifest.get("run_id") or ""))
-    s3.put_object(Bucket=bucket, Key=run_key, Body=body,
-                  ContentType="application/json")
-    report["report_key"] = run_key
-    if run_key != REPORT_KEY:
-        try:
-            s3.put_object(Bucket=bucket, Key=REPORT_KEY, Body=body,
-                          ContentType="application/json")
-        except Exception as exc:  # noqa: BLE001 — the durable copy is already written
-            report["alias_error"] = f"{type(exc).__name__}: {exc}"
+    s3.put_object(
+        Bucket=bucket,
+        Key=REPORT_KEY,
+        Body=json.dumps(report, indent=2, default=str).encode("utf-8"),
+        ContentType="application/json",
+    )
     return report

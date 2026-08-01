@@ -163,43 +163,6 @@ def main():
     t0 = time.time()
     train_ds, val_ds = load_jsonl(args.train_dir), load_jsonl(args.val_dir)
 
-    # Supply-chain path: a model_id of s3://.../models-mirror/<repo>@<revision>/ is a
-    # verified in-account mirror (pinned HF revision, safetensors, per-file SHA-256 in
-    # MODEL_MANIFEST.json — written by the data-prep mirror_model task). Training from
-    # the mirror rather than hub-at-job-start means the bytes a human signed off on in
-    # plan.json are the bytes that train, and the job no longer needs HF egress.
-    if args.model_id.startswith("s3://"):
-        import subprocess
-        local_dir = "/tmp/model-mirror"
-        print(f"[model] syncing mirror {args.model_id} -> {local_dir}")
-        subprocess.run(["aws", "s3", "sync", args.model_id, local_dir,
-                        "--only-show-errors"], check=True)
-        manifest_path = os.path.join(local_dir, "MODEL_MANIFEST.json")
-        if os.path.exists(manifest_path):
-            import hashlib as _hl
-            mm = json.load(open(manifest_path))
-            bad = []
-            for fname, want in (mm.get("files_sha256") or {}).items():
-                fpath = os.path.join(local_dir, fname)
-                if not os.path.exists(fpath):
-                    bad.append(f"{fname}: missing")
-                    continue
-                h = _hl.sha256()
-                with open(fpath, "rb") as fh:
-                    for chunk in iter(lambda: fh.read(1 << 20), b""):
-                        h.update(chunk)
-                if h.hexdigest() != want:
-                    bad.append(f"{fname}: sha256 mismatch")
-            if bad:
-                raise SystemExit(f"FATAL: mirror integrity check failed: {bad} — "
-                                 "the mirrored model does not match its manifest.")
-            print(f"[model] mirror verified: {len(mm.get('files_sha256') or {})} files, "
-                  f"{mm.get('hf_repo')}@{mm.get('revision', '')[:12]}")
-        else:
-            print("[model] WARNING: mirror has no MODEL_MANIFEST.json — loading "
-                  "unverified (legacy mirror?)")
-        args.model_id = local_dir
-
     tokenizer = AutoTokenizer.from_pretrained(args.model_id)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token

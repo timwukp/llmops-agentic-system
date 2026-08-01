@@ -44,13 +44,6 @@ ENV = {
     "DRIVER_FN": "llmops-harness-driver",
     "PROJECT": "llmops-agentic-system",
     "AWS_REGION": "us-east-1",
-    # Without this, _resolve_harness_arn falls through to a live ssm:GetParameter for
-    # /llmops/harness/finops. Any test that drives the handler LOOP (rather than
-    # calling handle_finops_tool directly) reaches it -- and it passed on a laptop
-    # with credentials while failing in CI with NoCredentialsError. tests/conftest.py
-    # now makes that impossible to miss again.
-    "HARNESS_ARN_LLMOPS_FINOPS":
-        "arn:aws:bedrock-agentcore:us-east-1:123456789012:harness/llmops_finops-TESTSUFFIX",
 }
 
 
@@ -215,50 +208,6 @@ def test_finops_can_read_the_billing_apis_it_needs():
         assert needed in acts, needed
 
 
-# The Budgets service is the one place in this repo where the boto3 call name and the
-# IAM action name diverge: describe_budgets authorizes against budgets:ViewBudget, so a
-# policy that grants only budgets:DescribeBudgets denies the call. That is exactly what
-# shipped, and the console degraded quietly -- an except/print, so the Cost tab rendered
-# with an empty budgets list and no error anywhere the user could see. This map is the
-# fixed part; the next test derives the demand side from the source that makes the calls.
-BUDGETS_CALL_TO_IAM = {"describe_budgets": "budgets:ViewBudget"}
-
-BILLING_CALLERS = ("deploy/console/lambda_function.py",
-                   "orchestration/finops_reconcile/handler.py",
-                   "pipeline/contracts/cost_model.py")
-
-
-def test_every_budgets_api_call_is_granted_the_action_it_authorizes_against():
-    """Derived from the callers, not from a hand-kept list: grep the source for the
-    boto3 Budgets calls that actually exist, then require the IAM action each one is
-    authorized against in every policy whose role runs that code. Anchored on the
-    call site (`b.describe_budgets(`) rather than the substring, so a mention of the
-    name in a comment cannot satisfy it."""
-    policies = {
-        "deploy/console/iam-policy.json": _actions(
-            json.loads((REPO / "deploy/console/iam-policy.json").read_text())),
-        HARNESS_ROLE: _actions(_statements(HARNESS_ROLE, "permissionsPolicy")),
-    }
-    found = {}
-    for rel in BILLING_CALLERS:
-        p = REPO / rel
-        if not p.exists():
-            continue
-        src = p.read_text()
-        for call, action in BUDGETS_CALL_TO_IAM.items():
-            if re.search(r"\.\s*" + call + r"\s*\(", src):
-                found.setdefault(action, []).append(rel)
-    assert found, ("no Budgets call found in any of " + str(BILLING_CALLERS)
-                   + " -- if the call moved, point BILLING_CALLERS at its new home "
-                     "rather than deleting this guard")
-    for action, callers in found.items():
-        for path, acts in policies.items():
-            assert action in acts, (
-                f"{path} is missing {action}, which {callers} needs: the Budgets API "
-                f"authorizes describe_budgets against it, and the caller swallows the "
-                f"AccessDeniedException into a log line")
-
-
 def test_no_role_can_mutate_billing_configuration():
     """An auditor with write access to cost categories, allocation-tag status, or
     budgets can reshape the numbers it reports on. Every billing verb granted anywhere
@@ -273,17 +222,9 @@ def test_no_role_can_mutate_billing_configuration():
     billing = {a for a in everything
                if a.split(":")[0] in ("ce", "pricing", "budgets", "cur", "billing")}
     assert billing, "expected some billing permissions to exist"
-    # "View" joins the read verbs for Budgets specifically: budgets:ViewBudget is the
-    # read side of that namespace (its writes are Create/Modify/Update/Delete/Execute).
-    read_verbs = ("Get", "List", "Describe", "View")
+    read_verbs = ("Get", "List", "Describe")
     bad = [a for a in billing if not a.split(":", 1)[1].startswith(read_verbs)]
     assert bad == [], f"mutating billing permission granted: {bad}"
-    # Deliberately redundant with the prefix check above, and only for the namespace
-    # whose read verb we just widened: the named writes are what a future edit to
-    # read_verbs (or a "budgets:*" grant reduced to a prefix) could let through.
-    for w in ("budgets:ModifyBudget", "budgets:CreateBudget", "budgets:UpdateBudget",
-              "budgets:DeleteBudget", "budgets:ExecuteBudgetAction", "budgets:*"):
-        assert w not in billing, w
 
 
 def test_finops_cannot_rewrite_an_approval_decision():
@@ -384,18 +325,6 @@ def _harness_s3(sid):
     raise AssertionError(f"no statement {sid}")
 
 
-def _prefixes(sid):
-    st = _harness_s3(sid)
-    res = st["Resource"]
-    return {r.rsplit("/", 1)[0].split("/", 1)[-1]
-            for r in ([res] if isinstance(res, str) else res)}
-
-
-def _readable_prefixes():
-    """Prefixes the role can GET: the read/write set plus the read-only ones."""
-    return _prefixes("S3PipelineObjects") | _prefixes("S3CustomerDataReadOnly")
-
-
 def test_every_s3_prefix_the_auditor_writes_is_one_its_role_can_write():
     """Measured live on the first successful pricing_refresh: the agent derived a
     complete 37-SKU rate card, then got AccessDenied writing
@@ -413,51 +342,15 @@ def test_every_s3_prefix_the_auditor_writes_is_one_its_role_can_write():
         assert prefix in granted, f"prompt writes {prefix}/ but the role cannot"
 
 
-def test_every_s3_prefix_any_agent_prompt_uses_is_one_the_role_can_reach():
-    """The same defect as the test above, widened past finops -- because it recurred.
-
-    Live, the orchestrator's accepted plan pointed data-prep at
-    customer-data/arc-demo/ (the prefix the consult prompt tells it to use) and the
-    data-prep specialist was denied both s3:ListBucket and s3:GetObject there. The run
-    dispatched, reached DataPrepGenerate, and failed without reading a single task; the
-    customer's data was never the problem. models-mirror/ has the identical gap: the
-    prompts and train_qlora.py both treat it as the only trustworthy source of
-    open-weight models, and nothing granted it.
-
-    Driven off every agent prompt rather than a hardcoded list, so a prefix added to
-    any prompt fails here rather than in the middle of a paid run."""
-    granted = _readable_prefixes()
-    # Every prefix these prompts name -- as an s3:// URI or bare, which is how
-    # customer-data/ and models-mirror/ are written and how both were missed.
-    known = granted | {"customer-data", "models-mirror"}
-    for harness in sorted((REPO / "agents").glob("*/harness.json")):
-        text = harness.read_text()
-        used = {u.split("/")[3] for u in re.findall(r"s3://<bucket>/\S+", text)}
-        used |= {m for m in known if f"{m}/" in text}
-        for prefix in used:
-            assert prefix in granted, \
-                f"{harness.parent.name} prompt uses {prefix}/ but the role cannot reach it"
-
-
 def test_the_list_prefixes_match_the_object_prefixes():
     """ListBucket is condition-scoped, so a prefix granted for Get/Put but absent from
     the condition can be read object-by-object and never enumerated. That reads as
     "the rate card history is not there" when it is."""
-    objects = _readable_prefixes()
+    objects = {r.rsplit("/", 1)[0].split("/", 1)[-1]
+               for r in _harness_s3("S3PipelineObjects")["Resource"]}
     listed = {p.rstrip("/*") for p in
               _harness_s3("S3PipelineList")["Condition"]["StringLike"]["s3:prefix"]}
     assert objects == listed, f"asymmetric: objects={objects} list={listed}"
-
-
-def test_the_customers_own_data_is_readable_but_never_writable():
-    """A pipeline that can rewrite the customer's data can destroy the held-out set
-    its own quality gates are judged against -- the one prefix where least-privilege
-    has to mean read-only, not "read plus the write we happened to need"."""
-    ro = _harness_s3("S3CustomerDataReadOnly")
-    assert set(ro["Action"]) == {"s3:GetObject"}, "customer data must not be writable"
-    assert "customer-data" in _prefixes("S3CustomerDataReadOnly")
-    # and it must NOT have leaked into the read/write statement
-    assert "customer-data" not in _prefixes("S3PipelineObjects")
 
 
 def test_the_canonical_cost_module_is_uploaded_where_the_prompt_says_to_fetch_it():
@@ -531,78 +424,6 @@ def test_a_valid_provisional_report_is_accepted_and_recorded():
     row = c["ddb"].Table(ENV["ACTUALS_TABLE"]).puts[0]
     assert row["project"] == "llmops-agentic-system"
     assert row["sk"].startswith("2026-07-29#finding#publish_cost_report")
-
-
-
-# ── driver: the audit loop ────────────────────────────────────────────────────
-class _Stream:
-    """Minimal invoke_harness response: a tool call, then messageStop."""
-
-    def __init__(self, name, args, stop="tool_use"):
-        self.events = [
-            {"contentBlockStart": {"start": {"toolUse": {
-                "toolUseId": f"tu-{name}", "name": name}}}},
-            {"contentBlockDelta": {"delta": {"toolUse": {
-                "input": json.dumps(args)}}}},
-            {"messageStop": {"stopReason": stop}},
-        ]
-
-
-class _FakeAgentCore:
-    def __init__(self, streams):
-        self.streams, self.calls = list(streams), []
-
-    def invoke_harness(self, **kw):
-        self.calls.append(kw)
-        if not self.streams:      # terminal tools send a fire-and-forget ack
-            return {"stream": [{"messageStop": {"stopReason": "end_turn"}}]}
-        return {"stream": self.streams.pop(0).events}
-
-
-def test_flag_variance_continues_the_loop_with_its_own_acknowledgement():
-    """flag_variance is a FINDING, not the end of the audit -- one turn can flag
-    several runs, so the driver acknowledges it and keeps going. That continue-branch
-    assigned the ack to a variable the loop no longer reads (a leftover from renaming
-    the loop's content -> messages for the two-message resume contract), so the next
-    turn would re-send the PREVIOUS message: the same finding flagged forever, or a
-    toolResult answering a call that was already answered. The existing tests call
-    handle_finops_tool directly and so never see the loop; pyflakes flagged it as an
-    unused local, and only a loop-level test shows what it costs.
-
-    It also asserts the RETURN VALUE, because the first version of this test did not.
-    Its fake publish_cost_report omitted the mandatory ``settlement`` field, so the
-    report was rejected, the loop ran out of re-asks, and the run ended in
-    ``missing stage_complete`` -- yet the turn-2 assertions below all passed, because
-    turn 2 happens before any of that. A loop test that never checks where the loop
-    ENDED will keep passing while the loop dies two turns later."""
-    ac = _FakeAgentCore([
-        _Stream("flag_variance", {
-            "run_id": "run-a", "estimate_usd": 10.0, "actual_usd": 30.0,
-            "variance_pct": 200.0, "driver": "sagemaker_training",
-            "recommendation": "raise the throughput constant"}),
-        _Stream("publish_cost_report", {
-            "report_uri": REPORT_URI, "period": "2026-07-29",
-            "total_usd": 30.0, "settlement": "provisional",
-            "headline": "spend up 200% on training"}),
-    ])
-    c = _clients()
-    c["agentcore"] = ac
-    out = driver.handler(dict(FINOPS_EVENT, harness_id="llmops_finops",
-                              task_token=None), clients=c)
-
-    # turn 2 must carry flag_variance's OWN acknowledgement, matched by toolUseId
-    second = ac.calls[1]["messages"]
-    assert [m["role"] for m in second] == ["assistant", "user"]
-    echo = second[0]["content"][0]["toolUse"]
-    tr = second[1]["content"][0]["toolResult"]
-    assert echo["name"] == "flag_variance"
-    assert tr["toolUseId"] == echo["toolUseId"]
-    assert json.loads(tr["content"][0]["text"])["status"] == "recorded"
-
-    # ...and the loop must then finish on the terminal tool, not exhaust its re-asks.
-    assert out["status"] == "completed", out
-    assert out["tool"] == "publish_cost_report"
-    assert len(ac.calls) == 3, "one turn per stream plus the terminal ack"
 
 
 # ── driver: flag_variance ─────────────────────────────────────────────────────

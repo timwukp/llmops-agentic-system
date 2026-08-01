@@ -24,21 +24,18 @@ import json
 import os
 import sys
 import time
-from typing import Optional
+from typing import Any, Optional
 
 import boto3
 from botocore.config import Config as BotoConfig
-from boto3.dynamodb.conditions import Key
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))  # repo layout
 try:
     from pipeline.contracts import events as ev
     from pipeline.contracts.report import normalize_stage_complete, write_run_report
-    from orchestration import conductor_tools
 except ImportError:  # Lambda bundle layout (contracts vendored alongside)
     import events as ev  # type: ignore
     from report import normalize_stage_complete, write_run_report  # type: ignore
-    import conductor_tools  # type: ignore
 
 # (stage, task) -> EventBridge detail-type. eval/gate resolved dynamically.
 STAGE_EVENT_MAP = {
@@ -75,19 +72,6 @@ def _clients():
     }
 
 
-def _kms(c: dict):
-    """KMS client for approval-signature verification, created on first use.
-
-    Not in _clients() because only the launch_run path needs it, and the unit-test
-    fake client dicts predate it — a lazy accessor means they keep working and a
-    test can inject c["kms"] to stub verification.
-    """
-    if "kms" not in c:
-        region = os.environ.get("AWS_REGION", "us-east-1")
-        c["kms"] = boto3.client("kms", region_name=region)
-    return c["kms"]
-
-
 _arn_cache: dict = {}
 
 
@@ -113,12 +97,9 @@ def _resolve_harness_arn(harness_id: str) -> str:
     return _arn_cache[harness_id]
 
 
-def _invoke(ac, harness_id: str, sess: str, messages: list, qualifier: Optional[str]):
-    """`messages` is the full messages list -- a resume needs two entries (assistant
-    toolUse echo + user toolResult), so this can no longer wrap a single content
-    block. See _tool_result_content."""
+def _invoke(ac, harness_id: str, sess: str, content: list, qualifier: Optional[str]):
     kwargs = dict(harnessArn=_resolve_harness_arn(harness_id), runtimeSessionId=sess,
-                  messages=messages)
+                  messages=[{"role": "user", "content": content}])
     if qualifier:
         kwargs["qualifier"] = qualifier
     return ac.invoke_harness(**kwargs)
@@ -155,34 +136,10 @@ def _drain(resp) -> dict:
             "stop_reason": stop_reason, "error": error}
 
 
-def _user_text(text: str) -> list:
-    """A plain user turn as a messages list."""
-    return [{"role": "user", "content": [{"text": text}]}]
-
-
-def _tool_result_content(tool_use: dict, payload: dict) -> list:
-    """Resume a paused inline function: echo the toolUse, THEN answer it.
-
-    Two messages, per the InvokeHarness pause/resume contract -- an assistant message
-    replaying the emitted toolUse, then a user message with the matching toolResult.
-    A lone toolResult is rejected ("The number of toolResult blocks at
-    messages.N.content exceeds the number of toolUse blocks of previous turn"),
-    because the history handed to the runtime contains no call to answer. Found live
-    on the console's dispatch path, where it broke four sessions in a row; here the
-    same bug hid behind the stream-retry, a rejected result looking like stream death.
-
-    JSON travels in a TEXT block: `json` blocks come back as
-    "runtimeClientError ... content_type=<json_> | unsupported type"."""
-    return [
-        {"role": "assistant", "content": [{"toolUse": {
-            "toolUseId": tool_use["toolUseId"],
-            "name": tool_use["name"],
-            "input": tool_use.get("input") or {}}}]},
-        {"role": "user", "content": [{"toolResult": {
-            "toolUseId": tool_use["toolUseId"],
-            "content": [{"text": json.dumps(payload, default=str)}],
-            "status": "success"}}]},
-    ]
+def _tool_result_content(tool_use_id: str, payload: dict) -> list:
+    return [{"toolResult": {"toolUseId": tool_use_id,
+                            "content": [{"json": payload}],
+                            "status": "success"}}]
 
 
 def verify_outputs(s3, outputs: list) -> list:
@@ -216,75 +173,6 @@ def _record_stage_event(ddb, run_id: str, stage: str, event_name: str, detail: d
     })
 
 
-#: A human verdict addressed to a run, parked where the run's own events live. The sk
-#: prefix keeps directives in one contiguous query range and out of the timeline the
-#: console renders.
-DIRECTIVE_SK = "directive#"
-
-
-def put_directive(ddb, run_id: str, decision: str, rationale: str = "",
-                  adjusted_params: dict | None = None, actor: str = "conductor"):
-    """Park a verdict where the agent working `run_id` will pick it up.
-
-    Until this existed, a stage agent could ASK a blocking question (checkpoint /
-    escalate_human) but nothing could ANSWER it: resolve_escalation wrote an
-    EscalationResolved stage-event that no reader consumed, so triage was advice
-    delivered into the void. Live, data-prep proved its own approved teacher budget
-    infeasible -- 13.5k output tokens per attempt against a plan that assumed 1,800 --
-    and then went on spending under that cap, because "continue" was the only answer
-    the driver knew how to give.
-    """
-    ddb.Table(os.environ["EVENTS_TABLE"]).put_item(Item={
-        "run_id": run_id,
-        "sk": f"{DIRECTIVE_SK}{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}",
-        "decision": decision,
-        "rationale": str(rationale)[:2000],
-        "adjusted_params": json.dumps(adjusted_params or {}, default=str),
-        "actor": actor,
-        "delivered": False,
-    })
-
-
-def take_directive(ddb, run_id: str) -> Optional[dict]:
-    """Pop the oldest undelivered directive for this run, or None.
-
-    Delivered exactly once, by a conditional update: a verdict redelivered on every
-    checkpoint reads as a fresh instruction each time, and an agent told "raise the cap
-    to $13" on every breath would raise it repeatedly. The condition also makes two
-    concurrent drivers safe -- the loser sees ConditionalCheckFailed and moves on.
-
-    Never raises. A directives lookup that fails must degrade to "no directive", not
-    stall a run that merely wanted another turn.
-    """
-    try:
-        table = ddb.Table(os.environ["EVENTS_TABLE"])
-        rows = table.query(
-            KeyConditionExpression=Key("run_id").eq(run_id)
-            & Key("sk").begins_with(DIRECTIVE_SK)).get("Items", [])
-        for row in sorted(rows, key=lambda r: r.get("sk", "")):
-            if not str(row.get("sk", "")).startswith(DIRECTIVE_SK) or row.get("delivered"):
-                continue
-            try:
-                table.update_item(
-                    Key={"run_id": run_id, "sk": row["sk"]},
-                    UpdateExpression="SET delivered = :t, delivered_at = :now",
-                    ConditionExpression="delivered = :f",
-                    ExpressionAttributeValues={
-                        ":t": True, ":f": False,
-                        ":now": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
-            except Exception:  # noqa: BLE001 — another driver claimed it first
-                continue
-            params = row.get("adjusted_params") or "{}"
-            return {"decision": row.get("decision", ""),
-                    "rationale": row.get("rationale", ""),
-                    "adjusted_params": (json.loads(params)
-                                        if isinstance(params, str) else dict(params)),
-                    "actor": row.get("actor", "conductor")}
-    except Exception:  # noqa: BLE001 — no directive beats a stalled run
-        return None
-    return None
-
-
 def _gate_event(metrics: dict) -> str:
     return ev.QUALITY_GATE_PASSED if metrics.get("gate_passed") else ev.QUALITY_GATE_FAILED
 
@@ -310,34 +198,12 @@ def handle_stage_complete(c, event, args) -> dict:
                       client=c["events"])
 
     # Canonical report — the driver writes it; never rely on the agent's upload.
-    #
-    # ISOLATED from the token settle below, because it used to sit directly in front of
-    # it and that cost a run. Live, data-prep finished teacher generation at its cap,
-    # called stage_complete (twice, at 19:23:49 and 19:26:20), and this write died on
-    # AccessDenied -- the driver had no s3:PutObject until 19:30. The exception left
-    # send_task_success unreached, so the token parked for the full 7200s TimeoutSeconds
-    # and the console showed "Data Prep · Generate failed" for work that was DONE and
-    # verified on S3.
-    #
-    # The report is a dashboard convenience; the token is the pipeline's only way to
-    # learn that a paid-for stage succeeded. Nothing about the former may be allowed to
-    # withhold the latter -- so it degrades to a reported warning instead of a 2-hour
-    # silence. The IAM gap is fixed too, but the ordering hazard is the general bug: any
-    # future failure in this write (throttling, a bucket policy, a KMS denial) would
-    # have bought the same outcome.
-    report_error = None
-    try:
-        manifest = _load_manifest(c["s3"], event["manifest_uri"])
-        if manifest:
-            manifest.setdefault("stages", {})[stage] = {
-                "status": "completed", "outputs": norm["outputs"],
-                "metrics": norm.get("metrics", {}), "evidence": norm.get("evidence", "")}
-            write_run_report(c["s3"], os.environ["DATA_BUCKET"], manifest)
-    except Exception as exc:  # noqa: BLE001 — never withhold the token for a report
-        report_error = f"{type(exc).__name__}: {exc}"
-        print(f"[driver] canonical report FAILED for {run_id}/{stage}: {report_error}")
-        _record_stage_event(c["ddb"], run_id, stage, "report_write_failed",
-                            {"error": report_error})
+    manifest = _load_manifest(c["s3"], event["manifest_uri"])
+    if manifest:
+        manifest.setdefault("stages", {})[stage] = {
+            "status": "completed", "outputs": norm["outputs"],
+            "metrics": norm.get("metrics", {}), "evidence": norm.get("evidence", "")}
+        write_run_report(c["s3"], os.environ["DATA_BUCKET"], manifest)
 
     if event.get("task_token"):
         metrics = norm.get("metrics", {})
@@ -349,12 +215,9 @@ def handle_stage_complete(c, event, args) -> dict:
             payload["gate_passed"] = metrics.get("gate_passed") is True
         else:
             payload["gate_passed"] = bool(metrics.get("gate_passed", True))
-        if report_error:
-            payload["report_write_failed"] = report_error
         c["sfn"].send_task_success(taskToken=event["task_token"],
                                    output=json.dumps(payload, default=str))
-    return {"ok": True, "normalized": norm,
-            **({"report_error": report_error} if report_error else {})}
+    return {"ok": True, "normalized": norm}
 
 
 def handle_job_launched(c, event, args) -> dict:
@@ -525,42 +388,7 @@ RE_ASK = ("Your turn ended without an inline-function call. If your task is "
 
 
 def handler(event, context=None, clients=None):
-    """Run one stage, and never strand the task token on the way out.
-
-    A SYNCHRONOUS stage invocation that raises is reported to Step Functions by the
-    Lambda integration itself. An ASYNCHRONOUS continuation is not: the state machine
-    waits on the task token, not on this invocation, so an exception here goes to
-    CloudWatch and to nobody else. The token then parks until TimeoutSeconds -- 7200s
-    for data-prep, 21600s for finetune -- with the run record still saying 'running'.
-
-    Live: the driver's missing s3:PutObject grant crashed the final stage_complete of
-    run-...-8b864805 twice in the same silence, and the run held its token for 90
-    minutes. The AccessDenied was one bug. The 90 minutes was this one: the stage had
-    genuinely failed and the only participant who knew was a log stream.
-
-    So an unexpected exception fails the token with the real cause attached, then
-    re-raises so the invocation is still recorded as an error (and a synchronous
-    caller, like the console's dispatch path, still sees a hard failure rather than a
-    silent success).
-    """
     c = clients or _clients()
-    try:
-        return _run_stage(event, context, c)
-    except Exception as exc:
-        token = event.get("task_token")
-        if token:
-            try:
-                c["sfn"].send_task_failure(
-                    taskToken=token, error="DriverCrashed",
-                    cause=f"{type(exc).__name__}: {exc}"[:32000])
-            except Exception as report_exc:  # noqa: BLE001
-                # Nothing left to do but say so; the timeout is now the only backstop.
-                print(f"[driver] could not fail the parked token: {report_exc}")
-        raise
-
-
-def _run_stage(event, context=None, c=None):
-    c = c if c is not None else _clients()
     sess = session_id(event["run_id"], event["stage"], event["task"])
     payload = {"run_id": event["run_id"], "stage": event["stage"],
                "manifest_uri": event["manifest_uri"],
@@ -571,14 +399,14 @@ def _run_stage(event, context=None, c=None):
     # Continuation across Lambda invocations: one harness turn can run 840s and the
     # Lambda dies at 900s, so only ONE turn fits per invocation. Whenever the loop
     # would start another turn without enough time left, self-reinvoke carrying the
-    # pending messages list (session + task token survive; live-verified Sandbox.Timedout
+    # pending content (session + task token survive; live-verified Sandbox.Timedout
     # killed a run whose agent finished its work but never got to report it).
     if event.get("_continuation"):
-        messages = event["_continuation"]
+        content = event["_continuation"]
         stream_retried = bool(event.get("_stream_retried"))
         re_asks = int(event.get("_re_asks", 0))
     else:
-        messages = _user_text(json.dumps(payload, default=str))
+        content = [{"text": json.dumps(payload, default=str)}]
         stream_retried = False
         re_asks = 0  # up to 2: continue-and-finish nudge, then final demand
 
@@ -588,7 +416,7 @@ def _run_stage(event, context=None, c=None):
     def _self_reinvoke():
         c["lambda"].invoke(
             FunctionName=context.function_name, InvocationType="Event",
-            Payload=json.dumps({**event, "_continuation": messages,
+            Payload=json.dumps({**event, "_continuation": content,
                                 "_stream_retried": stream_retried,
                                 "_re_asks": re_asks}, default=str))
         return {"status": "self_reinvoked_between_turns"}
@@ -599,7 +427,7 @@ def _run_stage(event, context=None, c=None):
         if not first_turn and _out_of_time():
             return _self_reinvoke()
         first_turn = False
-        resp = _invoke(c["agentcore"], event["harness_id"], sess, messages,
+        resp = _invoke(c["agentcore"], event["harness_id"], sess, content,
                        event.get("qualifier"))
         out = _drain(resp)
 
@@ -608,148 +436,69 @@ def _run_stage(event, context=None, c=None):
             stream_retried = True
             if _is_model_5xx(out["error"]):
                 _maybe_failover_model(c, event)  # vendor-quota burst: hot-swap model
-            messages = _user_text("The stream was interrupted. Continue from where "
-                                  "you left off; call your pending inline function.")
+            content = [{"text": "The stream was interrupted. Continue from where "
+                                "you left off; call your pending inline function."}]
             continue
 
         tu = out["tool_use"]
-        # Only a stopReason of "tool_use" means the harness is WAITING for a result.
-        # A toolUse block riding along with end_turn was already serviced inside the
-        # harness; replying to it makes the next ConverseStream invalid with
-        # "toolResult blocks ... exceeds the number of toolUse blocks of previous
-        # turn" (found live on the console's dispatch path, same shape here).
         if tu and out["stop_reason"] == "tool_use":
             name, args = tu["name"], tu.get("input") or {}
             if name == "stage_complete":
                 result = handle_stage_complete(c, event, args)
                 if not result["ok"]:
-                    messages = _tool_result_content(tu, {
+                    content = _tool_result_content(tu["toolUseId"], {
                         "status": "rejected",
                         "reason": f"claimed outputs missing from S3: {result['missing_outputs']}. "
                                   "Write them and call stage_complete again."})
                     continue
                 _invoke(c["agentcore"], event["harness_id"], sess,
-                        _tool_result_content(tu, {"status": "acknowledged"}),
+                        _tool_result_content(tu["toolUseId"], {"status": "acknowledged"}),
                         event.get("qualifier"))
                 return {"status": "completed", **result["normalized"]}
             if name == "job_launched":
                 handle_job_launched(c, event, args)
                 _invoke(c["agentcore"], event["harness_id"], sess,
-                        _tool_result_content(tu, {"status": "released"}),
+                        _tool_result_content(tu["toolUseId"], {"status": "released"}),
                         event.get("qualifier"))
                 return {"status": "released", "job_name": args.get("job_name")}
             if name == "checkpoint":
-                # Just answer it and let the loop-top _out_of_time() check own the
-                # reinvoke. This branch used to reinvoke itself with {"_resumed": True}
-                # -- a key nothing reads -- so the resumed invocation fell through to
-                # the fresh-start branch, re-sent the original stage prompt, and
-                # silently dropped both the pending toolResult and the work already
-                # paid for (live: a budget escalation raised after a pilot found the
-                # plan's token estimate 6.5x low). Its own <60s guard was also dead
-                # code, since _out_of_time() fires at 850s remaining, far earlier.
-                #
-                # A checkpoint is also the DELIVERY point for a human verdict. It is
-                # the one moment a working agent is guaranteed to be listening, so a
-                # directive parked by resolve_escalation (or by an operator) rides back
-                # in the toolResult here. Without this the answer channel was
-                # write-only: the agent could ask and nothing could reply.
-                directive = take_directive(c["ddb"], event["run_id"])
-                messages = _tool_result_content(tu, {
-                    "status": "directive", "directive": directive} if directive
-                    else {"status": "continue"})
+                if context and context.get_remaining_time_in_millis() < 60_000:
+                    c["lambda"].invoke(FunctionName=context.function_name,
+                                       InvocationType="Event",
+                                       Payload=json.dumps({**event, "_resumed": True}))
+                    return {"status": "self_reinvoked"}
+                content = _tool_result_content(tu["toolUseId"], {"status": "continue"})
                 continue
             if name == "escalate_human":
                 handle_escalate(c, event, args)
                 _invoke(c["agentcore"], event["harness_id"], sess,
-                        _tool_result_content(tu, {"status": "escalated"}),
+                        _tool_result_content(tu["toolUseId"], {"status": "escalated"}),
                         event.get("qualifier"))
                 return {"status": "escalated"}
-            if name == "resolve_escalation":
-                # Conductor triage verdict: record it where the escalation lives
-                # (stage-events) and emit the resolution event. Discovered unserviced
-                # by the same drift guard that found launch_run — a triage that ends
-                # in "unsupported" leaves the pipeline paused forever.
-                #
-                # The audit record alone was still a verdict nobody heard: the waiting
-                # agent reads directives, not the timeline. So the decision is ALSO
-                # parked for delivery — addressed to the run being triaged, never to
-                # the conductor's own run, or it lands in the triager's mailbox and the
-                # stuck run waits forever.
-                subject = args.get("run_id") or ""
-                _record_stage_event(c["ddb"], subject or event.get("run_id", ""),
-                                    "orchestrator", "EscalationResolved",
-                                    {"decision": args.get("decision"),
-                                     "rationale": str(args.get("rationale", ""))[:500],
-                                     "adjusted_params": args.get("adjusted_params") or {}})
-                if subject:
-                    put_directive(c["ddb"], subject,
-                                  decision=str(args.get("decision", "")),
-                                  rationale=str(args.get("rationale", "")),
-                                  adjusted_params=args.get("adjusted_params") or {},
-                                  actor="conductor")
-                _invoke(c["agentcore"], event["harness_id"], sess,
-                        _tool_result_content(tu, {"status": "recorded"}),
-                        event.get("qualifier"))
-                return {"status": "resolved", "decision": args.get("decision"),
-                        "run_id": args.get("run_id")}
-            if name == "write_report":
-                # trust-but-verify, same as every artifact claim
-                missing = verify_outputs(c["s3"], [args.get("report_uri", "")])
-                if missing:
-                    messages = _tool_result_content(tu, {
-                        "status": "rejected",
-                        "reason": f"report_uri not in S3: {missing}. Write it first."})
-                    continue
-                _invoke(c["agentcore"], event["harness_id"], sess,
-                        _tool_result_content(tu, {"status": "recorded"}),
-                        event.get("qualifier"))
-                return {"status": "completed", "report_uri": args.get("report_uri"),
-                        "headline": str(args.get("headline", ""))[:300]}
-            if name == "launch_run":
-                # The conductor's dispatch tool, serviced through the same shared
-                # module the console's Tasks tab uses — one implementation, no drift.
-                # From Phase 5 until this branch existed, launch_run fell through to
-                # the unknown-tool fallthrough below and every conductor plan died
-                # with {"status": "unsupported"}.
-                result = conductor_tools.service_launch_run(
-                    c["lambda"], c["s3"], _kms(c), args,
-                    os.environ.get("START_FN", "llmops-start-pipeline"),
-                    expected=(event.get("params") or {}).get("approval_context"))
-                if not result["ok"]:
-                    messages = _tool_result_content(tu, {
-                        "status": "rejected", "reason": result["reason"]})
-                    continue
-                _invoke(c["agentcore"], event["harness_id"], sess,
-                        _tool_result_content(tu, {
-                            "status": "dispatched", "run_id": result["run_id"]}),
-                        event.get("qualifier"))
-                return {"status": "dispatched", "run_id": result["run_id"],
-                        "manifest_uri": result["manifest_uri"],
-                        "execution_arn": result["execution_arn"]}
             if name in FINOPS_TERMINAL_TOOLS and _is_finops(event):
                 result = handle_finops_tool(c, event, name, args)
                 if not result["ok"]:
-                    messages = _tool_result_content(tu, {
+                    content = _tool_result_content(tu["toolUseId"], {
                         "status": "rejected", "reason": result["reason"]})
                     continue
                 # flag_variance is a FINDING, not the end of the task: an audit can
                 # flag several runs in one turn, so acknowledge and let it continue.
                 # The report/rate-card calls are terminal.
-                ack = _tool_result_content(tu, {"status": "recorded"})
+                ack = _tool_result_content(tu["toolUseId"], {"status": "recorded"})
                 if name == "flag_variance":
-                    messages = ack
+                    content = ack
                     continue
                 _invoke(c["agentcore"], event["harness_id"], sess, ack,
                         event.get("qualifier"))
                 return {"status": "completed", "tool": name, **result["args"]}
             # unknown tool — acknowledge and continue rather than dying
-            messages = _tool_result_content(tu, {"status": "unsupported"})
+            content = _tool_result_content(tu["toolUseId"], {"status": "unsupported"})
             continue
 
         # Stream ended without a tool call.
         if re_asks < 2:
             re_asks += 1
-            messages = _user_text(RE_ASK)
+            content = [{"text": RE_ASK}]
             continue
 
         # Re-asks exhausted → treat as stage failure.
