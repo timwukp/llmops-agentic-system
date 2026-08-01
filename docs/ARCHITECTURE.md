@@ -166,6 +166,27 @@ clause, so a protocol that grows a third exit cannot leave it half-wired. A page
 now rejected unless it carries both `situation` and `recommendation`: paging an owner with
 the problem and none of the analysis leaves them exactly where they started.
 
+**A prefix is not a filter.** The verdict channel above parks directives under a
+`directive#` sort key, and the constant's own comment claimed the prefix kept them "out of
+the timeline the console renders". Neither console reader filtered on it — and the prefix
+made the outcome *worse* than harmless rather than merely undelivered. `"d" > "2"`, so
+every `directive#` row sorts after every ISO-timestamped stage event, landing exactly in
+the window the operator sees (`evs.slice(-25)`); and a directive row carries no `detail`
+attribute, so each rendered as a blank line. Ten parked verdicts on a run with thirty
+events therefore showed ten blank rows *and pushed the ten newest real events off the
+screen* — the timeline degraded in proportion to how much triage a run had needed. The fix
+is two bounded queries rather than one filtered list, because a single `Limit`-ed query
+spends its budget on directives before the rows reach the Lambda: filtering afterwards
+would yield a short timeline with nothing to indicate anything was dropped. The event range
+is bounded on `"A"` — stage-event keys are ISO timestamps and so begin with a digit, while
+every non-event row uses a named `word#` prefix — and **not** on `directive#`, which would
+have fixed the symptom and re-armed the defect for the next prefix added (`audit#` and
+`checkpoint#` sort *before* `directive#` and would have been served as stage events).
+Directives are returned and rendered as their own section carrying `deliverable` /
+`delivered`, because a verdict that could never be read must not look like one an agent
+acted on — the indistinguishability that let the data-prep escalation read as answered for
+three days.
+
 If a turn ends *without* an inline-function call (models sometimes narrate completion but
 skip the structured call), the driver re-asks up to 2 times in the same session, then
 fails the stage as `MissingStageComplete` — narration is never promoted to success.

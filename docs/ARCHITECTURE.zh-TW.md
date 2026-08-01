@@ -146,6 +146,23 @@ chat worker 處理它 —— 但 triage 從來不是 chat：`EscalatedToHuman` �
 出口，也不可能只接一半。此外，一次 page 若沒有同時帶 `situation` 與 `recommendation`
 就會被駁回：把問題丟給 owner 而不附上你已經做完的分析，等於讓他們留在原地。
 
+**prefix 不是 filter。** 上面那個回答通道把裁決停放在 `directive#` 這個 sort key 下，而那個
+常數自己的註釋聲稱這個 prefix 讓它們「不出現在 console 渲染的 timeline 裡」。兩個 console
+reader 都沒有對它做過濾 —— 而這個 prefix 讓結果比「無害」**更糟**，不只是沒被投遞。
+`"d" > "2"`，所以每一個 `directive#` row 都排在所有 ISO 時間戳的 stage event 之後，正好落在
+操作者看得到的那個窗口裡（`evs.slice(-25)`）；而 directive row 沒有 `detail` 屬性，於是每一個
+都渲染成一條空白列。一個有 30 筆事件的 run 上停放 10 筆裁決，就會顯示 10 條空白列，
+**並且把最新的 10 筆真實事件擠出畫面** —— timeline 的退化程度，正比於這個 run 需要過多少
+分診。修法是**兩個各自有邊界的 query**，而不是一個過濾後的清單：單一個帶 `Limit` 的 query
+會在事件抵達 Lambda 之前就把額度花在 directive 上，事後再過濾只會得到一份變短的 timeline，
+而且沒有任何跡象顯示有東西被丟掉。事件範圍的上界取 `"A"` —— stage event 的 key 是 ISO
+時間戳，所以一定以數字開頭，而每一個非事件的 row 都用具名的 `word#` prefix —— 而**不是**取
+`directive#`：那樣只會修掉症狀，並且為下一個新增的 prefix 重新上膛（`audit#` 與 `checkpoint#`
+排在 `directive#` **之前**，會被當成 stage event 送出去）。directive 是被回傳並且渲染成自己
+一個區塊的，帶著 `deliverable` / `delivered`，因為一筆永遠不可能被讀到的裁決，不能長得跟一筆
+agent 真的照著做了的裁決一樣 —— 那種無法區分，正是 data-prep 那筆 escalation 三天裡一直
+讀起來像已被回答的原因。
+
 若一輪結束時*沒有* inline-function 呼叫（模型有時會口頭宣稱完成卻漏掉結構化呼叫），
 driver 在同一 session 內最多追問 2 次，然後以 `MissingStageComplete` 判定階段失敗 ——
 口頭敘述永遠不會被晉升為成功。

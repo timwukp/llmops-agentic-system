@@ -3634,3 +3634,177 @@ def test_the_thread_renderer_paints_every_new_piece():
     body = body[:body.index("\n}")]
     for fn in ("renderChoices(t)", "renderDrop(t)", "renderReadiness(t)", "loadReadiness(t)"):
         assert fn in body, f"renderThread never calls {fn}"
+
+
+# ── the timeline: a directive is an answer, not a moment ─────────────────────
+#
+# These use their own table stub on purpose. `_StubTable.query` ignores the
+# KeyConditionExpression entirely and returns every item it holds, so a test built on
+# it would pass no matter what the console queried -- including the broken single-query
+# version these guards exist to catch. A stub that cannot fail proves nothing.
+class _RangeTable:
+    """A (PK, SK) stub that actually honours eq / lt / begins_with and Limit.
+
+    Only the operators the console uses are implemented, and an unrecognised one RAISES
+    rather than degrading to "match everything": silently matching is how the stub it
+    replaces made the bug invisible.
+    """
+
+    def __init__(self, name="llmops-stage-events"):
+        self.name = name
+        self.rows = []
+        self.queries = []          # every KeyConditionExpression seen, in order
+
+    def put_item(self, Item):
+        self.rows.append(dict(Item))
+
+    #: Evaluators for the ops the console uses, keyed by the name _Cond records.
+    _OPS = {
+        "eq": lambda got, want: got == want,
+        "lt": lambda got, want: got < want,
+        "begins_with": lambda got, want: got.startswith(want),
+    }
+
+    def _preds(self, cond):
+        terms = getattr(cond, "terms", None)
+        # An empty term list means the condition told us nothing -- exactly the failure
+        # mode of the stub this replaces. Matching everything here would make every
+        # assertion below vacuous, so refuse instead.
+        assert terms, "the condition stub recorded no terms; the query is untestable"
+        preds = []
+        for attr, op, val in terms:
+            if op not in self._OPS:
+                raise AssertionError(f"_RangeTable does not implement {op!r}")
+            f = self._OPS[op]
+            preds.append(lambda r, a=attr, v=val, f=f: f(str(r.get(a, "")), v))
+        return preds
+
+    def query(self, **kw):
+        cond = kw["KeyConditionExpression"]
+        self.queries.append(cond)
+        preds = self._preds(cond)
+        hits = [dict(r) for r in self.rows if all(p(r) for p in preds)]
+        hits.sort(key=lambda r: str(r.get("sk", "")),
+                  reverse=not kw.get("ScanIndexForward", True))
+        if kw.get("Limit"):
+            hits = hits[:int(kw["Limit"])]
+        return {"Items": hits}
+
+
+def _seed_timeline(tbl, run_id, n_events=30, n_directives=10):
+    for i in range(n_events):
+        tbl.put_item({"run_id": run_id,
+                      "sk": f"2026-08-01T{i:02d}:00:00Z#eval#stage_complete",
+                      "event_name": "stage_complete",
+                      "detail": json.dumps({"i": i})})
+    for i in range(n_directives):
+        tbl.put_item({"run_id": run_id, "sk": f"directive#2026-08-01T{i:02d}:30:00Z",
+                      "decision": f"d{i}", "rationale": "because",
+                      "actor": "conductor", "deliverable": False, "delivered": False})
+    return tbl
+
+
+def test_a_parked_verdict_never_displaces_a_stage_event(console, monkeypatch):
+    """The defect, stated as the thing an operator lost.
+
+    `"d" > "2"`, so every `directive#` row sorts AFTER every ISO-timestamped event --
+    landing exactly in the window the frontend renders (`evs.slice(-25)`). A directive
+    carries no `detail`, so each one showed as a BLANK row and pushed one real event out
+    of view. Measured on the shape below: 10 verdicts cost the operator the 10 newest
+    stage events on a run that had 30.
+    """
+    tbl = _seed_timeline(_RangeTable(), "run-x")
+    monkeypatch.setattr(console, "events_tbl", tbl)
+    evs, dirs = console._timeline("run-x")
+    assert [e for e in evs if str(e["sk"]).startswith("directive#")] == [], \
+        "a verdict is being served as a stage event"
+    assert len(evs) == 30 and len(dirs) == 10
+    # the window the frontend actually paints must be all real events
+    assert all(not str(e["sk"]).startswith("directive#") for e in evs[-25:])
+
+
+def test_the_events_query_is_bounded_in_dynamodb_not_in_python(console, monkeypatch):
+    """Filtering after the fact is not a fix.
+
+    One `Limit`-ed query spends its budget on directives before the events reach the
+    Lambda, so a Python-side filter yields a SHORT timeline with nothing to indicate
+    anything was dropped. Two ranges each get their own budget -- so with a limit of 10
+    and 10 directives present, ten real EVENTS still come back.
+    """
+    tbl = _seed_timeline(_RangeTable(), "run-x")
+    monkeypatch.setattr(console, "events_tbl", tbl)
+    evs, dirs = console._timeline("run-x", limit=10)
+    assert len(evs) == 10, "the Limit was spent on rows that are not stage events"
+    assert len(tbl.queries) == 2, "the split must happen in DynamoDB, not after"
+
+
+def test_an_unknown_sk_prefix_cannot_displace_an_event_either(console, monkeypatch):
+    """The bound excludes by SHAPE, so the next prefix added is safe by default.
+
+    `lt(DIRECTIVE_SK)` would have fixed today's symptom and re-armed the bug: any prefix
+    sorting after `directive#` (`finding#`, `note#`, ...) would vanish from BOTH lists
+    with nothing to notice. Bounding on "A" keeps every `word#` row out of the stage
+    timeline, which is what such a row is.
+    """
+    tbl = _seed_timeline(_RangeTable(), "run-x", n_events=5, n_directives=0)
+    # Prefixes on BOTH sides of "directive#" alphabetically. The ones BEFORE it are the
+    # discriminating cases and the reason this test is written this way: `finding#` and
+    # `note#` sort after `directive#`, so `lt(DIRECTIVE_SK)` excludes them too and a test
+    # seeding only those passes against the narrow bound -- vacuous. `audit#` and
+    # `checkpoint#` sort BEFORE it, so the narrow bound serves them AS STAGE EVENTS.
+    for sk in ("audit#2026-08-01T09:00:00Z", "checkpoint#2026-08-01T09:00:00Z",
+               "finding#2026-08-01T09:00:00Z", "note#2026-08-01T09:00:00Z"):
+        tbl.put_item({"run_id": "run-x", "sk": sk, "detail": "not a stage event"})
+    monkeypatch.setattr(console, "events_tbl", tbl)
+    evs, _ = console._timeline("run-x")
+    assert len(evs) == 5, f"a non-event row reached the stage timeline: {[e['sk'] for e in evs]}"
+
+
+def test_the_two_directive_prefixes_have_not_drifted_apart(console):
+    """The console re-declares the driver's DIRECTIVE_SK because they ship in separate
+    bundles. If the driver ever renames its prefix, its verdicts become invisible to the
+    console rather than mis-sorted -- a quieter version of the same bug, so it fails
+    here instead.
+
+    Read from the driver's SOURCE rather than by importing it: the driver pulls in the
+    AgentCore SDK and its own env at import, and a guard about one string constant must
+    not depend on that.
+    """
+    src = (REPO / "orchestration/harness_driver/handler.py").read_text()
+    m = re.search(r'^DIRECTIVE_SK\s*=\s*"([^"]+)"', src, re.M)
+    assert m, "the driver no longer declares DIRECTIVE_SK"
+    assert console.DIRECTIVE_SK == m.group(1), (
+        f"driver parks under {m.group(1)!r}, console reads {console.DIRECTIVE_SK!r}")
+
+
+def test_a_verdict_that_could_never_be_read_does_not_render_as_one_that_was(console, monkeypatch):
+    """The undeliverable-verdict fix is only worth anything if the display preserves it.
+    `deliverable` arrives as the STRING "False" from DynamoDB, whose truthiness is not
+    the question -- so the projection must carry the field and the renderer must compare
+    it properly."""
+    tbl = _RangeTable()
+    tbl.put_item({"run_id": "run-x", "sk": "directive#2026-08-01T13:45:40Z",
+                  "decision": "raise_teacher_cap", "rationale": "why",
+                  "actor": "conductor", "deliverable": False, "delivered": False,
+                  "run_status_at_put": "escalated"})
+    monkeypatch.setattr(console, "events_tbl", tbl)
+    monkeypatch.setattr(console, "s3", FakeS3())
+    monkeypatch.setattr(console, "data_bucket", lambda: "b")
+    monkeypatch.setattr(console, "runs_tbl", None)
+    out = console.run_detail("run-x")
+    v = out["directives"][0]
+    assert v["deliverable"] == "False" and v["run_status_at_put"] == "escalated"
+    code = _strip_comments(_front())
+    assert 'String(v.deliverable).toLowerCase() === "true"' in code, \
+        "the renderer is treating the string \"False\" as a boolean"
+
+
+def test_the_run_view_paints_the_verdicts_it_is_served(console):
+    """Returning directives and never rendering them would repeat the defect one layer
+    up: the record exists, and nobody sees it."""
+    code = _strip_comments(_front())
+    assert "d.directives" in code, "run_detail serves directives that nothing renders"
+    body = code[code.index("const dirs = d.directives"):]
+    body = body[:body.index("const evs = d.events")]
+    for want in ("never delivered", "parked, awaiting pickup", "picked up by the run"):
+        assert want in body, f"the verdict table never says {want!r}"
