@@ -120,11 +120,18 @@
             "Resource": "arn:aws:ssm:<REGION>:<ACCOUNT_ID>:parameter/llmops/harness/*"
           },
           {
-            "_comment": "trust-but-verify: the driver head_objects every S3 URI an agent claims in a terminal tool (stage_complete outputs, publish_cost_report report_uri, update_rate_card rates_uri) and reads the run manifest. head_object needs s3:GetObject. Without it verify_outputs sees AccessDenied as 'missing' and rejects every terminal call the agent makes, even when the artifact exists. Read-only, own data bucket only: the driver verifies artifacts, it does not write them.",
+            "_comment": "trust-but-verify: the driver head_objects every S3 URI an agent claims in a terminal tool (stage_complete outputs, publish_cost_report report_uri, update_rate_card rates_uri) and reads the run manifest. head_object needs s3:GetObject. Without it verify_outputs sees AccessDenied as 'missing' and rejects every terminal call the agent makes, even when the artifact exists. Read-only across the data bucket: for everything except its own one report, the driver verifies artifacts rather than writing them.",
             "Sid": "TrustButVerifyArtifactRead",
             "Effect": "Allow",
             "Action": "s3:GetObject",
             "Resource": "arn:aws:s3:::<DATA_BUCKET>/*"
+          },
+          {
+            "_comment": "The driver -- not the agent -- writes the canonical run report, on EVERY successful stage_complete (pipeline.contracts.report.write_run_report). The statement above used to be the driver's only S3 grant, and its own comment asserted the driver 'does not write them' while handle_stage_complete had been calling put_object all along: a comment describing an intention the code had outgrown. Live, data-prep finished teacher generation, called stage_complete, and the driver died on AccessDenied AFTER the spend -- the report was the one artifact the run existed to produce. Scoped to that single key rather than the bucket: a wildcard write would also let the driver rewrite the customer data and held-out acceptance sets it is deliberately limited to reading, which is how a pipeline destroys the evidence its own quality gates are judged against.",
+            "Sid": "PublishCanonicalRunReport",
+            "Effect": "Allow",
+            "Action": "s3:PutObject",
+            "Resource": "arn:aws:s3:::<DATA_BUCKET>/reports/run-latest/test-report-latest.json"
           },
           {
             "_comment": "Servicing the conductor's launch_run: the driver invokes start-pipeline on the orchestrator's behalf. Without this, an orchestrator run with params.task=plan reaches the dispatch moment and dies on AccessDenied \u2014 the exact defect that made launch_run 'unsupported' for five phases.",

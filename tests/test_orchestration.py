@@ -1025,3 +1025,46 @@ def test_start_pipeline_role_can_emit_the_event_its_handler_always_emits():
                                      else st.get("Action", []))][0]
     assert "llmops-pipeline" in json.dumps(bus["Resource"]), \
         "scope PutEvents to the project bus, not *"
+
+
+def _allowed_actions(role: str) -> set:
+    doc = json.loads((REPO / "deploy/iam/lambda_roles.json").read_text())
+    allowed = set()
+    for st in doc["roles"][role]["permissionsPolicy"]["Statement"]:
+        if st.get("Effect") != "Allow":
+            continue
+        acts = st.get("Action")
+        allowed.update([acts] if isinstance(acts, str) else acts)
+    return allowed
+
+
+def test_the_driver_role_can_write_the_report_the_driver_always_writes():
+    """Same defect as start_pipeline's missing PutEvents, one function over, and the
+    role even said so out loud: its S3 statement was GetObject-only and commented
+    "the driver verifies artifacts, it does not write them" -- while
+    handle_stage_complete calls write_run_report on EVERY successful stage. The
+    comment described an intention the code had already outgrown.
+
+    Live cost: data-prep finished teacher generation, called stage_complete, and the
+    driver died on AccessDenied AFTER the work was paid for -- twice, since the
+    invocation retried. The agent's report was the one thing the run existed to
+    produce.
+
+    The write is scoped to the exact key the report lives at, not the bucket: the
+    driver publishes one canonical document, and a wildcard would also let it rewrite
+    the customer data and held-out sets it is supposed to only read."""
+    allowed = _allowed_actions("driver")
+    assert "s3:PutObject" in allowed, (
+        "handle_stage_complete writes reports/run-latest/test-report-latest.json on "
+        "every stage_complete; without PutObject every stage dies after doing its work")
+    doc = json.loads((REPO / "deploy/iam/lambda_roles.json").read_text())
+    writes = [st for st in doc["roles"]["driver"]["permissionsPolicy"]["Statement"]
+              if "s3:PutObject" in ([st.get("Action")] if isinstance(st.get("Action"), str)
+                                    else st.get("Action", []))]
+    assert len(writes) == 1, "one statement owns the driver's single write"
+    resource = json.dumps(writes[0]["Resource"])
+    from pipeline.contracts.report import REPORT_KEY
+    assert REPORT_KEY in resource, (
+        f"scope the write to {REPORT_KEY}, the only object the driver publishes")
+    assert "customer-data" not in resource and not resource.rstrip('"]').endswith("/*"), \
+        "a bucket-wide write would let the driver rewrite the data it must only read"
