@@ -139,6 +139,7 @@ class _Body:
 class FakeS3:
     def __init__(self):
         self.objects = {}
+        self.signed = []          # every generate_presigned_url call, in order
 
     def put_object(self, Bucket, Key, Body, **kw):
         self.objects[f"{Bucket}/{Key}"] = Body if isinstance(Body, bytes) else Body
@@ -153,6 +154,20 @@ class FakeS3:
         if f"{Bucket}/{Key}" not in self.objects:
             raise KeyError("404")
         return {}
+
+    def generate_presigned_url(self, ClientMethod, Params=None, ExpiresIn=None):
+        """Records the call and returns a URL shaped like the real one.
+
+        Deliberately NOT a signature: what these tests assert is which Key and
+        ContentType were signed, and that is in `Params`. Returning a plausible URL
+        while recording the exact params keeps the assertions on the thing that
+        matters -- a key that escapes its prefix -- rather than on boto's crypto.
+        """
+        self.signed.append({"method": ClientMethod, "params": dict(Params or {}),
+                            "expires_in": ExpiresIn})
+        p = Params or {}
+        return (f"https://{p.get('Bucket')}.s3.us-east-1.amazonaws.com/"
+                f"{p.get('Key')}?X-Amz-Signature=fake")
 
 
 class FakeLambda:
@@ -1509,3 +1524,399 @@ def test_the_frontend_has_a_colour_for_every_status_the_api_can_return():
     assert not missing, (
         f"pipeline_detail can return stage status {missing}, and stageColor() has no "
         "branch for it, so it falls through to the pending colour")
+
+
+# ── the presigned data upload: the customer's only way to hand us a dataset ────
+# Before this route the consult prompt opened every consultation by asking for "an S3
+# URI under customer-data/", which the product had no way to help answer: the console's
+# IAM could PutObject only into tasks/*, and the UI had no file input at all. The live
+# customer-data/arc-demo/ files were uploaded by CLI, not by the product. So these tests
+# guard a route whose whole purpose is to close that hole -- and the key-composition
+# tests below are what make it safe to expose at all.
+
+def test_upload_url_requires_a_console_group(wired):
+    tid = _mk_task(wired, status="plan_proposed")
+    r = wired.console.data_upload_url(
+        {"task_id": tid, "filename": "train.jsonl", "content_length": 10}, NOBODY)
+    assert r["status_code"] == 403
+    assert not wired.s3.signed, "a refused caller must not get a URL signed for them"
+
+
+def test_upload_url_signs_a_key_under_the_task_prefix(wired):
+    tid = _mk_task(wired, status="plan_proposed")
+    r = wired.console.data_upload_url(
+        {"task_id": tid, "filename": "train.jsonl", "content_length": 4096}, DS_USER)
+    assert r["ok"], r
+    assert r["key"] == f"customer-data/{tid}/train.jsonl"
+    assert r["uri"] == f"s3://test-bucket/customer-data/{tid}/train.jsonl"
+    assert r["expires_in"] == wired.console.UPLOAD_URL_TTL_S
+    call = wired.s3.signed[-1]
+    assert call["method"] == "put_object"
+    assert call["params"]["Key"] == r["key"]
+    # ContentType is signed IN so the browser cannot store a dataset as text/html, and
+    # SSE matches the bucket default rather than relying on it.
+    assert call["params"]["ContentType"] == "application/x-ndjson"
+    assert call["params"]["ServerSideEncryption"] == "AES256"
+
+
+def test_an_approver_may_also_upload(wired):
+    """Same bar as create_task: _user_may_task, not merely authenticated. The approver
+    group is in that set, so an approver walking a customer through onboarding is not
+    blocked by an authorization rule nobody intended."""
+    tid = _mk_task(wired, status="plan_proposed")
+    r = wired.console.data_upload_url(
+        {"task_id": tid, "filename": "eval.csv", "content_length": 10}, APPROVER)
+    assert r["ok"] and r["content_type"] == "text/csv"
+
+
+@pytest.mark.parametrize("filename", [
+    "../../runs/run-x/manifest.json",          # climb out of the prefix
+    "../../../finops/cost_model.json",         # into the ledger's prefix
+    "a/b/train.jsonl",                         # a nested path
+    "/etc/passwd.txt",                         # absolute
+    "C:\\Users\\me\\data\\set.jsonl",           # a Windows client's idea of a name
+    "..%2f..%2fruns%2fx.json",                 # pre-encoded traversal
+    "x" * 500 + ".jsonl",                      # a name longer than any key we want
+])
+def test_no_filename_can_escape_the_customer_data_prefix(wired, filename):
+    """The test that makes this route safe to ship. The key is composed server-side from
+    the task id and a sanitised name; nothing the client sent may reach it verbatim. Each
+    input must either be refused or land under customer-data/<task_id>/ with no path
+    separators left in the final segment.
+
+    Negative-control result worth recording: removing the basename split ALONE, or the
+    [A-Za-z0-9._-] whitelist ALONE, leaves this test green -- each guard is independently
+    sufficient, which is the point of having both. Removing BOTH fails 5 of these 7 cases.
+    So do not read a green run here as evidence that either guard is redundant; read it as
+    the redundancy working. (Verified by patching both out, 2026-08-01.)
+    """
+    tid = _mk_task(wired, status="plan_proposed")
+    r = wired.console.data_upload_url(
+        {"task_id": tid, "filename": filename, "content_length": 10}, DS_USER)
+    if r.get("ok"):
+        prefix = f"customer-data/{tid}/"
+        assert r["key"].startswith(prefix), f"{filename!r} escaped to {r['key']!r}"
+        tail = r["key"][len(prefix):]
+        assert "/" not in tail and "\\" not in tail and ".." not in tail, tail
+        assert len(r["key"]) < 300, "an unbounded name makes an unbounded key"
+        # and the SIGNED key must be the same one we reported
+        assert wired.s3.signed[-1]["params"]["Key"] == r["key"]
+    else:
+        assert r["status_code"] == 400
+        assert not wired.s3.signed, "a rejected name must not reach the signer"
+
+
+def test_upload_url_refuses_an_extension_the_pipeline_cannot_read(wired):
+    """Refused by extension rather than sniffed: this console never opens the bytes, so
+    the extension is the only honest signal. .html matters most -- a bucket that also
+    serves content plus an uploaded document is a stored-XSS shape."""
+    tid = _mk_task(wired, status="plan_proposed")
+    for name in ("payload.html", "logo.svg", "run.sh", "noextension"):
+        r = wired.console.data_upload_url(
+            {"task_id": tid, "filename": name, "content_length": 10}, DS_USER)
+        assert r.get("status_code") == 400, name
+    assert not wired.s3.signed
+
+
+def test_upload_url_for_an_unknown_task_is_404_not_400(wired):
+    """The upload is scoped to a consultation. An unknown task is not a complaint about a
+    field -- there is nothing to attach the data to, and minting a URL anyway would write
+    an orphan object into customer-data/ that no consultation ever reads."""
+    r = wired.console.data_upload_url(
+        {"task_id": "task-nope", "filename": "t.jsonl", "content_length": 10}, DS_USER)
+    assert r["status_code"] == 404
+    r2 = wired.console.data_upload_url({"filename": "t.jsonl", "content_length": 10}, DS_USER)
+    assert r2["status_code"] == 404
+    assert not wired.s3.signed
+
+
+@pytest.mark.parametrize("status", ["dispatched", "closed", "error", "completed", "failed"])
+def test_upload_url_is_refused_once_the_consultation_is_over(wired, status):
+    """Both lifecycle tuples, deliberately. TASK_TERMINAL predates the state machine,
+    which closes a task row out with completed/failed (TASK_SETTLED) -- a check that
+    tested only TASK_TERMINAL would happily hand out a write URL for a finished
+    consultation, and the object would land where no one is looking for it."""
+    tid = _mk_task(wired, status=status)
+    r = wired.console.data_upload_url(
+        {"task_id": tid, "filename": "t.jsonl", "content_length": 10}, DS_USER)
+    # .get, not [...]: when the guard is missing this returns a successful mint, and a
+    # bare KeyError reads as a broken test rather than as the open write grant it is.
+    assert r.get("status_code") == 409, \
+        f"status {status!r} still got an upload URL minted: {r}"
+    assert not wired.s3.signed
+
+
+def test_the_settled_statuses_are_the_ones_the_state_machine_writes(console):
+    """Guards the pair above against drift: if the state machine starts writing a third
+    closing status, this fails rather than the upload route silently accepting it.
+    Derived from the ASL, not from a hand-copied list."""
+    asl = json.loads((REPO / "orchestration/state_machine.asl.json").read_text())
+    written = set()
+    for st in asl["States"].values():
+        p = st.get("Parameters", {})
+        if p.get("TableName") != "llmops-tasks":
+            continue
+        for name, val in p.get("ExpressionAttributeValues", {}).items():
+            if f"#s = {name}" in p.get("UpdateExpression", ""):
+                written.add(val["S"])
+    assert written, "no llmops-tasks closer found -- did the state names change?"
+    covered = set(console.TASK_TERMINAL) | set(console.TASK_SETTLED)
+    missing = sorted(s for s in written if s not in covered)
+    assert not missing, (
+        f"the state machine closes a task with status {missing}, which is in neither "
+        "TASK_TERMINAL nor TASK_SETTLED -- data_upload_url would hand out a write URL "
+        "for a finished consultation and the object would land where nobody looks")
+
+
+def test_upload_url_needs_a_real_size(wired):
+    tid = _mk_task(wired, status="plan_proposed")
+    for cl in (None, 0, "", "abc"):
+        r = wired.console.data_upload_url(
+            {"task_id": tid, "filename": "t.jsonl", "content_length": cl}, DS_USER)
+        assert r.get("status_code") == 400, cl
+    assert not wired.s3.signed
+
+
+def test_upload_url_refuses_more_than_one_put_can_carry(wired):
+    """5 GiB is S3's single-PUT ceiling. Declared with a number rather than left to fail
+    at the END of a long upload, which is the worst possible time to learn it."""
+    tid = _mk_task(wired, status="plan_proposed")
+    r = wired.console.data_upload_url(
+        {"task_id": tid, "filename": "big.parquet",
+         "content_length": wired.console.UPLOAD_MAX_BYTES + 1}, DS_USER)
+    assert r["status_code"] == 413
+    assert not wired.s3.signed
+
+
+def test_upload_url_is_short_lived(console):
+    """A presigned PUT is a bearer write grant. It rides in browser history, proxy logs,
+    and any error report the customer pastes to us, so its lifetime is the blast radius."""
+    assert 0 < console.UPLOAD_URL_TTL_S <= 3600
+
+
+def test_upload_url_leaves_an_audit_event(wired):
+    tid = _mk_task(wired, status="plan_proposed")
+    wired.console.data_upload_url(
+        {"task_id": tid, "filename": "train.jsonl", "content_length": 4096}, DS_USER)
+    ev = [p for p in wired.events.puts if p.get("event_name") == "DataUploadUrlIssued"]
+    assert ev, ("an issued write grant that leaves no trace cannot be investigated later; "
+                f"events were {[p.get('event_name') for p in wired.events.puts]}")
+    detail = json.loads(ev[-1]["detail"])
+    assert detail["actor"] == "alice"
+    assert detail["key"] == f"customer-data/{tid}/train.jsonl"
+    assert detail["bytes"] == "4096"
+
+
+def test_a_signing_failure_is_a_502_not_a_broken_url(wired, monkeypatch):
+    """If S3 cannot sign, the caller must learn that instead of receiving something
+    URL-shaped that fails in the browser as an opaque CORS error."""
+    def _boom(*a, **k):
+        raise RuntimeError("kms/sts unavailable")
+    monkeypatch.setattr(wired.s3, "generate_presigned_url", _boom)
+    tid = _mk_task(wired, status="plan_proposed")
+    r = wired.console.data_upload_url(
+        {"task_id": tid, "filename": "t.jsonl", "content_length": 10}, DS_USER)
+    assert r["status_code"] == 502 and "url" not in r
+
+
+def test_the_upload_route_is_registered_inside_the_authenticated_post_block(console):
+    """An upload-URL minter above the auth check is an unauthenticated write grant on the
+    data bucket. Asserted structurally because the route list is long enough that a new
+    entry can land on the wrong side of `if user is None` unnoticed."""
+    src = (REPO / "deploy/console/lambda_function.py").read_text()
+    assert '"/api/data-upload-url"' in src
+    post_block = src.split('if user is None')[-1]
+    assert "/api/data-upload-url" in post_block
+
+
+# ── the CSP must permit the upload it is deployed alongside ────────────────────
+
+def test_the_csp_names_the_upload_origin_so_our_own_header_does_not_block_it(wired):
+    """connect-src 'self' alone blocks a browser PUT to S3, and the failure reads as a
+    broken S3 permission rather than as our own header -- the single most expensive way
+    this feature could fail. Scoped to the one bucket: 'https://*.s3.amazonaws.com'
+    would authorise every bucket on earth as a fetch target from this page."""
+    csp = wired.console._csp()
+    assert "connect-src 'self' https://test-bucket.s3." in csp
+    assert "*.s3." not in csp, "a wildcard S3 origin is not a scope"
+    # the rest of the policy must survive the edit
+    for d in ("default-src 'self'", "base-uri 'none'", "object-src 'none'",
+              "frame-ancestors 'self'"):
+        assert d in csp, d
+
+
+def test_the_csp_is_built_per_response_not_frozen_at_import(console):
+    """data_bucket() may resolve through SSM. A module-level constant means one transient
+    cold-start failure bakes an upload-less CSP into that container for its whole life.
+    Asserted by changing the bucket and re-reading the header, which a constant cannot
+    reflect -- and by the header NOT being in _SEC_HEADERS, which is the shape that
+    would silently reintroduce the freeze."""
+    assert "content-security-policy" not in console._SEC_HEADERS
+    import unittest.mock as _m
+    with _m.patch.object(console, "data_bucket", lambda: "bucket-one"):
+        first = console._resp(200, {})["headers"]["content-security-policy"]
+    with _m.patch.object(console, "data_bucket", lambda: "bucket-two"):
+        second = console._resp(200, {})["headers"]["content-security-policy"]
+    assert "bucket-one" in first and "bucket-two" in second
+
+
+def test_an_unresolvable_bucket_degrades_to_self_and_never_to_a_wildcard(console):
+    """Uploads are broken either way if the bucket cannot be resolved; a wildcard would
+    trade a real security boundary for nothing."""
+    import unittest.mock as _m
+    def _boom():
+        raise RuntimeError("ssm unavailable")
+    with _m.patch.object(console, "data_bucket", _boom):
+        csp = console._csp()
+    assert "connect-src 'self';" in csp and "s3." not in csp
+
+
+# ── the infrastructure the upload silently depends on ─────────────────────────
+
+def test_the_console_role_may_write_customer_data(console):
+    """generate_presigned_url signs with the CALLER's credentials: a URL signed by a role
+    without s3:PutObject on the key is minted happily and then 403s in the browser at the
+    end of the upload. So the grant is part of the feature, not an afterthought."""
+    pol = json.loads((REPO / "deploy/console/iam-policy.json").read_text())
+    puts = [s for s in pol["Statement"]
+            if "s3:PutObject" in (s["Action"] if isinstance(s["Action"], list) else [s["Action"]])]
+    res = [r for s in puts for r in (s["Resource"] if isinstance(s["Resource"], list) else [s["Resource"]])]
+    assert any("customer-data/*" in r for r in res), \
+        f"no PutObject grant on customer-data/*; found {res}"
+    # and it must stay scoped -- a bucket-wide PutObject lets the console overwrite
+    # manifests and signed approval records under runs/.
+    assert not any(r.rstrip("*").endswith(":::") or r.endswith(":::*") for r in res)
+
+
+def test_the_bucket_is_configured_for_browser_uploads(console):
+    """A presigned PUT from a page on another origin is a cross-origin request: without a
+    CORS rule the browser fails at the preflight no matter how correct the URL is. The
+    bucket had NO CORS configuration (NoSuchCORSConfiguration) and 03_storage.py had no
+    step to add one, so this is asserted rather than assumed."""
+    src = (REPO / "deploy/03_storage.py").read_text()
+    assert "put_bucket_cors" in src, "ensure_bucket never configures CORS"
+    block = src[src.index("put_bucket_cors") - 2000:src.index("put_bucket_cors") + 1200]
+    assert '"PUT"' in block or "'PUT'" in block, "the CORS rule must allow PUT"
+    assert "AllowedOrigins" in block
+    assert '"*"' not in block.split("AllowedOrigins")[1][:200], \
+        "AllowedOrigins '*' lets any page on the internet use a leaked presigned URL"
+
+
+def test_the_pipeline_role_still_cannot_write_customer_data(console):
+    """The console signs writes; the harness only reads. deploy/iam/harness_execution_role.json
+    explains why: a pipeline that can rewrite the customer's data can destroy the held-out
+    set its own gates are judged on. Adding an upload path must not have relaxed that."""
+    doc = json.loads((REPO / "deploy/iam/harness_execution_role.json").read_text())
+    # The file holds BOTH policies keyed separately (trustPolicy / permissionsPolicy);
+    # deploy/01_iam.py applies each. Reading doc["Statement"] would KeyError, and a
+    # `.get("Statement", [])` would silently iterate nothing and pass vacuously.
+    pol = doc["permissionsPolicy"]
+    for s in pol["Statement"]:
+        acts = s["Action"] if isinstance(s["Action"], list) else [s["Action"]]
+        res = s["Resource"] if isinstance(s["Resource"], list) else [s["Resource"]]
+        writes = [a for a in acts if a.startswith("s3:Put") or a.startswith("s3:Delete")
+                  or a == "s3:*"]
+        if writes:
+            assert not any("customer-data" in r for r in res), \
+                f"{writes} granted on {res} -- customer data must stay read-only here"
+
+
+# ── the CORS step, exercised rather than grepped ──────────────────────────────
+# The guard above proves put_bucket_cors exists in the source; these prove it does the
+# right thing. A structural assertion alone would pass on a step that wildcards its
+# origin, skips silently, or allows DELETE.
+
+@pytest.fixture(scope="module")
+def storage():
+    """deploy/03_storage.py loaded as a module. Its name starts with a digit so it is
+    not importable normally; nothing at import time calls AWS."""
+    spec = importlib.util.spec_from_file_location(
+        "llmops_03_storage", REPO / "deploy/03_storage.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class _CorsS3:
+    def __init__(self):
+        self.cors = None
+
+    def put_bucket_cors(self, Bucket, CORSConfiguration):
+        self.cors = {"bucket": Bucket, "config": CORSConfiguration}
+
+
+def test_cors_allows_the_upload_and_nothing_more(storage):
+    s3 = _CorsS3()
+    note = storage.ensure_cors(s3, "b", "https://api.example.com", dry=False)
+    rule = s3.cors["config"]["CORSRules"][0]
+    assert rule["AllowedOrigins"] == ["https://api.example.com"]
+    assert "PUT" in rule["AllowedMethods"]
+    # No DELETE: nothing in the product asks a browser to remove a customer's dataset,
+    # and a presigned URL is a bearer token -- a DELETE rule widens what a leaked one does.
+    assert "DELETE" not in rule["AllowedMethods"]
+    assert "POST" not in rule["AllowedMethods"]
+    # the preflight must be allowed to ask for the headers the signature covers
+    assert "content-type" in rule["AllowedHeaders"]
+    assert "x-amz-server-side-encryption" in rule["AllowedHeaders"]
+    assert "https://api.example.com" in note
+
+
+def test_cors_is_skipped_and_reported_never_wildcarded(storage):
+    """The whole point of a 15-minute presigned URL is that it is a narrow grant.
+    AllowedOrigins '*' would let any page on the internet spend one it got hold of, so an
+    unresolved origin must skip the rule and SAY so -- the deploy output is the only place
+    a skip is visible, because the symptom is a browser failure with no server-side trace.
+    """
+    s3 = _CorsS3()
+    note = storage.ensure_cors(s3, "b", "", dry=False)
+    assert s3.cors is None, "no CORS rule may be written without a known origin"
+    assert "skip" in note.lower() and "console-origin" in note
+
+
+def test_cors_dry_run_writes_nothing(storage):
+    s3 = _CorsS3()
+    note = storage.ensure_cors(s3, "b", "https://api.example.com", dry=True)
+    assert s3.cors is None and "would" in note
+
+
+def test_console_origin_prefers_an_explicit_override_over_any_aws_call(storage):
+    """--console-origin must work with no credentials at all: the offline dry-run path
+    (--account-id, no STS) is the one people use to review a deploy, and an AWS call in
+    that path turns a review into a failure."""
+    assert storage.console_origin("us-east-1", dry=True,
+                                  override="https://x.example.com/") == "https://x.example.com"
+
+
+def test_console_origin_matches_the_api_the_console_deploy_actually_creates(storage):
+    """deploy/console/deploy.sh names its HTTP API "$FN-api" with FN=llmops-admin. If
+    these two spellings drift, CORS is silently skipped on every deploy and browser
+    upload breaks with no error anywhere on the server side."""
+    sh = (REPO / "deploy/console/deploy.sh").read_text()
+    assert f"FN={storage.CONSOLE_FN}" in sh
+    assert '--name "$FN-api"' in sh
+
+
+def test_console_origin_is_empty_rather_than_wrong_when_the_api_is_absent(storage, monkeypatch):
+    class _Api:
+        def get_apis(self):
+            return {"Items": [{"Name": "some-other-api", "ApiId": "zzz"}]}
+    monkeypatch.setattr(storage.boto3, "client", lambda *a, **k: _Api())
+    assert storage.console_origin("us-east-1", dry=False) == ""
+
+
+def test_console_origin_resolves_the_real_api(storage, monkeypatch):
+    class _Api:
+        def get_apis(self):
+            return {"Items": [{"Name": "unrelated", "ApiId": "aaa"},
+                              {"Name": f"{storage.CONSOLE_FN}-api", "ApiId": "deovqcv4m7"}]}
+    monkeypatch.setattr(storage.boto3, "client", lambda *a, **k: _Api())
+    assert storage.console_origin("us-east-1", dry=False) == \
+        "https://deovqcv4m7.execute-api.us-east-1.amazonaws.com"
+
+
+def test_the_deploy_reports_cors_on_its_own_line(storage):
+    """Folded into the `settings` string it would be one word in a sentence nobody reads.
+    A skipped CORS step has no other visible symptom until a customer's upload fails."""
+    src = (REPO / "deploy/03_storage.py").read_text()
+    main = src[src.index("def main("):]
+    assert '"cors": ensure_cors(' in main

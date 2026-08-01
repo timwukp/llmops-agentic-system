@@ -1838,6 +1838,13 @@ def finops_run(body):
 
 TASK_ACTIVE = ("thinking", "accepting")           # one in-flight turn per task
 TASK_TERMINAL = ("dispatched", "closed", "error")
+#: The state machine closes a task row out with "completed"/"failed" (see
+#: orchestration/state_machine.asl.json), which TASK_TERMINAL predates and does not
+#: list. Kept as a SEPARATE tuple rather than folded into TASK_TERMINAL: widening that
+#: one would also change what post_task_message and close_task refuse, which is a
+#: lifecycle decision this change has no business making quietly. New checks that mean
+#: "this consultation is over" should test both.
+TASK_SETTLED = ("completed", "failed")
 STALE_TURN_MIN = 20                               # zombie 'thinking' escape hatch
 
 
@@ -1925,6 +1932,128 @@ def create_task(body, user):
     _task_event(task_id, "TaskCreated", user["username"], {"goal": goal[:200]})
     _enqueue_task_turn(task_id)
     return {"ok": True, "task": item}
+
+
+#: Where a customer's own data lands. Read-only to the pipeline (see
+#: deploy/iam/harness_execution_role.json: a pipeline that can rewrite customer data can
+#: destroy the held-out set its own gates are judged on), writable only by this console
+#: signing a short-lived presigned PUT.
+CUSTOMER_DATA_PREFIX = "customer-data"
+#: 15 min: long enough to upload a large file over a slow link, short enough that a URL
+#: leaked from a browser history or a proxy log is not a standing write grant.
+UPLOAD_URL_TTL_S = 900
+#: 5 GiB is S3's single-PUT ceiling. Declared rather than implied so the caller gets a
+#: 400 with a number instead of an opaque S3 failure at the end of a long upload.
+UPLOAD_MAX_BYTES = 5 * 1024 * 1024 * 1024
+#: A dataset the pipeline can actually read. Everything else is refused by extension
+#: rather than sniffed: this console never opens the bytes, so the extension is the only
+#: honest signal, and .html/.svg in a bucket that also serves content is a stored-XSS
+#: shape we simply do not accept.
+UPLOAD_EXTS = ("jsonl", "json", "csv", "tsv", "txt", "parquet", "zip", "gz")
+#: Only for the Content-Type pinned INTO the presigned URL. A dataset is never served as
+#: a document, so anything unrecognised becomes a stream rather than guessing.
+_UPLOAD_CTYPES = {"jsonl": "application/x-ndjson", "json": "application/json",
+                  "csv": "text/csv", "tsv": "text/tab-separated-values",
+                  "txt": "text/plain", "parquet": "application/vnd.apache.parquet",
+                  "zip": "application/zip", "gz": "application/gzip"}
+
+
+def _safe_upload_name(filename):
+    """A filename reduced to something that cannot escape its prefix.
+
+    The key is built server-side from this, never taken from the client. `basename`
+    alone is not enough: "..%2f" style input, backslashes (a Windows client sends
+    "C:\\data\\set.jsonl"), and leading dots all survive it. So: split on both
+    separators, keep the last segment, then keep only [A-Za-z0-9._-] and collapse the
+    rest. Returns "" when nothing usable remains, which the caller turns into a 400 --
+    silently inventing a name would store a file the customer cannot recognise later.
+    """
+    raw = str(filename or "").strip().replace("\\", "/")
+    raw = raw.split("/")[-1]
+    cleaned = "".join(ch if (ch.isalnum() or ch in "._-") else "-" for ch in raw)
+    # Collapse dot runs. Percent-encoded traversal ("..%2f..%2fruns%2fx.json") survives
+    # the character filter as "..-2f..-2fruns-2fx.json" -- harmless as an S3 key, since
+    # S3 does not resolve "..", but it leaves a name that READS like a traversal in every
+    # log and audit event that quotes it. Collapsing means no reviewer ever has to decide
+    # whether a ".." in our own bucket listing is the dangerous kind.
+    while ".." in cleaned:
+        cleaned = cleaned.replace("..", ".")
+    # No leading dots: ".." collapses to nothing usable, and a dotfile is not a dataset.
+    cleaned = cleaned.lstrip(".")[:120]
+    if not cleaned or cleaned in (".", ".."):
+        return ""
+    ext = cleaned.rsplit(".", 1)[-1].lower() if "." in cleaned else ""
+    if ext not in UPLOAD_EXTS:
+        return ""
+    return cleaned
+
+
+def data_upload_url(body, user):
+    """Mint a short-lived presigned PUT so the customer's browser can upload a dataset
+    straight to S3.
+
+    Why presigned rather than posting the file here: API Gateway caps a payload at 6 MB
+    and this Lambda has a 900s timeout, so routing an enterprise dataset through it
+    would fail on size or cost minutes of Lambda time per upload. The bytes go
+    browser -> S3; only the signature comes from here.
+
+    Before this route existed the consult prompt opened every consultation by asking
+    "where is your data (an S3 URI under customer-data/)" -- a question the product had
+    no way to help answer, because the console's IAM could write only tasks/* and the UI
+    had no file input. Someone with AWS credentials had to upload out of band.
+    """
+    if not _user_may_task(user):
+        return {"error": f"membership in {DS_GROUP} or {APPROVER_GROUP} required",
+                "status_code": 403}
+    task_id = str(body.get("task_id", "")).strip()
+    task = _task_get(task_id) if task_id else None
+    if not task:
+        # The upload is scoped to a consultation, so an unknown task is not a 400 about
+        # a field -- there is nothing to attach the data to.
+        return {"error": "unknown task_id", "status_code": 404}
+    status = str(task.get("status", ""))
+    if status in TASK_TERMINAL or status in TASK_SETTLED:
+        return {"error": f"task is {status}; data can only be added to an open "
+                         "consultation", "status_code": 409}
+    name = _safe_upload_name(body.get("filename"))
+    if not name:
+        return {"error": "filename must be a plain name ending in one of: "
+                         + ", ".join(UPLOAD_EXTS), "status_code": 400}
+    try:
+        size = int(body.get("content_length") or 0)
+    except (TypeError, ValueError):
+        return {"error": "content_length must be an integer", "status_code": 400}
+    if size <= 0:
+        return {"error": "content_length is required (an empty upload is not data)",
+                "status_code": 400}
+    if size > UPLOAD_MAX_BYTES:
+        return {"error": f"{size} bytes exceeds the {UPLOAD_MAX_BYTES} byte limit for a "
+                         "single upload", "status_code": 413}
+
+    bucket = data_bucket()
+    # The key is composed here from the task id and the sanitised name. Nothing the
+    # client sent reaches it verbatim, so a crafted filename cannot write into runs/,
+    # finops/, or another task's prefix.
+    key = f"{CUSTOMER_DATA_PREFIX}/{task_id}/{name}"
+    ext = name.rsplit(".", 1)[-1].lower()
+    ctype = _UPLOAD_CTYPES.get(ext, "application/octet-stream")
+    try:
+        url = s3.generate_presigned_url(
+            "put_object",
+            # ContentType is signed IN, so the browser must send this exact value and
+            # cannot store a dataset as text/html. ServerSideEncryption matches the
+            # bucket default (AES256) rather than relying on it.
+            Params={"Bucket": bucket, "Key": key, "ContentType": ctype,
+                    "ServerSideEncryption": "AES256"},
+            ExpiresIn=UPLOAD_URL_TTL_S)
+    except Exception as e:
+        return {"error": f"could not sign an upload URL: {str(e)[:200]}",
+                "status_code": 502}
+    _task_event(task_id, "DataUploadUrlIssued", user["username"],
+                {"key": key, "bytes": str(size)})
+    return {"ok": True, "url": url, "key": key, "bucket": bucket,
+            "uri": f"s3://{bucket}/{key}", "content_type": ctype,
+            "expires_in": UPLOAD_URL_TTL_S}
 
 
 def _enqueue_task_turn(task_id, accept=False):
@@ -2522,23 +2651,53 @@ def _chat_tool_result(tool_use, payload):
 # 'unsafe-inline' is unavoidable today (inline <script> + onclick handlers); CSP is
 # defence-in-depth, escaping at the sink (esc()/jstr() in frontend.html) is the
 # primary XSS control.
-CSP = ("default-src 'self'; script-src 'self' 'unsafe-inline'; "
-       "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
-       "connect-src 'self'; frame-src 'self'; frame-ancestors 'self'; "
-       "form-action 'self'; base-uri 'none'; object-src 'none'")
+def _upload_origin():
+    """The single S3 origin the browser may PUT a dataset to.
+
+    connect-src must name it explicitly or our own CSP blocks the presigned upload --
+    the failure looks like a broken S3 permission but is this header. Scoped to this one
+    bucket rather than a wildcard: 'https://*.s3.amazonaws.com' would authorise every
+    bucket on earth as a fetch target from this page.
+
+    Falls back to a bare-bucket-less origin only if the bucket cannot be resolved at
+    cold start, in which case uploads are broken anyway and a wildcard would be a
+    silent security downgrade in exchange for nothing.
+    """
+    try:
+        return f"https://{data_bucket()}.s3.{REGION}.amazonaws.com"
+    except Exception:
+        return ""
+
+
+def _csp():
+    """Built per response, not once at import.
+
+    The upload origin needs data_bucket(), which may resolve through SSM. Freezing this
+    into a module constant means a single transient SSM failure at cold start bakes an
+    upload-less CSP into that container for its whole life -- and the symptom is a
+    browser upload blocked by a header, which reads as an S3 permission problem and
+    would cost hours. data_bucket() caches on success, so this stays a dict lookup after
+    the first resolve.
+    """
+    origin = _upload_origin()
+    connect = f"connect-src 'self' {origin}".rstrip() if origin else "connect-src 'self'"
+    return ("default-src 'self'; script-src 'self' 'unsafe-inline'; "
+            "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+            + connect + "; frame-src 'self'; frame-ancestors 'self'; "
+            "form-action 'self'; base-uri 'none'; object-src 'none'")
 
 _SEC_HEADERS = {
     "x-content-type-options": "nosniff",
     "x-frame-options": "SAMEORIGIN",
     "referrer-policy": "strict-origin-when-cross-origin",
     "strict-transport-security": "max-age=31536000; includeSubDomains",
-    "content-security-policy": CSP,
 }
 
 
 def _resp(code, body, ctype="application/json"):
     headers = {"content-type": ctype}
     headers.update(_SEC_HEADERS)
+    headers["content-security-policy"] = _csp()
     if ctype.startswith("application/json"):
         headers["cache-control"] = "no-store"
     if ALLOWED_ORIGIN:
@@ -2739,6 +2898,8 @@ def handler(event, context):
                         return _resp_result(accept_task(tid, user))
                     if action == "close":
                         return _resp_result(close_task(tid, body, user))
+            if path == "/api/data-upload-url":
+                return _resp_result(data_upload_url(body, user))
             if path == "/api/start-run":
                 return _resp_result(start_run(body))
             if path == "/api/cost-estimate":
