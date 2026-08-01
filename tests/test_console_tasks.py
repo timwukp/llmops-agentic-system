@@ -1052,7 +1052,10 @@ def test_the_lifecycle_flow_renders_every_terminal_status_the_pipeline_writes():
 
 # ── the stage flow must not call a budget stop a failure ──────────────────────
 
-def _fake_sfn_history(events, exec_status, run_id="run-x"):
+def _fake_sfn_history(events, exec_status, run_id="run-x", definition=None):
+    asl = definition if definition is not None else json.dumps(
+        json.loads((REPO / "orchestration/state_machine.asl.json").read_text()))
+
     class _Sfn:
         def describe_execution(self, executionArn):
             return {"status": exec_status, "input": json.dumps({"run_id": run_id}),
@@ -1060,15 +1063,37 @@ def _fake_sfn_history(events, exec_status, run_id="run-x"):
 
         def get_execution_history(self, **kw):
             return {"events": events}
+
+        def describe_state_machine(self, stateMachineArn):
+            return {"definition": asl}
     return _Sfn()
 
 
-#: The live history of run-20260731T183103Z-8b864805, event for event. DataPrepGenerate
-#: was entered and exited (the .waitForTaskToken task TIMED OUT after 7200s), the Catch
-#: ran EscalateFail, and MarkRunFailed then died on States.Runtime because EscalateFail
-#: had no ResultPath at the time -- so the execution is FAILED with only these states.
+#: The live history of run-20260731T183103Z-8b864805, event for event (verified against
+#: GetExecutionHistory: 16 events). The .waitForTaskToken task TIMED OUT after 7200s
+#: with States.Timeout, the Catch ran EscalateFail, and MarkRunFailed then died on
+#: States.Runtime because EscalateFail had no ResultPath at the time.
+#:
+#: What the agent was doing is NOT visible here and that is the whole lesson: the
+#: manifest's last entry is complete-at-cap and stage-events holds two stage_complete
+#: rows (19:23:49, 19:26:20). The driver crashed writing the canonical report -- it had
+#: no s3:PutObject until 19:30 -- BEFORE it settled the token. So the stage finished and
+#: the token parked. A timeout is a crash, not a question.
 _LIVE_TIMEOUT_HISTORY = [
     {"stateEnteredEventDetails": {"name": "DataPrepGenerate"}},
+    {"taskTimedOutEventDetails": {"error": "States.Timeout"}},
+    {"stateExitedEventDetails": {"name": "DataPrepGenerate"}},
+    {"stateEnteredEventDetails": {"name": "EscalateFail"}},
+    {"stateExitedEventDetails": {"name": "EscalateFail"}},
+    {"stateEnteredEventDetails": {"name": "MarkRunFailed"}},
+]
+
+#: The same shape, but the driver reported the error handle_escalate sends when the
+#: agent called escalate_human. This -- not the state name -- is an escalation.
+_ESCALATED_HISTORY = [
+    {"stateEnteredEventDetails": {"name": "DataPrepGenerate"}},
+    {"taskFailedEventDetails": {"error": "EscalatedToHuman",
+                                "cause": "teacher token cap infeasible; options A-D"}},
     {"stateExitedEventDetails": {"name": "DataPrepGenerate"}},
     {"stateEnteredEventDetails": {"name": "EscalateFail"}},
     {"stateExitedEventDetails": {"name": "EscalateFail"}},
@@ -1076,42 +1101,161 @@ _LIVE_TIMEOUT_HISTORY = [
 ]
 
 
-def test_a_stage_that_escalated_is_not_painted_as_a_crash(console, monkeypatch):
-    """"Data Prep · Generate failed" was the first thing the operator saw, and it was
-    not what happened. The agent hit the teacher-token cap the human had approved,
-    wrote status=complete-at-cap, escalated with four costed options, and waited. The
-    turnaround is a BUDGET STOP awaiting a decision, not a crash.
+def test_a_stage_that_asked_a_human_is_not_painted_as_a_crash(console, monkeypatch):
+    """A stage that stopped to ASK something is waiting on us, not broken.
 
-    The console inferred "failed" from execution shape alone: entered-but-terminal, or
-    last_entered on a non-SUCCEEDED execution. Both were true here. Painting that red
-    tells the operator to go debug a stage that behaved exactly as designed, and buries
-    the thing that actually needs them -- an unanswered question with money attached.
-
-    EscalateFail is in the history precisely BECAUSE the stage escalated, so the
-    distinction is already available; it was just not used.
+    The signal is the driver's own error string (handle_escalate sends
+    error="EscalatedToHuman"), because that is the only place the two cases differ.
     """
-    monkeypatch.setattr(console, "sfn", _fake_sfn_history(_LIVE_TIMEOUT_HISTORY, "FAILED"))
-    out = console.pipeline_detail("run-20260731T183103Z-8b864805")
+    monkeypatch.setattr(console, "sfn", _fake_sfn_history(_ESCALATED_HISTORY, "FAILED"))
+    out = console.pipeline_detail("run-asked")
     gen = next(s for s in out["stages"] if s["key"] == "data-prep-generate")
-    assert out["escalated"] is True, "EscalateFail ran; the run escalated by definition"
+    assert out["escalated"] is True
     assert gen["status"] == "escalated", (
         f"the stage that escalated for a human decision reads {gen['status']!r}; "
         "'failed' sends the operator to debug a stage that did the right thing")
 
 
-def test_a_genuine_crash_still_reads_failed(console, monkeypatch):
-    """The counterweight: softening the escalation case must not soften a real crash.
+def test_reaching_escalatefail_is_not_by_itself_an_escalation(console, monkeypatch):
+    """The trap that a first pass at this fell into, kept as a test.
 
-    A stage that dies without EscalateFail (no escalation, nobody asked anything) on a
-    FAILED execution is exactly the zombie case the closers exist for, and it must stay
-    red -- otherwise the fix above trades a false alarm for a missed one.
+    EscalateFail is the Catch target of 9 of the 11 stages, so EVERY crash routes
+    through it. Deriving `escalated` from `name in TERMINAL_FAIL_STATES` therefore
+    painted crashes amber -- and the crash test written alongside it passed only
+    because its hand-written history omitted EscalateFail, which no real crashed run
+    does. This is the live run: it timed out, it never asked anything, it is red.
     """
-    crash = [{"stateEnteredEventDetails": {"name": "FinetuneLaunch"}}]  # entered, never exited
+    states = json.loads((REPO / "orchestration/state_machine.asl.json").read_text())["States"]
+    catchers = [n for n, st in states.items()
+                if any(c.get("Next") == "EscalateFail" for c in st.get("Catch", []))]
+    assert len(catchers) > 1, (
+        f"EscalateFail is the catch-all for {catchers}; a single-stage EscalateFail "
+        "would make the state name a valid escalation signal, and this test moot")
+
+    monkeypatch.setattr(console, "sfn", _fake_sfn_history(_LIVE_TIMEOUT_HISTORY, "FAILED"))
+    out = console.pipeline_detail("run-20260731T183103Z-8b864805")
+    gen = next(s for s in out["stages"] if s["key"] == "data-prep-generate")
+    assert out["escalated"] is False, (
+        "EscalateFail ran because the Catch fired, not because anyone was asked")
+    assert gen["status"] == "failed", (
+        "States.Timeout is a crash: the driver died writing the report before it "
+        "settled the token. Amber would tell the operator to wait for nothing")
+
+
+def test_a_genuine_crash_still_reads_failed(console, monkeypatch):
+    """The counterweight: softening the escalation case must not soften a real crash."""
+    crash = [{"stateEnteredEventDetails": {"name": "FinetuneLaunch"}},
+             {"taskFailedEventDetails": {"error": "DriverCrashed", "cause": "boom"}},
+             {"stateEnteredEventDetails": {"name": "EscalateFail"}}]
     monkeypatch.setattr(console, "sfn", _fake_sfn_history(crash, "FAILED"))
     out = console.pipeline_detail("run-crash")
     ft = next(s for s in out["stages"] if s["key"] == "finetune-launch")
     assert out["escalated"] is False
     assert ft["status"] == "failed", "a crash with no escalation must still read failed"
+
+
+def test_one_stage_asking_does_not_repaint_another_stages_crash(console, monkeypatch):
+    """The status is per stage, so it must be decided from THAT stage's error.
+
+    A run-wide `escalated` flag repaints every stopped stage the same colour: one
+    stage politely asking a question would hide a different stage's crash behind
+    amber, which is the original bug with the sign flipped.
+    """
+    mixed = [{"stateEnteredEventDetails": {"name": "DataPrepGenerate"}},
+             {"taskFailedEventDetails": {"error": "EscalatedToHuman", "cause": "budget?"}},
+             {"stateExitedEventDetails": {"name": "DataPrepGenerate"}},
+             {"stateEnteredEventDetails": {"name": "FinetuneLaunch"}},
+             {"taskFailedEventDetails": {"error": "DriverCrashed", "cause": "AccessDenied"}}]
+    monkeypatch.setattr(console, "sfn", _fake_sfn_history(mixed, "FAILED"))
+    out = console.pipeline_detail("run-mixed")
+    by = {s["key"]: s for s in out["stages"]}
+    assert by["finetune-launch"]["status"] == "failed", (
+        "the crashed stage must stay red even though another stage escalated")
+
+
+# ── the hover card: visibility into what is behind each stage box ─────────────
+
+def test_the_stage_hover_config_comes_from_the_deployed_definition(console, monkeypatch):
+    """The card answers "which AgentCore runtime is behind this box, with what timeout".
+
+    It is read from DescribeStateMachine, not hardcoded in the console: a second copy
+    would answer for whatever the console was packaged with, and a stale answer here is
+    undetectable by the operator asking the question.
+    """
+    console._STAGE_CFG_CACHE.clear()
+    monkeypatch.setattr(console, "sfn", _fake_sfn_history(_ESCALATED_HISTORY, "FAILED"))
+    out = console.pipeline_detail("run-asked")
+    by = {s["key"]: s for s in out["stages"]}
+
+    asl = json.loads((REPO / "orchestration/state_machine.asl.json").read_text())["States"]
+    for state, key in console.STATE_TO_STAGE.items():
+        pay = (asl[state].get("Parameters") or {}).get("Payload") or {}
+        if not pay.get("harness_id"):
+            continue
+        cfg = by[key]["config"]
+        assert cfg["harnessId"] == pay["harness_id"], f"{key}: wrong harness id"
+        assert cfg["runtime"] == "harness_" + pay["harness_id"]
+        assert state in cfg["states"], f"{key}: {state} missing from states"
+        if asl[state].get("TimeoutSeconds"):
+            assert cfg["timeoutSeconds"] == asl[state]["TimeoutSeconds"]
+
+
+def test_the_remediation_stage_reports_both_states_it_can_run_as(console, monkeypatch):
+    """RemediateFinetune and FinetuneLaunch map to ONE box. Whichever the dict happens
+    to visit second must not overwrite the first, or the card names the wrong state for
+    half the runs -- silently, since both are plausible."""
+    console._STAGE_CFG_CACHE.clear()
+    monkeypatch.setattr(console, "sfn", _fake_sfn_history([], "SUCCEEDED"))
+    cfg = console.stage_config()["finetune-launch"]
+    assert set(cfg["states"]) == {"FinetuneLaunch", "RemediateFinetune"}, cfg["states"]
+
+
+def test_a_hover_card_never_breaks_the_flow_diagram(console, monkeypatch):
+    """If DescribeStateMachine is denied or the definition is unparseable, the stage
+    flow itself must still render. A tooltip is an enhancement; taking the operator's
+    only live view of the pipeline down to serve one would be a bad trade."""
+    console._STAGE_CFG_CACHE.clear()
+
+    class _Broken:
+        def describe_execution(self, executionArn):
+            return {"status": "SUCCEEDED", "input": "{}", "startDate": "s", "stopDate": "e"}
+
+        def get_execution_history(self, **kw):
+            return {"events": []}
+
+        def describe_state_machine(self, stateMachineArn):
+            raise RuntimeError("AccessDenied: states:DescribeStateMachine")
+    monkeypatch.setattr(console, "sfn", _Broken())
+    out = console.pipeline_detail("run-x")
+    assert len(out["stages"]) == len(console.STAGE_FLOW), "the flow must still render"
+    assert "_error" in console.stage_config(), "and it must SAY the config is missing"
+
+
+def test_every_field_the_hover_card_renders_is_supplied_by_the_api(console, monkeypatch):
+    """stageTipRows() reads st.<field> and st.config.<field>. A field the API never
+    sends renders as a silently-absent row, so the card quietly loses the very fact
+    the operator hovered to find."""
+    console._STAGE_CFG_CACHE.clear()
+    monkeypatch.setattr(console, "sfn", _fake_sfn_history(_ESCALATED_HISTORY, "FAILED"))
+    out = console.pipeline_detail("run-asked")
+    gen = next(s for s in out["stages"] if s["key"] == "data-prep-generate")
+
+    front = (REPO / "deploy/console/frontend.html").read_text()
+    body = front[front.index("function stageTipRows"):front.index("function showStageTip")]
+    stage_fields = set(re.findall(r"\bst\.([A-Za-z_]\w*)", body)) - {"config"}
+    cfg_fields = set(re.findall(r"\bc\.([A-Za-z_]\w*)", body)) - {"_error"}
+    assert stage_fields, "regex found no st.<field> reads -- did the function move?"
+    missing = sorted(f for f in stage_fields if f not in gen)
+    assert not missing, f"the card renders st.{missing} but pipeline_detail never sends it"
+
+    # Union across stages, not one stage: heartbeatSeconds exists only on the two
+    # long-running SageMaker states, so requiring every field on data-prep would force
+    # a fake key onto stages that genuinely do not have one.
+    every_cfg = set()
+    for s in out["stages"]:
+        every_cfg |= set(s["config"])
+    missing = sorted(f for f in cfg_fields if f not in every_cfg)
+    assert not missing, f"the card renders config.{missing} but stage_config never sets it"
 
 
 def test_the_frontend_has_a_colour_for_every_status_the_api_can_return():
@@ -1121,12 +1265,22 @@ def test_the_frontend_has_a_colour_for_every_status_the_api_can_return():
     node into a grey-and-invisible one, which is worse: nobody chases grey.
     """
     src = (REPO / "deploy/console/lambda_function.py").read_text()
-    # Scope to pipeline_detail: the console assigns plenty of `status = "..."` for
-    # TASK records too, and those are the Tasks tab's business, not this flow's.
+    # Scope to pipeline_detail AND its nested _stop_status: the console assigns plenty
+    # of `status = "..."` for TASK records too, and those are the Tasks tab's business.
+    # Sliced to the next TOP-LEVEL def so the nested helper stays inside.
     fn = src[src.index("def pipeline_detail("):]
-    fn = fn[:fn.index("\ndef ")]
+    fn = fn[:fn.index("\ndef ", 1)]
+    # Any bare string literal the function can hand back as a stage status. Written
+    # against literals rather than one expression's syntax: the previous version
+    # matched the exact `"x" if escalated else "y"` ternary and broke the moment that
+    # per-run flag was replaced by a per-stage helper -- a guard that fails on a
+    # refactor of the thing it guards teaches people to delete guards.
     produced = set(re.findall(r'status = "([a-z-]+)"', fn))
-    produced |= set(re.findall(r'"([a-z-]+)" if escalated else "([a-z-]+)"', fn)[0])
+    produced |= set(re.findall(r'return "([a-z-]+)" if ', fn))
+    produced |= set(re.findall(r'else "([a-z-]+)"', fn))
+    assert {"failed", "escalated", "succeeded", "running"} <= produced, (
+        f"only found statuses {sorted(produced)} -- the extraction missed some, so this "
+        "test would pass with an uncoloured status live")
     front = (REPO / "deploy/console/frontend.html").read_text()
     body = front[front.index("function stageColor("):]
     body = body[:body.index("\n}")]

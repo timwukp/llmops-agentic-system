@@ -89,6 +89,14 @@
   .flow .pulse { animation:pipepulse 1.1s ease-in-out infinite; }
   @keyframes pipepulse { 0%,100%{ opacity:1; } 50%{ opacity:.25; } }
   .flow .looplbl { fill:#8592c0; font:600 11px system-ui,-apple-system,sans-serif; letter-spacing:.04em; }
+  /* hover affordance: without it the card appears with no hint the box was hoverable */
+  .flow .node:hover rect, .flow .node:focus rect { fill:#222d55; stroke-width:2.5; }
+  .flow .node:focus { outline:none; }
+  /* fixed, not absolute: the flow card scrolls horizontally on narrow screens and an
+     absolutely-positioned card would be clipped by its overflow container. */
+  #stageTip { position:fixed; z-index:60; display:none; max-width:400px; padding:10px 12px;
+    background:#141c38; border:1px solid #32406f; border-radius:8px; font-size:12px;
+    box-shadow:0 8px 28px rgba(0,0,0,.55); pointer-events:none; }
   #runDetail { margin-top:12px; background:var(--panel2); border:1px solid var(--line);
                border-radius:10px; padding:12px 14px; }
   .obsrow2 { display:grid; grid-template-columns:2fr 1fr; gap:10px; }
@@ -215,7 +223,11 @@
       <span id="pipeHead" class="sub">loading&hellip;</span>
     </div>
     <div id="pipeViz"></div>
+    <div class="sub" style="margin-top:8px">Hover (or tab to) any stage box for the live
+      configuration behind it &mdash; AgentCore runtime, harness id, timeout, retry and
+      error routing, read from the <b>deployed</b> state machine definition.</div>
   </div>
+  <div id="stageTip" role="tooltip"></div>
 
   <!-- Pipeline: recent runs + start run -->
   <div data-tab-panel="pipeline" class="card col-8"><h2>Recent runs &middot; click for detail</h2><div id="runsList"><span class="sub">loading&hellip;</span></div></div>
@@ -455,8 +467,61 @@ function stageColor(st){
   if (st==="skipped") return "#3a4577";
   return "#5a6491";  // pending
 }
+// Hover card for a stage node: what is actually behind this box. The operator's
+// question on seeing a red or amber node is "whose code is this, and how was it
+// configured" -- the answer used to require reading the ASL in another window.
+// Every value is server-supplied (config read from the DEPLOYED definition, runtime
+// facts from the execution history), so the card cannot claim a setting the live
+// pipeline does not have.
+function stageTipRows(st){
+  const c = st.config||{}, rows = [];
+  const add = (k,v)=>{ if(v!==undefined && v!==null && v!=="") rows.push([k,String(v)]); };
+  add("status", st.status);
+  add("AgentCore runtime", c.runtime);          // e.g. harness_llmops_data_prep
+  add("harness id", c.harnessId);
+  add("stage · task", c.stage && c.task ? c.stage+" · "+c.task : null);
+  add("SFN state", (c.states||[]).join(" | "));
+  add("driver λ", c.lambda);
+  // Seconds are what the ASL says; minutes are what a human reasons in. A 7200 that
+  // the operator has to divide is a number they will misread once and never trust.
+  if (c.timeoutSeconds) add("timeout", c.timeoutSeconds+"s ("+Math.round(c.timeoutSeconds/60)+" min)");
+  if (c.heartbeatSeconds) add("heartbeat", c.heartbeatSeconds+"s");
+  if (c.maxAttempts) add("retries", c.maxAttempts+" (service errors only)");
+  add("on error", (c.catch||[]).join(" -> "));
+  add("attempts this run", st.attempts>1 ? st.attempts+" (remediation loop)" : st.attempts);
+  add("entered", st.enteredAt);
+  add("exited", st.exitedAt);
+  add("error", st.error);
+  add("cause", st.cause);
+  if (c._error) add("config unavailable", c._error);
+  return rows;
+}
+function showStageTip(evt, key){
+  const st = (window._PIPE_STAGES||[]).find(s=>s.key===key);
+  if (!st) return;
+  const el = $("stageTip"); if (!el) return;
+  el.innerHTML = `<div style="font-weight:600;margin-bottom:6px">${esc(st.label)}</div>`+
+    stageTipRows(st).map(([k,v])=>
+      `<div style="display:flex;gap:8px;line-height:1.5"><span class="sub" style="min-width:112px">${esc(k)}</span>`+
+      `<span class="mono" style="word-break:break-all">${esc(v)}</span></div>`).join("");
+  el.style.display = "block";
+  moveStageTip(evt);
+}
+function moveStageTip(evt){
+  const el = $("stageTip"); if (!el || el.style.display!=="block") return;
+  // Flip before the right edge rather than after: a card that opens off-screen is a
+  // card the operator cannot read, and the widest values here are full ARNs.
+  const pad = 14, w = el.offsetWidth||320, h = el.offsetHeight||120;
+  let x = evt.clientX + pad, y = evt.clientY + pad;
+  if (x + w > window.innerWidth - 8) x = evt.clientX - w - pad;
+  if (y + h > window.innerHeight - 8) y = Math.max(8, evt.clientY - h - pad);
+  el.style.left = x+"px"; el.style.top = y+"px";
+}
+function hideStageTip(){ const el=$("stageTip"); if (el) el.style.display="none"; }
+
 function renderPipe(d){
   const stages = d.stages||[];
+  window._PIPE_STAGES = stages;   // the hover handlers read the same objects, not a copy
   const NW=128, GAP=18, Y=40, H=72, STEP=NW+GAP;
   const W = stages.length*STEP-GAP+20, VH=205;
   let svg = `<svg class="flow" viewBox="0 0 ${W} ${VH}" role="img" aria-label="LLMOps pipeline stage flow">`+
@@ -466,7 +531,11 @@ function renderPipe(d){
     const x = xs[i], c = stageColor(st.status), live = st.status==="running";
     if (i<stages.length-1)
       svg += `<path class="wire" d="M${x+NW},${Y+H/2} H${x+STEP-5}" marker-end="url(#pah)"/>`;
-    svg += `<g class="node">`+
+    // Hover target is the whole <g>, so the label text counts too -- a card that only
+    // opens on the 1px rect border is a card nobody discovers.
+    svg += `<g class="node" style="cursor:help" onmouseenter="showStageTip(event,${jstr(st.key)})"`+
+      ` onmousemove="moveStageTip(event)" onmouseleave="hideStageTip()"`+
+      ` tabindex="0" onfocus="showStageTip(event,${jstr(st.key)})" onblur="hideStageTip()">`+
       `<rect x="${x}" y="${Y}" width="${NW}" height="${H}" style="stroke:${c}"/>`+
       `<circle cx="${x+14}" cy="${Y+14}" r="5" fill="${c}"${live?' class="pulse"':''}/>`+
       `<text x="${x+NW/2}" y="${Y+34}" text-anchor="middle" style="font-size:11.5px">${esc(st.label)}</text>`+
