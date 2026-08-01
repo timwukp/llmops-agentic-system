@@ -106,6 +106,28 @@ prompt 明文禁止它刪東西的 agent。
   `attribute_not_exists(status) OR status = running` 條件，所以它永遠不可能覆蓋掉更豐富的
   判決；它的 `Catch` 也落到 `MarkTaskDone`，理由和 `MarkRunFailed` 的 `Catch` 一樣 ——
   關不掉其中一筆，不能連另一筆也一起開著。守護測試從 ASL 推導出「誰負責關閉」，而不是寫死名字。
+- **「關掉一個 run」和「鑄出一個 run」是同一個 DynamoDB 呼叫。** `update_item` 是 upsert：
+  對一個沒有列的 key，它會用 key 加上 `SET` 寫的東西**建立**一列。所以 driver 的
+  `handle_escalate` —— 它的意圖只是「把這個 run 標成 escalated」—— 為每一次「由不是 run 的東西」
+  發出的升級，實際上都新建了一個 run：一列只有兩個屬性的
+  `{run_id, status: escalated}`，沒有 `created_at`、沒有 `trigger_source`、沒有 `iteration`。
+  實例：**`sweep-2026-08-01`**，來自排程的孤兒端點 sweep。sweep Lambda 不是元凶，而且它根本無力
+  阻止：它把自己的記帳列寫進 stage-events 表，而且它的 docstring 明確寫出了為什麼一次 sweep
+  絕不能讀作一次 run（console 會把它列成 run、審計員會去對帳它的成本、每份文件引用的 run 總數
+  會每天多一）。是 driver 代它寫下的，透過一條 sweep 並不知道存在的路徑。這件事的第一版修法
+  列舉了當時已知的那**一個**非 run 呼叫者（`stage == "finops"`）—— 而這正是後來才加入、跑在自己
+  合成 `sweep-<date>` id 上的 sweep 會原地踩回同一個坑的原因；triage 的 `triage-<subject>`
+  是同一個形狀。所以這道守衛不是在「哪些 stage 不是 run」的清單上再加第三筆，而是一個
+  `ConditionExpression: attribute_exists(run_id)`：**只有 `start_pipeline` 會建立 run 列，
+  所以要問的問題是「這一列存在嗎」，而回答它的正是表自己。** 條件被拒絕就是答案，安靜返回；
+  其他任何錯誤仍然拋出 —— 因為在這裡吸收一次限流，會讓一個真的升級了的 run 留在 `running`，
+  也就是上一條所講的那種殭屍，被下一條的修法重新造了一次。而且這次才發現，那個寫列的動作一直在
+  代替一筆從來沒被寫下的紀錄：`handle_escalate` **完全不寫** stage event（`handle_page_human`
+  會寫），所以一次升級從來沒有出現在 console 依 `llmops-stage-events` 繪製的時間軸上 ——
+  對一個真的 run 來說，`runs.status` 就是唯一的持久痕跡。若只是拒絕寫列，對 sweep 而言就變成
+  「兩張表都沒有痕跡」，所以現在**兩條路徑**都會把升級記進 stage-events，並帶上 `run_row`
+  說明走的是哪一條。這筆寫入屬於記帳，且被包住：events 表寫失敗絕不能扣住 SNS 通知或
+  `EscalatedToHuman` 事件。
 - **deploy 之後必然執行 `Teardown`** —— 即使 `SmokeTest` 失敗，其 `Catch` 也先路由到
   `Teardown`。孤兒 endpoint 是第一大成本風險（Phase 4 就在帳號裡發現一個無關的
   endpoint 自 2024-04 起一直 InService）。

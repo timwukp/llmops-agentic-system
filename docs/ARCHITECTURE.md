@@ -120,6 +120,32 @@ Two spine details that are policy, not plumbing:
   `MarkTaskDone` for the same reason `MarkRunFailed`'s does — failing to close one record
   must not leave the other open. Guarded by property-based tests that derive the closers
   from the ASL rather than naming them.
+- **Closing a run and MINTING one are the same DynamoDB call.** `update_item` is an
+  upsert: on a key with no row it creates one from the key plus whatever `SET` writes. So
+  the driver's `handle_escalate`, whose only intent was "mark this run escalated", filed a
+  brand-new run for every escalation by something that is not a run — a two-attribute row
+  `{run_id, status: escalated}` with no `created_at`, no `trigger_source`, no `iteration`.
+  Live: **`sweep-2026-08-01`**, from a scheduled orphan-endpoint sweep. The sweep Lambda is
+  not the culprit and could not have prevented it: it writes its own bookkeeping row to the
+  stage-events table and its docstring spells out why a sweep must never read as a run
+  (the console would list it, the auditor would reconcile its cost, and the run count every
+  doc quotes would rise by one a day). The driver wrote one on its behalf, through a path
+  the sweep does not know exists. The first fix for this named the one non-run invoker known
+  at the time — `stage == "finops"` — which is precisely why the sweep, added later under
+  its own synthetic `sweep-<date>` id, walked back into it; triage's `triage-<subject>` is
+  the same shape. So the guard is not a third entry in a list of stages that are not runs
+  but a `ConditionExpression: attribute_exists(run_id)`: **only `start_pipeline` creates run
+  rows, so "a row exists" is the question, and the table itself answers it.** A rejected
+  condition is the answer and returns quietly; every other error still raises, because
+  absorbing a throttle here would leave a run that genuinely escalated at `running` — the
+  zombie of the bullet above, reintroduced by the fix for the bullet below it. And the row
+  write turned out to be standing in for a record that was never written: `handle_escalate`
+  emitted **no** stage event, unlike `handle_page_human`, so an escalation has never
+  appeared in the timeline the console renders from `llmops-stage-events` — for a real run,
+  `runs.status` was the only durable trace. Declining the row would have made that "no trace
+  anywhere" for a sweep, so the escalation is now recorded in stage-events on **both** paths,
+  carrying `run_row` to say which one ran. That write is bookkeeping and is wrapped: a
+  failing events table must never withhold the SNS page or the `EscalatedToHuman` event.
 - **`Teardown` always runs after deploy** — even when `SmokeTest` fails, its `Catch`
   routes to `Teardown` first. Orphaned endpoints are the #1 cost risk (Phase 4 found an
   unrelated endpoint in the account that had been InService since 2024-04).

@@ -94,6 +94,22 @@ def _cond_matches(cond, item) -> bool:
     raise AssertionError(f"fake table cannot evaluate operator {op!r}")
 
 
+def _conditional_check_failed():
+    """The real exception shape, not a bare Exception carrying the name as a message.
+
+    Code that discriminates a rejected condition from a throttle reads
+    ``exc.response["Error"]["Code"]`` -- botocore's ClientError contract -- because the
+    typed exception classes hang off a live client instance and are unavailable under an
+    injected double. A fake raising ``Exception("ConditionalCheckFailedException")`` has
+    no ``response``, so every such check would read the rejection as an unrelated error
+    and reraise, and the test would pass for the wrong reason.
+    """
+    from botocore.exceptions import ClientError
+    return ClientError({"Error": {"Code": "ConditionalCheckFailedException",
+                                  "Message": "The conditional request failed"}},
+                       "UpdateItem")
+
+
 class FakeTable:
     def __init__(self):
         self.items, self.updates = [], []
@@ -113,20 +129,43 @@ class FakeTable:
             if all(item.get(k) == v for k, v in (kw.get("Key") or {}).items()):
                 target = item
                 break
-        if target is None:
-            return {}
         vals = kw.get("ExpressionAttributeValues") or {}
         cond = kw.get("ConditionExpression")
-        if isinstance(cond, str) and "=" in cond:
+        # attribute_exists / attribute_not_exists BEFORE the upsert below, because that
+        # is the pair whose whole purpose is to gate row CREATION.
+        for guard, want_present in (("attribute_exists(", True),
+                                    ("attribute_not_exists(", False)):
+            if isinstance(cond, str) and guard in cond:
+                attr = cond.split(guard, 1)[1].split(")", 1)[0].strip()
+                present = target is not None and attr in target
+                if present != want_present:
+                    raise _conditional_check_failed()
+        if target is None:
+            # update_item is an UPSERT: on a key with no row DynamoDB CREATES one from
+            # the Key plus whatever SET writes. Returning early here instead -- as this
+            # fake did -- made a whole class of defect untestable: the driver's escalate
+            # path minted {run_id, status: escalated} rows for invocations that are not
+            # runs (live: sweep-2026-08-01 from a scheduled orphan sweep), and no test
+            # could see it because in the fake the write simply evaporated. A double
+            # that is more forgiving than production hides exactly the bugs production
+            # will have.
+            target = dict(kw.get("Key") or {})
+            self.items.append(target)
+        if isinstance(cond, str) and "=" in cond and "attribute_" not in cond:
             attr, _, placeholder = (p.strip() for p in cond.partition("="))
             if target.get(attr) != vals.get(placeholder):
-                raise Exception("ConditionalCheckFailedException")
+                raise _conditional_check_failed()
         expr = kw.get("UpdateExpression", "")
         if expr.upper().startswith("SET"):
+            # ExpressionAttributeNames must be resolved, or a `SET #s = :v` write lands
+            # under a literal "#s" key and the row reads back with no `status` at all.
+            # Latent for as long as nothing re-read a status this fake had written; the
+            # phantom-row work reads one back, which is what surfaced it.
+            names = kw.get("ExpressionAttributeNames") or {}
             for clause in expr[3:].split(","):
                 lhs, _, rhs = (p.strip() for p in clause.partition("="))
                 if rhs in vals:
-                    target[lhs] = vals[rhs]
+                    target[names.get(lhs, lhs)] = vals[rhs]
         return {}
 
     def query(self, **kw):
@@ -731,6 +770,173 @@ class TestDriver:
         assert out["status"] == "escalated"
         assert c["sns"].published and c["sfn"].failures
         assert c["sfn"].failures[0]["error"] == "EscalatedToHuman"
+
+    # ---- escalate must never MINT a run row (#62) ----------------------------
+    #
+    # update_item is an upsert, so "set status=escalated" on an id with no row CREATES
+    # one. Live: sweep-2026-08-01 in llmops-pipeline-runs, holding {run_id, status} and
+    # nothing else -- no created_at, no trigger_source, no iteration -- filed by a
+    # scheduled orphan-endpoint sweep whose own Lambda goes out of its way not to write
+    # there. Every id below reaches handle_escalate through a real dispatch path.
+
+    @staticmethod
+    def _escalate(c, event):
+        return driver.handle_escalate(c, event, {"reason": "budget exhausted"})
+
+    def test_an_escalation_updates_the_run_row_of_a_real_run(self):
+        """The behaviour being preserved. A pipeline stage that escalates must still
+        close its own run out at status=escalated -- that value is the driver's alone,
+        and MarkRunFailed's ConditionExpression deliberately keeps it rather than
+        overwriting it with the blunter 'failed'."""
+        c = clients()
+        table = c["ddb"].Table(ENV["RUNS_TABLE"])
+        table.put_item(Item={"run_id": "run-real-1", "status": "running",
+                             "created_at": "2026-08-02T00:00:00Z",
+                             "trigger_source": "console", "iteration": 0})
+        self._escalate(c, driver_event(run_id="run-real-1"))
+        row = table.get_item(Key={"run_id": "run-real-1"})["Item"]
+        assert row["status"] == "escalated"
+        # The richer attributes survive: this is an update, not a replacement.
+        assert row["trigger_source"] == "console" and row["created_at"]
+
+    @pytest.mark.parametrize("run_id,exists", [("run-real-1", True),
+                                               ("sweep-2026-08-01", False)])
+    def test_an_escalation_is_recorded_in_the_timeline_whichever_path_it_took(
+            self, run_id, exists):
+        """The trace the row write was silently standing in for.
+
+        handle_escalate wrote no stage event at all: for a real run, runs.status WAS the
+        record, so an escalation never appeared in the timeline the console renders from
+        llmops-stage-events -- unlike a page, which records its own. Making the row write
+        conditional would have turned that into no record anywhere for a non-run, so the
+        event is written on both paths and `run_row` reports which one ran."""
+        c = clients()
+        if exists:
+            c["ddb"].Table(ENV["RUNS_TABLE"]).put_item(
+                Item={"run_id": run_id, "status": "running"})
+        self._escalate(c, driver_event(run_id=run_id, stage="monitor", task_token=""))
+        rows = [i for i in c["ddb"].Table(ENV["EVENTS_TABLE"]).items
+                if i["run_id"] == run_id and i["sk"].endswith("#escalated")]
+        assert len(rows) == 1, f"{run_id} escalated leaving no durable trace"
+        detail = json.loads(rows[0]["detail"])
+        assert detail["reason"] == "budget exhausted"
+        assert detail["run_row"] is exists, (
+            "the event has to say whether a run row was closed too, or a reader cannot "
+            "tell an escalated run from an escalating non-run")
+
+    def test_a_failed_timeline_write_never_withholds_the_escalation(self):
+        """Bookkeeping must not be able to swallow the alert. The stage event is the
+        record; SNS and the bus event are how a human finds out. If the record fails,
+        the human must still be told -- an escalation nobody hears is the failure mode
+        this whole handler exists to prevent."""
+        c = clients()
+        events_table = c["ddb"].Table(ENV["EVENTS_TABLE"])
+
+        def boom(**kw):
+            raise RuntimeError("events table gone")
+        events_table.put_item = boom
+        out = self._escalate(c, driver_event(run_id="sweep-2026-08-01", stage="monitor",
+                                            task_token=""))
+        assert out == {"escalated": True}
+        assert c["sns"].published
+        assert any(e["DetailType"] == ev.ESCALATED_TO_HUMAN for e in c["events"].entries)
+
+    @pytest.mark.parametrize("run_id,stage,task", [
+        # The live offender: EventBridge Scheduler -> llmops-monitor-sweep -> driver.
+        ("sweep-2026-08-01", "monitor", "sweep"),
+        # Triage: the driver invokes itself under triage-<subject> off the bus rule. If
+        # a triage escalates in turn, the id names no run either.
+        ("triage-run-abc", "orchestrator", "triage"),
+    ])
+    def test_an_escalation_by_something_that_is_not_a_run_mints_no_run_row(
+            self, run_id, stage, task):
+        """The runs table is the authority on what a run is, and only start_pipeline
+        writes to it. So a synthetic id has no row, and the escalate path must leave the
+        table exactly as it found it -- empty."""
+        c = clients()
+        out = self._escalate(c, driver_event(run_id=run_id, stage=stage, task=task,
+                                            task_token=""))
+        assert out == {"escalated": True}
+        assert c["ddb"].Table(ENV["RUNS_TABLE"]).items == [], (
+            f"escalating {run_id} minted a phantom run row")
+        # The escalation itself is NOT suppressed: a sweep that cannot finish still has
+        # to reach a human. Only the run-row write is conditional.
+        assert c["sns"].published, "the escalation was swallowed along with the row"
+        assert any(e["DetailType"] == ev.ESCALATED_TO_HUMAN
+                   for e in c["events"].entries)
+
+    def test_the_row_write_is_gated_on_the_row_existing_not_on_a_stage_allowlist(self):
+        """Why a condition rather than another _is_finops-style list.
+
+        The first fix for this enumerated the one non-run invoker known at the time
+        (stage == 'finops'), which is why the sweep -- added later, under its own
+        sweep-<date> id -- walked straight back into it. An allowlist of stages that are
+        not runs is a hand-maintained second copy of a fact the runs table already
+        holds, and it is wrong the moment someone adds a caller. So assert the mechanism:
+        the write carries attribute_exists(run_id)."""
+        c = clients()
+        self._escalate(c, driver_event(run_id="sweep-2026-08-01", stage="monitor",
+                                       task="sweep", task_token=""))
+        updates = c["ddb"].Table(ENV["RUNS_TABLE"]).updates
+        assert updates, "no conditional write was even attempted"
+        assert "attribute_exists(run_id)" in updates[0]["ConditionExpression"]
+
+    def test_a_throttle_on_the_row_write_is_not_read_as_this_was_not_a_run(self):
+        """The discriminating half, and the reason the fake raises a real ClientError.
+
+        Absorbing every failure would be worse than the bug it fixes: a run that DID
+        escalate would silently keep status=running, becoming the zombie MarkRunDone and
+        MarkRunFailed exist to prevent. Only a rejected condition means 'not a run'."""
+        c = clients()
+        table = c["ddb"].Table(ENV["RUNS_TABLE"])
+
+        def throttled(**kw):
+            from botocore.exceptions import ClientError
+            raise ClientError({"Error": {"Code": "ProvisionedThroughputExceededException",
+                                         "Message": "slow down"}}, "UpdateItem")
+        table.update_item = throttled
+        with pytest.raises(Exception) as ei:
+            self._escalate(c, driver_event(run_id="run-real-2"))
+        assert "ProvisionedThroughput" in str(ei.value)
+
+    def test_the_condition_is_matched_by_error_code_not_by_message_text(self):
+        """_is_condition_failure reads exc.response['Error']['Code'], because the typed
+        exception classes hang off a live client instance and cannot be referenced from a
+        module that must import under an injected double. A bare
+        Exception('ConditionalCheckFailedException') is NOT the rejection: it has no
+        response, and treating its text as one would absorb any error whose message
+        happened to contain that word."""
+        from botocore.exceptions import ClientError
+        assert driver._is_condition_failure(ClientError(
+            {"Error": {"Code": "ConditionalCheckFailedException"}}, "UpdateItem")) is True
+        assert driver._is_condition_failure(ClientError(
+            {"Error": {"Code": "ThrottlingException"}}, "UpdateItem")) is False
+        assert driver._is_condition_failure(
+            Exception("ConditionalCheckFailedException")) is False
+
+    def test_the_fake_table_upserts_like_dynamodb_does(self):
+        """A guard on the test double itself, because the double is what hid this.
+
+        This fake used to return early when update_item named a key with no row, so the
+        phantom-row write simply evaporated in every test -- the defect was not merely
+        untested, it was untestable. A double more forgiving than production hides
+        exactly the bugs production will have."""
+        t = FakeTable()
+        t.update_item(Key={"run_id": "ghost"}, UpdateExpression="SET #s = :v",
+                      ExpressionAttributeNames={"#s": "status"},
+                      ExpressionAttributeValues={":v": "escalated"})
+        assert t.items == [{"run_id": "ghost", "status": "escalated"}], (
+            "the fake dropped an unconditional write to an absent key; real DynamoDB "
+            "creates the row")
+        # ...and attribute_exists gates that creation, which is the fix under test.
+        t2 = FakeTable()
+        with pytest.raises(Exception) as ei:
+            t2.update_item(Key={"run_id": "ghost"}, UpdateExpression="SET #s = :v",
+                           ConditionExpression="attribute_exists(run_id)",
+                           ExpressionAttributeNames={"#s": "status"},
+                           ExpressionAttributeValues={":v": "escalated"})
+        assert ei.value.response["Error"]["Code"] == "ConditionalCheckFailedException"
+        assert t2.items == []
 
     def test_a_checkpoint_delivers_any_human_directive_waiting_for_this_run(self):
         """A stage agent's only way to ask a blocking question mid-run is checkpoint,

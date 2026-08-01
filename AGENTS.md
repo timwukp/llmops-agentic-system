@@ -124,6 +124,22 @@ versions and introspects the live CreateHarness/UpdateHarness schemas.
   time (`live_bus_translator_gap`) and raises rather than warns. `BUS_DELIVERY_TRANSLATORS`
   in `pipeline/contracts/events.py` declares which function reads which detail-type; an
   `InputTransformer` on the rule's target is the accepted alternative.
+- **`update_item` is an UPSERT, so "update a row" and "create a row" are one call.** On a
+  key with no row DynamoDB creates one from the key plus whatever `SET` writes. The driver's
+  escalate path therefore *minted* a run for every escalation by something that is not a run
+  — live, `sweep-2026-08-01` sat in `llmops-pipeline-runs` as `{run_id, status: escalated}`
+  with none of the attributes a real run carries. Gate creation with
+  `ConditionExpression="attribute_exists(<pk>)"` rather than with a hand-maintained list of
+  callers-that-are-not-runs; the earlier list (`stage == "finops"`) is exactly why the sweep,
+  added later, reintroduced it. Absorb **only** `ConditionalCheckFailedException`, matched by
+  botocore error *code* — absorbing everything would leave a run that really escalated at
+  `running`. And note the co-defect: `FakeTable.update_item` in `tests/test_orchestration.py`
+  used to drop writes to an absent key, which made the whole class untestable. A double more
+  forgiving than production hides exactly the bugs production will have. One more thing the
+  row write was hiding: it was the *only* durable record an escalation left, because
+  `handle_escalate` wrote no stage event at all — so check what a conditional write was
+  standing in for before you make it conditional. The escalation is now recorded in
+  `llmops-stage-events` on both paths, wrapped, so a failed record cannot withhold the alert.
 - **Observability**: `OTEL_TRACES_SAMPLER=always_on` env var is mandatory or
   evaluations/insights sit at zero forever. X-Ray delivery takes no `outputFormat`.
 - **Turn budget**: harness `timeoutSeconds` is 840 here (driver Lambda caps at 900s).

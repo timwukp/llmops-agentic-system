@@ -534,6 +534,58 @@ def _is_finops(event) -> bool:
     return event.get("stage") == FINOPS_STAGE
 
 
+def _mark_run_escalated(ddb, run_id: str) -> bool:
+    """Set status=escalated on an EXISTING run row. True if a row was updated.
+
+    `attribute_exists(run_id)` is the whole point. DynamoDB's update_item is an UPSERT:
+    on a key with no row it CREATES one carrying the key plus whatever SET writes. So
+    this call was never "update the run's status" -- for any invocation with no run, it
+    was "mint a run", and the row it minted was the two-attribute shape
+    {run_id, status: escalated} with no created_at, trigger_source or iteration.
+
+    That is not hypothetical: `sweep-2026-08-01` sat in llmops-pipeline-runs from a
+    scheduled orphan-endpoint sweep that escalated. monitor_sweep/handler.py is careful
+    -- it writes its own bookkeeping row to EVENTS_TABLE and its docstring says why a
+    sweep must never appear as a run -- and then the driver wrote one on its behalf,
+    through a path the sweep does not know exists.
+
+    The condition, rather than another `_is_finops`-style stage allowlist: the previous
+    fix enumerated the one non-run invoker known at the time (finops), which left the
+    NEXT one -- the sweep, added later, under its own synthetic sweep-<date> id -- to
+    rediscover the same defect. Triage (triage-<subject>) and any future scheduled
+    dispatch are the same shape. The runs table already knows which ids name runs; a
+    list of stages that don't is a second copy of that fact, maintained by hand, that
+    is wrong the moment someone adds a caller. Only start_pipeline creates run rows,
+    which makes "a row exists" exactly the right question.
+
+    A rejected condition is NOT an error here: it is the answer. Anything else raises,
+    because a throttle or an outage must not read as "this was not a run".
+    """
+    try:
+        ddb.Table(os.environ["RUNS_TABLE"]).update_item(
+            Key={"run_id": run_id},
+            UpdateExpression="SET #s = :v",
+            ConditionExpression="attribute_exists(run_id)",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={":v": "escalated"})
+        return True
+    except Exception as exc:  # noqa: BLE001 — only the rejected condition is absorbed
+        if _is_condition_failure(exc):
+            return False
+        raise
+
+
+def _is_condition_failure(exc) -> bool:
+    """ConditionalCheckFailedException, matched by botocore error CODE.
+
+    Same reasoning as resume_pipeline's TASK_GONE_CODES: the exception classes hang off
+    a live client instance, so referencing table.meta.client.exceptions here would make
+    this module unimportable under an injected test double.
+    """
+    code = getattr(exc, "response", {}).get("Error", {}).get("Code", "")
+    return code == "ConditionalCheckFailedException"
+
+
 def handle_escalate(c, event, args) -> dict:
     run_id = event["run_id"]
     c["sns"].publish(TopicArn=os.environ["LLMOPS_SNS_TOPIC"],
@@ -542,12 +594,26 @@ def handle_escalate(c, event, args) -> dict:
     if _is_finops(event):
         # No runs-table row exists for an audit invocation; updating one would mint a
         # phantom run that the console would then display alongside real pipeline runs.
+        # Kept as an early return even though _mark_run_escalated would now decline the
+        # write anyway: the audit path also has no task token and no run to emit about,
+        # so it exits before the event and the settle below, not just before the write.
         return {"escalated": True}
-    c["ddb"].Table(os.environ["RUNS_TABLE"]).update_item(
-        Key={"run_id": run_id},
-        UpdateExpression="SET #s = :v",
-        ExpressionAttributeNames={"#s": "status"},
-        ExpressionAttributeValues={":v": "escalated"})
+    run_row = _mark_run_escalated(c["ddb"], run_id)
+    # Record the escalation in stage-events on BOTH paths. handle_escalate has never
+    # written one -- for a real run the runs.status write was the whole durable record,
+    # so an escalation has never appeared in the timeline the console renders from this
+    # table, unlike a page (handle_page_human records its own). Declining the row write
+    # for a non-run would have made that worse: a scheduled sweep's escalation would be
+    # left with nothing on record anywhere but an SNS email. Unconditional, so the trail
+    # does not depend on which path ran; `run_row` says which it was, and false is the
+    # signal that this id names no pipeline run. Bookkeeping only -- it must never be
+    # able to withhold the alert below.
+    try:
+        _record_stage_event(c["ddb"], run_id, event["stage"], "escalated",
+                            {"reason": args.get("reason", ""),
+                             "task": event.get("task", ""), "run_row": run_row})
+    except Exception as exc:  # noqa: BLE001 — never withhold an escalation for a log
+        print(f"[driver] could not record the escalation of {run_id}: {exc}")
     ev.emit_event(os.environ["EVENT_BUS"], ev.ESCALATED_TO_HUMAN,
                   {"run_id": run_id, "stage": event["stage"],
                    "reason": args.get("reason", "")}, client=c["events"])

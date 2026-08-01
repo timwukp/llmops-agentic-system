@@ -493,6 +493,120 @@ case("contracts: a ruled event has no declared translator", "pipeline/contracts/
      m39,
      ["tests/test_orchestration.py::test_the_translator_declaration_covers_every_event_that_needs_a_rule"])
 
+# ── #62: the escalate path must never MINT a run row ─────────────────────────────────
+#
+# 40. The exact regression: drop the ConditionExpression and update_item is an upsert
+#     again, minting {run_id, status} for every non-run escalation. This is the state the
+#     live sweep-2026-08-01 row was written from.
+def m40(t):
+    old = '            ConditionExpression="attribute_exists(run_id)",\n'
+    assert old in t, "the escalate row-write condition has moved; re-anchor this mutation"
+    return t.replace(old, "", 1)
+case("driver: escalate writes the run row unconditionally (upsert mints a phantom run)",
+     "orchestration/harness_driver/handler.py", m40,
+     ["tests/test_orchestration.py::TestDriver::test_an_escalation_by_something_that_is_not_a_run_mints_no_run_row",
+      "tests/test_orchestration.py::TestDriver::test_the_row_write_is_gated_on_the_row_existing_not_on_a_stage_allowlist"])
+
+# 41. Absorb EVERY failure, not just the rejected condition. Worse than the original bug:
+#     a run that really escalated keeps status=running and becomes the zombie MarkRunDone
+#     and MarkRunFailed both exist to prevent.
+def m41(t):
+    old = ("        if _is_condition_failure(exc):\n"
+           "            return False\n"
+           "        raise")
+    assert old in t, "the escalate error discrimination has moved; re-anchor this mutation"
+    return t.replace(old, "        return False", 1)
+case("driver: a throttle on the row write is read as 'this was not a run'",
+     "orchestration/harness_driver/handler.py", m41,
+     ["tests/test_orchestration.py::TestDriver::test_a_throttle_on_the_row_write_is_not_read_as_this_was_not_a_run"])
+
+# 42. Match the rejection by message text instead of by botocore error code. Passes on
+#     the real exception and ALSO on any unrelated error whose message contains the word
+#     -- the same over-broad absorption as 41, arriving by a route that looks careful.
+def m42(t):
+    old = '    code = getattr(exc, "response", {}).get("Error", {}).get("Code", "")\n    return code == "ConditionalCheckFailedException"'
+    assert old in t, "_is_condition_failure has moved; re-anchor this mutation"
+    return t.replace(old, '    return "ConditionalCheckFailedException" in str(exc)', 1)
+case("driver: the rejected condition is matched by message text, not error code",
+     "orchestration/harness_driver/handler.py", m42,
+     ["tests/test_orchestration.py::TestDriver::test_the_condition_is_matched_by_error_code_not_by_message_text"])
+
+# 43. Suppress the whole escalation for a non-run instead of just the row write. A sweep
+#     that cannot finish would then reach nobody -- fixing a phantom row by losing the
+#     alert, which is the more expensive half of the pair.
+def m43(t):
+    old = "    run_row = _mark_run_escalated(c[\"ddb\"], run_id)"
+    assert old in t, "the escalate row-write call site has moved; re-anchor this mutation"
+    return t.replace(old, "    run_row = _mark_run_escalated(c[\"ddb\"], run_id)\n"
+                          "    if not run_row:\n        return {\"escalated\": True}", 1)
+case("driver: a non-run escalation is swallowed along with its row",
+     "orchestration/harness_driver/handler.py", m43,
+     ["tests/test_orchestration.py::TestDriver::test_an_escalation_by_something_that_is_not_a_run_mints_no_run_row"])
+
+# 44. The real-run path stops closing out. The condition must gate CREATION only; a guard
+#     that also blocks the legitimate update would leave every escalated run at 'running'.
+def m44(t):
+    old = 'ConditionExpression="attribute_exists(run_id)",'
+    assert old in t, "the escalate row-write condition has moved; re-anchor this mutation"
+    return t.replace(old, 'ConditionExpression="attribute_not_exists(run_id)",', 1)
+case("driver: the condition is inverted, so a real run never reaches status=escalated",
+     "orchestration/harness_driver/handler.py", m44,
+     ["tests/test_orchestration.py::TestDriver::test_an_escalation_updates_the_run_row_of_a_real_run"])
+
+# 45. The test DOUBLE goes back to dropping writes to an absent key. This is the co-defect
+#     -- with this reverted the fix's own tests cannot fail, because the phantom write
+#     evaporates in the fake. A double more forgiving than production hides exactly the
+#     bugs production will have, so it needs a control of its own.
+def m45(t):
+    old = ("        if target is None:\n"
+           "            # update_item is an UPSERT")
+    assert old in t, "the fake's upsert branch has moved; re-anchor this mutation"
+    return t.replace(old, "        if target is None:\n            return {}\n"
+                          "        if False:\n            # update_item is an UPSERT", 1)
+case("test double: the fake drops update_item writes to an absent key",
+     "tests/test_orchestration.py", m45,
+     ["tests/test_orchestration.py::TestDriver::test_the_fake_table_upserts_like_dynamodb_does"])
+
+# 46. The fake stops resolving ExpressionAttributeNames, so `SET #s = :v` lands under a
+#     literal "#s" and every read-back of a status it wrote is empty. That was latent here
+#     until a test read one back.
+def m46(t):
+    old = "                    target[names.get(lhs, lhs)] = vals[rhs]"
+    assert old in t, "the fake's name resolution has moved; re-anchor this mutation"
+    return t.replace(old, "                    target[lhs] = vals[rhs]", 1)
+case("test double: ExpressionAttributeNames are not resolved on a SET",
+     "tests/test_orchestration.py", m46,
+     ["tests/test_orchestration.py::TestDriver::test_an_escalation_updates_the_run_row_of_a_real_run"])
+
+# 47. The escalation stops being recorded in the timeline -- the state handle_escalate was
+#     actually in before this fix, which the runs.status write was standing in for. With the
+#     row write now correctly declined for a non-run, this leaves a sweep's escalation with
+#     no durable trace in EITHER table.
+def m47(t):
+    old = ('    try:\n'
+           '        _record_stage_event(c["ddb"], run_id, event["stage"], "escalated",\n'
+           '                            {"reason": args.get("reason", ""),\n'
+           '                             "task": event.get("task", ""), "run_row": run_row})\n'
+           '    except Exception as exc:  # noqa: BLE001 — never withhold an escalation for a log\n'
+           '        print(f"[driver] could not record the escalation of {run_id}: {exc}")\n')
+    assert old in t, "the escalate stage-event write has moved; re-anchor this mutation"
+    return t.replace(old, "", 1)
+case("driver: an escalation leaves no stage event, so the timeline never shows it",
+     "orchestration/harness_driver/handler.py", m47,
+     ["tests/test_orchestration.py::TestDriver::test_an_escalation_is_recorded_in_the_timeline_whichever_path_it_took"])
+
+# 48. Bookkeeping is allowed to withhold the alert: the stage-event write is no longer
+#     wrapped, so a failing events table takes the SNS page and the bus event down with it.
+#     An escalation nobody hears is the failure this handler exists to prevent.
+def m48(t):
+    old = ('    except Exception as exc:  # noqa: BLE001 — never withhold an escalation for a log\n'
+           '        print(f"[driver] could not record the escalation of {run_id}: {exc}")')
+    assert old in t, "the escalate stage-event guard has moved; re-anchor this mutation"
+    return t.replace(old, '    except Exception:\n        raise', 1)
+case("driver: a failed timeline write takes the escalation alert down with it",
+     "orchestration/harness_driver/handler.py", m48,
+     ["tests/test_orchestration.py::TestDriver::test_a_failed_timeline_write_never_withholds_the_escalation"])
+
 
 failed = []
 for name, rel, mutate, tests in CASES:
