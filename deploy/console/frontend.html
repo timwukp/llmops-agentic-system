@@ -29,10 +29,11 @@
   .card { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:16px; }
   .card h2 { font-size:12px; text-transform:uppercase; letter-spacing:.06em;
              color:var(--muted); margin:0 0 12px; font-weight:600; }
-  .col-4 { grid-column:span 4; } .col-5 { grid-column:span 5; }
-  .col-6 { grid-column:span 6; } .col-7 { grid-column:span 7; }
-  .col-8 { grid-column:span 8; } .col-12 { grid-column:span 12; }
-  @media (max-width:900px){ .col-4,.col-5,.col-6,.col-7,.col-8 { grid-column:span 12; } }
+  .col-3 { grid-column:span 3; } .col-4 { grid-column:span 4; }
+  .col-5 { grid-column:span 5; } .col-6 { grid-column:span 6; }
+  .col-7 { grid-column:span 7; } .col-8 { grid-column:span 8; }
+  .col-9 { grid-column:span 9; } .col-12 { grid-column:span 12; }
+  @media (max-width:900px){ .col-3,.col-4,.col-5,.col-6,.col-7,.col-8,.col-9 { grid-column:span 12; } }
   .row { display:flex; align-items:center; justify-content:space-between; gap:10px;
          padding:8px 0; border-bottom:1px solid var(--line); }
   .row:last-child { border-bottom:0; }
@@ -48,7 +49,41 @@
   input,select,textarea { font:inherit; background:var(--bg); color:var(--text);
                    border:1px solid var(--line); border-radius:7px; padding:7px; width:100%; }
   label { display:block; color:var(--muted); font-size:12px; margin:8px 0 3px; }
-  .chat { max-height:420px; overflow-y:auto; display:flex; flex-direction:column; gap:8px; padding:4px; }
+  /* ── single-thread task view ──────────────────────────────────────────────
+     One conversation, one composer. The old layout had a task list with its own
+     textarea beside a chat with its own input, and nothing on screen said which
+     box created a thread and which continued one -- two typing targets read as a
+     bug. The rail selects; the thread is where everything happens. */
+  .threads { max-height:520px; overflow-y:auto; }
+  .threads .th { padding:8px 10px; border-radius:8px; cursor:pointer; margin-bottom:4px;
+                 border:1px solid transparent; }
+  .threads .th:hover { background:var(--panel2); }
+  .threads .th.sel { background:var(--panel2); border-color:var(--accent); }
+  .threads .th .thgoal { font-size:12.5px; font-weight:600; overflow:hidden;
+                         text-overflow:ellipsis; white-space:nowrap; }
+  /* The status strip replaces a full-width lifecycle card. The SVG logic is reused
+     verbatim -- only the box it renders into got shorter, so a reader sees the
+     conversation first and the machinery second. */
+  .stagestrip { display:flex; align-items:center; gap:6px; flex-wrap:wrap; font-size:11px;
+                color:var(--muted); padding:2px 0 8px; border-bottom:1px solid var(--line);
+                margin-bottom:10px; }
+  .stagestrip .sg { display:flex; align-items:center; gap:4px; padding:2px 8px;
+                    border-radius:20px; border:1px solid var(--line); background:var(--panel2); }
+  .stagestrip .sg.done { color:var(--green); border-color:rgba(62,207,142,.4); }
+  .stagestrip .sg.act { color:var(--accent); border-color:var(--accent); }
+  .stagestrip .sgsep { color:var(--line); }
+  /* Chips: the first turn is one click. Without them an empty composer asks the
+     customer to invent the shape of a request they have never made before. */
+  .chips { display:flex; gap:6px; flex-wrap:wrap; margin-bottom:8px; }
+  .chips button { font-size:12px; padding:5px 11px; border-radius:20px; text-align:left; }
+  /* An artifact is a message that is not prose: the plan, the readiness table, the
+     approval record. It sits IN the thread, where the turn that produced it is. */
+  .chat .m-artifact { align-self:stretch; max-width:100%; background:var(--panel2);
+                      border:1px solid var(--accent); }
+  .chat .m-artifact .arth { font-size:11px; text-transform:uppercase; letter-spacing:.05em;
+                            color:var(--muted); font-weight:600; margin-bottom:6px; }
+  .chat .m-artifact pre { max-height:260px; overflow:auto; }
+  .chat { max-height:460px; overflow-y:auto; display:flex; flex-direction:column; gap:8px; padding:4px; }
   .chat .msg { max-width:82%; padding:8px 12px; border-radius:12px; font-size:13px;
                line-height:1.5; white-space:pre-wrap; word-break:break-word; }
   .chat .m-user { align-self:flex-end; background:var(--panel2); border:1px solid var(--accent); }
@@ -58,6 +93,40 @@
   .chat .m-pending { opacity:.55; }
   .chat .who { font-size:10px; color:var(--muted); margin-bottom:2px; }
   .plankv td:first-child { color:var(--muted); width:180px; }
+  /* In-thread prompt, replacing window.prompt()/alert(). A browser prompt cannot be
+     styled, cannot be cancelled without losing what was typed, and blocks the poll
+     that keeps the thread live; an alert dumping 1800 chars of signed JSON was the
+     least product-like thing on the tab. */
+  .inlineask { border:1px solid var(--accent); border-radius:10px; padding:10px;
+               background:var(--panel2); margin-top:8px; }
+  .inlineask .askq { font-size:12px; color:var(--muted); margin-bottom:6px; }
+  /* Upload. Before this existed the console's IAM could write only tasks/* and this
+     page had no file input at all, so the orchestrator opened every consultation by
+     asking "where is your data (an S3 URI under customer-data/)" -- a question the
+     product could not help answer. The bytes go browser -> S3 against a presigned
+     PUT; only the signature comes from the Lambda. */
+  .dropzone { border:1.5px dashed var(--line); border-radius:10px; padding:12px 14px;
+              text-align:center; font-size:12.5px; color:var(--muted); cursor:pointer;
+              margin-top:10px; }
+  .dropzone:hover, .dropzone.over { border-color:var(--accent); background:var(--panel2);
+                                    color:var(--text); }
+  /* A real dataset is large and a browser fetch() reports no upload progress, so the
+     PUT goes through XMLHttpRequest to drive this bar. Without it a multi-GB upload
+     is indistinguishable from a hang, and the customer retries on top of it. */
+  .dropzone .bar { height:6px; border-radius:3px; background:var(--panel2); margin-top:8px;
+                   overflow:hidden; border:1px solid var(--line); }
+  .dropzone .bar i { display:block; height:100%; background:var(--accent); width:0;
+                     transition:width .15s linear; }
+  /* Readiness. Every unanswered field is SHOWN as unanswered: a blank row reads as
+     "fine", and the entire purpose of the panel is which questions nobody answered. */
+  .readiness { border:1px solid var(--line); border-radius:10px; background:var(--panel2);
+               padding:8px 10px; margin-bottom:10px; font-size:12px; }
+  .readiness .rdhead { display:flex; align-items:center; gap:8px; cursor:pointer; }
+  .readiness table { width:100%; border-collapse:collapse; margin-top:8px; }
+  .readiness td { padding:4px 6px; border-top:1px solid var(--line); vertical-align:top; }
+  .readiness td.rdlabel { color:var(--muted); width:190px; }
+  .readiness .rdno { color:var(--amber); }
+  .readiness .rdwhy { color:var(--muted); font-size:11px; display:block; margin-top:2px; }
   .flex { display:flex; gap:8px; align-items:center; }
   .stat { font-size:26px; font-weight:700; } .stat small { font-size:12px; color:var(--muted); font-weight:400; }
   nav.tabs { display:flex; gap:6px; padding:10px 24px 0; background:var(--panel);
@@ -136,37 +205,42 @@
   <div data-tab-panel="all" class="card col-4"><h2>Executions</h2>
     <div class="stat" id="kpiExec">&ndash;</div><small id="kpiExecSub">Step Functions llmops-pipeline</small></div>
 
-  <!-- Tasks: goal-driven entry — consult the orchestrator, sign the plan -->
-  <div data-tab-panel="tasks" class="card col-12"><h2>Task lifecycle &middot; live</h2>
-    <div id="taskFlow"><span class="sub">select or create a task</span></div>
+  <!-- Tasks: goal-driven entry — consult the orchestrator, sign the plan.
+       One thread, like a Claude Code session: the rail picks a conversation, the
+       conversation holds everything about it (status, plan, uploads, approvals),
+       and a single composer either starts a new consultation or continues the
+       selected one. -->
+  <div data-tab-panel="tasks" class="card col-3"><h2>Consultations</h2>
+    <button class="primary" style="width:100%;margin-bottom:10px" onclick="newThread()">+ New consultation</button>
+    <div id="taskList" class="threads"><span class="sub">loading&hellip;</span></div>
   </div>
 
-  <div data-tab-panel="tasks" class="card col-4"><h2>Tasks</h2>
-    <div id="taskList"><span class="sub">loading&hellip;</span></div>
-    <label style="margin-top:12px">New task &middot; describe your goal</label>
-    <textarea id="taskGoal" rows="3" placeholder="e.g. I want a small private model that answers questions about our product manuals. Budget around $100."></textarea>
-    <div class="flex" style="margin-top:8px"><button class="primary" onclick="createTask()">Start consultation</button></div>
-    <div id="taskCreateMsg" class="sub" style="margin-top:6px"></div>
-  </div>
-
-  <div data-tab-panel="tasks" class="card col-8"><h2>Consultation &middot; llmops_orchestrator</h2>
-    <div id="taskChat" class="chat"><span class="sub">no task selected — the orchestrator is a pre-sales solution architect: it will ask about your data first, then propose a priced plan you can sign.</span></div>
-    <div class="flex" style="margin-top:10px">
-      <input id="taskMsg" placeholder="reply to the orchestrator&hellip;" style="flex:1" onkeydown="if(event.key==='Enter')sendTaskMsg()"/>
-      <button class="primary" id="taskSendBtn" onclick="sendTaskMsg()">Send</button>
+  <div data-tab-panel="tasks" class="card col-9"><h2 id="taskThreadTitle">Consultation &middot; llmops_orchestrator</h2>
+    <div id="taskStrip" class="stagestrip"><span class="sub">new consultation &mdash; describe your goal below</span></div>
+    <div id="taskReadiness"></div>
+    <div id="taskChat" class="chat"></div>
+    <div id="taskChoices" class="chips" style="margin-top:10px"></div>
+    <div id="taskChips" class="chips" style="margin-top:10px"></div>
+    <div id="taskAsk"></div>
+    <!-- Upload: the bytes go browser -> S3 against a presigned PUT, so a multi-GB
+         dataset never passes through API Gateway (6 MB cap) or this Lambda. Hidden
+         until a consultation exists, because the key is customer-data/<task_id>/... -
+         there is no prefix to write into before then. -->
+    <div id="taskDrop" class="dropzone" style="display:none"
+         ondragover="dropOver(event,true)" ondragleave="dropOver(event,false)"
+         ondrop="dropFiles(event)" onclick="$('taskFile').click()">
+      <input type="file" id="taskFile" style="display:none" onchange="pickFiles(event)"/>
+      <div id="taskDropMsg">&#128193; Drop your dataset here, or click to choose a file</div>
+      <div class="sub" style="margin-top:3px">jsonl &middot; json &middot; csv &middot; tsv &middot; txt &middot; parquet &middot; zip &middot; gz &mdash; up to 5 GiB. It uploads straight into this consultation's own S3 prefix, and the URI is posted into the conversation so the orchestrator can audit it.</div>
+      <div id="taskUpBar" class="bar" style="display:none"><i id="taskUpFill"></i></div>
+    </div>
+    <div class="flex" style="margin-top:8px;align-items:flex-end">
+      <textarea id="taskMsg" rows="2" style="flex:1"
+        onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();composerSend();}"></textarea>
+      <button class="primary" id="taskSendBtn" onclick="composerSend()">Send</button>
     </div>
     <div id="taskChatMsg" class="sub" style="margin-top:6px"></div>
-  </div>
-
-  <div data-tab-panel="tasks" class="card col-12" id="taskPlanCard" style="display:none"><h2>Proposed plan &middot; requires your signature</h2>
-    <div id="taskPlanBody"></div>
-    <div class="flex" style="margin-top:12px;flex-wrap:wrap">
-      <button class="primary" onclick="acceptTask()">&#9997;&#65039; Accept &amp; sign</button>
-      <button onclick="taskFeedback()">Send feedback</button>
-      <button onclick="closeTask()">Close task</button>
-      <a id="taskApprovalLink" style="display:none" href="#" onclick="return viewApproval()"><button>View approval record</button></a>
-    </div>
-    <div id="taskPlanMsg" class="sub" style="margin-top:6px"></div>
+    <div id="taskActions" class="flex" style="margin-top:10px;flex-wrap:wrap"></div>
   </div>
 
   <!-- Architecture: what this system is and how it is wired -->
@@ -1242,29 +1316,13 @@ function taskStageStates(t){
   return {done, active: activeSet, status: s};
 }
 
-function renderTaskFlow(t){
-  const el = $("taskFlow");
-  if (!t){ el.innerHTML = '<span class="sub">select or create a task</span>'; return; }
-  const st = taskStageStates(t);
-  const NW = 132, GAP = 26, Y = 26, H = 62, STEP = NW + GAP;
-  const W = TASK_STAGES.length * STEP - GAP + 20, VH = 132;
-  let svg = `<svg class="flow" viewBox="0 0 ${W} ${VH}" role="img" aria-label="task lifecycle">`+
-    `<defs><marker id="tah" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L8,4 L0,8 Z" class="arrow"/></marker></defs>`;
-  TASK_STAGES.forEach((sd,i)=>{
-    const x = 10 + i*STEP;
-    const isDone = st.done.includes(sd.key), isActive = st.active.has(sd.key);
-    const c = isActive ? "#5b8cff" : isDone ? "#3ecf8e" : "#26305a";
-    if (i < TASK_STAGES.length-1)
-      svg += `<path class="wire" d="M${x+NW},${Y+H/2} H${x+STEP-5}" marker-end="url(#tah)"/>`;
-    svg += `<g class="node${isActive?" pulse":""}">`+
-      `<rect x="${x}" y="${Y}" width="${NW}" height="${H}" style="stroke:${c}" rx="10"/>`+
-      `<text x="${x+NW/2}" y="${Y+26}" text-anchor="middle" style="font-size:13px">${sd.icon} ${esc(sd.label)}</text>`+
-      `<text x="${x+NW/2}" y="${Y+44}" text-anchor="middle" class="tsub" style="font-size:10px;fill:var(--muted)">${isActive?esc(st.status):isDone?"done":""}</text></g>`;
-  });
-  svg += `</svg>`;
-  let note = "";
+// The note is the part of the lifecycle display that carries information the stage
+// icons cannot: which run, why it failed, who is holding the approval. Kept as its
+// own function because it is the same prose whether it sits under a diagram or a
+// strip -- collapsing the diagram must not quietly drop the reason a task ended.
+function taskFlowNote(t, st){
   if (st.status === "pending_approval")
-    note = `<div class="sub" style="margin-top:6px;color:var(--amber)">over the spend limit — waiting for an approver on the <a href="#" onclick="showTab('cost');return false" style="color:var(--accent)">Cost tab</a></div>`;
+    return `<div class="sub" style="color:var(--amber)">over the spend limit — waiting for an approver on the <a href="#" onclick="showTab('cost');return false" style="color:var(--accent)">Cost tab</a></div>`;
   // The run link belongs on every status that HAS a run, not just dispatched:
   // after the state machine closes the task, the run is the only place the reason
   // lives, so that is exactly when a reader needs the link most.
@@ -1274,11 +1332,31 @@ function renderTaskFlow(t){
     const tail = st.status === "dispatched" ? " — follow it on Pipeline / Cost"
                : ` at ${esc(t.closed_at || "an unrecorded time")} — see Pipeline / Cost`;
     const col = st.status === "failed" ? "var(--red)" : "var(--muted)";
-    note = `<div class="sub" style="margin-top:6px;color:${col}">run <a href="#" onclick="showTab('pipeline');loadRun('${esc(t.run_id)}');return false" style="color:var(--accent)" class="mono">${esc(t.run_id)}</a> ${verb}${tail}</div>`;
+    return `<div class="sub" style="color:${col}">run <a href="#" onclick="showTab('pipeline');loadRun('${esc(t.run_id)}');return false" style="color:var(--accent)" class="mono">${esc(t.run_id)}</a> ${verb}${tail}</div>`;
   }
   if (st.status === "error")
-    note = `<div class="sub" style="margin-top:6px;color:var(--red)">error: ${esc(t.error_msg||"")}</div>`;
-  el.innerHTML = svg + note;
+    return `<div class="sub" style="color:var(--red)">error: ${esc(t.error_msg||"")}</div>`;
+  return "";
+}
+
+// The 7-node SVG was 1100px wide in a full-width card ABOVE the conversation, so the
+// machinery outranked the conversation on screen and, in col-9, would not fit at all.
+// Same stages, same taskStageStates() mapping, same note -- rendered as one line.
+function renderTaskFlow(t){
+  const el = $("taskStrip");
+  if (!t){
+    el.innerHTML = '<span class="sub">new consultation &mdash; describe your goal below</span>';
+    return;
+  }
+  const st = taskStageStates(t);
+  const pills = TASK_STAGES.map(sd=>{
+    const isDone = st.done.includes(sd.key), isActive = st.active.has(sd.key);
+    const cls = isActive ? "sg act" : isDone ? "sg done" : "sg";
+    return `<span class="${cls}" title="${esc(sd.label)}">${sd.icon} ${esc(sd.label)}`+
+      `${isActive?" &middot; "+esc(st.status):isDone?" &check;":""}</span>`;
+  }).join('<span class="sgsep">&rsaquo;</span>');
+  const note = taskFlowNote(t, st);
+  el.innerHTML = pills + (note ? `<div style="flex-basis:100%;margin-top:6px">${note}</div>` : "");
 }
 
 // minimal safe renderer: escape EVERYTHING first, then whitelist a few transforms
@@ -1289,34 +1367,319 @@ function mdLite(s){
   return h;
 }
 
-function renderChat(t){
-  const el = $("taskChat");
-  const msgs = (t && t.messages) || [];
-  if (!msgs.length){ el.innerHTML = '<span class="sub">no messages yet</span>'; return; }
-  el.innerHTML = msgs.map(m=>{
-    const role = m.role==="user"?"m-user":m.role==="assistant"?"m-assistant":"m-system";
-    const who = m.role==="assistant"?"orchestrator":(m.by||m.role);
-    return `<div class="msg ${role}"><div class="who">${esc(who)} · ${esc(String(m.at||"").slice(0,19))}</div>${mdLite(String(m.text||""))}</div>`;
-  }).join("") + (String(t.status)==="thinking"||String(t.status)==="accepting"
-    ? '<div class="msg m-system">orchestrator is thinking&hellip;</div>' : "");
-  el.scrollTop = el.scrollHeight;
-}
+// The plan is an ARTIFACT of the conversation, not a separate screen. It used to
+// live in a full-width card below the thread, which put its "$" figure a scroll
+// away from the turn that justified it; here it is a bubble at the point the
+// orchestrator produced it, with its own signing button attached.
+const PLAN_STATUSES = ["plan_proposed","pending_approval","accepting","dispatched"];
 
-function renderPlanCard(t){
-  const card = $("taskPlanCard"), body = $("taskPlanBody");
-  const show = t && ["plan_proposed","pending_approval","accepting","dispatched"].includes(String(t.status));
-  card.style.display = show ? "" : "none";
-  if (!show) return;
+// The artifact carries no status line of its own: it is re-rendered from the task on
+// every poll, so anything written into it would be wiped a second later. Outcomes go
+// to #taskChatMsg and #taskAsk, which live outside the re-rendered region -- which is
+// also why the in-thread ask widget is not inside .chat.
+function planArtifactHtml(t){
+  if (!t || !PLAN_STATUSES.includes(String(t.status))) return "";
   const gateNote = t.status==="plan_proposed"
-    ? '<div class="sub">signing means: you approve this exact plan (its hash is signed with the project KMS key). Under $2,000 it dispatches immediately; over, it goes to the Cost approval queue.</div>' : "";
-  body.innerHTML =
-    `<div style="font-size:14px;margin-bottom:8px">${mdLite(String(t.plan_summary||""))}</div>`+
+    ? '<div class="sub" style="margin-top:8px">signing means: you approve this exact plan (its hash is signed with the project KMS key). Under $2,000 it dispatches immediately; over, it goes to the Cost approval queue.</div>' : "";
+  const signBtn = t.status==="plan_proposed"
+    ? '<div class="flex" style="margin-top:10px"><button class="primary" onclick="acceptTask()">&#9997;&#65039; Accept &amp; sign</button></div>' : "";
+  return `<div class="msg m-artifact"><div class="arth">Proposed plan &middot; requires your signature</div>`+
+    `<div style="font-size:13.5px;margin-bottom:8px">${mdLite(String(t.plan_summary||""))}</div>`+
     `<table class="plankv"><tr><td>Estimated cost</td><td><b>${usd(t.cost_estimate_usd)}</b></td></tr>`+
     `<tr><td>plan.json</td><td class="mono">${esc(t.plan_uri||"")}</td></tr>`+
     `<tr><td>Status</td><td><span class="pill ${badge(t.status)}">${esc(t.status)}</span></td></tr>`+
     (t.run_id?`<tr><td>Run</td><td class="mono">${esc(t.run_id)}</td></tr>`:"")+
-    `</table>` + gateNote;
-  $("taskApprovalLink").style.display = (t.approvals && t.approvals.length) ? "" : "none";
+    `</table>${gateNote}${signBtn}</div>`;
+    // No status line of its own: the artifact is re-rendered from the task on every
+    // poll, so anything written into it would be wiped a second later. Outcomes go to
+    // #taskChatMsg, which lives outside the re-rendered region.
+}
+
+// ── agent choices as buttons (consult protocol step 3b) ───────────────────────
+// The priced MENU the orchestrator offers ("Starter audit / Set menu / A la carte")
+// was plain prose the customer had to retype, word for word, to pick one. Step 3b
+// lets a turn append a SECOND fenced json block, {"choices":[{"label","value"}]},
+// and this renders it as buttons whose value is sent verbatim.
+//
+// Degrades silently, deliberately: a turn without the block renders exactly as
+// before, so an agent that ignores step 3b is not a broken tab. Every failure mode
+// here -- no fence, unparseable json, wrong shape, a label that is not a string --
+// ends as "no buttons", never as an error in the customer's face.
+function parseChoices(text){
+  const out = [];
+  const parts = String(text||"").split("```");
+  // odd indices are fenced bodies; 0,2,4… are the prose between fences
+  for (let i=1; i<parts.length; i+=2){
+    const b = parts[i].replace(/^[A-Za-z0-9]*\s*\n/, "");   // drop a "json" info string
+    let obj = null;
+    try { obj = JSON.parse(b.slice(b.indexOf("{"), b.lastIndexOf("}")+1)); } catch(_){ continue; }
+    if (!obj || !Array.isArray(obj.choices)) continue;      // the plan trailer lands here
+    obj.choices.forEach(c=>{
+      if (!c || typeof c.label !== "string" || typeof c.value !== "string") return;
+      if (!c.label.trim() || !c.value.trim()) return;
+      out.push({label: c.label.slice(0,90), value: c.value.slice(0,2000)});
+    });
+  }
+  return out;
+}
+
+// The block is an accelerator, not prose, so it is stripped from what the chat
+// shows: leaving the raw json in the bubble means the customer reads the same menu
+// twice, once as unusable JSON.
+function stripChoiceFences(text){
+  const parts = String(text||"").split("```");
+  let out = parts[0];
+  for (let i=1; i<parts.length; i+=2){
+    // A truncated turn ends mid-fence. Appending the "```" that closes it would put
+    // characters in the transcript the agent never wrote, so an unterminated tail is
+    // passed through exactly as received.
+    if (i === parts.length-1) { out += "```" + parts[i]; break; }
+    const keep = parseChoices("```"+parts[i]+"```").length === 0;
+    if (keep) out += "```" + parts[i] + "```";
+    out += parts[i+1];
+  }
+  return out;
+}
+
+let CHOICES = [];
+// Only the LAST assistant turn's choices are offered. A menu from three turns ago
+// answers a question that has already been answered, and clicking it would send the
+// consultation backwards.
+function renderChoices(t){
+  const el = $("taskChoices");
+  CHOICES = [];
+  if (!t) { el.innerHTML = ""; return; }
+  const msgs = (t.messages||[]).filter(m=>m.role==="assistant");
+  if (!msgs.length) { el.innerHTML = ""; return; }
+  CHOICES = parseChoices(String(msgs[msgs.length-1].text||""));
+  if (!CHOICES.length) { el.innerHTML = ""; return; }
+  el.innerHTML = '<span class="sub" style="width:100%">pick one, or just reply in your own words:</span>'
+    + CHOICES.map((c,i)=>`<button class="primary" onclick="useChoice(${i})">${esc(c.label)}</button>`).join("");
+}
+// Sends immediately: the whole point is saving the retype. The value goes through
+// sendTaskMsg, so it appears in the thread as a message the customer sent -- a
+// silent side-channel reply would leave the transcript lying about who said what.
+function useChoice(i){
+  const c = CHOICES[i];
+  if (!c) return;
+  $("taskChoices").innerHTML = "";
+  return sendTaskMsg(c.value);
+}
+
+// ── data readiness panel ──────────────────────────────────────────────────────
+// Answered from plan.json via /readiness, not from the chat, because the plan is the
+// artifact the customer signs. Collapsed by default so it does not push the
+// conversation down, and the open/closed state survives the 3s poll.
+let READY_OPEN = false, READY_KEY = null, READY_DATA = null;
+function readinessToggle(){ READY_OPEN = !READY_OPEN; renderReadiness(TASK_CACHE); }
+
+async function loadReadiness(t){
+  // Re-fetch only when something that could change the answers changed. The thread
+  // polls every 3s while a turn is in flight; re-reading plan.json from S3 on every
+  // one of those would be a GET per 3 seconds per open browser tab for a file that
+  // changes once per proposal.
+  const key = t ? [t.id, t.plan_uri||"", t.status||""].join("|") : null;
+  if (!t) { READY_KEY = null; $("taskReadiness").innerHTML = ""; return; }
+  if (key === READY_KEY) return;
+  READY_KEY = key;
+  try {
+    const d = await fetch(API+"/api/tasks/"+encodeURIComponent(t.id)+"/readiness").then(r=>r.json());
+    READY_DATA = d && !d.error ? d : null;
+  } catch(_){ READY_DATA = null; }
+  renderReadiness(t);
+}
+
+function renderReadiness(t){
+  const el = $("taskReadiness");
+  if (!t || !READY_DATA) { el.innerHTML = ""; return; }
+  const d = READY_DATA;
+  const fields = d.fields || [];
+  const missing = fields.length - (d.answered||0);
+  const cls = missing ? "warn" : "ok";
+  const rows = READY_OPEN ? `<table>` + fields.map(f=>
+      `<tr><td class="rdlabel">${esc(f.label)}</td><td>`+
+      (f.answered
+        ? `<span class="mono">${esc(String(f.value).slice(0,200))}</span>`
+        // "— not answered yet" spelled out, with WHY it matters. A blank cell reads
+        // as "fine", and the customer signs a plan whose data questions are open.
+        : `<span class="rdno">&mdash; not answered yet</span><span class="rdwhy">${esc(f.why)}</span>`)+
+      `</td></tr>`).join("") + `</table>`
+    + (d.note ? `<div class="sub" style="margin-top:6px">${esc(d.note)}</div>` : "")
+    + (d.plan_uri ? `<div class="sub mono" style="margin-top:4px">${esc(d.plan_uri)}</div>` : "")
+    : "";
+  el.innerHTML = `<div class="readiness"><div class="rdhead" onclick="readinessToggle()">`+
+    `<span>${READY_OPEN?"&#9662;":"&#9656;"}</span><b>Data readiness</b>`+
+    `<span class="pill ${cls}">${d.answered||0}/${fields.length} answered</span>`+
+    (missing ? `<span class="sub">${missing} question${missing===1?"":"s"} still open</span>` : "")+
+    `</div>${rows}</div>`;
+}
+
+// ── dataset upload: browser -> S3, presigned ──────────────────────────────────
+// The statuses the server refuses an upload URL for (data_upload_url returns 409 on
+// TASK_TERMINAL + TASK_SETTLED). Kept identical here so the tab never offers a drop
+// zone whose first click is guaranteed to fail.
+const UPLOAD_CLOSED = ["dispatched","closed","error","completed","failed"];
+let UPLOADING = false;
+
+// The announcement the orchestrator has not been told yet, as {task_id, text}.
+//
+// Found by a live run, and it silently LOST an upload. The server allows an upload URL
+// during a turn (rightly -- a 5 GiB PUT should not wait on a 60s agent turn) but
+// post_task_message 409s while one is in flight ("a turn is already in flight"). So a
+// file dropped while the orchestrator was still answering went to S3, the auto-post was
+// refused, and uploadDataset then overwrote the error with "uploaded <key>" -- the
+// customer read success, the agent never heard about the data, and the next question was
+// still "where is your data?". Bytes on disk that no one knows about are worse than a
+// failed upload, which at least gets retried.
+//
+// So the announcement is queued instead of dropped, and delivered by loadTaskDetail the
+// moment the task stops being busy. It is one slot, not a list: the same file announced
+// twice is noise, and only the newest upload matters.
+let PENDING_POST = null;
+
+function renderDrop(t){
+  const el = $("taskDrop");
+  // No task means no customer-data/<task_id>/ prefix to write into, so there is
+  // nowhere for the file to go: describe the goal first, then upload.
+  const show = !!t && !UPLOAD_CLOSED.includes(String(t.status||""));
+  el.style.display = show ? "" : "none";
+}
+
+function dropOver(ev, on){
+  ev.preventDefault();
+  $("taskDrop").classList.toggle("over", !!on);
+}
+function dropFiles(ev){
+  ev.preventDefault();
+  $("taskDrop").classList.remove("over");
+  const f = ev.dataTransfer && ev.dataTransfer.files && ev.dataTransfer.files[0];
+  if (f) uploadDataset(f);
+}
+function pickFiles(ev){
+  const f = ev.target.files && ev.target.files[0];
+  // Cleared so choosing the SAME file twice fires change again (a retry after a
+  // failed upload is the common case, and it would otherwise appear to do nothing).
+  ev.target.value = "";
+  if (f) uploadDataset(f);
+}
+
+function upProgress(pct, label){
+  $("taskUpBar").style.display = pct == null ? "none" : "";
+  if (pct != null) $("taskUpFill").style.width = Math.max(0, Math.min(100, pct)) + "%";
+  $("taskDropMsg").innerHTML = label
+    ? esc(label)
+    : "&#128193; Drop your dataset here, or click to choose a file";
+}
+
+// XMLHttpRequest, not fetch: fetch cannot report upload progress, and a 5 GiB PUT
+// with no progress is indistinguishable from a hang -- the customer retries on top
+// of the upload already running.
+function putWithProgress(url, file, headers){
+  return new Promise((resolve)=>{
+    const xhr = new XMLHttpRequest();
+    xhr.open("PUT", url, true);
+    Object.keys(headers).forEach(k=>xhr.setRequestHeader(k, headers[k]));
+    xhr.upload.onprogress = (e)=>{
+      if (e.lengthComputable) upProgress(e.loaded/e.total*100,
+        "uploading " + file.name + " — " + Math.round(e.loaded/e.total*100) + "%");
+    };
+    xhr.onload = ()=>resolve(xhr.status>=200 && xhr.status<300
+      ? {ok:true}
+      // S3 answers a rejected PUT with an XML <Message>; surfacing it beats "failed".
+      : {ok:false, msg:"S3 refused the upload (HTTP "+xhr.status+")"+
+          (xhr.responseText ? ": "+String(xhr.responseText).replace(/<[^>]+>/g," ").trim().slice(0,160) : "")});
+    // A CORS preflight failure arrives here as a zero-information error event, so the
+    // message has to name the cause the browser will not: it is the bucket's CORS
+    // rule or the page's CSP connect-src, not the signature.
+    xhr.onerror = ()=>resolve({ok:false, msg:"the browser could not reach S3 — the bucket's CORS rule or this page's connect-src is blocking it, not the signature"});
+    xhr.onabort = ()=>resolve({ok:false, msg:"upload cancelled"});
+    xhr.send(file);
+  });
+}
+
+function humanBytes(n){
+  const u = ["B","KiB","MiB","GiB"];
+  let i = 0, v = Number(n)||0;
+  while (v >= 1024 && i < u.length-1) { v /= 1024; i++; }
+  return (i ? v.toFixed(1) : String(v)) + " " + u[i];
+}
+
+async function uploadDataset(file){
+  if (!TASK_SEL) { $("taskChatMsg").textContent = "describe your goal first — the upload lands in this consultation's own prefix"; return; }
+  // One at a time: two concurrent uploads share one progress bar and one status line,
+  // so the second would silently overwrite the first's reporting.
+  if (UPLOADING) { $("taskChatMsg").textContent = "an upload is already running"; return; }
+  UPLOADING = true;
+  $("taskChatMsg").textContent = "";
+  upProgress(0, "requesting an upload URL for " + file.name + "…");
+  try {
+    const r = await postApi("/api/data-upload-url",
+      {task_id: TASK_SEL, filename: file.name, content_length: file.size});
+    if (!r.ok) { upProgress(null, null); $("taskChatMsg").textContent = r.msg; return; }
+    const d = r.data;
+    // These two headers are signed INTO the URL (ContentType + ServerSideEncryption),
+    // so they must be sent with exactly the values the server signed. Sending the
+    // browser's own guess at content-type instead is a SignatureDoesNotMatch.
+    const put = await putWithProgress(d.url, file,
+      {"content-type": d.content_type, "x-amz-server-side-encryption": "AES256"});
+    if (!put.ok) { upProgress(null, null); $("taskChatMsg").textContent = put.msg; return; }
+    upProgress(null, null);
+    // The auto-post is what makes the upload VISIBLE to the agent instead of a silent
+    // side-effect in a bucket. Row count is deliberately not claimed here: counting
+    // lines would mean reading the whole file in the browser, and the data-prep audit
+    // reads it anyway -- a guessed count in the transcript is worse than no count.
+    const note = "data uploaded: " + d.uri + " (" + humanBytes(file.size) + ", "
+      + d.content_type + "). Please audit it and tell me what is still missing.";
+    const sent = await sendTaskMsg(note);
+    // Never report plain success on a refused announcement: the file is in the bucket but
+    // the agent does not know, so say which of the two happened.
+    if (sent.ok) { $("taskChatMsg").textContent = "uploaded " + d.key; }
+    else {
+      PENDING_POST = {task_id: TASK_SEL, text: note};
+      $("taskChatMsg").textContent = "uploaded " + d.key
+        + " — telling the orchestrator as soon as it finishes the current reply";
+    }
+  } catch(e){
+    upProgress(null, null);
+    $("taskChatMsg").textContent = "upload error: " + (e && e.message ? e.message : String(e));
+  } finally { UPLOADING = false; }
+}
+
+function renderChat(t){
+  const el = $("taskChat");
+  if (!t){
+    el.innerHTML = '<span class="sub">The orchestrator is a pre-sales solution architect: it asks about your data first, then proposes a priced plan you can sign. Describe a goal below to start.</span>';
+    return;
+  }
+  const msgs = t.messages || [];
+  const body = msgs.map(m=>{
+    const role = m.role==="user"?"m-user":m.role==="assistant"?"m-assistant":"m-system";
+    const who = m.role==="assistant"?"orchestrator":(m.by||m.role);
+    const text = m.role==="assistant" ? stripChoiceFences(String(m.text||"")) : String(m.text||"");
+    return `<div class="msg ${role}"><div class="who">${esc(who)} · ${esc(String(m.at||"").slice(0,19))}</div>${mdLite(text)}</div>`;
+  }).join("");
+  el.innerHTML = (body || '<span class="sub">no messages yet</span>')
+    + planArtifactHtml(t)
+    + (String(t.status)==="thinking"||String(t.status)==="accepting"
+       ? '<div class="msg m-system">orchestrator is thinking&hellip;</div>' : "");
+  el.scrollTop = el.scrollHeight;
+}
+
+// Actions that act on the whole thread rather than on the plan bubble. Rendered from
+// the task so a closed thread does not offer "Close task", and the approval record
+// button appears only once there is a record to show.
+function renderTaskActions(t){
+  const el = $("taskActions");
+  if (!t){ el.innerHTML = ""; return; }
+  const s = String(t.status||"");
+  const terminal = ["closed","completed","failed","error"].includes(s);
+  let html = "";
+  if (PLAN_STATUSES.includes(s) && s === "plan_proposed")
+    html += `<button onclick="taskFeedback()">Send feedback on the plan</button>`;
+  if (!terminal) html += `<button onclick="closeTask()">Close consultation</button>`;
+  if (t.approvals && t.approvals.length)
+    html += `<button onclick="viewApproval()">View approval record</button>`;
+  el.innerHTML = html;
 }
 
 async function loadTasks(){
@@ -1324,11 +1687,12 @@ async function loadTasks(){
     const d = await fetch(API+"/api/tasks").then(r=>r.json());
     const items = d.tasks||[];
     $("taskList").innerHTML = items.length ? items.map(t=>
-      `<div class="row" style="cursor:pointer" onclick="selectTask('${esc(t.id)}')">`+
-      `<div style="min-width:0"><div style="font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(t.goal||t.id)}</div>`+
-      `<div class="sub">${esc(t.created_by||"")} · ${esc(String(t.updated_at||"").slice(0,16))}</div></div>`+
-      `<span class="pill ${badge(t.status)}">${esc(t.status)}</span></div>`).join("")
-      : '<span class="sub">no tasks yet — describe a goal below</span>';
+      `<div class="th${t.id===TASK_SEL?" sel":""}" onclick="selectTask('${esc(t.id)}')">`+
+      `<div class="thgoal">${esc(t.goal||t.id)}</div>`+
+      `<div class="sub" style="display:flex;justify-content:space-between;gap:6px;margin-top:3px">`+
+      `<span style="overflow:hidden;text-overflow:ellipsis">${esc(String(t.updated_at||"").slice(0,16))}</span>`+
+      `<span class="pill ${badge(t.status)}">${esc(t.status)}</span></div></div>`).join("")
+      : '<span class="sub">no consultations yet — describe a goal in the composer</span>';
     if (TASK_SEL) await loadTaskDetail();
   } catch(e){ $("taskList").innerHTML = `<span class="sub">error: ${esc(e)}</span>`; }
 }
@@ -1339,82 +1703,233 @@ async function loadTaskDetail(){
     const t = await fetch(API+"/api/tasks/"+encodeURIComponent(TASK_SEL)).then(r=>r.json());
     if (t.error) { $("taskChatMsg").textContent = t.error; return; }
     TASK_CACHE = t;
-    renderTaskFlow(t); renderChat(t); renderPlanCard(t);
+    renderThread(t);
     const busy = ["thinking","accepting"].includes(String(t.status));
     $("taskSendBtn").disabled = busy;
     tasksPoll(true, busy ? 3000 : 15000);
+    flushPendingPost(t);   // an upload announced during a turn is delivered here
   } catch(e){ $("taskChatMsg").textContent = "error: "+e; }
 }
 
-function selectTask(id){ TASK_SEL = id; TASK_CACHE = null; loadTaskDetail(); }
+// One render for the whole thread. The old code called three renderers from two
+// places and it was possible for the strip and the plan to disagree about which
+// task they were showing; now the panel has exactly one entry point.
+function renderThread(t){
+  renderTaskFlow(t); renderChat(t); renderTaskActions(t); renderChips(t);
+  renderChoices(t); renderDrop(t); renderReadiness(t);
+  // Fire-and-forget: the readiness fetch must not delay the thread paint, and it
+  // no-ops unless the plan or the status actually moved.
+  loadReadiness(t);
+  $("taskThreadTitle").textContent = t
+    ? "Consultation · " + String(t.goal || t.id).slice(0, 70)
+    : "New consultation · llmops_orchestrator";
+  $("taskMsg").placeholder = t
+    ? "reply to the orchestrator… (Enter to send, Shift+Enter for a newline)"
+    : "describe your goal — e.g. a small private model that answers questions about our product manuals, budget around $100";
+}
+
+function selectTask(id){
+  TASK_SEL = id; TASK_CACHE = null;
+  // The readiness answers belong to the task that was open, not to this one: keeping
+  // them would show the previous consultation's data questions under a new title.
+  READY_DATA = null; READY_KEY = null;
+  $("taskChatMsg").textContent = ""; $("taskAsk").innerHTML = "";
+  loadTasks();          // repaint the rail so the selected thread is highlighted
+  loadTaskDetail();
+}
+
+// Deselect rather than create: a new consultation exists once its goal is typed,
+// so this clears the panel and lets the one composer do the creating.
+function newThread(){
+  TASK_SEL = null; TASK_CACHE = null;
+  READY_DATA = null; READY_KEY = null;
+  $("taskChatMsg").textContent = ""; $("taskAsk").innerHTML = "";
+  renderThread(null);
+  loadTasks();
+  $("taskMsg").focus();
+}
 
 function tasksPoll(on, ms){
   if (taskTimer) { clearInterval(taskTimer); taskTimer = null; }
   if (on) taskTimer = setInterval(loadTasks, ms||15000);
 }
 
-async function createTask(){
-  const goal = $("taskGoal").value.trim();
-  if (!goal) { $("taskCreateMsg").textContent = "describe your goal first"; return; }
-  const r = await postApi("/api/tasks", {goal});
-  $("taskCreateMsg").textContent = r.ok ? "consultation started" : r.msg;
-  if (r.ok && r.data.task) { $("taskGoal").value=""; TASK_SEL = r.data.task.id; loadTasks(); }
+// Starter prompts. The first turn of a consultation is the hardest one to write --
+// an empty box asks the customer to guess what kind of ask this system takes. Shown
+// only on a new thread; inside a conversation the orchestrator is already asking.
+const TASK_CHIPS = [
+  "I want a small private model that answers questions about our product manuals. Budget around $100.",
+  "Audit my dataset before I commit any budget — tell me if it is good enough to train on.",
+  "We have support tickets in S3 and want a cheaper model to draft replies. What would that cost?",
+];
+function renderChips(t){
+  const el = $("taskChips");
+  if (t) { el.innerHTML = ""; return; }
+  el.innerHTML = '<span class="sub" style="width:100%">start from one of these, or write your own:</span>'
+    + TASK_CHIPS.map((c,i)=>`<button onclick="useChip(${i})">${esc(c.length>72?c.slice(0,70)+"…":c)}</button>`).join("");
+}
+function useChip(i){
+  const c = TASK_CHIPS[i];
+  if (!c) return;
+  $("taskMsg").value = c;
+  $("taskMsg").focus();
 }
 
-async function sendTaskMsg(){
-  if (!TASK_SEL) { $("taskChatMsg").textContent = "select a task first"; return; }
+// The single composer, and the whole point of the merge: with no thread selected it
+// CREATES, with one selected it CONTINUES. Two boxes could not express that -- one
+// of them was always the wrong place to type.
+async function composerSend(){
   const text = $("taskMsg").value.trim();
-  if (!text) return;
+  if (!text) { $("taskChatMsg").textContent = TASK_SEL ? "" : "describe your goal first"; return; }
+  if (!TASK_SEL) return createTask(text);
+  // Cleared HERE, not inside sendTaskMsg: a choice button and the upload auto-post
+  // also call sendTaskMsg, and clearing there would silently delete a half-written
+  // reply the customer had in the box.
+  $("taskMsg").value = "";
+  return sendTaskMsg(text);
+}
+
+async function createTask(goal){
+  const r = await postApi("/api/tasks", {goal});
+  $("taskChatMsg").textContent = r.ok ? "consultation started" : r.msg;
+  if (r.ok && r.data.task) {
+    $("taskMsg").value = "";
+    TASK_SEL = r.data.task.id;
+    loadTasks();
+  }
+}
+
+// Returns {ok, msg}. The result is load-bearing for the upload auto-post, which has to
+// queue its announcement when the send is refused rather than assume it landed.
+async function sendTaskMsg(text){
+  if (!TASK_SEL) { const m = "select a consultation first";
+    $("taskChatMsg").textContent = m; return {ok:false, msg:m}; }
   // optimistic append; the poll reconciles
   const el = $("taskChat");
   el.insertAdjacentHTML("beforeend",
     `<div class="msg m-user m-pending"><div class="who">you</div>${mdLite(text)}</div>`);
   el.scrollTop = el.scrollHeight;
-  $("taskMsg").value = "";
+  // The composer is NOT cleared here -- composerSend clears its own box before
+  // calling. A choice button and the upload auto-post also send through this
+  // function, and neither of them should erase text the customer is still writing.
   const r = await postApi("/api/tasks/"+encodeURIComponent(TASK_SEL)+"/message", {text});
   $("taskChatMsg").textContent = r.ok ? "" : r.msg;
   if (r.ok) { tasksPoll(true, 3000); }
+  return {ok: !!r.ok, msg: r.msg || ""};
+}
+
+// Deliver a queued upload announcement once the orchestrator's turn has ended. Called
+// from loadTaskDetail, which already knows whether the task is busy.
+async function flushPendingPost(t){
+  const p = PENDING_POST;
+  // Task-scoped, and matched against the RECORD's id rather than only TASK_SEL: a note
+  // about task A's dataset must never be posted into task B because the customer
+  // switched threads while the turn was running. Not cleared by selectTask/newThread --
+  // the note belongs to its task, so switching away and back still delivers it.
+  if (!p || !t || p.task_id !== String(t.id||"")) return;
+  if (["thinking","accepting"].includes(String(t.status))) return;
+  // Cleared BEFORE the await: the 3s poll can re-enter this while the post is in
+  // flight, and the same announcement twice is the "already in flight" error again.
+  PENDING_POST = null;
+  // Posted to p.task_id explicitly, not through sendTaskMsg's TASK_SEL: the target is
+  // the task the file was uploaded to, whatever the rail is showing now.
+  const r = await postApi("/api/tasks/"+encodeURIComponent(p.task_id)+"/message",
+                          {text: p.text});
+  // Put it back on a refusal so a lost race retries rather than dropping the note.
+  if (!r.ok) { PENDING_POST = p; return; }
+  $("taskChatMsg").textContent = "the orchestrator has been told about your upload";
+  tasksPoll(true, 3000);
+}
+
+// ── in-thread asks, replacing window.prompt()/alert()/confirm() ───────────────
+// A native prompt() is unstyleable, throws away what was typed if the user
+// mis-clicks, and blocks the interval that keeps the thread live -- so the page
+// freezes mid-consultation. This renders the question into the thread instead, and
+// keeps the typed text on screen while the request is in flight.
+let ASK_CB = null;
+function askInThread(question, placeholder, label, cb){
+  ASK_CB = cb;
+  $("taskAsk").innerHTML =
+    `<div class="inlineask"><div class="askq">${esc(question)}</div>`+
+    `<textarea id="askInput" rows="2" placeholder="${esc(placeholder||"")}"></textarea>`+
+    `<div class="flex" style="margin-top:8px"><button class="primary" onclick="askSubmit()">${esc(label||"Send")}</button>`+
+    `<button onclick="askCancel()">Cancel</button>`+
+    `<span id="askMsg" class="sub"></span></div></div>`;
+  $("askInput").focus();
+}
+function askCancel(){ ASK_CB = null; $("taskAsk").innerHTML = ""; }
+async function askSubmit(){
+  const v = ($("askInput") ? $("askInput").value : "").trim();
+  if (!v) { $("askMsg").textContent = "required"; return; }
+  const cb = ASK_CB;
+  if (!cb) return;
+  $("askMsg").textContent = "sending…";
+  const msg = await cb(v);
+  // Only tear the widget down on success: on failure the text stays on screen, which
+  // is the behaviour prompt() could never give.
+  if (msg === true) { ASK_CB = null; $("taskAsk").innerHTML = ""; }
+  else $("askMsg").textContent = String(msg || "failed");
 }
 
 async function acceptTask(){
   if (!TASK_SEL || !TASK_CACHE) return;
   const c = TASK_CACHE;
-  if (!confirm("Sign and accept this plan?\n\nCost estimate: "+usd(c.cost_estimate_usd)
-      +"\nPlan: "+String(c.plan_summary||"").slice(0,300)
-      +"\n\nYour acceptance is recorded with a KMS digital signature.")) return;
-  const r = await postApi("/api/tasks/"+encodeURIComponent(TASK_SEL)+"/accept", {});
-  $("taskPlanMsg").textContent = r.ok
-    ? (r.data.status==="pending_approval"
-       ? "submitted for budget approval — see the Cost tab queue"
-       : "signed — dispatching through the pipeline")
-    : r.msg;
-  if (r.ok) tasksPoll(true, 3000);
+  askInThread(
+    "Sign and accept this plan? Estimated cost " + usd(c.cost_estimate_usd)
+      + ". Your acceptance is recorded with a KMS digital signature — type ACCEPT to confirm.",
+    "ACCEPT", "✍️ Sign", async (v)=>{
+      if (v.trim().toUpperCase() !== "ACCEPT") return "type ACCEPT to confirm";
+      const r = await postApi("/api/tasks/"+encodeURIComponent(TASK_SEL)+"/accept", {});
+      if (!r.ok) return r.msg;
+      $("taskChatMsg").textContent = r.data.status==="pending_approval"
+        ? "submitted for budget approval — see the Cost tab queue"
+        : "signed — dispatching through the pipeline";
+      tasksPoll(true, 3000);
+      return true;
+    });
 }
 
 async function taskFeedback(){
-  const fb = prompt("What should the orchestrator change about this plan?");
-  if (!fb || !fb.trim()) return;
-  const r = await postApi("/api/tasks/"+encodeURIComponent(TASK_SEL)+"/message", {text: fb.trim()});
-  $("taskPlanMsg").textContent = r.ok ? "feedback sent — the plan will be revised" : r.msg;
-  if (r.ok) tasksPoll(true, 3000);
+  if (!TASK_SEL) return;
+  askInThread("What should the orchestrator change about this plan?",
+    "e.g. drop the held-out set to 10% and re-price", "Send feedback", async (v)=>{
+      const r = await postApi("/api/tasks/"+encodeURIComponent(TASK_SEL)+"/message", {text: v});
+      if (!r.ok) return r.msg;
+      $("taskChatMsg").textContent = "feedback sent — the plan will be revised";
+      tasksPoll(true, 3000);
+      return true;
+    });
 }
 
 async function closeTask(){
-  const reason = prompt("Reason for closing this task (required):");
-  if (!reason || !reason.trim()) return;
-  const r = await postApi("/api/tasks/"+encodeURIComponent(TASK_SEL)+"/close", {reason: reason.trim()});
-  $("taskPlanMsg").textContent = r.ok ? "task closed" : r.msg;
-  if (r.ok) loadTasks();
+  if (!TASK_SEL) return;
+  askInThread("Reason for closing this consultation (required — it is recorded on the task):",
+    "e.g. the customer went with an off-the-shelf model", "Close consultation", async (v)=>{
+      const r = await postApi("/api/tasks/"+encodeURIComponent(TASK_SEL)+"/close", {reason: v});
+      if (!r.ok) return r.msg;
+      $("taskChatMsg").textContent = "consultation closed";
+      loadTasks();
+      return true;
+    });
 }
 
+// The approval record is evidence, so it belongs in the thread where it can be read,
+// scrolled and copied. alert() truncated it at 1800 chars and could not be copied
+// out of on most browsers -- for a KMS signature that is the one thing you need.
 async function viewApproval(){
   if (!TASK_SEL) return false;
+  const el = $("taskAsk");
   try {
     const d = await fetch(API+"/api/tasks/"+encodeURIComponent(TASK_SEL)+"/approval").then(r=>r.json());
-    alert("Approval records ("+(d.approvals||[]).length+")\n\nKey: "+(d.key_arn||d.key||"")
-      +"\n\n"+JSON.stringify(d.approvals||[], null, 1).slice(0, 1800)
-      +"\n\nVerify: "+(d.verify||""));
-  } catch(e){ alert("error: "+e); }
+    el.innerHTML = `<div class="inlineask"><div class="askq">Approval records (${(d.approvals||[]).length})`+
+      ` &middot; key <span class="mono">${esc(d.key_arn||d.key||"")}</span></div>`+
+      `<pre style="max-height:260px;overflow:auto">${esc(JSON.stringify(d.approvals||[], null, 1))}</pre>`+
+      (d.verify?`<div class="sub" style="margin-top:6px">verify: <span class="mono">${esc(d.verify)}</span></div>`:"")+
+      `<div class="flex" style="margin-top:8px"><button onclick="askCancel()">Close</button></div></div>`;
+  } catch(e){
+    el.innerHTML = `<div class="inlineask"><div class="askq">could not load the approval record: ${esc(String(e))}</div>`+
+      `<div class="flex"><button onclick="askCancel()">Close</button></div></div>`;
+  }
   return false;
 }
 

@@ -2284,3 +2284,962 @@ def test_the_in_memory_token_comment_still_describes_the_truth(auth):
     front = (REPO / "deploy/console/frontend.html").read_text()
     assert "A reload costs one sign-in" not in front
     assert "httpOnly refresh cookie" in front
+
+
+# ── the single thread: one composer, one conversation ─────────────────────────
+# The tab used to be four cards: a lifecycle diagram, a task list WITH ITS OWN
+# textarea, a chat with its own input, and a plan card. Nothing on screen said the
+# left box created a thread and the right box continued one, so two typing targets
+# read as a bug. These guard the merge -- structurally, because "it looks right" is
+# not something a test can see.
+
+def _front():
+    return (REPO / "deploy/console/frontend.html").read_text()
+
+
+def _strip_comments(src):
+    """Drop // lines and /* */ blocks.
+
+    Every structural assertion below runs on this, because a guard that greps raw
+    source is satisfiable by a COMMENT that mentions the thing -- that exact failure
+    already happened once on this file (see
+    test_the_page_restores_its_session_on_load), and the comments here deliberately
+    name the very functions and ids the tests look for.
+    """
+    out, in_block = [], False
+    for ln in src.splitlines():
+        s = ln.strip()
+        if in_block:
+            if "*/" in s:
+                in_block = False
+            continue
+        if s.startswith("/*"):
+            in_block = "*/" not in s
+            continue
+        if s.startswith("//"):
+            continue
+        out.append(ln)
+    return "\n".join(out)
+
+
+def _js_fn_src(code, name):
+    """Brace-match one named function out of already-comment-stripped frontend source.
+
+    Separate from _js_fn (which reads the raw file and returns several bodies for node to
+    execute): these are structural assertions about ONE function, and they must not be
+    satisfiable by a neighbouring function that happens to contain the same statement.
+    """
+    i = code.index("function " + name + "(")
+    depth, k = 0, code.index("{", i)
+    while True:
+        if code[k] == "{":
+            depth += 1
+        elif code[k] == "}":
+            depth -= 1
+            if depth == 0:
+                return code[i:k + 1]
+        k += 1
+
+
+def test_the_tasks_tab_has_exactly_one_text_input_for_the_conversation():
+    """The whole defect in one assertion. Two composers meant one of them was always
+    the wrong place to type, and the customer could not tell which.
+
+    Every <textarea>/<input> in the panel is collected, then the hidden file picker is
+    subtracted BY NAME: a `type="file"` input is not a place to type -- it is opened by
+    clicking the drop zone and has no caret -- but it is also the only exception this
+    test will ever grant. A second textarea, or a text input, still fails, which is the
+    failure that matters: that is the shape the defect came back as.
+    """
+    code = _strip_comments(_front())
+    panel = code[code.index('data-tab-panel="tasks"'):code.index('data-tab-panel="architecture"')]
+    fields = re.findall(r'<(textarea|input)([^>]*)id="([A-Za-z0-9_]+)"', panel)
+    typing = [i for tag, attrs, i in fields
+              if not (tag == "input" and 'type="file"' in attrs)]
+    assert typing == ["taskMsg"], f"expected one composer, found {typing}"
+    # And the exception is real: taskFile must actually BE a file input, so relabelling a
+    # second composer `type="file"` to get past the line above does not work either.
+    pickers = [i for tag, attrs, i in fields
+               if tag == "input" and 'type="file"' in attrs]
+    assert pickers == ["taskFile"], pickers
+
+
+def test_the_tasks_tab_is_a_rail_plus_a_conversation():
+    """A col-3 rail and a col-9 thread. Four cards down to two is what makes the
+    conversation, not the machinery, the thing on screen."""
+    code = _strip_comments(_front())
+    cols = re.findall(r'data-tab-panel="tasks" class="card (col-\d+)"', code)
+    assert cols == ["col-3", "col-9"], cols
+    # the grid must actually define the spans, or both cards silently render full-width
+    assert ".col-3 { grid-column:span 3; }" in code
+    assert ".col-9 { grid-column:span 9; }" in code
+
+
+def test_the_narrow_breakpoint_stacks_the_new_columns():
+    """col-3/col-9 added to the grid but not to the media query is a rail squeezed to
+    a quarter of a phone screen -- unreadable, and invisible on a desktop review."""
+    code = _strip_comments(_front())
+    mq = code[code.index("@media (max-width:900px)"):]
+    mq = mq[:mq.index("}")]
+    for c in (".col-3", ".col-9"):
+        assert c in mq, f"{c} must stack at the narrow breakpoint: {mq}"
+
+
+def test_the_one_composer_creates_when_no_thread_is_selected_and_replies_otherwise():
+    """One box, two behaviours -- and the branch must be on TASK_SEL, because that is
+    the only thing that distinguishes "new consultation" from "reply"."""
+    code = _strip_comments(_front())
+    body = code[code.index("async function composerSend()"):]
+    body = body[:body.index("\n}")]
+    assert "!TASK_SEL" in body and "createTask(" in body and "sendTaskMsg(" in body, body
+    # createTask must take the goal as an argument: reading it back out of the DOM is
+    # how the second textarea would grow back.
+    assert "async function createTask(goal)" in code
+    assert "async function sendTaskMsg(text)" in code
+
+
+def test_the_composer_sends_on_enter_and_keeps_shift_enter_for_newlines():
+    """A textarea that submits on any Enter cannot express a two-line requirement; one
+    that never submits on Enter is not a chat."""
+    code = _strip_comments(_front())
+    i = code.index('id="taskMsg"')
+    handler = code[i:i + 320]
+    assert "event.key==='Enter'" in handler and "!event.shiftKey" in handler, handler
+    assert "composerSend()" in handler
+    assert "preventDefault()" in handler, "without it Enter also inserts a newline"
+
+
+def test_the_plan_is_rendered_inside_the_thread():
+    """The plan is an artifact of the conversation. In its own card its cost figure sat
+    a scroll away from the turn that justified it."""
+    code = _strip_comments(_front())
+    assert 'id="taskPlanCard"' not in code, "the separate plan card must be gone"
+    chat = code[code.index("function renderChat(t)"):]
+    chat = chat[:chat.index("\n}")]
+    assert "planArtifactHtml(t)" in chat, "the plan must be composed into the thread"
+    art = code[code.index("function planArtifactHtml(t)"):]
+    art = art[:art.index("\n}")]
+    assert "m-artifact" in art
+    assert 'onclick="acceptTask()"' in art, "signing belongs on the plan itself"
+
+
+def test_the_plan_artifact_only_offers_signing_while_the_plan_is_signable():
+    """A sign button on an already-dispatched plan is an action that can only fail."""
+    code = _strip_comments(_front())
+    art = code[code.index("function planArtifactHtml(t)"):]
+    art = art[:art.index("\n}")]
+    sign = art[art.index("const signBtn"):]
+    sign = sign[:sign.index(";")]
+    assert 'status==="plan_proposed"' in sign, sign
+
+
+def test_the_lifecycle_strip_keeps_the_stage_mapping_and_the_run_link():
+    """Collapsing the diagram must not drop the information the icons cannot carry:
+    which run, why it failed, who holds the approval. That prose is the only place a
+    closed task's reason lives."""
+    code = _strip_comments(_front())
+    flow = code[code.index("function renderTaskFlow(t)"):]
+    flow = flow[:flow.index("\nfunction ")]
+    assert "taskStageStates(t)" in flow, "the status->stage mapping must be reused, not rewritten"
+    assert "taskFlowNote(t, st)" in flow, "the note must still be rendered"
+    note = code[code.index("function taskFlowNote(t, st)"):]
+    note = note[:note.index("\n}")]
+    for marker in ("pending_approval", "loadRun(", "error_msg"):
+        assert marker in note, marker
+
+
+def test_the_thread_has_one_render_entry_point():
+    """The old code called three renderers from two places, so the strip and the plan
+    could disagree about which task they were showing."""
+    code = _strip_comments(_front())
+    assert "function renderThread(t)" in code
+    for fn in ("renderTaskFlow(", "renderChat(", "renderTaskActions(", "renderChips("):
+        callers = [ln for ln in code.splitlines() if fn in ln and "function " not in ln]
+        assert len(callers) == 1, f"{fn} should be called only from renderThread: {callers}"
+
+
+def test_no_native_dialog_survives_in_the_task_flow():
+    """A native prompt() blocks the poll that keeps the thread live, cannot be styled,
+    and throws away what was typed. alert() truncated a KMS approval record at 1800
+    chars and could not be copied out -- for a signature that is the one thing needed.
+    """
+    code = _strip_comments(_front())
+    for fn in ("acceptTask", "taskFeedback", "closeTask", "viewApproval"):
+        body = code[code.index("function " + fn + "()"):]
+        body = body[:body.index("\n}")]
+        for bad in ("prompt(", "alert(", "confirm("):
+            assert bad not in body, f"{fn} still uses {bad}"
+        assert "askInThread(" in body or 'id="taskAsk"' in body or "taskAsk" in body, fn
+
+
+def test_a_failed_in_thread_ask_keeps_what_was_typed():
+    """The one thing prompt() could never do. If the widget tore itself down on every
+    submit, a rejected close-reason would have to be retyped from memory."""
+    code = _strip_comments(_front())
+    body = code[code.index("async function askSubmit()"):]
+    body = body[:body.index("\n}")]
+    assert "=== true" in body, "only a true result may clear the widget"
+    assert 'askMsg' in body, "a failure must be reported in place"
+
+
+def test_signing_still_requires_a_deliberate_confirmation():
+    """Replacing confirm() with an inline widget must not make signing a single click:
+    this dispatches real spend against a KMS-signed acceptance."""
+    code = _strip_comments(_front())
+    body = code[code.index("async function acceptTask()"):]
+    body = body[:body.index("\n}")]
+    assert "ACCEPT" in body, "an explicit typed confirmation must remain"
+    assert 'toUpperCase() !== "ACCEPT"' in body, body
+
+
+def test_starter_chips_exist_and_only_show_on_a_new_thread():
+    """An empty composer asks the customer to invent the shape of a request they have
+    never made. Inside a conversation the orchestrator is already asking, so chips
+    there would compete with its question."""
+    code = _strip_comments(_front())
+    assert "const TASK_CHIPS = [" in code
+    chips = code[code.index("const TASK_CHIPS = ["):]
+    assert chips[:chips.index("];")].count('",') + 1 >= 3, "at least three starters"
+    body = code[code.index("function renderChips(t)"):]
+    body = body[:body.index("\n}")]
+    assert "if (t)" in body and 'innerHTML = ""' in body, body
+
+
+def test_a_chip_fills_the_composer_rather_than_sending_it():
+    """A chip that sends immediately spends a real orchestrator turn on text the
+    customer never read, and they cannot edit the budget figure in it."""
+    code = _strip_comments(_front())
+    body = code[code.index("function useChip(i)"):]
+    body = body[:body.index("\n}")]
+    assert 'value = c' in body, body
+    for bad in ("composerSend(", "createTask(", "postApi("):
+        assert bad not in body, f"a chip must not {bad}"
+
+
+def test_new_consultation_clears_the_selection_instead_of_creating_a_task():
+    """A + button that POSTs would create an empty goalless task on every stray click."""
+    code = _strip_comments(_front())
+    body = code[code.index("function newThread()"):]
+    body = body[:body.index("\n}")]
+    assert "TASK_SEL = null" in body, body
+    for bad in ("postApi(", "createTask("):
+        assert bad not in body, f"newThread must not {bad}"
+
+
+def test_the_rail_marks_which_thread_is_open():
+    """Selecting a thread with no visible selection leaves the reader unable to tell
+    which conversation the panel is showing."""
+    code = _strip_comments(_front())
+    body = code[code.index("async function loadTasks()"):]
+    body = body[:body.index("\n}\n")]
+    assert "t.id===TASK_SEL" in body and '" sel"' in body, body
+    assert ".threads .th.sel" in code, "the selected class needs a style or it is invisible"
+
+
+def test_selecting_a_thread_repaints_the_rail():
+    """Without this the highlight lags a poll behind the panel, so for up to 15
+    seconds the rail points at the previous conversation."""
+    code = _strip_comments(_front())
+    body = code[code.index("function selectTask(id)"):]
+    body = body[:body.index("\n}")]
+    assert "loadTasks()" in body and "loadTaskDetail()" in body, body
+
+
+def test_thread_actions_are_offered_only_when_they_can_succeed():
+    """Close on a closed task and "view approval" with no record are buttons whose only
+    outcome is an error.
+
+    Each button is matched together with the guard on its own line, not by asking
+    whether the word "terminal" appears somewhere in the function. The first draft
+    asserted the latter and stayed green with `if (!terminal)` deleted, because the
+    `const terminal = [...]` declaration -- and the string "closed" inside it -- still
+    satisfied it. A test that a variable was *declared* says nothing about it being
+    *used*. (Verified by deleting the guard, 2026-08-01.)
+    """
+    code = _strip_comments(_front())
+    body = code[code.index("function renderTaskActions(t)"):]
+    body = body[:body.index("\n}")]
+    for guard, action in ((r"if \(!terminal\)", "closeTask()"),
+                          (r"if \(t\.approvals && t\.approvals\.length\)", "viewApproval()"),
+                          (r'if \(PLAN_STATUSES\.includes\(s\)', "taskFeedback()")):
+        hit = [ln for ln in body.splitlines() if re.search(guard, ln)]
+        assert hit, f"{action} must be guarded by {guard}: {body}"
+        # the guard and the button it protects must be the same statement, or the guard
+        # is decorative and the button renders unconditionally anyway
+        stmt = "\n".join(body.splitlines()[body.splitlines().index(hit[0]):][:2])
+        assert action in stmt, f"{action} is not inside {guard}: {stmt}"
+
+
+def test_every_task_handler_the_markup_names_is_defined():
+    """The merge rewired every button on the tab. A typo'd handler is a button that
+    does nothing at all, and the browser reports it only in the console."""
+    front = _front()
+    code = _strip_comments(front)
+    panel = code[code.index('data-tab-panel="tasks"'):code.index('data-tab-panel="architecture"')]
+    handlers = set(re.findall(r'on(?:click|keydown)="([A-Za-z0-9_]+)\(', panel))
+    defined = set(re.findall(r'(?:async\s+)?function\s+([A-Za-z0-9_]+)', code))
+    missing = sorted(h for h in handlers if h not in defined and h != "if")
+    assert not missing, f"markup calls undefined functions: {missing}"
+
+
+def test_no_task_code_addresses_an_element_the_merge_deleted():
+    """Four cards became two. A $("taskFlow") left behind throws on every poll and
+    silently stops the thread from updating."""
+    code = _strip_comments(_front())
+    gone = ("taskFlow", "taskGoal", "taskCreateMsg", "taskPlanCard", "taskPlanBody",
+            "taskApprovalLink", "taskPlanMsg")
+    for g in gone:
+        assert f'$("{g}")' not in code, f'$("{g}") refers to a removed element'
+
+
+def test_every_element_the_task_code_reads_actually_exists():
+    """The general form of the above: any $("id") with no matching id= in the markup is
+    a TypeError on the next poll."""
+    front = _front()
+    code = _strip_comments(front)
+    used = set(re.findall(r'\$\("([A-Za-z0-9_]+)"\)', code))
+    declared = set(re.findall(r'id="([A-Za-z0-9_]+)"', front))
+    # ids created by innerHTML rather than static markup are still real elements
+    declared |= set(re.findall(r"id=\\?[\"']([A-Za-z0-9_]+)\\?[\"']", code))
+    missing = sorted(u for u in used if u not in declared)
+    assert not missing, f"code reads elements that do not exist: {missing}"
+
+
+# ── data readiness: what the plan says about the data, and what it does not ────
+# Answered from plan.json rather than from the chat, because the plan is the artifact
+# the customer signs: a fact stated in conversation and then absent from the plan is
+# exactly the gap this panel exists to surface.
+
+def _plan_with(data):
+    return json.dumps({"goal": "x", "data": data}).encode()
+
+
+def test_readiness_names_every_field_the_consult_protocol_asks_for(wired):
+    """The panel's checklist and the orchestrator's step-0 questions must be one list.
+    If the console drops a field the agent asks about, the customer sees two different
+    checklists for one consultation and can sign with an open question invisible."""
+    tid = _mk_task(wired, plan_body=_plan_with({}))
+    r = wired.console.task_readiness(tid)
+    paths = [f["field"] for f in r["fields"]]
+    for expected in ("source_uri", "verification_method", "datasheet.license",
+                     "datasheet.pii_disposition", "datasheet.consent",
+                     "customer_eval_uri", "decontamination"):
+        assert expected in paths, f"{expected} missing from the readiness panel: {paths}"
+    assert r["total"] == len(paths) == len(wired.console.DATA_READINESS_FIELDS)
+
+
+def test_an_unanswered_field_says_so_and_says_why(wired):
+    """A blank row reads as "fine". Every unanswered field comes back answered=False
+    WITH the reason it matters, because the customer is being asked to go find the
+    answer -- "license: (blank)" does not tell anyone that training on data they have
+    no licence for is the risk."""
+    tid = _mk_task(wired, plan_body=_plan_with({}))
+    r = wired.console.task_readiness(tid)
+    assert r["answered"] == 0
+    for f in r["fields"]:
+        assert f["answered"] is False
+        assert f["value"] == "", "an unanswered field must not carry a value"
+        assert f["why"].strip(), f"{f['field']} has no explanation of why it matters"
+        assert f["label"].strip()
+
+
+def test_readiness_reads_nested_datasheet_answers(wired):
+    """Three of the seven fields live under plan.data.datasheet. A flat lookup would
+    report a fully-documented dataset as having no licence, consent or PII answer --
+    the panel would tell the customer to go re-answer what they already answered."""
+    tid = _mk_task(wired, plan_body=_plan_with({
+        "source_uri": "s3://test-bucket/customer-data/t/x.jsonl",
+        "datasheet": {"license": "CC-BY-4.0", "pii_disposition": "redacted",
+                      "consent": "granted 2026-07-01"}}))
+    r = wired.console.task_readiness(tid)
+    by = {f["field"]: f for f in r["fields"]}
+    assert by["datasheet.license"]["answered"] and by["datasheet.license"]["value"] == "CC-BY-4.0"
+    assert by["datasheet.pii_disposition"]["answered"]
+    assert by["datasheet.consent"]["answered"]
+    assert r["answered"] == 4
+    # and the ones nobody answered are still counted as open
+    assert by["decontamination"]["answered"] is False
+
+
+def test_readiness_treats_an_empty_string_as_unanswered(wired):
+    """An LLM writing the plan fills the shape it was given, so `"license": ""` and
+    `"consent": {}` are the common way a field arrives unanswered. Truth-testing the
+    KEY instead of the VALUE would count those as answered and show the customer a
+    7/7 panel over a plan that answers nothing."""
+    tid = _mk_task(wired, plan_body=_plan_with({
+        "source_uri": "", "verification_method": [], "datasheet": {"license": {}},
+        "decontamination": None}))
+    r = wired.console.task_readiness(tid)
+    assert r["answered"] == 0, [f for f in r["fields"] if f["answered"]]
+
+
+def test_readiness_before_any_plan_exists_is_a_200_with_a_reason(wired):
+    """A consultation two turns old has no plan.json yet. That is the NORMAL state, not
+    an error: a 4xx here would make the panel vanish from the thread exactly when the
+    customer most needs to see which questions are still open."""
+    tid = _mk_task(wired, plan_body=b"{}")
+    wired.tasks.items[tid]["plan_uri"] = ""
+    r = wired.console.task_readiness(tid)
+    assert "status_code" not in r
+    assert "no plan yet" in r["note"]
+    assert r["answered"] == 0 and len(r["fields"]) == r["total"]
+
+
+def test_readiness_reports_an_unreadable_plan_instead_of_failing(wired):
+    """"The plan could not be read" is itself a readiness answer. Raising would drop the
+    whole panel and leave the customer with no signal at all."""
+    tid = _mk_task(wired, plan_body=b"{}")
+    del wired.s3.objects[f"test-bucket/tasks/{tid}/plan.json"]
+    r = wired.console.task_readiness(tid)
+    assert "status_code" not in r
+    assert "could not be read" in r["note"]
+    assert len(r["fields"]) == r["total"]
+
+
+def test_readiness_survives_a_plan_whose_data_block_is_not_an_object(wired):
+    """A model that writes `"data": "see above"` must not 500 the panel."""
+    for bad in (b'{"data":"see above"}', b'{"data":[1,2]}', b'{"data":null}', b'[]'):
+        tid = _mk_task(wired, plan_body=bad)
+        r = wired.console.task_readiness(tid)
+        assert "status_code" not in r, f"{bad!r} broke the panel: {r}"
+        assert r["answered"] == 0
+
+
+def test_readiness_for_an_unknown_task_is_404(wired):
+    r = wired.console.task_readiness("task-nope")
+    assert r["status_code"] == 404
+
+
+def test_readiness_value_is_capped_so_one_field_cannot_flood_the_panel(wired):
+    tid = _mk_task(wired, plan_body=_plan_with({"source_uri": "s3://" + "a" * 5000}))
+    r = wired.console.task_readiness(tid)
+    val = [f for f in r["fields"] if f["field"] == "source_uri"][0]["value"]
+    assert len(val) <= 300
+
+
+def test_the_readiness_route_is_registered(console):
+    """A handler nothing routes to is dead code, and the panel would render the tab's
+    own 404 HTML as though the plan were unreadable."""
+    src = (REPO / "deploy/console/lambda_function.py").read_text()
+    assert 'seg[1] == "readiness"' in src
+    assert "task_readiness(seg[0])" in src
+
+
+def test_dig_does_not_explode_on_a_scalar_midway_down_the_path(console):
+    """`datasheet.license` where datasheet is the string "unknown" is a real shape from a
+    real model. _dig must return None, not raise AttributeError."""
+    assert console._dig({"datasheet": "unknown"}, "datasheet.license") is None
+    assert console._dig({}, "a.b.c") is None
+    assert console._dig({"a": {"b": {"c": 1}}}, "a.b.c") == 1
+
+
+# ── the upload drop zone ──────────────────────────────────────────────────────
+
+def test_the_thread_has_a_drop_zone_and_a_file_picker():
+    """Before this the tab had NO file input at all (grep for `input type="file"`
+    returned 0), while the consult prompt opened every conversation by asking for an S3
+    URI under customer-data/. Someone with AWS credentials had to upload out of band."""
+    front = _front()
+    code = _strip_comments(front)
+    panel = code[code.index('data-tab-panel="tasks"'):code.index('data-tab-panel="architecture"')]
+    assert 'type="file"' in panel and 'id="taskFile"' in panel
+    assert 'id="taskDrop"' in panel
+    # drag-and-drop as well as the picker: a dataset is dragged out of a file manager
+    for handler in ("ondragover", "ondragleave", "ondrop"):
+        assert handler in panel, f"the drop zone has no {handler}"
+
+
+def test_the_upload_sends_the_exact_content_type_the_server_signed():
+    """ContentType and ServerSideEncryption are signed INTO the presigned URL. Sending
+    the browser's own guess at content-type instead is a SignatureDoesNotMatch at the
+    END of the upload -- the worst possible time -- and reads as a permissions problem.
+    """
+    code = _strip_comments(_front())
+    body = code[code.index("async function uploadDataset"):]
+    body = body[:body.index("\nfunction renderChat")]
+    # The HEADER, not merely a mention of d.content_type anywhere in the function: the
+    # first draft asserted the latter and stayed green when the header was switched to
+    # `file.type`, because the auto-post message a few lines below still names
+    # d.content_type. (Verified by making that exact swap, 2026-08-01.)
+    hdr = re.search(r'\{"content-type":\s*([A-Za-z0-9_.]+)', body)
+    assert hdr, f"no content-type header on the PUT: {body}"
+    assert hdr.group(1) == "d.content_type", \
+        (f"the PUT sends {hdr.group(1)}; ContentType is signed INTO the URL, so anything "
+         "other than the value the route returned is a SignatureDoesNotMatch")
+    assert '"x-amz-server-side-encryption": "AES256"' in body
+    # and it must be the URL the server signed, not one composed here
+    assert re.search(r"putWithProgress\(d\.url", body), \
+        "the PUT must go to the URL the server signed"
+
+
+def test_the_upload_announces_itself_in_the_conversation():
+    """An upload the agent cannot see is a silent side-effect in a bucket. The auto-post
+    is what turns it into a fact of the consultation -- and it goes through sendTaskMsg
+    so the transcript shows who said it."""
+    code = _strip_comments(_front())
+    body = code[code.index("async function uploadDataset"):]
+    body = body[:body.index("\nfunction renderChat")]
+    assert "sendTaskMsg(" in body, "a successful upload must post into the thread"
+    assert "data uploaded" in body and "d.uri" in body, \
+        "the auto-post must name the s3:// URI the agent has to audit"
+    # ordering: the announcement happens after the PUT succeeded, never before
+    assert body.index("putWithProgress") < body.index("sendTaskMsg("), \
+        "the thread must not be told about an upload that has not happened"
+
+
+def test_a_failed_put_does_not_announce_an_upload_that_did_not_happen():
+    """The failure branch must return before the auto-post. A thread claiming
+    "data uploaded: s3://..." for a key that does not exist sends the data-prep audit
+    after a nonexistent object, and the customer believes their data is in."""
+    code = _strip_comments(_front())
+    body = code[code.index("async function uploadDataset"):]
+    body = body[:body.index("\nfunction renderChat")]
+    fail = body[body.index("if (!put.ok)"):]
+    fail = fail[:fail.index("\n")]
+    assert "return" in fail, f"the failed-PUT branch must return: {fail}"
+
+
+def test_the_drop_zone_is_hidden_when_there_is_nowhere_to_upload_to():
+    """The key is customer-data/<task_id>/..., so with no consultation selected there is
+    no prefix to write into; and the server answers 409 for a task that is dispatched,
+    closed, completed, failed or errored. Offering the zone in those states is a click
+    whose only possible outcome is an error."""
+    code = _strip_comments(_front())
+    body = code[code.index("function renderDrop(t)"):]
+    body = body[:body.index("\n}")]
+    assert "!!t" in body or "!t" in body, "the zone must depend on a task existing"
+    assert "UPLOAD_CLOSED" in body and "display" in body
+
+
+def test_the_frontends_closed_statuses_match_the_statuses_the_route_refuses(console):
+    """The list is duplicated in the browser, so it can drift. If the server grows a new
+    terminal status and this list does not, the tab offers an upload that 409s."""
+    code = _strip_comments(_front())
+    listed = re.search(r'const UPLOAD_CLOSED = \[([^\]]*)\]', code)
+    assert listed, "UPLOAD_CLOSED not found"
+    front_set = set(re.findall(r'"([a-z_]+)"', listed.group(1)))
+    server_set = set(console.TASK_TERMINAL) | set(console.TASK_SETTLED)
+    assert front_set == server_set, \
+        (f"drift: the frontend hides the drop zone for {sorted(front_set)} but the route "
+         f"refuses {sorted(server_set)}")
+
+
+def test_an_upload_during_an_agent_turn_is_queued_not_lost(console):
+    """The worst of the three defects the live runs found, because it lost data silently.
+
+    data_upload_url deliberately allows an upload while a turn is in flight -- a 5 GiB PUT
+    must not wait on a 60s agent turn. But post_task_message 409s during TASK_ACTIVE. So a
+    file dropped mid-turn went to S3 and its announcement was refused, and uploadDataset
+    then set "uploaded <key>" over the error: the customer read success, the agent was
+    never told, and the next question was still "where is your data?".
+
+    The asymmetry is intentional on both sides, so the client has to carry the note. This
+    asserts the queue exists, that success is not claimed on a refusal, and that delivery
+    is wired to the poll that knows when the turn ended."""
+    # The asymmetry this whole mechanism exists for. If a later change makes the two
+    # routes agree, the queue is dead code and this test should be revisited.
+    assert set(console.TASK_ACTIVE) - (set(console.TASK_TERMINAL) | set(console.TASK_SETTLED)), \
+        ("post_task_message no longer refuses any status data_upload_url allows -- the "
+         "mid-turn upload race is gone and PENDING_POST may be removable")
+    code = _strip_comments(_front())
+    # Anchored on the DECLARATION, not on the name appearing anywhere: a bare
+    # `"PENDING_POST" in code` is satisfied by the prefix of PENDING_POST_UNUSED, which is
+    # how a control that renamed the slot into oblivion left this guard green.
+    assert re.search(r"^(let|var|const)\s+PENDING_POST\s*=", code, re.M), \
+        "no queue for an announcement refused mid-turn"
+
+    up = _js_fn_src(code, "uploadDataset")
+    # The refusal must be detected. Awaiting sendTaskMsg and ignoring what it returns is
+    # exactly the bug: the error line is overwritten one statement later.
+    assert re.search(r"(const|let|var)\s+\w+\s*=\s*await sendTaskMsg\(", up), \
+        "uploadDataset must capture sendTaskMsg's result, not fire and forget"
+    assert re.search(r"PENDING_POST\s*=\s*\{", up), \
+        "a refused announcement must be queued in uploadDataset"
+    # Success must be conditional. Anchored on the status-line report itself, not on the
+    # word "uploaded": that word also appears in the announcement text ("data uploaded:
+    # s3://..."), which sits EARLIER in the function -- so a laxer anchor matched the note
+    # instead of the report and this assertion failed against correct code.
+    report = '"uploaded " + d.key'
+    assert report in up, f"the upload no longer reports {report}; re-check this guard"
+    assert re.search(r"if\s*\(\s*\w+\.ok\s*\)", up[:up.index(report)]), \
+        "'uploaded' is still reported unconditionally, including when the agent was not told"
+
+    # sendTaskMsg has to report the outcome for any of the above to be possible.
+    send = _js_fn_src(code, "sendTaskMsg")
+    # EVERY exit must report an outcome, checked on the LAST return rather than on any:
+    # the no-task-selected guard returns {ok:false} early, and that alone satisfied a
+    # `return {ok:` search even with the success path returning undefined -- so the guard
+    # stayed green while the caller could no longer tell a refusal from a send.
+    returns = re.findall(r"return\s*([^;]*);", send)
+    assert returns, "sendTaskMsg has no return at all"
+    assert all(r.strip().startswith("{ok") or r.strip().startswith("{ ok")
+               for r in returns), \
+        (f"sendTaskMsg has a return that does not report an outcome: {returns} -- the "
+         "upload auto-post cannot tell a refusal from a send")
+
+    # ...and the queue needs a delivery point tied to the status the server gates on.
+    flush = _js_fn_src(code, "flushPendingPost")
+    assert re.search(r'"thinking"', flush) and re.search(r'"accepting"', flush), \
+        "delivery must wait for the same statuses post_task_message refuses"
+    assert re.search(r"PENDING_POST\s*=\s*null", flush), \
+        "the slot must be cleared before the await, or the 3s poll double-posts"
+    assert flush.index("PENDING_POST = null") < flush.index("await"), \
+        "clearing after the await lets a re-entrant poll send the same note twice"
+    assert "p.task_id" in flush and "t.id" in flush, \
+        "the note must be matched to its own task, not posted into whichever is selected"
+    detail = _js_fn_src(code, "loadTaskDetail")
+    assert "flushPendingPost" in detail, \
+        "nothing ever delivers the queued note: it is only reachable from the poll"
+
+
+def test_the_upload_reports_progress_rather_than_appearing_to_hang():
+    """fetch() cannot report upload progress. A 5 GiB PUT with no progress bar is
+    indistinguishable from a freeze, and the customer retries on top of an upload that
+    is already running -- which is why this uses XMLHttpRequest."""
+    code = _strip_comments(_front())
+    assert "XMLHttpRequest" in code
+    # Anchored assignments, not substring hits: renaming the handler to `onprogressX`
+    # (i.e. disabling it) left "upload.onprogress" matching as a prefix and this test
+    # green. (Verified by that rename, 2026-08-01.)
+    assert re.search(r"xhr\.upload\.onprogress\s*=", code), "no upload progress handler"
+    assert re.search(r'\$\("taskUpFill"\)\.style\.width', code), \
+        "nothing ever moves the progress bar"
+    # every terminal outcome must be handled, or a failed PUT leaves the bar at 40%
+    for h in ("onload", "onerror", "onabort"):
+        assert re.search(r"xhr\." + h + r"\s*=", code), \
+            f"xhr.{h} unhandled: a failed upload would look like a stalled one"
+
+
+def test_a_cors_or_csp_failure_says_what_it_actually_is():
+    """A blocked preflight arrives in JS as a zero-information error event. The bucket
+    had no CORS configuration at all and the page's CSP is connect-src 'self', so this is
+    the single most likely failure in production -- and "network error" would send the
+    reader looking at IAM, which is the one thing that is fine."""
+    code = _strip_comments(_front())
+    err = code[code.index("xhr.onerror"):]
+    err = err[:err.index("\n")]
+    assert "CORS" in err and "connect-src" in err, \
+        f"the browser-blocked case must name CORS/CSP: {err}"
+
+
+def test_two_uploads_cannot_race_over_one_progress_bar():
+    code = _strip_comments(_front())
+    body = code[code.index("async function uploadDataset"):]
+    body = body[:body.index("\nfunction renderChat")]
+    assert "if (UPLOADING)" in body
+    assert "finally" in body, "UPLOADING must be cleared even when the PUT throws"
+
+
+def test_choosing_the_same_file_twice_still_fires():
+    """An <input type=file> does not fire change when the same file is chosen again, so
+    retrying a failed upload by re-picking the file would silently do nothing."""
+    code = _strip_comments(_front())
+    body = code[code.index("function pickFiles(ev)"):]
+    body = body[:body.index("\n}")]
+    assert "ev.target.value" in body
+
+
+# ── agent choices as buttons (consult protocol step 3b) ───────────────────────
+
+def test_the_choice_block_is_specified_in_the_harness_prompt():
+    """The buttons are useless unless the agent knows to emit the block. And it must be
+    told to keep the prose complete: a turn whose menu exists ONLY as json renders as an
+    empty message on any client that does not parse it."""
+    h = json.loads((REPO / "agents/orchestrator/harness.json").read_text())
+    # The prompt text itself, not json.dumps of the file: dumps re-escapes every quote,
+    # so '"choices"' would not be found in it and this guard would fail on a prompt that
+    # is perfectly correct -- or worse, pass on a coincidence.
+    prompt = "\n".join(b.get("text", "") for b in h["systemPrompt"])
+    assert '{"choices"' in prompt, "the consult protocol never specifies the choices block"
+    assert '"label"' in prompt and '"value"' in prompt, \
+        "the block's shape must be stated, or the agent invents its own key names"
+    assert "accelerator" in prompt, \
+        "the prompt must say the block is an accelerator, not the message itself"
+    assert "same fence as the plan trailer" in prompt, \
+        "the prompt must forbid sharing the plan trailer's fence"
+    # The gates rule belongs to PROPOSE. It sat at the end of step 3 and a careless
+    # insertion of 3b swept it into the choices paragraph, where it reads as a rule about
+    # buttons -- caught by re-reading the diff, and asserted here so it stays put.
+    step3 = prompt[prompt.index("3. PROPOSE"):prompt.index("3b. CHOICES")]
+    assert "Quality gates must be anchored" in step3, \
+        "the held-out-set gate rule drifted out of step 3 PROPOSE"
+
+
+def test_the_prompt_sends_the_customer_to_the_drop_zone_not_to_a_bucket(console):
+    """Found by a live run, not by review.
+
+    The prompt used to say "where is the data (S3 URI under customer-data/)". With the
+    drop zone shipped, the agent still answered a real consultation with "I don't see a
+    support-tickets prefix under customer-data/ yet -- please upload the JSONL to
+    s3://.../customer-data/support-tickets/ and give me the exact URI". That is the
+    out-of-band upload this whole feature removed, and it is worse than useless: the
+    customer being consulted may hold no AWS credentials at all, and the invented prefix
+    is not the one the console writes (customer-data/<task_id>/), so any plan built on it
+    points at an object that will never exist.
+
+    So the prompt must name the drop zone, must take the URI from the auto-post verbatim,
+    and must not instruct the customer to upload anything themselves."""
+    h = json.loads((REPO / "agents/orchestrator/harness.json").read_text())
+    prompt = "\n".join(b.get("text", "") for b in h["systemPrompt"])
+    step0 = prompt[prompt.index("0. DATA DISCOVERY"):prompt.index("1. GUIDED REQUIREMENTS")]
+    assert "DROP ZONE" in step0.upper(), \
+        "step 0 must tell the agent the thread has an upload drop zone"
+    assert "verbatim" in step0.lower(), \
+        "the agent must be told to take the uploaded URI verbatim, not to compose one"
+    assert "never invent" in step0.lower(), \
+        "the agent must be forbidden from inventing a customer-data/ path"
+    # The key layout the agent is told about has to be the one the route actually writes,
+    # or the prompt teaches a path that never receives an object.
+    assert f"{console.CUSTOMER_DATA_PREFIX}/<task_id>/" in step0, \
+        "the prompt must state the real key layout: customer-data/<task_id>/<filename>"
+    assert "data uploaded:" in step0, \
+        "the prompt must name the auto-post prefix it should read the URI out of"
+    # ...and that prefix has to be the one the browser actually sends. The prompt telling
+    # the agent to look for one string while the frontend posts another is a drift that
+    # nothing else here would catch: both sides stay internally consistent and the agent
+    # simply never recognises an upload.
+    # Anchored inside uploadDataset rather than on the sendTaskMsg call site: the note is
+    # now built into a variable first (so a refusal can queue it), and a guard tied to the
+    # call site went stale the moment that refactor landed.
+    up = _js_fn_src(_strip_comments(_front()), "uploadDataset")
+    posted = re.search(r'=\s*"([^"]+)"\s*\+\s*d\.uri', up)
+    assert posted, "the upload announcement was not found in uploadDataset"
+    assert posted.group(1) == "data uploaded: ", \
+        f"the frontend posts {posted.group(1)!r}, which the prompt does not describe"
+
+
+def test_choices_render_only_from_the_latest_agent_turn():
+    """A menu from three turns ago answers a question that has already been answered;
+    clicking it sends the consultation backwards."""
+    code = _strip_comments(_front())
+    body = code[code.index("function renderChoices(t)"):]
+    body = body[:body.index("\n}")]
+    assert "msgs[msgs.length-1]" in body, "choices must come from the last assistant turn"
+    assert 'role==="assistant"' in body, "a customer's own message is not a menu"
+
+
+def test_clicking_a_choice_sends_it_as_a_visible_message():
+    """Sent through sendTaskMsg so it appears in the thread as something the customer
+    said. A silent side-channel reply would leave the transcript lying about who chose."""
+    code = _strip_comments(_front())
+    body = code[code.index("function useChoice(i)"):]
+    body = body[:body.index("\n}")]
+    assert "sendTaskMsg(c.value)" in body
+
+
+def test_the_choice_fence_is_not_shown_as_raw_json_in_the_chat():
+    """Leaving the block in the bubble means the customer reads the same menu twice, the
+    second time as unusable JSON."""
+    code = _strip_comments(_front())
+    body = code[code.index("function renderChat(t)"):]
+    body = body[:body.index("\n  el.innerHTML")]
+    assert "stripChoiceFences" in body
+
+
+def test_the_composer_clears_itself_but_sendTaskMsg_does_not():
+    """A choice button and the upload auto-post both call sendTaskMsg. If THAT cleared
+    the composer, clicking a menu button would delete a half-written reply the customer
+    was in the middle of typing."""
+    code = _strip_comments(_front())
+    send = code[code.index("async function sendTaskMsg(text)"):]
+    send = send[:send.index("\n}")]
+    assert '$("taskMsg").value = ""' not in send, \
+        "sendTaskMsg must not clear the composer -- its other callers are not the composer"
+    comp = code[code.index("async function composerSend()"):]
+    comp = comp[:comp.index("\n}")]
+    assert '$("taskMsg").value = ""' in comp or "createTask(text)" in comp
+
+
+# ── the choice parser, EXECUTED rather than grepped ───────────────────────────
+# Structural greps cannot tell a parser that works from one that throws on the first
+# malformed block an LLM emits. These run the real functions out of frontend.html in
+# node, so the assertions are about behaviour. Skipped (never silently passed) when
+# node is unavailable: a skip is visible in the run, a vacuous pass is not.
+
+def _js_fn(names):
+    """Extract named top-level functions from frontend.html by brace matching."""
+    js = _front()
+    js = js[js.index("<script>"):js.rindex("</script>")]
+    out = []
+    for n in names:
+        i = js.index("function " + n + "(")
+        depth, k = 0, js.index("{", i)
+        while True:
+            if js[k] == "{":
+                depth += 1
+            elif js[k] == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            k += 1
+        out.append(js[i:k + 1])
+    return "\n".join(out)
+
+
+def _run_js(body, call, arg):
+    """Run `call` (which reads the string IN) against the real frontend functions.
+
+    The input is handed over as a JSON literal rather than pasted into a JS string:
+    every interesting test input here IS json, full of double quotes, and interpolating
+    it produced a SyntaxError that failed 11 tests for a reason that had nothing to do
+    with the code under test.
+
+    Skipped, never silently passed, when node is missing: a skip is visible in the run.
+    """
+    import shutil
+    import subprocess
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node not available")
+    src = f"{body}\nconst IN = {json.dumps(arg)};\n"
+    src += "process.stdout.write(JSON.stringify(" + call + "));"
+    p = subprocess.run([node, "-e", src], capture_output=True, text=True, timeout=30)
+    assert p.returncode == 0, p.stderr
+    return json.loads(p.stdout)
+
+
+CHOICE_FNS = ("parseChoices", "stripChoiceFences")
+
+PLAN_FENCE = ('```json\n{"plan_uri":"s3://b/k","plan_summary":"s",'
+              '"cost_estimate_usd":"12"}\n```')
+MENU_FENCE = '```json\n{"choices":[{"label":"Sign it","value":"accept"}]}\n```'
+
+
+def test_a_well_formed_choices_block_becomes_buttons():
+    turn = ('Three options.\n\n```json\n{"choices":[{"label":"Starter audit",'
+            '"value":"I want the starter audit."},{"label":"Set menu","value":"set menu"}]}\n```')
+    got = _run_js(_js_fn(CHOICE_FNS), "parseChoices(IN)", turn)
+    assert got == [{"label": "Starter audit", "value": "I want the starter audit."},
+                   {"label": "Set menu", "value": "set menu"}]
+
+
+def test_the_plan_trailer_is_not_mistaken_for_a_menu():
+    """Both are fenced json blocks. If the plan trailer parsed as choices, every priced
+    proposal would sprout a nonsense button -- and the trailer would be stripped out of
+    the chat, so the customer would lose the plan text as well."""
+    body = _js_fn(CHOICE_FNS)
+    turn = "Plan.\n" + PLAN_FENCE
+    assert _run_js(body, "parseChoices(IN)", turn) == []
+    assert "plan_uri" in _run_js(body, "stripChoiceFences(IN)", turn)
+
+
+def test_a_turn_with_both_blocks_keeps_the_plan_and_lifts_the_choices():
+    body = _js_fn(CHOICE_FNS)
+    turn = "Plan.\n" + PLAN_FENCE + "\n\n" + MENU_FENCE
+    assert _run_js(body, "parseChoices(IN)", turn) == [{"label": "Sign it", "value": "accept"}]
+    shown = _run_js(body, "stripChoiceFences(IN)", turn)
+    assert "plan_uri" in shown, "stripping the choices must not remove the plan trailer"
+    assert "Sign it" not in shown, "the choices json must not also be shown as text"
+
+
+@pytest.mark.parametrize("turn,why", [
+    ("just prose, no fence at all", "a turn without the block renders as ordinary chat"),
+    ('```json\n{not valid json,,\n```', "unparseable json must not throw"),
+    ('```json\n{"choices":"starter,set-menu"}\n```', "choices must be an array"),
+    ('```json\n{"choices":[{"label":1,"value":"x"}]}\n```', "a non-string label"),
+    ('```json\n{"choices":[{"label":"only a label"}]}\n```', "a missing value"),
+    ('```json\n{"choices":[{"label":"  ","value":"x"}]}\n```', "a blank label"),
+    ('```json\n{"choices":[null]}\n```', "a null entry"),
+    ('```json\n{"choices":[]}\n```', "an empty list"),
+    ('```json\n[]\n```', "an array where an object was specified"),
+    ('a ```json\n{"choices":[{"label":"L","value":"V"}', "a truncated turn"),
+])
+def test_the_choices_block_degrades_silently(turn, why):
+    """Step 3b calls the block an accelerator: an agent that ignores it, or emits it
+    wrongly, must not produce a broken tab. Every malformed shape ends as "no buttons"
+    or as well-formed buttons -- never as an exception in the customer's face."""
+    got = _run_js(_js_fn(CHOICE_FNS), "parseChoices(IN)", turn)
+    assert isinstance(got, list), why
+    for c in got:
+        assert isinstance(c.get("label"), str) and c.get("label").strip(), why
+        assert isinstance(c.get("value"), str) and c.get("value").strip(), why
+
+
+def test_stripping_never_invents_a_closing_fence():
+    """A truncated turn ends mid-fence. Appending the "```" that closes it would put
+    characters in the transcript the agent never wrote."""
+    body = _js_fn(CHOICE_FNS)
+    for turn in ("a ```x", 'p ```json\n{"choices":[{"label":"L","value":"V"}]}'):
+        assert _run_js(body, "stripChoiceFences(IN)", turn) == turn
+
+
+def test_a_code_block_in_an_answer_is_left_alone():
+    """The orchestrator explains things with code. Stripping every fence would eat it."""
+    turn = "Run this:\n```bash\naws s3 ls\n```\nthen tell me."
+    assert _run_js(_js_fn(CHOICE_FNS), "stripChoiceFences(IN)", turn) == turn
+
+
+def test_a_long_label_or_value_is_capped_not_dropped():
+    """A model can emit a paragraph as a label. Truncating keeps the button usable;
+    dropping it would silently lose an option the customer was offered in the prose."""
+    turn = ('```json\n{"choices":[{"label":"' + "L" * 400 + '","value":"' + "V" * 5000
+            + '"}]}\n```')
+    got = _run_js(_js_fn(CHOICE_FNS), "parseChoices(IN)", turn)
+    assert len(got) == 1 and len(got[0]["label"]) <= 90 and len(got[0]["value"]) <= 2000
+
+
+# ── the readiness panel in the browser ────────────────────────────────────────
+
+def test_the_readiness_panel_exists_and_is_fed_by_the_route():
+    code = _strip_comments(_front())
+    assert 'id="taskReadiness"' in code
+    assert "/readiness" in code, "the panel must consume GET /api/tasks/{id}/readiness"
+
+
+def test_the_panel_spells_out_an_unanswered_field():
+    """A blank cell reads as "fine", and the customer signs a plan whose data questions
+    are still open. The words are asserted because the words are the feature."""
+    code = _strip_comments(_front())
+    body = code[code.index("function renderReadiness(t)"):]
+    body = body[:body.index("\n}")]
+    assert "not answered yet" in body
+    assert "f.answered" in body, "the panel must branch on the server's answered flag"
+    assert "f.why" in body, "the reason a field matters must reach the customer"
+
+
+def test_the_panel_does_not_refetch_the_plan_on_every_poll():
+    """The thread polls every 3s while a turn is in flight. Re-reading plan.json from S3
+    on each one is a GET per 3 seconds per open tab, for a file that changes once per
+    proposal."""
+    code = _strip_comments(_front())
+    body = code[code.index("async function loadReadiness(t)"):]
+    body = body[:body.index("\n}")]
+    # The early return, matched as one statement. The first draft asked only whether
+    # "READY_KEY" and "return" both appeared somewhere in the function -- satisfied by
+    # the assignment `READY_KEY = key` plus the unrelated early return for `!t`, so
+    # deleting the cache check entirely kept it green. (Verified 2026-08-01.)
+    guard = [ln for ln in body.splitlines() if re.search(r"if \(key === READY_KEY\)", ln)]
+    assert guard, f"no cache check against READY_KEY: {body}"
+    assert "return" in guard[0], f"the cache check does not skip the fetch: {guard[0]}"
+    # and the fetch must come AFTER it, or the check saves nothing
+    assert body.index("if (key === READY_KEY)") < body.index("fetch(")
+    assert "plan_uri" in body and "status" in body, \
+        "the cache key must include what can change the answers"
+
+
+def test_switching_threads_drops_the_previous_readiness_answers():
+    """Keeping them would show one consultation's data questions under another's title."""
+    code = _strip_comments(_front())
+    for fn in ("function selectTask(id)", "function newThread()"):
+        body = code[code.index(fn):]
+        body = body[:body.index("\n}")]
+        assert "READY_DATA = null" in body, f"{fn} leaks the previous thread's readiness"
+
+
+def test_a_failed_readiness_fetch_leaves_the_thread_working():
+    """The panel is an extra, not the thread. An unhandled rejection here would stop the
+    render that follows it and freeze the conversation."""
+    code = _strip_comments(_front())
+    body = code[code.index("async function loadReadiness(t)"):]
+    body = body[:body.index("\n}")]
+    assert "catch" in body
+
+
+def test_the_thread_renderer_paints_every_new_piece():
+    """renderThread is the panel's only entry point (that is why it exists). A piece it
+    forgets to call renders once and then never updates again."""
+    code = _strip_comments(_front())
+    body = code[code.index("function renderThread(t)"):]
+    body = body[:body.index("\n}")]
+    for fn in ("renderChoices(t)", "renderDrop(t)", "renderReadiness(t)", "loadReadiness(t)"):
+        assert fn in body, f"renderThread never calls {fn}"
