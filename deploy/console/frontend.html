@@ -735,6 +735,30 @@ async function loadRun(runId){
         (tj.failureReason?`<div class="sub">${esc(tj.failureReason)}</div>`:"")+`</span>`+
         `<span class="pill ${badge(tj.status)}">${esc(tj.status)}${tj.secondaryStatus?" · "+esc(tj.secondaryStatus):""}</span></div>`;
     }
+    // Verdicts parked against this run. Rendered ABOVE the stage events, and as their
+    // own section, because they are answers rather than moments: a directive is what a
+    // human or the conductor DECIDED about this run. They used to arrive mixed into
+    // d.events, where they sorted last (`"d" > "2"`), carried no `detail`, and so showed
+    // as blank rows that pushed the newest real events out of the slice below.
+    const dirs = d.directives||[];
+    if (dirs.length) {
+      html += `<h2 style="margin-top:12px">Verdicts on this run (${dirs.length})</h2>`+
+        `<table><tr><th>When · who</th><th>Decision</th><th>Reached the run?</th></tr>`+
+        dirs.map(v=>{
+          // "False" arrives as a STRING from the projection; the truthiness of a
+          // non-empty string is not the question being asked here.
+          const ok = String(v.deliverable).toLowerCase() === "true";
+          const got = String(v.delivered).toLowerCase() === "true";
+          // Undeliverable is the state worth shouting about: the verdict was recorded
+          // and no agent can ever read it, which is the failure this column exists for.
+          const lbl = !ok ? `never delivered${v.run_status_at_put?" — run was "+esc(v.run_status_at_put):""}`
+                    : got ? "picked up by the run" : "parked, awaiting pickup";
+          const cls = !ok ? "err" : got ? "ok" : "warn";
+          return `<tr><td class="mono">${esc(String(v.sk).replace("directive#",""))}`+
+                 `${v.actor?` <span class="sub">${esc(v.actor)}</span>`:""}</td>`+
+                 `<td>${esc(v.decision)}${v.rationale?`<div class="sub">${esc(String(v.rationale).slice(0,220))}</div>`:""}</td>`+
+                 `<td><span class="pill ${cls}">${lbl}</span></td></tr>`;}).join("")+`</table>`;
+    }
     // stage events
     const evs = d.events||[];
     if (evs.length) {

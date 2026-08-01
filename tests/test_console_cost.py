@@ -108,21 +108,48 @@ def _fake_boto3():
     conds = types.ModuleType("boto3.dynamodb.conditions")
 
     class _Cond:
+        """A key/filter condition that RECORDS what was asked.
+
+        It used to keep one (op, val) pair and define `__and__` as `return self`, which
+        silently discarded the right-hand side of every compound condition. Any table
+        stub built on it therefore could not see -- and so could not test -- the sk range
+        half of a `PK eq AND SK <op>` query. That is not a harmless simplification: it is
+        what let a query returning rows it should have excluded look correct in tests.
+
+        `terms` is the flat list of (attr, op, val) an AND chain contributed, so a stub
+        can evaluate the real predicate. Comparison methods are named after the boto3
+        ones the console actually calls; an unimplemented one raises on use rather than
+        being quietly absent.
+        """
+
         def __init__(self, key):
             self.key = key
             self.op = None
             self.val = None
+            self.terms = []
+
+        def _rec(self, op, v):
+            self.op, self.val = op, v
+            self.terms = [(self.key, op, v)]
+            return self
 
         def eq(self, v):
-            self.op, self.val = "eq", v
-            return self
+            return self._rec("eq", v)
 
         def gte(self, v):
-            self.op, self.val = "gte", v
-            return self
+            return self._rec("gte", v)
+
+        def lt(self, v):
+            return self._rec("lt", v)
+
+        def begins_with(self, v):
+            return self._rec("begins_with", v)
 
         def __and__(self, other):
-            return self
+            combined = _Cond(self.key)
+            combined.op, combined.val = self.op, self.val
+            combined.terms = list(self.terms) + list(getattr(other, "terms", []))
+            return combined
 
     conds.Key = _Cond
     conds.Attr = _Cond

@@ -560,9 +560,78 @@ def pipeline_detail(execution=None):
             "escalated": escalated, "terminal": exec_status if terminal else None}
 
 
+#: The sk prefix the driver parks human/conductor verdicts under (its DIRECTIVE_SK).
+#: Duplicated deliberately rather than imported: the driver ships in a different
+#: bundle, and the guard in tests/ asserts the two constants still agree, so drift
+#: fails a test instead of silently splitting the timeline.
+DIRECTIVE_SK = "directive#"
+
+#: Upper bound of the stage-timeline sk range. Stage-event sks are ISO timestamps, so
+#: they always begin with a digit; every non-event row in this table uses a named
+#: `word#` prefix instead. In ASCII digits sort below every letter, so "A" is the
+#: boundary between "a moment in this run" and "a record filed against this run".
+#:
+#: Bounding on "A" rather than on DIRECTIVE_SK is the difference between a fix and the
+#: next instance of this bug: `lt(DIRECTIVE_SK)` would also exclude any prefix that
+#: sorts after `directive#` (`finding#`, `note#`, ...), so the next prefix added would
+#: vanish from BOTH lists with nothing to notice it. This bound excludes by *shape* --
+#: unknown prefixes stay out of the stage timeline, which is what they are, and they
+#: can never displace an event.
+TIMELINE_SK_MAX = "A"
+
+
+def _directive_view(d):
+    """A parked verdict, projected for display.
+
+    `deliverable` and `delivered` are carried deliberately: they are the whole point of
+    the undeliverable-verdict fix. A verdict written against a run that can never read
+    it must not render identically to one an agent acted on -- that indistinguishability
+    is exactly how the data-prep escalation read as answered for three days.
+    """
+    return {"sk": str(d.get("sk", "")),
+            "decision": str(d.get("decision", "")),
+            "rationale": str(d.get("rationale", ""))[:500],
+            "actor": str(d.get("actor", "")),
+            "deliverable": str(d.get("deliverable", "")),
+            "delivered": str(d.get("delivered", "")),
+            "run_status_at_put": str(d.get("run_status_at_put", ""))}
+
+
+def _timeline(run_id, limit=100):
+    """(stage events, directives) for a run -- as two queries, not one filtered list.
+
+    The driver's DIRECTIVE_SK comment claims the prefix keeps directives "out of the
+    timeline the console renders". It did not: neither reader filtered on sk, and the
+    prefix makes it *worse* than harmless. `"d" > "2"`, so every `directive#` row sorts
+    AFTER every ISO-timestamped event, which puts them exactly where the frontend looks
+    (`evs.slice(-25)`) -- and a directive row carries no `detail` attribute, so it
+    renders as a blank line. Ten parked verdicts on a busy run therefore showed ten
+    blank rows and pushed the ten newest real events off the screen.
+
+    Splitting the query rather than filtering in Python is the load-bearing part: a
+    single `Limit`-ed query spends its budget on directives before the events reach us,
+    so filtering afterwards would leave a short timeline with no indication anything
+    was dropped. Two `begins_with` ranges each get their own budget.
+
+    Directives are RETURNED, not discarded -- a verdict is the audit record of what was
+    decided, and #16 is the case study in what unread records cost. They are just kept
+    out of the stage timeline so a reader can tell an event from an answer.
+    """
+    if not events_tbl:
+        return [], []
+    evs = events_tbl.query(
+        KeyConditionExpression=Key("run_id").eq(run_id) & Key("sk").lt(TIMELINE_SK_MAX),
+        Limit=int(limit)).get("Items", [])
+    dirs = events_tbl.query(
+        KeyConditionExpression=(Key("run_id").eq(run_id)
+                                & Key("sk").begins_with(DIRECTIVE_SK)),
+        ScanIndexForward=False, Limit=int(limit)).get("Items", [])
+    return evs, dirs
+
+
 # ── /api/run: manifest + stage events + training job + gate verdict ──────────
 def run_detail(run_id):
-    out = {"runId": run_id, "manifest": None, "events": [], "gates": [],
+    out = {"runId": run_id, "manifest": None, "events": [], "directives": [], "gates": [],
            "gateVerdict": None, "trainingJob": None}
     if not run_id:
         return {"error": "run_id required"}
@@ -573,8 +642,9 @@ def run_detail(run_id):
         out["manifestError"] = str(e)[:150]
     if events_tbl:
         try:
-            r = events_tbl.query(KeyConditionExpression=Key("run_id").eq(run_id), Limit=100)
-            out["events"] = r.get("Items", [])
+            evs, dirs = _timeline(run_id)
+            out["events"] = evs
+            out["directives"] = [_directive_view(d) for d in dirs]
         except Exception as e:
             out["eventsError"] = str(e)[:150]
     # gate verdict: thresholds from params.gates vs eval stage metrics
@@ -2148,15 +2218,18 @@ def get_task(task_id):
     if not item:
         return {"error": "unknown task", "status_code": 404}
     out = json.loads(json.dumps(item, default=str))
-    # event timeline feeds the lifecycle flow diagram
+    # event timeline feeds the lifecycle flow diagram. Directives come back on their
+    # own key for the same reason as in run_detail: they sort after every event, so
+    # left in the list they render as blank rows and push real events out of view.
     try:
-        evs = events_tbl.query(KeyConditionExpression=Key("run_id").eq(task_id),
-                               ScanIndexForward=True).get("Items", [])
+        evs, dirs = _timeline(task_id)
         out["events"] = [{"sk": str(e.get("sk", "")),
                           "event_name": str(e.get("event_name", "")),
                           "detail": str(e.get("detail", ""))[:500]} for e in evs]
+        out["directives"] = [_directive_view(d) for d in dirs]
     except Exception:
         out["events"] = []
+        out["directives"] = []
     return out
 
 
