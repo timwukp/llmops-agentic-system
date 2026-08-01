@@ -1086,13 +1086,23 @@ function taskStageStates(t){
   // maps a task's status onto the 7 lifecycle nodes: done/active/idle
   const s = t ? String(t.status||"") : "";
   const done = [], activeSet = new Set();
+  // completed/failed are written by the state machine itself (MarkTaskDone /
+  // MarkTaskFailed), not by this console — a run reaching a terminal state closes
+  // the task it was dispatched from. They sit at the last node: the order is
+  // walked to the END, so every node before it reads done.
   const order = {drafting:0, thinking:0, data_audit:1, plan_proposed:2,
-                 pending_approval:3, accepting:4, dispatched:5, closed:0, error:0};
+                 pending_approval:3, accepting:4, dispatched:5,
+                 completed:6, failed:6, closed:0, error:0};
+  // Terminal statuses light nothing: a task that has ENDED is not in flight, and
+  // an unknown status must not fall through to 0 and render a finished task as
+  // active at "Requirements".
+  const TERMINAL = ["closed", "error", "completed", "failed"];
   const pos = (s in order) ? order[s] : 0;
   TASK_STAGES.forEach((st,i)=>{
     if (i < pos) done.push(st.key);
-    if (i === pos && s !== "closed" && s !== "error") activeSet.add(st.key);
+    if (i === pos && !TERMINAL.includes(s)) activeSet.add(st.key);
   });
+  if (s === "completed") done.push(TASK_STAGES[TASK_STAGES.length-1].key);
   if (s === "dispatched") { activeSet.add("run"); activeSet.add("cost"); }
   return {done, active: activeSet, status: s};
 }
@@ -1120,8 +1130,17 @@ function renderTaskFlow(t){
   let note = "";
   if (st.status === "pending_approval")
     note = `<div class="sub" style="margin-top:6px;color:var(--amber)">over the spend limit — waiting for an approver on the <a href="#" onclick="showTab('cost');return false" style="color:var(--accent)">Cost tab</a></div>`;
-  if (st.status === "dispatched" && t.run_id)
-    note = `<div class="sub" style="margin-top:6px">run <a href="#" onclick="showTab('pipeline');loadRun('${esc(t.run_id)}');return false" style="color:var(--accent)" class="mono">${esc(t.run_id)}</a> dispatched — follow it on Pipeline / Cost</div>`;
+  // The run link belongs on every status that HAS a run, not just dispatched:
+  // after the state machine closes the task, the run is the only place the reason
+  // lives, so that is exactly when a reader needs the link most.
+  if (["dispatched","completed","failed"].includes(st.status) && t.run_id){
+    const verb = st.status === "completed" ? "completed"
+               : st.status === "failed" ? "ended failed" : "dispatched";
+    const tail = st.status === "dispatched" ? " — follow it on Pipeline / Cost"
+               : ` at ${esc(t.closed_at || "an unrecorded time")} — see Pipeline / Cost`;
+    const col = st.status === "failed" ? "var(--red)" : "var(--muted)";
+    note = `<div class="sub" style="margin-top:6px;color:${col}">run <a href="#" onclick="showTab('pipeline');loadRun('${esc(t.run_id)}');return false" style="color:var(--accent)" class="mono">${esc(t.run_id)}</a> ${verb}${tail}</div>`;
+  }
   if (st.status === "error")
     note = `<div class="sub" style="margin-top:6px;color:var(--red)">error: ${esc(t.error_msg||"")}</div>`;
   el.innerHTML = svg + note;

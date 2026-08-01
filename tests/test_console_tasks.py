@@ -1009,3 +1009,41 @@ def test_signature_field_is_excluded_from_the_signed_digest():
     signed = conductor_tools.sign_record(kmsf, rec)
     # verifying uses only SIGNED_KEYS, so the signature's presence must not change it
     assert conductor_tools.record_sha256(signed) == conductor_tools.record_sha256(rec)
+
+
+# ── the lifecycle flow must know every status something can write ─────────────
+
+def test_the_lifecycle_flow_renders_every_terminal_status_the_pipeline_writes():
+    """The state machine now closes tasks, and it writes statuses the UI never saw.
+
+    taskStageStates() maps a status onto the 7 lifecycle nodes via an `order`
+    lookup with `(s in order) ? order[s] : 0` -- so an UNKNOWN status silently
+    becomes position 0 and the task renders as *active at Requirements*. A run
+    that finished an hour ago would look like a consultation that had barely
+    started, which is worse than the zombie 'dispatched' the closers were added
+    to fix: that at least said something true.
+
+    The statuses are read out of the ASL closers rather than listed here, so
+    adding a third closer (or renaming a status) fails this instead of quietly
+    reintroducing the mis-render.
+    """
+    asl = json.loads((REPO / "orchestration/state_machine.asl.json").read_text())
+    written = set()
+    for st in asl["States"].values():
+        p = st.get("Parameters", {})
+        if p.get("TableName") != "llmops-tasks":
+            continue
+        for name, val in p.get("ExpressionAttributeValues", {}).items():
+            # only the values the UpdateExpression assigns to #s (status)
+            if f"#s = {name}" in p.get("UpdateExpression", ""):
+                written.add(val["S"])
+    assert written, "no llmops-tasks closer found -- did the state names change?"
+
+    front = (REPO / "deploy/console/frontend.html").read_text()
+    order = front[front.index("const order = {"):]
+    order = order[:order.index("};") + 1]
+    missing = sorted(s for s in written if f"{s}:" not in order)
+    assert not missing, (
+        f"the state machine writes task status {missing} but taskStageStates()'s "
+        "order map has no entry, so `(s in order) ? order[s] : 0` renders a "
+        "finished task as active at the first node")
