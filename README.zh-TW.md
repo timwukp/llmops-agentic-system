@@ -19,7 +19,7 @@
 | Skill | 在此扮演的角色 |
 |---|---|
 | [agentcore-harness-builder](https://github.com/timwukp/agent-skills-best-practice/tree/main/skills/skills/agentcore-harness-builder) | **平台構建** —— 其規定工作流（preflight → 設計 → 撰寫配置 → 建立 → 記憶 → 可觀測性 → 調用驗證 → 版本/釘選 → 評估）構建了每一個 harness；其腳本直接複用於 `deploy/` |
-| [MLOps-agent-skills](https://github.com/timwukp/MLOps-agent-skills)（LLMOps 鏈） | **Agent 能力** —— 每個 harness 在 session 啟動時通過 harness `skills` 來源掛載其階段所需的技能（目前 19 個來源全部是 `git`；S3 鏡像是計劃中的工作，也是 VPC 模式的前置條件） |
+| [MLOps-agent-skills](https://github.com/timwukp/MLOps-agent-skills)（LLMOps 鏈） | **Agent 能力** —— 每個 harness 在 session 啟動時通過 harness `skills` 來源掛載其階段所需的技能（目前 19 個來源全部是 `s3` —— 由 `ensure_skills` 鏡像並先驗證 frontmatter 的釘選快照；git 來源會隨技能 repo 的 main 漂移，而且在 VPC 模式下根本連不上） |
 
 ## 架構
 

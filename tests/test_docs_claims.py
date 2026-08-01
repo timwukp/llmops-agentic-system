@@ -106,36 +106,62 @@ def _skill_sources() -> dict[str, dict[str, int]]:
 
 
 def test_the_skill_source_claims_match_the_harness_configs():
-    """The docs state 19 git sources and 0 s3. Derive both from the configs.
+    """The docs state 19 sources and which KIND they are. Derive both from the configs.
 
     Stating "19 git, 0 s3" in prose is exactly the kind of claim that was false here
-    before, so it is checked against the files. When the s3 migration lands, this test
-    fails and names the new numbers -- which is the point: the docs must move with it,
-    in the same commit, or the next reader is told the migration never happened.
+    before, so it is checked against the files. It has now been through the migration it
+    was written to catch: the sources moved to s3 and this test failed and named the new
+    numbers, which is what forced the eight docs to move in the same commit.
+
+    Both halves are asserted, because either one alone can be true while the sentence as
+    a whole misleads:
+      * the COUNT, against the total number of sources -- not against the git total. Read
+        against git alone it would go green the moment the last git source disappeared and
+        the docs still said 19, since 19 != 0 would be the only thing that failed and a
+        doc dropping the number entirely is caught by the `silent` check above, not here.
+      * the KIND named next to the count. A doc left saying "19 sources, all `git`" is
+        precisely as wrong as one saying 4, and the count check cannot see it.
     """
     counts = _skill_sources()
     git_n = sum(k.get("git", 0) for k in counts.values())
     s3_n = sum(k.get("s3", 0) for k in counts.values())
+    total = git_n + s3_n
+    want_kind = "s3" if s3_n else "git"
     claims = []
     for doc in DOC_SKILL_CLAIMS:
         text = doc.read_text()
-        for m in re.finditer(r"(\d+)\s+(?:skill sources|sources)", text):
-            claims.append((doc.name, int(m.group(1))))
-        for m in re.finditer(r"(\d+)\s*個(?:技能)?來源", text):
-            claims.append((doc.name, int(m.group(1))))
+        # The lookbehind is load-bearing: without it the phrase "the s3 sources work"
+        # parses as a claim of THREE sources, and the guard fails on prose that states no
+        # count at all. Any count claim is preceded by whitespace or start-of-line.
+        for pattern in (r"(?<![A-Za-z0-9_])(\d+)\s+(?:skill sources|sources)",
+                        r"(?<![A-Za-z0-9_])(\d+)\s*個(?:技能)?來源"):
+            for m in re.finditer(pattern, text):
+                # The kind is whichever of git/s3 is named FIRST after the count: the
+                # corrected prose reads "are `s3` today; none are `git`", so merely
+                # looking for the expected token in the window would also accept the
+                # sentence with the two swapped.
+                after = text[m.end():m.end() + 160]
+                kinds = re.findall(r"`(git|s3)`", after)
+                claims.append((doc.name, int(m.group(1)), kinds[0] if kinds else None))
     # Per-doc, not "at least one doc". Requiring only one leaves the guard satisfied
     # while the count is quietly deleted from the other seven -- the check would then be
     # anchored to whichever file still happens to mention it. Each doc in the list either
     # states the count or is not in the list.
-    stating = {name for name, _ in claims}
+    stating = {name for name, _, _ in claims}
     silent = [d.name for d in DOC_SKILL_CLAIMS if d.name not in stating]
     assert not silent, (
         f"these docs no longer state a skill-source count: {silent}. The counts were "
         "wrong before, so dropping them removes the check rather than passing it. Either "
         "state the count or remove the file from DOC_SKILL_CLAIMS deliberately.")
-    wrong = [f"{name} says {n}, configs have {git_n} git sources"
-             for name, n in claims if n != git_n]
+    wrong = [f"{name} says {n}, configs have {total} skill sources"
+             for name, n, _ in claims if n != total]
     assert not wrong, "; ".join(wrong) + f" (per-config: {counts})"
+    miskind = [f"{name} calls the {n} sources {k!r}" for name, n, k in claims
+               if k != want_kind]
+    assert not miskind, (
+        "; ".join(miskind) + f", but the configs have {git_n} git and {s3_n} s3. "
+        "A count that is right about the number and wrong about the kind still tells the "
+        "reader the migration never happened.")
     assert s3_n == 0 or git_n == 0, (
         f"skill sources are now MIXED ({git_n} git, {s3_n} s3): {counts}. A partial "
         "migration means some harnesses read a pinned snapshot and others float on the "

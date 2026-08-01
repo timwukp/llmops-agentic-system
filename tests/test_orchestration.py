@@ -1840,10 +1840,24 @@ class TestConductorDispatch:
 
         Asserted on both harnesses: it is a MOUNT, not a move. data-prep still needs it to
         do the work the answers describe.
+
+        The path is read from the git path OR the s3 URI, because this guard asks WHICH
+        SKILL is mounted and that question is independent of where the bytes come from. Read
+        git-only, it went quietly green-on-nothing at the s3 migration: every skill became
+        an empty string, and `want in {""}` is simply False for both agents -- so the day
+        the mount was actually intact it failed, and a day the mount was deleted it would
+        have failed identically. A guard that cannot distinguish those two is not a guard.
         """
         def skill_paths(agent):
             h = json.loads((REPO / f"agents/{agent}/harness.json").read_text())
-            return {s.get("git", {}).get("path", "") for s in (h.get("skills") or [])}
+            out = set()
+            for s in h.get("skills") or []:
+                if "git" in s:
+                    out.add(s["git"].get("path", ""))
+                elif isinstance(s.get("s3"), dict):
+                    rest = s["s3"].get("uri", "").split("://", 1)[-1]
+                    out.add(rest.split("/", 1)[1].rstrip("/") if "/" in rest else "")
+            return out
 
         want = "skills/llmops/llm-data-preparation"
         assert want in skill_paths("orchestrator"), (
@@ -2328,14 +2342,45 @@ def test_the_sync_covers_every_skill_the_configs_mount(storage_mod):
     mounts = storage_mod.mounted_skills(REPO)
     total = sum(len(v) for v in mounts.values())
     configs = sorted((REPO / "agents").glob("*/harness.json"))
+    # BOTH kinds. Counting only `git` would make this guard evaporate at exactly the
+    # moment it matters: after the migration every source is `s3`, so a git-only sync
+    # plan covers 0 mounts, a git-only expectation is also 0, and 0 == 0 passes while the
+    # mirror has stopped syncing the only copy any agent ever reads.
     from_cfg = sum(1 for c in configs
                    for s in (json.loads(c.read_text()).get("skills") or [])
-                   if "git" in s)
+                   if "git" in s or "s3" in s)
     assert total == from_cfg, (
-        f"the sync plan covers {total} mounts but the configs declare {from_cfg} git "
-        "sources; a mount the sync does not know about is a skill that vanishes when "
-        "its source is switched to s3")
+        f"the sync plan covers {total} mounts but the configs declare {from_cfg} git+s3 "
+        "sources; a mount the sync does not know about is a skill that goes stale in S3 "
+        "while every config still reads healthy")
     assert mounts, "no mounts found at all -- the glob or the config shape changed"
+
+
+def test_the_sync_still_covers_a_skill_once_its_source_is_s3(storage_mod, tmp_path):
+    """After the migration S3 is the ONLY copy an agent reads, so that is precisely when
+    the mirror must keep syncing it.
+
+    The first version of `mounted_skills` collected `git` only, reasoning that an entry
+    already on s3 needs no upload. That inverts at the switch: a git-only plan silently
+    covers nothing, and the coverage guard above compares 0 to 0 and passes, so the next
+    skill edit would never reach any agent. The path is recovered from the URI because the
+    s3 source shape is a single `uri` with no `path` field.
+    """
+    agents = tmp_path / "agents"
+    (agents / "monitor").mkdir(parents=True)
+    (agents / "monitor" / "harness.json").write_text(json.dumps({"skills": [
+        {"s3": {"uri": "s3://llmops-data/skills/llmops/llm-observability"}},
+        {"s3": {"uri": "s3://<DATA_BUCKET>/skills/llmops/llm-cost-optimization"}},
+        {"git": {"url": "u", "path": "skills/llmops/llm-agent-orchestration"}},
+    ]}))
+    mounts = storage_mod.mounted_skills(tmp_path)
+    assert set(mounts) == {"skills/llmops/llm-observability",
+                           "skills/llmops/llm-cost-optimization",
+                           "skills/llmops/llm-agent-orchestration"}, (
+        f"an s3-sourced mount was dropped from the mirror plan: {mounts}")
+    assert mounts["skills/llmops/llm-cost-optimization"] == ["monitor"], (
+        "an UNRESOLVED <DATA_BUCKET> must yield the same repo-relative path as a resolved "
+        "bucket, so the plan is identical before and after substitution")
 
 
 def test_a_skill_entry_with_sibling_keys_is_still_collected(storage_mod, tmp_path):
@@ -3115,3 +3160,130 @@ def test_the_sweep_function_is_deployed_by_the_deployer_that_schedules_it():
     entry = lambdas.split('"monitor_sweep": {')[1].split("},")[0]
     for key in ("EVENTS_TABLE", "DATA_BUCKET", "DRIVER_FN", "PROJECT"):
         assert key in entry, f"{key} is read by the handler and not passed at deploy time"
+
+
+# --- #42: placeholder substitution for harness configs --------------------------------
+# The s3 skill-source shape is a single URI that embeds the bucket name, and this
+# account's bucket name embeds the account id -- which may not appear in a file of this
+# public repo (hooks/pre-commit + .github/workflows/redaction-check.yml). So the configs
+# carry <DATA_BUCKET> and the deploy resolves it. deploy/01_iam.py has resolved exactly
+# these tokens in its policy documents since Phase 1; this is that mechanism applied to
+# agents/*/harness.json, which had NO substitution step at all before this change.
+
+@pytest.fixture(scope="module")
+def subst():
+    return _load("llmops_config_subst", "deploy/config_subst.py")
+
+
+@pytest.fixture(scope="module")
+def harnesses_mod():
+    """deploy/05_harnesses.py as a module (name starts with a digit). Import-time safe."""
+    return _load("llmops_05_harnesses", "deploy/05_harnesses.py")
+
+
+def test_no_harness_config_contains_a_literal_account_id():
+    """The redaction scan enforces this repo-wide; this says WHY for these files.
+
+    A CI failure reading "possible account ID found" does not tell the next person that a
+    skill URI is the reason a bucket name wanted to be literal here, nor that a
+    placeholder is the supported way to write one.
+    """
+    import re as _re
+    bad = []
+    for cfg in sorted((REPO / "agents").glob("*/harness*.json")):
+        for m in _re.finditer(r"(?<![0-9.])[0-9]{12}(?![0-9.])", cfg.read_text()):
+            bad.append(f"{cfg.relative_to(REPO)}: {m.group(0)}")
+    assert not bad, (
+        f"literal 12-digit account id(s) in harness configs: {bad}. Write <ACCOUNT_ID> / "
+        "<DATA_BUCKET> instead -- deploy/config_subst.py resolves them at deploy time, "
+        "and the CI redaction scan fails the build on a literal one.")
+
+
+def test_every_s3_skill_uri_uses_the_bucket_placeholder():
+    """An s3 source must name <DATA_BUCKET>, not a bucket spelled out.
+
+    Enforced separately from the account-id guard because a hardcoded bucket without an
+    account id in the name (`my-skills-bucket`) passes redaction and still pins every
+    harness to one account's storage.
+    """
+    wrong = []
+    for cfg in sorted((REPO / "agents").glob("*/harness*.json")):
+        for i, s in enumerate(json.loads(cfg.read_text()).get("skills") or []):
+            uri = (s.get("s3") or {}).get("uri")
+            if uri and not uri.startswith("s3://<DATA_BUCKET>/"):
+                wrong.append(f"{cfg.relative_to(REPO)} skills[{i}]: {uri}")
+    assert not wrong, (
+        "s3 skill sources must be written s3://<DATA_BUCKET>/<path>: " + "; ".join(wrong))
+
+
+def test_every_placeholder_a_config_uses_has_a_value(subst):
+    """A token nobody can resolve is the failure this whole mechanism exists to prevent.
+
+    `<DATABUCKET>` would sail past the linter, past validate_config, and past
+    UpdateHarness -- which mints a version and reports READY -- and then kill every
+    session at START. So the set of tokens the configs use must be a subset of the set the
+    mapping knows.
+    """
+    known = set(subst.mapping_for("123456789012", "us-east-1"))
+    for cfg in sorted((REPO / "agents").glob("*/harness*.json")):
+        used = set(subst.unresolved(json.loads(cfg.read_text())))
+        unknown = used - known
+        assert not unknown, (
+            f"{cfg.relative_to(REPO)} uses {sorted(unknown)}, which nothing resolves. "
+            f"Known tokens: {sorted(known)}. AgentCore accepts an unresolved URI and the "
+            "harness fails at session start, not at deploy.")
+
+
+def test_resolve_refuses_a_config_with_a_token_left_in_it(subst):
+    """The load-bearing half. Substituting is easy; refusing to ship the leftover is the
+    part that turns a session-start failure into a deploy-time error."""
+    cfg = {"skills": [{"s3": {"uri": "s3://<DATA_BUCKET>/skills/x"}},
+                      {"s3": {"uri": "s3://<DATABUCKET>/skills/y"}}]}
+    mapping = subst.mapping_for("123456789012", "us-east-1")
+    with pytest.raises(SystemExit, match="DATABUCKET"):
+        subst.resolve(cfg, mapping, where="agents/x/harness.json")
+
+
+def test_resolve_reports_every_unresolved_token_not_just_the_first(subst):
+    """One deploy names every token you must supply, instead of one per re-run."""
+    cfg = {"a": "<ONE>", "b": ["<TWO>", {"c": "<THREE>"}]}
+    with pytest.raises(SystemExit) as e:
+        subst.resolve(cfg, {}, where="x")
+    for tok in ("<ONE>", "<TWO>", "<THREE>"):
+        assert tok in str(e.value), f"{tok} was not reported: {e.value}"
+
+
+def test_substitution_reaches_a_skill_uri_nested_in_a_list(subst):
+    """skills is a LIST of dicts, so a substituter that only walked dict VALUES would
+    leave every skill URI untouched while resolving the flat fields and reporting success."""
+    cfg = {"harnessName": "llmops_monitor",
+           "skills": [{"s3": {"uri": "s3://<DATA_BUCKET>/skills/llmops/llm-observability"}}]}
+    out = subst.resolve(cfg, subst.mapping_for("123456789012", "us-east-1",
+                                               bucket="llmops-agentic-x"))
+    assert out["skills"][0]["s3"]["uri"] == \
+        "s3://llmops-agentic-x/skills/llmops/llm-observability"
+
+
+def test_an_explicit_bucket_beats_the_derived_one(subst):
+    """03_storage.py PUBLISHES the bucket to SSM; a name derived from the account id would
+    disagree with it after any deploy that passed --bucket, and a skill URI pointing at a
+    bucket that does not exist fails at session start."""
+    m = subst.mapping_for("123456789012", "us-east-1", bucket="chosen-bucket")
+    assert m["<DATA_BUCKET>"] == "chosen-bucket"
+    assert subst.mapping_for("123456789012", "us-east-1")["<DATA_BUCKET>"] == \
+        "llmops-agentic-123456789012-us-east-1"
+
+
+def test_the_deployer_resolves_placeholders_before_sending_a_config(harnesses_mod):
+    """05_harnesses.load_config must return a resolved config, and must REFUSE one that
+    still carries a token. It did neither before #42: the script's only transforms were
+    strip_comments and ensure_env, so a placeholder URI had nothing to resolve it."""
+    mapping = {"<ACCOUNT_ID>": "123456789012", "<REGION>": "us-east-1",
+               "<DATA_BUCKET>": "bkt"}
+    cfg = harnesses_mod.load_config("monitor", prod=False, mapping=mapping)
+    left = [s for s in json.dumps(cfg).split() if "<DATA_BUCKET>" in s]
+    assert not left, f"load_config returned unresolved tokens: {left}"
+    for skill in cfg.get("skills") or []:
+        uri = (skill.get("s3") or {}).get("uri")
+        if uri:
+            assert uri.startswith("s3://bkt/"), f"{uri} was not substituted"

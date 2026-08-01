@@ -209,16 +209,39 @@ def mounted_skills(repo):
     fails at SESSION START, on every invocation, with the config still reading healthy.
     So the sync follows the configs by construction.
 
-    Only `git` sources are collected. An entry already on `s3` needs no upload, and an
-    entry may carry sibling keys (one currently carries a `_comment`), so membership is
+    BOTH `git` and `s3` sources are collected, and that is the load-bearing detail. The
+    first version collected only `git`, on the reasoning that "an entry already on s3
+    needs no upload" -- which inverts the dependency the moment the migration lands. Once
+    every source reads `s3://<bucket>/skills/...`, S3 is the ONLY copy the agents ever
+    see, so it is exactly then that the mirror must keep syncing it. A git-only sync would
+    have gone quietly empty at the switch, taking its own coverage guard with it (0 mounts
+    compared against 0 git sources passes), and the next skill edit would never reach any
+    agent while every config still read healthy.
+
+    An `s3` entry's repo-relative path is recovered from its URI rather than from a
+    `path` key, because the s3 source shape is a single `uri` with no path field. The
+    bucket is dropped: what is returned is the path both source kinds name identically
+    (`skills/llmops/llm-evaluation`), which is what makes the key mechanical.
+
+    An entry may carry sibling keys (one currently carries a `_comment`), so membership is
     tested by key rather than by taking the entry's first key.
     """
     mounts = {}
     for cfg in sorted((repo / "agents").glob("*/harness.json")):
         for skill in json.loads(cfg.read_text()).get("skills") or []:
+            path = None
             git = skill.get("git")
+            s3src = skill.get("s3")
             if git and git.get("path"):
-                mounts.setdefault(git["path"], []).append(cfg.parent.name)
+                path = git["path"]
+            elif isinstance(s3src, dict) and s3src.get("uri"):
+                # s3://<bucket>/<path> -> <path>. A placeholder bucket (<DATA_BUCKET>) is
+                # unresolved in the repo file and is discarded here along with the real
+                # one, so the mirror plan is the same before and after substitution.
+                rest = s3src["uri"].split("://", 1)[-1]
+                path = rest.split("/", 1)[1].rstrip("/") if "/" in rest else None
+            if path:
+                mounts.setdefault(path, []).append(cfg.parent.name)
     return mounts
 
 

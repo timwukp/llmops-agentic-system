@@ -3,8 +3,14 @@
 
 Thin orchestrator over the agentcore-harness-builder skill's create_harness.py /
 update_harness.py conventions: reads each config, strips `_`-prefixed comment keys,
-injects the execution role from SSM, creates the harness (or updates it if it
-already exists), waits READY, and publishes ids to SSM /llmops/harness/<name>.
+resolves <ACCOUNT_ID>/<REGION>/<DATA_BUCKET> placeholders, injects the execution role
+from SSM, creates the harness (or updates it if it already exists), waits READY, and
+publishes ids to SSM /llmops/harness/<name>.
+
+The placeholders exist because an s3 skill source is a single URI that embeds the bucket
+name, and this account's bucket name embeds the account id -- which may not appear in a
+file of this public repo. See deploy/config_subst.py for why an unresolved token is a
+hard error and not a warning.
 
 Also sets the observability env var the ops console requires on EVERY harness:
 OTEL_TRACES_SAMPLER=always_on (without it, evaluations/insights sit at zero).
@@ -24,6 +30,9 @@ import time
 
 import boto3
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import config_subst  # noqa: E402 — deploy/ is not a package; path is set just above
+
 REPO = pathlib.Path(__file__).resolve().parent.parent
 AGENTS = ["data-prep", "finetune", "eval", "deploy", "monitor", "orchestrator",
           # The auditor. Listed here and not only in agents/ because this list is
@@ -40,12 +49,23 @@ def strip_comments(obj):
     return obj
 
 
-def load_config(agent, prod):
+def load_config(agent, prod, mapping=None):
+    """Read a harness config, strip comment keys, and resolve deploy-time placeholders.
+
+    `mapping` is None only for callers that genuinely have no account/region to resolve
+    with; passing None leaves tokens in place, which the resolve step would otherwise
+    reject. Every real deploy path passes one -- including --dry-run, which derives it
+    from --account-id so the dry run exercises the same substitution the real run does.
+    A dry run that skipped substitution would report a config nobody will ever send.
+    """
     fname = "harness.prod.json" if prod else "harness.json"
     path = REPO / "agents" / agent / fname
     if not path.exists():
         raise FileNotFoundError(f"{path} (run with/without --prod?)")
-    return strip_comments(json.loads(path.read_text()))
+    cfg = strip_comments(json.loads(path.read_text()))
+    if mapping is None:
+        return cfg
+    return config_subst.resolve(cfg, mapping, where=str(path.relative_to(REPO)))
 
 
 def ensure_env(cfg):
@@ -231,6 +251,8 @@ def main():
     ap.add_argument("--region", required=True)
     ap.add_argument("--agent", action="append", choices=AGENTS)
     ap.add_argument("--prod", action="store_true", help="use harness.prod.json variants")
+    ap.add_argument("--account-id", help="for offline --dry-run placeholder resolution")
+    ap.add_argument("--bucket", help="override the data bucket in <DATA_BUCKET>")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
     agents = args.agent or AGENTS
@@ -244,12 +266,32 @@ def main():
         config=boto3.session.Config(read_timeout=300, retries={"max_attempts": 1}))
 
     role_arn = None
+    account_id, bucket = args.account_id, args.bucket
     if not args.dry_run:
         role_arn = ssm.get_parameter(Name="/llmops/iam/harness_execution_arn")["Parameter"]["Value"]
+        account_id = account_id or boto3.client(
+            "sts", region_name=args.region).get_caller_identity()["Account"]
+        # Prefer the bucket 03_storage.py actually PUBLISHED over one derived from the
+        # account id. The derived name is right for this account and would be wrong for a
+        # deploy that passed 01_iam.py --bucket; a skill URI pointing at a bucket that
+        # does not exist fails at session start, not here.
+        if not bucket:
+            try:
+                bucket = ssm.get_parameter(
+                    Name="/llmops/storage/bucket")["Parameter"]["Value"]
+            except ssm.exceptions.ParameterNotFound:
+                pass  # falls back to the derived default in mapping_for
+    mapping = None
+    if account_id:
+        mapping = config_subst.mapping_for(account_id, args.region, bucket)
+    elif any(config_subst.unresolved(load_config(a, args.prod)) for a in agents):
+        raise SystemExit(
+            "a config carries placeholders but no --account-id was given for this "
+            "dry run; pass --account-id to resolve them offline")
 
     results = []
     for agent in agents:
-        cfg = load_config(agent, args.prod)
+        cfg = load_config(agent, args.prod, mapping)
         res = create_or_update(ctl, cfg, role_arn, args.dry_run, dat)
         results.append(res)
         if not args.dry_run:

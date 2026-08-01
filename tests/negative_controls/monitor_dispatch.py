@@ -257,6 +257,121 @@ case("driver: event row trusts the agent's echoed task",
      "orchestration/harness_driver/handler.py", m20,
      ["tests/test_orchestration.py::test_the_event_row_records_the_task_that_was_dispatched_not_the_one_echoed"])
 
+# ── #42: the s3 skill-source migration ────────────────────────────────────────────
+# 21. mounted_skills() reverted to collecting git only -- the shape it had before the
+#     switch. This is the case that matters most, because the bug it models is INVISIBLE:
+#     with every source now s3, a git-only sync mirrors nothing, and the coverage guard
+#     compares 0 mounts against 0 git sources and PASSES. The mirror would quietly stop
+#     syncing, every config would still read healthy, and the next skill edit would reach
+#     no agent. So the guard must fail on a sync that collects nothing, not just on one
+#     that collects the wrong thing.
+def m21(t):
+    old = ('            elif isinstance(s3src, dict) and s3src.get("uri"):')
+    assert old in t, "mounted_skills' s3 branch has moved; re-anchor this mutation"
+    # neuter the s3 branch without changing the line count or the surrounding logic
+    return t.replace(old, '            elif False:', 1)
+case("storage: mounted_skills collects git sources only", "deploy/03_storage.py", m21,
+     ["tests/test_orchestration.py::test_the_sync_covers_every_skill_the_configs_mount",
+      "tests/test_orchestration.py::test_the_sync_still_covers_a_skill_once_its_source_is_s3"])
+
+# 22. A literal bucket name written into a skill URI. It resolves, it works in THIS
+#     account, and it passes the redaction scan whenever the name carries no digits --
+#     which is why this needs its own guard rather than leaning on the account-id check:
+#     a config pinned to one account's bucket is not deployable anywhere else, and the
+#     failure appears at session start in the account that does not have that bucket.
+def m22(t):
+    d = json.loads(t)
+    d["skills"][0]["s3"]["uri"] = "s3://my-skills-bucket/skills/llmops/llm-observability"
+    return json.dumps(d, indent=2, ensure_ascii=False)
+case("config: literal bucket in a skill URI", "agents/monitor/harness.json", m22,
+     ["tests/test_orchestration.py::test_every_s3_skill_uri_uses_the_bucket_placeholder"])
+
+# 23. An unknown token in a skill URI -- the `<DATABUCKET>` typo. Nothing else in the
+#     chain rejects it: the JSON is valid, validate_config.py accepts the s3 shape, and
+#     UpdateHarness accepts it, mints a version and reports READY. resolve() is the only
+#     thing standing between the typo and a harness that cannot start a session.
+def m23(t):
+    d = json.loads(t)
+    d["skills"][0]["s3"]["uri"] = "s3://<DATABUCKET>/skills/llmops/llm-observability"
+    return json.dumps(d, indent=2, ensure_ascii=False)
+case("config: unknown placeholder token in a skill URI", "agents/monitor/harness.json", m23,
+     ["tests/test_orchestration.py::test_every_placeholder_a_config_uses_has_a_value"])
+
+# 24. resolve() downgraded from raising to warning -- "substitute and carry on", the
+#     tempting shape, since a warning still prints. It ships the config: the token reaches
+#     AWS, the harness reports READY, and every session dies at start. A guard that only
+#     checks the substitution happened would score this as fine.
+def m24(t):
+    old = "        raise SystemExit("
+    assert old in t, "resolve()'s raise has moved; re-anchor this mutation"
+    return t.replace(old, "        print(", 1)
+case("config_subst: resolve() warns instead of raising", "deploy/config_subst.py", m24,
+     ["tests/test_orchestration.py::test_resolve_refuses_a_config_with_a_token_left_in_it",
+      "tests/test_orchestration.py::test_resolve_reports_every_unresolved_token_not_just_the_first"])
+
+# 25. The deployer stops resolving -- load_config returns the raw config. The placeholder
+#     then travels all the way into the UpdateHarness payload. This is the wiring case:
+#     config_subst.py can be perfect and unreferenced.
+def m25(t):
+    old = "    return config_subst.resolve(cfg, mapping, where=str(path.relative_to(REPO)))"
+    assert old in t, "load_config's resolve call has moved; re-anchor this mutation"
+    return t.replace(old, "    return cfg", 1)
+case("deployer: 05_harnesses stops resolving placeholders", "deploy/05_harnesses.py", m25,
+     ["tests/test_orchestration.py::test_the_deployer_resolves_placeholders_before_sending_a_config"])
+
+# 26. substitute() walks dict values only. `skills` is a LIST of dicts, so every flat
+#     field resolves, `unresolved()` on the result still finds the URI's token, and the
+#     deploy fails with a confusing message -- or, if the check were also list-blind,
+#     ships the token. Recursion through lists is not incidental to this file.
+def m26(t):
+    old = "    if isinstance(obj, list):\n        return [substitute(x, mapping) for x in obj]\n"
+    assert old in t, "substitute()'s list branch has moved; re-anchor this mutation"
+    return t.replace(old, "", 1)
+case("config_subst: substitute() does not recurse into lists", "deploy/config_subst.py", m26,
+     ["tests/test_orchestration.py::test_substitution_reaches_a_skill_uri_nested_in_a_list"])
+
+# 27. The doc-claim guard reads the git total instead of the total. It then passes on the
+#     current tree by accident (19 != 0 is the only comparison that fires) while every doc
+#     could say any number at all once the git count hits zero.
+def m27(t):
+    old = ('    wrong = [f"{name} says {n}, configs have {total} skill sources"\n'
+           '             for name, n, _ in claims if n != total]')
+    assert old in t, "the count comparison has moved; re-anchor this mutation"
+    return t.replace(old, ('    wrong = [f"{name} says {n}, configs have {git_n} git sources"\n'
+                           '             for name, n, _ in claims if n != git_n]'), 1)
+case("docs guard: count compared against the git total", "tests/test_docs_claims.py", m27,
+     ["tests/test_docs_claims.py::test_the_skill_source_claims_match_the_harness_configs"])
+
+# 28. One doc left saying the sources are `git`. The count is still 19 and still correct,
+#     so the count check cannot see it -- and the sentence tells the reader the migration
+#     never happened, which is precisely the failure this whole guard exists to prevent.
+def m28(t):
+    old = "are `s3` today; none are `git`"
+    assert old in t, "AGENTS.md's kind claim has moved; re-anchor this mutation"
+    return t.replace(old, "are `git` today; none are `s3`", 1)
+case("docs: a doc still calls the 19 sources git", "AGENTS.md", m28,
+     ["tests/test_docs_claims.py::test_the_skill_source_claims_match_the_harness_configs"])
+
+# 29. #32's mount guard read the git path only. After the switch every skill path became
+#     "", so `want in {""}` was False and it failed -- but it would fail identically if the
+#     mount had actually been deleted. Restoring the git-only read models a guard that can
+#     no longer tell an intact mount from a missing one.
+def m29(t):
+    old = ('            out = set()\n'
+           '            for s in h.get("skills") or []:\n'
+           '                if "git" in s:\n'
+           '                    out.add(s["git"].get("path", ""))\n'
+           '                elif isinstance(s.get("s3"), dict):\n'
+           '                    rest = s["s3"].get("uri", "").split("://", 1)[-1]\n'
+           '                    out.add(rest.split("/", 1)[1].rstrip("/") if "/" in rest else "")\n'
+           '            return out\n')
+    assert old in t, "skill_paths' source-agnostic read has moved; re-anchor this mutation"
+    return t.replace(
+        old, '            return {s.get("git", {}).get("path", "") '
+             'for s in (h.get("skills") or [])}\n', 1)
+case("mount guard: skill_paths reads git paths only", "tests/test_orchestration.py", m29,
+     ["tests/test_orchestration.py::TestConductorDispatch::test_the_agent_that_asks_about_data_has_the_skill_that_knows_how"])
+
 failed = []
 for name, rel, mutate, tests in CASES:
     p = REPO / rel

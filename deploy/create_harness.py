@@ -12,8 +12,12 @@ Usage:
 """
 import argparse
 import json
+import pathlib
 import secrets
 import sys
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import config_subst  # noqa: E402 — deploy/ is not a package; path is set just above
 
 
 def _strip_comments(obj):
@@ -45,11 +49,29 @@ def main() -> int:
     ap.add_argument("--config", required=True)
     ap.add_argument("--role-arn", required=True)
     ap.add_argument("--region", default="us-east-1")
+    ap.add_argument("--account-id", help="Resolve <ACCOUNT_ID>/<DATA_BUCKET> without STS")
+    ap.add_argument("--bucket", help="Override the data bucket used for <DATA_BUCKET>")
     ap.add_argument("--dry-run", action="store_true", help="Print the API call without executing")
     args = ap.parse_args()
 
     print(f"Region: {args.region}")
     cfg = load_config(args.config)
+    # Placeholders are resolved before the payload is built, in dry-run as well: a dry run
+    # that printed <DATA_BUCKET> verbatim would show a config nobody will ever send, and
+    # an unresolved skill URI is accepted by the API and fails at SESSION START.
+    if config_subst.unresolved(cfg):
+        account_id = args.account_id
+        if not account_id:
+            if args.dry_run:
+                print(f"FAIL  config carries {config_subst.unresolved(cfg)}; pass "
+                      "--account-id to resolve them for an offline dry run.")
+                return 1
+            import boto3
+            account_id = boto3.client(
+                "sts", region_name=args.region).get_caller_identity()["Account"]
+        cfg = config_subst.resolve(
+            cfg, config_subst.mapping_for(account_id, args.region, args.bucket),
+            where=args.config)
     kwargs = build_kwargs(cfg, args.role_arn)
 
     if args.dry_run:

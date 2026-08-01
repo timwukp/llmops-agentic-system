@@ -350,20 +350,28 @@ Harness configs (`agents/*/harness.json`) run PUBLIC-network for iteration speed
 VPC itself is built by `deploy/02_network.py` and the Lambdas can run **VPC-isolated with
 interface endpoints — no internet egress**.
 
-**Not yet built** (tracked as the s3-skill-source work): the VPC-mode harness variants,
-and the *switch* of the sources themselves. The mirror they require now exists —
-`ensure_skills` in `deploy/03_storage.py` derives what to mirror from the harness configs,
-validates each `SKILL.md`'s frontmatter before uploading, and reads every one back, with
-the harness role granted `GetObject` + `ListBucket` on `skills/*` and no write. All
-**19 skill sources across the 7 harnesses are `git` sources today; none are `s3`** —
-verified by
+The skill sources have moved: all **19 skill sources across the 7 harnesses are `s3`
+sources today; none are `git`** — verified by
 `tests/test_docs_claims.py::test_the_skill_source_claims_match_the_harness_configs`,
-which reads the configs rather than trusting this paragraph. Earlier revisions of this
-file described `agents/*/harness.prod.json` and `deploy/05_mirror_skills.py` as existing;
-both paths do not exist, and never have in any branch, so that was a design being read as
-a shipped feature.
+which reads the configs rather than trusting this paragraph, and which also rejects a
+*mixed* state, because a half-done migration leaves some harnesses pinned and others still
+floating on the skill repo's main. The mirror they read is built by `ensure_skills` in
+`deploy/03_storage.py`, which derives what to mirror from the harness configs, validates
+each `SKILL.md`'s frontmatter before uploading, and reads every one back, with the harness
+role granted `GetObject` + `ListBucket` on `skills/*` and no write.
 
-Two forcing functions make the mirror a prerequisite for VPC mode rather than an
+Each URI is written `s3://<DATA_BUCKET>/skills/...` and resolved at deploy time by
+`deploy/config_subst.py`, because the bucket name embeds the account id and these configs
+are public-repo files. That resolution is a hard failure, not a warning: an unresolved
+token in a skill URI is *accepted* by `UpdateHarness`, mints a version and reports READY,
+and only then fails at every session start — so `resolve()` raises rather than send it.
+
+**Still not built:** the VPC-mode harness variants. Earlier revisions of this file
+described `agents/*/harness.prod.json` and `deploy/05_mirror_skills.py` as existing; both
+paths do not exist, and never have in any branch, so that was a design being read as a
+shipped feature.
+
+Two forcing functions made the mirror a prerequisite for VPC mode rather than an
 optimization:
 
 - VPC-mode harnesses can't reach GitHub, so a git skill source cannot resolve at all —

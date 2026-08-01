@@ -72,22 +72,38 @@ versions and introspects the live CreateHarness/UpdateHarness schemas.
   hide the tool.
 - **Git skill source reads the DEFAULT branch only** (there is no branch field) — a
   skill change must merge to the skill repo's main before a fresh session picks it up.
-  **All 19 skill sources across the 7 harnesses are `git` today; none are `s3`.** An S3
-  mirror is the fix, for two reasons: VPC-mode harnesses can't reach GitHub at
+  **All 19 skill sources across the 7 harnesses are `s3` today; none are `git`.** The S3
+  mirror was the fix, for two reasons: VPC-mode harnesses can't reach GitHub at
   all, and main-branch drift otherwise silently changes agent behavior. The mirror and
-  its IAM now exist (`ensure_skills` in `deploy/03_storage.py`); the source *switch* is
-  what has not happened. `deploy/05_mirror_skills.py` and `agents/*/harness.prod.json`
-  were described here as existing files and have never existed in any branch.
-  `tests/test_docs_claims.py` now derives the counts from the configs, so this line
-  cannot go stale silently.
+  its IAM come from `ensure_skills` in `deploy/03_storage.py`; the sources themselves now
+  point at `s3://<DATA_BUCKET>/skills/...`, resolved at deploy time by
+  `deploy/config_subst.py` (the bucket name embeds the account id, which may not appear in
+  a file of this public repo). `tests/test_docs_claims.py` derives the counts and the KIND
+  from the configs, so this line cannot go stale silently, and it rejects a *mixed* state:
+  a partial migration means some harnesses read a pinned snapshot while others still float
+  on the skill repo's main, which is the drift the migration exists to stop.
+- **An unresolved `<TOKEN>` in a config is a deploy-time FAILURE, not a warning.**
+  `config_subst.resolve()` raises on any `<UPPER_CASE>` left after substitution — a typo
+  like `<DATABUCKET>` passes the linter, passes `validate_config.py`, and is accepted by
+  the API. `05_harnesses.py` / `update_harness.py` / `create_harness.py` all resolve before
+  the first API call, and the live bucket comes from SSM `/llmops/storage/bucket` in
+  preference to the derived name (a deploy that passed `01_iam.py --bucket` has a different
+  one).
 - **A bad skill source fails at SESSION START, not at `UpdateHarness`** — a wrong path
   or a `SKILL.md` missing its YAML frontmatter is accepted by the control plane and then
   fails every invocation. So switching sources requires the objects to be in place
-  first; the switch is not reversible by config alone once sessions start failing.
-- **The mirror is live at `s3://<bucket>/skills/` but no source points at it yet.**
+  first; the switch is not reversible by config alone once sessions start failing. READY is
+  therefore no evidence at all: the proof that the s3 sources work is a live session that
+  ran and wrote its artifacts.
+- **The mirror is at `s3://<bucket>/skills/` and all 19 sources are now `s3` and point
+  at it.**
   `deploy/03_storage.py --skills-src <checkout>` derives what to mirror from
   `agents/*/harness.json`, validates every `SKILL.md`'s frontmatter *before* uploading,
-  and reads each one back. 66 files / 11 distinct skills behind the 19 mounts.
+  and reads each one back. 66 files / 11 distinct skills behind the 19 mounts. It derives
+  the list from **both** source kinds: collecting only `git` mounts inverted at exactly
+  the switch — after it, S3 is the only copy any agent reads, so that is precisely when
+  the mirror must keep syncing, and the coverage guard would have compared 0 mounts
+  against 0 git sources and passed.
 - **An s3 skill source is fetched by `llmops-harness-execution`, NOT by the deployer.**
   The mirror's own `head_object` read-back passes under admin credentials and proves
   nothing about the role that actually fetches at session start:

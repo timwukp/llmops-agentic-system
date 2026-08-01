@@ -308,13 +308,20 @@ harness 配置（`agents/*/harness.json`）走 PUBLIC 網絡以求迭代速度�
 `deploy/02_network.py` 建立，Lambda 可以**在 VPC 內隔離運行，走 interface
 endpoints —— 無互聯網出口**。
 
-**尚未實作**（追蹤於 s3 技能來源的工作項）：VPC 模式的 harness 變體，以及來源本身的**切換**。
-它所需要的鏡像現在已經存在 —— `deploy/03_storage.py` 裡的 `ensure_skills` 從 harness 配置
-推導出要鏡像什麼、在上傳**之前**驗證每個 `SKILL.md` 的 frontmatter、並且把每一個都讀回來
-確認；harness 角色對 `skills/*` 只有 `GetObject` 與 `ListBucket`，沒有寫入權限。
-目前 **7 個 harness 上的 19 個技能來源全部是 `git`，沒有一個是 `s3`** ——
+技能來源已經切換完成：目前 **7 個 harness 上的 19 個技能來源全部是 `s3`，沒有一個是 `git`** ——
 由 `tests/test_docs_claims.py::test_the_skill_source_claims_match_the_harness_configs`
-讀取實際配置驗證，而不是相信這段文字。本文件的先前版本把
+讀取實際配置驗證，而不是相信這段文字；該測試同時拒絕**混合**狀態，因為做一半的遷移會讓
+一部分 harness 讀釘選快照、另一部分仍然隨技能 repo 的 main 漂移。它們讀的鏡像由
+`deploy/03_storage.py` 裡的 `ensure_skills` 建立 —— 從 harness 配置推導出要鏡像什麼、
+在上傳**之前**驗證每個 `SKILL.md` 的 frontmatter、並且把每一個都讀回來確認；
+harness 角色對 `skills/*` 只有 `GetObject` 與 `ListBucket`，沒有寫入權限。
+
+每個 URI 寫成 `s3://<DATA_BUCKET>/skills/...`，在部署時由 `deploy/config_subst.py` 解析，
+因為 bucket 名稱內嵌了 account id，而這些配置是公開 repo 的檔案。這個解析是**硬失敗**而不是
+警告：技能 URI 裡未解析的 token 會被 `UpdateHarness` 接受、鑄出一個版本、回報 READY，
+然後在每一次 session 啟動時才失敗 —— 所以 `resolve()` 選擇拋錯，而不是把它送出去。
+
+**仍未實作**：VPC 模式的 harness 變體。本文件的先前版本把
 `agents/*/harness.prod.json` 與 `deploy/05_mirror_skills.py` 寫成既有檔案；這兩個檔案
 在任何分支都從未存在過，也就是把一個設計當成已交付的功能在讀。
 
