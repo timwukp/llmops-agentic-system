@@ -215,6 +215,50 @@ def test_finops_can_read_the_billing_apis_it_needs():
         assert needed in acts, needed
 
 
+# The Budgets service is the one place in this repo where the boto3 call name and the
+# IAM action name diverge: describe_budgets authorizes against budgets:ViewBudget, so a
+# policy that grants only budgets:DescribeBudgets denies the call. That is exactly what
+# shipped, and the console degraded quietly -- an except/print, so the Cost tab rendered
+# with an empty budgets list and no error anywhere the user could see. This map is the
+# fixed part; the next test derives the demand side from the source that makes the calls.
+BUDGETS_CALL_TO_IAM = {"describe_budgets": "budgets:ViewBudget"}
+
+BILLING_CALLERS = ("deploy/console/lambda_function.py",
+                   "orchestration/finops_reconcile/handler.py",
+                   "pipeline/contracts/cost_model.py")
+
+
+def test_every_budgets_api_call_is_granted_the_action_it_authorizes_against():
+    """Derived from the callers, not from a hand-kept list: grep the source for the
+    boto3 Budgets calls that actually exist, then require the IAM action each one is
+    authorized against in every policy whose role runs that code. Anchored on the
+    call site (`b.describe_budgets(`) rather than the substring, so a mention of the
+    name in a comment cannot satisfy it."""
+    policies = {
+        "deploy/console/iam-policy.json": _actions(
+            json.loads((REPO / "deploy/console/iam-policy.json").read_text())),
+        HARNESS_ROLE: _actions(_statements(HARNESS_ROLE, "permissionsPolicy")),
+    }
+    found = {}
+    for rel in BILLING_CALLERS:
+        p = REPO / rel
+        if not p.exists():
+            continue
+        src = p.read_text()
+        for call, action in BUDGETS_CALL_TO_IAM.items():
+            if re.search(r"\.\s*" + call + r"\s*\(", src):
+                found.setdefault(action, []).append(rel)
+    assert found, ("no Budgets call found in any of " + str(BILLING_CALLERS)
+                   + " -- if the call moved, point BILLING_CALLERS at its new home "
+                     "rather than deleting this guard")
+    for action, callers in found.items():
+        for path, acts in policies.items():
+            assert action in acts, (
+                f"{path} is missing {action}, which {callers} needs: the Budgets API "
+                f"authorizes describe_budgets against it, and the caller swallows the "
+                f"AccessDeniedException into a log line")
+
+
 def test_no_role_can_mutate_billing_configuration():
     """An auditor with write access to cost categories, allocation-tag status, or
     budgets can reshape the numbers it reports on. Every billing verb granted anywhere
@@ -229,9 +273,17 @@ def test_no_role_can_mutate_billing_configuration():
     billing = {a for a in everything
                if a.split(":")[0] in ("ce", "pricing", "budgets", "cur", "billing")}
     assert billing, "expected some billing permissions to exist"
-    read_verbs = ("Get", "List", "Describe")
+    # "View" joins the read verbs for Budgets specifically: budgets:ViewBudget is the
+    # read side of that namespace (its writes are Create/Modify/Update/Delete/Execute).
+    read_verbs = ("Get", "List", "Describe", "View")
     bad = [a for a in billing if not a.split(":", 1)[1].startswith(read_verbs)]
     assert bad == [], f"mutating billing permission granted: {bad}"
+    # Deliberately redundant with the prefix check above, and only for the namespace
+    # whose read verb we just widened: the named writes are what a future edit to
+    # read_verbs (or a "budgets:*" grant reduced to a prefix) could let through.
+    for w in ("budgets:ModifyBudget", "budgets:CreateBudget", "budgets:UpdateBudget",
+              "budgets:DeleteBudget", "budgets:ExecuteBudgetAction", "budgets:*"):
+        assert w not in billing, w
 
 
 def test_finops_cannot_rewrite_an_approval_decision():

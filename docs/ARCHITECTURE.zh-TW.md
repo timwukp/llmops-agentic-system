@@ -223,7 +223,7 @@ endpoints —— 無互聯網出口**（`deploy/02_network.py`）。兩個硬性
 
 所以它坐在 `llmops_orchestrator` 旁邊、主幹之上：**指揮家決定要花什麼，審計員報告花了什麼。**
 
-它的 IAM 對帳務是唯讀的（`ce:Get*`、`pricing:*`、`budgets:DescribeBudgets`），且沒有終止任何
+它的 IAM 對帳務是唯讀的（`ce:Get*`、`pricing:*`、`budgets:ViewBudget`），且沒有終止任何
 東西的權限。有兩個理由，而第二個是承重的那個：
 
 - 審計員不能有能力改變它所審計的對象。

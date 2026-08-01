@@ -205,7 +205,7 @@
       "Resource": "arn:aws:dynamodb:REGION:ACCOUNT_ID:table/llmops-cost-actuals"
     },
     {
-      "_comment": "Read-only on billing, deliberately. ce:* and pricing:* have no resource-level ARNs so Resource must be * -- the scoping is that only Get/List/Describe verbs appear here. budgets:DescribeBudgets surfaces the existing $1000 account guardrail rather than duplicating it.",
+      "_comment": "Read-only on billing, deliberately. ce:* and pricing:* have no resource-level ARNs so Resource must be * -- the scoping is that only Get/List/Describe verbs appear here. Budgets surfaces the existing $1000 account guardrail rather than duplicating it. budgets:ViewBudget is the action the DescribeBudgets API actually authorizes against -- the IAM action name and the API call name differ, and granting only 'budgets:DescribeBudgets' produced a live AccessDeniedException naming budgets:ViewBudget on every Cost tab load. Both are listed: ViewBudget is what is enforced, DescribeBudgets is harmless and keeps the grant readable against the call it serves.",
       "Sid": "BillingRead",
       "Effect": "Allow",
       "Action": [
@@ -217,6 +217,7 @@
         "pricing:GetProducts",
         "pricing:GetAttributeValues",
         "pricing:DescribeServices",
+        "budgets:ViewBudget",
         "budgets:DescribeBudgets"
       ],
       "Resource": "*"

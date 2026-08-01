@@ -275,7 +275,7 @@ It appears in the console's fleet view but never in a run's stage sequence.
 
 ### The auditor cannot stop a run
 
-Its IAM is **read-only on billing** — `ce:Get*`, `pricing:*`, `budgets:DescribeBudgets` — and
+Its IAM is **read-only on billing** — `ce:Get*`, `pricing:*`, `budgets:ViewBudget` — and
 it has no authority to terminate anything. The auditor must never be able to change what it
 audits, and spend-control authority belongs to the orchestrator (via `page_human`), not to the
 component whose job is to observe. An auditor with kill rights is a different and riskier
