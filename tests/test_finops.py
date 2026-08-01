@@ -376,6 +376,86 @@ def test_the_auditor_lambda_runs_under_its_own_role_not_the_drivers():
     assert "/llmops/iam/lambda_driver_arn" not in finops
 
 
+def _run_deployer_dry(monkeypatch, capsys, only):
+    """Run 07_lambdas.py's main() with --dry-run and stub clients, and return the
+    parsed report. Dry-run reaches every target-selection decision -- which is the
+    property under test -- while the only AWS call left on the path is the read-only
+    ValidateStateMachineDefinition, stubbed here."""
+    mod = _load("deploy_lambdas", "deploy/07_lambdas.py")
+
+    class _Sfn:
+        exceptions = type("E", (), {"StateMachineDoesNotExist": Exception})
+
+        def validate_state_machine_definition(self, **kw):
+            return {"result": "OK", "diagnostics": []}
+
+    monkeypatch.setattr(mod.boto3, "client",
+                        lambda svc, **kw: _Sfn() if svc == "stepfunctions" else object())
+    argv = ["07_lambdas.py", "--region", "us-east-1", "--dry-run"]
+    for t in only:
+        argv += ["--only", t]
+    monkeypatch.setattr(sys, "argv", argv)
+    mod.main()
+    return json.loads(capsys.readouterr().out)
+
+
+def test_a_targeted_deploy_ships_only_what_was_asked_for(monkeypatch, capsys):
+    """The state machine and the resume rule used to deploy unconditionally, so
+    `--only driver` shipped the driver AND whatever the working tree's ASL said. A
+    flag named --only that widens past its argument is worse than no flag: the whole
+    reason to reach for it is blast radius."""
+    report = _run_deployer_dry(monkeypatch, capsys, ["driver"])
+    assert report["targets"] == ["driver"]
+    assert [r.get("lambda") for r in report["results"]] == ["llmops-harness-driver"]
+    assert not [r for r in report["results"] if "state_machine" in r or "rule" in r], \
+        "a driver-only deploy also published the state machine or the resume rule"
+
+
+def test_the_state_machine_can_be_deployed_without_redeploying_any_lambda(monkeypatch,
+                                                                         capsys):
+    """Found by the MarkRunDone fix: the ASL change had to reach production while the
+    driver's own redeploy was deliberately held back pending an IAM widen, and --only
+    could not express that -- it selected among LAMBDAS alone, so every route to the
+    ASL dragged a Lambda along."""
+    report = _run_deployer_dry(monkeypatch, capsys, ["state_machine"])
+    assert report["targets"] == ["state_machine"]
+    assert [r.get("state_machine") for r in report["results"]] == ["llmops-pipeline"]
+    assert not [r for r in report["results"] if "lambda" in r], \
+        "deploying the state machine alone still redeployed a Lambda"
+
+
+def test_a_bare_run_still_deploys_everything(monkeypatch, capsys):
+    """Making the non-Lambda targets selectable must not make them opt-in: a bare
+    `07_lambdas.py --region ...` is the full-deploy path, and dropping the state
+    machine from it would leave the ASL silently un-deployed forever."""
+    report = _run_deployer_dry(monkeypatch, capsys, [])
+    src = _deploy_src("07_lambdas.py")
+    every = re.findall(r'^\s{4}"(\w+)": \{$', src, re.M)  # the LAMBDAS keys
+    assert set(every) <= set(report["targets"]), "a bare run skips a Lambda"
+    assert {"state_machine", "resume_rule"} <= set(report["targets"])
+    assert [r.get("state_machine") for r in report["results"]].count("llmops-pipeline") == 1
+    assert [r.get("rule") for r in report["results"]].count(
+        "llmops-sagemaker-job-state") == 1
+
+
+def test_the_documented_spine_lambda_count_matches_LAMBDAS():
+    """Both the script's own docstring and deploy/README.md said "4 spine Lambdas" long
+    after finops-reconcile made it 5 — the auditor was undocumented in the very table
+    someone reads to find out what runs. Derived from LAMBDAS so the next addition
+    fails here instead of quietly making the docs wrong again."""
+    src = _deploy_src("07_lambdas.py")
+    n = len(re.findall(r'^\s{4}"(\w+)": \{$', src, re.M))
+    assert n >= 5, "guard reads the wrong thing: found no LAMBDAS keys"
+    for doc, text in (("07_lambdas.py", src),
+                      ("deploy/README.md", (REPO / "deploy/README.md").read_text())):
+        claims = re.findall(r"(\w+) spine Lambdas", text)
+        assert claims, f"{doc}: no spine-Lambda count claim to check"
+        words = {"four": 4, "five": 5, "six": 6, "seven": 7}
+        for c in claims:
+            got = words.get(c.lower(), int(c) if c.isdigit() else None)
+            assert got == n, f"{doc} claims {c!r} spine Lambdas, LAMBDAS has {n}"
+
+
 def _harness_s3(sid):
     doc = json.loads((REPO / "deploy/iam/harness_execution_role.json").read_text())
     for st in doc["permissionsPolicy"]["Statement"]:
