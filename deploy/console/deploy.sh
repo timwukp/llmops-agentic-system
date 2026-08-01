@@ -155,7 +155,13 @@ cp "$(dirname "$0")/../../orchestration/conductor_tools.py" "$BUILD/conductor_to
   print('bundled conductor_tools OK')"
 (cd "$BUILD" && zip -rq /tmp/llmops-admin-dashboard.zip .)
 
-ENV_VARS="Variables={CONSOLE_TABLE=$TABLE,RUNS_TABLE=llmops-pipeline-runs,EVENTS_TABLE=llmops-stage-events,TASKS_TABLE=llmops-tasks,STATE_MACHINE=llmops-pipeline,START_FN=llmops-start-pipeline,DATA_BUCKET=$DATA_BUCKET,COGNITO_POOL_ID=$POOL_ID,COGNITO_CLIENT_ID=$CLIENT_ID,JUDGE_MODEL=$JUDGE_MODEL,SPANS_SINCE=$SPANS_SINCE,OPTIMIZE_HARNESS=$OPTIMIZE_HARNESS,LLMOPS_SNS_TOPIC=arn:aws:sns:$REGION:$ACCOUNT_ID:llmops-escalations,APPROVAL_KEY=alias/llmops-approval,DS_GROUP=llmops-datascience}"
+# BUDGET_MODE=advisory: an over-budget run is REPORTED (named and numbered on the Cost
+# tab) and launches anyway. Set blocking to restore the approval gate. Stated explicitly
+# here rather than left to the code default, so the live behaviour is visible in the
+# deploy script and switchable without a code change.
+BUDGET_MODE="${BUDGET_MODE:-advisory}"
+
+ENV_VARS="Variables={CONSOLE_TABLE=$TABLE,RUNS_TABLE=llmops-pipeline-runs,EVENTS_TABLE=llmops-stage-events,TASKS_TABLE=llmops-tasks,STATE_MACHINE=llmops-pipeline,START_FN=llmops-start-pipeline,DATA_BUCKET=$DATA_BUCKET,COGNITO_POOL_ID=$POOL_ID,COGNITO_CLIENT_ID=$CLIENT_ID,JUDGE_MODEL=$JUDGE_MODEL,SPANS_SINCE=$SPANS_SINCE,OPTIMIZE_HARNESS=$OPTIMIZE_HARNESS,LLMOPS_SNS_TOPIC=arn:aws:sns:$REGION:$ACCOUNT_ID:llmops-escalations,APPROVAL_KEY=alias/llmops-approval,DS_GROUP=llmops-datascience,BUDGET_MODE=$BUDGET_MODE}"
 
 # timeout 900: one orchestrator consultation turn can stream for up to 840s; the
 # old 300 killed the worker mid-turn and left the task stuck in 'thinking'.

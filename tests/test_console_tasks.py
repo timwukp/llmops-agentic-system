@@ -238,6 +238,15 @@ def wired(console, monkeypatch):
                                  est=est, s3=fake_s3, lam=fake_lam, kms=fake_kms)
 
 
+@pytest.fixture
+def blocking(wired, monkeypatch):
+    """The same console with BUDGET_MODE=blocking, so the Cost-queue branch of
+    accept_task stays covered. Advisory is the default because this platform's owner is
+    its only approver — but the queue path is shipped code one env var away."""
+    monkeypatch.setattr(wired.console, "BUDGET_MODE", "blocking")
+    return wired
+
+
 def _mk_task(w, status="plan_proposed", cost="50", plan_body=b'{"goal":"x"}'):
     tid = "task-abc123"
     uri = f"s3://test-bucket/tasks/{tid}/plan.json"
@@ -295,7 +304,38 @@ def test_accept_under_limit_dispatches_and_writes_shadow_estimate(wired):
     assert payload["accept"] is True
 
 
-def test_accept_over_limit_goes_to_the_cost_queue(wired):
+def test_accept_over_budget_dispatches_but_signs_the_overage(wired):
+    """Advisory mode at the acceptance boundary.
+
+    The $3000 plan dispatches — the owner is the only approver, so a queue here could
+    only ask them to approve their own run. What must NOT happen is the overage
+    disappearing: it goes into the KMS-signed approval record, which is the artifact a
+    third party audits later. A signed record that reads as within-budget when the plan
+    was 50% over is a false attestation, not a relaxed policy.
+    """
+    tid = _mk_task(wired, cost="3000")
+    r = wired.console.accept_task(tid, DS_USER)
+    assert r["ok"] and r["status"] == "accepting"
+    signed = wired.tasks.items[tid]["approvals"][-1]
+    gate = signed["record"]["gate"] if "record" in signed else signed["gate"]
+    assert gate["budget_mode"] == "advisory"
+    assert gate["over_budget"], "the signed record must carry the overage"
+    assert any("single-run" in x for x in gate["over_budget"])
+    assert gate["approval_required"] is False
+    # The signature must cover those bytes, or "signed record" overstates what the
+    # artifact proves: erasing the overage afterwards would leave a record that still
+    # verifies. verify_record re-derives the digest from the contents, so the edit below
+    # must break it -- asserted, not assumed, because a fake that ignored Message would
+    # make every signature test above vacuous.
+    ct = wired.console.conductor_tools
+    assert ct.verify_record(wired.kms, signed) is True
+    tampered = json.loads(json.dumps(signed))
+    tampered["gate"]["over_budget"] = []
+    assert ct.verify_record(wired.kms, tampered) is False
+
+
+def test_accept_over_limit_goes_to_the_cost_queue(blocking):
+    wired = blocking
     tid = _mk_task(wired, cost="3000")
     r = wired.console.accept_task(tid, DS_USER)
     assert r["ok"] and r["status"] == "pending_approval"
@@ -315,10 +355,11 @@ def test_accept_requires_a_console_group_even_over_limit(wired):
     assert not [p for p in wired.est.puts if p.get("task_id") == tid]
 
 
-def test_over_limit_self_approval_is_blocked_at_the_cost_queue(wired):
+def test_over_limit_self_approval_is_blocked_at_the_cost_queue(blocking):
     """The REAL self-approval control lives in decide_approval via
     cost_model.check_approval (requester != approver) — exactly the same rule the
     form-based estimates enforce. Alice created and submitted; Alice may not decide."""
+    wired = blocking
     tid = _mk_task(wired, cost="3000")
     wired.console.accept_task(tid, DS_USER)
     eid = [p for p in wired.est.puts if p.get("task_id") == tid][-1]["id"]
