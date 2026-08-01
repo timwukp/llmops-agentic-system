@@ -30,6 +30,14 @@ corruptions live:
      repo whose commit bodies carry the measurements justifying each change, that is
      evidence being dropped, not formatting.
 
+  5. A rebased branch replayed onto its own stale remote head. After a local rebase the
+     remote head is no longer an ancestor of HEAD, so base..HEAD includes every commit
+     the branch was rebased ONTO. Observed 2026-08-01: the plan for a 3-commit branch
+     listed three of main's merge commits for replay, which would have landed 6 commits
+     and attributed main's merges to this branch. `--onto <sha>` states the real base;
+     it is not inferred, because "not an ancestor" also describes a divergence whose
+     commits must not be discarded.
+
 So this reads modes from git instead of assuming them, diffs against the branch's
 actual remote head instead of assuming the local parent matches it, never concludes
 "no such branch" from a single 404, and replays each local commit as its own remote
@@ -196,6 +204,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--branch", required=True, help="remote branch to advance")
     ap.add_argument("--repo", default=None, help="owner/name (default: gh's view of origin)")
     ap.add_argument("--message", default=None, help="commit message (default: HEAD's)")
+    ap.add_argument("--onto", default=None,
+                    help="base to replay onto after a local rebase (e.g. the main sha); "
+                         "the branch ref is rewritten to the new tip")
     ap.add_argument("--dry-run", action="store_true", help="print the plan, call nothing")
     args = ap.parse_args(argv)
 
@@ -231,6 +242,25 @@ def main(argv: list[str] | None = None) -> int:
                   f"{default} @ {remote_sha[:10]}")
     else:
         remote_sha = ref["object"]["sha"]
+
+    if args.onto:
+        # 5. A rebased branch replayed onto its own stale remote head. After a local
+        #    rebase the remote head is no longer an ancestor of HEAD, so
+        #    `rev-list stale..HEAD` returns this branch's commits AND every commit it
+        #    was rebased onto. Observed 2026-08-01 rebasing the round-trip branch onto
+        #    main: the plan listed three of main's merge commits ("Merge pull request
+        #    #26/#27/#28") for replay as if they were this branch's work -- 3 commits
+        #    would have landed as 6, attributing main's merges here. There is no way to
+        #    detect this automatically: "the remote head is not an ancestor" is equally
+        #    consistent with a rebase and with a divergence that must NOT be discarded.
+        #    So the base is stated, and stated bases are verified before anything runs.
+        if not gh.call(f"/git/commits/{args.onto}", absent_ok=True):
+            raise SystemExit(
+                f"--onto {args.onto} is not a commit on {repo}; nothing was pushed. "
+                "Pass a sha the remote already has (e.g. `git rev-parse origin/main`).")
+        print(f"replaying onto {args.onto[:10]} instead of {args.branch}'s current head "
+              f"{remote_sha[:10]} (rebase: the ref will be rewritten)")
+        remote_sha = args.onto
     # The remote head must be a local object or the diff base is a guess.
     if subprocess.run(["git", "cat-file", "-e", f"{remote_sha}^{{commit}}"],
                       capture_output=True).returncode != 0:
