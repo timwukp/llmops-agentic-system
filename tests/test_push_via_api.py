@@ -735,6 +735,30 @@ def test_onto_still_moves_the_branch_ref_to_the_new_tip(monkeypatch):
         f"the branch must point at the last replayed commit: {gh.refs!r}")
 
 
+def test_only_an_onto_push_forces_the_ref(monkeypatch):
+    """A rebase is by definition not a fast forward, so the PATCH needs force=True.
+
+    Live 422 on 2026-08-01: "Update is not a fast forward". But force must be scoped
+    to --onto and nowhere else -- an ordinary advance that is somehow non-fast-forward
+    means the remote has commits this run did not see, and forcing there deletes them.
+    """
+    gh = FakeGH({"heads/main": "mainsha", "heads/feat/x": "stale-remote-head"},
+                commits=["mainsha", "stale-remote-head"])
+    _run_main(monkeypatch, gh, branch="feat/x", revs=["c1sha"],
+              extra_argv=["--onto", "mainsha"])
+    patches = [c for c in gh.calls if c[0] == "PATCH"]
+    assert patches and patches[-1][2].get("force") is True, (
+        f"a rebase push must force the ref or the PATCH 422s: {patches!r}")
+
+    plain = FakeGH({"heads/main": "mainsha", "heads/feat/x": "remotesha"},
+                   commits=["parentsha", "remotesha"])
+    _run_main(monkeypatch, plain, branch="feat/x")
+    plain_patches = [c for c in plain.calls if c[0] == "PATCH"]
+    assert plain_patches and not plain_patches[-1][2].get("force"), (
+        f"an ordinary advance must NOT force: a non-fast-forward there means the "
+        f"remote has commits we never saw, and forcing deletes them: {plain_patches!r}")
+
+
 def test_onto_refuses_a_base_the_remote_does_not_have(monkeypatch):
     """A typo'd --onto must fail before any commit is built.
 
