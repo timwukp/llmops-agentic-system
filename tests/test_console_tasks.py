@@ -592,6 +592,182 @@ def _text_stream(text):
                         {"messageStop": {"stopReason": "end_turn"}})
 
 
+def _harness_loop_stream(text, internal_tools=("shell", "shell")):
+    """One InvokeHarness response carrying the harness's OWN agent loop.
+
+    Copied from a live orchestrator turn (probe: skill-reading prompt), because the
+    fakes above are missing the events that make this measurable -- none of them emit
+    `messageStart` or `metadata` at all, so every existing test sees a stream in which
+    the harness did no internal work. That is a fake that cannot express the situation
+    being tested, and it is why `rounds=0` looked correct in tests for so long.
+
+    Live shape, with 2 internal shell calls:
+
+        messageStart(assistant) -> toolUse shell -> messageStop tool_use -> metadata
+        messageStart(user)      -> messageStop tool_result
+        messageStart(assistant) -> toolUse shell -> messageStop tool_use -> metadata
+        messageStart(user)      -> messageStop tool_result
+        messageStart(assistant) -> text          -> messageStop end_turn -> metadata
+
+    3 assistant messages = 3 model round-trips; latencyMs 6973/7764/6950 = 21.7s of a
+    29.6s turn. The final messageStop is end_turn, so nothing here reaches the worker's
+    own servicing loop -- the whole point is that this turn used to log rounds=0.
+    """
+    evs, lat = [], [6973, 7764, 6950]
+    for i, name in enumerate(internal_tools):
+        evs += [
+            {"messageStart": {"role": "assistant"}},
+            {"contentBlockStart": {"start": {"toolUse": {"toolUseId": f"h{i}",
+                                                        "name": name}}}},
+            {"messageStop": {"stopReason": "tool_use"}},
+            {"metadata": {"usage": {"inputTokens": 11773 + i, "outputTokens": 186 + i},
+                          "metrics": {"latencyMs": lat[i % len(lat)]}}},
+            {"messageStart": {"role": "user"}},
+            {"messageStop": {"stopReason": "tool_result"}},
+        ]
+    evs += [
+        {"messageStart": {"role": "assistant"}},
+        {"contentBlockDelta": {"delta": {"text": text}}},
+        {"messageStop": {"stopReason": "end_turn"}},
+        {"metadata": {"usage": {"inputTokens": 12696, "outputTokens": 386},
+                      "metrics": {"latencyMs": lat[-1]}}},
+    ]
+    return _fake_stream(*evs)
+
+
+def test_the_log_reports_the_real_model_round_trips_not_just_the_ones_we_service(
+        wired, monkeypatch, capsys):
+    """`rounds=` structurally could not show what its name claimed.
+
+    It incremented only where the worker services an inline function (stop_reason ==
+    "tool_use"), so everything the HARNESS ran on its own -- a skill read, `shell`, the
+    browser -- was invisible. Verified live on the orchestrator: one InvokeHarness call
+    made 3 model round-trips and 2 internal shell calls, ended in end_turn, and the old
+    line logged `rounds=0`. That zero reads as "the agent did no work", which is the
+    opposite of what happened, and it is why the latency question could not be measured
+    from the logs at all.
+
+    The measured turn spent latencyMs 6973 + 7764 + 6950 = 21.7s of 29.6s wall clock
+    inside the model, so the round-trips are not a detail of the turn -- they ARE it.
+    """
+    tid = _mk_task(wired, status="thinking")
+
+    class _AC:
+        def invoke_harness(self, **kw):
+            return _harness_loop_stream("Audited. Three findings.")
+
+    monkeypatch.setattr(wired.console, "agentcore_chat", _AC())
+    monkeypatch.setattr(wired.console, "_resolve_harness_id",
+                        lambda x: "llmops_orchestrator-x")
+    wired.console.run_task_turn(tid, accept=False)
+    line = [ln for ln in capsys.readouterr().out.splitlines()
+            if "[task-chat]" in ln and str(tid) in ln]
+    assert line, "the per-turn log line is missing entirely"
+    line = line[0]
+
+    # The two counters must be REPORTED SEPARATELY. Renaming one to the other's name
+    # would satisfy a test that only looked for the new field, and that rename is
+    # exactly the wrong fix: both numbers are real, they just answer different
+    # questions (what we serviced vs what the model actually cost).
+    m_model = re.search(r"model_rounds=(\d+)", line)
+    m_serv = re.search(r"serviced=(\d+)", line)
+    assert m_model and m_serv, (
+        f"the log must report the harness's own round-trips AND the ones we service, "
+        f"as separate fields: {line!r}")
+    assert int(m_model.group(1)) == 3, (
+        f"3 assistant messages arrived, so 3 model round-trips happened; the log says "
+        f"{m_model.group(1)}: {line!r}")
+    # This is the whole defect in one assertion: the turn serviced NOTHING (it ended in
+    # end_turn) and still cost 3 round-trips. If the two fields are wired to the same
+    # counter, this fails.
+    assert int(m_serv.group(1)) == 0, (
+        f"this turn ended in end_turn and serviced no inline function, so serviced= "
+        f"must be 0 -- a nonzero value means both fields read the same counter: {line!r}")
+    # The tools the harness ran itself, by name: "2 internal calls" is not diagnosable,
+    # "shell, shell" is.
+    assert "'shell', 'shell'" in line or '"shell", "shell"' in line, (
+        f"the harness's own tool calls must be named, or a slow turn cannot be "
+        f"attributed to what it actually ran: {line!r}")
+    # And the model's share of the wall clock, which is what #45 needs and what no log
+    # line could previously answer.
+    ms = re.search(r"model_ms=(\d+)", line)
+    assert ms and int(ms.group(1)) == 6973 + 7764 + 6950, (
+        f"model_ms must sum every metadata latencyMs in the turn: {line!r}")
+    assert re.search(r"tok=\d+/\d+", line), (
+        f"token usage is in the stream and is what a cost question needs: {line!r}")
+
+
+def test_the_per_turn_totals_accumulate_across_every_invoke_the_turn_makes(
+        wired, monkeypatch, capsys):
+    """A turn is often several InvokeHarness calls, and the totals must span all of them.
+
+    The single-invoke test above cannot see this: with one invoke, `total += this_invoke`
+    and `total = this_invoke` are indistinguishable, and a negative control that swapped
+    one for the other passed. A turn that services an inline function makes at least two
+    invokes, so it is the only place the accumulation is load-bearing.
+
+    Two invokes, each carrying a harness-internal loop: 3 + 3 model round-trips, 2 + 2
+    internal shell calls, and the model_ms of both. Reporting only the last invoke's
+    figures would understate a slow turn by exactly the amount already spent.
+
+    THREE invokes and TWO serviced checkpoints, not one of each, because a single
+    serviced call cannot distinguish `tool_rounds += 1` from `tool_rounds = 1` -- a
+    control that made exactly that substitution passed against an earlier version of
+    this test. Every counter here needs at least two contributions to be load-bearing.
+    """
+    tid = _mk_task(wired, status="thinking")
+    calls = {"n": 0}
+
+    def _checkpoint_invoke(tag, ms):
+        """A harness-internal loop that ends by asking US for a checkpoint."""
+        evs = _harness_loop_stream("thinking...")["stream"][:-4]
+        return _fake_stream(
+            *evs,
+            {"messageStart": {"role": "assistant"}},
+            {"contentBlockStart": {"start": {"toolUse": {
+                "toolUseId": tag, "name": "checkpoint"}}}},
+            {"contentBlockDelta": {"delta": {"toolUse": {"input": "{}"}}}},
+            {"messageStop": {"stopReason": "tool_use"}},
+            {"metadata": {"usage": {"inputTokens": 100, "outputTokens": 10},
+                          "metrics": {"latencyMs": ms}}})
+
+    class _AC:
+        def invoke_harness(self, **kw):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return _checkpoint_invoke("cp1", 1000)
+            if calls["n"] == 2:
+                return _checkpoint_invoke("cp2", 2000)
+            return _harness_loop_stream("Done.")
+
+    monkeypatch.setattr(wired.console, "agentcore_chat", _AC())
+    monkeypatch.setattr(wired.console, "_resolve_harness_id",
+                        lambda x: "llmops_orchestrator-x")
+    wired.console.run_task_turn(tid, accept=False)
+    assert calls["n"] == 3, "this test needs a turn that invokes more than twice"
+
+    lines = [ln for ln in capsys.readouterr().out.splitlines()
+             if "[task-chat]" in ln and str(tid) in ln]
+    assert len(lines) == 3, f"one log line per invoke expected, got {len(lines)}"
+    last = lines[-1]
+    # Each checkpoint invoke: 2 assistant messages from the truncated loop + 1 for the
+    # checkpoint itself = 3. The final invoke: 3. The last line reports the TURN, so 9.
+    m = re.search(r"model_rounds=(\d+)", last)
+    assert m and int(m.group(1)) == 9, (
+        f"model_rounds must span every invoke in the turn (3 + 3 + 3 = 9), not just the "
+        f"last: {last!r}")
+    ms = re.search(r"model_ms=(\d+)", last)
+    # 6973 + 7764 + 1000, then + 2000, then the full 6973 + 7764 + 6950
+    assert ms and int(ms.group(1)) == (6973 + 7764 + 1000) + (6973 + 7764 + 2000) \
+        + (6973 + 7764 + 6950), \
+        f"model_ms must span every invoke in the turn: {last!r}"
+    # And the serviced counter must still be its own number, accumulated in its own
+    # right: TWO checkpoints, which is what makes `+= 1` distinguishable from `= 1`.
+    serv = re.search(r"serviced=(\d+)", last)
+    assert serv and int(serv.group(1)) == 2, (
+        f"two inline functions were serviced, so serviced=2: {last!r}")
+
+
 def test_worker_rejects_launch_run_before_acceptance(wired, monkeypatch):
     tid = _mk_task(wired, status="thinking")
     calls = {"n": 0}
