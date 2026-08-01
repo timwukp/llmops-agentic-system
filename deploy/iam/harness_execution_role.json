@@ -292,7 +292,7 @@
         "Resource": "arn:aws:events:<REGION>:<ACCOUNT_ID>:event-bus/llmops-pipeline"
       },
       {
-        "_comment": "For llmops_finops (the audit runtime). READ-ONLY on billing, by design: an auditor able to change what it audits is not an auditor. Every verb here is Get/List/Describe -- notably NO ce:CreateCostCategoryDefinition, NO ce:UpdateCostAllocationTagsStatus, NO budgets:ModifyBudget. Resource must be * because ce:* and pricing:* have no resource-level ARNs; the scoping is the verb list. All six harnesses share this role, so the other five gain read-only billing visibility they do not use -- the alternative is a second execution role, which the harness create path does not support today.",
+        "_comment": "For llmops_finops (the audit runtime). READ-ONLY on billing, by design: an auditor able to change what it audits is not an auditor. Every verb here is a read -- notably NO ce:CreateCostCategoryDefinition, NO ce:UpdateCostAllocationTagsStatus, NO budgets:ModifyBudget. budgets:ViewBudget is the read: the Budgets API authorizes DescribeBudgets against the IAM action budgets:ViewBudget, so a policy naming only budgets:DescribeBudgets denies the call (live AccessDeniedException named budgets:ViewBudget). Both are listed -- ViewBudget is the one enforced. Resource must be * because ce:* and pricing:* have no resource-level ARNs; the scoping is the verb list. All six harnesses share this role, so the other five gain read-only billing visibility they do not use -- the alternative is a second execution role, which the harness create path does not support today.",
         "Sid": "BillingReadOnlyForFinOps",
         "Effect": "Allow",
         "Action": [
@@ -305,6 +305,7 @@
           "pricing:GetProducts",
           "pricing:GetAttributeValues",
           "pricing:DescribeServices",
+          "budgets:ViewBudget",
           "budgets:DescribeBudgets"
         ],
         "Resource": "*"

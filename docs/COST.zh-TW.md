@@ -262,7 +262,7 @@ Cost Explorer 大約延遲 **24 小時**，並把近期期間標記為 `Estimate
 
 ### 審計員不能停掉 run
 
-它的 IAM 對帳務是**唯讀的** —— `ce:Get*`、`pricing:*`、`budgets:DescribeBudgets` ——
+它的 IAM 對帳務是**唯讀的** —— `ce:Get*`、`pricing:*`、`budgets:ViewBudget` ——
 而且沒有終止任何東西的權限。審計員絕不能有能力改變它所審計的對象，而支出控制的權限屬於
 orchestrator（透過 `page_human`），不屬於一個職責是「觀察」的元件。一個有終止權的審計員
 是另一種、而且風險更高的設計。
