@@ -477,8 +477,19 @@ function stageTipRows(st){
   const c = st.config||{}, rows = [];
   const add = (k,v)=>{ if(v!==undefined && v!==null && v!=="") rows.push([k,String(v)]); };
   add("status", st.status);
-  add("AgentCore runtime", c.runtime);          // e.g. harness_llmops_data_prep
+  // "unresolved" is a real answer and must look different from a name: it means no
+  // live AgentCore runtime matched this harness. The runtime NAME is not unique
+  // (harness_llmops_data_prep) -- the id is (…-D8SPwm7Kog), so both are shown: the
+  // name to recognise, the id to grep logs and match ARNs with.
+  add("AgentCore runtime", c.runtime==="unresolved" ? "unresolved (no live match)" : c.runtime);
+  add("runtime id", c.runtimeId);
+  add("runtime status", c.runtimeStatus);
+  add("runtime version", c.runtimeVersion);
   add("harness id", c.harnessId);
+  add("harness (deployed)", c.harnessFullId);   // the suffixed id the driver invokes
+  add("harness status", c.harnessStatus);
+  add("model", c.model);
+  add("harness version", c.harnessVersion);
   add("stage · task", c.stage && c.task ? c.stage+" · "+c.task : null);
   add("SFN state", (c.states||[]).join(" | "));
   add("driver λ", c.lambda);
@@ -493,6 +504,11 @@ function stageTipRows(st){
   add("exited", st.exitedAt);
   add("error", st.error);
   add("cause", st.cause);
+  // Partial-resolution notes: a field that could not be read says why, rather than
+  // being silently absent (absent reads as "not applicable", which is a different claim).
+  if (c.harnessIdError) add("harness id unresolved", c.harnessIdError);
+  if (c.runtimeError) add("runtime lookup failed", c.runtimeError);
+  if (c.fleetError) add("harness health unavailable", c.fleetError);
   if (c._error) add("config unavailable", c._error);
   return rows;
 }

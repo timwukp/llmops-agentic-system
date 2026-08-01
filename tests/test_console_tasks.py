@@ -1175,6 +1175,68 @@ def test_one_stage_asking_does_not_repaint_another_stages_crash(console, monkeyp
 
 # ── the hover card: visibility into what is behind each stage box ─────────────
 
+#: The live suffixes, as SSM and AgentCore actually report them (verified 2026-08-01
+#: against get-parameters-by-path and list-agent-runtimes).
+#:
+#: The shapes matter and are NOT symmetric -- copied here verbatim because a fixture
+#: that guesses them tests the guess, not the pipeline:
+#:     agentRuntimeName = "harness_llmops_data_prep"             (no suffix; not unique)
+#:     agentRuntimeId   = "harness_llmops_data_prep-D8SPwm7Kog"  (the real identity)
+#:     SSM value        = "llmops_data_prep-KuSKXUaxyP"          (what the driver invokes)
+#: The SSM and runtime suffixes differ in the real account, so they differ here too.
+_LIVE_SSM_SUFFIX = {"llmops_data_prep": "KuSKXUaxyP", "llmops_finetune": "xXl7jsACZO",
+                    "llmops_eval": "iuIIs96fFM", "llmops_deploy": "nLLNWairTc",
+                    "llmops_orchestrator": "GsIqHZ4viJ", "llmops_monitor": "YCXC5hcXzu",
+                    "llmops_finops": "eDJtU9PvKh"}
+_LIVE_RT_SUFFIX = {"llmops_data_prep": "D8SPwm7Kog", "llmops_finetune": "toAA4REpAu",
+                   "llmops_eval": "rjwDnkFGr2", "llmops_deploy": "6xUSao73Lp",
+                   "llmops_orchestrator": "2sx6hzCapx", "llmops_monitor": "XsSfiw3c52",
+                   "llmops_finops": "7X1rk8DHKz"}
+
+
+def _stub_identity(console, monkeypatch, *, ssm_ok=True, rt_ok=True, fleet_ok=True,
+                   rt_present=True):
+    """Stub the three AWS reads harness_identity() makes, shaped like the live ones."""
+    # Both caches, or a later denial path is served the earlier healthy answer and the
+    # denial tests pass without exercising a denial. This is not test bookkeeping: the
+    # same leak in a warm Lambda serves a 40-minute-old status as if it were live.
+    console._HARNESS_ID_CACHE.clear()
+    console._FLEET_WIDE_CACHE.clear()
+
+    class _Ssm:
+        def get_parameter(self, Name):
+            if not ssm_ok:
+                raise RuntimeError("AccessDenied: ssm:GetParameter")
+            agent = Name.rsplit("/", 1)[-1]
+            logical = "llmops_" + agent.replace("-", "_")
+            return {"Parameter": {"Value": f"{logical}-{_LIVE_SSM_SUFFIX[logical]}"}}
+
+    class _Ctl:
+        def list_agent_runtimes(self, **kw):
+            if not rt_ok:
+                raise RuntimeError("AccessDenied: ListAgentRuntimes")
+            if not rt_present:
+                return {"agentRuntimes": [{"agentRuntimeName": "someone_elses_agent",
+                                           "agentRuntimeId": "someone_elses_agent-zzz",
+                                           "status": "READY"}]}
+            return {"agentRuntimes": [
+                {"agentRuntimeName": f"harness_{lg}",
+                 "agentRuntimeId": f"harness_{lg}-{sfx}",
+                 "agentRuntimeVersion": "8", "status": "READY"}
+                for lg, sfx in _LIVE_RT_SUFFIX.items()]}
+
+    monkeypatch.setattr(console, "ssm", _Ssm())
+    monkeypatch.setattr(console, "ctl", _Ctl())
+
+    def _fleet():
+        if not fleet_ok:
+            raise RuntimeError("AccessDenied: ListHarnesses")
+        return [{"name": lg, "id": f"{lg}-{_LIVE_SSM_SUFFIX[lg]}", "status": "READY",
+                 "version": "7", "model": "global.anthropic.claude-sonnet-5"}
+                for lg in _LIVE_SSM_SUFFIX]
+    monkeypatch.setattr(console, "list_fleet", _fleet)
+
+
 def test_the_stage_hover_config_comes_from_the_deployed_definition(console, monkeypatch):
     """The card answers "which AgentCore runtime is behind this box, with what timeout".
 
@@ -1183,6 +1245,7 @@ def test_the_stage_hover_config_comes_from_the_deployed_definition(console, monk
     undetectable by the operator asking the question.
     """
     console._STAGE_CFG_CACHE.clear()
+    _stub_identity(console, monkeypatch)
     monkeypatch.setattr(console, "sfn", _fake_sfn_history(_ESCALATED_HISTORY, "FAILED"))
     out = console.pipeline_detail("run-asked")
     by = {s["key"]: s for s in out["stages"]}
@@ -1192,12 +1255,102 @@ def test_the_stage_hover_config_comes_from_the_deployed_definition(console, monk
         pay = (asl[state].get("Parameters") or {}).get("Payload") or {}
         if not pay.get("harness_id"):
             continue
+        hid = pay["harness_id"]
         cfg = by[key]["config"]
-        assert cfg["harnessId"] == pay["harness_id"], f"{key}: wrong harness id"
-        assert cfg["runtime"] == "harness_" + pay["harness_id"]
+        assert cfg["harnessId"] == hid, f"{key}: wrong harness id"
         assert state in cfg["states"], f"{key}: {state} missing from states"
         if asl[state].get("TimeoutSeconds"):
             assert cfg["timeoutSeconds"] == asl[state]["TimeoutSeconds"]
+
+        # The identity must be RESOLVED, not assembled. Note what is NOT asserted here:
+        # `cfg["runtime"] == "harness_" + hid` is true either way, because that string
+        # really is the runtime's display name -- which is exactly why the old test
+        # passed while the console verified nothing. The suffixed id and the SSM harness
+        # id are unforgeable by concatenation, so they are what this pins.
+        assert cfg["harnessFullId"] == f"{hid}-{_LIVE_SSM_SUFFIX[hid]}"
+        assert cfg["runtimeId"] == f"harness_{hid}-{_LIVE_RT_SUFFIX[hid]}"
+        assert cfg["runtimeStatus"] == "READY", "runtime health is not reported"
+        assert cfg["harnessStatus"] == "READY" and cfg["model"], "harness health missing"
+
+
+def test_the_hover_card_says_unresolved_rather_than_inventing_a_runtime(console, monkeypatch):
+    """No live runtime matches -> say so. The failure mode this replaces is worse than
+    a blank: a synthesized name looks authoritative, so an operator chasing an outage
+    searches the console for an ARN that does not exist and concludes their own eyes
+    are wrong. Everything else on the card must still render."""
+    console._STAGE_CFG_CACHE.clear()
+    _stub_identity(console, monkeypatch, rt_present=False)
+    monkeypatch.setattr(console, "sfn", _fake_sfn_history([], "SUCCEEDED"))
+    cfg = console.stage_config()["data-prep-generate"]
+    assert cfg["runtime"] == "unresolved", cfg.get("runtime")
+    assert "runtimeId" not in cfg, "no id may be reported for a runtime we did not find"
+    # still useful: the facts that DID resolve are all present
+    assert cfg["harnessFullId"].startswith("llmops_data_prep-")
+    assert cfg["timeoutSeconds"] == 7200 and cfg["harnessStatus"] == "READY"
+
+
+def test_a_cached_harness_status_expires_instead_of_being_served_forever(console, monkeypatch):
+    """Health is a claim about NOW, so it must not be cached without a clock.
+
+    The first cut of harness_identity() cached its result keyed only by harness id, with
+    no expiry. Lambda containers live for tens of minutes, so a hover card would keep
+    rendering "READY" for a harness that had since gone UPDATING or failed -- a stale
+    read presented as a live one, which is the same lie as the concatenated runtime name
+    this function was written to remove. Two things are pinned: that a status CHANGE
+    becomes visible after the TTL, and that the TTL is short enough (<= one 30s poll of
+    the flow diagram, i.e. <= 60s) to be worth calling live.
+    """
+    assert console._HARNESS_ID_TTL_S <= 60.0, "a status this stale is not a status"
+
+    clock = {"t": 1_000.0}
+    monkeypatch.setattr(console.time, "time", lambda: clock["t"])
+    _stub_identity(console, monkeypatch)
+    first = console.harness_identity("llmops_data_prep")
+    assert first["harnessStatus"] == "READY"
+
+    # The fleet now reports the harness as UPDATING. Same container, same cache.
+    monkeypatch.setattr(console, "list_fleet",
+                        lambda: [{"name": "llmops_data_prep", "id": "llmops_data_prep-x",
+                                  "status": "UPDATING", "model": "m", "version": "9"}])
+    clock["t"] += console._HARNESS_ID_TTL_S / 2.0
+    assert console.harness_identity("llmops_data_prep")["harnessStatus"] == "READY", \
+        "within the TTL the cache is expected to serve -- that is what it is for"
+    clock["t"] += console._HARNESS_ID_TTL_S
+    assert console.harness_identity("llmops_data_prep")["harnessStatus"] == "UPDATING", \
+        "past the TTL the card is still reporting a status the fleet no longer has"
+
+
+def test_the_card_does_not_list_the_whole_account_once_per_stage_box(console, monkeypatch):
+    """ListAgentRuntimes and list_fleet answer for the ACCOUNT, so asking per box asks
+    the same question four times and bills for four.
+
+    list_fleet is the costly one -- ListHarnesses plus a GetHarness each, ~8 calls -- and
+    the 9 boxes carry 4 distinct harness ids, so the naive version made ~40 calls where
+    10 do. On the diagram's 30s poll that is a self-inflicted throttling risk on the
+    operator's only live view of the pipeline.
+    """
+    calls = {"fleet": 0, "runtimes": 0}
+    _stub_identity(console, monkeypatch)
+    real_fleet, real_ctl = console.list_fleet, console.ctl
+
+    monkeypatch.setattr(console, "list_fleet",
+                        lambda: (calls.__setitem__("fleet", calls["fleet"] + 1),
+                                 real_fleet())[1])
+
+    class _Ctl:
+        def list_agent_runtimes(self, **kw):
+            calls["runtimes"] += 1
+            return real_ctl.list_agent_runtimes(**kw)
+    monkeypatch.setattr(console, "ctl", _Ctl())
+
+    console._STAGE_CFG_CACHE.clear()
+    monkeypatch.setattr(console, "sfn", _fake_sfn_history([], "SUCCEEDED"))
+    cfgs = console.stage_config()
+    distinct = {c["harnessId"] for c in cfgs.values()
+                if isinstance(c, dict) and c.get("harnessId")}
+    assert len(distinct) > 1, "fixture must span several harness ids or this proves nothing"
+    assert calls["fleet"] == 1, f"list_fleet called {calls['fleet']}x for one render"
+    assert calls["runtimes"] == 1, f"ListAgentRuntimes called {calls['runtimes']}x"
 
 
 def test_the_remediation_stage_reports_both_states_it_can_run_as(console, monkeypatch):
@@ -1230,12 +1383,30 @@ def test_a_hover_card_never_breaks_the_flow_diagram(console, monkeypatch):
     assert len(out["stages"]) == len(console.STAGE_FLOW), "the flow must still render"
     assert "_error" in console.stage_config(), "and it must SAY the config is missing"
 
+    # Same contract for the identity lookups, which are three MORE ways to fail: SSM,
+    # ListAgentRuntimes and the fleet listing. Each is denied independently here
+    # because a role can hold one grant and not the others, and any single denial
+    # taking down the flow diagram would be the same bad trade as above.
+    for kw, note in (({"ssm_ok": False}, "harnessIdError"),
+                     ({"rt_ok": False}, "runtimeError"),
+                     ({"fleet_ok": False}, "fleetError")):
+        console._STAGE_CFG_CACHE.clear()
+        _stub_identity(console, monkeypatch, **kw)
+        monkeypatch.setattr(console, "sfn", _fake_sfn_history([], "SUCCEEDED"))
+        out = console.pipeline_detail("run-x")
+        assert len(out["stages"]) == len(console.STAGE_FLOW), f"{kw}: flow broke"
+        cfg = console.stage_config()["data-prep-generate"]
+        assert note in cfg, f"{kw}: the card must say why, not omit silently"
+        # a denial on one lookup must not blank the others
+        assert cfg["timeoutSeconds"] == 7200, f"{kw}: lost the ASL config too"
+
 
 def test_every_field_the_hover_card_renders_is_supplied_by_the_api(console, monkeypatch):
     """stageTipRows() reads st.<field> and st.config.<field>. A field the API never
     sends renders as a silently-absent row, so the card quietly loses the very fact
     the operator hovered to find."""
     console._STAGE_CFG_CACHE.clear()
+    _stub_identity(console, monkeypatch)
     monkeypatch.setattr(console, "sfn", _fake_sfn_history(_ESCALATED_HISTORY, "FAILED"))
     out = console.pipeline_detail("run-asked")
     gen = next(s for s in out["stages"] if s["key"] == "data-prep-generate")
@@ -1254,6 +1425,15 @@ def test_every_field_the_hover_card_renders_is_supplied_by_the_api(console, monk
     every_cfg = set()
     for s in out["stages"]:
         every_cfg |= set(s["config"])
+    # ...and across the DENIAL paths too, because the *Error notes only exist when a
+    # lookup fails. Unioning real code paths rather than exempting those names keeps the
+    # guard honest: a misspelled c.runtimeErorr in the card still fails here, which an
+    # exemption list would have waved through.
+    for kw in ({"ssm_ok": False}, {"rt_ok": False}, {"fleet_ok": False}):
+        console._STAGE_CFG_CACHE.clear()
+        _stub_identity(console, monkeypatch, **kw)
+        for s in console.pipeline_detail("run-asked")["stages"]:
+            every_cfg |= set(s["config"])
     missing = sorted(f for f in cfg_fields if f not in every_cfg)
     assert not missing, f"the card renders config.{missing} but stage_config never sets it"
 
