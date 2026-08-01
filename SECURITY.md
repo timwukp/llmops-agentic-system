@@ -31,9 +31,11 @@ documentation example ID, used only in offline dry-run usage examples).
 
 - **Least-privilege IAM only** — every role in `deploy/iam/` is resource-scoped;
   no `*FullAccess` managed policies anywhere.
-- **Production = VPC-isolated**: harnesses and Lambdas run in a dedicated VPC with
-  no internet gateway; all AWS dependencies via VPC endpoints (`deploy/02_network.py`).
-  Skills are mounted from an S3 mirror, not GitHub, in production.
+- **VPC isolation** — `deploy/02_network.py` builds a dedicated VPC with no internet
+  gateway and all AWS dependencies via VPC endpoints. VPC-mode *harness* variants are
+  **not built yet**, and they are blocked on the S3 skill mirror: all 19 skill sources
+  are `git`, which a VPC-mode harness cannot reach. Skills therefore come from GitHub
+  today, and the git source reads the skill repo's default branch only.
 - `InvokeAgentRuntime` on `runtime/harness_*` executes shell in the session VM and
   bypasses `allowedTools` — it is granted only to the harness-driver Lambda role.
 - S3: public access block ON, SSE, versioning; DynamoDB: PITR on.
