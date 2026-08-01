@@ -279,6 +279,38 @@ class TestContracts:
         with pytest.raises(ValueError, match="client=None"):
             ev.emit_event("bus", ev.PIPELINE_FAILED, {"run_id": "r"}, client=None)
 
+    def test_every_lambda_client_factory_builds_a_real_events_client(self):
+        """Why the sentinel above cannot change deployed behaviour.
+
+        Every orchestration call site passes ``client=c["events"]`` explicitly -- so
+        the question is not whether the argument is supplied, it is whether it can ever
+        be None in a Lambda. It cannot: ``handler`` does ``c = clients or _clients()``,
+        ``clients`` is injected only by tests, and each ``_clients()`` constructs a real
+        ``boto3.client("events")``. A None therefore only ever arrives from a test fake,
+        which is exactly the case the sentinel now rejects.
+
+        That reasoning is what let the fix ship without redeploying the bundles that
+        vendor events.py, so it is asserted rather than left in a commit message. If a
+        factory ever grows an ``"events": None`` -- plausible for a Lambda that believes
+        it emits nothing -- the sentinel stops being a no-op live and this fails first.
+        """
+        factories = []
+        for path in sorted(REPO.glob("orchestration/**/handler.py")):
+            src = path.read_text()
+            if "emit_event(" not in src:
+                continue
+            m = re.search(r"def _clients\(\).*?(?=\n(?:def|class|@)|\Z)", src, re.DOTALL)
+            assert m, f"{path.relative_to(REPO)} emits events but has no _clients()"
+            body = m.group(0)
+            assert '"events": None' not in body, (
+                f"{path.relative_to(REPO)}'s _clients() hands out a None events client; "
+                "emit_event now rejects that, so this Lambda would raise at runtime")
+            assert re.search(r'"events":\s*boto3\.client\(\s*["\']events["\']', body), (
+                f"{path.relative_to(REPO)}'s _clients() does not build a real events "
+                "client -- confirm emit_event can still reach EventBridge from it")
+            factories.append(path.name)
+        assert factories, "found no event-emitting Lambda to check"
+
     def test_normalize_alias_drift(self):
         norm = normalize_stage_complete(
             {"stage": "eval", "task": "gate", "artifacts": "s3://b/one",
