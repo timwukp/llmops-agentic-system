@@ -141,6 +141,19 @@ prompt 明文禁止它刪東西的 agent。
   之前，runtime 必須假設那條通道是死的。現在每一種通知都各自被包住並記錄，順序依「失去它的
   代價」遞增排列：先 SNS、再時間軸那一列、再 bus 事件，最後才是 token settle —— 好讓即使所有
   通知都失敗，它仍然會發生。
+- **就緒檢查清單必須從 prompt 推導出來，不能從它抄一份。** console 的 Data-readiness 面板存在的
+  意義，就是逐題呈現 orchestrator 的 consult protocol 要求 agent 回答哪些問題、以及哪些還沒答。
+  但它的守門測試自己重述了七個路徑並斷言 console 含有它們 —— 於是測試同時同意 console 也同意
+  自己，而 prompt 的 `data` 區塊其實指定了**九個**。線上實況是：面板少了
+  `datasheet.provenance`（沒有來源，授權條款幾乎沒有意義）以及 `readiness_report_uri` ——
+  指向 Data Readiness Report 的連結，而審核的 PII 掃描結果正是落在那份報告裡。客戶因此可能讀到
+  一個看起來很完整的面板，看見 `PII disposition: redacted` 這個寫在計畫裡的宣稱，卻拿不到任何
+  通往那份「真的檢查過資料」的產物的連結。現在面板與它的守門測試都源自
+  `agents/orchestrator/harness.json`：`tests/test_console_tasks.py` 的
+  `_prompt_data_block_keys()` 直接從 prompt 解析該區塊，另有一個測試斷言這個推導仍然是推導，
+  而不是又一份寫死的清單。規則與「文件裡的測試數」守門一致 —— 當事實來源是一段模型 prompt，
+  就去解析那段 prompt。（`frontend.html` 的 `renderReadiness` 是由 API 的 `fields` 驅動的，
+  所以補回的兩列不需要動前端。）
 - **deploy 之後必然執行 `Teardown`** —— 即使 `SmokeTest` 失敗，其 `Catch` 也先路由到
   `Teardown`。孤兒 endpoint 是第一大成本風險（Phase 4 就在帳號裡發現一個無關的
   endpoint 自 2024-04 起一直 InService）。

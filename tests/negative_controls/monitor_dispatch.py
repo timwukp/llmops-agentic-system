@@ -653,6 +653,42 @@ case("driver: a failed bus emit skips the task-token settle, parking it until th
      ["tests/test_orchestration.py::TestDriver::test_a_failed_bus_emit_still_settles_the_task_token"])
 
 
+# ── the readiness checklist must be derived from the prompt, not restated ─────────────
+#
+# 51. The readiness panel drops readiness_report_uri again -- the pointer to the Data
+#     Readiness Report, which is where the audit's PII scan lands. The panel then shows a
+#     complete 8/8 while the customer has no link to the artifact that examined their data,
+#     and "PII disposition: redacted" is a claim in the plan with nothing behind it.
+def m51(t):
+    old = ('    ("readiness_report_uri", "Data Readiness Report",\n'
+           '     "the audit that actually examined the data, including its PII scan — without this "\n'
+           '     "link the PII answer above is a claim in the plan with nothing behind it"),\n')
+    assert old in t, "the readiness_report_uri row has moved; re-anchor this mutation"
+    return t.replace(old, "", 1)
+case("console: the readiness panel omits the report that carries the PII scan",
+     "deploy/console/lambda_function.py", m51,
+     ["tests/test_console_tasks.py::test_readiness_names_every_field_the_consult_protocol_asks_for"])
+
+# 52. The derivation itself is replaced by a hand-copied set -- the shape the guard was in
+#     when the omission got through. A restated checklist agrees with the console and with
+#     itself, so it cannot detect the drift it exists to detect. This mutation is aimed at
+#     _prompt_data_block_keys, which is what BOTH readiness guards read, so it also proves
+#     control 51's catch depends on the derivation rather than on a coincidence.
+def m52(t):
+    old = "    m = re.search(r'a \"data\" block \\{(.*?)\\}; and for any', prompt)"
+    assert old in t, "the data-block prompt parse has moved; re-anchor this mutation"
+    return t.replace(
+        old,
+        "    m = None\n"
+        "    if True:\n"
+        "        return {'source_uri', 'verification_method', 'datasheet.license',\n"
+        "                'datasheet.pii_disposition', 'datasheet.consent',\n"
+        "                'customer_eval_uri', 'decontamination'}", 1)
+case("test: the readiness guard restates the checklist instead of deriving it",
+     "tests/test_console_tasks.py", m52,
+     ["tests/test_console_tasks.py::test_the_readiness_guard_is_derived_from_the_prompt"])
+
+
 failed = []
 for name, rel, mutate, tests in CASES:
     p = REPO / rel

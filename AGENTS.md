@@ -140,6 +140,22 @@ versions and introspects the live CreateHarness/UpdateHarness schemas.
   `handle_escalate` wrote no stage event at all — so check what a conditional write was
   standing in for before you make it conditional. The escalation is now recorded in
   `llmops-stage-events` on both paths, wrapped, so a failed record cannot withhold the alert.
+- **A checklist guard that carries its own copy of the checklist cannot detect drift.**
+  The console's Data-readiness panel is supposed to ask every question the orchestrator's
+  consult protocol tells the agent to answer. Its guard hand-copied seven paths and
+  asserted the console contained them — so the test agreed with the console and with
+  itself, while the prompt's `data` block specified **nine**. `datasheet.provenance` and
+  `readiness_report_uri` were missing from the panel with every test green, and the second
+  is the pointer to the Data Readiness Report — where the audit's **PII scan** lands. The
+  panel showed "PII disposition" as answered from a claim in the plan while omitting the
+  only link to the artifact that examined the data. The guard now parses the key list out
+  of `agents/orchestrator/harness.json`, and a second guard asserts that derivation is
+  still a derivation. Same rule as the documented-test-count guard: derive from the real
+  source, and if the source is a model prompt, parse the prompt.
+- **Macie is ENABLED in this account but scans nothing of ours** — the only classification
+  job is a `ONE_TIME` job from 2021 over unrelated buckets, so nothing looks at
+  `customer-data/`. The audit's PII scan is heuristic regex by design and says so in its
+  own report; do not read "Macie: ENABLED" as coverage.
 - **Notify on independent channels, and never let the weakest one gate the rest.** The
   driver's escalate path publishes to SNS, writes a stage event, emits `EscalatedToHuman`,
   and settles the task token. The SNS publish was first and unwrapped, so one failed publish

@@ -161,6 +161,22 @@ Two spine details that are policy, not plumbing:
   channel is dead. Each notification is now wrapped and logged on its own, in ascending
   order of what it costs to lose: SNS, then the timeline row, then the bus event, and the
   token settle last so it happens even when every notification failed.
+- **A readiness checklist must be derived from the prompt, not copied from it.** The console's
+  Data-readiness panel exists to show, question by question, what the orchestrator's consult
+  protocol told the agent to answer — and which answers are still missing. Its guard restated
+  seven paths and asserted the console contained them, so the test agreed with the console and
+  with itself while the prompt's `data` block specified **nine**. Live, the panel was missing
+  `datasheet.provenance` (a license means little without the origin it applies to) and
+  `readiness_report_uri` — the pointer to the Data Readiness Report, which is where the
+  audit's PII scan lands. A customer could therefore read a complete-looking panel, see
+  `PII disposition: redacted` as a claim in the plan, and have no link to the one artifact
+  that examined the data. The panel and its guard now both come from
+  `agents/orchestrator/harness.json`: `_prompt_data_block_keys()` in
+  `tests/test_console_tasks.py` parses the block out of the prompt, and a second test asserts
+  that the derivation is still a derivation rather than a fresh hardcoded list. Same rule as
+  the documented-test-count guard — when the source of truth is a model prompt, parse the
+  prompt. (`renderReadiness` in `frontend.html` is data-driven from the API's `fields`, so the
+  two restored rows needed no frontend change.)
 - **`Teardown` always runs after deploy** — even when `SmokeTest` fails, its `Catch`
   routes to `Teardown` first. Orphaned endpoints are the #1 cost risk (Phase 4 found an
   unrelated endpoint in the account that had been InService since 2024-04).

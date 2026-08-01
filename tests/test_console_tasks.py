@@ -2927,18 +2927,71 @@ def _plan_with(data):
     return json.dumps({"goal": "x", "data": data}).encode()
 
 
+def _prompt_data_block_keys():
+    """The data-block keys the orchestrator's prompt actually names, parsed from it.
+
+    DERIVED, not restated. The previous version of this test hand-copied seven paths and
+    asserted the console contained them -- so it agreed with the console and with itself
+    while the prompt specified NINE, and `datasheet.provenance` and `readiness_report_uri`
+    were missing from the panel with every test green. A checklist guard that carries its
+    own copy of the checklist cannot detect the drift it exists to detect: the same lesson
+    as the documented-test-count guard, which is derived from pytest for exactly this
+    reason. The prompt is the authority here because it is what the agent is told to write.
+    """
+    import re
+    cfg = json.loads((REPO / "agents/orchestrator/harness.json").read_text())
+    prompt = cfg["systemPrompt"][0]["text"]
+    m = re.search(r'a "data" block \{(.*?)\}; and for any', prompt)
+    assert m, "the consult protocol's data block is no longer in the prompt; re-anchor"
+    spec, keys = m.group(1), []
+    for nested in re.finditer(r'(\w+)\{([^}]*)\}', spec):
+        keys += [f"{nested.group(1)}.{k.strip()}" for k in nested.group(2).split(",")]
+    for flat in re.sub(r'\w+\{[^}]*\}', '', spec).split(","):
+        if flat.strip():
+            keys.append(flat.strip())
+    return set(keys)
+
+
 def test_readiness_names_every_field_the_consult_protocol_asks_for(wired):
-    """The panel's checklist and the orchestrator's step-0 questions must be one list.
-    If the console drops a field the agent asks about, the customer sees two different
-    checklists for one consultation and can sign with an open question invisible."""
+    """The panel's checklist and the orchestrator's step-2 data block must be ONE list.
+
+    If the console drops a field the agent is told to write, the customer sees a
+    complete-looking readiness panel for an incomplete consultation and can sign with an
+    open question invisible. That was live for `readiness_report_uri` -- the pointer to
+    the Data Readiness Report, which is where the audit's PII scan lands. The panel showed
+    "PII disposition" as answered from a claim in the plan while omitting the only link to
+    the artifact that examined the data.
+    """
     tid = _mk_task(wired, plan_body=_plan_with({}))
     r = wired.console.task_readiness(tid)
     paths = [f["field"] for f in r["fields"]]
-    for expected in ("source_uri", "verification_method", "datasheet.license",
-                     "datasheet.pii_disposition", "datasheet.consent",
-                     "customer_eval_uri", "decontamination"):
-        assert expected in paths, f"{expected} missing from the readiness panel: {paths}"
+    missing = _prompt_data_block_keys() - set(paths)
+    assert not missing, (
+        f"the orchestrator is told to write {sorted(missing)}, and the readiness panel "
+        f"never asks about them: {paths}")
     assert r["total"] == len(paths) == len(wired.console.DATA_READINESS_FIELDS)
+    assert len(paths) == len(set(paths)), f"a field is listed twice: {paths}"
+
+
+def test_the_readiness_guard_is_derived_from_the_prompt(wired):
+    """A guard on the guard above, because a restated checklist is how this got through.
+
+    The test above is only worth anything if its expected list comes from the prompt. If
+    someone replaces the derivation with a literal set, every assertion still passes and
+    the panel can silently fall behind the prompt again -- which is exactly the state that
+    hid `readiness_report_uri`. So assert the derivation itself: the parsed keys must
+    include the nested datasheet paths and the report pointer, and must be more than the
+    one field a hardcoded stub would likely name.
+    """
+    keys = _prompt_data_block_keys()
+    assert "readiness_report_uri" in keys and "datasheet.provenance" in keys, (
+        f"the data-block parse lost keys the prompt names: {sorted(keys)}")
+    assert len(keys) >= 9, f"the prompt names 9 data-block keys; parsed {sorted(keys)}"
+    assert all(k.startswith("datasheet.") for k in keys if "provenance" in k)
+    # And the panel is measured against ALL of them, not a subset.
+    tid = _mk_task(wired, plan_body=_plan_with({}))
+    paths = {f["field"] for f in wired.console.task_readiness(tid)["fields"]}
+    assert keys <= paths, f"not measured against the full spec: {sorted(keys - paths)}"
 
 
 def test_an_unanswered_field_says_so_and_says_why(wired):

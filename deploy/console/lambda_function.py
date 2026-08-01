@@ -2401,19 +2401,33 @@ def close_task(task_id, body, user):
 # The consult protocol's step-2 "data" block, as the orchestrator is told to write it.
 # Each entry is (dotted path into the plan's data block, label, why the customer should
 # care). The WHY is shipped to the browser rather than written into the frontend,
-# because these are the same six questions the orchestrator asks at step 0 -- if the
+# because these are the same questions the orchestrator asks at step 0 -- if the
 # wording drifts between the agent and the panel the customer sees two different
 # checklists for one consultation.
+#
+# This list must cover EVERY key the orchestrator's prompt names in that block, and it
+# did not: `datasheet.provenance` and `readiness_report_uri` were specified for the agent
+# to write and absent here, so the panel had 7 rows against a 9-key spec. The second
+# omission is the expensive one -- readiness_report_uri is the pointer to the Data
+# Readiness Report, which is where the audit's PII scan actually lands. A customer could
+# therefore read a complete-looking readiness panel, see "PII disposition: redacted" as a
+# claim in the plan, and have no link to the one artifact that examined the data. The
+# guard for this now derives the key list from harness.json rather than restating it.
 DATA_READINESS_FIELDS = (
     ("source_uri", "Where the data is",
      "an S3 URI under customer-data/ — until this exists there is nothing to audit"),
     ("verification_method", "How outputs are verified",
      "tests, exact answers or rules; without one, quality gates fall back to an "
      "LLM judge and are marked low-confidence"),
+    ("datasheet.provenance", "Where the data came from",
+     "who collected it and how; a license means little without the origin it applies to"),
     ("datasheet.license", "License / provenance",
      "whether the data may legally be used to train, and where it came from"),
     ("datasheet.pii_disposition", "PII disposition",
      "what personal data is present and what happens to it"),
+    ("readiness_report_uri", "Data Readiness Report",
+     "the audit that actually examined the data, including its PII scan — without this "
+     "link the PII answer above is a claim in the plan with nothing behind it"),
     ("datasheet.consent", "Consent to send to the teacher",
      "distillation sends this data to the teacher model; the customer has to know"),
     ("customer_eval_uri", "Held-out acceptance set",
