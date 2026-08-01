@@ -1274,6 +1274,25 @@ def _cost_model():
         return None
 
 
+def _rate_card_doc():
+    """The rate-card DOCUMENT from S3 as a plain dict, or None.
+
+    Separate from _rate_card() because RateCard keeps only the SKU table: the document's
+    generated_at / rate_precedence / health fields do not survive the constructor. A
+    caller that needs them (rate_card_for_prompt) cannot get them from a RateCard, and
+    reaching for a `.doc` attribute that does not exist fails SILENTLY through getattr —
+    which would make the console tell every customer it cannot quote prices.
+    """
+    try:
+        o = s3.get_object(Bucket=data_bucket(),
+                          Key="finops/rates/rate_card_latest.json")
+        doc = json.loads(o["Body"].read())
+        return doc if isinstance(doc, dict) else None
+    except Exception as e:
+        print(f"[finops] no rate card: {e}")
+        return None
+
+
 def _rate_card():
     """Latest rate card from S3 as a RateCard, or None.
 
@@ -1285,17 +1304,14 @@ def _rate_card():
     cm = _cost_model()
     if cm is None:
         return None
-    try:
-        o = s3.get_object(Bucket=data_bucket(),
-                          Key="finops/rates/rate_card_latest.json")
-        # RateCard unwraps the document itself now. Repeating doc.get("rates", doc)
-        # here is how the knowledge stayed in ONE caller while every other caller --
-        # including an agent following the orchestrator prompt's instruction to read
-        # this exact file -- died on a ValueError from dict('rate_card').
-        return cm.RateCard(json.loads(o["Body"].read()))
-    except Exception as e:
-        print(f"[finops] no rate card: {e}")
+    doc = _rate_card_doc()
+    if doc is None:
         return None
+    # RateCard unwraps the document itself now. Repeating doc.get("rates", doc)
+    # here is how the knowledge stayed in ONE caller while every other caller --
+    # including an agent following the orchestrator prompt's instruction to read
+    # this exact file -- died on a ValueError from dict('rate_card').
+    return cm.RateCard(doc)
 
 
 def _f(v, default=0.0):
@@ -1751,6 +1767,48 @@ def rate_card_health(plan=None):
     out = cm.rate_card_health(card, cm.required_skus_for(plan or {}))
     out["present"] = True
     return out
+
+
+def rate_card_for_prompt():
+    """The rate card as a compact dict to hand the orchestrator IN its invocation.
+
+    The consult prompt used to say "read s3://<bucket>/finops/rates/rate_card_latest.json
+    FIRST". That cost a whole model round-trip -- the agent had to answer with a tool call,
+    wait, then be re-invoked with the result -- and X-Ray showed the round-trip is where
+    the latency lives: on one measured 60.6s turn, 8.4s went to the call that only decided
+    to run a shell, and 44.8s to the call that finally answered. Worse, the agent did not
+    reliably obey: traces 1-6a6d85d0-... and 1-6a6d85c5-... show it fetching litellm's
+    model_prices_and_context_window.json from raw.githubusercontent.com instead, so it was
+    paying for a round-trip AND quoting the customer prices from a third party's file.
+
+    Handing it the rates removes both failures at once. The card is read here, at invoke
+    time, from the same S3 object _rate_card() uses -- so this is not a snapshot baked into
+    a prompt that goes stale the next time pricing_refresh runs.
+
+    Only unit_price/unit/source per SKU: the full document is 10463 bytes of provenance
+    (realized_from bases, usage types, CE windows) the agent does not quote, and every
+    injected byte is billed on every turn. 16 SKUs compact to ~1.8 KB.
+
+    Returns None when the card is unreadable -- the caller must then say it cannot quote
+    prices, exactly as the prompt already required. An empty dict here would read as "no
+    rates exist" and invite an invented number.
+
+    Reads the DOCUMENT, not a RateCard: the constructor keeps only the SKU table, so
+    generated_at / rate_precedence do not survive it, and there is no `.doc` attribute to
+    reach back through. getattr(card, "doc", None) returns None silently -- which would
+    ship a console that tells every customer it cannot quote prices.
+    """
+    doc = _rate_card_doc() or {}
+    rates = doc.get("rates") or {}
+    if not rates:
+        return None
+    return {
+        "generated_at": doc.get("generated_at", ""),
+        "rate_precedence": doc.get("rate_precedence", []),
+        "rates": {k: {"unit_price": v.get("unit_price"), "unit": v.get("unit"),
+                      "source": v.get("source")}
+                  for k, v in rates.items() if isinstance(v, dict)},
+    }
 
 
 def cost_variance(estimates=None, overview=None):
@@ -2437,6 +2495,17 @@ def run_task_turn(task_id, accept=False):
                 or task.get("plan_uri") or f"s3://{b}/tasks/{task_id}/plan.json")
     params = {"task": "consult", "task_id": task_id,
               "plan_uri": str(plan_uri), "bucket": b, "region": REGION}
+    # Hand the agent its prices instead of making it fetch them. The prompt used to say
+    # "read s3://<bucket>/finops/rates/rate_card_latest.json FIRST", which cost a whole
+    # model round-trip per turn -- and X-Ray shows the round-trip IS the latency (one
+    # measured 60.6s turn: 8.4s for the call that only decided to run a shell, 44.8s for
+    # the call that finally answered). It also did not work: the agent fetched litellm's
+    # price file off raw.githubusercontent.com instead, so it paid for the round-trip AND
+    # quoted the customer a third party's prices. Read fresh here every turn, so this is
+    # not a snapshot that goes stale when pricing_refresh next runs.
+    card = rate_card_for_prompt()
+    if card:
+        params["rate_card"] = card
     envelope = json.dumps({"run_id": f"task-{task_id}", "stage": "consult",
                            "manifest_uri": "", "params": params}, default=str)
     if approval_ctx:
