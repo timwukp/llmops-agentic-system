@@ -19,7 +19,7 @@
 | Skill | 在此扮演的角色 |
 |---|---|
 | [agentcore-harness-builder](https://github.com/timwukp/agent-skills-best-practice/tree/main/skills/skills/agentcore-harness-builder) | **平台構建** —— 其規定工作流（preflight → 設計 → 撰寫配置 → 建立 → 記憶 → 可觀測性 → 調用驗證 → 版本/釘選 → 評估）構建了每一個 harness；其腳本直接複用於 `deploy/` |
-| [MLOps-agent-skills](https://github.com/timwukp/MLOps-agent-skills)（LLMOps 鏈） | **Agent 能力** —— 每個 harness 在 session 啟動時通過 harness `skills` 來源掛載其階段所需的技能（開發用 git、生產用 S3 鏡像） |
+| [MLOps-agent-skills](https://github.com/timwukp/MLOps-agent-skills)（LLMOps 鏈） | **Agent 能力** —— 每個 harness 在 session 啟動時通過 harness `skills` 來源掛載其階段所需的技能（目前 19 個來源全部是 `git`；S3 鏡像是計劃中的工作，也是 VPC 模式的前置條件） |
 
 ## 架構
 
@@ -48,8 +48,9 @@ Lambda + HTTP API + Cognito 獨立棧，從
 - **訓練採 launch-and-release** —— harness 絕不空等數小時的作業：發起作業後呼叫
   `job_launched` 釋放 session，管線經 `waitForTaskToken` + EventBridge SageMaker 狀態變化
   規則在全新 session 中恢復。狀態存在 S3 manifest，絕不存在 session 裡。
-- **企業級態勢** —— 生產環境的 harness 與 Lambda 都在 VPC 內隔離運行（interface endpoints，
-  無互聯網出口）；全程最小權限 IAM；生產技能從 S3 鏡像掛載。
+- **企業級態勢** —— 全程最小權限 IAM；VPC 與 interface endpoints（無互聯網出口）由
+  `deploy/02_network.py` 建立。VPC 模式的 harness 變體與其所需的 S3 技能鏡像**尚未實作**:
+  VPC 模式的 harness 無法解析 `git` 技能來源,所以鏡像是前置條件,不是優化。
 
 ## 為什麼這些 agent 能替代 LLMOps 工程師：三層疊加，而不是單一模型
 

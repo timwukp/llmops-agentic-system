@@ -39,7 +39,10 @@ Next: v2 experiments — code-as-reasoning distillation + augmentation; Kimi K3 
 | Admin console | `agent-cicd-admin` stack (Lambda+APIGW+DDB+Cognito) | ops-console deploy.sh | login secret `agent-admin/dashboard-login`; monitors orchestrator + finetune |
 | Online evals | one config per harness (Correctness/GoalSuccessRate/ToolSelectionAccuracy, 100% sampling) | deploy/06_observability.py --evals | role llmops-eval-execution |
 
-_Prod-only, not deployed: VPC + endpoints (deploy/02_network.py), harness.prod.json variants (S3-mirrored skills)._
+_Not deployed: VPC + endpoints (deploy/02_network.py). Not built at all: VPC-mode
+harness variants and the S3 skill mirror they depend on — all 19 skill sources across
+the 7 harnesses are `git`, none are `s3` (guarded by tests/test_docs_claims.py). Earlier
+revisions named `harness.prod.json` files that have never existed._
 
 ## Standing cost posture
 

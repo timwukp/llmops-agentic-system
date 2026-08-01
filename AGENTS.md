@@ -70,11 +70,19 @@ versions and introspects the live CreateHarness/UpdateHarness schemas.
   (not `harnessArn`); InvokeHarness returns `stream`; `runtimeSessionId` ≥ 33 chars.
 - **allowedTools**: plain names only. `browser_*` globs match nothing and silently
   hide the tool.
-- **Git skill source reads the DEFAULT branch only** — a skill change must merge to
-  the skill repo's main before a fresh session picks it up. Production harnesses use
-  the S3-mirrored skill snapshot instead (see `deploy/05_mirror_skills.py`), because
-  (a) VPC-mode harnesses can't reach GitHub and (b) main-branch drift must not
-  silently change production agent behavior.
+- **Git skill source reads the DEFAULT branch only** (there is no branch field) — a
+  skill change must merge to the skill repo's main before a fresh session picks it up.
+  **All 19 skill sources across the 7 harnesses are `git` today; none are `s3`.** An S3
+  mirror is the planned fix, for two reasons: VPC-mode harnesses can't reach GitHub at
+  all, and main-branch drift otherwise silently changes agent behavior. It does not
+  exist yet — `deploy/05_mirror_skills.py` and `agents/*/harness.prod.json` were
+  described here as existing files and have never existed in any branch.
+  `tests/test_docs_claims.py` now derives the counts from the configs, so this line
+  cannot go stale silently.
+- **A bad skill source fails at SESSION START, not at `UpdateHarness`** — a wrong path
+  or a `SKILL.md` missing its YAML frontmatter is accepted by the control plane and then
+  fails every invocation. So switching sources requires the objects to be in place
+  first; the switch is not reversible by config alone once sessions start failing.
 - **Observability**: `OTEL_TRACES_SAMPLER=always_on` env var is mandatory or
   evaluations/insights sit at zero forever. X-Ray delivery takes no `outputFormat`.
 - **Turn budget**: harness `timeoutSeconds` is 840 here (driver Lambda caps at 900s).
@@ -92,9 +100,10 @@ versions and introspects the live CreateHarness/UpdateHarness schemas.
   files, and commit diffs. Use `<ACCOUNT_ID>` placeholders; deploy scripts substitute
   at run time. `hooks/pre-commit` and `.github/workflows/redaction-check.yml` enforce.
 - Least-privilege IAM only. No `*FullAccess` managed policies.
-- Production harnesses run VPC-mode with interface endpoints (see `deploy/02_network.py`);
-  dev configs (`agents/*/harness.json`) are PUBLIC-network for iteration speed —
-  prod variants are `agents/*/harness.prod.json`.
+- The VPC with interface endpoints is built by `deploy/02_network.py`. Harness configs
+  (`agents/*/harness.json`) are PUBLIC-network for iteration speed. VPC-mode harness
+  variants are **not built yet** and depend on the S3 skill mirror above (a VPC-mode
+  harness cannot resolve a git skill source).
 
 ## Repo conventions
 
