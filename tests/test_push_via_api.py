@@ -181,13 +181,20 @@ class FakeGH:
     and the bug that cost a commit on 2026-08-01 cannot be reproduced offline.
     """
 
-    def __init__(self, refs, commits=(), stale_reads=0):
+    def __init__(self, refs, commits=(), stale_reads=0, chain=()):
         self.refs = dict(refs)          # "heads/<branch>" -> sha
         self.commits = set(commits)     # shas the remote can resolve
         self.calls = []                 # (method, path, data)
         self.stale_reads = stale_reads  # ref GETs to answer 404 despite the ref existing
         self.slept = []                 # backoff delays, so a retry loop is observable
         self.created_commits = []       # every POST /git/commits payload, in order
+        # The remote's existing commit chain, newest first: [(sha, tree, parent), ...].
+        # Needed because an API-replayed commit has a sha the local repo has never seen,
+        # so "has the remote already got this commit" can only be answered by TREE --
+        # and a double that reports no parents cannot model a chain to walk at all.
+        self.chain = {sha: {"tree": tree, "parent": parent}
+                      for sha, tree, parent in chain}
+        self.commits |= set(self.chain)
 
     # read_ref lives on the real GitHub class, so the double must provide it too.
     # Delegating keeps the RETRY POLICY under test instead of reimplemented here — a
@@ -231,6 +238,10 @@ class FakeGH:
                 if absent_ok:
                     return None
                 raise SystemExit(f"GitHub 404 on GET {path}")
+            if sha in self.chain:
+                node = self.chain[sha]
+                return {"tree": {"sha": node["tree"]},
+                        "parents": ([{"sha": node["parent"]}] if node["parent"] else [])}
             return {"tree": {"sha": f"tree-of-{sha}"}}
         if path == "/git/blobs":
             # Keyed by content so a test can prove which commit a blob was read from:
@@ -269,7 +280,7 @@ class FakeGH:
 
 def _run_main(monkeypatch, gh, *, branch, parent="parentsha", commit_count="7",
               ops=(":100644 100644 aaa bbb M", "pipeline/contracts/report.py"),
-              revs=None, messages=None, extra_argv=()):
+              revs=None, messages=None, extra_argv=(), trees=None):
     """Drive main() with fake git + fake HTTP; return (exit code, gh).
 
     `revs` is the local commit list the tool would replay (oldest first, as
@@ -279,6 +290,10 @@ def _run_main(monkeypatch, gh, *, branch, parent="parentsha", commit_count="7",
     """
     revs = list(revs) if revs is not None else ["headsha"]
     messages = messages or {}
+    # Per-rev tree shas, so a test can model "the remote already has THIS commit's tree".
+    # Default: every rev reports "local-tree", which keeps the parity check satisfied for
+    # the tests that do not care about per-commit trees.
+    trees = trees or {}
 
     def fake_git(*args, binary=False):
         if args[0] == "config":
@@ -288,7 +303,7 @@ def _run_main(monkeypatch, gh, *, branch, parent="parentsha", commit_count="7",
         if args[:2] == ("rev-parse", "HEAD^"):
             return parent
         if args[0] == "rev-parse" and args[1].endswith("^{tree}"):
-            return "local-tree"
+            return trees.get(args[1][:-len("^{tree}")], "local-tree")
         if args[:2] == ("rev-list", "--count"):
             return commit_count
         if args[:2] == ("rev-list", "--reverse"):
@@ -782,3 +797,116 @@ def test_onto_refuses_a_base_the_remote_does_not_have(monkeypatch):
     assert not [c for c in gh.calls if c[1] == "/git/blobs"], (
         f"a bad --onto must be caught BEFORE any blob is uploaded; these went up "
         f"anyway: {[c for c in gh.calls if c[1] == '/git/blobs']!r}")
+
+
+# ── corruption #6: the fix for #4 made every push replay the whole branch ──────
+# Replaying commit-by-commit gives each remote commit a NEW sha, so the remote head is
+# never an ancestor of local HEAD and `rev-list remote..HEAD` returns everything again.
+# Observed live 2026-08-01: pushing 1 new commit to docs/no-s3-skill-mirror landed 2, and
+# the previous commit appeared on the remote twice under its own message. Tree parity is
+# blind to it for the same reason it was blind to the squash -- the final tree is
+# identical either way -- which is why the prefix is now matched by TREE.
+
+def test_a_commit_the_remote_already_has_is_not_replayed_a_second_time(monkeypatch):
+    """The live defect. Two local commits, the first already on the remote (as a replayed
+    commit with a different sha but the SAME tree): only the second may be created."""
+    gh = FakeGH({"heads/docs/x": "remote-c1"},
+                commits=["basesha"],
+                chain=[("remote-c1", "tree-c1", "basesha"),
+                       ("basesha", "tree-base", None)])
+    rc, gh = _run_main(monkeypatch, gh, branch="docs/x",
+                       revs=["c1", "c2"],
+                       trees={"c1": "tree-c1", "c2": "local-tree"},
+                       messages={"c1": "first commit", "c2": "second commit"})
+    assert rc == 0
+    made = [c["message"] for c in gh.created_commits]
+    assert made == ["second commit"], (
+        f"the remote already had c1's tree, so only c2 should be created; got {made}. "
+        "Replaying c1 puts it on the remote twice under its own message.")
+
+
+def test_the_duplicate_is_caught_by_tree_because_the_shas_cannot_match(monkeypatch):
+    """Why the check is by tree and not by sha, asserted rather than left to the comment.
+
+    The remote commit's sha ("remote-c1") appears nowhere in the local rev list -- that is
+    the whole nature of an API replay -- so any sha-based comparison finds no overlap and
+    replays everything. The tool must never ask for a local object named by a remote sha.
+    """
+    gh = FakeGH({"heads/docs/x": "remote-c1"},
+                commits=["basesha"],
+                chain=[("remote-c1", "tree-c1", "basesha"),
+                       ("basesha", "tree-base", None)])
+    _run_main(monkeypatch, gh, branch="docs/x", revs=["c1", "c2"],
+              trees={"c1": "tree-c1", "c2": "local-tree"})
+    assert "remote-c1" not in [c["message"] for c in gh.created_commits]
+    trees_read = [c[1] for c in gh.calls if c[1].startswith("/git/commits/")]
+    assert "/git/commits/remote-c1" in trees_read, (
+        "the remote chain must be READ to learn its trees; without that the tool has no "
+        "way to know what it already pushed")
+
+
+def test_only_a_prefix_is_dropped_so_a_revert_still_pushes(monkeypatch):
+    """A revert restores an earlier tree. If the skip scanned the whole list instead of
+    stopping at the first mismatch, the revert would be silently discarded -- the tool
+    would decide "the remote already has this tree" about a commit whose entire purpose
+    is to bring that tree back."""
+    gh = FakeGH({"heads/docs/x": "remote-c1"},
+                commits=["basesha"],
+                chain=[("remote-c1", "tree-c1", "basesha"),
+                       ("basesha", "tree-base", None)])
+    rc, gh = _run_main(monkeypatch, gh, branch="docs/x",
+                       revs=["c1", "c2", "c3"],
+                       # c3 reverts c2, restoring the base tree the remote also has
+                       trees={"c1": "tree-c1", "c2": "local-tree", "c3": "tree-base"},
+                       messages={"c1": "first", "c2": "change", "c3": "Revert change"})
+    assert rc == 0
+    made = [c["message"] for c in gh.created_commits]
+    assert made == ["change", "Revert change"], (
+        f"expected c2 and c3 (the revert) to be pushed, got {made}. Scanning past the "
+        "first mismatch drops the revert because its tree matches the remote's base.")
+
+
+def test_an_ordinary_advance_still_pushes_every_new_commit(monkeypatch):
+    """The guard must not become a filter that eats real work: when none of the local
+    trees are on the remote, all of them are replayed, in order."""
+    gh = FakeGH({"heads/docs/x": "remote-c1"},
+                commits=["basesha"],
+                chain=[("remote-c1", "tree-c1", "basesha"),
+                       ("basesha", "tree-base", None)])
+    rc, gh = _run_main(monkeypatch, gh, branch="docs/x",
+                       revs=["c2", "c3"],
+                       trees={"c2": "tree-c2", "c3": "local-tree"},
+                       messages={"c2": "second", "c3": "third"})
+    assert rc == 0
+    assert [c["message"] for c in gh.created_commits] == ["second", "third"]
+
+
+def test_the_skip_reports_what_it_dropped(monkeypatch, capsys):
+    """A silent skip is indistinguishable from a push that lost a commit. Whichever way
+    this goes wrong, the operator must be able to see it in the output."""
+    gh = FakeGH({"heads/docs/x": "remote-c1"},
+                commits=["basesha"],
+                chain=[("remote-c1", "tree-c1", "basesha"),
+                       ("basesha", "tree-base", None)])
+    _run_main(monkeypatch, gh, branch="docs/x", revs=["c1", "c2"],
+              trees={"c1": "tree-c1", "c2": "local-tree"},
+              messages={"c1": "already pushed", "c2": "new work"})
+    out = capsys.readouterr().out
+    assert "skipping" in out and "already pushed" in out, (
+        f"the skip must be visible; got:\n{out}")
+
+
+def test_a_remote_chain_walk_that_404s_does_not_abort_the_push(monkeypatch):
+    """The walk is an optimization on top of a correct push, not a precondition for one.
+
+    A shallow or unreadable remote chain (a 404 partway back) must degrade to "replay
+    what rev-list said" rather than raise -- refusing to push because history could not
+    be walked would be a worse failure than the duplicate it prevents.
+    """
+    gh = FakeGH({"heads/docs/x": "remote-c1"},
+                commits=[],
+                chain=[("remote-c1", "tree-c1", "missing-parent")])
+    rc, gh = _run_main(monkeypatch, gh, branch="docs/x", revs=["c2"],
+                       trees={"c2": "local-tree"}, messages={"c2": "new work"})
+    assert rc == 0
+    assert [c["message"] for c in gh.created_commits] == ["new work"]

@@ -38,6 +38,13 @@ corruptions live:
      it is not inferred, because "not an ancestor" also describes a divergence whose
      commits must not be discarded.
 
+  6. Every already-pushed commit replayed again on the next push -- caused by the fix for
+     #4. A replayed commit gets a new sha, so the remote head is never an ancestor of
+     local HEAD and base..HEAD returns the whole branch every time. Observed 2026-08-01:
+     pushing 1 new commit landed 2, duplicating the previous commit under its own
+     message. Tree parity is blind to it (the final tree is the same either way), so the
+     prefix the remote already has is now matched by TREE, not by sha.
+
 So this reads modes from git instead of assuming them, diffs against the branch's
 actual remote head instead of assuming the local parent matches it, never concludes
 "no such branch" from a single 404, and replays each local commit as its own remote
@@ -198,6 +205,58 @@ class GitHub:
         return None
 
 
+def drop_already_pushed(gh: "GitHub", locals_: list[str], remote_sha: str) -> list[str]:
+    """Drop the leading local commits the remote already has, matched by TREE.
+
+    6. Every already-pushed commit replayed again on the next push. This one was caused
+       by the fix for #4. Replaying commit-by-commit means each remote commit is a NEW
+       object with a new sha, so the remote branch head is never an ancestor of local
+       HEAD -- and `rev-list remote_sha..HEAD` then returns the ENTIRE branch on every
+       subsequent push. Observed 2026-08-01 pushing one new commit to
+       docs/no-s3-skill-mirror: the plan said "2 commits" and the doc commit landed on
+       the remote a second time, with the same message, as a sibling of the first.
+
+       The tree-parity check at the end cannot see this, for the same reason it could not
+       see the squash: the final tree is identical whether the prefix is duplicated or
+       not. Two different corruptions, one blind spot -- which is why this is matched
+       rather than trusted.
+
+    Sha comparison is useless here (the remote shas differ by construction), so the
+    remote's recent commits are compared by tree sha. Walking from the oldest local
+    commit, a commit whose tree the remote chain already carries has already been pushed;
+    the first one that does not is where this push must start. Only a PREFIX is dropped:
+    stopping at the first mismatch means a genuinely new commit is never skipped just
+    because some later commit happens to restore an earlier tree (a revert does exactly
+    that, and dropping it would silently discard the revert).
+    """
+    seen, sha = set(), remote_sha
+    # Bounded: only as far back as the number of commits in play, plus a little slack for
+    # the base itself. A long walk here would cost an API call per commit for no gain.
+    for _ in range(len(locals_) + 1):
+        commit = gh.call(f"/git/commits/{sha}", absent_ok=True)
+        if not commit:
+            break
+        seen.add(commit["tree"]["sha"])
+        parents = commit.get("parents") or []
+        if not parents:
+            break
+        sha = parents[0]["sha"]
+
+    keep = list(locals_)
+    while keep:
+        if git("rev-parse", f"{keep[0]}^{{tree}}") not in seen:
+            break
+        dropped = keep.pop(0)
+        print(f"skipping {dropped[:10]} {git('log', '-1', '--format=%s', dropped)!r} "
+              "-- the remote already has this tree")
+    if not keep:
+        # Everything in the range is already on the remote. Reporting "nothing to push"
+        # here would be wrong only if a tree difference remained, and there is none by
+        # definition, so the caller's own no-op check handles it.
+        return [locals_[-1]]
+    return keep
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -295,6 +354,8 @@ def main(argv: list[str] | None = None) -> int:
             # still be a tree difference if the remote was built by an earlier squash,
             # so fall back to one commit rather than reporting nothing to do.
             locals_ = [head]
+        else:
+            locals_ = drop_already_pushed(gh, locals_, remote_sha)
 
     plan_ops = {}
     prev = remote_sha
