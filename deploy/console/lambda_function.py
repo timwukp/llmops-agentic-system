@@ -1899,15 +1899,9 @@ def _user_may_task(user):
     return DS_GROUP in groups or APPROVER_GROUP in groups
 
 
-def _append_messages(task_id, msgs, extra_update="", extra_names=None, extra_values=None,
-                     drop_partial=False):
+def _append_messages(task_id, msgs, extra_update="", extra_names=None, extra_values=None):
     """Append to the messages list atomically-enough (single writer per task is
-    enforced by the thinking-status lock at the route layer).
-
-    drop_partial removes the streamed draft in the SAME write that commits the real
-    message. Two writes would leave a window in which a poll (every 3s during a turn)
-    sees both, and the customer watches the reply appear twice.
-    """
+    enforced by the thinking-status lock at the route layer)."""
     names = {"#m": "messages"}
     values = {":new": msgs, ":empty": [], ":t": _now_iso()}
     expr = "SET #m = list_append(if_not_exists(#m, :empty), :new), updated_at = :t"
@@ -1915,8 +1909,6 @@ def _append_messages(task_id, msgs, extra_update="", extra_names=None, extra_val
         expr += ", " + extra_update
         names.update(extra_names or {})
         values.update(extra_values or {})
-    if drop_partial:
-        expr += " REMOVE partial_reply"
     tasks_tbl.update_item(Key={"id": task_id}, UpdateExpression=expr,
                           ExpressionAttributeNames=names,
                           ExpressionAttributeValues=values)
@@ -2415,41 +2407,6 @@ _DISPATCH_RE_ASK = (
     "function NOW, exactly once, with {plan_uri, params, cost_estimate_usd}, using "
     "the plan_uri you wrote. Emit only that tool call.")
 
-# How often the in-flight reply is written for the browser to see. The frontend polls
-# every 3s while a turn is running (frontend.html: busy ? 3000 : 15000), so a shorter
-# flush buys nothing a customer can perceive and costs a DynamoDB write per flush.
-_STREAM_FLUSH_S = 2.0
-
-
-def _stream_sink(task_id):
-    """A throttled progress writer for the in-flight reply.
-
-    Writes to a SEPARATE `partial_reply` attribute, never into `messages`. Appending
-    real messages as the text grows would put half-sentences into the transcript the
-    next turn replays to the agent (_replay_context) and into the record an approval is
-    signed against — the reply must enter `messages` exactly once, whole, at the end.
-    partial_reply is display-only scaffolding and is cleared when the turn lands.
-
-    Returns None when the flush interval has not elapsed, so the caller need not track
-    time itself. The closure holds the last-write time; there is one sink per turn and
-    one writer per task (the thinking-status lock at the route layer).
-    """
-    state = {"at": 0.0, "n": 0}
-
-    def sink(text_so_far):
-        now = time.time()
-        if now - state["at"] < _STREAM_FLUSH_S:
-            return
-        state["at"] = now
-        state["n"] += 1
-        tasks_tbl.update_item(
-            Key={"id": task_id},
-            UpdateExpression="SET partial_reply = :p, updated_at = :t",
-            ExpressionAttributeValues={":p": str(text_so_far)[:8000], ":t": _now_iso()})
-
-    sink.flushes = lambda: state["n"]
-    return sink
-
 
 def run_task_turn(task_id, accept=False):
     """One orchestrator turn: send pending user/system messages, service tools,
@@ -2504,7 +2461,6 @@ def run_task_turn(task_id, accept=False):
     messages = _chat_user_text(body_text)
 
     collected_text = []
-    sink = _stream_sink(task_id)
     tool_rounds = 0
     re_asks = 0          # only spent on a turn that OWES a tool call (see below)
     stream_retried = False
@@ -2535,22 +2491,14 @@ def run_task_turn(task_id, accept=False):
                 _task_fail(task_id, f"invoke failed: {e}")
                 return
 
-        # Show the reply as it arrives. The prefix carries text from earlier rounds of
-        # this same turn, or a tool round would appear to erase what the agent already
-        # said in front of the customer.
-        prefix = "\n".join(t for t in collected_text if t)
-        out = _drain_chat(resp, on_text=(
-            lambda s, _p=prefix: sink((_p + "\n" + s) if _p else s)))
+        out = _drain_chat(resp)
         # One line per turn. The first diagnosis of a stalled dispatch had NOTHING to
         # read here — the task record showed the symptom and the logs showed only
         # billing REPORTs, so the cause had to be inferred twice.
-        # flushes= is here because its absence cost a diagnosis: the first live check saw
-        # no partial_reply and this line could not say whether the sink never fired or the
-        # 3s poll simply missed a short turn. Those need opposite fixes.
         print(f"[task-chat] {task_id} accept={accept} sess={sess} "
               f"stop={out['stop_reason']} tool={(out['tool_use'] or {}).get('name')} "
               f"text={len(out['text'] or '')}b err={out['error']} "
-              f"rounds={tool_rounds} re_asks={re_asks} flushes={sink.flushes()}")
+              f"rounds={tool_rounds} re_asks={re_asks}")
         if out["text"]:
             collected_text.append(out["text"])
 
@@ -2702,54 +2650,29 @@ def run_task_turn(task_id, accept=False):
                        ":ce": str(trailer["cost_estimate_usd"])[:50]})
         _task_event(task_id, "PlanProposed", "orchestrator",
                     {"cost": str(trailer["cost_estimate_usd"])})
-    # The streamed draft dies in the same write that commits the real message, so a poll
-    # can never catch both and render the reply twice.
     if new_msgs:
-        _append_messages(task_id, new_msgs, update, names, values, drop_partial=True)
+        _append_messages(task_id, new_msgs, update, names, values)
     else:
         tasks_tbl.update_item(Key={"id": task_id},
-                              UpdateExpression=f"SET {update}, updated_at = :t "
-                                               f"REMOVE partial_reply",
+                              UpdateExpression=f"SET {update}, updated_at = :t",
                               ExpressionAttributeNames=names,
                               ExpressionAttributeValues={**values, ":t": _now_iso()})
 
 
 def _task_fail(task_id, msg):
     tasks_tbl.update_item(Key={"id": task_id},
-                          UpdateExpression="SET #s = :s, error_msg = :e, updated_at = :t "
-                                           "REMOVE partial_reply",
+                          UpdateExpression="SET #s = :s, error_msg = :e, updated_at = :t",
                           ExpressionAttributeNames={"#s": "status"},
                           ExpressionAttributeValues={":s": "error", ":e": str(msg)[:300],
                                                      ":t": _now_iso()})
     _task_event(task_id, "TurnFailed", "worker", {"error": str(msg)[:200]})
 
 
-def _drain_chat(resp, on_text=None):
-    """Ported from the driver's _drain — same stream shape, same tolerance.
-
-    on_text(joined_text_so_far) is called as deltas arrive, so the customer can watch
-    the reply build instead of staring at "thinking…" for the whole turn. MEASURED on
-    the live orchestrator harness: the first text delta landed at 8.4s of a 24.65s turn
-    and the 214 deltas spread over 16.04s — 65% of wall clock. The stream was always
-    incremental; the buffering was ours, right here, in a list nobody could see.
-
-    The sink is called at most every _STREAM_FLUSH_S seconds (see _stream_sink): one
-    DynamoDB write per delta would be 214 writes for that turn, which is both throttling
-    risk and a cost nobody asked for.
-
-    A sink that raises must not kill the turn — a failed progress write is cosmetic, but
-    losing the reply is not. So it is called defensively.
-    """
+def _drain_chat(resp):
+    """Ported from the driver's _drain — same stream shape, same tolerance."""
     text, tool_use, stop_reason, error = [], None, None, None
     try:
         for ev_ in resp.get("stream", []):
-            if on_text is not None and "contentBlockDelta" in ev_:
-                d_ = ev_["contentBlockDelta"].get("delta", {})
-                if "text" in d_:
-                    try:
-                        on_text("".join(text) + d_["text"])
-                    except Exception as sink_exc:
-                        print(f"[task-chat] progress sink failed (ignored): {sink_exc}")
             if "contentBlockDelta" in ev_:
                 delta = ev_["contentBlockDelta"].get("delta", {})
                 if "text" in delta:
