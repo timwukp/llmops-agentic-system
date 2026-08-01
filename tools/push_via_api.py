@@ -356,8 +356,16 @@ def main(argv: list[str] | None = None) -> int:
                 f"({remote_sha[:10]}). Nothing was moved -- that commit is unreferenced "
                 "and harmless. Re-run this command; the ref is visible now.")
     else:
-        gh.call(f"/git/refs/heads/{args.branch}", {"sha": parent_sha},
-                method="PATCH")
+        # force ONLY on --onto. A rebase moves the branch to a commit that is not a
+        # descendant of the old head, so the PATCH is not a fast forward and GitHub
+        # answers 422 (observed live 2026-08-01). Everywhere else the same 422 means
+        # something else entirely -- the remote has commits this run never saw -- and
+        # forcing there would delete them. So the force is tied to the flag that says
+        # "the ref is being rewritten on purpose", not applied as a general fix.
+        body = {"sha": parent_sha}
+        if args.onto:
+            body["force"] = True
+        gh.call(f"/git/refs/heads/{args.branch}", body, method="PATCH")
 
     local_tree = git("rev-parse", f"{head}^{{tree}}")
     if tree != local_tree:
