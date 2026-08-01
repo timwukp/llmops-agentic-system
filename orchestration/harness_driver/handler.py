@@ -509,11 +509,14 @@ def handler(event, context=None, clients=None):
                         event.get("qualifier"))
                 return {"status": "released", "job_name": args.get("job_name")}
             if name == "checkpoint":
-                if context and context.get_remaining_time_in_millis() < 60_000:
-                    c["lambda"].invoke(FunctionName=context.function_name,
-                                       InvocationType="Event",
-                                       Payload=json.dumps({**event, "_resumed": True}))
-                    return {"status": "self_reinvoked"}
+                # Just answer it and let the loop-top _out_of_time() check own the
+                # reinvoke. This branch used to reinvoke itself with {"_resumed": True}
+                # -- a key nothing reads -- so the resumed invocation fell through to
+                # the fresh-start branch, re-sent the original stage prompt, and
+                # silently dropped both the pending toolResult and the work already
+                # paid for (live: a budget escalation raised after a pilot found the
+                # plan's token estimate 6.5x low). Its own <60s guard was also dead
+                # code, since _out_of_time() fires at 850s remaining, far earlier.
                 messages = _tool_result_content(tu, {"status": "continue"})
                 continue
             if name == "escalate_human":

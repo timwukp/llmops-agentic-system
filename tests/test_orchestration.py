@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
 import os
 import pathlib
 import sys
@@ -324,9 +325,10 @@ class TestDriver:
                 self.calls = 0
 
             def get_remaining_time_in_millis(self):
-                # plenty for turn 1, out of time before turn 2
+                # turn 1 always runs (the loop only checks before LATER turns); by the
+                # time turn 2 would start there is not enough left for another 840s turn
                 self.calls += 1
-                return 900_000 if self.calls <= 1 else 10_000
+                return 10_000
 
         class _Lam:
             def __init__(self):
@@ -353,6 +355,30 @@ class TestDriver:
         assert [m["role"] for m in cont] == ["assistant", "user"]
         assert "toolUse" in cont[0]["content"][0]
         assert "toolResult" in cont[1]["content"][0]
+
+    def test_the_driver_has_exactly_one_way_to_hand_a_turn_to_the_next_invocation(self):
+        """The checkpoint branch had its OWN reinvoke that sent {"_resumed": True} -- a
+        key nothing in the handler reads. The resumed invocation therefore fell through
+        to the fresh-start branch, re-sent the original stage prompt, and silently
+        dropped both the pending toolResult and work already paid for (live: a budget
+        escalation raised after a pilot found the plan's token estimate 6.5x low).
+
+        Two reinvoke sites meant two chances to forget the payload contract, and the
+        second one forgot. Now there is one, so this asserts the shape rather than the
+        behaviour: every self-invoke goes through _self_reinvoke, and _continuation is
+        the only handoff key -- if a future branch invents another, it must teach the
+        resume branch to read it."""
+        src = (REPO / "orchestration/harness_driver/handler.py").read_text()
+        body = src[src.index("def _run_stage") if "def _run_stage" in src else 0:]
+        # the resume branch reads exactly one key; nothing may hand off via another
+        assert body.count('event.get("_continuation")') == 1
+        assert "_resumed" not in body.split("# reinvoke. This branch used to")[0], \
+            "a reinvoke is carrying a key the resume branch does not read"
+        # every self-invoke of this same function goes through the one closure
+        self_invokes = re.findall(r"FunctionName=context\.function_name", body)
+        assert len(self_invokes) == 1, (
+            f"{len(self_invokes)} self-invoke sites -- there must be exactly one, "
+            "_self_reinvoke, so the handoff payload is defined in one place")
 
     def test_gate_null_gate_passed_fails_closed(self):
         """A gate stage whose agent omits/nulls gate_passed must NOT promote (fail closed)."""
