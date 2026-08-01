@@ -2137,6 +2137,49 @@ class TestConductorDispatch:
             f"{want} was MOVED off data-prep rather than also mounted -- the worker that "
             "actually prepares the data lost its guidance")
 
+    def test_every_mounted_skill_is_named_in_the_prompt_that_must_consult_it(self):
+        """A mount makes a skill READABLE; only the prompt makes the agent read it.
+
+        The orchestrator's prompt said "Your mounted skills (llm-agent-orchestration,
+        ml-solution-design) are your methodology — consult them before acting" while FOUR
+        were mounted. `llm-cost-optimization` and `llm-data-preparation` were mounted by
+        later work that never revisited the sentence, and the omitted one is the skill for
+        step 0 DATA DISCOVERY -- the protocol's own opening move. The test above asserts
+        the MOUNT, which was intact, so nothing failed.
+
+        Verified live against the harness rather than reasoned about: asked which skills it
+        had, the deployed agent listed all four -- because the RUNTIME injects a skills
+        manifest into the system prompt that `GetHarness` does not return (a deterministic
+        1148 extra input tokens; see the pass-through gotcha in AGENTS.md). So the agent can
+        SEE all four and is still told, in prose, that two of them are its methodology. Both
+        statements are in front of the model at once and the prose is the one that says
+        "consult them before acting".
+
+        Derived from the mount list in both directions, per the standing rule that a guard
+        carrying its own copy of a checklist cannot detect drift: a skill added to `skills`
+        without being named fails here, and a name left behind after a mount is removed
+        fails too. Every harness is checked, not just the one that drifted.
+        """
+        for cfg in sorted((REPO / "agents").glob("*/harness.json")):
+            h = json.loads(cfg.read_text())
+            mounted = set()
+            for s in h.get("skills") or []:
+                for kind in ("s3", "git", "path"):
+                    if isinstance(s.get(kind), dict):
+                        loc = (s[kind].get("uri") or s[kind].get("path") or "")
+                        mounted.add(loc.rstrip("/").rsplit("/", 1)[-1])
+            prompt = " ".join(b.get("text", "") for b in h.get("systemPrompt") or [])
+            # Only skill-shaped tokens, so ordinary prose cannot accidentally satisfy this.
+            named = set(re.findall(r"\b(?:llm|ml|mlops)-[a-z0-9-]+\b", prompt))
+            agent = h.get("harnessName", cfg.parent.name)
+            assert not (mounted - named), (
+                f"{agent} mounts {sorted(mounted - named)} but its prompt never names "
+                "them -- a mounted skill the prompt does not name is a skill the agent "
+                "is not told to consult")
+            assert not (named - mounted), (
+                f"{agent}'s prompt names {sorted(named - mounted)} but nothing is "
+                "mounted -- the agent is told to consult a skill it cannot read")
+
     def test_deploying_a_harness_warms_it_so_a_customer_does_not_pay_cold_start(self):
         """READY is not warm, and the deploy script used to believe it was.
 

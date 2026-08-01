@@ -175,6 +175,40 @@ versions and introspects the live CreateHarness/UpdateHarness schemas.
   `UpdateMacieSession` (an agent must not be able to switch off the check it is judged by).
   The audit's own scan stays heuristic regex and still says so; the prompt now also requires
   it to write *"no Macie classification job covers this data"* when nothing does.
+- **`additionalParams` is a raw ConverseStream pass-through, and both ways into it silently
+  drop harness state.** InvokeHarness has no prompt-caching field: a `cachePoint` block in
+  the top-level `messages` is rejected outright (`must be one of: text, toolUse, toolResult,
+  reasoningContent`). But `bedrockModelConfig.additionalParams` forwards verbatim to
+  ConverseStream — an unknown key returns its full member list (`modelId, messages, system,
+  inferenceConfig, toolConfig, guardrailConfig, additionalModelRequestFields, promptVariables,
+  additionalModelResponseFieldPaths, requestMetadata, performanceConfig, serviceTier,
+  outputConfig`), so caching *is* reachable and was measured working
+  (`cacheWriteInputTokens 3568` then `cacheReadInputTokens 3568`). Both routes are traps:
+  * `additionalParams.system` **REPLACES** the harness `systemPrompt`. Asked a question only
+    the prompt could answer, the same harness said `STARTER "Data Readiness Audit"` natively
+    and `NO-PROTOCOL` with `system` set. Input tokens *fell* 10840 → 6644 and the agent still
+    answered fluently, so every signal reads as an optimization.
+  * `additionalParams.messages` **REPLACES** the message list including session history. A
+    codeword stored one turn earlier came back `NONE` — while `cacheReadInputTokens=3568`
+    made the call look like a pure win.
+  * Echoing `GetHarness`'s `systemPrompt` back is not a fix either: the runtime **injects a
+    skills manifest the control plane does not return** (a deterministic 1148 extra input
+    tokens; 12707 native vs 11559 echoed, measured 3/3). Echoed back, the agent listed **2 of
+    4** skills and lost the `.agents/skills/s3/<name>/SKILL.md` path it reads them by.
+  Measured shape of a real consult turn: `wall=59.0s ttft=26.4s rounds=2 model_ms=52030 (88%
+  of wall) in_tok=31691` — the ~11 KB system prompt is resent uncached on every round, and the
+  round-trips ARE the turn. Caching it needs a first-class field on InvokeHarness; until then
+  the lever is fewer round-trips, not a cheaper one.
+- **A mount makes a skill readable; only the prompt makes the agent read it.** The
+  orchestrator's prompt named `(llm-agent-orchestration, ml-solution-design)` as "your
+  methodology — consult them before acting" while **four** were mounted; the two later mounts
+  were never added to the sentence, and the missing `llm-data-preparation` is the skill for
+  step 0 DATA DISCOVERY, the consult protocol's own opening move. The existing guard asserted
+  the MOUNT, which was intact. Live, the agent listed all four (the runtime manifest above),
+  so it could see them and was still told in prose that two were its methodology — and prose
+  is what says "consult them". The guard now derives the expected names from each harness's
+  `skills` list in **both** directions, across every agent: a mount nobody names fails, and a
+  name nothing mounts fails.
 - **Notify on independent channels, and never let the weakest one gate the rest.** The
   driver's escalate path publishes to SNS, writes a stage event, emits `EscalatedToHuman`,
   and settles the task token. The SNS publish was first and unwrapped, so one failed publish

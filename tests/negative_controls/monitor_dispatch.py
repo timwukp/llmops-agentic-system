@@ -802,6 +802,32 @@ case("prompt: the audit stops disclosing that nothing classified the data",
      "agents/data-prep/harness.json", m61,
      ["tests/test_console_tasks.py::test_the_audit_prompt_refuses_to_read_enabled_as_coverage"])
 
+# 62. The orchestrator prompt goes back to naming two of its four mounted skills -- the
+#     exact live state before this fix. The mount stays intact, so the older
+#     "has the skill that knows how" guard still passes; only a guard derived from the
+#     mount list can see it.
+def m62(t):
+    old = ("Your mounted skills (llm-agent-orchestration, ml-solution-design, "
+           "llm-cost-optimization, llm-data-preparation) are your methodology")
+    assert old in t, "the mounted-skills sentence has moved; re-anchor this mutation"
+    return t.replace(old, "Your mounted skills (llm-agent-orchestration, "
+                          "ml-solution-design) are your methodology", 1)
+case("prompt: the orchestrator is told to consult 2 of its 4 mounted skills",
+     "agents/orchestrator/harness.json", m62,
+     ["tests/test_orchestration.py::TestConductorDispatch"
+      "::test_every_mounted_skill_is_named_in_the_prompt_that_must_consult_it"])
+
+# 63. A skill is named in the prompt but never mounted -- the mirror image of 62, and the
+#     failure that ships an agent instructed to consult a file that does not exist.
+def m63(t):
+    old = '        "uri": "s3://<DATA_BUCKET>/skills/llmops/llm-data-preparation"\n'
+    assert old in t, "the data-prep skill mount has moved; re-anchor this mutation"
+    return t.replace(old, '        "uri": "s3://<DATA_BUCKET>/skills/llmops/llm-nonexistent"\n', 1)
+case("prompt: the orchestrator is told to consult a skill nothing mounts",
+     "agents/orchestrator/harness.json", m63,
+     ["tests/test_orchestration.py::TestConductorDispatch"
+      "::test_every_mounted_skill_is_named_in_the_prompt_that_must_consult_it"])
+
 
 failed = []
 for name, rel, mutate, tests in CASES:

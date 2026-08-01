@@ -197,6 +197,26 @@ Two spine details that are policy, not plumbing:
   invisible to the very agent that writes the report — `MacieFindingsReadForDataAudit` fixes
   that, read-only in both directions (no job creation, no session disable), and the audit
   prompt must now state *"no Macie classification job covers this data"* whenever none does.
+- **The system prompt is resent uncached on every model round-trip, and the two ways to cache
+  it both silently discard harness state.** A measured consult turn: `wall=59.0s ttft=26.4s
+  rounds=2 model_ms=52030` — 88% of the wall clock is the model, and `in_tok=31691` over two
+  rounds is the ~11 KB prompt paid for twice. InvokeHarness has no caching field, but
+  `bedrockModelConfig.additionalParams` forwards raw to ConverseStream, so a `cachePoint` gets
+  through and demonstrably works (`cacheWriteInputTokens 3568` → `cacheReadInputTokens 3568`).
+  It is still the wrong lever: `additionalParams.system` **replaces** the harness prompt (the
+  same agent answered `NO-PROTOCOL` to a question it had just answered correctly, while input
+  tokens *fell* 10840 → 6644), `additionalParams.messages` **replaces** session history (a
+  codeword from the previous turn came back `NONE`), and echoing `GetHarness`'s prompt back
+  loses the skills manifest the runtime injects but the control plane never returns — 1148
+  tokens, after which the agent listed 2 of its 4 skills. Every wrong path reports fewer
+  tokens and a cache hit. Until InvokeHarness exposes caching, the lever is **fewer
+  round-trips**, not cheaper ones.
+- **A mounted skill the prompt does not name is a skill the agent is not told to consult.**
+  The orchestrator mounted four and its prompt named two; the unnamed
+  `llm-data-preparation` is the methodology for step 0 of its own consult protocol. The mount
+  guard passed because the mount was real. The prompt is what carries "consult them before
+  acting", so the guard now derives the names from each harness's `skills` list in both
+  directions.
 - **`Teardown` always runs after deploy** — even when `SmokeTest` fails, its `Catch`
   routes to `Teardown` first. Orphaned endpoints are the #1 cost risk (Phase 4 found an
   unrelated endpoint in the account that had been InService since 2024-04).

@@ -171,6 +171,22 @@ prompt 明文禁止它刪東西的 agent。
   agent 完全不可見 —— `MacieFindingsReadForDataAudit` 修掉這點，且雙向都是唯讀（不能建立作業、也不能
   停用 session）；audit 的 prompt 現在也必須在沒有任何覆蓋時明確寫出
   「no Macie classification job covers this data」。
+- **system prompt 在每一次模型往返都會重送，而且完全沒有快取；而兩條想快取它的路，都會靜靜地
+  丟掉 harness 的狀態。** 實測一次 consult turn：`wall=59.0s ttft=26.4s rounds=2
+  model_ms=52030` —— 88% 的牆鐘時間都是模型，而兩輪加起來 `in_tok=31691`，等於那份約 11 KB 的
+  prompt 付了兩次錢。InvokeHarness 沒有任何快取欄位，但 `bedrockModelConfig.additionalParams`
+  是原封不動轉給 ConverseStream 的，所以 `cachePoint` 真的塞得進去，也確實有效
+  （`cacheWriteInputTokens 3568` → `cacheReadInputTokens 3568`）。但它仍然是錯的槓桿：
+  `additionalParams.system` 會**取代**harness 的 prompt（同一個 agent 對它剛剛才答對的問題改回答
+  `NO-PROTOCOL`，而 input token 反而*下降* 10840 → 6644）；`additionalParams.messages` 會**取代**
+  session 歷史（上一輪才記下的暗號回答 `NONE`）；而把 `GetHarness` 的 prompt 原樣送回去也不行 ——
+  那會丟掉 runtime 注入、控制平面卻從不回傳的 skills 清單，共 1148 個 token，之後 agent 只列得出
+  4 個 skill 中的 2 個。**每一條錯的路，看起來都是 token 變少、又有 cache hit。** 在 InvokeHarness
+  真正開放快取之前，槓桿是**減少往返次數**，不是讓每次往返變便宜。
+- **prompt 沒有點名的 mounted skill，就是一個沒有人叫 agent 去讀的 skill。** orchestrator 掛了
+  四個、prompt 只名了兩個；而沒被名到的 `llm-data-preparation` 正是它自己 consult 協議第 0 步的
+  方法論。原有的守衛通過了，因為 mount 本身是真的。真正說出「consult them before acting」的是
+  prompt，所以守衛現在改成從每個 harness 的 `skills` 清單雙向推導。
 - **deploy 之後必然執行 `Teardown`** —— 即使 `SmokeTest` 失敗，其 `Catch` 也先路由到
   `Teardown`。孤兒 endpoint 是第一大成本風險（Phase 4 就在帳號裡發現一個無關的
   endpoint 自 2024-04 起一直 InService）。
