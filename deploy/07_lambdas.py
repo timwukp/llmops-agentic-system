@@ -153,8 +153,23 @@ def deploy_state_machine(sfn, ssm, region, account, dry):
     asl = asl.replace("${HarnessDriverArn}", driver_arn)
     asl = asl.replace("${EventBusName}", "llmops-pipeline")
     if dry:
+        # json.loads only proves it is JSON. ASL rejects plenty of valid JSON -- an
+        # unsupported field, a bad JSONPath, an unknown SDK integration -- and does so
+        # at UpdateStateMachine time, i.e. in the middle of a real deploy. The
+        # ValidateStateMachineDefinition API is read-only and creates nothing, so the
+        # dry run can make the claim it was already printing.
         json.loads(asl)
-        return {"state_machine": STATE_MACHINE_NAME, "would": "create/update", "asl": "valid"}
+        try:
+            checked = sfn.validate_state_machine_definition(definition=asl,
+                                                            type="STANDARD")
+        except Exception as exc:  # no credentials / no network: say so, do not claim
+            return {"state_machine": STATE_MACHINE_NAME, "would": "create/update",
+                    "asl": "json-parses; ASL NOT validated",
+                    "validator_unreachable": f"{type(exc).__name__}: {exc}"}
+        diags = [f"[{d['severity']}] {d['code']} {d.get('location', '')}: {d['message']}"
+                 for d in checked.get("diagnostics", [])]
+        return {"state_machine": STATE_MACHINE_NAME, "would": "create/update",
+                "asl": checked["result"], "diagnostics": diags}
     # The state machine's own role, published by 01_iam.py from iam/sfn_execution_role.json.
     # The legacy /llmops/iam/sfn_arn name is still read as a fallback for accounts
     # deployed before the role was declared in-repo; the start role is the last resort

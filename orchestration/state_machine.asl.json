@@ -370,6 +370,7 @@
     },
     "Complete": {
       "Type": "Task",
+      "Comment": "ResultPath keeps $.run_id and $.task_id in the state for MarkTaskDone. Same trap EscalateFail fell into: without it the PutEvents response becomes the whole state and the next state dies on a missing path.",
       "Resource": "arn:aws:states:::events:putEvents",
       "Parameters": {
         "Entries": [
@@ -384,7 +385,52 @@
           }
         ]
       },
-      "End": true
+      "ResultPath": "$.complete_event",
+      "Next": "MarkTaskDone"
+    },
+    "MarkTaskDone": {
+      "Type": "Task",
+      "Comment": "Close out the conductor's task record on the SUCCESS path. A run dispatched from an approved plan has two records with lifecycles -- the run and the llmops-tasks row -- and only the run was ever closed, so the console's Tasks tab showed a finished order as still in flight and the audit trail never recorded how it ended. llmops-tasks is written only by the console Lambda, which is not in the execution path, so the state machine does it, as it already does for the run record. The ConditionExpression makes the NO_TASK sentinel a no-op: most runs (schedule, webhook) have no task, and attempting the write anyway would either mint a phantom task row or fail a healthy execution.",
+      "Resource": "arn:aws:states:::aws-sdk:dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "llmops-tasks",
+        "Key": {
+          "id": {
+            "S.$": "$.task_id"
+          }
+        },
+        "UpdateExpression": "SET #s = :done, closed_at = :now, final_run_status = :done",
+        "ConditionExpression": "attribute_exists(id) AND #s = :dispatched",
+        "ExpressionAttributeNames": {
+          "#s": "status"
+        },
+        "ExpressionAttributeValues": {
+          ":done": {
+            "S": "completed"
+          },
+          ":dispatched": {
+            "S": "dispatched"
+          },
+          ":now": {
+            "S.$": "$$.State.EnteredTime"
+          }
+        }
+      },
+      "ResultPath": null,
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "No task (sentinel), or a task already in a richer terminal state. Neither is a run failure -- the run genuinely succeeded, so swallow and end.",
+          "ResultPath": null,
+          "Next": "Succeed"
+        }
+      ],
+      "Next": "Succeed"
+    },
+    "Succeed": {
+      "Type": "Succeed"
     },
     "EscalateFail": {
       "Type": "Task",
@@ -445,6 +491,47 @@
           "ErrorEquals": [
             "States.ALL"
           ],
+          "ResultPath": null,
+          "Next": "MarkTaskFailed"
+        }
+      ],
+      "Next": "MarkTaskFailed"
+    },
+    "MarkTaskFailed": {
+      "Type": "Task",
+      "Comment": "The failure-path twin of MarkTaskDone. Both of MarkRunFailed's exits route here, including its Catch: a DDB error while closing the RUN must not stop us from closing the TASK, since those are separate records and separate reasons to be stale. Observed live: task-58ecde82adcd73bf sat at 'dispatched' for a day after run-20260731T183103Z-8b864805 read 'failed', because nothing on this path wrote the task at all. Ends at Fail either way, so the execution still reports FAILED.",
+      "Resource": "arn:aws:states:::aws-sdk:dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "llmops-tasks",
+        "Key": {
+          "id": {
+            "S.$": "$.task_id"
+          }
+        },
+        "UpdateExpression": "SET #s = :failed, closed_at = :now, final_run_status = :failed",
+        "ConditionExpression": "attribute_exists(id) AND #s = :dispatched",
+        "ExpressionAttributeNames": {
+          "#s": "status"
+        },
+        "ExpressionAttributeValues": {
+          ":failed": {
+            "S": "failed"
+          },
+          ":dispatched": {
+            "S": "dispatched"
+          },
+          ":now": {
+            "S.$": "$$.State.EnteredTime"
+          }
+        }
+      },
+      "ResultPath": null,
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "No task (sentinel) or already terminal -- the run still failed, so go to Fail regardless.",
           "ResultPath": null,
           "Next": "Fail"
         }

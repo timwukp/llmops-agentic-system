@@ -905,6 +905,39 @@ def asl():
     return json.loads((REPO / "orchestration/state_machine.asl.json").read_text())
 
 
+def _exits(st: dict) -> list:
+    """Every state this one can transition to: Next, Catch, Choices, Default."""
+    return (([st["Next"]] if "Next" in st else [])
+            + [c["Next"] for c in st.get("Catch", [])]
+            + [c["Next"] for c in st.get("Choices", [])]
+            + ([st["Default"]] if "Default" in st else []))
+
+
+def _reaches(states: dict, start: str, target: str, seen=frozenset()) -> bool:
+    """Can `start` transition to `target`, following any number of hops?
+
+    Asserting on a literal `Next` pins the shape of the graph, not the guarantee.
+    The guarantees here are about outcomes -- "an exhausted budget ends the
+    execution FAILED", "no stage catches to Fail before the run record is
+    marked" -- and those survive an extra hop being inserted on the path. Three
+    tests broke on exactly that when the task closers landed between
+    MarkRunFailed and Fail, though every guarantee still held.
+    """
+    if start == target:
+        return True
+    if start in seen:
+        return False
+    return any(_reaches(states, n, target, seen | {start})
+               for n in _exits(states.get(start, {})))
+
+
+def _terminals_from(states: dict, start: str) -> set:
+    """Every terminal state (Succeed/Fail) reachable from `start`."""
+    return {n for n in states
+            if states[n].get("Type") in ("Succeed", "Fail")
+            and _reaches(states, start, n)}
+
+
 class TestStateMachine:
 
     def test_all_next_targets_exist(self, asl):
@@ -934,11 +967,16 @@ class TestStateMachine:
         # remediation loops BACK to analysis -> eval, closing the self-iteration loop
         assert states["RemediateFinetune"]["Next"] == "FinetuneAnalyze"
         assert states["FinetuneAnalyze"]["Next"] == "EvalGate"
-        # budget exhausted -> escalate, never silent fail; escalation now closes the
-        # run record out before failing (see MarkRunFailed)
+        # budget exhausted -> escalate, never silent fail; escalation closes the run
+        # record (MarkRunFailed) and the conductor's task (MarkTaskFailed) on the way
+        # out. Asserted as reachability, not a literal Next: the guarantee is that an
+        # exhausted budget ends the execution FAILED after the marker runs, and that
+        # holds however many closers get chained in front of Fail.
         assert states["RemediationChoice"]["Default"] == "EscalateFail"
         assert states["EscalateFail"]["Next"] == "MarkRunFailed"
-        assert states["MarkRunFailed"]["Next"] == "Fail"
+        assert _terminals_from(states, "MarkRunFailed") == {"Fail"}, (
+            "the marker must lead to Fail and ONLY Fail -- a path from here to a "
+            "Succeed state would report an exhausted budget as a successful run")
 
     def test_every_harness_task_uses_task_token(self, asl):
         for name, st in asl["States"].items():
@@ -969,8 +1007,12 @@ class TestStateMachine:
         # Every stage Catch that gives up must pass through the marker rather than
         # jumping to Fail. MarkRunFailed's own Catch is the one exception: it is the
         # marker, and its fallback has nowhere left to go.
+        # Exempt exactly the states at or after the run marker: once MarkRunFailed has
+        # run (or itself errored), the record is already written or unwritable, so Fail
+        # is the only place left to go. Derived by reachability rather than named, so a
+        # future state added BEFORE the marker is still held to the rule.
         for name, st in states.items():
-            if name == "MarkRunFailed":
+            if name == "MarkRunFailed" or _reaches(states, "MarkRunFailed", name):
                 continue
             for cat in st.get("Catch", []):
                 assert cat["Next"] != "Fail", (
@@ -982,17 +1024,26 @@ class TestStateMachine:
             "mark the run through the AWS SDK integration, not another Lambda: a "
             "Lambda is the thing that just crashed")
         assert mark["Parameters"]["Key"]["run_id"]["S.$"] == "$.run_id"
-        assert mark["Next"] == "Fail"
+        # Marking the run must not swallow the failure: whatever the marker chains
+        # into afterwards, the execution still ends FAILED.
+        assert _terminals_from(states, "MarkRunFailed") == {"Fail"}
 
     def test_marking_a_run_failed_never_overwrites_a_richer_terminal_status(self, asl):
         """When the AGENT escalated, the driver already wrote status=escalated -- more
         informative than 'failed'. The condition keeps it, and the Catch means a
         rejected condition still reaches Fail instead of hanging the execution."""
-        mark = asl["States"]["MarkRunFailed"]
+        states = asl["States"]
+        mark = states["MarkRunFailed"]
         assert ":running" in mark["Parameters"]["ConditionExpression"] or \
                "running" in json.dumps(mark["Parameters"]["ExpressionAttributeValues"])
-        assert mark["Catch"][0]["Next"] == "Fail"
         assert "States.ALL" in mark["Catch"][0]["ErrorEquals"]
+        # A rejected condition must still terminate the execution as FAILED. It may
+        # pass through the task closer first (a richer run status says nothing about
+        # the conductor's task, which is still stuck at 'dispatched'), but it must
+        # never hang and never end in Succeed.
+        assert _terminals_from(states, mark["Catch"][0]["Next"]) == {"Fail"}, (
+            "MarkRunFailed's Catch must lead to Fail: a rejected condition is not a "
+            "success, and a dead end would hang the execution instead of failing it")
 
     def test_the_asl_carries_no_fields_amazon_states_language_rejects(self, asl):
         """`_comment` is this repo's convention for explaining a policy document, and it
@@ -1017,6 +1068,35 @@ class TestStateMachine:
                 for a in ([st["Action"]] if isinstance(st["Action"], str) else st["Action"])]
         assert "dynamodb:UpdateItem" in acts, (
             "MarkRunFailed calls dynamodb:UpdateItem with this role")
+
+    def test_the_role_covers_every_table_the_state_machine_writes(self, asl):
+        """The action alone is not the grant -- the RESOURCE is.
+
+        Checking only for "dynamodb:UpdateItem" passed while the policy was scoped to
+        the runs table alone, so the task closers would have taken AccessDenied. Their
+        Catch (which exists so a run with no task does not fail) would have swallowed
+        it, making a missing grant look exactly like a healthy no-op: the execution
+        succeeds, the task stays 'dispatched', and nothing anywhere says why. Every
+        table the ASL names must appear in the policy's resources.
+        """
+        sfn = json.loads((REPO / "deploy/iam/sfn_execution_role.json").read_text())
+        granted = set()
+        for st in sfn["permissionsPolicy"]["Statement"]:
+            acts = st["Action"]
+            if "dynamodb:UpdateItem" not in ([acts] if isinstance(acts, str) else acts):
+                continue
+            res = st["Resource"]
+            for r in ([res] if isinstance(res, str) else res):
+                granted.add(r.rsplit("table/", 1)[-1])
+
+        written = {st["Parameters"]["TableName"] for st in asl["States"].values()
+                   if st.get("Resource", "").endswith("dynamodb:updateItem")}
+        assert written, "no updateItem states found -- did the resource ARN change?"
+        missing = written - granted
+        assert not missing, (
+            f"the state machine writes {sorted(missing)} but its role grants "
+            f"UpdateItem only on {sorted(granted)}; the closer would take "
+            "AccessDenied and its Catch would hide it")
 
     def test_teardown_always_follows_smoke_even_on_failure(self, asl):
         smoke = asl["States"]["SmokeTest"]
@@ -1064,6 +1144,71 @@ class TestStateMachine:
                 assert rp not in ("__absent__", "$"), (
                     f"{name}'s catch to {cat['Next']} replaces the state with the error "
                     "object, discarding $.run_id and $.iteration")
+
+    def test_a_conductor_dispatched_task_is_closed_out_when_its_run_ends(self, asl):
+        """The zombie-run bug, one level up: the TASK stays 'dispatched' forever.
+
+        MarkRunFailed closes the run record because the state machine is the only
+        participant still alive when a stage dies. A conductor-dispatched run has a
+        second record with a lifecycle -- the llmops-tasks row whose id is carried in
+        the manifest's approval block -- and nothing closed it. Observed live:
+        task-58ecde82adcd73bf read status=dispatched while its run
+        run-20260731T183103Z-8b864805 had read failed since the day before.
+
+        Nothing else can do this job. llmops-tasks is written only by the console
+        Lambda, which is not in the execution path; the driver dies with the stage; and
+        the event bus has no rules, so PipelineFailed reaches no subscriber. The
+        console's Tasks tab therefore renders a dead task as mid-flight, and the
+        lifecycle flow -- the audit view of who ordered what and how it ended -- stops
+        at 'dispatched' for every run that fails.
+
+        Both terminal paths must close it: failure via the marker chain, success from
+        Complete.
+        """
+        states = asl["States"]
+        closers = {n: st for n, st in states.items()
+                   if st.get("Resource", "").endswith("dynamodb:updateItem")
+                   and st.get("Parameters", {}).get("TableName") == "llmops-tasks"}
+        assert closers, (
+            "no state writes llmops-tasks, so a conductor task stays 'dispatched' "
+            "after its run reaches a terminal state -- the console shows a dead task "
+            "as live and the audit trail never records how the order ended")
+
+        # Reachable from BOTH terminal paths, or half the outcomes still zombie.
+        for terminal in ("MarkRunFailed", "Complete"):
+            assert any(_reaches(states, terminal, name) for name in closers), (
+                f"{terminal} does not reach any llmops-tasks closer, so runs ending "
+                f"via {terminal} leave their task at 'dispatched'")
+
+        for name, st in closers.items():
+            # A run with no task_id (schedule/webhook trigger) must not fail the
+            # execution -- most runs are not conductor-dispatched.
+            assert st.get("Catch"), (
+                f"{name} has no Catch: a non-conductor run has no task to close, and "
+                "the resulting DDB error would fail an otherwise healthy execution")
+
+    def test_a_non_conductor_run_has_a_task_id_the_closer_can_read_harmlessly(self, asl):
+        """The closer reads `$.task_id`, and reading a path that is not there raises
+        the uncatchable States.Runtime -- no Catch, straight to ExecutionFailed, run
+        left at status=running. That is the exact failure the starter-contract guard
+        below exists for, and it would be reintroduced by a closer that assumes every
+        run is conductor-dispatched. Most are not: schedule and webhook triggers have
+        no task.
+
+        So start_pipeline must always set task_id (sentinel when there is no task), and
+        the closer must be conditioned so the sentinel writes nothing.
+        """
+        closers = {n: st for n, st in asl["States"].items()
+                   if st.get("Resource", "").endswith("dynamodb:updateItem")
+                   and st.get("Parameters", {}).get("TableName") == "llmops-tasks"}
+        assert closers, "no llmops-tasks closer to check (see the test above)"
+        src = (REPO / "orchestration/start_pipeline/handler.py").read_text()
+        start_input = src[src.index("input=json.dumps("):]
+        start_input = start_input[:start_input.index("\n\n")]
+        assert '"task_id"' in start_input, (
+            "the closer reads $.task_id but start_pipeline does not set it; a run "
+            "from any non-conductor trigger would die on States.Runtime before it "
+            "could self-close -- strictly worse than the zombie task it fixes")
 
     def test_the_starter_supplies_every_top_level_path_the_machine_reads(self, asl):
         """A missing input field raises States.Runtime, which no Catch can intercept.
@@ -1192,6 +1337,33 @@ class TestConductorDispatch:
         # and absent approval stays an empty dict, not a KeyError for readers
         m2 = start_pipeline.seed_manifest("run-y", "scheduler", {}, None)
         assert m2["approval"] == {}
+
+    def test_the_execution_input_carries_the_task_id_from_the_approval_block(self):
+        """The state machine closes the conductor's task record at the end of a run, so
+        it needs the task id in the EXECUTION input -- it cannot read the manifest from
+        S3, the same constraint that put pipeline_mode there.
+
+        The id already exists on the approval block (`approval.task_id`, written when
+        the human accepted the plan), so this is a plumbing gap rather than missing
+        data: run-20260731T183103Z-8b864805's manifest names task-58ecde82adcd73bf, and
+        that task still read 'dispatched' a day after the run failed.
+
+        A run with no approval must still get the field, as an explicit sentinel: the
+        closer reads $.task_id, and a missing path raises the uncatchable
+        States.Runtime.
+        """
+        for approval, expected in (
+                ({"task_id": "task-abc", "approved_by": "alice"}, "task-abc"),
+                (None, start_pipeline.NO_TASK),          # scheduler/webhook run
+                ({"approved_by": "alice"}, start_pipeline.NO_TASK)):  # signed, no task
+            c = {"s3": FakeS3(), "ddb": FakeDDB(), "sfn": FakeSfn(),
+                 "events": FakeEvents()}
+            start_pipeline.handler({"trigger_source": "conductor", "params": {},
+                                    "approval": approval}, clients=c)
+            sent = json.loads(c["sfn"].executions[0]["input"])
+            assert sent["task_id"] == expected, (
+                f"approval={approval!r} produced task_id={sent.get('task_id')!r}; the "
+                "closer needs a real id or the sentinel, never a missing path")
 
 def _deploy_src(name):
     return (REPO / "deploy" / name).read_text()
