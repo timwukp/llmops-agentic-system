@@ -2633,8 +2633,16 @@ def run_task_turn(task_id, accept=False):
         # did no work". model_rounds/htools/model_ms come off the stream itself and are
         # what a latency question actually needs -- on the measured turn, model_ms was
         # 21.7s of a 29.6s wall clock, i.e. the round-trips ARE the turn.
+        #
+        # `tool=` names only a call we OWE, for the same reason. A toolUse block also
+        # streams alongside end_turn for a tool the harness already ran itself (see the
+        # servicing condition below, which deliberately skips those), and the live line
+        # read `stop=end_turn tool=shell` -- indistinguishable from a call we failed to
+        # answer. Those calls are in htools=, where they belong.
+        owed = (out["tool_use"] or {}).get("name") \
+            if out["stop_reason"] == "tool_use" else None
         print(f"[task-chat] {task_id} accept={accept} sess={sess} "
-              f"stop={out['stop_reason']} tool={(out['tool_use'] or {}).get('name')} "
+              f"stop={out['stop_reason']} tool={owed} "
               f"text={len(out['text'] or '')}b err={out['error']} "
               f"serviced={tool_rounds} model_rounds={model_rounds} "
               f"htools={out['harness_tools']} model_ms={model_ms} "
