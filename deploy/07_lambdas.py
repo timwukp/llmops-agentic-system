@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""07_lambdas.py — package and deploy the four spine Lambdas + the state machine.
+"""07_lambdas.py — package and deploy the 5 spine Lambdas + the state machine.
 
 Each Lambda bundle = its handler.py + the contracts (events.py, report.py,
 manifest.schema.json) vendored flat so the `except ImportError` fallback path
@@ -7,10 +7,14 @@ resolves. Roles come from SSM (01_iam.py); env vars from SSM (03_storage.py).
 State machine is created/updated from orchestration/state_machine.asl.json with
 ${HarnessDriverArn} and ${EventBusName} substituted.
 
+--only selects among ALL targets, Lambdas and non-Lambdas alike (state_machine,
+resume_rule); a bare run still deploys everything.
+
 Usage:
   python deploy/07_lambdas.py --region us-east-1 --dry-run
   python deploy/07_lambdas.py --region us-east-1
   python deploy/07_lambdas.py --region us-east-1 --only driver
+  python deploy/07_lambdas.py --region us-east-1 --only state_machine   # ASL only
 """
 import argparse
 import io
@@ -223,10 +227,22 @@ def ensure_resume_rule(events, lam, region, account, dry):
     return {"rule": rule, "action": "ensured"}
 
 
+# --only selects among ALL of this script's targets, not just the Lambdas. The state
+# machine and the resume rule used to deploy unconditionally on every run, which made
+# --only the opposite of what it says: `--only driver` shipped the driver AND the ASL,
+# and there was no way to ship the ASL alone. Both directions bit. The ASL change that
+# added MarkRunDone could not be deployed without also shipping a driver whose redeploy
+# is deliberately held back pending an IAM widen; and a driver-only redeploy silently
+# published whatever the working tree's ASL happened to say. A targeted deploy has to
+# mean what it claims, because the whole reason to reach for --only is blast radius.
+NON_LAMBDA_TARGETS = ("state_machine", "resume_rule")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--region", required=True)
-    ap.add_argument("--only", action="append", choices=list(LAMBDAS))
+    ap.add_argument("--only", action="append",
+                    choices=list(LAMBDAS) + list(NON_LAMBDA_TARGETS))
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
@@ -237,12 +253,15 @@ def main():
     account = "" if args.dry_run else boto3.client("sts", region_name=args.region) \
         .get_caller_identity()["Account"]
 
-    targets = args.only or list(LAMBDAS)
+    targets = args.only or list(LAMBDAS) + list(NON_LAMBDA_TARGETS)
     results = [deploy_lambda(lam, ssm, args.region, account, k, LAMBDAS[k], args.dry_run)
-               for k in targets]
-    results.append(deploy_state_machine(sfn, ssm, args.region, account, args.dry_run))
-    results.append(ensure_resume_rule(events, lam, args.region, account, args.dry_run))
-    print(json.dumps({"results": results, "dry_run": args.dry_run}, indent=2, default=str))
+               for k in targets if k in LAMBDAS]
+    if "state_machine" in targets:
+        results.append(deploy_state_machine(sfn, ssm, args.region, account, args.dry_run))
+    if "resume_rule" in targets:
+        results.append(ensure_resume_rule(events, lam, args.region, account, args.dry_run))
+    print(json.dumps({"results": results, "targets": targets,
+                      "dry_run": args.dry_run}, indent=2, default=str))
 
 
 if __name__ == "__main__":

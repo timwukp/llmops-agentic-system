@@ -25,9 +25,9 @@ time from `sts get-caller-identity` and are never committed to the repo.
 | 02 | `02_network.py` | dedicated VPC, 2 private subnets, SGs, gateway + interface VPC endpoints; SSM `/llmops/network/*` | **prod only** (dev harnesses use PUBLIC network mode) |
 | 03 | `03_storage.py` | S3 data bucket (versioned, SSE-S3, public-access-block, `runs/` 90-day lifecycle), DDB `llmops-pipeline-runs` + `llmops-stage-events`, EventBridge bus `llmops-pipeline`, SNS `llmops-escalations`; SSM `/llmops/storage/*` | always |
 | 04 | `04_wire_memory.py` | shared BYO AgentCore Memory (SEMANTIC+EPISODIC), attach to every harness, per-Memory IAM grant; SSM `/llmops/memory/*` | after 05 creates harnesses (re-run to attach new ones) |
-| 05 | `05_harnesses.py` | all 6 harnesses from `agents/*/harness.json` (dev) or `harness.prod.json` (VPC + S3-mirrored skills); injects `OTEL_TRACES_SAMPLER=always_on`; SSM `/llmops/harness/*` | after 01/03 (and 02 for prod) |
+| 05 | `05_harnesses.py` | all 7 harnesses from `agents/*/harness.json`; injects `OTEL_TRACES_SAMPLER=always_on`. `--prod` reads `harness.prod.json`, which **no agent has yet** (VPC-mode variants are unbuilt and need the S3 skill mirror first); SSM `/llmops/harness/*` | after 01/03 (and 02 for prod) |
 | 06 | `06_observability.py` | log/trace deliveries per harness (targets the auto-created runtime ARN); `--evals` attaches Builtin online evaluation configs (needs `llmops-eval-execution` role) | after 05 |
-| 07 | `07_lambdas.py` | 4 spine Lambdas (driver/start/resume/webhook, contracts vendored), Step Functions `llmops-pipeline`, SageMaker job-state EventBridge rule | after 05 |
+| 07 | `07_lambdas.py` | 5 spine Lambdas (driver/start/resume/webhook/finops-reconcile, contracts vendored), Step Functions `llmops-pipeline`, SageMaker job-state EventBridge rule. `--only` selects any single target incl. `state_machine` / `resume_rule` | after 05 |
 | 08 | `08_triggers.py` | EventBridge Scheduler (nightly, DISABLED), webhook HMAC secret, HTTP API (`POST /webhook`, `POST /runs` IAM); SSM `/llmops/triggers/*` | after 07; `--enable-schedule` for nightly |
 | — | ops console | deployed from [bedrock-agentcore-agent-ops-console](https://github.com/timwukp/bedrock-agentcore-agent-ops-console) `deploy/deploy.sh` with `UI_HARNESS`/`QA_BUCKET` env pointing at this platform | last |
 

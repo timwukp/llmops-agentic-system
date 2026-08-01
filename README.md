@@ -22,7 +22,7 @@ This repo is a reference implementation of skill-driven engineering:
 | Skill | Role here |
 |---|---|
 | [agentcore-harness-builder](https://github.com/timwukp/agent-skills-best-practice/tree/main/skills/skills/agentcore-harness-builder) | **Platform construction** — its prescribed workflow (preflight → design → author → create → memory → observability → invoke-verify → version/pin → evaluate) built every harness; its scripts are reused verbatim in `deploy/` |
-| [MLOps-agent-skills](https://github.com/timwukp/MLOps-agent-skills) (LLMOps chain) | **Agent capability** — each harness mounts its stage's skills at session start via the harness `skills` source (git in dev, S3 mirror in prod) |
+| [MLOps-agent-skills](https://github.com/timwukp/MLOps-agent-skills) (LLMOps chain) | **Agent capability** — each harness mounts its stage's skills at session start via the harness `skills` source (all 19 sources are `git` today; an S3 mirror is planned and required before VPC mode) |
 
 ## Architecture
 
@@ -55,9 +55,11 @@ Key design decisions (full rationale in [docs/ARCHITECTURE.md](docs/ARCHITECTURE
   it launches, calls `job_launched`, and the pipeline resumes in a fresh session via
   `waitForTaskToken` + an EventBridge SageMaker state-change rule. State lives in the
   S3 manifest, never in the session.
-- **Enterprise posture** — production harnesses and Lambdas run VPC-isolated with
-  interface endpoints (no internet egress); least-privilege IAM throughout; skills
-  mounted from an S3 mirror in prod.
+- **Enterprise posture** — least-privilege IAM throughout; the VPC with interface
+  endpoints (no internet egress) is built by `deploy/02_network.py`. VPC-mode harness
+  variants and the S3 skill mirror they require are **not built yet**: a VPC-mode
+  harness cannot resolve a `git` skill source, so the mirror is a prerequisite, not a
+  refinement.
 
 ## Why the agents can replace an LLMOps engineer: three layers, not one model
 

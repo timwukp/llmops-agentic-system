@@ -129,6 +129,15 @@ class FakeTable:
         items = [i for i in self.items if cond is None or _cond_matches(cond, i)]
         return {"Items": items}
 
+    def get_item(self, **kw):
+        # Reads back what was written, like query. put_directive consults the run's
+        # status through this to decide whether anyone can still hear the verdict; a
+        # stub returning a fixed row would make an unreachable run look reachable.
+        for item in self.items:
+            if all(item.get(k) == v for k, v in (kw.get("Key") or {}).items()):
+                return {"Item": item}
+        return {}
+
 
 class FakeDDB:
     def __init__(self):
@@ -816,6 +825,222 @@ class TestDriver:
                                     run_id="run-orch-1"), clients=c)
         assert driver.take_directive(c["ddb"], "run-orch-1") is None
 
+    @staticmethod
+    def _seed_run(c, run_id, status):
+        c["ddb"].Table("llmops-pipeline-runs").put_item(
+            Item={"run_id": run_id, "status": status})
+
+    @pytest.mark.parametrize("status", ["escalated", "failed", "completed",
+                                        "stopped-smoke-verification"])
+    def test_a_verdict_for_a_run_that_cannot_hear_it_is_not_reported_resolved(self, status):
+        """take_directive has exactly ONE caller: the checkpoint branch of a LIVE driver
+        invocation. So a verdict addressed to a run whose execution has ENDED lands in a
+        mailbox nobody will open again -- and this branch used to return
+        {"status": "resolved"} regardless.
+
+        That is how #16 stayed open for three days: run-20260729T104648Z-41631739 was
+        already `escalated`, its token failed and its execution FAILED at 11:19:55Z, so
+        triaging it would have reported success and changed NOTHING. Same class as the
+        stranded task token (#52): the write is authorized, and unreachable.
+
+        Asserted on the returned status ONLY. The follow-up turn and the audit flag are
+        separate properties with their own guards below, and asserting them here made this
+        test go red for three unrelated reasons -- which is how a suite ends up with
+        guards that look independent and are not."""
+        ac = FakeAgentCore([
+            tool_use_stream("resolve_escalation",
+                            {"run_id": "run-dead-1", "decision": "option_B",
+                             "adjusted_params": {"teacher_cap_usd": 39}}),
+            tool_use_stream("stage_complete", {"outputs": []}),
+            text_stream("ack")])
+        c = clients(ac)
+        self._seed_run(c, "run-dead-1", status)
+        out = driver.handler(driver_event(stage="orchestrator", task="triage",
+                                          run_id="run-orch-1"), clients=c)
+
+        assert out["status"] != "resolved", \
+            f"a verdict for a {status} run was reported as a resolution"
+
+    def test_an_undeliverable_verdict_is_rejected_back_so_triage_can_still_act(self):
+        """The rejection must ride back into the SAME turn, not end it. A conductor told
+        "undeliverable" can relaunch the work via launch_run or escalate to page_human;
+        returning would leave triage having done nothing, which is the bug being fixed.
+
+        This is the ONLY guard on the follow-up turn and on the rejection's wording, so a
+        `return` here fails exactly this test and not the reachability guards above."""
+        ac = FakeAgentCore([
+            tool_use_stream("resolve_escalation",
+                            {"run_id": "run-dead-2", "decision": "raise_cap"}),
+            tool_use_stream("page_human", {"reason": "needs owner authority"}),
+            text_stream("ack")])
+        c = clients(ac)
+        self._seed_run(c, "run-dead-2", "escalated")
+        driver.handler(driver_event(stage="orchestrator", task="triage",
+                                    run_id="run-orch-1"), clients=c)
+        assert len(ac.calls) >= 2, \
+            "the conductor never got another turn to act on the rejection"
+        answer = json.loads(
+            ac.calls[1]["messages"][-1]["content"][0]["toolResult"]["content"][0]["text"])
+        assert answer["status"] == "undeliverable"
+        assert answer["run_status"] == "escalated"
+        assert "launch_run" in answer["reason"], \
+            "a rejection must name the path that CAN act, or triage just stops"
+
+    def test_a_verdict_for_a_live_run_is_still_delivered_and_reported_resolved(self):
+        """The reachability check must not break the case it is guarding. A `running`
+        run has a listener, so the verdict is delivered and the turn resolves -- a guard
+        that refused every directive would 'fix' the silence by making it total."""
+        ac = FakeAgentCore([
+            tool_use_stream("resolve_escalation",
+                            {"run_id": "run-live-1", "decision": "option_B",
+                             "adjusted_params": {"teacher_cap_usd": 39}}),
+            text_stream("ack")])
+        c = clients(ac)
+        self._seed_run(c, "run-live-1", "running")
+        out = driver.handler(driver_event(stage="orchestrator", task="triage",
+                                          run_id="run-orch-1"), clients=c)
+        assert out["status"] == "resolved"
+        pending = driver.take_directive(c["ddb"], "run-live-1")
+        assert pending and pending["adjusted_params"] == {"teacher_cap_usd": 39}
+
+    def test_an_unknown_run_is_treated_as_reachable_not_silently_dropped(self):
+        """A run row that cannot be read must NOT withhold the verdict. The failure being
+        fixed is a silent no-op; refusing to deliver on a transient DDB error or an
+        unseeded row would invent a second one, in the same direction."""
+        ac = FakeAgentCore([
+            tool_use_stream("resolve_escalation",
+                            {"run_id": "run-unknown-1", "decision": "retry"}),
+            text_stream("ack")])
+        c = clients(ac)  # no run row seeded at all
+        out = driver.handler(driver_event(stage="orchestrator", task="triage",
+                                          run_id="run-orch-1"), clients=c)
+        assert out["status"] == "resolved"
+        assert driver.take_directive(c["ddb"], "run-unknown-1")
+
+    def test_the_audit_record_survives_even_when_the_verdict_cannot_be_delivered(self):
+        """Undeliverable is not un-decided. The stage-event and the directive row are both
+        still written -- flagged deliverable=False -- because what the conductor decided is
+        evidence regardless of whether anyone acted on it."""
+        ac = FakeAgentCore([
+            tool_use_stream("resolve_escalation",
+                            {"run_id": "run-dead-3", "decision": "abort",
+                             "rationale": "2-sample scale has no quality signal"}),
+            tool_use_stream("stage_complete", {"outputs": []}),
+            text_stream("ack")])
+        c = clients(ac)
+        self._seed_run(c, "run-dead-3", "escalated")
+        driver.handler(driver_event(stage="orchestrator", task="triage",
+                                    run_id="run-orch-1"), clients=c)
+        rows = c["ddb"].Table("llmops-stage-events").items
+        parked = [r for r in rows
+                  if str(r.get("sk", "")).startswith(driver.DIRECTIVE_SK)]
+        assert parked, "the decision was lost entirely, not merely undelivered"
+        assert parked[0]["deliverable"] is False
+        assert parked[0]["run_status_at_put"] == "escalated"
+        assert any("EscalationResolved" in str(r.get("sk", "")) for r in rows)
+
+    def test_the_above_authority_exit_actually_pages_the_owner(self):
+        """page_human is the conductor's ONLY exit when a decision is above its authority
+        -- and the exit the driver's own undeliverable-verdict rejection names. It was
+        declared on the orchestrator harness from Phase 5 and serviced only by the
+        CONSOLE chat worker, so on the driver path (every triage invocation) it hit the
+        unknown-tool branch and answered {"status": "unsupported"}: no SNS, no event, no
+        owner told.
+
+        Live, 2026-08-01 13:45Z: #53's fix correctly rejected the verdict as
+        undeliverable and named launch_run/page_human. The conductor re-called
+        resolve_escalation, was rejected again, wrote two plan files to S3, and the turn
+        ended -- zero runs dispatched, zero pages sent. A rejection naming a path that
+        answers "unsupported" is a dead end dressed as a choice."""
+        ac = FakeAgentCore([
+            tool_use_stream("page_human",
+                            {"run_id": "run-stuck-9",
+                             "situation": "teacher budget 7.5x under-planned",
+                             "options": ["raise the cap", "cut coverage"],
+                             "recommendation": "raise the cap, preserve coverage"}),
+            text_stream("ack")])
+        c = clients(ac)
+        out = driver.handler(driver_event(stage="orchestrator", task="triage",
+                                         run_id="run-orch-1"), clients=c)
+        assert out["status"] == "paged", \
+            "page_human fell through to the unknown-tool branch; the owner was never told"
+        assert c["sns"].published, "an above-authority decision reached no human at all"
+        brief = json.loads(c["sns"].published[0]["Message"])
+        assert brief["recommendation"] == "raise the cap, preserve coverage"
+        assert brief["options"] == ["raise the cap", "cut coverage"]
+
+    def test_a_page_is_recorded_on_the_stuck_run_not_the_triaging_run(self):
+        """Same addressing rule as put_directive, for the same reason: the timeline a
+        reader opens is the stuck run's, not the conductor's."""
+        ac = FakeAgentCore([
+            tool_use_stream("page_human",
+                            {"run_id": "run-stuck-9", "situation": "s",
+                             "recommendation": "r"}),
+            text_stream("ack")])
+        c = clients(ac)
+        driver.handler(driver_event(stage="orchestrator", task="triage",
+                                    run_id="run-orch-1"), clients=c)
+        paged = [r for r in c["ddb"].Table("llmops-stage-events").items
+                 if "HumanPaged" in str(r.get("sk", ""))]
+        assert paged, "the page left no audit record on the run it was about"
+        assert paged[0]["run_id"] == "run-stuck-9", \
+            f"the page was filed against the conductor's own run: {paged[0]['run_id']}"
+
+    def test_a_page_with_no_recommendation_is_rejected_back_not_sent(self):
+        """A page reading "needs a human" with no recommendation hands the owner the
+        problem and none of the analysis the conductor already did -- which leaves them
+        exactly where they started. Rejected into the same turn so it can add one."""
+        ac = FakeAgentCore([
+            tool_use_stream("page_human", {"run_id": "run-stuck-9",
+                                           "situation": "budget blown"}),
+            tool_use_stream("page_human",
+                            {"run_id": "run-stuck-9", "situation": "budget blown",
+                             "recommendation": "approve $13 cap"}),
+            text_stream("ack")])
+        c = clients(ac)
+        out = driver.handler(driver_event(stage="orchestrator", task="triage",
+                                         run_id="run-orch-1"), clients=c)
+        first = json.loads(
+            ac.calls[1]["messages"][-1]["content"][0]["toolResult"]["content"][0]["text"])
+        assert first["status"] == "rejected"
+        assert "recommendation" in first["reason"]
+        assert out["status"] == "paged", "the corrected page never went out"
+        assert len(c["sns"].published) == 1, \
+            "the incomplete page was sent anyway, then sent again"
+
+    def test_every_triage_tool_is_serviced_on_the_driver_path(self):
+        """The existing drift guard asks whether a declared tool is serviced ANYWHERE,
+        and that is what let page_human ship half-wired: the console handled it, the
+        driver did not, and only the driver runs a triage.
+
+        So the guard is per-path. The tools the orchestrator's triage protocol names must
+        be serviced by the DRIVER, because an EscalatedToHuman event routes to the driver
+        and there is no chat session anywhere near it. Derived from the prompt's own
+        triage clause, not a hand-kept list."""
+        h = json.loads((REPO / "agents/orchestrator/harness.json").read_text())
+        prompt = h["systemPrompt"][0]["text"]
+        triage_clause = prompt.split('- "triage"')[1].split('- "report"')[0]
+        declared = {t["name"] for t in h["tools"] if t["type"] == "inline_function"}
+        named_in_triage = {n for n in declared if n in triage_clause}
+        assert {"resolve_escalation", "page_human"} <= named_in_triage, \
+            "the triage clause stopped naming its own exits; this guard went vacuous"
+        driver_src = (REPO / "orchestration/harness_driver/handler.py").read_text()
+        unserviced = {n for n in named_in_triage
+                      if f'name == "{n}"' not in driver_src}
+        assert not unserviced, (
+            f"the triage protocol tells the conductor to call {unserviced}, but the "
+            "driver -- the only thing that runs a triage -- does not service them; "
+            "they return 'unsupported' and the escalation stays stuck")
+
+    def test_running_is_the_only_state_with_a_listener(self):
+        """Derived, not hand-listed: every terminal status any writer in the repo can put
+        on a run must be treated as unreachable. A status added later (a new terminal
+        marker) that this tuple does not know about would silently go back to filing
+        verdicts into a dead mailbox."""
+        assert "running" not in driver.UNREACHABLE_RUN_STATES
+        for status in ("escalated", "failed", "completed"):
+            assert status in driver.UNREACHABLE_RUN_STATES
+
     def test_missing_stage_complete_reasks_then_fails(self):
         ac = FakeAgentCore([text_stream("done, I think"), text_stream("still no call"),
                             text_stream("third strike")])
@@ -946,6 +1171,68 @@ class TestResumePipeline:
         c = self._clients({"run_id": "run-1", "task_token": "tok-9"})
         out = resume_pipeline.handler(sm_event("InProgress"), clients=c)
         assert out["skipped"] is True
+
+    @staticmethod
+    def _client_error(code):
+        from botocore.exceptions import ClientError
+        return ClientError({"Error": {"Code": code, "Message": code}}, "SendTaskSuccess")
+
+    def _sfn_raising(self, c, exc):
+        def boom(**kw):
+            raise exc
+        c["sfn"].send_task_success = boom
+        c["sfn"].send_task_failure = boom
+        return c
+
+    @pytest.mark.parametrize("code", ["TaskTimedOut", "TaskDoesNotExist"])
+    @pytest.mark.parametrize("status", ["Completed", "Failed"])
+    def test_a_dead_token_is_still_cleared_from_the_run_row(self, code, status):
+        """A token Step Functions has already discarded is stale data, not a pending
+        obligation. Live: run-20260729T104648Z-41631739 held a task_token for an
+        execution that ended 2026-07-29T11:19:55Z and still held it three days later,
+        because the settle raised (AccessDenied on the clear, then TaskTimedOut,
+        'Provided task does not exist anymore', over ~5 deliveries) and every retry
+        raised before reaching the REMOVE. Both terminal statuses and both
+        already-gone error codes, because the clear sat after a two-branch if."""
+        c = self._sfn_raising(self._clients({"run_id": "run-1", "task_token": "tok-9"}),
+                              self._client_error(code))
+        out = resume_pipeline.handler(sm_event(status), clients=c)
+        assert out["outcome"] == "token-already-gone"
+        assert code in out["settle_error"]
+        updates = c["ddb"].Table(ENV["RUNS_TABLE"]).updates
+        assert updates and "REMOVE task_token" in updates[0]["UpdateExpression"], \
+            "a token whose execution is over stayed parked in the run row"
+
+    @pytest.mark.parametrize("code", ["ThrottlingException", "InvalidToken",
+                                      "InternalServerError"])
+    def test_a_settle_that_might_still_land_is_retried_and_the_token_kept(self, code):
+        """The discriminating half. Clearing on EVERY failure would be worse than the
+        bug: the token is the pipeline's only way to learn a paid-for stage finished, so
+        a throttle or a 5xx must reraise for EventBridge to retry, and must NOT clear.
+        Only 'the task is gone' is safe to absorb."""
+        c = self._sfn_raising(self._clients({"run_id": "run-1", "task_token": "tok-9"}),
+                              self._client_error(code))
+        with pytest.raises(Exception) as ei:
+            resume_pipeline.handler(sm_event("Completed"), clients=c)
+        assert code in str(ei.value)
+        assert not c["ddb"].Table(ENV["RUNS_TABLE"]).updates, \
+            "a retryable settle failure cleared the token the retry still needs"
+
+    def test_a_failure_to_clear_the_token_is_raised_not_swallowed(self):
+        """The 2026-07-29 clear failed with AccessDenied and that was invisible: the
+        traceback that followed was about the settle, not about this write. If the field
+        cannot be cleared, the run row is wrong and the caller has to hear about it."""
+        c = self._clients({"run_id": "run-1", "task_token": "tok-9"})
+        table = c["ddb"].Table(ENV["RUNS_TABLE"])
+
+        def denied(**kw):
+            raise self._client_error("AccessDeniedException")
+        table.update_item = denied
+        with pytest.raises(Exception) as ei:
+            resume_pipeline.handler(sm_event("Completed"), clients=c)
+        assert "AccessDenied" in str(ei.value)
+        # The settle still happened -- the pipeline moved on; only bookkeeping failed.
+        assert c["sfn"].successes, "the token was not settled before the clear was tried"
 
 
 # ---------------------------------------------------------------------------
@@ -1149,6 +1436,79 @@ class TestStateMachine:
         assert _terminals_from(states, mark["Catch"][0]["Next"]) == {"Fail"}, (
             "MarkRunFailed's Catch must lead to Fail: a rejected condition is not a "
             "success, and a dead end would hang the execution instead of failing it")
+
+    def test_a_successful_run_is_closed_out_too_not_only_a_failed_one(self, asl):
+        """The failure path was fixed and the success path was not, and the asymmetry
+        survived precisely because it could not be seen: runs.status is written 'running'
+        by start_pipeline, 'escalated' by the driver, 'failed' by MarkRunFailed -- and
+        'completed' by nothing at all. stage_complete updates the manifest and settles the
+        task token; it never touches the run's own status.
+
+        So a run that SUCCEEDED sat at status=running forever, the same zombie
+        MarkRunFailed exists to prevent, on the other branch. It stayed invisible because
+        no execution had ever succeeded before: run-20260801T062313Z-4d3e2e69 was the
+        first, and five hours after it finished its task row read 'completed' while its
+        run row still read 'running'.
+
+        Asserted as a property of the success path rather than by naming the state, so
+        rerouting Complete elsewhere cannot quietly drop the closer.
+        """
+        states = asl["States"]
+        closers = [n for n, st in states.items()
+                   if st.get("Resource", "").endswith("dynamodb:updateItem")
+                   and st["Parameters"]["TableName"] == "llmops-pipeline-runs"
+                   and "completed" in json.dumps(
+                       st["Parameters"]["ExpressionAttributeValues"])]
+        assert closers, (
+            "no state writes status=completed to llmops-pipeline-runs; a successful run "
+            "stays at 'running' forever and the console shows it as still in flight")
+        for name in closers:
+            assert _reaches(states, "Complete", name) or name == "Complete", (
+                f"{name} writes the completed status but the success path never reaches "
+                "it, so the run record is still never closed")
+        # And it must not turn a successful pipeline into a failed execution.
+        for name in closers:
+            assert _terminals_from(states, name) == {"Succeed"}, (
+                f"{name} can end the execution somewhere other than Succeed; closing a "
+                "record is bookkeeping and must never change the run's verdict")
+
+    def test_closing_a_successful_run_never_overwrites_a_richer_status(self, asl):
+        """Mirrors the MarkRunFailed guard. The driver may already have written
+        'escalated' -- more informative than 'completed' -- and a DDB outage must not
+        fail an execution whose pipeline genuinely succeeded."""
+        states = asl["States"]
+        closer = next(n for n, st in states.items()
+                      if st.get("Resource", "").endswith("dynamodb:updateItem")
+                      and st["Parameters"]["TableName"] == "llmops-pipeline-runs"
+                      and "completed" in json.dumps(
+                          st["Parameters"]["ExpressionAttributeValues"]))
+        params = states[closer]["Parameters"]
+        assert "running" in json.dumps(params["ExpressionAttributeValues"]), (
+            "the write must be conditional on the run still being 'running', or it "
+            "would clobber the driver's richer 'escalated'")
+        assert "States.ALL" in states[closer]["Catch"][0]["ErrorEquals"]
+        assert _terminals_from(states, states[closer]["Catch"][0]["Next"]) == {"Succeed"}
+
+    def test_both_records_are_closed_on_both_paths(self, asl):
+        """The run record and the task record are separate records with separate reasons
+        to go stale, and each path has now been caught missing one of them: the failure
+        path closed the run but not the task (task-58ecde82adcd73bf sat at 'dispatched'
+        for a day), the success path closed the task but not the run. Assert the full
+        2x2 rather than the one cell that was most recently broken.
+        """
+        states = asl["States"]
+        for start, table, want in (("Complete", "llmops-pipeline-runs", "completed"),
+                                   ("Complete", "llmops-tasks", "completed"),
+                                   ("EscalateFail", "llmops-pipeline-runs", "failed"),
+                                   ("EscalateFail", "llmops-tasks", "failed")):
+            hit = [n for n, st in states.items()
+                   if st.get("Resource", "").endswith("dynamodb:updateItem")
+                   and st["Parameters"]["TableName"] == table
+                   and want in json.dumps(st["Parameters"]["ExpressionAttributeValues"])
+                   and _reaches(states, start, n)]
+            assert hit, (
+                f"nothing reachable from {start} writes {want!r} to {table}; that record "
+                "stays open and the console keeps showing finished work as in flight")
 
     def test_the_asl_carries_no_fields_amazon_states_language_rejects(self, asl):
         """`_comment` is this repo's convention for explaining a policy document, and it
@@ -1822,3 +2182,301 @@ def test_every_aws_call_a_handler_makes_is_in_its_role(role, src):
     assert not missing, (
         f"{src} performs actions the {role!r} role does not allow: {missing}. "
         "The handler will do its work and then die on AccessDenied.")
+
+
+# ── the S3 skill mirror: a prerequisite, not an optimization ───────────────────
+# All 19 skill sources across the 7 harnesses are `git` today. Moving them to `s3` is
+# worth doing for two reasons -- a git source has NO branch field, so it always reads the
+# skills repo's DEFAULT branch and main-branch drift silently changes production agent
+# behaviour; and a VPC-mode harness cannot reach GitHub at all -- but the order cannot be
+# reversed. Switch the sources first and UpdateHarness ACCEPTS it, mints a version, and
+# reports READY; the failure lands at SESSION START, on every invocation. These guards
+# hold the sync step to being a real gate rather than a copy loop.
+
+@pytest.fixture(scope="module")
+def storage_mod():
+    """deploy/03_storage.py as a module (its name starts with a digit, so not importable).
+    Nothing at import time calls AWS."""
+    return _load("llmops_03_storage_orch", "deploy/03_storage.py")
+
+
+class _SkillS3:
+    """Records uploads and answers head_object only for keys that were uploaded."""
+
+    def __init__(self):
+        self.uploads = []
+        self.heads = []
+
+    def upload_file(self, local, bucket, key):
+        self.uploads.append((local, bucket, key))
+
+    def head_object(self, Bucket, Key):
+        self.heads.append((Bucket, Key))
+        if Key not in [u[2] for u in self.uploads]:
+            raise AssertionError(f"head_object on a key never uploaded: {Key}")
+        return {"ContentLength": 1}
+
+
+def _skill_tree(root, names, frontmatter=True):
+    """Write a minimal but valid skills checkout under `root`."""
+    for name in names:
+        d = root / name
+        d.mkdir(parents=True, exist_ok=True)
+        head = ("---\n"
+                f"name: {name.rsplit('/', 1)[-1]}\n"
+                "description: one line\n"
+                "---\n\n") if frontmatter else ""
+        (d / "SKILL.md").write_text(head + "# body\n", encoding="utf-8")
+    return root
+
+
+def test_the_sync_covers_every_skill_the_configs_mount(storage_mod):
+    """The list of what to mirror is DERIVED from agents/*/harness.json, never hand-kept.
+
+    A hand-kept list is the exact failure this whole step guards against: a mount added
+    later would be absent from S3, and a missing skill source does not fail at
+    UpdateHarness -- it fails at session start, on every invocation, with the config
+    still reading healthy.
+    """
+    mounts = storage_mod.mounted_skills(REPO)
+    total = sum(len(v) for v in mounts.values())
+    configs = sorted((REPO / "agents").glob("*/harness.json"))
+    from_cfg = sum(1 for c in configs
+                   for s in (json.loads(c.read_text()).get("skills") or [])
+                   if "git" in s)
+    assert total == from_cfg, (
+        f"the sync plan covers {total} mounts but the configs declare {from_cfg} git "
+        "sources; a mount the sync does not know about is a skill that vanishes when "
+        "its source is switched to s3")
+    assert mounts, "no mounts found at all -- the glob or the config shape changed"
+
+
+def test_a_skill_entry_with_sibling_keys_is_still_collected(storage_mod, tmp_path):
+    """One live entry carries a `_comment` beside its `git` key.
+
+    Membership must be tested by key, not by taking the entry's first key -- a counter
+    written the latter way reported 18 git sources plus one '_comment', which would have
+    silently excluded the orchestrator's llm-data-preparation mount from the mirror.
+    """
+    agents = tmp_path / "agents"
+    (agents / "a").mkdir(parents=True)
+    (agents / "a" / "harness.json").write_text(json.dumps({"skills": [
+        {"_comment": "why this is mounted here too", "git": {
+            "url": "https://github.com/x/y", "path": "skills/llmops/llm-data-preparation"}},
+    ]}))
+    mounts = storage_mod.mounted_skills(tmp_path)
+    assert "skills/llmops/llm-data-preparation" in mounts, (
+        f"an entry with a sibling key was dropped: {mounts}")
+
+
+def test_a_skill_md_without_frontmatter_is_rejected_before_upload(storage_mod, tmp_path):
+    """The #1 skills failure, and undocumented: no YAML frontmatter kills every session
+    at start. Catching it at upload time is the only cheap place to catch it."""
+    d = _skill_tree(tmp_path, ["skills/llmops/llm-evaluation"], frontmatter=False)
+    with pytest.raises(ValueError, match="does not start with"):
+        storage_mod.skill_frontmatter(d / "skills/llmops/llm-evaluation/SKILL.md")
+
+
+def test_frontmatter_missing_name_or_description_is_rejected(storage_mod, tmp_path):
+    """`name` is how the agent addresses the skill, so an absent one is unreachable even
+    though the file opens with valid-looking frontmatter."""
+    p = tmp_path / "SKILL.md"
+    p.write_text("---\ndescription: only a description\n---\n\n# body\n")
+    with pytest.raises(ValueError, match="missing.*name"):
+        storage_mod.skill_frontmatter(p)
+    p.write_text("---\nname: llm-evaluation\n---\n\n# body\n")
+    with pytest.raises(ValueError, match="missing.*description"):
+        storage_mod.skill_frontmatter(p)
+    p.write_text("---\nname: llm-evaluation\ndescription: real\n---\n\n# body\n")
+    assert storage_mod.skill_frontmatter(p) == ("llm-evaluation", "real")
+
+
+def test_unclosed_frontmatter_is_rejected(storage_mod, tmp_path):
+    """A file that opens `---` and never closes it has no frontmatter block at all; the
+    naive parser would read the whole document as keys and find name/description in prose."""
+    p = tmp_path / "SKILL.md"
+    p.write_text("---\nname: x\ndescription: y\n\n# body with no closing marker\n")
+    with pytest.raises(ValueError, match="never closes"):
+        storage_mod.skill_frontmatter(p)
+
+
+def test_a_mounted_skill_absent_from_the_source_tree_is_fatal(storage_mod, tmp_path):
+    """Uploading 10 of 11 and reporting success is how a source switch loses a skill.
+
+    The real checkout is the sync source, so a partial or wrong --skills-src must stop
+    the deploy rather than mirror what it happens to have.
+    """
+    agents = tmp_path / "repo" / "agents" / "a"
+    agents.mkdir(parents=True)
+    (agents / "harness.json").write_text(json.dumps({"skills": [
+        {"git": {"url": "u", "path": "skills/llmops/llm-evaluation"}},
+        {"git": {"url": "u", "path": "skills/llmops/llm-nonexistent"}},
+    ]}))
+    src = _skill_tree(tmp_path / "src", ["skills/llmops/llm-evaluation"])
+    s3 = _SkillS3()
+    with pytest.raises(SystemExit, match="llm-nonexistent"):
+        storage_mod.ensure_skills(s3, "b", dry=False, src=src, repo=tmp_path / "repo")
+    assert not s3.uploads, (
+        f"a missing skill must be caught BEFORE any upload; these went up: {s3.uploads}")
+
+
+def test_the_s3_key_mirrors_the_path_the_git_source_already_names(storage_mod, tmp_path):
+    """The URI a harness config needs must be mechanical -- s3://<bucket>/<the same path
+    the git source names> -- not a second naming scheme to keep in sync by hand."""
+    agents = tmp_path / "repo" / "agents" / "a"
+    agents.mkdir(parents=True)
+    (agents / "harness.json").write_text(json.dumps({"skills": [
+        {"git": {"url": "u", "path": "skills/llmops/llm-evaluation"}}]}))
+    src = _skill_tree(tmp_path / "src", ["skills/llmops/llm-evaluation"])
+    s3 = _SkillS3()
+    out = storage_mod.ensure_skills(s3, "bkt", dry=False, src=src,
+                                    repo=tmp_path / "repo")
+    entry = out["skills"]["skills/llmops/llm-evaluation"]
+    assert entry["uri"] == "s3://bkt/skills/llmops/llm-evaluation"
+    assert ("bkt", "skills/llmops/llm-evaluation/SKILL.md") in \
+        [(u[1], u[2]) for u in s3.uploads]
+
+
+def test_each_uploaded_skill_is_read_back_at_the_key_a_harness_will_ask_for(
+        storage_mod, tmp_path):
+    """upload_file returning without an exception is not the same claim as the object
+    being fetchable at that key, and the gap between those two claims is a session-start
+    failure. So the entry point of every skill is head_object'd after upload."""
+    agents = tmp_path / "repo" / "agents" / "a"
+    agents.mkdir(parents=True)
+    (agents / "harness.json").write_text(json.dumps({"skills": [
+        {"git": {"url": "u", "path": "skills/llmops/llm-evaluation"}},
+        {"git": {"url": "u", "path": "skills/mlops/ml-solution-design"}}]}))
+    src = _skill_tree(tmp_path / "src", ["skills/llmops/llm-evaluation",
+                                        "skills/mlops/ml-solution-design"])
+    s3 = _SkillS3()
+    storage_mod.ensure_skills(s3, "bkt", dry=False, src=src, repo=tmp_path / "repo")
+    assert sorted(k for _, k in s3.heads) == [
+        "skills/llmops/llm-evaluation/SKILL.md",
+        "skills/mlops/ml-solution-design/SKILL.md"], (
+        f"every skill's SKILL.md must be read back, got {s3.heads}")
+
+
+def test_a_dry_run_validates_frontmatter_but_writes_nothing(storage_mod, tmp_path):
+    """The validation is the valuable half, so --dry-run must still do it. A dry run that
+    only prints a file count cannot tell you the switch is safe."""
+    agents = tmp_path / "repo" / "agents" / "a"
+    agents.mkdir(parents=True)
+    (agents / "harness.json").write_text(json.dumps({"skills": [
+        {"git": {"url": "u", "path": "skills/llmops/llm-evaluation"}}]}))
+    src = _skill_tree(tmp_path / "src", ["skills/llmops/llm-evaluation"],
+                      frontmatter=False)
+    s3 = _SkillS3()
+    with pytest.raises(ValueError, match="does not start with"):
+        storage_mod.ensure_skills(s3, "b", dry=True, src=src, repo=tmp_path / "repo")
+    assert not s3.uploads
+
+
+def test_no_skills_src_skips_loudly_rather_than_uploading_nothing_quietly(
+        storage_mod, tmp_path):
+    """Uploading nothing is safe. Reporting a mirror that did not happen is not: the next
+    step reads that as permission to switch a source."""
+    s3 = _SkillS3()
+    out = storage_mod.ensure_skills(s3, "b", dry=True, src=None, repo=REPO)
+    assert "skipped" in out["status"] and "skills-src" in out["status"]
+    assert not s3.uploads
+
+
+def test_the_deploy_runs_the_skill_sync_and_reports_it_on_its_own_line(storage_mod):
+    """Folded into another string it is one word in output nobody reads -- the same
+    mistake CORS made, whose only symptom was a customer upload failing much later."""
+    src = (REPO / "deploy/03_storage.py").read_text()
+    main = src[src.index("def main("):]
+    assert '"skills"] = ensure_skills(' in main, \
+        "main() never calls ensure_skills, so the step cannot run at deploy time"
+    assert "--skills-src" in src
+
+
+def test_the_skill_sync_lands_before_any_source_is_switched(storage_mod):
+    """The ordering constraint, asserted so it cannot be quietly inverted later.
+
+    While every source is still `git`, ensure_skills must exist. Once sources move to
+    `s3`, the mirror they read must be the one this step writes -- so if any config names
+    an s3 skill URI, that URI has to be a key ensure_skills would have uploaded.
+    """
+    assert hasattr(storage_mod, "ensure_skills"), (
+        "the sync step must exist BEFORE any source moves to s3: a bad source is "
+        "accepted by UpdateHarness and then fails at session start on every invocation")
+    for cfg in sorted((REPO / "agents").glob("*/harness.json")):
+        for skill in json.loads(cfg.read_text()).get("skills") or []:
+            uri = (skill.get("s3") or {}).get("uri", "")
+            if uri:
+                path = uri.split("/", 3)[-1] if uri.startswith("s3://") else ""
+                assert path.startswith("skills/"), (
+                    f"{cfg.parent.name} mounts {uri}, which is not under the skills/ "
+                    "prefix ensure_skills mirrors, so nothing keeps it in sync")
+
+
+def _harness_role_statements():
+    doc = json.loads((REPO / "deploy/iam/harness_execution_role.json").read_text())
+    return doc["permissionsPolicy"]["Statement"]
+
+
+def _prefix_is_granted(action, prefix):
+    """Does any statement allow `action` on <bucket>/<prefix>...? Returns the Sids."""
+    hits = []
+    for st in _harness_role_statements():
+        if st.get("Effect") != "Allow":
+            continue
+        actions = st["Action"]
+        if action not in ([actions] if isinstance(actions, str) else actions):
+            continue
+        res = st.get("Resource")
+        for r in [res] if isinstance(res, str) else (res or []):
+            _, _, tail = r.partition("<DATA_BUCKET>/")
+            if tail and prefix.startswith(tail.rstrip("*")):
+                hits.append(st.get("Sid"))
+    return hits
+
+
+def test_the_role_that_fetches_a_skill_at_session_start_can_read_the_mirror(storage_mod):
+    """The read-back inside ensure_skills proves the object is fetchable BY THE DEPLOYER.
+
+    That is not the claim that matters. An s3 skill source is fetched at session start by
+    the harness execution role, and this was measured live: after the mirror uploaded 66
+    files and head_object confirmed all 11 SKILL.md keys under my admin credentials,
+    `simulate_principal_policy` for llmops-harness-execution on
+    skills/llmops/llm-agent-orchestration/SKILL.md returned **implicitDeny**. The role file
+    granted `skills-mirror/*` -- a prefix that has never held a single object -- and not
+    the `skills/*` prefix the sync actually writes. Switching a source then would have been
+    accepted by UpdateHarness, reported READY, and failed every session afterwards.
+
+    Derived from ensure_skills' own key layout rather than a literal, so renaming the
+    prefix fails here instead of at session start.
+    """
+    key = f"{sorted(storage_mod.mounted_skills(REPO))[0]}/SKILL.md"
+    assert _prefix_is_granted("s3:GetObject", key), (
+        f"no statement lets the harness role GET {key}; an s3 skill source is fetched "
+        "under that role at session start, not under the deployer's credentials")
+
+
+def test_the_skill_mirror_is_listable_because_a_source_fetches_a_tree_not_one_object():
+    """ListBucket here is condition-scoped, and this repo has already been bitten by a
+    prefix granted for GetObject but absent from that condition: readable object-by-object,
+    never enumerable, which surfaced as 'the rate card history is there but the agent
+    reports no card exists'. A skill source resolves a whole directory, so the same gap
+    would strand it."""
+    for st in _harness_role_statements():
+        if st.get("Sid") == "S3PipelineList":
+            prefixes = st["Condition"]["StringLike"]["s3:prefix"]
+            assert "skills/*" in prefixes, (
+                f"skills/* is missing from the ListBucket condition {prefixes}; the "
+                "objects would be individually readable and the tree still unlistable")
+            return
+    raise AssertionError("no S3PipelineList statement")
+
+
+def test_the_agents_cannot_write_the_skill_tree_they_are_judged_against():
+    """Read-only on purpose, and NOT folded into S3PipelineObjects, which carries
+    PutObject alongside GetObject. An agent that can rewrite its own skill tree can
+    rewrite the instructions it is evaluated against on the next session -- the same
+    reasoning that keeps customer-data/ read-only for the pipeline."""
+    assert not _prefix_is_granted("s3:PutObject", "skills/llmops/x/SKILL.md"), (
+        "the harness role can WRITE the skill mirror; the skills grant must be "
+        "GetObject-only and separate from the read/write pipeline prefixes")
+    assert not _prefix_is_granted("s3:DeleteObject", "skills/llmops/x/SKILL.md")

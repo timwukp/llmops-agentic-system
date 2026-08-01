@@ -67,6 +67,19 @@ DataPrepGenerate → DataPrepCurate → FinetuneLaunch → FinetuneAnalyze → E
 
 兩個屬於「政策」而非「管道」的主幹細節：
 
+- **兩條路徑都要關掉兩筆記錄。** 一次 run 會寫兩筆記錄 —— `llmops-pipeline-runs` 裡它自己
+  那一列，以及 `llmops-tasks` 裡發起它的那個任務 —— 而兩條路徑都各被抓到只關了其中一筆。
+  失敗路徑（`EscalateFail` → `MarkRunFailed` → `MarkTaskFailed`）關了 run 卻沒關 task，
+  害 `task-58ecde82adcd73bf` 卡在 `dispatched` 整整一天。接著是成功路徑：`runs.status`
+  從頭到尾只被寫過 `running`（start-pipeline）、`escalated`（driver）、`failed`
+  （`MarkRunFailed`）—— **沒有任何東西寫過 `completed`**，所以每一次成功的 run 都變成殭屍，
+  正是 `MarkRunFailed` 在另一條分支上要防的那件事。它之所以沒被看見，是因為在
+  `run-20260801T062313Z-4d3e2e69` 之前**從來沒有一次執行成功過**（6 次失敗、1 次中止）；
+  那次 run 的 task 列在 06:34:43Z 正確關閉，而它的 run 列在五小時後仍讀作 `running`。
+  現在 `Complete` → **`MarkRunDone`** → `MarkTaskDone` 把它關掉，並帶
+  `attribute_not_exists(status) OR status = running` 條件，所以它永遠不可能覆蓋掉更豐富的
+  判決；它的 `Catch` 也落到 `MarkTaskDone`，理由和 `MarkRunFailed` 的 `Catch` 一樣 ——
+  關不掉其中一筆，不能連另一筆也一起開著。守護測試從 ASL 推導出「誰負責關閉」，而不是寫死名字。
 - **deploy 之後必然執行 `Teardown`** —— 即使 `SmokeTest` 失敗，其 `Catch` 也先路由到
   `Teardown`。孤兒 endpoint 是第一大成本風險（Phase 4 就在帳號裡發現一個無關的
   endpoint 自 2024-04 起一直 InService）。
@@ -93,6 +106,35 @@ run）、`resolve_escalation`（政策範圍內第一線處置：調參重跑階
 `page_human`（**僅限**超出其權限的決策 —— 預算超支、共享資源刪除、業務取捨 ——
 附決策簡報：情勢、選項、建議）、`write_report`（發布跨運行運維彙總），加 `checkpoint`。
 
+**裁決要嘛被投遞，要嘛可見地無法投遞 —— 絕不靜默歸檔。** 回答通道
+（`put_directive` → `checkpoint` 分支的 `take_directive`）**只有一個讀者**：一個
+*活著的* driver invocation。所以「已投遞」不是寫入的屬性，而是「將來會不會有人去讀」的
+屬性 —— 而 `resolve_escalation` 過去兩種情況都回 `{"status": "resolved"}`。這正是那筆
+data-prep 預算 escalation 懸了三天的原因：`run-20260729T104648Z-41631739` 早已是
+`escalated`，它的 task token 已被 `handle_escalate` 置失敗、execution 也在 11:19:55Z
+FAILED，所以今天去 triage 它**會回報成功、然後什麼都不會發生**。那個為了回答 escalation
+而存在的工具，回答不了*那一筆* escalation，而且沒有告訴任何人。這與 §4 那個滯留的 task
+token 是同一個形狀：**寫入被授權了，但到不了。** 現在 `put_directive` 會先查該 run 的
+狀態；終態 run 的裁決仍然會被寫下（決定本身就是證據，即使沒人照它行動），但標記
+`deliverable: false`，並且**在同一輪把呼叫駁回**，明確指出仍然能動的路徑 ——
+用 `launch_run` 帶著 adjusted params 重跑，或 `page_human`。讀不到或不存在的 run 列
+**刻意**算作可投遞：要修的缺陷就是靜默無操作，若因為一次暫時性 DynamoDB 錯誤就扣住裁決，
+等於朝同一個方向又造出第二個。
+
+**逃生口必須在真正會用到它的那條路徑上被服務。** 上面那個駁回指出了兩條路，而其中一條
+根本沒接線。`page_human` 從 Phase 5 就宣告在 orchestrator harness 上，卻只有 console 的
+chat worker 處理它 —— 但 triage 從來不是 chat：`EscalatedToHuman` 事件路由到的是
+**driver**，而在 driver 上 `page_human` 落到了未知工具分支，回答
+`{"status": "unsupported"}`。沒有 SNS、沒有事件、沒有任何人被通知。2026-08-01 13:45Z
+實測，而且是在上面那個修復**已經部署之後**：指揮家被正確告知裁決無法投遞、應改用
+`launch_run` 或 `page_human`，於是它改為再次呼叫 `resolve_escalation`、再次被駁回、
+把 `plan.json` 與 `relaunch-plan.json` 寫到 S3，然後那一輪就結束了 ——
+**零次派發、零次呼叫人類。** 舊的漂移守護測試之所以通過，是因為它只問一個被宣告的工具
+有沒有在**任何地方**被服務；console 讓它成立，而只有 driver 會跑 triage。現在守護測試
+改為**逐路徑**，並且從 prompt 自己的 triage 條款推導工具清單，所以協議日後多長出第三個
+出口，也不可能只接一半。此外，一次 page 若沒有同時帶 `situation` 與 `recommendation`
+就會被駁回：把問題丟給 owner 而不附上你已經做完的分析，等於讓他們留在原地。
+
 若一輪結束時*沒有* inline-function 呼叫（模型有時會口頭宣稱完成卻漏掉結構化呼叫），
 driver 在同一 session 內最多追問 2 次，然後以 `MissingStageComplete` 判定階段失敗 ——
 口頭敘述永遠不會被晉升為成功。
@@ -109,7 +151,15 @@ finetune agent 發起 SageMaker 作業、呼叫 `job_launched`、session 隨即�
    （Completed | Failed | Stopped）→ `llmops-resume-pipeline` Lambda。
 3. Lambda 按 job name 查回 run，發出 `ModelTrained` / `PipelineFailed`，結算 token
    （`send_task_success` / `send_task_failure`），並**刪除 token** ——
-   EventBridge 重複投遞也無法二次結算。
+   EventBridge 重複投遞也無法二次結算。這個刪除**與結算隔離**，因為 Step Functions 已經
+   丟棄的 token 是過期資料，不是待辦義務：2026-07-29 那次刪除以 `AccessDenied` 失敗，而
+   隨後約 5 次 EventBridge 重試全都**更早**就掛了 —— 掛在結算，`TaskTimedOut`
+   （「Provided task does not exist anymore」）—— 所以沒有任何一次抵達刪除，
+   `run-20260729T104648Z-41631739` 就一直為一個已在 11:19:55Z 結束的 execution 保留著
+   `task_token`。補上缺的 IAM 是必要條件但不是充分條件；**IAM 授權能修好「被禁止」的事，
+   永遠修不好「到不了」的事。** 現在只吸收「task 已不存在」這一種錯 —— 限流或 5xx 仍然
+   重拋而且**不刪除**，因為那個 token 是管線唯一能得知該階段已完成的途徑 —— 而刪除本身
+   失敗則是拋出而非吞掉，因為那正是當初「traceback 講的是別的事」的那個失敗。
 4. 之後 `FinetuneAnalyze` 在**全新 session** 中運行，從 AWS 狀態
    （describe-training-job + S3 + manifest）重建全部上下文。
 
@@ -201,14 +251,30 @@ Lambda 硬上限 **900 秒**，而 harness 回合預算（`timeoutSeconds`）是
 
 ## 11. 生產環境的 VPC 態勢
 
-開發配置（`agents/*/harness.json`）走 PUBLIC 網絡以求迭代速度。生產變體
-（`agents/*/harness.prod.json`）與 Lambda 都**在 VPC 內隔離運行，走 interface
-endpoints —— 無互聯網出口**（`deploy/02_network.py`）。兩個硬性理由：
+harness 配置（`agents/*/harness.json`）走 PUBLIC 網絡以求迭代速度。VPC 本身由
+`deploy/02_network.py` 建立，Lambda 可以**在 VPC 內隔離運行，走 interface
+endpoints —— 無互聯網出口**。
 
-- VPC 模式的 harness 連不上 GitHub，因此生產技能從 **S3 鏡像快照**掛載
-  （`deploy/05_mirror_skills.py`），而非 git 來源。
-- 這也是正確性問題而不只是連通性：git 技能來源只讀默認分支，main 分支漂移會靜默改變
-  生產 agent 的行為。S3 鏡像釘死了生產 agent 實際運行的內容。
+**尚未實作**（追蹤於 s3 技能來源的工作項）：VPC 模式的 harness 變體，以及來源本身的**切換**。
+它所需要的鏡像現在已經存在 —— `deploy/03_storage.py` 裡的 `ensure_skills` 從 harness 配置
+推導出要鏡像什麼、在上傳**之前**驗證每個 `SKILL.md` 的 frontmatter、並且把每一個都讀回來
+確認；harness 角色對 `skills/*` 只有 `GetObject` 與 `ListBucket`，沒有寫入權限。
+目前 **7 個 harness 上的 19 個技能來源全部是 `git`，沒有一個是 `s3`** ——
+由 `tests/test_docs_claims.py::test_the_skill_source_claims_match_the_harness_configs`
+讀取實際配置驗證，而不是相信這段文字。本文件的先前版本把
+`agents/*/harness.prod.json` 與 `deploy/05_mirror_skills.py` 寫成既有檔案；這兩個檔案
+在任何分支都從未存在過，也就是把一個設計當成已交付的功能在讀。
+
+兩個硬性理由讓鏡像成為 VPC 模式的前置條件，而不只是優化：
+
+- VPC 模式的 harness 連不上 GitHub，所以 git 技能來源根本無法解析 —— 而來源錯誤或無法
+  連線是在 **session 啟動時**才失敗，不是在 `UpdateHarness` 時，所以 harness 會被接受，
+  然後每一次 invocation 都失敗。這個不對稱也讓鏡像的**權限**成為前置條件的一部分，而不是
+  後續工作：抓取技能的身分是 `llmops-harness-execution`，所以部署者自己成功讀回上傳的物件
+  什麼都證明不了。第一次上傳完成後用 `simulate_principal_policy` 實測，那個角色對它將會被
+  要求的那些 key 是**隱性拒絕（implicitDeny）**。
+- 這也是正確性問題而不只是連通性：git 技能來源只讀默認分支（沒有 branch 欄位），
+  技能 repo 的 main 分支漂移會靜默改變生產 agent 的行為。S3 快照釘死 agent 實際運行的內容。
 
 ## 12. 審計員在狀態機之外，而且是唯讀的
 

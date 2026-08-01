@@ -73,6 +73,22 @@ else remediation), `RemediationChoice` (iteration < 3 → remediate, else escala
 
 Two spine details that are policy, not plumbing:
 
+- **Both records are closed on both paths.** A run writes two records — its own row in
+  `llmops-pipeline-runs` and the originating task's row in `llmops-tasks` — and each path
+  has now been caught closing only one of them. The failure path (`EscalateFail` →
+  `MarkRunFailed` → `MarkTaskFailed`) closed the run but not the task, which left
+  `task-58ecde82adcd73bf` at `dispatched` for a day. Then the success path: `runs.status`
+  was only ever written `running` (start-pipeline), `escalated` (the driver), or `failed`
+  (`MarkRunFailed`) — **nothing wrote `completed`**, so every successful run stayed a
+  zombie, exactly what `MarkRunFailed` exists to prevent on the other branch. It was
+  invisible because until `run-20260801T062313Z-4d3e2e69` **no execution had ever
+  succeeded** (6 failed, 1 aborted); that run's task row closed correctly at 06:34:43Z
+  while its run row still read `running` five hours later. `Complete` → **`MarkRunDone`**
+  → `MarkTaskDone` closes it, conditional on `attribute_not_exists(status) OR status =
+  running` so it can never overwrite a richer verdict, and its `Catch` falls through to
+  `MarkTaskDone` for the same reason `MarkRunFailed`'s does — failing to close one record
+  must not leave the other open. Guarded by property-based tests that derive the closers
+  from the ASL rather than naming them.
 - **`Teardown` always runs after deploy** — even when `SmokeTest` fails, its `Catch`
   routes to `Teardown` first. Orphaned endpoints are the #1 cost risk (Phase 4 found an
   unrelated endpoint in the account that had been InService since 2024-04).
@@ -101,6 +117,40 @@ authority — budget overruns, shared-resource deletion, business tradeoffs — 
 decision brief: situation, options, recommendation), `write_report` (publish cross-run
 operations synthesis), plus `checkpoint`.
 
+**A verdict is delivered or visibly undeliverable — never silently filed.** The answer
+channel (`put_directive` → the `checkpoint` branch's `take_directive`) has exactly ONE
+reader: a *live* driver invocation. So delivery is not a property of the write, it is a
+property of whether anyone will ever read it — and `resolve_escalation` used to return
+`{"status": "resolved"}` either way. That is why the data-prep budget escalation sat
+unanswered for three days: `run-20260729T104648Z-41631739` was already `escalated`, its
+task token failed by `handle_escalate` and its execution FAILED at 11:19:55Z, so triaging
+it would have reported success and changed nothing. The tool that existed to answer the
+escalation could not answer *that* escalation, and said so to no one. The same shape as
+the stranded task token in §4: **the write was authorized, and unreachable.** Now
+`put_directive` consults the run's status first; a verdict for a run in a terminal state
+is still written (a decision is evidence even when nobody acts on it) but flagged
+`deliverable: false`, and the call is *rejected back into the same turn* naming the paths
+that can still act — `launch_run` to relaunch the work carrying the adjusted params, or
+`page_human`. An unknown or unreadable run row counts as reachable on purpose: the defect
+being fixed is a silent no-op, and withholding a verdict on a transient DynamoDB error
+would invent a second one in the same direction.
+
+**An escape hatch must be serviced on the path that uses it.** That rejection names two
+paths, and one of them was not wired. `page_human` was declared on the orchestrator
+harness from Phase 5 on and handled only by the console's chat worker — but a triage is
+never a chat: an `EscalatedToHuman` event routes to the *driver*, and there `page_human`
+fell through to the unknown-tool branch and answered `{"status": "unsupported"}`. No SNS,
+no event, no owner told. Measured live on 2026-08-01 at 13:45Z, with the fix above already
+deployed: the conductor was correctly told its verdict was undeliverable and to use
+`launch_run` or `page_human`, so it re-called `resolve_escalation`, was rejected again,
+wrote `plan.json` and `relaunch-plan.json` to S3, and the turn ended — **zero runs
+dispatched, zero pages sent.** The previous drift guard passed because it asked whether a
+declared tool was serviced *anywhere*; the console qualified, and only the driver runs a
+triage. The guard is now per-path and derives the tool list from the prompt's own triage
+clause, so a protocol that grows a third exit cannot leave it half-wired. A page is also
+now rejected unless it carries both `situation` and `recommendation`: paging an owner with
+the problem and none of the analysis leaves them exactly where they started.
+
 If a turn ends *without* an inline-function call (models sometimes narrate completion but
 skip the structured call), the driver re-asks up to 2 times in the same session, then
 fails the stage as `MissingStageComplete` — narration is never promoted to success.
@@ -117,7 +167,18 @@ never waits on a job**. The finetune agent launches the SageMaker job, calls
    Change" (Completed | Failed | Stopped) → `llmops-resume-pipeline` Lambda.
 3. The Lambda looks the run up by job name, emits `ModelTrained` / `PipelineFailed`,
    settles the token (`send_task_success` / `send_task_failure`), and **removes the token**
-   so a duplicate EventBridge delivery cannot double-settle.
+   so a duplicate EventBridge delivery cannot double-settle. The removal is **isolated
+   from the settle**, because a token Step Functions has already discarded is stale data,
+   not a pending obligation: on 2026-07-29 the clear failed `AccessDenied`, and the ~5
+   EventBridge retries that followed all failed *earlier*, at the settle, with
+   `TaskTimedOut` ("Provided task does not exist anymore") — so none of them ever reached
+   the clear, and `run-20260729T104648Z-41631739` held a `task_token` for an execution
+   that had ended at 11:19:55Z. Granting the missing IAM was necessary and not
+   sufficient; **an IAM grant fixes what is forbidden, never what is unreachable.** Only
+   "the task is gone" is absorbed — a throttle or 5xx still reraises *without* clearing,
+   since that token is the pipeline's only way to learn the stage finished — and a
+   failure of the clear itself is raised rather than swallowed, because that is precisely
+   the failure whose traceback was about something else.
 4. `FinetuneAnalyze` then runs in a **fresh session**, reconstructing all context from AWS
    state (describe-training-job + S3 + manifest).
 
@@ -220,16 +281,37 @@ salvage retry when a stream dies mid-turn.
 
 ## 11. VPC posture for production
 
-Dev harness configs (`agents/*/harness.json`) run PUBLIC-network for iteration speed.
-Production variants (`agents/*/harness.prod.json`) and the Lambdas run **VPC-isolated
-with interface endpoints — no internet egress** (`deploy/02_network.py`). Two forcing
-functions:
+Harness configs (`agents/*/harness.json`) run PUBLIC-network for iteration speed. The
+VPC itself is built by `deploy/02_network.py` and the Lambdas can run **VPC-isolated with
+interface endpoints — no internet egress**.
 
-- VPC-mode harnesses can't reach GitHub, so production skills mount from an **S3-mirrored
-  snapshot** (`deploy/05_mirror_skills.py`) instead of the git source.
-- That is also correctness, not just connectivity: the git skill source reads the default
-  branch only, so main-branch drift would silently change production agent behavior.
-  The S3 mirror pins what production agents actually run.
+**Not yet built** (tracked as the s3-skill-source work): the VPC-mode harness variants,
+and the *switch* of the sources themselves. The mirror they require now exists —
+`ensure_skills` in `deploy/03_storage.py` derives what to mirror from the harness configs,
+validates each `SKILL.md`'s frontmatter before uploading, and reads every one back, with
+the harness role granted `GetObject` + `ListBucket` on `skills/*` and no write. All
+**19 skill sources across the 7 harnesses are `git` sources today; none are `s3`** —
+verified by
+`tests/test_docs_claims.py::test_the_skill_source_claims_match_the_harness_configs`,
+which reads the configs rather than trusting this paragraph. Earlier revisions of this
+file described `agents/*/harness.prod.json` and `deploy/05_mirror_skills.py` as existing;
+both paths do not exist, and never have in any branch, so that was a design being read as
+a shipped feature.
+
+Two forcing functions make the mirror a prerequisite for VPC mode rather than an
+optimization:
+
+- VPC-mode harnesses can't reach GitHub, so a git skill source cannot resolve at all —
+  and a bad or unreachable source fails at **session start**, not at `UpdateHarness`, so
+  the harness would be accepted and then fail every invocation. That asymmetry also makes
+  the mirror's *permissions* part of the prerequisite rather than a follow-up: the fetch
+  runs as `llmops-harness-execution`, so the deployer's own successful read-back of an
+  uploaded object proves nothing. Measured with `simulate_principal_policy` after the
+  first upload, that role was **implicitly denied** on the very keys it would have been
+  asked for.
+- It is also correctness, not just connectivity: the git skill source reads the default
+  branch only (there is no branch field), so main-branch drift in the skills repo
+  silently changes production agent behavior. An S3 snapshot pins what agents run.
 
 ## 12. The auditor is outside the state machine, and read-only
 
