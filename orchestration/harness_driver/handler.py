@@ -451,6 +451,59 @@ def handle_escalate(c, event, args) -> dict:
     return {"escalated": True}
 
 
+def handle_page_human(c, event, args: dict) -> dict:
+    """Escalate a triage decision to the human owner: SNS brief + audit event.
+
+    `page_human` is the conductor's ONLY exit when a decision is above its authority,
+    and it is the exit the driver names in its own undeliverable-verdict rejection.
+    It was declared on the orchestrator harness from Phase 5 on and serviced only by
+    the console's chat worker -- so on the DRIVER path (every triage invocation: the
+    conductor is not in a chat when an EscalatedToHuman event routes to it) it fell
+    through to the unknown-tool branch and came back {"status": "unsupported"}.
+
+    Live proof, 2026-08-01 13:45Z: the fix to resolve_escalation (#53) correctly told
+    the conductor its verdict was undeliverable and to use launch_run or page_human.
+    The conductor did neither -- it re-called resolve_escalation, was rejected again,
+    then wrote plan.json + relaunch-plan.json to S3 and the turn ended. No run was
+    dispatched and no human was paged. A rejection that names two paths where one of
+    them silently answers "unsupported" is a dead end dressed as a choice.
+
+    The paging itself is NOT trust-but-verify'd against anything, because there is
+    nothing to verify: the brief IS the artifact. What is enforced is that a page
+    carries a decision brief -- situation + recommendation, matching the harness's own
+    required schema. A page reading "needs a human" with no options tells the owner
+    only that something is wrong, which is the state they were already in.
+    """
+    situation = str(args.get("situation") or args.get("reason") or "").strip()
+    recommendation = str(args.get("recommendation") or "").strip()
+    if not situation or not recommendation:
+        return {"ok": False, "reason": (
+            "page_human needs both 'situation' and 'recommendation': a page without a "
+            "recommendation hands the owner the problem and none of the analysis you "
+            "already did. Include 'options' too if there is a real choice to make.")}
+
+    subject_run = str(args.get("run_id") or event.get("run_id") or "")
+    brief = {"run_id": subject_run,
+             "situation": situation,
+             "options": args.get("options") or [],
+             "recommendation": recommendation,
+             "paged_by": "orchestrator-triage",
+             "triaging_run_id": event.get("run_id", "")}
+    c["sns"].publish(
+        TopicArn=os.environ["LLMOPS_SNS_TOPIC"],
+        Subject=f"[llmops] owner decision needed: {subject_run or 'triage'}"[:100],
+        Message=json.dumps(brief, indent=2, default=str))
+    # Recorded against the run being escalated ABOUT, not the triaging run -- same
+    # addressing rule as put_directive, for the same reason: the timeline a reader
+    # opens is the stuck run's, not the conductor's.
+    _record_stage_event(c["ddb"], subject_run or event.get("run_id", ""),
+                        "orchestrator", "HumanPaged", brief)
+    ev.emit_event(os.environ["EVENT_BUS"], ev.ESCALATED_TO_HUMAN,
+                  {"run_id": subject_run, "stage": "orchestrator",
+                   "reason": situation[:500]}, client=c["events"])
+    return {"ok": True, "run_id": subject_run}
+
+
 def handle_finops_tool(c, event, name: str, args: dict) -> dict:
     """Service one of the finops agent's terminal tools.
 
@@ -763,6 +816,23 @@ def _run_stage(event, context=None, c=None):
                         event.get("qualifier"))
                 return {"status": "resolved", "decision": args.get("decision"),
                         "run_id": args.get("run_id")}
+            if name == "page_human":
+                # The conductor's above-authority exit, and one of the two paths the
+                # undeliverable-verdict rejection above tells it to take. Unserviced on
+                # this path until now: declared on the harness since Phase 5, handled
+                # only by the console chat worker, so every triage page answered
+                # "unsupported" and the owner was never told. Terminal for the turn --
+                # a page is a handoff, so continuing to prompt the agent would have it
+                # keep deciding after it just said it could not.
+                result = handle_page_human(c, event, args)
+                if not result["ok"]:
+                    messages = _tool_result_content(tu, {
+                        "status": "rejected", "reason": result["reason"]})
+                    continue
+                _invoke(c["agentcore"], event["harness_id"], sess,
+                        _tool_result_content(tu, {"status": "paged"}),
+                        event.get("qualifier"))
+                return {"status": "paged", "run_id": result["run_id"]}
             if name == "write_report":
                 # trust-but-verify, same as every artifact claim
                 missing = verify_outputs(c["s3"], [args.get("report_uri", "")])

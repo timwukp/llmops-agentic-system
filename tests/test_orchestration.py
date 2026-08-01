@@ -939,6 +939,99 @@ class TestDriver:
         assert parked[0]["run_status_at_put"] == "escalated"
         assert any("EscalationResolved" in str(r.get("sk", "")) for r in rows)
 
+    def test_the_above_authority_exit_actually_pages_the_owner(self):
+        """page_human is the conductor's ONLY exit when a decision is above its authority
+        -- and the exit the driver's own undeliverable-verdict rejection names. It was
+        declared on the orchestrator harness from Phase 5 and serviced only by the
+        CONSOLE chat worker, so on the driver path (every triage invocation) it hit the
+        unknown-tool branch and answered {"status": "unsupported"}: no SNS, no event, no
+        owner told.
+
+        Live, 2026-08-01 13:45Z: #53's fix correctly rejected the verdict as
+        undeliverable and named launch_run/page_human. The conductor re-called
+        resolve_escalation, was rejected again, wrote two plan files to S3, and the turn
+        ended -- zero runs dispatched, zero pages sent. A rejection naming a path that
+        answers "unsupported" is a dead end dressed as a choice."""
+        ac = FakeAgentCore([
+            tool_use_stream("page_human",
+                            {"run_id": "run-stuck-9",
+                             "situation": "teacher budget 7.5x under-planned",
+                             "options": ["raise the cap", "cut coverage"],
+                             "recommendation": "raise the cap, preserve coverage"}),
+            text_stream("ack")])
+        c = clients(ac)
+        out = driver.handler(driver_event(stage="orchestrator", task="triage",
+                                         run_id="run-orch-1"), clients=c)
+        assert out["status"] == "paged", \
+            "page_human fell through to the unknown-tool branch; the owner was never told"
+        assert c["sns"].published, "an above-authority decision reached no human at all"
+        brief = json.loads(c["sns"].published[0]["Message"])
+        assert brief["recommendation"] == "raise the cap, preserve coverage"
+        assert brief["options"] == ["raise the cap", "cut coverage"]
+
+    def test_a_page_is_recorded_on_the_stuck_run_not_the_triaging_run(self):
+        """Same addressing rule as put_directive, for the same reason: the timeline a
+        reader opens is the stuck run's, not the conductor's."""
+        ac = FakeAgentCore([
+            tool_use_stream("page_human",
+                            {"run_id": "run-stuck-9", "situation": "s",
+                             "recommendation": "r"}),
+            text_stream("ack")])
+        c = clients(ac)
+        driver.handler(driver_event(stage="orchestrator", task="triage",
+                                    run_id="run-orch-1"), clients=c)
+        paged = [r for r in c["ddb"].Table("llmops-stage-events").items
+                 if "HumanPaged" in str(r.get("sk", ""))]
+        assert paged, "the page left no audit record on the run it was about"
+        assert paged[0]["run_id"] == "run-stuck-9", \
+            f"the page was filed against the conductor's own run: {paged[0]['run_id']}"
+
+    def test_a_page_with_no_recommendation_is_rejected_back_not_sent(self):
+        """A page reading "needs a human" with no recommendation hands the owner the
+        problem and none of the analysis the conductor already did -- which leaves them
+        exactly where they started. Rejected into the same turn so it can add one."""
+        ac = FakeAgentCore([
+            tool_use_stream("page_human", {"run_id": "run-stuck-9",
+                                           "situation": "budget blown"}),
+            tool_use_stream("page_human",
+                            {"run_id": "run-stuck-9", "situation": "budget blown",
+                             "recommendation": "approve $13 cap"}),
+            text_stream("ack")])
+        c = clients(ac)
+        out = driver.handler(driver_event(stage="orchestrator", task="triage",
+                                         run_id="run-orch-1"), clients=c)
+        first = json.loads(
+            ac.calls[1]["messages"][-1]["content"][0]["toolResult"]["content"][0]["text"])
+        assert first["status"] == "rejected"
+        assert "recommendation" in first["reason"]
+        assert out["status"] == "paged", "the corrected page never went out"
+        assert len(c["sns"].published) == 1, \
+            "the incomplete page was sent anyway, then sent again"
+
+    def test_every_triage_tool_is_serviced_on_the_driver_path(self):
+        """The existing drift guard asks whether a declared tool is serviced ANYWHERE,
+        and that is what let page_human ship half-wired: the console handled it, the
+        driver did not, and only the driver runs a triage.
+
+        So the guard is per-path. The tools the orchestrator's triage protocol names must
+        be serviced by the DRIVER, because an EscalatedToHuman event routes to the driver
+        and there is no chat session anywhere near it. Derived from the prompt's own
+        triage clause, not a hand-kept list."""
+        h = json.loads((REPO / "agents/orchestrator/harness.json").read_text())
+        prompt = h["systemPrompt"][0]["text"]
+        triage_clause = prompt.split('- "triage"')[1].split('- "report"')[0]
+        declared = {t["name"] for t in h["tools"] if t["type"] == "inline_function"}
+        named_in_triage = {n for n in declared if n in triage_clause}
+        assert {"resolve_escalation", "page_human"} <= named_in_triage, \
+            "the triage clause stopped naming its own exits; this guard went vacuous"
+        driver_src = (REPO / "orchestration/harness_driver/handler.py").read_text()
+        unserviced = {n for n in named_in_triage
+                      if f'name == "{n}"' not in driver_src}
+        assert not unserviced, (
+            f"the triage protocol tells the conductor to call {unserviced}, but the "
+            "driver -- the only thing that runs a triage -- does not service them; "
+            "they return 'unsupported' and the escalation stays stuck")
+
     def test_running_is_the_only_state_with_a_listener(self):
         """Derived, not hand-listed: every terminal status any writer in the repo can put
         on a run must be treated as unreachable. A status added later (a new terminal
