@@ -1023,9 +1023,20 @@ async function estimateCost(){
   const unpriced = (e.unpriced||[]).length
     ? `<div class="pill err" style="margin:8px 0">${(e.unpriced||[]).length} UNPRICED SKU(s) — these lines are $0 because no rate exists, not because they are free</div>`+
       `<div class="sub mono">${(e.unpriced||[]).map(esc).join("<br>")}</div>` : "";
-  const gateBox = g.approval_required
-    ? `<div class="pill err" style="margin:8px 0">Approval required</div><div class="sub">${(g.reasons||[]).map(esc).join("<br>")}</div>`
-    : `<div class="pill ok" style="margin:8px 0">Under the limit — may launch without approval</div>`;
+  // Three states, not two. "Over budget" and "under budget" are different facts from
+  // "we could not price it", and in advisory mode none of them blocks the launch — so
+  // the box reports which one it is instead of implying permission. Collapsing the
+  // unknown into "under" would render an unchecked run as a reassuring green pill.
+  const over = g.over_budget || g.reasons || [];
+  const gateBox = g.budget_unknown
+    ? `<div class="pill warn" style="margin:8px 0">Budget NOT checked — no rate card</div>`+
+      `<div class="sub">${(g.notes||[]).map(esc).join("<br>")}</div>`
+    : g.approval_required
+    ? `<div class="pill err" style="margin:8px 0">Approval required (blocking mode)</div><div class="sub">${over.map(esc).join("<br>")}</div>`
+    : over.length
+    ? `<div class="pill warn" style="margin:8px 0">Over budget — advisory, not blocked</div>`+
+      `<div class="sub">${over.map(esc).join("<br>")}</div>`
+    : `<div class="pill ok" style="margin:8px 0">Within budget</div>`;
   $("cEstOut").innerHTML =
     `<div class="flex" style="gap:20px;margin-bottom:6px">`+
       `<div><div class="sub">expected</div><div class="stat" style="font-size:22px">${usd(e.total_usd)}</div></div>`+
