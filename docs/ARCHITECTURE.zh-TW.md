@@ -122,7 +122,15 @@ finetune agent 發起 SageMaker 作業、呼叫 `job_launched`、session 隨即�
    （Completed | Failed | Stopped）→ `llmops-resume-pipeline` Lambda。
 3. Lambda 按 job name 查回 run，發出 `ModelTrained` / `PipelineFailed`，結算 token
    （`send_task_success` / `send_task_failure`），並**刪除 token** ——
-   EventBridge 重複投遞也無法二次結算。
+   EventBridge 重複投遞也無法二次結算。這個刪除**與結算隔離**，因為 Step Functions 已經
+   丟棄的 token 是過期資料，不是待辦義務：2026-07-29 那次刪除以 `AccessDenied` 失敗，而
+   隨後約 5 次 EventBridge 重試全都**更早**就掛了 —— 掛在結算，`TaskTimedOut`
+   （「Provided task does not exist anymore」）—— 所以沒有任何一次抵達刪除，
+   `run-20260729T104648Z-41631739` 就一直為一個已在 11:19:55Z 結束的 execution 保留著
+   `task_token`。補上缺的 IAM 是必要條件但不是充分條件；**IAM 授權能修好「被禁止」的事，
+   永遠修不好「到不了」的事。** 現在只吸收「task 已不存在」這一種錯 —— 限流或 5xx 仍然
+   重拋而且**不刪除**，因為那個 token 是管線唯一能得知該階段已完成的途徑 —— 而刪除本身
+   失敗則是拋出而非吞掉，因為那正是當初「traceback 講的是別的事」的那個失敗。
 4. 之後 `FinetuneAnalyze` 在**全新 session** 中運行，從 AWS 狀態
    （describe-training-job + S3 + manifest）重建全部上下文。
 

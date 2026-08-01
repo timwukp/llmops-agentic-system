@@ -947,6 +947,68 @@ class TestResumePipeline:
         out = resume_pipeline.handler(sm_event("InProgress"), clients=c)
         assert out["skipped"] is True
 
+    @staticmethod
+    def _client_error(code):
+        from botocore.exceptions import ClientError
+        return ClientError({"Error": {"Code": code, "Message": code}}, "SendTaskSuccess")
+
+    def _sfn_raising(self, c, exc):
+        def boom(**kw):
+            raise exc
+        c["sfn"].send_task_success = boom
+        c["sfn"].send_task_failure = boom
+        return c
+
+    @pytest.mark.parametrize("code", ["TaskTimedOut", "TaskDoesNotExist"])
+    @pytest.mark.parametrize("status", ["Completed", "Failed"])
+    def test_a_dead_token_is_still_cleared_from_the_run_row(self, code, status):
+        """A token Step Functions has already discarded is stale data, not a pending
+        obligation. Live: run-20260729T104648Z-41631739 held a task_token for an
+        execution that ended 2026-07-29T11:19:55Z and still held it three days later,
+        because the settle raised (AccessDenied on the clear, then TaskTimedOut,
+        'Provided task does not exist anymore', over ~5 deliveries) and every retry
+        raised before reaching the REMOVE. Both terminal statuses and both
+        already-gone error codes, because the clear sat after a two-branch if."""
+        c = self._sfn_raising(self._clients({"run_id": "run-1", "task_token": "tok-9"}),
+                              self._client_error(code))
+        out = resume_pipeline.handler(sm_event(status), clients=c)
+        assert out["outcome"] == "token-already-gone"
+        assert code in out["settle_error"]
+        updates = c["ddb"].Table(ENV["RUNS_TABLE"]).updates
+        assert updates and "REMOVE task_token" in updates[0]["UpdateExpression"], \
+            "a token whose execution is over stayed parked in the run row"
+
+    @pytest.mark.parametrize("code", ["ThrottlingException", "InvalidToken",
+                                      "InternalServerError"])
+    def test_a_settle_that_might_still_land_is_retried_and_the_token_kept(self, code):
+        """The discriminating half. Clearing on EVERY failure would be worse than the
+        bug: the token is the pipeline's only way to learn a paid-for stage finished, so
+        a throttle or a 5xx must reraise for EventBridge to retry, and must NOT clear.
+        Only 'the task is gone' is safe to absorb."""
+        c = self._sfn_raising(self._clients({"run_id": "run-1", "task_token": "tok-9"}),
+                              self._client_error(code))
+        with pytest.raises(Exception) as ei:
+            resume_pipeline.handler(sm_event("Completed"), clients=c)
+        assert code in str(ei.value)
+        assert not c["ddb"].Table(ENV["RUNS_TABLE"]).updates, \
+            "a retryable settle failure cleared the token the retry still needs"
+
+    def test_a_failure_to_clear_the_token_is_raised_not_swallowed(self):
+        """The 2026-07-29 clear failed with AccessDenied and that was invisible: the
+        traceback that followed was about the settle, not about this write. If the field
+        cannot be cleared, the run row is wrong and the caller has to hear about it."""
+        c = self._clients({"run_id": "run-1", "task_token": "tok-9"})
+        table = c["ddb"].Table(ENV["RUNS_TABLE"])
+
+        def denied(**kw):
+            raise self._client_error("AccessDeniedException")
+        table.update_item = denied
+        with pytest.raises(Exception) as ei:
+            resume_pipeline.handler(sm_event("Completed"), clients=c)
+        assert "AccessDenied" in str(ei.value)
+        # The settle still happened -- the pipeline moved on; only bookkeeping failed.
+        assert c["sfn"].successes, "the token was not settled before the clear was tried"
+
 
 # ---------------------------------------------------------------------------
 # webhook

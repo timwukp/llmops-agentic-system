@@ -133,7 +133,18 @@ never waits on a job**. The finetune agent launches the SageMaker job, calls
    Change" (Completed | Failed | Stopped) → `llmops-resume-pipeline` Lambda.
 3. The Lambda looks the run up by job name, emits `ModelTrained` / `PipelineFailed`,
    settles the token (`send_task_success` / `send_task_failure`), and **removes the token**
-   so a duplicate EventBridge delivery cannot double-settle.
+   so a duplicate EventBridge delivery cannot double-settle. The removal is **isolated
+   from the settle**, because a token Step Functions has already discarded is stale data,
+   not a pending obligation: on 2026-07-29 the clear failed `AccessDenied`, and the ~5
+   EventBridge retries that followed all failed *earlier*, at the settle, with
+   `TaskTimedOut` ("Provided task does not exist anymore") — so none of them ever reached
+   the clear, and `run-20260729T104648Z-41631739` held a `task_token` for an execution
+   that had ended at 11:19:55Z. Granting the missing IAM was necessary and not
+   sufficient; **an IAM grant fixes what is forbidden, never what is unreachable.** Only
+   "the task is gone" is absorbed — a throttle or 5xx still reraises *without* clearing,
+   since that token is the pipeline's only way to learn the stage finished — and a
+   failure of the clear itself is raised rather than swallowed, because that is precisely
+   the failure whose traceback was about something else.
 4. `FinetuneAnalyze` then runs in a **fresh session**, reconstructing all context from AWS
    state (describe-training-job + S3 + manifest).
 
