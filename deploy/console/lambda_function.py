@@ -1260,8 +1260,11 @@ def _rate_card():
     try:
         o = s3.get_object(Bucket=data_bucket(),
                           Key="finops/rates/rate_card_latest.json")
-        doc = json.loads(o["Body"].read())
-        return cm.RateCard(doc.get("rates", doc))
+        # RateCard unwraps the document itself now. Repeating doc.get("rates", doc)
+        # here is how the knowledge stayed in ONE caller while every other caller --
+        # including an agent following the orchestrator prompt's instruction to read
+        # this exact file -- died on a ValueError from dict('rate_card').
+        return cm.RateCard(json.loads(o["Body"].read()))
     except Exception as e:
         print(f"[finops] no rate card: {e}")
         return None

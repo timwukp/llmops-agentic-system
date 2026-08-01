@@ -548,6 +548,59 @@ def test_unknown_source_is_treated_as_the_weakest_not_trusted():
     assert c.source("s") == "fallback_static"
 
 
+# ── the published document, which is what callers actually have ────────────────
+#
+# Every test above hands RateCard a bare SKU table. The artifact on S3 is a
+# DOCUMENT with the table under "rates", so the shape under test was the one shape
+# no real caller has -- and passing the real file raised ValueError from
+# dict('rate_card'): an error naming a string fragment, pointing nowhere.
+
+def test_the_published_rate_card_document_can_be_priced_directly():
+    """The orchestrator prompt tells the agent to read this exact file first.
+
+    An agent doing as instructed passes the document. If only the console knows to
+    unwrap it, every other caller gets a crash five frames from its mistake.
+    """
+    doc = {"kind": "rate_card", "generated_at": "2026-07-31",
+           "rate_precedence": ["ce_realized", "price_list"],
+           "rates": FULL_RATES, "n_rates": len(FULL_RATES),
+           "health": {"n_rates": len(FULL_RATES)}, "notes": ["..."]}
+    est = estimate_run(PLAN, doc)
+    assert est["unpriced"] == [], "the document's own rates must price the run"
+    assert est["total_usd"] == pytest.approx(estimate_run(PLAN, FULL_RATES)["total_usd"])
+
+
+def test_a_bare_sku_table_still_works_unwrapped():
+    """The pre-existing shape must not regress; both callers exist in the tree."""
+    assert RateCard(FULL_RATES).price(sku_training("ml.g5.2xlarge")) == \
+        FULL_RATES[sku_training("ml.g5.2xlarge")]["unit_price"]
+
+
+def test_a_sku_literally_named_rates_is_not_mistaken_for_a_document():
+    """Unwrapping keys off the SHAPE, not off the mere presence of a "rates" key.
+
+    A table whose SKU is named "rates" would otherwise be read as a document and
+    its one real rate silently discarded -- the card would price nothing and every
+    line would come back unpriced, which reads as "no rate card" rather than "we
+    threw your rates away".
+    """
+    table = {"rates": {"unit_price": 2.0, "unit": "hours", "source": "ce_realized"}}
+    card = RateCard(table)
+    assert card.price("rates") == 2.0
+
+
+def test_an_empty_document_is_an_empty_card_not_a_crash():
+    """A card generator that produced no rates yet is a real state; it must read as
+    "everything unpriced", which is visibly not-an-estimate."""
+    est = estimate_run(PLAN, {"kind": "rate_card", "rates": {}})
+    assert est["unpriced"], "an empty card must leave lines unpriced, not priced at 0"
+    # Every rate-card-derived category is absent; only the flat support line, which
+    # never consults the card, survives. If a card-derived category showed up here it
+    # would mean a missing rate had been read as $0 -- the failure this class exists
+    # to prevent.
+    assert set(est["subtotals"]) == {"support"}, est["subtotals"]
+
+
 # ── rate card health ──────────────────────────────────────────────────────────
 def test_health_flags_a_missing_teacher_price_instead_of_hiding_it():
     """This is the panel that makes 'the teacher prices at $0' visible."""
