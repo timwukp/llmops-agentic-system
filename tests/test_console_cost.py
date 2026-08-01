@@ -213,6 +213,20 @@ def _submit(w, eid, user="requester"):
                                 "2026-07-31T00:01:00+00:00")
 
 
+@pytest.fixture
+def blocking(wired, monkeypatch):
+    """The same console with BUDGET_MODE=blocking.
+
+    The default is advisory: this platform's owner is its only approver, so a gate here
+    could only ever ask them to approve their own run. But the enforcement path is still
+    shipped code reachable by one env var, so every budget hazard below is asserted
+    twice — reported in advisory mode, and blocking under this fixture. Testing only the
+    default would leave `blocking` as an untested branch that operators can switch on.
+    """
+    monkeypatch.setattr(wired.m, "BUDGET_MODE", "blocking")
+    return wired
+
+
 # ── estimating ────────────────────────────────────────────────────────────────
 def test_estimate_is_line_itemised_and_persisted_as_a_draft(wired):
     r = _mk_estimate(wired)
@@ -287,51 +301,104 @@ def test_rate_card_as_of_is_stamped_so_old_variances_stay_explainable(wired):
     assert wired.est.puts[0]["rate_card_as_of"] == "2026-07-31T00:00:00+00:00"
 
 
-# ── the dual gate ─────────────────────────────────────────────────────────────
+# ── the dual budget check ─────────────────────────────────────────────────────
 def test_gate_does_not_fire_under_both_limits(wired):
     g = wired.m.gate_decision(500.0)
     assert g["approval_required"] is False
+    assert g["over_budget"] == []
+    assert not g.get("budget_unknown")
 
 
-def test_gate_fires_on_the_single_run_limit(wired):
+def test_the_console_default_is_advisory_not_blocking(wired):
+    """Asserted on the module constant, not inferred from one response, because the
+    default decides what this platform does to every run it prices."""
+    assert wired.m.BUDGET_MODE == "advisory"
+    assert wired.m.gate_decision(1e9)["budget_mode"] == "advisory"
+
+
+def test_over_the_single_run_limit_is_reported_and_still_launches(wired):
+    """Advisory mode's contract in one test: the overage is named and numbered, and the
+    run is not stopped. The `notes`/`over_budget` assertions are the load-bearing half —
+    a budget that is neither enforced nor mentioned is not a reference, it is a number
+    nobody will ever act on."""
     g = wired.m.gate_decision(2500.0)
+    assert g["approval_required"] is False
+    assert any("single-run" in r for r in g["over_budget"])
+    assert g["over_budget_usd"] == 500.0
+    assert g["notes"]
+
+    eid = _mk_estimate(wired, {"sample_count": 2_000_000, "max_iterations": 3})[
+        "estimate_id"]
+    assert wired.m.start_run({"estimate_id": eid})["ok"]
+    assert len(wired.invokes) == 1, "advisory mode must not hold the launch"
+
+
+def test_over_the_single_run_limit_still_blocks_in_blocking_mode(blocking):
+    g = blocking.m.gate_decision(2500.0)
     assert g["approval_required"] is True
     assert any("single-run" in r for r in g["reasons"])
 
 
-def test_gate_fires_on_cumulative_alone(wired):
-    """The case a single-limit-only gate misses: four $500 runs are the same $2000
-    exposure as one $2000 run, and each one passes on its own."""
+def test_the_cumulative_arm_still_fires_on_its_own(wired):
+    """The case a single-limit-only check misses: four $500 runs are the same $2000
+    exposure as one $2000 run, and each passes on its own. This is also the arm advisory
+    mode could most easily have dropped, since no individual run ever looks expensive."""
     for i in range(4):
         wired.act.put_item(Item={"project": wired.m.PROJECT,
                                  "sk": f"2026-07-2{i}#run-{i}#sagemaker_training",
                                  "cost_usd": "500", "settlement": "settled"})
     g = wired.m.gate_decision(500.0)
+    assert any("cumulative" in r or "to-date" in r for r in g["over_budget"])
+    assert g["project_to_date_usd"] == 2000.0
+    assert g["notes"]
+
+
+def test_the_cumulative_arm_blocks_in_blocking_mode(blocking):
+    for i in range(4):
+        blocking.act.put_item(Item={"project": blocking.m.PROJECT,
+                                    "sk": f"2026-07-2{i}#run-{i}#sagemaker_training",
+                                    "cost_usd": "500", "settlement": "settled"})
+    g = blocking.m.gate_decision(500.0)
     assert g["approval_required"] is True
     assert any("cumulative" in r or "to-date" in r for r in g["reasons"])
 
 
-def test_gate_reads_worst_case_not_expected(wired):
-    """Approving $2000 that can silently become $6000 because the remediation loop ran
-    three times is not a gate.
+def test_the_budget_check_reads_worst_case_not_expected(wired):
+    """Reporting $1,268 for a plan that can cost $3,804 because the remediation loop ran
+    three times misstates the exposure whether or not anything blocks on it.
 
     2M rows against the measured $1.515/h · 0.664 rows/s prices at $1,268 expected and
     $3,804 worst case — deliberately straddling the limit, which is the only arrangement
-    that can tell the two fields apart.
+    that can tell the two fields apart. Read from total_usd this run reads as clean.
     """
     r = _mk_estimate(wired, {"sample_count": 2_000_000, "max_iterations": 3})
     est = r["estimate"]
     assert est["total_usd"] < 2000 < est["worst_case_usd"], est
-    assert r["gate"]["approval_required"] is True
     assert r["gate"]["gating_basis"] == "worst_case_usd"
+    assert r["gate"]["over_budget"], "the worst case is over the limit and must be said"
 
 
-def test_gate_fails_closed_when_the_cost_model_is_missing(wired, monkeypatch):
-    """A bundle without cost_model.py cannot prove a run is under the limit. "We could
-    not check" must land on the require-approval side, never on the allow side."""
+def test_an_unpriceable_run_is_unknown_not_under_budget(wired, monkeypatch):
+    """A bundle without cost_model.py cannot price the run, so it cannot claim the run
+    is under budget. Advisory mode does not block it — but "could not check" is a THIRD
+    answer, and collapsing it into "under" would render an unchecked run as a
+    reassuring green pill on the Cost tab."""
     monkeypatch.setattr(wired.m, "_cost_model", lambda: None)
     g = wired.m.gate_decision(1.0)
+    assert g["budget_unknown"] is True
+    assert g["approval_required"] is False       # advisory: not stopped
+    assert g["over_budget"] == []               # no overage was MEASURED...
+    assert g["notes"] and "NOT checked" in g["notes"][0]   # ...and that is stated
+
+
+def test_an_unpriceable_run_still_fails_closed_in_blocking_mode(blocking, monkeypatch):
+    """When the budget IS being enforced, "we could not check" must land on the
+    require-approval side, never on the allow side."""
+    monkeypatch.setattr(blocking.m, "_cost_model", lambda: None)
+    g = blocking.m.gate_decision(1.0)
     assert g["approval_required"] is True
+    assert g["budget_unknown"] is True
+    assert g["reasons"], "a blocking refusal must say why"
 
 
 def test_audit_rows_are_excluded_from_project_to_date(wired):
@@ -432,25 +499,46 @@ def test_unknown_estimate_id_is_404_on_both_paths(wired):
 
 # ── launching ─────────────────────────────────────────────────────────────────
 def _over_limit(w):
-    """An estimate whose worst case trips the single-run limit.
+    """An estimate whose worst case exceeds the single-run limit.
 
     The assert is not decoration: if a rate change ever drops this under $2000 the launch
-    tests would pass by never engaging the gate at all — green, and testing nothing.
+    tests would pass by never engaging the budget check at all — green, and testing
+    nothing. It asserts on `over_budget` rather than `approval_required` so it holds in
+    both modes; `approval_required` is false in advisory mode by design.
     """
     r = _mk_estimate(w, {"sample_count": 2_000_000, "max_iterations": 3})
-    assert r["gate"]["approval_required"], "fixture must actually be over the limit"
+    assert r["gate"]["over_budget"], "fixture must actually be over the limit"
     return r["estimate_id"]
 
 
-def test_a_gated_estimate_cannot_launch_before_approval(wired):
+def test_an_over_budget_launch_says_so_in_its_own_response(wired):
+    """Advisory mode's honesty requirement at the launch boundary. Nothing refuses this
+    run, so the launch response is the ONLY place the operator can learn it went over —
+    if the verdict is dropped here, the overage is computed and then discarded."""
     eid = _over_limit(wired)
-    _submit(wired, eid)
     r = wired.m.start_run({"estimate_id": eid})
+    assert r["ok"] and len(wired.invokes) == 1
+    assert r["result"]["gate"]["over_budget"]
+    assert "single-run" in r["result"]["budget_notice"]
+
+
+def test_a_gated_estimate_cannot_launch_before_approval(blocking):
+    eid = _over_limit(blocking)
+    _submit(blocking, eid)
+    r = blocking.m.start_run({"estimate_id": eid})
     assert r["status_code"] == 409
-    assert not wired.invokes, "start-pipeline must not be invoked"
+    assert not blocking.invokes, "start-pipeline must not be invoked"
 
 
 def test_a_rejected_estimate_cannot_launch(wired):
+    """Terminal status is NOT the budget check, so it holds in advisory mode too.
+
+    Advisory mode is what makes this test load-bearing. It used to be covered only
+    incidentally: the estimate was over the limit, so the approval branch refused it via
+    can_launch and the terminal check never had to run. Now that advisory mode never
+    sets approval_required, this `if` is the only thing standing between a recorded
+    rejection and a relaunch.
+    """
     eid = _over_limit(wired)
     _submit(wired, eid)
     wired.m.decide_approval(
@@ -461,12 +549,24 @@ def test_a_rejected_estimate_cannot_launch(wired):
     assert not wired.invokes
 
 
-def test_an_approved_estimate_launches_and_is_stamped_with_the_execution(wired):
-    eid = _over_limit(wired)
-    _submit(wired, eid)
-    wired.m.decide_approval(
+def test_a_rejected_estimate_cannot_launch_in_blocking_mode_either(blocking):
+    eid = _over_limit(blocking)
+    _submit(blocking, eid)
+    blocking.m.decide_approval(
+        {"estimate_id": eid, "decision": "reject", "reason": "too expensive"},
+        {"username": "boss", "groups": [blocking.m.APPROVER_GROUP]}, "t")
+    r = blocking.m.start_run({"estimate_id": eid})
+    assert r.get("status_code") in (409, 403)
+    assert not blocking.invokes
+
+
+def test_an_approved_estimate_launches_and_is_stamped_with_the_execution(blocking):
+    eid = _over_limit(blocking)
+    _submit(blocking, eid)
+    blocking.m.decide_approval(
         {"estimate_id": eid, "decision": "approve"},
-        {"username": "boss", "groups": [wired.m.APPROVER_GROUP]}, "t")
+        {"username": "boss", "groups": [blocking.m.APPROVER_GROUP]}, "t")
+    wired = blocking
     r = wired.m.start_run({"estimate_id": eid})
     assert r["ok"] and len(wired.invokes) == 1
     # Without this link the variance report holds an estimate and an actual it cannot
@@ -491,9 +591,22 @@ def test_an_under_limit_estimate_launches_without_approval(wired):
     assert r["ok"] and len(wired.invokes) == 1
 
 
-def test_a_launched_estimate_cannot_launch_twice(wired):
+def test_an_over_budget_estimate_cannot_launch_twice(wired):
+    """Double-launching attaches two runs to one estimate and double-counts it in the
+    variance report. Asserted on an OVER-BUDGET estimate in advisory mode, the newly
+    reachable combination: before advisory mode an over-budget estimate could not reach
+    the terminal check at all, because the approval branch refused it first."""
+    eid = _over_limit(wired)
+    assert wired.m.start_run({"estimate_id": eid})["ok"]
+    second = wired.m.start_run({"estimate_id": eid})
+    assert second.get("status_code") == 409
+    assert len(wired.invokes) == 1
+
+
+def test_a_launched_estimate_cannot_launch_twice(blocking):
     """Two runs against one approval would double-count it in the variance report and
     spend twice what a human authorised once."""
+    wired = blocking
     eid = _over_limit(wired)
     _submit(wired, eid)
     wired.m.decide_approval(
@@ -518,28 +631,42 @@ def test_an_unknown_estimate_id_does_not_launch(wired):
     assert not wired.invokes
 
 
-def test_lowering_the_limit_re_gates_an_already_clean_estimate(wired, monkeypatch):
-    """The case that distinguishes WHICH field the launch-time check reads.
+def _priced_clean_under_a_high_limit(w, monkeypatch):
+    """Price 2M rows under a $5000 limit, so the STORED verdict is clean.
 
-    Priced under a $5000 limit, this estimate stores approval_required=False, so the
-    stored verdict cannot gate it. Drop the limit to $2000 and only the worst case
-    ($3,804) crosses it — the expected total ($1,268) still does not. A launch check
-    re-derived from total_usd therefore lets it through, and one derived from
-    worst_case_usd stops it. Nothing else in the suite can tell those two apart, because
-    every other over-limit fixture is also over on the stored gate.
+    Distinguishes WHICH field the launch-time re-derivation reads: only the worst case
+    ($3,804) crosses a $2000 limit — the expected total ($1,268) does not. Nothing else
+    in the suite can tell those two apart, because every other over-limit fixture is
+    also over on its stored gate.
     """
-    monkeypatch.setattr(wired.m, "APPROVAL_LIMIT_USD", 5000.0)
-    monkeypatch.setattr(wired.m, "CUMULATIVE_LIMIT_USD", 5000.0)
-    r = _mk_estimate(wired, {"sample_count": 2_000_000, "max_iterations": 3})
-    eid = r["estimate_id"]
-    assert r["gate"]["approval_required"] is False
+    monkeypatch.setattr(w.m, "APPROVAL_LIMIT_USD", 5000.0)
+    monkeypatch.setattr(w.m, "CUMULATIVE_LIMIT_USD", 5000.0)
+    r = _mk_estimate(w, {"sample_count": 2_000_000, "max_iterations": 3})
+    assert r["gate"]["over_budget"] == [], "the stored verdict must start clean"
     assert r["estimate"]["total_usd"] < 2000 < r["estimate"]["worst_case_usd"]
+    monkeypatch.setattr(w.m, "APPROVAL_LIMIT_USD", 2000.0)
+    monkeypatch.setattr(w.m, "CUMULATIVE_LIMIT_USD", 2000.0)
+    return r["estimate_id"]
 
-    monkeypatch.setattr(wired.m, "APPROVAL_LIMIT_USD", 2000.0)
-    monkeypatch.setattr(wired.m, "CUMULATIVE_LIMIT_USD", 2000.0)
+
+def test_lowering_the_limit_re_derives_an_already_clean_estimate(wired, monkeypatch):
+    """Re-derivation at launch is not a property of blocking — it is what makes the
+    REPORTED number true. On a stored-clean estimate whose limit has since dropped,
+    advisory mode must still report the overage; a launch that trusted the stored
+    verdict, or re-derived from total_usd, would report this run as within budget."""
+    eid = _priced_clean_under_a_high_limit(wired, monkeypatch)
     out = wired.m.start_run({"estimate_id": eid})
+    assert out["ok"] and len(wired.invokes) == 1
+    assert out["result"]["gate"]["over_budget"], out
+    assert out["result"]["gate"]["gating_usd"] > 2000
+
+
+def test_lowering_the_limit_re_gates_an_already_clean_estimate(blocking, monkeypatch):
+    """The same re-derivation, with enforcement on: the stored verdict cannot clear it."""
+    eid = _priced_clean_under_a_high_limit(blocking, monkeypatch)
+    out = blocking.m.start_run({"estimate_id": eid})
     assert out.get("status_code") == 409, out
-    assert not wired.invokes
+    assert not blocking.invokes
 
 
 def test_an_under_limit_estimate_cannot_launch_twice_either(wired):
@@ -565,17 +692,31 @@ def test_an_under_limit_rejected_estimate_cannot_launch(wired):
     assert not wired.invokes
 
 
+def _stale_cumulative(w):
+    """An estimate priced when the project had spent nothing, launched after it has
+    spent $1,999 — the same run, a different exposure."""
+    eid = _mk_estimate(w, {"sample_count": 2000})["estimate_id"]
+    assert json.loads(w.est.items[eid]["gate"])["over_budget"] == []
+    w.act.put_item(Item={"project": w.m.PROJECT,
+                         "sk": "2026-07-30#run-old#sagemaker_training",
+                         "cost_usd": "1999", "settlement": "settled"})
+    return eid
+
+
 def test_a_stale_under_limit_verdict_is_re_derived_at_launch(wired):
-    """The exposure changes between pricing and launching. An estimate priced when the
-    project had spent nothing must not launch a week later on that stale verdict."""
-    eid = _mk_estimate(wired, {"sample_count": 2000})["estimate_id"]
-    assert not json.loads(wired.est.items[eid]["gate"])["approval_required"]
-    wired.act.put_item(Item={"project": wired.m.PROJECT,
-                             "sk": "2026-07-30#run-old#sagemaker_training",
-                             "cost_usd": "1999", "settlement": "settled"})
+    """Advisory mode still re-reads project-to-date at launch, so the cumulative drip
+    is reported on the run that crosses the line rather than on none of them."""
+    eid = _stale_cumulative(wired)
     r = wired.m.start_run({"estimate_id": eid})
+    assert r["ok"]
+    assert any("to-date" in x for x in r["result"]["gate"]["over_budget"]), r
+
+
+def test_a_stale_under_limit_verdict_is_re_gated_at_launch_when_blocking(blocking):
+    eid = _stale_cumulative(blocking)
+    r = blocking.m.start_run({"estimate_id": eid})
     assert r["status_code"] == 409, r
-    assert not wired.invokes
+    assert not blocking.invokes
 
 
 # ── rollup and variance ───────────────────────────────────────────────────────
@@ -762,8 +903,10 @@ def test_authed_user_denies_when_the_group_lookup_fails(console, monkeypatch):
 
     monkeypatch.setattr(console, "cognito", _Cog())
     monkeypatch.setattr(console, "COGNITO_POOL_ID", "us-east-1_test")
+    # sub joined the payload for approval-record identity; empty when Cognito
+    # returns no attributes — the assertion below pins groups=[] (the deny), not sub.
     u = console._authed_user({"authorization": "Bearer tok"})
-    assert u == {"username": "alice", "groups": []}
+    assert u == {"username": "alice", "groups": [], "sub": ""}
     # The caller then denies, because "we could not prove you are an approver" belongs
     # on the deny side.
     import cost_model
@@ -812,6 +955,29 @@ def test_frontend_renders_cost_values_through_the_escaping_sinks():
     """The file's own CSP comment states escaping at the sink is the primary XSS
     control, so the ids that land in inline onclick handlers must use jstr()."""
     assert "decideCost(${jstr(p.id)}" in FRONTEND
+
+
+def test_frontend_renders_four_distinct_budget_states():
+    """The Cost tab is where the budget stops being arithmetic and becomes something a
+    person reads, so all four answers the backend can give must be distinguishable:
+    unknown, over-and-blocked, over-and-advisory, within. Any two sharing a rendering
+    means the operator cannot tell them apart — and three of the four are the ones that
+    should give pause, so collapsing them all lands on the reassuring side.
+    """
+    box = FRONTEND.split("const gateBox")[1].split("$(\"cEstOut\")")[0]
+    assert "budget_unknown" in box, "an unpriceable run must not render as under budget"
+    assert "NOT checked" in box
+    assert "blocking mode" in box          # over AND enforced
+    assert "advisory, not blocked" in box  # over but launching — the new default
+    assert "Within budget" in box
+    # Distinct pill classes, or the four texts still all look the same at a glance.
+    assert box.count("pill warn") == 2 and "pill err" in box and "pill ok" in box
+    # .warn must actually exist as CSS; a pill with no rule renders unstyled.
+    assert ".warn" in FRONTEND.split("</style>")[0]
+    # The unknown branch must be tested FIRST: budget_unknown responses carry
+    # over_budget=[] and approval_required=false, so any later position lets them fall
+    # through to the green "Within budget" pill.
+    assert box.index("budget_unknown") < box.index("approval_required")
 
 
 def test_frontend_warns_about_unpriced_and_unestimated_rather_than_hiding_them():

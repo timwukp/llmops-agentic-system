@@ -23,7 +23,9 @@ OPTIMIZE_HARNESS="${OPTIMIZE_HARNESS:-llmops_orchestrator}"
 # COGNITO_TIER=ESSENTIALS to opt out, accepting that credential stuffing is then unmitigated.
 COGNITO_TIER="${COGNITO_TIER:-PLUS}"
 PASSWORD_MIN_LENGTH="${PASSWORD_MIN_LENGTH:-20}"
-# Caps how fast anyone can grind POST /api/login, the only unauthenticated write route.
+# Caps how fast anyone can grind POST /api/login. It is the only unauthenticated route
+# that takes a guessable secret; /api/refresh and /api/refresh/revoke are also
+# unauthenticated but consume an httpOnly cookie, which is not something to brute-force.
 API_RATE_LIMIT="${API_RATE_LIMIT:-20}"         # steady-state requests/second
 API_BURST_LIMIT="${API_BURST_LIMIT:-40}"       # burst bucket
 
@@ -103,7 +105,31 @@ else
     || echo "  note: password minimum is $CUR_MINLEN (want >= $PASSWORD_MIN_LENGTH)"
   [ "$CUR_ADMINONLY" = "True" ] \
     || echo "  WARNING: self-signup is ENABLED on this pool — any stranger can register and, because the dashboard accepts any valid token from it, gain every write endpoint"
+  # The session routes need two CLIENT-level settings that the pool-level query above
+  # cannot see. Neither failure is visible in the UI: without ALLOW_REFRESH_TOKEN_AUTH
+  # every page reload silently drops back to a password prompt (the exact bug the refresh
+  # cookie exists to fix), and without token revocation sign-out clears the cookie while
+  # leaving the 30-day refresh token usable in Cognito. Reported, not "fixed": as with
+  # update-user-pool above, update-user-pool-client has PUT semantics.
+  read -r CUR_FLOWS CUR_REVOKE < <(aws cognito-idp describe-user-pool-client \
+    --user-pool-id "$POOL_ID" --client-id "$CLIENT_ID" --region "$REGION" --output text \
+    --query 'UserPoolClient.[join(`,`,ExplicitAuthFlows),EnableTokenRevocation]' \
+    2>/dev/null || echo "? ?")
+  case "$CUR_FLOWS" in *ALLOW_REFRESH_TOKEN_AUTH*) ;; *)
+    echo "  note: client lacks ALLOW_REFRESH_TOKEN_AUTH — POST /api/refresh will fail, so every page reload forces a re-login" ;; esac
+  [ "$CUR_REVOKE" = "True" ] \
+    || echo "  note: token revocation is off on this client — sign-out clears the cookie but cannot invalidate the refresh token"
 fi
+
+# ── Cognito groups (idempotent): approver gates spend, datascience may consult ─
+for G in llmops-approver llmops-datascience; do
+  aws cognito-idp get-group --user-pool-id "$POOL_ID" --group-name "$G" --region "$REGION" >/dev/null 2>&1 || \
+    aws cognito-idp create-group --user-pool-id "$POOL_ID" --group-name "$G" --region "$REGION" \
+      --description "llmops console authorization group" >/dev/null
+  # admin sits in both: may consult AND approve (but never self-approve — server rule)
+  aws cognito-idp admin-add-user-to-group --user-pool-id "$POOL_ID" --username admin \
+    --group-name "$G" --region "$REGION" 2>/dev/null || true
+done
 
 # ── package: vendor boto3 (Lambda's builtin may predate AgentCore harness APIs) ─
 BUILD=$(mktemp -d)
@@ -124,6 +150,8 @@ case "$VENDORED" in
 esac
 cp "$(dirname "$0")/lambda_function.py" "$BUILD/lambda_function.py"
 cp "$(dirname "$0")/frontend.html" "$BUILD/frontend.html"   # read once at cold start by the handler
+# Architecture-tab diagrams, served same-origin (CSP is connect-src 'self').
+cp "$(dirname "$0")"/../../docs/architecture-{high-level,low-level,console}.svg "$BUILD/"
 # The gate arithmetic, vendored flat because the handler does `import cost_model`.
 # Without it every estimate refuses with 503 and the Cost tab reports the rate card
 # as unavailable -- which is the fail-closed behaviour working, but it means the tab
@@ -134,16 +162,31 @@ cp "$(dirname "$0")/../../pipeline/contracts/cost_model.py" "$BUILD/cost_model.p
 "$PY_FOR_BUILD" -c "import sys; sys.path.insert(0,'$BUILD'); import cost_model; \
   assert hasattr(cost_model,'approval_decision'), 'cost_model missing approval_decision'; \
   print('bundled cost_model OK')"
+# The Tasks tab's dispatch path (launch_run servicing + approval signing) is the SAME
+# module the harness driver uses — vendored, like cost_model, so the two callers
+# cannot drift apart.
+cp "$(dirname "$0")/../../orchestration/conductor_tools.py" "$BUILD/conductor_tools.py"
+"$PY_FOR_BUILD" -c "import sys; sys.path.insert(0,'$BUILD'); import conductor_tools; \
+  assert hasattr(conductor_tools,'service_launch_run'), 'conductor_tools missing service_launch_run'; \
+  print('bundled conductor_tools OK')"
 (cd "$BUILD" && zip -rq /tmp/llmops-admin-dashboard.zip .)
 
-ENV_VARS="Variables={CONSOLE_TABLE=$TABLE,RUNS_TABLE=llmops-pipeline-runs,EVENTS_TABLE=llmops-stage-events,STATE_MACHINE=llmops-pipeline,START_FN=llmops-start-pipeline,DATA_BUCKET=$DATA_BUCKET,COGNITO_POOL_ID=$POOL_ID,COGNITO_CLIENT_ID=$CLIENT_ID,JUDGE_MODEL=$JUDGE_MODEL,SPANS_SINCE=$SPANS_SINCE,OPTIMIZE_HARNESS=$OPTIMIZE_HARNESS}"
+# BUDGET_MODE=advisory: an over-budget run is REPORTED (named and numbered on the Cost
+# tab) and launches anyway. Set blocking to restore the approval gate. Stated explicitly
+# here rather than left to the code default, so the live behaviour is visible in the
+# deploy script and switchable without a code change.
+BUDGET_MODE="${BUDGET_MODE:-advisory}"
 
+ENV_VARS="Variables={CONSOLE_TABLE=$TABLE,RUNS_TABLE=llmops-pipeline-runs,EVENTS_TABLE=llmops-stage-events,TASKS_TABLE=llmops-tasks,STATE_MACHINE=llmops-pipeline,START_FN=llmops-start-pipeline,DATA_BUCKET=$DATA_BUCKET,COGNITO_POOL_ID=$POOL_ID,COGNITO_CLIENT_ID=$CLIENT_ID,JUDGE_MODEL=$JUDGE_MODEL,SPANS_SINCE=$SPANS_SINCE,OPTIMIZE_HARNESS=$OPTIMIZE_HARNESS,LLMOPS_SNS_TOPIC=arn:aws:sns:$REGION:$ACCOUNT_ID:llmops-escalations,APPROVAL_KEY=alias/llmops-approval,DS_GROUP=llmops-datascience,BUDGET_MODE=$BUDGET_MODE}"
+
+# timeout 900: one orchestrator consultation turn can stream for up to 840s; the
+# old 300 killed the worker mid-turn and left the task stuck in 'thinking'.
 if aws lambda get-function --function-name "$FN" --region "$REGION" >/dev/null 2>&1; then
   aws lambda update-function-code --function-name "$FN" --zip-file fileb:///tmp/llmops-admin-dashboard.zip --region "$REGION" >/dev/null
   aws lambda wait function-updated --function-name "$FN" --region "$REGION"
-  aws lambda update-function-configuration --function-name "$FN" --environment "$ENV_VARS" --region "$REGION" >/dev/null
+  aws lambda update-function-configuration --function-name "$FN" --environment "$ENV_VARS" --timeout 900 --region "$REGION" >/dev/null
 else
-  aws lambda create-function --function-name "$FN" --runtime python3.12 --timeout 300 --memory-size 512 \
+  aws lambda create-function --function-name "$FN" --runtime python3.12 --timeout 900 --memory-size 512 \
     --role "arn:aws:iam::$ACCOUNT_ID:role/$ROLE" --handler lambda_function.handler \
     --zip-file fileb:///tmp/llmops-admin-dashboard.zip --environment "$ENV_VARS" --region "$REGION" >/dev/null
 fi
