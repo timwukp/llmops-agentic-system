@@ -137,8 +137,37 @@ class RateCard:
 
     def __init__(self, rates: dict | None = None):
         self.rates: dict[str, dict] = {}
-        for sku, entry in (rates or {}).items():
+        for sku, entry in (self.unwrap(rates) or {}).items():
             self.put(sku, entry)
+
+    @staticmethod
+    def unwrap(rates: dict | None) -> dict:
+        """Accept either the bare SKU table or a whole rate-card DOCUMENT.
+
+        The published artifact at finops/rates/rate_card_latest.json is a document --
+        {kind, generated_at, rates: {...}, health, notes} -- and the SKU table is one
+        field of it. This constructor only ever took the bare table, so handing it the
+        file died on ValueError from dict('rate_card'): an error naming a string
+        fragment, pointing at nothing, five frames from the actual mistake.
+
+        That is not a hypothetical misuse. The orchestrator's own prompt instructs the
+        agent to "read s3://<bucket>/finops/rates/rate_card_latest.json FIRST" and to
+        refuse to quote prices if it is missing -- so an agent doing exactly as told
+        arrives here with the document. The console already unwrapped it at its own
+        call site (doc.get("rates", doc)), which means the knowledge existed but lived
+        in one caller instead of the contract every caller shares.
+
+        Detection is by shape, not by the presence of a "rates" key alone: a document
+        has a dict under "rates" whose values are themselves rate entries. A SKU table
+        that happens to contain a SKU literally named "rates" keeps working.
+        """
+        if not rates:
+            return {}
+        inner = rates.get("rates")
+        if isinstance(inner, dict) and (not inner or all(
+                isinstance(v, dict) for v in inner.values())):
+            return inner
+        return rates
 
     def put(self, sku: str, entry: dict) -> None:
         """Insert a rate, keeping the better source if the SKU is already priced."""
