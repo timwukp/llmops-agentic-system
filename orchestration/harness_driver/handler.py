@@ -500,7 +500,42 @@ RE_ASK = ("Your turn ended without an inline-function call. If your task is "
 
 
 def handler(event, context=None, clients=None):
+    """Run one stage, and never strand the task token on the way out.
+
+    A SYNCHRONOUS stage invocation that raises is reported to Step Functions by the
+    Lambda integration itself. An ASYNCHRONOUS continuation is not: the state machine
+    waits on the task token, not on this invocation, so an exception here goes to
+    CloudWatch and to nobody else. The token then parks until TimeoutSeconds -- 7200s
+    for data-prep, 21600s for finetune -- with the run record still saying 'running'.
+
+    Live: the driver's missing s3:PutObject grant crashed the final stage_complete of
+    run-...-8b864805 twice in the same silence, and the run held its token for 90
+    minutes. The AccessDenied was one bug. The 90 minutes was this one: the stage had
+    genuinely failed and the only participant who knew was a log stream.
+
+    So an unexpected exception fails the token with the real cause attached, then
+    re-raises so the invocation is still recorded as an error (and a synchronous
+    caller, like the console's dispatch path, still sees a hard failure rather than a
+    silent success).
+    """
     c = clients or _clients()
+    try:
+        return _run_stage(event, context, c)
+    except Exception as exc:
+        token = event.get("task_token")
+        if token:
+            try:
+                c["sfn"].send_task_failure(
+                    taskToken=token, error="DriverCrashed",
+                    cause=f"{type(exc).__name__}: {exc}"[:32000])
+            except Exception as report_exc:  # noqa: BLE001
+                # Nothing left to do but say so; the timeout is now the only backstop.
+                print(f"[driver] could not fail the parked token: {report_exc}")
+        raise
+
+
+def _run_stage(event, context=None, c=None):
+    c = c if c is not None else _clients()
     sess = session_id(event["run_id"], event["stage"], event["task"])
     payload = {"run_id": event["run_id"], "stage": event["stage"],
                "manifest_uri": event["manifest_uri"],
