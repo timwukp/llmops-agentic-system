@@ -7,6 +7,10 @@ Creates (all tagged project=llmops-agentic-system):
       lifecycle: objects under runs/ expire after 90 days,
       CORS: PUT/GET/HEAD from the console's HTTP API origin only (browser-direct
         dataset upload via presigned PUT; skipped, never wildcarded, if unresolved)
+      skills/: the SKILL.md trees the harness configs mount, mirrored with --skills-src
+        so harnesses can move off `git` sources; each SKILL.md is validated for YAML
+        frontmatter BEFORE upload (a bad source fails at SESSION START, not at
+        UpdateHarness, so this must land before any source is switched)
   - DynamoDB llmops-pipeline-runs  (PK run_id S; GSI job_name-index on job_name S;
       on-demand; point-in-time recovery ON)
   - DynamoDB llmops-stage-events   (PK run_id S, SK sk S; on-demand)
@@ -196,6 +200,122 @@ def ensure_contracts(s3, bucket, dry):
             "to": [f"s3://{bucket}/contracts/", f"s3://{bucket}/pipeline/contracts/"]}
 
 
+def mounted_skills(repo):
+    """Every skill path the harness configs mount, mapped to the harnesses mounting it.
+
+    Derived from `agents/*/harness.json` rather than from a hand-kept list here, because
+    a hand-kept list is exactly the thing that goes stale silently: a new mount would be
+    absent from S3, and a missing skill source does not fail at `UpdateHarness` -- it
+    fails at SESSION START, on every invocation, with the config still reading healthy.
+    So the sync follows the configs by construction.
+
+    Only `git` sources are collected. An entry already on `s3` needs no upload, and an
+    entry may carry sibling keys (one currently carries a `_comment`), so membership is
+    tested by key rather than by taking the entry's first key.
+    """
+    mounts = {}
+    for cfg in sorted((repo / "agents").glob("*/harness.json")):
+        for skill in json.loads(cfg.read_text()).get("skills") or []:
+            git = skill.get("git")
+            if git and git.get("path"):
+                mounts.setdefault(git["path"], []).append(cfg.parent.name)
+    return mounts
+
+
+def skill_frontmatter(path):
+    """Return (name, description) from a SKILL.md, or raise ValueError saying what is wrong.
+
+    This is the #1 skills failure and it is undocumented: a SKILL.md that does not START
+    with YAML frontmatter carrying `name` and `description` is accepted by the control
+    plane and then kills every session at start with
+
+        runtimeClientError: SKILL.md in .agents/skills/... has no YAML frontmatter
+
+    Validating here -- before the object is uploaded and long before any source is
+    switched -- is the whole reason this step exists as a gate rather than a copy loop.
+    Parsed by hand rather than with a YAML dependency: the requirement is only that the
+    first line is `---` and that two scalar keys appear before the closing `---`, and a
+    deploy script that needs PyYAML installed is a new way for a deploy to fail.
+    """
+    text = path.read_text(encoding="utf-8")
+    if not text.startswith("---"):
+        raise ValueError(f"{path} does not start with '---'; every session would fail "
+                         "at start with 'has no YAML frontmatter'")
+    end = text.find("\n---", 3)
+    if end == -1:
+        raise ValueError(f"{path} opens frontmatter with '---' but never closes it")
+    found = {}
+    for line in text[3:end].splitlines():
+        if ":" in line and not line.startswith((" ", "\t", "#")):
+            k, _, v = line.partition(":")
+            found[k.strip()] = v.strip()
+    missing = [k for k in ("name", "description") if not found.get(k)]
+    if missing:
+        raise ValueError(f"{path} frontmatter is missing {missing}; the agent addresses a "
+                         "skill by its frontmatter `name`, so an absent one is unreachable")
+    return found["name"], found["description"]
+
+
+def ensure_skills(s3, bucket, dry, src=None, repo=None):
+    """Mirror the mounted skills to s3://<bucket>/<repo-relative path>/ and VERIFY them.
+
+    This exists to be a prerequisite, not an optimization. Moving the harnesses off `git`
+    skill sources is worth doing for two reasons -- a git source has no branch field, so
+    it always reads the skills repo's DEFAULT branch and main-branch drift silently
+    changes production agent behaviour; and a VPC-mode harness cannot reach GitHub at all
+    -- but the order cannot be reversed. Switch the sources first and `UpdateHarness`
+    accepts it, mints a version, reports READY, and then every session fails at start.
+    So: objects land and are validated here, and only then may a source move.
+
+    The S3 key mirrors the repo-relative path (`skills/llmops/llm-evaluation`), so the
+    URI a harness config needs is mechanical -- `s3://<bucket>/<the same path the git
+    source already names>` -- rather than a second naming scheme to keep in sync.
+
+    A skill the configs mount but the source tree does not have is a hard error, not a
+    skip: quietly uploading 10 of 11 is how a source switch loses a skill.
+    """
+    repo = repo or pathlib.Path(__file__).resolve().parent.parent
+    mounts = mounted_skills(repo)
+    if not src:
+        # Reported, never guessed. Uploading nothing is safe; uploading a stale or
+        # partial tree and calling it verified is not.
+        return {"status": "skipped (no --skills-src; pass a checkout of the skills repo)",
+                "mounted": len(mounts)}
+    src = pathlib.Path(src).expanduser().resolve()
+    if not src.is_dir():
+        raise SystemExit(f"--skills-src {src} is not a directory")
+
+    absent = [p for p in sorted(mounts) if not (src / p / "SKILL.md").is_file()]
+    if absent:
+        raise SystemExit(
+            f"{len(absent)} mounted skill(s) have no SKILL.md under {src}: {absent}. "
+            "Switching those sources to s3 would drop them, and the failure would only "
+            "appear at session start. Point --skills-src at a full checkout.")
+
+    validated, plan = {}, []
+    for path in sorted(mounts):
+        name, _desc = skill_frontmatter(src / path / "SKILL.md")   # raises on a bad one
+        files = sorted(p for p in (src / path).rglob("*") if p.is_file())
+        validated[path] = {"name": name, "files": len(files),
+                           "uri": f"s3://{bucket}/{path}",
+                           "mounted_by": mounts[path]}
+        plan.extend((p, f"{path}/{p.relative_to(src / path).as_posix()}") for p in files)
+
+    if dry:
+        return {"status": f"would upload {len(plan)} files for {len(validated)} skills",
+                "frontmatter": "validated for all mounted skills", "skills": validated}
+    for local, key in plan:
+        s3.upload_file(str(local), bucket, key)
+    # Read back the entry point of each skill. The upload call returning without an
+    # exception is not the same claim as the object being fetchable at the key a harness
+    # will ask for, and the gap between those two claims is a session-start failure.
+    for path in validated:
+        s3.head_object(Bucket=bucket, Key=f"{path}/SKILL.md")
+    return {"status": f"uploaded {len(plan)} files for {len(validated)} skills, "
+                      "each SKILL.md validated and read back",
+            "skills": validated}
+
+
 def ensure_table(ddb, name, spec, dry, pitr=False):
     try:
         ddb.describe_table(TableName=name)
@@ -314,6 +434,12 @@ def main():
                          "https://abc123.execute-api.us-east-1.amazonaws.com. Auto-"
                          f"resolved from the {CONSOLE_FN}-api HTTP API when omitted; CORS "
                          "is SKIPPED (never wildcarded) if it cannot be resolved.")
+    ap.add_argument("--skills-src",
+                    help="checkout of the MLOps-agent-skills repo to mirror into "
+                         f"s3://<bucket>/skills/. Every SKILL.md is validated for YAML "
+                         "frontmatter BEFORE upload, because a bad skill source is "
+                         "accepted by UpdateHarness and then fails at session start. "
+                         "Omitted: the step is skipped and says so.")
     ap.add_argument("--escalation-email",
                     help="subscribe this address to llmops-escalations (idempotent). "
                          "Without a subscriber, escalate_human publishes into the void.")
@@ -344,6 +470,9 @@ def main():
         "cors": ensure_cors(s3, bucket, origin, args.dry_run),
     }
     results["contracts"] = ensure_contracts(s3, bucket, args.dry_run)
+    # Reported on its own line for the same reason as CORS: when this is skipped there is
+    # no other visible symptom until a source is switched and every session fails at start.
+    results["skills"] = ensure_skills(s3, bucket, args.dry_run, args.skills_src)
     results[RUNS_TABLE] = {
         "status": ensure_table(ddb, RUNS_TABLE, {
             "AttributeDefinitions": [

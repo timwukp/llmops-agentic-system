@@ -1822,3 +1822,231 @@ def test_every_aws_call_a_handler_makes_is_in_its_role(role, src):
     assert not missing, (
         f"{src} performs actions the {role!r} role does not allow: {missing}. "
         "The handler will do its work and then die on AccessDenied.")
+
+
+# ── the S3 skill mirror: a prerequisite, not an optimization ───────────────────
+# All 19 skill sources across the 7 harnesses are `git` today. Moving them to `s3` is
+# worth doing for two reasons -- a git source has NO branch field, so it always reads the
+# skills repo's DEFAULT branch and main-branch drift silently changes production agent
+# behaviour; and a VPC-mode harness cannot reach GitHub at all -- but the order cannot be
+# reversed. Switch the sources first and UpdateHarness ACCEPTS it, mints a version, and
+# reports READY; the failure lands at SESSION START, on every invocation. These guards
+# hold the sync step to being a real gate rather than a copy loop.
+
+@pytest.fixture(scope="module")
+def storage_mod():
+    """deploy/03_storage.py as a module (its name starts with a digit, so not importable).
+    Nothing at import time calls AWS."""
+    return _load("llmops_03_storage_orch", "deploy/03_storage.py")
+
+
+class _SkillS3:
+    """Records uploads and answers head_object only for keys that were uploaded."""
+
+    def __init__(self):
+        self.uploads = []
+        self.heads = []
+
+    def upload_file(self, local, bucket, key):
+        self.uploads.append((local, bucket, key))
+
+    def head_object(self, Bucket, Key):
+        self.heads.append((Bucket, Key))
+        if Key not in [u[2] for u in self.uploads]:
+            raise AssertionError(f"head_object on a key never uploaded: {Key}")
+        return {"ContentLength": 1}
+
+
+def _skill_tree(root, names, frontmatter=True):
+    """Write a minimal but valid skills checkout under `root`."""
+    for name in names:
+        d = root / name
+        d.mkdir(parents=True, exist_ok=True)
+        head = ("---\n"
+                f"name: {name.rsplit('/', 1)[-1]}\n"
+                "description: one line\n"
+                "---\n\n") if frontmatter else ""
+        (d / "SKILL.md").write_text(head + "# body\n", encoding="utf-8")
+    return root
+
+
+def test_the_sync_covers_every_skill_the_configs_mount(storage_mod):
+    """The list of what to mirror is DERIVED from agents/*/harness.json, never hand-kept.
+
+    A hand-kept list is the exact failure this whole step guards against: a mount added
+    later would be absent from S3, and a missing skill source does not fail at
+    UpdateHarness -- it fails at session start, on every invocation, with the config
+    still reading healthy.
+    """
+    mounts = storage_mod.mounted_skills(REPO)
+    total = sum(len(v) for v in mounts.values())
+    configs = sorted((REPO / "agents").glob("*/harness.json"))
+    from_cfg = sum(1 for c in configs
+                   for s in (json.loads(c.read_text()).get("skills") or [])
+                   if "git" in s)
+    assert total == from_cfg, (
+        f"the sync plan covers {total} mounts but the configs declare {from_cfg} git "
+        "sources; a mount the sync does not know about is a skill that vanishes when "
+        "its source is switched to s3")
+    assert mounts, "no mounts found at all -- the glob or the config shape changed"
+
+
+def test_a_skill_entry_with_sibling_keys_is_still_collected(storage_mod, tmp_path):
+    """One live entry carries a `_comment` beside its `git` key.
+
+    Membership must be tested by key, not by taking the entry's first key -- a counter
+    written the latter way reported 18 git sources plus one '_comment', which would have
+    silently excluded the orchestrator's llm-data-preparation mount from the mirror.
+    """
+    agents = tmp_path / "agents"
+    (agents / "a").mkdir(parents=True)
+    (agents / "a" / "harness.json").write_text(json.dumps({"skills": [
+        {"_comment": "why this is mounted here too", "git": {
+            "url": "https://github.com/x/y", "path": "skills/llmops/llm-data-preparation"}},
+    ]}))
+    mounts = storage_mod.mounted_skills(tmp_path)
+    assert "skills/llmops/llm-data-preparation" in mounts, (
+        f"an entry with a sibling key was dropped: {mounts}")
+
+
+def test_a_skill_md_without_frontmatter_is_rejected_before_upload(storage_mod, tmp_path):
+    """The #1 skills failure, and undocumented: no YAML frontmatter kills every session
+    at start. Catching it at upload time is the only cheap place to catch it."""
+    d = _skill_tree(tmp_path, ["skills/llmops/llm-evaluation"], frontmatter=False)
+    with pytest.raises(ValueError, match="does not start with"):
+        storage_mod.skill_frontmatter(d / "skills/llmops/llm-evaluation/SKILL.md")
+
+
+def test_frontmatter_missing_name_or_description_is_rejected(storage_mod, tmp_path):
+    """`name` is how the agent addresses the skill, so an absent one is unreachable even
+    though the file opens with valid-looking frontmatter."""
+    p = tmp_path / "SKILL.md"
+    p.write_text("---\ndescription: only a description\n---\n\n# body\n")
+    with pytest.raises(ValueError, match="missing.*name"):
+        storage_mod.skill_frontmatter(p)
+    p.write_text("---\nname: llm-evaluation\n---\n\n# body\n")
+    with pytest.raises(ValueError, match="missing.*description"):
+        storage_mod.skill_frontmatter(p)
+    p.write_text("---\nname: llm-evaluation\ndescription: real\n---\n\n# body\n")
+    assert storage_mod.skill_frontmatter(p) == ("llm-evaluation", "real")
+
+
+def test_unclosed_frontmatter_is_rejected(storage_mod, tmp_path):
+    """A file that opens `---` and never closes it has no frontmatter block at all; the
+    naive parser would read the whole document as keys and find name/description in prose."""
+    p = tmp_path / "SKILL.md"
+    p.write_text("---\nname: x\ndescription: y\n\n# body with no closing marker\n")
+    with pytest.raises(ValueError, match="never closes"):
+        storage_mod.skill_frontmatter(p)
+
+
+def test_a_mounted_skill_absent_from_the_source_tree_is_fatal(storage_mod, tmp_path):
+    """Uploading 10 of 11 and reporting success is how a source switch loses a skill.
+
+    The real checkout is the sync source, so a partial or wrong --skills-src must stop
+    the deploy rather than mirror what it happens to have.
+    """
+    agents = tmp_path / "repo" / "agents" / "a"
+    agents.mkdir(parents=True)
+    (agents / "harness.json").write_text(json.dumps({"skills": [
+        {"git": {"url": "u", "path": "skills/llmops/llm-evaluation"}},
+        {"git": {"url": "u", "path": "skills/llmops/llm-nonexistent"}},
+    ]}))
+    src = _skill_tree(tmp_path / "src", ["skills/llmops/llm-evaluation"])
+    s3 = _SkillS3()
+    with pytest.raises(SystemExit, match="llm-nonexistent"):
+        storage_mod.ensure_skills(s3, "b", dry=False, src=src, repo=tmp_path / "repo")
+    assert not s3.uploads, (
+        f"a missing skill must be caught BEFORE any upload; these went up: {s3.uploads}")
+
+
+def test_the_s3_key_mirrors_the_path_the_git_source_already_names(storage_mod, tmp_path):
+    """The URI a harness config needs must be mechanical -- s3://<bucket>/<the same path
+    the git source names> -- not a second naming scheme to keep in sync by hand."""
+    agents = tmp_path / "repo" / "agents" / "a"
+    agents.mkdir(parents=True)
+    (agents / "harness.json").write_text(json.dumps({"skills": [
+        {"git": {"url": "u", "path": "skills/llmops/llm-evaluation"}}]}))
+    src = _skill_tree(tmp_path / "src", ["skills/llmops/llm-evaluation"])
+    s3 = _SkillS3()
+    out = storage_mod.ensure_skills(s3, "bkt", dry=False, src=src,
+                                    repo=tmp_path / "repo")
+    entry = out["skills"]["skills/llmops/llm-evaluation"]
+    assert entry["uri"] == "s3://bkt/skills/llmops/llm-evaluation"
+    assert ("bkt", "skills/llmops/llm-evaluation/SKILL.md") in \
+        [(u[1], u[2]) for u in s3.uploads]
+
+
+def test_each_uploaded_skill_is_read_back_at_the_key_a_harness_will_ask_for(
+        storage_mod, tmp_path):
+    """upload_file returning without an exception is not the same claim as the object
+    being fetchable at that key, and the gap between those two claims is a session-start
+    failure. So the entry point of every skill is head_object'd after upload."""
+    agents = tmp_path / "repo" / "agents" / "a"
+    agents.mkdir(parents=True)
+    (agents / "harness.json").write_text(json.dumps({"skills": [
+        {"git": {"url": "u", "path": "skills/llmops/llm-evaluation"}},
+        {"git": {"url": "u", "path": "skills/mlops/ml-solution-design"}}]}))
+    src = _skill_tree(tmp_path / "src", ["skills/llmops/llm-evaluation",
+                                        "skills/mlops/ml-solution-design"])
+    s3 = _SkillS3()
+    storage_mod.ensure_skills(s3, "bkt", dry=False, src=src, repo=tmp_path / "repo")
+    assert sorted(k for _, k in s3.heads) == [
+        "skills/llmops/llm-evaluation/SKILL.md",
+        "skills/mlops/ml-solution-design/SKILL.md"], (
+        f"every skill's SKILL.md must be read back, got {s3.heads}")
+
+
+def test_a_dry_run_validates_frontmatter_but_writes_nothing(storage_mod, tmp_path):
+    """The validation is the valuable half, so --dry-run must still do it. A dry run that
+    only prints a file count cannot tell you the switch is safe."""
+    agents = tmp_path / "repo" / "agents" / "a"
+    agents.mkdir(parents=True)
+    (agents / "harness.json").write_text(json.dumps({"skills": [
+        {"git": {"url": "u", "path": "skills/llmops/llm-evaluation"}}]}))
+    src = _skill_tree(tmp_path / "src", ["skills/llmops/llm-evaluation"],
+                      frontmatter=False)
+    s3 = _SkillS3()
+    with pytest.raises(ValueError, match="does not start with"):
+        storage_mod.ensure_skills(s3, "b", dry=True, src=src, repo=tmp_path / "repo")
+    assert not s3.uploads
+
+
+def test_no_skills_src_skips_loudly_rather_than_uploading_nothing_quietly(
+        storage_mod, tmp_path):
+    """Uploading nothing is safe. Reporting a mirror that did not happen is not: the next
+    step reads that as permission to switch a source."""
+    s3 = _SkillS3()
+    out = storage_mod.ensure_skills(s3, "b", dry=True, src=None, repo=REPO)
+    assert "skipped" in out["status"] and "skills-src" in out["status"]
+    assert not s3.uploads
+
+
+def test_the_deploy_runs_the_skill_sync_and_reports_it_on_its_own_line(storage_mod):
+    """Folded into another string it is one word in output nobody reads -- the same
+    mistake CORS made, whose only symptom was a customer upload failing much later."""
+    src = (REPO / "deploy/03_storage.py").read_text()
+    main = src[src.index("def main("):]
+    assert '"skills"] = ensure_skills(' in main, \
+        "main() never calls ensure_skills, so the step cannot run at deploy time"
+    assert "--skills-src" in src
+
+
+def test_the_skill_sync_lands_before_any_source_is_switched(storage_mod):
+    """The ordering constraint, asserted so it cannot be quietly inverted later.
+
+    While every source is still `git`, ensure_skills must exist. Once sources move to
+    `s3`, the mirror they read must be the one this step writes -- so if any config names
+    an s3 skill URI, that URI has to be a key ensure_skills would have uploaded.
+    """
+    assert hasattr(storage_mod, "ensure_skills"), (
+        "the sync step must exist BEFORE any source moves to s3: a bad source is "
+        "accepted by UpdateHarness and then fails at session start on every invocation")
+    for cfg in sorted((REPO / "agents").glob("*/harness.json")):
+        for skill in json.loads(cfg.read_text()).get("skills") or []:
+            uri = (skill.get("s3") or {}).get("uri", "")
+            if uri:
+                path = uri.split("/", 3)[-1] if uri.startswith("s3://") else ""
+                assert path.startswith("skills/"), (
+                    f"{cfg.parent.name} mounts {uri}, which is not under the skills/ "
+                    "prefix ensure_skills mirrors, so nothing keeps it in sync")
