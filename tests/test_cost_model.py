@@ -21,7 +21,8 @@ REPO = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
 from pipeline.contracts.cost_model import (  # noqa: E402
-    CATEGORIES, DEFAULT_PROJECT_CUMULATIVE_LIMIT_USD, DEFAULT_SINGLE_RUN_LIMIT_USD,
+    BUDGET_MODES, CATEGORIES, DEFAULT_BUDGET_MODE,
+    DEFAULT_PROJECT_CUMULATIVE_LIMIT_USD, DEFAULT_SINGLE_RUN_LIMIT_USD,
     MEASURED_INPUT_TOKENS_PER_SAMPLE, MEASURED_NONREASONING_OUTPUT_TOKENS,
     MEASURED_REASONING_MULTIPLIER, MEASURED_REASONING_OUTPUT_TOKENS,
     MEASURED_ROWS_PER_SEC, MEASURED_SETUP_OVERHEAD_S, PROJECT_RESOURCE_PATTERNS,
@@ -196,13 +197,16 @@ def test_remediation_multiplies_only_the_rerunnable_categories(rates):
 
 
 def test_gate_reads_worst_case_not_expected(rates):
-    """Approving $2000 that can silently become $6000 is not a gate."""
+    """Quoting $1500 for something that can silently become $4500 is the hazard, and
+    it survives advisory mode: what changed is whether we BLOCK, not which number we
+    compare. Reported against the expected total this run reads as under budget."""
     est = estimate_run(PLAN, rates)
     est["total_usd"], est["worst_case_usd"] = 1500.0, 4500.0
     d = approval_decision(est)
-    assert d["approval_required"] is True
     assert d["gating_basis"] == "worst_case_usd"
     assert d["gating_usd"] == 4500.0
+    assert d["over_budget"], "the worst case is over the limit and must be reported"
+    assert approval_decision(est, budget_mode="blocking")["approval_required"] is True
 
 
 # ── keep_reasoning: the invisible-parameter hazard ────────────────────────────
@@ -287,11 +291,26 @@ def test_teardown_off_is_stated_as_an_assumption(rates):
 
 
 # ── dual threshold ────────────────────────────────────────────────────────────
-def test_single_run_over_limit_requires_approval():
+# The arithmetic below is unchanged by advisory mode and is the part worth pinning:
+# WHICH comparisons fire, on which number, at which limits. Advisory mode changed only
+# the consequence -- `over_budget` is populated exactly where `reasons` used to be, and
+# `approval_required` is now gated on the mode. Each threshold is therefore asserted
+# twice: reported in the default (advisory) mode, and blocking under budget_mode=
+# "blocking". A single-mode assertion would let a regression that hard-codes one mode
+# pass, which is how a budget silently stops being either enforced or mentioned.
+def test_single_run_over_limit_is_reported_and_blocks_only_in_blocking_mode():
     d = approval_decision({"worst_case_usd": 2500.0}, project_to_date_usd=0.0)
-    assert d["approval_required"] is True
-    assert d["status"] == "pending_approval"
-    assert any("single-run" in r for r in d["reasons"])
+    assert d["approval_required"] is False       # advisory: the run is not stopped
+    assert d["status"] == "approved"
+    assert any("single-run" in r for r in d["over_budget"])
+    assert d["over_budget_usd"] == 500.0         # 2500 - the 2000 limit, named
+    assert d["notes"], "advisory must still SAY it is over; silence is not a reference"
+
+    b = approval_decision({"worst_case_usd": 2500.0}, project_to_date_usd=0.0,
+                          budget_mode="blocking")
+    assert b["approval_required"] is True
+    assert b["status"] == "pending_approval"
+    assert any("single-run" in r for r in b["reasons"])
 
 
 def test_under_both_limits_needs_no_approval():
@@ -299,20 +318,36 @@ def test_under_both_limits_needs_no_approval():
     assert d["approval_required"] is False
     assert d["status"] == "approved"
     assert d["reasons"] == []
+    assert d["over_budget"] == []
+    assert d["over_budget_usd"] == 0.0
+    assert d["notes"] == []
+    # Under the limit is under the limit in either mode -- blocking mode must not
+    # invent an overage, or turning enforcement on would stop every run.
+    assert approval_decision({"worst_case_usd": 50.0}, project_to_date_usd=100.0,
+                             budget_mode="blocking")["approval_required"] is False
 
 
-def test_cumulative_only_trip_still_requires_approval():
+def test_cumulative_only_trip_is_still_detected():
     """The drip case: twenty $150 runs each sail under a single-run limit while the
-    project quietly passes $2000. A single-threshold gate never fires here."""
+    project quietly passes $2000. A single-threshold check never sees it -- and the
+    cumulative arm is the one advisory mode could most easily have dropped, since
+    per-run it always looks fine."""
     d = approval_decision({"worst_case_usd": 150.0}, project_to_date_usd=1950.0)
-    assert d["approval_required"] is True
-    assert len(d["reasons"]) == 1
-    assert "project to-date" in d["reasons"][0]
+    assert len(d["over_budget"]) == 1
+    assert "project to-date" in d["over_budget"][0]
+    # Under the single-run limit, so there is no single-run overage to name...
+    assert d["over_budget_usd"] == 0.0
+    # ...but the run is still over budget, and must not read as clean.
+    assert d["notes"]
+    assert approval_decision({"worst_case_usd": 150.0}, project_to_date_usd=1950.0,
+                             budget_mode="blocking")["approval_required"] is True
 
 
 def test_both_thresholds_can_trip_together():
     d = approval_decision({"worst_case_usd": 5000.0}, project_to_date_usd=9000.0)
-    assert len(d["reasons"]) == 2
+    assert len(d["over_budget"]) == 2
+    assert len(approval_decision({"worst_case_usd": 5000.0}, project_to_date_usd=9000.0,
+                                 budget_mode="blocking")["reasons"]) == 2
 
 
 def test_default_limits_are_the_2000_dollars_asked_for():
@@ -320,15 +355,47 @@ def test_default_limits_are_the_2000_dollars_asked_for():
     assert DEFAULT_PROJECT_CUMULATIVE_LIMIT_USD == 2000.0
 
 
+def test_the_budget_is_a_reference_by_default_not_a_ceiling():
+    """The product decision: this platform's owner is its only approver, so a gate
+    here could only ever ask them to approve their own run. Advisory is therefore the
+    DEFAULT, and it is asserted on the constant rather than inferred from behaviour --
+    a flipped default is a change in what the platform does to every run, and it
+    should have to break a test to happen."""
+    assert DEFAULT_BUDGET_MODE == "advisory"
+    assert set(BUDGET_MODES) == {"advisory", "blocking"}
+    assert approval_decision({"worst_case_usd": 1e9})["budget_mode"] == "advisory"
+
+
+def test_an_unrecognised_budget_mode_falls_back_to_advisory_not_to_blocking():
+    """A typo'd env var must not silently become enforcement. The failure mode of
+    guessing 'blocking' is every run stopping on a value nobody can approve; the
+    failure mode of guessing 'advisory' is the documented default."""
+    d = approval_decision({"worst_case_usd": 2500.0}, budget_mode="Blocking!")
+    assert d["budget_mode"] == "advisory"
+    assert d["approval_required"] is False
+    assert d["over_budget"], "the overage is still reported under a bad mode"
+    for bogus in (None, "", "off", "enforce", "yes"):
+        assert approval_decision({"worst_case_usd": 2500.0},
+                                 budget_mode=bogus)["approval_required"] is False
+
+
 def test_limits_are_configurable():
     d = approval_decision({"worst_case_usd": 300.0}, single_run_limit_usd=100.0,
                           cumulative_limit_usd=1e9)
-    assert d["approval_required"] is True
+    assert d["over_budget"]
+    assert d["over_budget_usd"] == 200.0
+    assert d["single_run_limit_usd"] == 100.0
+    assert approval_decision({"worst_case_usd": 300.0}, single_run_limit_usd=100.0,
+                             cumulative_limit_usd=1e9,
+                             budget_mode="blocking")["approval_required"] is True
 
 
 def test_approval_falls_back_to_total_when_worst_case_absent():
     d = approval_decision({"total_usd": 2500.0})
-    assert d["approval_required"] is True
+    assert d["gating_usd"] == 2500.0
+    assert d["over_budget"]
+    assert approval_decision({"total_usd": 2500.0},
+                             budget_mode="blocking")["approval_required"] is True
 
 
 # ── separation of duties ──────────────────────────────────────────────────────

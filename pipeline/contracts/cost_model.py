@@ -105,10 +105,26 @@ CATEGORIES = ("sagemaker_training", "sagemaker_inference", "bedrock_teacher",
               "agentcore_runtime", "agentcore_model", "agentcore_memory",
               "agentcore_evaluations", "support")
 
-#: Default approval thresholds (USD). Dual gate: a single expensive run trips the
-#: first, a drip of cheap runs against the same project trips the second.
+#: Default budget references (USD). Dual reference: a single expensive run passes the
+#: first, a drip of cheap runs against the same project passes the second.
 DEFAULT_SINGLE_RUN_LIMIT_USD = 2000.0
 DEFAULT_PROJECT_CUMULATIVE_LIMIT_USD = 2000.0
+
+#: How the budget behaves when a run exceeds it.
+#:
+#: ``advisory`` (the default): the estimate is still computed, the overage is still
+#: reported by name and number, and the run launches anyway. The owner's instruction is
+#: that this platform must not block them on their own spend approval, so the budget is
+#: a reference, not a gate.
+#:
+#: ``blocking`` keeps the old behaviour for anyone who wants it back -- a deployment
+#: that genuinely needs a second signature sets this and nothing else changes.
+#:
+#: Note what is NOT affected: cost is still measured, priced, attributed and reconciled,
+#: and an over-budget run still says so. Advisory means "does not stop the run", not
+#: "goes unmentioned" -- a silent overage would be a worse platform than a blocking one.
+BUDGET_MODES = ("advisory", "blocking")
+DEFAULT_BUDGET_MODE = "advisory"
 
 #: Estimate lifecycle. ``draft`` never launches; only ``approved`` does.
 ESTIMATE_STATUSES = ("draft", "pending_approval", "approved", "rejected",
@@ -465,33 +481,65 @@ def estimate_run(plan: dict, rates: RateCard | dict) -> dict:
 # ── approval gating ───────────────────────────────────────────────────────────
 def approval_decision(estimate: dict, project_to_date_usd: float = 0.0,
                       single_run_limit_usd: float = DEFAULT_SINGLE_RUN_LIMIT_USD,
-                      cumulative_limit_usd: float = DEFAULT_PROJECT_CUMULATIVE_LIMIT_USD) -> dict:
-    """Does this run need a human approver? Dual threshold, gated on the worst case.
+                      cumulative_limit_usd: float = DEFAULT_PROJECT_CUMULATIVE_LIMIT_USD,
+                      budget_mode: str = DEFAULT_BUDGET_MODE) -> dict:
+    """Compare this run against the budget. Dual reference, on the worst case.
 
-    Two independent limits, because they catch different failure modes: one $5000 run
-    trips ``single_run``, while twenty $150 runs against the same project trip
-    ``cumulative`` and would otherwise sail through one at a time.
+    Two independent references, because they describe different situations: one $5000
+    run passes ``single_run``, while twenty $150 runs against the same project pass
+    ``cumulative`` and would otherwise each look small on its own.
+
+    Under the default ``advisory`` mode the comparison is REPORTED and the run still
+    launches: ``approval_required`` is False even when the budget is exceeded, and the
+    overage rides in ``over_budget``/``notes`` instead. The platform owner does not want
+    to be stopped by their own spend approval, and a gate whose only possible answer is
+    "yes, I approve my own run" is ceremony, not control.
+
+    What advisory does NOT mean is quiet. ``over_budget`` and ``notes`` are populated
+    exactly as ``reasons`` used to be, so an over-budget run says so by name and number
+    on every surface that shows this verdict. A budget that is neither enforced nor
+    mentioned is not a reference; it is a number nobody will ever act on.
+
+    ``budget_mode="blocking"`` restores gating for a deployment that wants it.
 
     Reads ``worst_case_usd`` deliberately — see ``estimate_run``.
     """
     gating = float(estimate.get("worst_case_usd", estimate.get("total_usd", 0.0)) or 0.0)
     to_date = float(project_to_date_usd or 0.0)
-    reasons = []
+    mode = str(budget_mode or DEFAULT_BUDGET_MODE)
+    if mode not in BUDGET_MODES:
+        # An unrecognised mode must not silently mean "no budget checking at all".
+        # Fall back to the documented default and say so, rather than inventing a
+        # third behaviour out of a typo.
+        mode = DEFAULT_BUDGET_MODE
+    over_budget = []
     if gating > float(single_run_limit_usd):
-        reasons.append(f"single-run worst case ${gating:,.2f} exceeds "
-                       f"${float(single_run_limit_usd):,.2f}")
+        over_budget.append(f"single-run worst case ${gating:,.2f} exceeds "
+                           f"${float(single_run_limit_usd):,.2f}")
     if to_date + gating > float(cumulative_limit_usd):
-        reasons.append(f"project to-date ${to_date:,.2f} + ${gating:,.2f} = "
-                       f"${to_date + gating:,.2f} exceeds ${float(cumulative_limit_usd):,.2f}")
+        over_budget.append(f"project to-date ${to_date:,.2f} + ${gating:,.2f} = "
+                           f"${to_date + gating:,.2f} exceeds "
+                           f"${float(cumulative_limit_usd):,.2f}")
+    blocking = mode == "blocking" and bool(over_budget)
     return {
-        "approval_required": bool(reasons),
-        "reasons": reasons,
+        "approval_required": blocking,
+        # Kept for the surfaces that render this list: in blocking mode these are the
+        # reasons approval is required, in advisory mode there are none BY DEFINITION,
+        # because nothing is being required. The facts live in over_budget either way,
+        # so no caller has to know the mode to report the overage.
+        "reasons": list(over_budget) if blocking else [],
+        "over_budget": over_budget,
+        "over_budget_usd": round(max(0.0, gating - float(single_run_limit_usd)), 4),
+        "budget_mode": mode,
+        "notes": ([f"over budget by ${gating - float(single_run_limit_usd):,.2f}; "
+                   "advisory mode — the run is not blocked"]
+                  if over_budget and not blocking else []),
         "gating_usd": round(gating, 4),
         "gating_basis": "worst_case_usd",
         "project_to_date_usd": round(to_date, 4),
         "single_run_limit_usd": float(single_run_limit_usd),
         "cumulative_limit_usd": float(cumulative_limit_usd),
-        "status": "pending_approval" if reasons else "approved",
+        "status": "pending_approval" if blocking else "approved",
     }
 
 

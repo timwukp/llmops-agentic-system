@@ -38,11 +38,16 @@ ESTIMATES_TABLE = os.environ.get("ESTIMATES_TABLE", "llmops-cost-estimates")  # 
 ACTUALS_TABLE = os.environ.get("ACTUALS_TABLE", "llmops-cost-actuals")        # PK project, SK sk
 FINOPS_FN = os.environ.get("FINOPS_FN", "llmops-finops-reconcile")
 PROJECT = os.environ.get("PROJECT", "llmops-agentic-system")
-#: Approval fires when EITHER this run's worst case exceeds the single-run limit, OR
-#: project-to-date actual + this estimate exceeds the cumulative one. Two independent
-#: limits, because a stream of $500 runs is the same $2000 exposure as one $2000 run.
+#: Budget references, compared two independent ways: this run's worst case against the
+#: single-run figure, and project-to-date actual + this estimate against the cumulative
+#: one, because a stream of $500 runs is the same $2000 exposure as one $2000 run.
 APPROVAL_LIMIT_USD = float(os.environ.get("APPROVAL_LIMIT_USD", "2000"))
 CUMULATIVE_LIMIT_USD = float(os.environ.get("CUMULATIVE_LIMIT_USD", "2000"))
+#: advisory (default) = report the overage, launch anyway. blocking = the old gate.
+#: The platform owner is the only approver here, so a gate could only ever ask them to
+#: approve their own run; the budget is a reference instead. Overages are still named
+#: and numbered on every surface -- advisory is not silent.
+BUDGET_MODE = os.environ.get("BUDGET_MODE", "advisory")
 #: Cognito group whose members may approve. Membership is checked server-side on every
 #: approval call; hiding the button in the UI is not a control.
 APPROVER_GROUP = os.environ.get("APPROVER_GROUP", "llmops-approver")
@@ -1164,6 +1169,7 @@ def start_run(body):
                               or fresh.get("approval_required"))
         cm = _cost_model()
         if needs_approval:
+            # Only reachable in blocking mode; advisory never sets approval_required.
             # Delegated so the console and the pipeline agree on what "may launch"
             # means; a second copy of this rule is a copy that can drift.
             ok = cm.can_launch(est) if cm else {
@@ -1173,10 +1179,20 @@ def start_run(body):
                 return {"error": (ok.get("error", "not launchable") + ". "
                                   + "; ".join(fresh.get("reasons", []))),
                         "status_code": int(ok.get("code", 409)), "gate": fresh}
-        elif status in ("rejected", "launched"):
-            # Terminal both ways even under the limit: a rejection must not be
-            # re-launched, and re-launching an already-launched estimate would attach
-            # two runs to one approval and double-count it in the variance report.
+        if status in ("rejected", "launched"):
+            # NOT a budget check, which is why it survives advisory mode. Both statuses
+            # are terminal for reasons that have nothing to do with the amount: a
+            # rejection someone recorded must not be relaunched behind their back, and
+            # relaunching a launched estimate attaches two runs to one record and
+            # double-counts it in the variance report.
+            #
+            # This was an `elif` on the approval branch until advisory mode. That was
+            # NOT exploitable -- checked by reverting it, which changed no test: when
+            # needs_approval was true, can_launch already refused everything except
+            # status=="approved", so rejected/launched were rejected one branch earlier.
+            # It is a plain `if` now because advisory mode never sets approval_required,
+            # so the elif would have been dead code and the terminal check would have
+            # depended on a budget verdict it has nothing to do with.
             return {"error": f"estimate is {status} and cannot launch",
                     "status_code": 409}
         for k in ("task_count", "sample_count"):
@@ -1217,6 +1233,14 @@ def start_run(body):
             print(f"[finops] could not stamp estimate {est['id']}: {e}")
             out["warning"] = "run started but the estimate record was not updated"
         out["estimate_id"] = est["id"]
+        # The re-derived verdict travels with the launch, not just with the refusal.
+        # In advisory mode nothing above stopped this run, so this is the ONLY place the
+        # caller learns it went over -- and a budget that is neither enforced nor
+        # mentioned is not a reference, it is a number nobody will ever act on.
+        out["gate"] = fresh
+        if fresh.get("over_budget") or fresh.get("budget_unknown"):
+            out["budget_notice"] = "; ".join(
+                fresh.get("over_budget") or fresh.get("notes") or [])
     return {"ok": True, "result": out}
 
 
@@ -1313,16 +1337,24 @@ def gate_decision(worst_case_usd, project=None):
     cm = _cost_model()
     ptd, _ = project_to_date_usd(project)
     if cm is None:
-        # Fail CLOSED. With no estimator we cannot prove the run is under the limit, so
-        # "we could not check" must land on the require-approval side.
-        return {"approval_required": True, "project_to_date_usd": ptd,
-                "gating_usd": _f(worst_case_usd), "status": "pending_approval",
-                "reasons": ["cost model unavailable — cannot verify the spend limit, "
-                            "so approval is required"]}
+        # No estimator, so we cannot price the run. In advisory mode that does not
+        # block it -- but it must not be reported as "under budget" either, because we
+        # did not check. It is an UNKNOWN, which is a third answer, and saying so is
+        # the whole reason this branch exists.
+        blocking = BUDGET_MODE == "blocking"
+        return {"approval_required": blocking, "project_to_date_usd": ptd,
+                "gating_usd": _f(worst_case_usd), "budget_mode": BUDGET_MODE,
+                "status": "pending_approval" if blocking else "approved",
+                "budget_unknown": True, "over_budget": [],
+                "reasons": (["cost model unavailable — cannot verify the spend limit, "
+                             "so approval is required"] if blocking else []),
+                "notes": ["cost model unavailable — this run's cost was NOT checked "
+                          "against the budget"]}
     return cm.approval_decision({"worst_case_usd": _f(worst_case_usd)},
                                 project_to_date_usd=ptd,
                                 single_run_limit_usd=APPROVAL_LIMIT_USD,
-                                cumulative_limit_usd=CUMULATIVE_LIMIT_USD)
+                                cumulative_limit_usd=CUMULATIVE_LIMIT_USD,
+                                budget_mode=BUDGET_MODE)
 
 
 def create_estimate(body, username, now_iso):
@@ -1983,10 +2015,13 @@ def accept_task(task_id, user):
     fresh = gate_decision(task["cost_estimate_usd"])
     needs_approval = bool(fresh.get("approval_required"))
 
-    # Same membership bar either way (datascience or approver may sign). What the
-    # gate changes is the CONSEQUENCE of signing: under-limit dispatches now;
-    # over-limit only submits to the Cost queue, where decide_approval enforces the
-    # approver group and requester != approver — that is the real spend control.
+    # Same membership bar either way (datascience or approver may sign). What blocking
+    # mode changes is the CONSEQUENCE of signing: within-budget dispatches now;
+    # over-budget only submits to the Cost queue, where decide_approval enforces the
+    # approver group and requester != approver. In advisory mode (the default) an
+    # over-budget plan dispatches too — but the overage is still written into the
+    # signed record below, so the audit trail says what this run was expected to cost
+    # relative to the budget even though nothing stopped it.
     if not _user_may_task(user):
         return {"error": "not authorized", "status_code": 403}
 
@@ -2006,7 +2041,13 @@ def accept_task(task_id, user):
         "gate": {"approval_required": needs_approval,
                  # str(): DynamoDB rejects floats in the stored approval record
                  "single_run_limit_usd": str(APPROVAL_LIMIT_USD),
-                 "cumulative_limit_usd": str(CUMULATIVE_LIMIT_USD)},
+                 "cumulative_limit_usd": str(CUMULATIVE_LIMIT_USD),
+                 # The budget comparison belongs in the SIGNED record, not only in the
+                 # runtime response. Advisory mode means the overage did not stop the
+                 # dispatch; it does not mean the approval record should read as though
+                 # the plan was within budget.
+                 "budget_mode": str(fresh.get("budget_mode", BUDGET_MODE)),
+                 "over_budget": [str(r) for r in (fresh.get("over_budget") or [])]},
         "decision": "submitted" if needs_approval else "accepted",
         "approved_by": username, "cognito_sub": str(user.get("sub", "")),
         "source_ip": str(user.get("source_ip", "")), "approved_at": _now_iso(),
