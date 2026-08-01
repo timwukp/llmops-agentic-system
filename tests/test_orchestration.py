@@ -129,6 +129,15 @@ class FakeTable:
         items = [i for i in self.items if cond is None or _cond_matches(cond, i)]
         return {"Items": items}
 
+    def get_item(self, **kw):
+        # Reads back what was written, like query. put_directive consults the run's
+        # status through this to decide whether anyone can still hear the verdict; a
+        # stub returning a fixed row would make an unreachable run look reachable.
+        for item in self.items:
+            if all(item.get(k) == v for k, v in (kw.get("Key") or {}).items()):
+                return {"Item": item}
+        return {}
+
 
 class FakeDDB:
     def __init__(self):
@@ -815,6 +824,129 @@ class TestDriver:
         driver.handler(driver_event(stage="orchestrator", task="triage",
                                     run_id="run-orch-1"), clients=c)
         assert driver.take_directive(c["ddb"], "run-orch-1") is None
+
+    @staticmethod
+    def _seed_run(c, run_id, status):
+        c["ddb"].Table("llmops-pipeline-runs").put_item(
+            Item={"run_id": run_id, "status": status})
+
+    @pytest.mark.parametrize("status", ["escalated", "failed", "completed",
+                                        "stopped-smoke-verification"])
+    def test_a_verdict_for_a_run_that_cannot_hear_it_is_not_reported_resolved(self, status):
+        """take_directive has exactly ONE caller: the checkpoint branch of a LIVE driver
+        invocation. So a verdict addressed to a run whose execution has ENDED lands in a
+        mailbox nobody will open again -- and this branch used to return
+        {"status": "resolved"} regardless.
+
+        That is how #16 stayed open for three days: run-20260729T104648Z-41631739 was
+        already `escalated`, its token failed and its execution FAILED at 11:19:55Z, so
+        triaging it would have reported success and changed NOTHING. Same class as the
+        stranded task token (#52): the write is authorized, and unreachable.
+
+        Asserted on the returned status ONLY. The follow-up turn and the audit flag are
+        separate properties with their own guards below, and asserting them here made this
+        test go red for three unrelated reasons -- which is how a suite ends up with
+        guards that look independent and are not."""
+        ac = FakeAgentCore([
+            tool_use_stream("resolve_escalation",
+                            {"run_id": "run-dead-1", "decision": "option_B",
+                             "adjusted_params": {"teacher_cap_usd": 39}}),
+            tool_use_stream("stage_complete", {"outputs": []}),
+            text_stream("ack")])
+        c = clients(ac)
+        self._seed_run(c, "run-dead-1", status)
+        out = driver.handler(driver_event(stage="orchestrator", task="triage",
+                                          run_id="run-orch-1"), clients=c)
+
+        assert out["status"] != "resolved", \
+            f"a verdict for a {status} run was reported as a resolution"
+
+    def test_an_undeliverable_verdict_is_rejected_back_so_triage_can_still_act(self):
+        """The rejection must ride back into the SAME turn, not end it. A conductor told
+        "undeliverable" can relaunch the work via launch_run or escalate to page_human;
+        returning would leave triage having done nothing, which is the bug being fixed.
+
+        This is the ONLY guard on the follow-up turn and on the rejection's wording, so a
+        `return` here fails exactly this test and not the reachability guards above."""
+        ac = FakeAgentCore([
+            tool_use_stream("resolve_escalation",
+                            {"run_id": "run-dead-2", "decision": "raise_cap"}),
+            tool_use_stream("page_human", {"reason": "needs owner authority"}),
+            text_stream("ack")])
+        c = clients(ac)
+        self._seed_run(c, "run-dead-2", "escalated")
+        driver.handler(driver_event(stage="orchestrator", task="triage",
+                                    run_id="run-orch-1"), clients=c)
+        assert len(ac.calls) >= 2, \
+            "the conductor never got another turn to act on the rejection"
+        answer = json.loads(
+            ac.calls[1]["messages"][-1]["content"][0]["toolResult"]["content"][0]["text"])
+        assert answer["status"] == "undeliverable"
+        assert answer["run_status"] == "escalated"
+        assert "launch_run" in answer["reason"], \
+            "a rejection must name the path that CAN act, or triage just stops"
+
+    def test_a_verdict_for_a_live_run_is_still_delivered_and_reported_resolved(self):
+        """The reachability check must not break the case it is guarding. A `running`
+        run has a listener, so the verdict is delivered and the turn resolves -- a guard
+        that refused every directive would 'fix' the silence by making it total."""
+        ac = FakeAgentCore([
+            tool_use_stream("resolve_escalation",
+                            {"run_id": "run-live-1", "decision": "option_B",
+                             "adjusted_params": {"teacher_cap_usd": 39}}),
+            text_stream("ack")])
+        c = clients(ac)
+        self._seed_run(c, "run-live-1", "running")
+        out = driver.handler(driver_event(stage="orchestrator", task="triage",
+                                          run_id="run-orch-1"), clients=c)
+        assert out["status"] == "resolved"
+        pending = driver.take_directive(c["ddb"], "run-live-1")
+        assert pending and pending["adjusted_params"] == {"teacher_cap_usd": 39}
+
+    def test_an_unknown_run_is_treated_as_reachable_not_silently_dropped(self):
+        """A run row that cannot be read must NOT withhold the verdict. The failure being
+        fixed is a silent no-op; refusing to deliver on a transient DDB error or an
+        unseeded row would invent a second one, in the same direction."""
+        ac = FakeAgentCore([
+            tool_use_stream("resolve_escalation",
+                            {"run_id": "run-unknown-1", "decision": "retry"}),
+            text_stream("ack")])
+        c = clients(ac)  # no run row seeded at all
+        out = driver.handler(driver_event(stage="orchestrator", task="triage",
+                                          run_id="run-orch-1"), clients=c)
+        assert out["status"] == "resolved"
+        assert driver.take_directive(c["ddb"], "run-unknown-1")
+
+    def test_the_audit_record_survives_even_when_the_verdict_cannot_be_delivered(self):
+        """Undeliverable is not un-decided. The stage-event and the directive row are both
+        still written -- flagged deliverable=False -- because what the conductor decided is
+        evidence regardless of whether anyone acted on it."""
+        ac = FakeAgentCore([
+            tool_use_stream("resolve_escalation",
+                            {"run_id": "run-dead-3", "decision": "abort",
+                             "rationale": "2-sample scale has no quality signal"}),
+            tool_use_stream("stage_complete", {"outputs": []}),
+            text_stream("ack")])
+        c = clients(ac)
+        self._seed_run(c, "run-dead-3", "escalated")
+        driver.handler(driver_event(stage="orchestrator", task="triage",
+                                    run_id="run-orch-1"), clients=c)
+        rows = c["ddb"].Table("llmops-stage-events").items
+        parked = [r for r in rows
+                  if str(r.get("sk", "")).startswith(driver.DIRECTIVE_SK)]
+        assert parked, "the decision was lost entirely, not merely undelivered"
+        assert parked[0]["deliverable"] is False
+        assert parked[0]["run_status_at_put"] == "escalated"
+        assert any("EscalationResolved" in str(r.get("sk", "")) for r in rows)
+
+    def test_running_is_the_only_state_with_a_listener(self):
+        """Derived, not hand-listed: every terminal status any writer in the repo can put
+        on a run must be treated as unreachable. A status added later (a new terminal
+        marker) that this tuple does not know about would silently go back to filing
+        verdicts into a dead mailbox."""
+        assert "running" not in driver.UNREACHABLE_RUN_STATES
+        for status in ("escalated", "failed", "completed"):
+            assert status in driver.UNREACHABLE_RUN_STATES
 
     def test_missing_stage_complete_reasks_then_fails(self):
         ac = FakeAgentCore([text_stream("done, I think"), text_stream("still no call"),

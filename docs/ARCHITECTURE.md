@@ -117,6 +117,24 @@ authority — budget overruns, shared-resource deletion, business tradeoffs — 
 decision brief: situation, options, recommendation), `write_report` (publish cross-run
 operations synthesis), plus `checkpoint`.
 
+**A verdict is delivered or visibly undeliverable — never silently filed.** The answer
+channel (`put_directive` → the `checkpoint` branch's `take_directive`) has exactly ONE
+reader: a *live* driver invocation. So delivery is not a property of the write, it is a
+property of whether anyone will ever read it — and `resolve_escalation` used to return
+`{"status": "resolved"}` either way. That is why the data-prep budget escalation sat
+unanswered for three days: `run-20260729T104648Z-41631739` was already `escalated`, its
+task token failed by `handle_escalate` and its execution FAILED at 11:19:55Z, so triaging
+it would have reported success and changed nothing. The tool that existed to answer the
+escalation could not answer *that* escalation, and said so to no one. The same shape as
+the stranded task token in §4: **the write was authorized, and unreachable.** Now
+`put_directive` consults the run's status first; a verdict for a run in a terminal state
+is still written (a decision is evidence even when nobody acts on it) but flagged
+`deliverable: false`, and the call is *rejected back into the same turn* naming the paths
+that can still act — `launch_run` to relaunch the work carrying the adjusted params, or
+`page_human`. An unknown or unreadable run row counts as reachable on purpose: the defect
+being fixed is a silent no-op, and withholding a verdict on a transient DynamoDB error
+would invent a second one in the same direction.
+
 If a turn ends *without* an inline-function call (models sometimes narrate completion but
 skip the structured call), the driver re-asks up to 2 times in the same session, then
 fails the stage as `MissingStageComplete` — narration is never promoted to success.

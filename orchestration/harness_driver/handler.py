@@ -222,8 +222,40 @@ def _record_stage_event(ddb, run_id: str, stage: str, event_name: str, detail: d
 DIRECTIVE_SK = "directive#"
 
 
+#: A run in one of these states has no live driver invocation, so nothing will ever
+#: call take_directive() for it again. Derived from the only two writers of a terminal
+#: runs.status -- the driver's own handle_escalate ("escalated") and the state machine's
+#: MarkRunFailed / MarkRunDone ("failed" / "completed") -- plus the manual-stop marker.
+#: `running` is deliberately absent: that is the ONE state with a listener.
+UNREACHABLE_RUN_STATES = ("escalated", "failed", "completed", "stopped")
+
+
+def run_can_hear_a_directive(ddb, run_id: str) -> tuple[bool, str]:
+    """Can a directive addressed to `run_id` still reach an agent? (reachable, status).
+
+    take_directive has exactly one caller: the checkpoint branch of a LIVE driver
+    invocation. So "delivered" is not a property of the write -- it is a property of
+    whether anyone will ever read it. A verdict parked for a run whose execution has
+    ended sits in a mailbox nobody will open again.
+
+    Unknown or unreadable status returns reachable=True. A directives lookup that
+    fails must not be the reason a verdict is withheld from a run that could act on
+    it; the failure mode we are fixing is a SILENT no-op, and refusing to deliver on
+    a transient DDB error would invent a second one.
+    """
+    try:
+        row = ddb.Table(os.environ["RUNS_TABLE"]).get_item(
+            Key={"run_id": run_id}).get("Item") or {}
+    except Exception:  # noqa: BLE001 — see docstring: unknown means "try to deliver"
+        return True, ""
+    status = str(row.get("status", ""))
+    if not row:
+        return True, ""
+    return not status.startswith(UNREACHABLE_RUN_STATES), status
+
+
 def put_directive(ddb, run_id: str, decision: str, rationale: str = "",
-                  adjusted_params: dict | None = None, actor: str = "conductor"):
+                  adjusted_params: dict | None = None, actor: str = "conductor") -> dict:
     """Park a verdict where the agent working `run_id` will pick it up.
 
     Until this existed, a stage agent could ASK a blocking question (checkpoint /
@@ -233,7 +265,15 @@ def put_directive(ddb, run_id: str, decision: str, rationale: str = "",
     infeasible -- 13.5k output tokens per attempt against a plan that assumed 1,800 --
     and then went on spending under that cap, because "continue" was the only answer
     the driver knew how to give.
+
+    Returns {"parked": bool, "reachable": bool, "run_status": str}. The verdict is
+    still WRITTEN when unreachable -- it is the audit record of what was decided --
+    but `reachable: False` is what stops the caller reporting success. Answering an
+    escalation whose run has already ended is not an answer, and a channel that
+    returns 200 for it is how #16 stayed open for three days: the tool reported
+    "resolved" every time, so nothing looked broken.
     """
+    reachable, status = run_can_hear_a_directive(ddb, run_id)
     ddb.Table(os.environ["EVENTS_TABLE"]).put_item(Item={
         "run_id": run_id,
         "sk": f"{DIRECTIVE_SK}{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}",
@@ -242,7 +282,10 @@ def put_directive(ddb, run_id: str, decision: str, rationale: str = "",
         "adjusted_params": json.dumps(adjusted_params or {}, default=str),
         "actor": actor,
         "delivered": False,
+        "deliverable": reachable,
+        **({"run_status_at_put": status} if status else {}),
     })
+    return {"parked": True, "reachable": reachable, "run_status": status}
 
 
 def take_directive(ddb, run_id: str) -> Optional[dict]:
@@ -675,6 +718,17 @@ def _run_stage(event, context=None, c=None):
                 # parked for delivery — addressed to the run being triaged, never to
                 # the conductor's own run, or it lands in the triager's mailbox and the
                 # stuck run waits forever.
+                #
+                # And parking it is still not answering it. take_directive has exactly
+                # ONE caller -- the checkpoint branch of a LIVE driver invocation -- so
+                # a verdict addressed to a run whose execution has ENDED goes into a
+                # mailbox nobody will open again. This branch used to return
+                # {"status": "resolved"} either way, which is how #16 stayed open for
+                # three days: run-20260729T104648Z-41631739 was already `escalated`
+                # with its token failed and its execution FAILED at 11:19:55Z, so
+                # triaging it would have reported success and changed nothing. Same
+                # class as the stranded task token: the write is authorized, and
+                # unreachable. A tool that cannot act must say so, not return 200.
                 subject = args.get("run_id") or ""
                 _record_stage_event(c["ddb"], subject or event.get("run_id", ""),
                                     "orchestrator", "EscalationResolved",
@@ -682,11 +736,28 @@ def _run_stage(event, context=None, c=None):
                                      "rationale": str(args.get("rationale", ""))[:500],
                                      "adjusted_params": args.get("adjusted_params") or {}})
                 if subject:
-                    put_directive(c["ddb"], subject,
-                                  decision=str(args.get("decision", "")),
-                                  rationale=str(args.get("rationale", "")),
-                                  adjusted_params=args.get("adjusted_params") or {},
-                                  actor="conductor")
+                    parked = put_directive(
+                        c["ddb"], subject,
+                        decision=str(args.get("decision", "")),
+                        rationale=str(args.get("rationale", "")),
+                        adjusted_params=args.get("adjusted_params") or {},
+                        actor="conductor")
+                    if not parked["reachable"]:
+                        # Rejected back to the conductor, not returned as a verdict:
+                        # a rejection it can still act on (relaunch the stage via
+                        # launch_run, or page_human) in the SAME turn. Returning here
+                        # would end the triage having done nothing, which is the bug.
+                        messages = _tool_result_content(tu, {
+                            "status": "undeliverable",
+                            "run_status": parked["run_status"],
+                            "reason": (
+                                f"run {subject} is {parked['run_status']}: its execution "
+                                "has ended, so no agent will ever read this directive. "
+                                "The decision is recorded for audit but CHANGES NOTHING. "
+                                "To act on it, relaunch the work with launch_run "
+                                "(carrying your adjusted_params), or call page_human if "
+                                "that is above your authority.")})
+                        continue
                 _invoke(c["agentcore"], event["harness_id"], sess,
                         _tool_result_content(tu, {"status": "recorded"}),
                         event.get("qualifier"))
