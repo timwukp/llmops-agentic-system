@@ -44,6 +44,13 @@ ENV = {
     "DRIVER_FN": "llmops-harness-driver",
     "PROJECT": "llmops-agentic-system",
     "AWS_REGION": "us-east-1",
+    # Without this, _resolve_harness_arn falls through to a live ssm:GetParameter for
+    # /llmops/harness/finops. Any test that drives the handler LOOP (rather than
+    # calling handle_finops_tool directly) reaches it -- and it passed on a laptop
+    # with credentials while failing in CI with NoCredentialsError. tests/conftest.py
+    # now makes that impossible to miss again.
+    "HARNESS_ARN_LLMOPS_FINOPS":
+        "arn:aws:bedrock-agentcore:us-east-1:123456789012:harness/llmops_finops-TESTSUFFIX",
 }
 
 
@@ -508,7 +515,14 @@ def test_flag_variance_continues_the_loop_with_its_own_acknowledgement():
     turn would re-send the PREVIOUS message: the same finding flagged forever, or a
     toolResult answering a call that was already answered. The existing tests call
     handle_finops_tool directly and so never see the loop; pyflakes flagged it as an
-    unused local, and only a loop-level test shows what it costs."""
+    unused local, and only a loop-level test shows what it costs.
+
+    It also asserts the RETURN VALUE, because the first version of this test did not.
+    Its fake publish_cost_report omitted the mandatory ``settlement`` field, so the
+    report was rejected, the loop ran out of re-asks, and the run ended in
+    ``missing stage_complete`` -- yet the turn-2 assertions below all passed, because
+    turn 2 happens before any of that. A loop test that never checks where the loop
+    ENDED will keep passing while the loop dies two turns later."""
     ac = _FakeAgentCore([
         _Stream("flag_variance", {
             "run_id": "run-a", "estimate_usd": 10.0, "actual_usd": 30.0,
@@ -516,12 +530,13 @@ def test_flag_variance_continues_the_loop_with_its_own_acknowledgement():
             "recommendation": "raise the throughput constant"}),
         _Stream("publish_cost_report", {
             "report_uri": REPORT_URI, "period": "2026-07-29",
-            "total_actual_usd": 30.0}),
+            "total_usd": 30.0, "settlement": "provisional",
+            "headline": "spend up 200% on training"}),
     ])
     c = _clients()
     c["agentcore"] = ac
-    driver.handler(dict(FINOPS_EVENT, harness_id="llmops_finops", task_token=None),
-                   clients=c)
+    out = driver.handler(dict(FINOPS_EVENT, harness_id="llmops_finops",
+                              task_token=None), clients=c)
 
     # turn 2 must carry flag_variance's OWN acknowledgement, matched by toolUseId
     second = ac.calls[1]["messages"]
@@ -531,6 +546,11 @@ def test_flag_variance_continues_the_loop_with_its_own_acknowledgement():
     assert echo["name"] == "flag_variance"
     assert tr["toolUseId"] == echo["toolUseId"]
     assert json.loads(tr["content"][0]["text"])["status"] == "recorded"
+
+    # ...and the loop must then finish on the terminal tool, not exhaust its re-asks.
+    assert out["status"] == "completed", out
+    assert out["tool"] == "publish_cost_report"
+    assert len(ac.calls) == 3, "one turn per stream plus the terminal ack"
 
 
 # ── driver: flag_variance ─────────────────────────────────────────────────────
