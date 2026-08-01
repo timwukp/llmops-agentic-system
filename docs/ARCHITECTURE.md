@@ -220,16 +220,28 @@ salvage retry when a stream dies mid-turn.
 
 ## 11. VPC posture for production
 
-Dev harness configs (`agents/*/harness.json`) run PUBLIC-network for iteration speed.
-Production variants (`agents/*/harness.prod.json`) and the Lambdas run **VPC-isolated
-with interface endpoints — no internet egress** (`deploy/02_network.py`). Two forcing
-functions:
+Harness configs (`agents/*/harness.json`) run PUBLIC-network for iteration speed. The
+VPC itself is built by `deploy/02_network.py` and the Lambdas can run **VPC-isolated with
+interface endpoints — no internet egress**.
 
-- VPC-mode harnesses can't reach GitHub, so production skills mount from an **S3-mirrored
-  snapshot** (`deploy/05_mirror_skills.py`) instead of the git source.
-- That is also correctness, not just connectivity: the git skill source reads the default
-  branch only, so main-branch drift would silently change production agent behavior.
-  The S3 mirror pins what production agents actually run.
+**Not yet built** (tracked as the s3-skill-source work): the VPC-mode harness variants
+and the S3 skill mirror they require. All **19 skill sources across the 7 harnesses are
+`git` sources today; none are `s3`** — verified by
+`tests/test_docs_claims.py::test_the_skill_source_claims_match_the_harness_configs`,
+which reads the configs rather than trusting this paragraph. Earlier revisions of this
+file described `agents/*/harness.prod.json` and `deploy/05_mirror_skills.py` as existing;
+both paths do not exist, and never have in any branch, so that was a design being read as
+a shipped feature.
+
+Two forcing functions make the mirror a prerequisite for VPC mode rather than an
+optimization:
+
+- VPC-mode harnesses can't reach GitHub, so a git skill source cannot resolve at all —
+  and a bad or unreachable source fails at **session start**, not at `UpdateHarness`, so
+  the harness would be accepted and then fail every invocation.
+- It is also correctness, not just connectivity: the git skill source reads the default
+  branch only (there is no branch field), so main-branch drift in the skills repo
+  silently changes production agent behavior. An S3 snapshot pins what agents run.
 
 ## 12. The auditor is outside the state machine, and read-only
 

@@ -201,14 +201,24 @@ Lambda 硬上限 **900 秒**，而 harness 回合預算（`timeoutSeconds`）是
 
 ## 11. 生產環境的 VPC 態勢
 
-開發配置（`agents/*/harness.json`）走 PUBLIC 網絡以求迭代速度。生產變體
-（`agents/*/harness.prod.json`）與 Lambda 都**在 VPC 內隔離運行，走 interface
-endpoints —— 無互聯網出口**（`deploy/02_network.py`）。兩個硬性理由：
+harness 配置（`agents/*/harness.json`）走 PUBLIC 網絡以求迭代速度。VPC 本身由
+`deploy/02_network.py` 建立，Lambda 可以**在 VPC 內隔離運行，走 interface
+endpoints —— 無互聯網出口**。
 
-- VPC 模式的 harness 連不上 GitHub，因此生產技能從 **S3 鏡像快照**掛載
-  （`deploy/05_mirror_skills.py`），而非 git 來源。
-- 這也是正確性問題而不只是連通性：git 技能來源只讀默認分支，main 分支漂移會靜默改變
-  生產 agent 的行為。S3 鏡像釘死了生產 agent 實際運行的內容。
+**尚未實作**（追蹤於 s3 技能來源的工作項）：VPC 模式的 harness 變體，以及它所需要的
+S3 技能鏡像。目前 **7 個 harness 上的 19 個技能來源全部是 `git`，沒有一個是 `s3`** ——
+由 `tests/test_docs_claims.py::test_the_skill_source_claims_match_the_harness_configs`
+讀取實際配置驗證，而不是相信這段文字。本文件的先前版本把
+`agents/*/harness.prod.json` 與 `deploy/05_mirror_skills.py` 寫成既有檔案；這兩個檔案
+在任何分支都從未存在過，也就是把一個設計當成已交付的功能在讀。
+
+兩個硬性理由讓鏡像成為 VPC 模式的前置條件，而不只是優化：
+
+- VPC 模式的 harness 連不上 GitHub，所以 git 技能來源根本無法解析 —— 而來源錯誤或無法
+  連線是在 **session 啟動時**才失敗，不是在 `UpdateHarness` 時，所以 harness 會被接受，
+  然後每一次 invocation 都失敗。
+- 這也是正確性問題而不只是連通性：git 技能來源只讀默認分支（沒有 branch 欄位），
+  技能 repo 的 main 分支漂移會靜默改變生產 agent 的行為。S3 快照釘死 agent 實際運行的內容。
 
 ## 12. 審計員在狀態機之外，而且是唯讀的
 

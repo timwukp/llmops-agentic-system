@@ -21,6 +21,7 @@ reader happens to open.
 """
 from __future__ import annotations
 
+import json
 import pathlib
 import re
 import subprocess
@@ -28,6 +29,13 @@ import sys
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 DOCS = (REPO / "docs" / "TEST_RESULTS.md", REPO / "docs" / "TEST_RESULTS.zh-TW.md")
+
+#: Docs that state how many skill sources exist, and of which kind.
+DOC_SKILL_CLAIMS = (REPO / "AGENTS.md", REPO / "SECURITY.md", REPO / "PROJECT_STATE.md",
+                    REPO / "README.md", REPO / "README.zh-TW.md",
+                    REPO / "docs" / "ARCHITECTURE.md",
+                    REPO / "docs" / "ARCHITECTURE.zh-TW.md",
+                    REPO / "agents" / "README.md")
 
 #: Counts in the docs are written as **N passed** / **N/N passed** / **N/N 通過**.
 _CLAIM = re.compile(r"\*\*(\d+)(?:/(\d+))?\s*(?:passed|通過)\*\*")
@@ -76,3 +84,99 @@ def test_both_language_variants_make_the_same_count_claims():
     assert first == second, (
         f"the bilingual evidence pair disagrees about its own numbers: {per_doc}. "
         "Same evidence, two audiences -- update them together.")
+
+
+def _skill_sources() -> dict[str, dict[str, int]]:
+    """Count skill sources per harness config, by source kind.
+
+    Reads the configs rather than any prose, because the prose is what drifted: seven
+    docs described `agents/*/harness.prod.json` and `deploy/05_mirror_skills.py` as
+    shipped, and neither file has ever existed in any branch. A design read as a
+    delivered feature is worse than an omission -- it stops anyone from building it.
+    """
+    counts = {}
+    for cfg in sorted((REPO / "agents").glob("*/harness*.json")):
+        kinds = {}
+        for skill in json.loads(cfg.read_text()).get("skills") or []:
+            for kind in ("git", "s3", "path", "awsSkills"):
+                if kind in skill:
+                    kinds[kind] = kinds.get(kind, 0) + 1
+        counts[str(cfg.relative_to(REPO))] = kinds
+    return counts
+
+
+def test_the_skill_source_claims_match_the_harness_configs():
+    """The docs state 19 git sources and 0 s3. Derive both from the configs.
+
+    Stating "19 git, 0 s3" in prose is exactly the kind of claim that was false here
+    before, so it is checked against the files. When the s3 migration lands, this test
+    fails and names the new numbers -- which is the point: the docs must move with it,
+    in the same commit, or the next reader is told the migration never happened.
+    """
+    counts = _skill_sources()
+    git_n = sum(k.get("git", 0) for k in counts.values())
+    s3_n = sum(k.get("s3", 0) for k in counts.values())
+    claims = []
+    for doc in DOC_SKILL_CLAIMS:
+        text = doc.read_text()
+        for m in re.finditer(r"(\d+)\s+(?:skill sources|sources)", text):
+            claims.append((doc.name, int(m.group(1))))
+        for m in re.finditer(r"(\d+)\s*個(?:技能)?來源", text):
+            claims.append((doc.name, int(m.group(1))))
+    # Per-doc, not "at least one doc". Requiring only one leaves the guard satisfied
+    # while the count is quietly deleted from the other seven -- the check would then be
+    # anchored to whichever file still happens to mention it. Each doc in the list either
+    # states the count or is not in the list.
+    stating = {name for name, _ in claims}
+    silent = [d.name for d in DOC_SKILL_CLAIMS if d.name not in stating]
+    assert not silent, (
+        f"these docs no longer state a skill-source count: {silent}. The counts were "
+        "wrong before, so dropping them removes the check rather than passing it. Either "
+        "state the count or remove the file from DOC_SKILL_CLAIMS deliberately.")
+    wrong = [f"{name} says {n}, configs have {git_n} git sources"
+             for name, n in claims if n != git_n]
+    assert not wrong, "; ".join(wrong) + f" (per-config: {counts})"
+    assert s3_n == 0 or git_n == 0, (
+        f"skill sources are now MIXED ({git_n} git, {s3_n} s3): {counts}. A partial "
+        "migration means some harnesses read a pinned snapshot and others float on the "
+        "skill repo's default branch, which is the drift the migration exists to stop. "
+        "Update the docs and this guard together.")
+
+
+def test_no_doc_claims_a_file_that_does_not_exist():
+    """Seven docs pointed at two files that were never committed on any branch.
+
+    `deploy/05_mirror_skills.py` and `agents/*/harness.prod.json` were cited as the
+    production skill-mirror mechanism. Both absent -- so "production uses an S3 mirror"
+    read as a shipped property of the system while all 19 sources were git.
+    """
+    cited = {}
+    pattern = re.compile(r"`((?:deploy|agents|tests|tools|pipeline)/[A-Za-z0-9_./*-]+)`")
+    # A path may be named precisely BECAUSE it does not exist -- the corrected prose says
+    # so explicitly. Flagging those would force the docs to stop naming the gap, which is
+    # the opposite of the fix. So a citation is exempt when its own line marks it absent,
+    # and only there: the marker has to be next to the path, not elsewhere in the file.
+    absent_markers = ("not exist", "never existed", "unbuilt", "not built", "no such file",
+                      "has yet", "尚未", "從未存在", "不存在")
+    # Paths belonging to OTHER repos are cited next to that repo's link, on the same line.
+    external = re.compile(r"https?://github\.com/")
+    for doc in sorted(REPO.glob("*.md")) + sorted((REPO / "docs").glob("*.md")) + [
+            REPO / "deploy" / "README.md", REPO / "agents" / "README.md"]:
+        if not doc.exists():
+            continue
+        # Scope is the PARAGRAPH, not the line: prose wraps, so "...`deploy/05_mirror_skills.py`\n
+        # has never existed" puts the path and its disclaimer on different lines. A
+        # line-scoped check re-flags exactly the corrected text it was meant to allow.
+        for para in re.split(r"\n\s*\n", doc.read_text()):
+            if any(mark in para for mark in absent_markers) or external.search(para):
+                continue
+            for m in pattern.finditer(para):
+                path = m.group(1)
+                missing = (not list(REPO.glob(path))) if "*" in path \
+                    else (not (REPO / path).exists())
+                if missing:
+                    cited.setdefault(path, []).append(doc.name)
+    assert not cited, (
+        "docs cite repo paths that do not exist: "
+        + "; ".join(f"{p} (in {', '.join(sorted(set(d)))})" for p, d in sorted(cited.items()))
+        + ". Either build the file, or say plainly that it does not exist yet.")

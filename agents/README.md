@@ -29,5 +29,7 @@ training jobs (Step Functions `waitForTaskToken` resumes a fresh session on job 
 
 **Dev vs prod variants:** `harness.json` (this directory) is the **dev** variant — PUBLIC
 network, skills mounted from the git source (`timwukp/MLOps-agent-skills`, default branch).
-The **prod** variant (`harness.prod.json`, added in Phase 6) uses VPC network mode with an
-S3-mirrored skill snapshot, since VPC mode cannot reach GitHub and git skills float on main.
+A **prod** variant (`harness.prod.json`) would use VPC network mode with an S3-mirrored
+skill snapshot, since VPC mode cannot reach GitHub and git skills float on main. **No such
+file exists for any agent** — `05_harnesses.py --prod` looks for one, but the variants and
+the S3 mirror are both unbuilt. All 19 skill sources here are `git`.
