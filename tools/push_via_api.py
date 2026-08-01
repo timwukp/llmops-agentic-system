@@ -123,7 +123,14 @@ class GitHub:
     def __init__(self, repo: str, token: str):
         self.repo, self.token = repo, token
 
-    def call(self, path: str, data=None, method: str | None = None):
+    def call(self, path: str, data=None, method: str | None = None,
+             absent_ok: bool = False):
+        """Call the API. `absent_ok` turns a 404 into None instead of exiting.
+
+        Only the ref lookup passes absent_ok: "this branch does not exist yet" is a
+        normal state for the first push of a PR branch, whereas a 404 on a blob or
+        tree write is a real failure and must still be fatal.
+        """
         req = urllib.request.Request(
             f"{API}/repos/{self.repo}{path}",
             data=json.dumps(data).encode() if data is not None else None,
@@ -135,6 +142,8 @@ class GitHub:
             with urllib.request.urlopen(req) as resp:
                 return json.load(resp)
         except urllib.error.HTTPError as exc:
+            if exc.code == 404 and absent_ok:
+                return None
             raise SystemExit(f"GitHub {exc.code} on {method or 'GET'} {path}: "
                              f"{exc.read().decode()[:500]}") from exc
 
@@ -156,11 +165,37 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("no token from `gh auth token`")
     gh = GitHub(repo, token)
 
-    remote_sha = gh.call(f"/git/ref/heads/{args.branch}")["object"]["sha"]
+    ref = gh.call(f"/git/ref/heads/{args.branch}", absent_ok=True)
+    creating = ref is None
+    if creating:
+        # First push of a PR branch. The old code took the 404 as fatal and every new
+        # branch had to be conjured by hand with `gh api` before this tool would run --
+        # which is exactly the hand-rolled path this tool exists to replace, so the
+        # gap put the risky steps back in human hands at the riskiest moment.
+        #
+        # The base is only the PARENT here; content correctness does not rest on it,
+        # because the tree is built by diffing local HEAD against the base and then
+        # checked against local HEAD's own tree at the end. So prefer HEAD's parent
+        # when the remote already has it (the branch then reads as a child of where it
+        # was actually cut) and fall back to the default branch head otherwise.
+        parent = git("rev-parse", "HEAD^") if git(
+            "rev-list", "--count", "HEAD") != "1" else ""
+        if parent and gh.call(f"/git/commits/{parent}", absent_ok=True):
+            remote_sha = parent
+        else:
+            default = gh.call("")["default_branch"]
+            remote_sha = gh.call(f"/git/ref/heads/{default}")["object"]["sha"]
+            print(f"HEAD's parent is not on the remote; basing {args.branch} on "
+                  f"{default} @ {remote_sha[:10]}")
+    else:
+        remote_sha = ref["object"]["sha"]
     # The remote head must be a local object or the diff base is a guess.
     if subprocess.run(["git", "cat-file", "-e", f"{remote_sha}^{{commit}}"],
                       capture_output=True).returncode != 0:
-        subprocess.run(["git", "fetch", "-q", "origin", args.branch], check=True)
+        # Fetch the sha itself, not args.branch: on a create there is no such remote
+        # branch to fetch, and check=True would abort on git's non-zero exit.
+        subprocess.run(["git", "fetch", "-q", "origin", remote_sha],
+                       capture_output=True)
     if subprocess.run(["git", "cat-file", "-e", f"{remote_sha}^{{commit}}"],
                       capture_output=True).returncode != 0:
         raise SystemExit(f"remote head {remote_sha[:10]} is not in the local object "
@@ -172,7 +207,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"remote {args.branch} already matches HEAD tree; nothing to push")
         return 0
 
-    print(f"{repo} {args.branch}: {remote_sha[:10]} -> tree of {head[:10]}")
+    verb = "create from" if creating else "advance"
+    print(f"{repo} {args.branch}: {verb} {remote_sha[:10]} -> tree of {head[:10]}")
     for op in ops:
         moved = f" (was {op['old_path']})" if op["old_path"] else ""
         chmod = f" mode {op['old_mode']}->{op['new_mode']}" \
@@ -192,7 +228,14 @@ def main(argv: list[str] | None = None) -> int:
     message = args.message or git("log", "-1", "--format=%B")
     commit = gh.call("/git/commits", {"message": message, "tree": tree,
                                      "parents": [remote_sha]})
-    gh.call(f"/git/refs/heads/{args.branch}", {"sha": commit["sha"]}, method="PATCH")
+    if creating:
+        # POST /git/refs with a full ref name creates; PATCH would 404 on a ref that
+        # does not exist yet, which is the whole reason this branch of the code exists.
+        gh.call("/git/refs", {"ref": f"refs/heads/{args.branch}",
+                              "sha": commit["sha"]})
+    else:
+        gh.call(f"/git/refs/heads/{args.branch}", {"sha": commit["sha"]},
+                method="PATCH")
 
     local_tree = git("rev-parse", f"{head}^{{tree}}")
     if tree != local_tree:
