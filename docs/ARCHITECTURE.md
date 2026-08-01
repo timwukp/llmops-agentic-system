@@ -246,7 +246,7 @@ across other runs' data.
 So it sits beside `llmops_orchestrator`, above the spine: **the conductor decides what to spend,
 the auditor reports what was spent.**
 
-Its IAM is read-only on billing (`ce:Get*`, `pricing:*`, `budgets:DescribeBudgets`) and it has no
+Its IAM is read-only on billing (`ce:Get*`, `pricing:*`, `budgets:ViewBudget`) and it has no
 authority to terminate anything. Two reasons, and the second is the load-bearing one:
 
 - An auditor must not be able to change what it audits.
