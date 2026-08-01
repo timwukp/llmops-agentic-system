@@ -368,6 +368,51 @@ class TestDriver:
         assert ("s3://llmops-data-test/reports/run-latest/test-report-latest.json"
                 in c["s3"].objects)
 
+    def test_a_failed_report_write_still_settles_the_task_token(self):
+        """The root cause of run-20260731T183103Z-8b864805's 7200-second stall.
+
+        data-prep finished teacher generation at its approved cap and called
+        stage_complete (twice: 19:23:49, 19:26:20). The canonical-report put_object then
+        died on AccessDenied -- the driver had no s3:PutObject until 19:30 -- and that
+        exception sat directly in front of send_task_success. The token was never
+        settled, so it parked for the whole 7200s TimeoutSeconds, and the console
+        reported "Data Prep · Generate failed" for work already verified on S3.
+
+        The IAM grant is fixed, but the ORDER is the real defect: the report is a
+        dashboard convenience, the token is the pipeline's only channel for learning
+        that a paid-for stage succeeded. So this pins the guarantee rather than the
+        AccessDenied: whatever makes the report write fail, the token still gets
+        settled, and the failure is reported rather than swallowed.
+        """
+        uri = "s3://llmops-data-test/runs/run-test-1/raw/data.jsonl"
+        ac = FakeAgentCore([
+            tool_use_stream("stage_complete",
+                            {"stage": "data-prep", "task": "generate",
+                             "outputs": [uri], "metrics": {"count": 2000}}),
+            text_stream("ack")])
+        c = clients(ac, FakeS3(existing=[uri]))
+        c["s3"].objects["s3://llmops-data-test/runs/run-test-1/manifest.json"] = json.dumps(
+            {"run_id": "run-test-1", "stages": {}})
+
+        def _denied(Bucket, Key, Body, **kw):
+            raise Exception("AccessDenied: s3:PutObject on reports/run-latest/...")
+        c["s3"].put_object = _denied
+
+        out = driver.handler(driver_event(), clients=c)
+        assert out["status"] == "completed", "the stage DID complete; its work is on S3"
+        assert c["sfn"].successes, (
+            "the report write failed and took the task token with it -- this is the "
+            "7200-second stall: finished, paid-for work that the pipeline never heard "
+            "about, shown to the operator as a failure")
+        assert not c["sfn"].failures, "a cosmetic write must not fail a healthy stage"
+        # And it must not be silent: a report the console will serve stale needs to say so.
+        payload = json.loads(c["sfn"].successes[0]["output"])
+        assert "AccessDenied" in payload.get("report_write_failed", ""), (
+            "swallowing the error trades a 2-hour stall for an invisible stale report")
+        rows = [i for t in c["ddb"].tables.values() for i in t.items]
+        assert any("report_write_failed" in json.dumps(r, default=str) for r in rows), (
+            "the failure must also land in stage-events, or the stale report is invisible")
+
     def test_stage_complete_rejected_when_outputs_missing(self):
         uri = "s3://llmops-data-test/runs/run-test-1/raw/missing.jsonl"
         ac = FakeAgentCore([
@@ -508,21 +553,26 @@ class TestDriver:
 
         uri = "s3://llmops-test/runs/r/out.json"
 
-        class _DeniedWrite(FakeS3):
-            """Reads fine, denies the report write -- the live shape exactly: the
-            agent's outputs verified, then put_object raised on the ONE key the
-            driver's role had no grant for."""
-            def put_object(self, Bucket, Key, Body, **kw):
+        # The live trigger was the report write. That specific step is now isolated --
+        # it degrades to a warning precisely so it can never park a token again (see
+        # test_a_failed_report_write_still_settles_the_task_token), so it can no longer
+        # serve as this test's crash. The GUARANTEE here is not about S3: it is that
+        # ANY unexpected exception raised while a token is held gets reported. Pinned
+        # to the stage-events write, which is genuinely fatal and runs before it.
+        class _DeniedEvents(FakeDDB):
+            """The audit write raises -- an AccessDenied on the stage-events table has
+            exactly the shape the S3 denial had: real work done, then a crash in the
+            bookkeeping that follows it, while a task token is held."""
+            def Table(self, name):
                 raise RuntimeError(
-                    "An error occurred (AccessDenied) when calling the PutObject "
-                    f"operation: s3:PutObject on {Bucket}/{Key}")
+                    "An error occurred (AccessDenied) when calling the UpdateItem "
+                    f"operation: dynamodb:PutItem on {name}")
 
         ac = FakeAgentCore([tool_use_stream("stage_complete", {"outputs": [uri]}),
                             text_stream("ack")])
         c = clients(ac)
-        c["s3"] = _DeniedWrite(existing=[uri])
-        # the manifest must load, or the driver never reaches the report write --
-        # which is where the live grant was missing
+        c["s3"] = FakeS3(existing=[uri])
+        c["ddb"] = _DeniedEvents()
         c["s3"].objects["s3://llmops-data-test/runs/run-test-1/manifest.json"] = json.dumps(
             {"run_id": "run-test-1", "stages": {}})
         event = driver_event()
@@ -538,7 +588,7 @@ class TestDriver:
             "21600s for finetune) while the run record still says 'running'")
         assert failures[0]["taskToken"] == "tok-parked"
         cause = json.dumps(failures[0])
-        assert "AccessDenied" in cause or "PutObject" in cause, (
+        assert "AccessDenied" in cause or "PitItem" in cause or "PutItem" in cause, (
             "the failure must carry the real cause; 'the stage failed' with the "
             "reason only in CloudWatch is what made this take a night to find")
 
@@ -546,14 +596,15 @@ class TestDriver:
         """The console's dispatch path invokes the driver synchronously with no token.
         Swallowing the exception there would turn a hard failure into a silent success,
         which is worse than the parked token. Re-raise unless the token was settled."""
-        class _Boom(FakeS3):
-            def put_object(self, Bucket, Key, Body, **kw):
+        class _Boom(FakeDDB):
+            def Table(self, name):
                 raise RuntimeError("kaboom")
 
         ac = FakeAgentCore([tool_use_stream("stage_complete", {"outputs": ["s3://b/k"]}),
                             text_stream("ack")])
         c = clients(ac)
-        c["s3"] = _Boom(existing=["s3://b/k"])
+        c["s3"] = FakeS3(existing=["s3://b/k"])
+        c["ddb"] = _Boom()
         c["s3"].objects["s3://llmops-data-test/runs/run-test-1/manifest.json"] = json.dumps(
             {"run_id": "run-test-1", "stages": {}})
         event = driver_event()

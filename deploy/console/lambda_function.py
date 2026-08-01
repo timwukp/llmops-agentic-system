@@ -247,6 +247,17 @@ STATE_TO_STAGE = {
 }
 TERMINAL_FAIL_STATES = {"EscalateFail", "Fail"}
 
+#: The error a stage reports when it stopped to ASK a human, set by the driver's
+#: handle_escalate (send_task_failure error="EscalatedToHuman").
+#:
+#: Reaching EscalateFail is NOT that signal, and treating it as one was wrong: the
+#: state is the Catch target of 9 of the 11 stages, so every crash goes through it
+#: too. A first pass at this used `escalated = name in TERMINAL_FAIL_STATES` and
+#: painted genuine crashes amber; its negative-control test only passed because the
+#: hand-written crash history omitted EscalateFail, which no real crashed run does.
+#: The error string is the one place the two are actually distinguishable.
+ESCALATION_ERRORS = {"EscalatedToHuman"}
+
 
 def _exec_arn(execution):
     if execution.startswith("arn:"):
@@ -254,12 +265,63 @@ def _exec_arn(execution):
     return f"arn:aws:states:{REGION}:{ACCOUNT_ID}:execution:{STATE_MACHINE}:{execution}"
 
 
+#: Static per-stage config for the hover card, read from the DEPLOYED definition once
+#: per container. Read, not hardcoded: the whole point of the card is to answer "which
+#: AgentCore runtime is behind this box, and with what timeout" -- a second copy in
+#: this file would answer for the version the console was packaged with, which is
+#: exactly the kind of confidently-wrong answer the operator cannot detect.
+_STAGE_CFG_CACHE = {}
+
+
+def stage_config():
+    if _STAGE_CFG_CACHE:
+        return _STAGE_CFG_CACHE
+    try:
+        sm = sfn.describe_state_machine(
+            stateMachineArn=f"arn:aws:states:{REGION}:{ACCOUNT_ID}:stateMachine:{STATE_MACHINE}")
+        states = json.loads(sm["definition"])["States"]
+    except Exception as exc:  # noqa: BLE001 — a hover card must never break the flow
+        _STAGE_CFG_CACHE["_error"] = f"{type(exc).__name__}: {exc}"
+        return _STAGE_CFG_CACHE
+    for name, st in states.items():
+        key = STATE_TO_STAGE.get(name)
+        if not key:
+            continue
+        pay = (st.get("Parameters") or {}).get("Payload") or {}
+        cfg = _STAGE_CFG_CACHE.setdefault(key, {})
+        # RemediateFinetune maps onto finetune-launch, so do not let the second state
+        # silently overwrite the first: record both state names it can run as.
+        cfg.setdefault("states", []).append(name)
+        for src, dst in (("harness_id", "harnessId"), ("stage", "stage"), ("task", "task")):
+            if pay.get(src):
+                cfg.setdefault(dst, pay[src])
+        if st.get("TimeoutSeconds"):
+            cfg.setdefault("timeoutSeconds", st["TimeoutSeconds"])
+        if st.get("HeartbeatSeconds"):
+            cfg.setdefault("heartbeatSeconds", st["HeartbeatSeconds"])
+        fn = (st.get("Parameters") or {}).get("FunctionName") or ""
+        if fn:
+            cfg.setdefault("lambda", fn.rsplit(":", 1)[-1])
+        if st.get("Retry"):
+            cfg.setdefault("maxAttempts", st["Retry"][0].get("MaxAttempts"))
+        cfg.setdefault("catch", [c.get("Next") for c in st.get("Catch", [])])
+        # The AgentCore runtime that actually serves this harness id. The driver
+        # invokes harness/<id>, which AWS backs with runtime/harness_<id>.
+        if cfg.get("harnessId"):
+            cfg.setdefault("runtime", f"harness_{cfg['harnessId']}")
+    return _STAGE_CFG_CACHE
+
+
 def pipeline_detail(execution=None):
     if not execution:
         exs = list_executions()
         if isinstance(exs, dict) or not exs:
-            return {"execution": None, "stages": [{"key": k, "label": l, "status": "pending"}
-                                                  for k, l in STAGE_FLOW], "iteration": 0}
+            # config included even with no execution: the hover card is documentation of
+            # the deployed pipeline, useful before the first run rather than only after.
+            return {"execution": None, "iteration": 0,
+                    "stages": [{"key": k, "label": l, "status": "pending",
+                                "config": stage_config().get(k, {})}
+                               for k, l in STAGE_FLOW]}
         execution = exs[0]["arn"]
     arn = _exec_arn(execution)
     d = sfn.describe_execution(executionArn=arn)
@@ -272,6 +334,11 @@ def pipeline_detail(execution=None):
 
     entered, exited = {}, {}  # logical stage -> counts
     iteration, escalated, last_entered = 0, False, None
+    # Per-stage forensics for the hover card: which SFN state, when, and how it ended.
+    # Collected in the same single pass over the history -- the history is already the
+    # most expensive call in this handler, and a second walk would double it.
+    detail = {}          # logical stage -> dict
+    cur_state = None     # state name of the most recent StateEntered, for error attribution
     token = None
     while True:
         kw = {"executionArn": arn, "maxResults": 1000}
@@ -282,32 +349,62 @@ def pipeline_detail(execution=None):
             det = ev.get("stateEnteredEventDetails")
             if det:
                 name = det.get("name", "")
+                cur_state = name
                 if name == "IncrementIteration":
                     iteration += 1
-                if name in TERMINAL_FAIL_STATES:
-                    escalated = True
                 st = STATE_TO_STAGE.get(name)
                 if st:
                     entered[st] = entered.get(st, 0) + 1
                     last_entered = st
+                    d0 = detail.setdefault(st, {})
+                    d0["state"] = name
+                    d0.setdefault("enteredAt", str(ev.get("timestamp", "")))
+                    d0["attempts"] = entered[st]
             det = ev.get("stateExitedEventDetails")
             if det:
                 st = STATE_TO_STAGE.get(det.get("name", ""))
                 if st:
                     exited[st] = exited.get(st, 0) + 1
+                    detail.setdefault(st, {})["exitedAt"] = str(ev.get("timestamp", ""))
+            # How a task ended, attributed to the stage whose state was last entered.
+            # TaskTimedOut carries error States.Timeout; a driver-reported failure
+            # carries the driver's own error string, which is the only place an
+            # escalation is distinguishable from a crash.
+            for fld in ("taskFailedEventDetails", "taskTimedOutEventDetails"):
+                td = ev.get(fld)
+                if not td:
+                    continue
+                err = td.get("error", "")
+                if err in ESCALATION_ERRORS:
+                    escalated = True
+                st = STATE_TO_STAGE.get(cur_state or "")
+                if st:
+                    d0 = detail.setdefault(st, {})
+                    d0["error"] = err
+                    d0["cause"] = str(td.get("cause", ""))[:400]
         token = h.get("nextToken")
         if not token:
             break
 
     terminal = exec_status != "RUNNING"
-    # A run that reached EscalateFail stopped to ASK something, and the stage it
-    # stopped in did not crash. Live: "Data Prep · Generate failed" was the first
-    # thing the operator saw, when in fact data-prep had hit the teacher-token cap
-    # its own approved plan set, written status=complete-at-cap, escalated with four
-    # costed options, and waited for a human -- until the 7200s task timeout. Red
-    # sends the operator to debug a stage that did exactly the right thing, and
-    # buries the thing that needs them: an unanswered question with money attached.
-    stop_status = "escalated" if escalated else "failed"
+
+    def _stop_status(key):
+        """"Waiting on a human" vs "broken", decided per STAGE from its own error.
+
+        Live: "Data Prep · Generate failed" was the first thing the operator saw. What
+        the stage actually did was stop -- but not to ask anything. It finished teacher
+        generation at its approved cap, called stage_complete twice (19:23:49, 19:26:20),
+        and the driver died on an S3 AccessDenied writing the canonical report BEFORE it
+        settled the task token, so the token parked until States.Timeout at 7200s.
+
+        So amber would be wrong here too, and the run-wide flag that produced it was
+        wrong in a second way: `escalated` was set from reaching EscalateFail, which is
+        the Catch target of 9 of the 11 stages. Every crash lands there. Only the
+        driver's error string separates "I asked you something" from "I broke".
+        """
+        return "escalated" if detail.get(key, {}).get("error") in ESCALATION_ERRORS \
+            else "failed"
+
     stages = []
     for key, label in STAGE_FLOW:
         n_in, n_out = entered.get(key, 0), exited.get(key, 0)
@@ -318,12 +415,14 @@ def pipeline_detail(execution=None):
         elif not terminal:
             status = "running"
         else:  # entered but never exited on a terminal execution
-            status = stop_status
-        stages.append({"key": key, "label": label, "status": status})
+            status = _stop_status(key)
+        stages.append({"key": key, "label": label, "status": status,
+                       "config": stage_config().get(key, {}),
+                       **detail.get(key, {})})
     if terminal and exec_status != "SUCCEEDED" and last_entered:
         for st in stages:  # make the stop location explicit even if the state "exited" into Fail
             if st["key"] == last_entered and st["status"] not in ("running",):
-                st["status"] = stop_status
+                st["status"] = _stop_status(st["key"])
     return {"execution": {"arn": arn, "name": arn.rsplit(":", 1)[-1], "status": exec_status,
                           "startDate": str(d.get("startDate", "")),
                           "stopDate": str(d.get("stopDate", ""))},
