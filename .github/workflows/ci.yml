@@ -39,6 +39,12 @@ jobs:
           echo "dry-runs OK"
       - name: Unit tests
         run: python -m pytest tests/ -q --ignore=tests/golden
-      - name: SVG geometry check (if diagrams exist)
-        run: |
-          ls docs/architecture-*.svg 2>/dev/null && python tests/check_svg_geometry.py docs/architecture-*.svg || echo "no SVGs yet"
+      - name: SVG geometry check
+        # Was: `ls *.svg && python check.py || echo "no SVGs yet"`. The trailing
+        # `||` catches the CHECKER's non-zero exit as well as a missing-file
+        # exit, so the step reported success on a broken layout -- a guard CI
+        # cannot fail. The diagrams are committed, so require them: no file is
+        # itself a failure now, not a reason to skip. (The checker is also
+        # collected by the pytest step above; this keeps the readable per-diagram
+        # report in the CI log.)
+        run: python tests/test_svg_geometry.py
