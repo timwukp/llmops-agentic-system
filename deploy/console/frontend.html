@@ -448,6 +448,10 @@ function stageColor(st){
   if (st==="running") return "#f5b342";
   if (st==="succeeded") return "#3ecf8e";
   if (st==="failed") return "#ff6b6b";
+  // amber, not red: the stage stopped to ask a human something (a budget cap, a
+  // gate it will not cross unattended). Waiting on us, not broken. Falling through
+  // to the default would have painted it as "pending" — the opposite of urgent.
+  if (st==="escalated") return "#f5b342";
   if (st==="skipped") return "#3a4577";
   return "#5a6491";  // pending
 }

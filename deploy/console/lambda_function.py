@@ -300,6 +300,14 @@ def pipeline_detail(execution=None):
             break
 
     terminal = exec_status != "RUNNING"
+    # A run that reached EscalateFail stopped to ASK something, and the stage it
+    # stopped in did not crash. Live: "Data Prep · Generate failed" was the first
+    # thing the operator saw, when in fact data-prep had hit the teacher-token cap
+    # its own approved plan set, written status=complete-at-cap, escalated with four
+    # costed options, and waited for a human -- until the 7200s task timeout. Red
+    # sends the operator to debug a stage that did exactly the right thing, and
+    # buries the thing that needs them: an unanswered question with money attached.
+    stop_status = "escalated" if escalated else "failed"
     stages = []
     for key, label in STAGE_FLOW:
         n_in, n_out = entered.get(key, 0), exited.get(key, 0)
@@ -310,12 +318,12 @@ def pipeline_detail(execution=None):
         elif not terminal:
             status = "running"
         else:  # entered but never exited on a terminal execution
-            status = "failed"
+            status = stop_status
         stages.append({"key": key, "label": label, "status": status})
     if terminal and exec_status != "SUCCEEDED" and last_entered:
-        for st in stages:  # make the failure location explicit even if the state "exited" into Fail
+        for st in stages:  # make the stop location explicit even if the state "exited" into Fail
             if st["key"] == last_entered and st["status"] not in ("running",):
-                st["status"] = "failed"
+                st["status"] = stop_status
     return {"execution": {"arn": arn, "name": arn.rsplit(":", 1)[-1], "status": exec_status,
                           "startDate": str(d.get("startDate", "")),
                           "stopDate": str(d.get("stopDate", ""))},
