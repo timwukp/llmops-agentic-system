@@ -53,6 +53,64 @@ STAGE_EVENT_MAP = {
 _AGENTCORE_CFG = BotoConfig(read_timeout=870, connect_timeout=30,
                             retries={"max_attempts": 0})
 
+#: The conductor's own run_id for a triage. NOT the escalated run's id, which is the
+#: obvious choice and is wrong twice over:
+#:
+#:   * take_directive() is keyed on event["run_id"], and the checkpoint branch is its
+#:     only caller. A triage invoked under the subject's id would pop the subject's own
+#:     parked verdict -- the one the conductor is about to write -- and hand it to the
+#:     conductor as an instruction from a human. The conductor would then be answering
+#:     itself.
+#:   * handle_escalate() and handle_job_launched() update the runs table keyed on
+#:     event["run_id"]. A triage that escalated in turn would overwrite the subject
+#:     run's status and job_name with the triage's.
+#:
+#: The subject run reaches the conductor as params.escalation.run_id, which is what the
+#: orchestrator prompt's triage clause already tells it to read.
+TRIAGE_STAGE = "orchestrator"
+TRIAGE_TASK = "triage"
+
+
+def _is_triage(event) -> bool:
+    return event.get("stage") == TRIAGE_STAGE and event.get("task") == TRIAGE_TASK
+
+
+def triage_event_from_bus(record: dict, bucket: str) -> dict:
+    """Turn an EventBridge EscalatedToHuman event into a driver invocation.
+
+    Done HERE, in Python, rather than in an EventBridge InputTransformer, for one
+    reason: a transformer that references a JSON path the event does not carry drops the
+    event silently -- no invocation, no failure, nothing on any metric that names this
+    pipeline. That is the exact class of defect this task exists to fix (an emitted
+    event with no listener), and an InputTransformer would let it back in through a
+    channel with even less visibility, since the ASL's own EscalateFail entry carries a
+    different key set from the driver's handle_escalate entry. A dict built in a
+    function is testable offline against every real emitter's payload.
+
+    manifest_uri is derived from the SUBJECT run, not the triage: the conductor's job is
+    to read the stuck run's manifest, and there is no manifest for a triage.
+    """
+    detail = record.get("detail") or {}
+    subject = str(detail.get("run_id") or "")
+    if not subject:
+        # An escalation with no run_id names nothing to triage. Better to fail loudly
+        # here than to invoke a conductor that will read an empty manifest URI.
+        raise ValueError(f"EscalatedToHuman with no run_id in detail: {detail!r}")
+    return {
+        "run_id": f"triage-{subject}",
+        "stage": TRIAGE_STAGE,
+        "task": TRIAGE_TASK,
+        "harness_id": "llmops_orchestrator",
+        "manifest_uri": f"s3://{bucket}/runs/{subject}/manifest.json",
+        "params": {"escalation": {
+            "run_id": subject,
+            "stage": detail.get("stage", ""),
+            "reason": detail.get("reason", ""),
+            "iteration": detail.get("iteration", 0),
+            "escalated_at": detail.get("emitted_at", ""),
+        }},
+    }
+
 
 def session_id(run_id: str, stage: str, task: str) -> str:
     """Deterministic, >=33 chars (AgentCore minimum). Same task -> same session."""
@@ -498,7 +556,12 @@ def handle_page_human(c, event, args: dict) -> dict:
     # opens is the stuck run's, not the conductor's.
     _record_stage_event(c["ddb"], subject_run or event.get("run_id", ""),
                         "orchestrator", "HumanPaged", brief)
-    ev.emit_event(os.environ["EVENT_BUS"], ev.ESCALATED_TO_HUMAN,
+    # OwnerPaged, NOT EscalatedToHuman. A page is what the conductor emits when it has
+    # ALREADY triaged and found the decision above its authority; EscalatedToHuman means
+    # "a conductor should look at this". Sharing one detail-type made the triage rule
+    # feed itself the moment that rule existed -- escalate -> triage -> page -> triage --
+    # and every lap is a real harness invocation billed against a decision already made.
+    ev.emit_event(os.environ["EVENT_BUS"], ev.OWNER_PAGED,
                   {"run_id": subject_run, "stage": "orchestrator",
                    "reason": situation[:500]}, client=c["events"])
     return {"ok": True, "run_id": subject_run}
@@ -604,8 +667,15 @@ def _maybe_failover_model(c, event) -> None:
             if ctl.get_harness(harnessId=harness_full_id)["harness"]["status"] == "READY":
                 break
             time.sleep(5)
-        ev.emit_event(os.environ["EVENT_BUS"], ev.ESCALATED_TO_HUMAN, {
+        # ModelFailedOver, NOT EscalatedToHuman. Nothing is being escalated: the
+        # failover already fixed it and the retry continues. This carried the word
+        # "informational" inside a reason string, which was harmless only while the bus
+        # had no rules -- an EventBridge pattern cannot read prose, so the first rule to
+        # route EscalatedToHuman to triage would have paged the conductor about a run
+        # that had just healed itself.
+        ev.emit_event(os.environ["EVENT_BUS"], ev.MODEL_FAILED_OVER, {
             "run_id": event.get("run_id", "?"), "stage": event.get("stage", "?"),
+            "from_model": current, "to_model": fallback,
             "reason": f"ModelFailover: {current} -> {fallback} (vendor 5xx burst); "
                       "informational, pipeline continuing"}, client=c["events"])
     except Exception:  # noqa: BLE001 — never let failover break the retry path
@@ -640,6 +710,11 @@ def handler(event, context=None, clients=None):
     silent success).
     """
     c = clients or _clients()
+    # An EventBridge delivery is not a state-machine payload. Recognised by its own
+    # envelope keys ("detail-type" + "detail") rather than by the absence of a task
+    # token, because plenty of legitimate driver invocations have no token.
+    if event.get("detail-type") == ev.ESCALATED_TO_HUMAN and "detail" in event:
+        event = triage_event_from_bus(event, os.environ["DATA_BUCKET"])
     try:
         return _run_stage(event, context, c)
     except Exception as exc:

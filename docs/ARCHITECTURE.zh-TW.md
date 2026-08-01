@@ -135,6 +135,45 @@ chat worker 處理它 —— 但 triage 從來不是 chat：`EscalatedToHuman` �
 出口，也不可能只接一半。此外，一次 page 若沒有同時帶 `situation` 與 `recommendation`
 就會被駁回：把問題丟給 owner 而不附上你已經做完的分析，等於讓他們留在原地。
 
+**發出去卻沒有 rule 的事件，是一個沒有路可以走的承諾。** 上面那段說 `EscalatedToHuman`
+事件「路由到的是 **driver**」。它並沒有。`llmops-pipeline` bus 從 Phase 1 到 Phase 5
+一共掛著**零**條 EventBridge rule，而這個 detail-type 有三處在發、在這份文件裡被寫成會
+路由到指揮家、而且有一個 driver 分支在服務它 —— 那個分支永遠不可能被觸達，`task="triage"`
+從來沒有被派發過一次。在活的 bus 上這是最安靜的失敗：`PutEvents` 成功、事件落地、什麼
+都沒發生。沒有錯誤、沒有 metric、沒有任何一行 log，因為「本來就沒有 rule」和「rule 掉了」
+是同一個觀察。現在 rule 存在了（`llmops-escalation-triage`，掛在**自訂** bus 上 ——
+旁邊那條 SageMaker rule 用的是預設 bus，因為服務事件只會落在那裡、搬不動，而把那個形狀
+照抄過來，會得到一條在 console 裡活著、健康、卻永遠匹配不到任何東西的 rule），而哪些
+detail-type **必須**有 listener，宣告在 contracts 的 `EVENTS_NEEDING_A_RULE` 裡，
+所以這個決定是離線被檢查的，而不是從「剛好存在哪些 rule」推論出來的。
+
+接這條線的過程中，有兩個 emitter 被迫**改名**，因為這個判別必須放在 EventBridge pattern
+讀得到的地方 —— pattern 讀不懂散文：
+
+- `_maybe_failover_model` 在廠商 5xx 突發後熱抽換模型，然後重試**繼續進行**。它卻以
+  `EscalatedToHuman` 的身分宣告自己，把「informational, pipeline continuing」這幾個字
+  埋在 reason 字串裡；這件事之所以無害，純粹是因為當時沒有人訂閱。第一條把這個
+  detail-type 路由到 triage 的 rule，就會為一個剛剛自己痊癒的 run 去呼叫指揮家。
+  它現在是 `ModelFailedOver`。
+- `handle_page_human` **也**發 `EscalatedToHuman` —— 但一次 page 是指揮家**已經**分診完、
+  判斷這個決定超出自己權限時才發出的，而 `EscalatedToHuman` 的意思是「該有一位指揮家來看
+  這件事」。兩者共用同一個 detail-type，會讓新 rule 自己餵自己：escalate → triage →
+  page → triage，每一圈都是一次真金白銀的 harness turn。它現在是 `OwnerPaged`，而且
+  rule **另外**排除 `stage: orchestrator` 作為第二道防線。那個排除用的是 `anything-but`，
+  而它對「根本沒有這個 key」的事件**不會**匹配 —— 所以本來只帶 `run_id` 與 `iteration` 的
+  `EscalateFail`，現在也帶上 `stage`。少了它，每一次終態的 pipeline 失敗（也就是最需要
+  分診的那些升級）都會被那個本來要保護它們的 filter 丟掉。
+
+一次 triage 也跑在自己**專屬**的合成 `run_id`（`triage-<subject>`）上，而不是被升級的那個
+run 的 id。`take_directive` 以 `event["run_id"]` 為 key，而 checkpoint 分支是它唯一的
+呼叫者，所以一個用受害 run 的 id 發動的 triage，會把那個 run 自己被停放的裁決 ——
+正是指揮家此刻正在寫的那一份 —— 取走，並當成來自負責人的指令收下。指揮家會變成在回答
+自己。受害 run 透過 `params.escalation.run_id` 抵達，那正是 prompt 的 triage 條款本來就
+會讀的欄位；而 manifest 用的是受害 run 的，因為 triage 自己沒有 manifest。這個 envelope
+是在 driver 的入口用 Python 轉譯的，而不是交給 EventBridge 的 `InputTransformer` ——
+理由跟這條 rule 存在的理由一樣：transformer 一旦引用到事件沒有的路徑就會靜默丟棄，
+而這個 detail-type 的兩個 emitter 帶的 key 集合本來就不一樣。
+
 **prefix 不是 filter。** 上面那個回答通道把裁決停放在 `directive#` 這個 sort key 下，而那個
 常數自己的註釋聲稱這個 prefix 讓它們「不出現在 console 渲染的 timeline 裡」。兩個 console
 reader 都沒有對它做過濾 —— 而這個 prefix 讓結果比「無害」**更糟**，不只是沒被投遞。

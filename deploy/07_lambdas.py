@@ -8,13 +8,14 @@ State machine is created/updated from orchestration/state_machine.asl.json with
 ${HarnessDriverArn} and ${EventBusName} substituted.
 
 --only selects among ALL targets, Lambdas and non-Lambdas alike (state_machine,
-resume_rule); a bare run still deploys everything.
+resume_rule, triage_rule); a bare run still deploys everything.
 
 Usage:
   python deploy/07_lambdas.py --region us-east-1 --dry-run
   python deploy/07_lambdas.py --region us-east-1
   python deploy/07_lambdas.py --region us-east-1 --only driver
   python deploy/07_lambdas.py --region us-east-1 --only state_machine   # ASL only
+  python deploy/07_lambdas.py --region us-east-1 --only triage_rule     # bus rule only
 """
 import argparse
 import io
@@ -28,6 +29,13 @@ import boto3
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 CONTRACTS = REPO / "pipeline" / "contracts"
+
+# The event vocabulary is imported, not re-spelled: a rule whose `source` or detail-type
+# disagrees with the emitter's by one character matches nothing, and a rule that matches
+# nothing is indistinguishable from a healthy one in the console. Same reason the driver
+# imports these constants instead of writing the strings inline.
+sys.path.insert(0, str(REPO))
+from pipeline.contracts import events as ev  # noqa: E402 — needs REPO on sys.path
 
 LAMBDAS = {
     "driver": {
@@ -227,6 +235,57 @@ def ensure_resume_rule(events, lam, region, account, dry):
     return {"rule": rule, "action": "ensured"}
 
 
+def ensure_triage_rule(events, lam, region, account, dry):
+    """EventBridge rule: EscalatedToHuman -> harness driver, as a conductor triage.
+
+    The llmops-pipeline bus carried ZERO rules from Phase 1 to Phase 5 while
+    EscalatedToHuman was emitted from three places, documented as routing to the
+    conductor, and serviced by a driver branch (#54's page_human fix) that nothing could
+    ever reach. Both halves of the channel existed; the wire between them did not.
+
+    The CUSTOM bus, not the default one -- unlike ensure_resume_rule, whose SageMaker
+    service events land on the default bus and cannot be moved. Omitting EventBusName
+    here would create a rule that is live, healthy, and matches nothing forever.
+
+    The pattern excludes stage="orchestrator" so a triage cannot trigger a triage. That
+    is not hypothetical: handle_page_human emitted EscalatedToHuman until this change,
+    so escalate -> triage -> page -> triage would have looped, each lap paying for a
+    real harness turn. page_human now emits OwnerPaged, and this exclusion is the second
+    line of defence for the next tool that reaches for the escalation vocabulary. Note
+    the coupling it creates: `anything-but` does not match an event with no `stage` key
+    at all, so an emitter that omits stage would be dropped silently -- a test asserts
+    every emitter in the repo carries one.
+    """
+    rule = "llmops-escalation-triage"
+    pattern = {
+        "source": [ev.EVENT_SOURCE],
+        "detail-type": [ev.ESCALATED_TO_HUMAN],
+        "detail": {"stage": [{"anything-but": ["orchestrator"]}]},
+    }
+    if dry:
+        return {"rule": rule, "would": "put_rule + target + permission",
+                "bus": "llmops-pipeline", "pattern": pattern}
+    events.put_rule(Name=rule, EventPattern=json.dumps(pattern), State="ENABLED",
+                    EventBusName="llmops-pipeline",
+                    Description="Route escalations to the conductor for first-line triage")
+    fn_arn = f"arn:aws:lambda:{region}:{account}:function:llmops-harness-driver"
+    # No InputTransformer: the driver translates the envelope in Python
+    # (triage_event_from_bus). A transformer referencing a path an event lacks drops it
+    # silently, and the two emitters of this detail-type carry different key sets.
+    events.put_targets(Rule=rule, EventBusName="llmops-pipeline",
+                       Targets=[{"Id": "triage", "Arn": fn_arn}])
+    try:
+        lam.add_permission(FunctionName="llmops-harness-driver",
+                           StatementId="eventbridge-escalation-triage",
+                           Action="lambda:InvokeFunction",
+                           Principal="events.amazonaws.com",
+                           SourceArn=f"arn:aws:events:{region}:{account}:rule/"
+                                     f"llmops-pipeline/{rule}")
+    except lam.exceptions.ResourceConflictException:
+        pass  # permission already exists
+    return {"rule": rule, "action": "ensured", "bus": "llmops-pipeline"}
+
+
 # --only selects among ALL of this script's targets, not just the Lambdas. The state
 # machine and the resume rule used to deploy unconditionally on every run, which made
 # --only the opposite of what it says: `--only driver` shipped the driver AND the ASL,
@@ -235,7 +294,7 @@ def ensure_resume_rule(events, lam, region, account, dry):
 # is deliberately held back pending an IAM widen; and a driver-only redeploy silently
 # published whatever the working tree's ASL happened to say. A targeted deploy has to
 # mean what it claims, because the whole reason to reach for --only is blast radius.
-NON_LAMBDA_TARGETS = ("state_machine", "resume_rule")
+NON_LAMBDA_TARGETS = ("state_machine", "resume_rule", "triage_rule")
 
 
 def main():
@@ -260,6 +319,8 @@ def main():
         results.append(deploy_state_machine(sfn, ssm, args.region, account, args.dry_run))
     if "resume_rule" in targets:
         results.append(ensure_resume_rule(events, lam, args.region, account, args.dry_run))
+    if "triage_rule" in targets:
+        results.append(ensure_triage_rule(events, lam, args.region, account, args.dry_run))
     print(json.dumps({"results": results, "targets": targets,
                       "dry_run": args.dry_run}, indent=2, default=str))
 
