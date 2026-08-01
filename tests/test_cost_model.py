@@ -22,6 +22,8 @@ sys.path.insert(0, str(REPO))
 
 from pipeline.contracts.cost_model import (  # noqa: E402
     CATEGORIES, DEFAULT_PROJECT_CUMULATIVE_LIMIT_USD, DEFAULT_SINGLE_RUN_LIMIT_USD,
+    MEASURED_INPUT_TOKENS_PER_SAMPLE, MEASURED_NONREASONING_OUTPUT_TOKENS,
+    MEASURED_REASONING_MULTIPLIER, MEASURED_REASONING_OUTPUT_TOKENS,
     MEASURED_ROWS_PER_SEC, MEASURED_SETUP_OVERHEAD_S, PROJECT_RESOURCE_PATTERNS,
     RATE_PRECEDENCE,
     REMEDIABLE_CATEGORIES, SKU_AGENTCORE_GB, SKU_AGENTCORE_MEMORY, SKU_AGENTCORE_VCPU,
@@ -211,6 +213,70 @@ def test_keep_reasoning_raises_the_teacher_output_line(rates):
     off = estimate_run(dict(PLAN, keep_reasoning=False), rates)
     assert on["subtotals"]["bedrock_teacher"] > off["subtotals"]["bedrock_teacher"]
     assert any("keep_reasoning=True" in i["basis"] for i in on["line_items"])
+
+
+def test_teacher_token_calibration_matches_the_measured_run():
+    """The 4.7x underestimate that the whole suite used to be blind to.
+
+    Before this guard the defaults were 700 output tokens x reasoning_multiplier 4.0 =
+    2,800/sample, and 393 tests passed anyway -- nothing anywhere pinned the largest
+    quantity in a distillation estimate. Three independent checkpoints of
+    run-20260731T183103Z-8b864805, all within 3% of each other:
+
+        24 attempts ->   323,226 out tokens = 13,468/attempt
+        36 attempts ->   471,496 out tokens = 13,097/attempt
+        70 attempts ->   922,088 out tokens = 13,173/attempt
+
+    The band below is the measurement, not a tolerance chosen to fit: 12,000-14,500
+    contains all three and excludes both 2,800 and any drift back toward it.
+    """
+    assert MEASURED_REASONING_OUTPUT_TOKENS == pytest.approx(13_125, abs=1)
+    # The product is what the estimator actually multiplies, so pin the product too --
+    # a base/multiplier pair that silently cancels out would otherwise pass.
+    product = MEASURED_NONREASONING_OUTPUT_TOKENS * MEASURED_REASONING_MULTIPLIER
+    assert product == pytest.approx(MEASURED_REASONING_OUTPUT_TOKENS, abs=1)
+    assert 12_000 <= product <= 14_500, "outside the measured 13.1-13.5k band"
+    assert MEASURED_INPUT_TOKENS_PER_SAMPLE == pytest.approx(2_014, abs=1)
+    # 922,088 / 70 is the strongest single checkpoint (largest n): stay within 10% of it.
+    assert abs(product - 922_088 / 70) / (922_088 / 70) < 0.10
+
+
+def test_the_estimate_would_have_caught_the_infeasible_teacher_cap(rates):
+    """The failure this recalibration exists to prevent, priced end to end.
+
+    run-20260731T183103Z-8b864805's plan promised 160 samples AND capped the teacher
+    line at $7.56 -- a cap computed from 2,800 tokens/sample. At the measured rate 160
+    samples cost ~$11.78, so the two halves of the same plan contradicted each other and
+    the run stopped at 70 samples (44%) having done nothing wrong. Under the old defaults
+    the estimate came out at $2.85, i.e. it AGREED with the infeasible cap.
+    """
+    est = estimate_run({"sample_count": 160, "train_rows": 0, "endpoint_hours": 0,
+                        "n_stages": 0, "support_usd": 0, "max_iterations": 1,
+                        "keep_reasoning": True}, rates)
+    teacher = est["subtotals"]["bedrock_teacher"]
+    assert teacher > 7.56, (
+        f"a ${teacher:.2f} estimate still fits under the cap that killed the run at 44% "
+        "-- the estimator is back to blessing an infeasible plan")
+    assert teacher == pytest.approx(11.78, rel=0.05)
+
+
+def test_an_estimate_says_where_its_largest_number_came_from(rates):
+    """Provenance, and only when it is earned.
+
+    The teacher output line is the biggest quantity in a distillation estimate, so it
+    must name its source. But if the PLAN overrides the tokens, the estimate must say
+    THAT instead -- attributing a caller's guess to our measurement would lend it
+    credibility it has not got, which is the same class of bug as the hover card's
+    concatenated runtime name.
+    """
+    est = estimate_run(dict(PLAN, keep_reasoning=True), rates)
+    assert any("run-20260731T183103Z-8b864805" in a for a in est["assumptions"]), \
+        "the measured teacher tokens carry no provenance"
+    over = estimate_run(dict(PLAN, teacher_output_tokens_per_sample=700,
+                             reasoning_multiplier=4.0), rates)
+    assert any("OVERRIDDEN by the plan" in a for a in over["assumptions"]), \
+        "a plan override is being passed off as our measurement"
+    assert not any("run-20260731T183103Z-8b864805" in a for a in over["assumptions"])
 
 
 def test_teardown_off_is_stated_as_an_assumption(rates):

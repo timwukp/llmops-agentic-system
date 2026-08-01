@@ -272,6 +272,125 @@ def _exec_arn(execution):
 #: exactly the kind of confidently-wrong answer the operator cannot detect.
 _STAGE_CFG_CACHE = {}
 
+#: Resolved AgentCore identity per LOGICAL harness id (llmops_data_prep -> the real
+#: suffixed harness + the runtime that serves it). Separate cache: the ASL walk below
+#: is pure parsing, this needs three AWS calls, and a failure in one must not blank
+#: the other.
+#:
+#: TTL'd, unlike _STAGE_CFG_CACHE, and the difference is the point. That cache holds the
+#: deployed state machine definition, which cannot change without a redeploy. This one
+#: holds STATUS -- runtimeStatus/harnessStatus. Caching health forever means a warm
+#: container keeps rendering "READY" for a harness that has since gone UPDATING or
+#: failed: a stale read presented as a live one, which is the exact bug class this
+#: function was written to remove. A guessed name and a 40-minute-old status are the
+#: same lie told two ways.
+_HARNESS_ID_CACHE = {}
+#: 60s: the flow diagram polls every 30s (frontend.html PIPE_TIMER), so this still
+#: collapses the fan-out (4 distinct harness ids x 9 calls each) while keeping any
+#: displayed status at most one poll stale.
+_HARNESS_ID_TTL_S = 60.0
+
+#: Account-wide listings shared across the harness ids resolved in one pass.
+_FLEET_WIDE_CACHE = {}
+
+
+def _fleet_wide(key, fetch):
+    """One account-wide listing per TTL, not one per harness id.
+
+    ListAgentRuntimes and list_fleet() answer for the whole account, so calling them
+    once per stage box asks the same question four times and bills for four. list_fleet()
+    is the expensive one: ListHarnesses plus a GetHarness per harness, so ~8 calls, and
+    the pipeline has 4 distinct harness ids across its 9 boxes -> ~40 calls where 10 do.
+    On a 30s poll that is a self-inflicted throttling risk on the operator's only live
+    view of the pipeline.
+
+    Shares _HARNESS_ID_TTL_S for the same reason that cache has one at all: these
+    listings carry status, and a cached status is a claim about right now.
+    """
+    hit = _FLEET_WIDE_CACHE.get(key)
+    if hit and time.time() - hit[0] < _HARNESS_ID_TTL_S:
+        return hit[1]
+    val = fetch()
+    _FLEET_WIDE_CACHE[key] = (time.time(), val)
+    return val
+
+
+def harness_identity(harness_id):
+    """Resolve what is ACTUALLY behind a stage box, the way the driver resolves it.
+
+    This used to be `f"harness_{harness_id}"` -- a string built by concatenation. It
+    happens to equal the runtime's *display name*, but nothing checked that, and the
+    name is the one part of the identity that is NOT unique. Live:
+
+        agentRuntimeName: harness_llmops_data_prep                 <- what we printed
+        agentRuntimeId  : harness_llmops_data_prep-D8SPwm7Kog      <- the real identity
+        SSM harness id  : llmops_data_prep-KuSKXUaxyP              <- what the driver invokes
+
+    So the card showed the least specific of three strings, unverified, and omitted the
+    id and ARN an operator needs to grep CloudWatch or match an ARN in the console. It
+    would also have kept printing that name after the runtime was deleted or renamed.
+    Every field here is READ; anything that fails to resolve says so rather than falling
+    back to a guess.
+
+    The suffix derivation is copied from the driver's _resolve_harness_arn on purpose:
+    if the two ever disagree, the card is naming a harness the pipeline does not invoke.
+    """
+    hit_cache = _HARNESS_ID_CACHE.get(harness_id)
+    if hit_cache and time.time() - hit_cache[0] < _HARNESS_ID_TTL_S:
+        return hit_cache[1]
+    out = {}
+    agent = harness_id.removeprefix("llmops_").replace("_", "-")
+    try:
+        out["harnessFullId"] = ssm.get_parameter(
+            Name=f"/llmops/harness/{agent}")["Parameter"]["Value"]
+    except Exception as exc:  # noqa: BLE001 — fail soft, per field
+        out["harnessIdError"] = f"{type(exc).__name__}: {exc}"
+
+    # Report the runtime only if a live one matches. Live-verified shapes:
+    #   agentRuntimeName = "harness_llmops_data_prep"              (NOT unique)
+    #   agentRuntimeId   = "harness_llmops_data_prep-D8SPwm7Kog"   (the identity)
+    # So match on the name -- which is what "harness_<logical id>" actually equals --
+    # but report the id, version and ARN, which are what an operator can act on. The
+    # lookup is the point: a name that is merely constructed keeps being printed after
+    # the runtime is renamed or deleted.
+    try:
+        want = {f"harness_{harness_id}"}
+        if out.get("harnessFullId"):
+            want.add(f"harness_{out['harnessFullId']}")
+        runtimes = _fleet_wide("runtimes",
+                               lambda: ctl.list_agent_runtimes().get("agentRuntimes", []))
+        hit = next((r for r in runtimes
+                    if r.get("agentRuntimeName") in want
+                    or r.get("agentRuntimeId") in want
+                    or str(r.get("agentRuntimeId", "")).rsplit("-", 1)[0] in want), None)
+        out["runtime"] = hit["agentRuntimeName"] if hit else "unresolved"
+        if hit:
+            for src, dst in (("agentRuntimeId", "runtimeId"),
+                             ("agentRuntimeVersion", "runtimeVersion"),
+                             ("status", "runtimeStatus")):
+                if hit.get(src):
+                    out[dst] = hit[src]
+    except Exception as exc:  # noqa: BLE001
+        out["runtime"] = "unresolved"
+        out["runtimeError"] = f"{type(exc).__name__}: {exc}"
+
+    # Health/model/version, reusing the fleet listing the overview tab already does --
+    # not a second listing path. On a red box the operator's next question is "is that
+    # harness even READY, and on which model", and that used to need another window.
+    try:
+        for h in _fleet_wide("fleet", list_fleet):
+            if h.get("name") == harness_id or h.get("id") == out.get("harnessFullId"):
+                for src, dst in (("status", "harnessStatus"), ("model", "model"),
+                                 ("version", "harnessVersion")):
+                    if h.get(src):
+                        out[dst] = h[src]
+                break
+    except Exception as exc:  # noqa: BLE001
+        out["fleetError"] = f"{type(exc).__name__}: {exc}"
+
+    _HARNESS_ID_CACHE[harness_id] = (time.time(), out)
+    return out
+
 
 def stage_config():
     if _STAGE_CFG_CACHE:
@@ -305,10 +424,12 @@ def stage_config():
         if st.get("Retry"):
             cfg.setdefault("maxAttempts", st["Retry"][0].get("MaxAttempts"))
         cfg.setdefault("catch", [c.get("Next") for c in st.get("Catch", [])])
-        # The AgentCore runtime that actually serves this harness id. The driver
-        # invokes harness/<id>, which AWS backs with runtime/harness_<id>.
+        # The AgentCore runtime, harness and health actually behind this box -- resolved
+        # from SSM + AgentCore, never assembled from the logical name. See
+        # harness_identity() for why the old concatenation was a bug and not a shortcut.
         if cfg.get("harnessId"):
-            cfg.setdefault("runtime", f"harness_{cfg['harnessId']}")
+            for fld, val in harness_identity(cfg["harnessId"]).items():
+                cfg.setdefault(fld, val)
     return _STAGE_CFG_CACHE
 
 
