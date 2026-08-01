@@ -68,7 +68,18 @@ class TaskTable(_StubTable):
             return {}
         vals = kw.get("ExpressionAttributeValues") or {}
         names = kw.get("ExpressionAttributeNames") or {}
-        expr = kw.get("UpdateExpression", "").replace("SET ", "")
+        expr = kw.get("UpdateExpression", "")
+        # SET and REMOVE are separate clauses of one expression. Splitting the string on
+        # commas without honouring that made "SET #s = :s REMOVE partial_reply" parse as
+        # an assignment whose rhs is ":s REMOVE partial_reply" -- matching no placeholder,
+        # so the status write vanished SILENTLY and the task stayed 'thinking'. The real
+        # table applies both clauses; so must this.
+        expr, _, remove_clause = expr.partition("REMOVE")
+        for attr in remove_clause.split(","):
+            attr = names.get(attr.strip(), attr.strip())
+            if attr:
+                it.pop(attr, None)
+        expr = expr.replace("SET ", "")
         for part in _split_top_level(expr):
             if "=" not in part:
                 continue
@@ -998,6 +1009,123 @@ def test_consult_turn_ending_in_prose_is_not_re_asked(wired, monkeypatch):
     wired.console.run_task_turn(tid, accept=False)
     assert calls["n"] == 1
     assert wired.tasks.items[tid]["status"] == "drafting"
+
+
+def test_the_reply_is_shown_as_it_streams_and_never_leaks_a_half_sentence(
+        wired, monkeypatch, capsys):
+    """MEASURED, not assumed: the stream is incremental and we were the ones buffering.
+
+    Probing the live orchestrator harness with a prose-only question: headers at 4.26s,
+    first text delta at 8.40s, messageStop at 24.46s, and the 214 deltas spread over
+    16.04s -- 65% of wall clock. So the first words existed at 8.4s while the customer
+    waited 24.65s for the Lambda plus up to a 3s poll. _drain_chat collected deltas into
+    a list nobody could see; nothing upstream was withholding them.
+
+    Four things have to hold, and each has burned somewhere in this file before:
+
+    1. Text is published DURING the turn, not only at the end.
+    2. It is throttled -- 214 DynamoDB writes for one turn is throttling risk and cost.
+    3. The draft NEVER enters `messages`. _replay_context feeds messages back to the
+       agent next turn and an approval is signed against that record; a half-sentence in
+       there is corruption, not a cosmetic bug.
+    4. The draft is gone the moment the real message lands, in the SAME write -- two
+       writes leave a window where a 3s poll sees both and the reply renders twice.
+    """
+    tid = _mk_task(wired, status="thinking")
+    console = wired.console
+
+    # Deltas that would each trigger a write if unthrottled.
+    chunks = ["Where is ", "your data, ", "and is it ", "verifiable?"]
+
+    class _AC:
+        def invoke_harness(self, **kw):
+            return _fake_stream(
+                *[{"contentBlockDelta": {"delta": {"text": c}}} for c in chunks],
+                {"messageStop": {"stopReason": "end_turn"}})
+
+    monkeypatch.setattr(console, "agentcore_chat", _AC())
+    monkeypatch.setattr(console, "_resolve_harness_id", lambda x: "llmops_orchestrator-x")
+    # Force every flush to fire so the mid-turn writes are observable at all.
+    monkeypatch.setattr(console, "_STREAM_FLUSH_S", 0.0)
+    console.run_task_turn(tid, accept=False)
+
+    partials = [str(u.get("ExpressionAttributeValues", {}).get(":p"))
+                for u in wired.tasks.updates
+                if ":p" in (u.get("ExpressionAttributeValues") or {})
+                and "partial_reply" in u.get("UpdateExpression", "")]
+    assert partials, ("the reply must be published while the turn runs; with no "
+                      "mid-turn write the customer stares at 'thinking…' for the "
+                      "whole turn even though the words already arrived")
+    # Growing prefixes of the same reply, not independent fragments: the browser
+    # replaces the draft each poll, so a fragment would make text disappear.
+    assert partials == sorted(partials, key=len), f"draft must only grow: {partials}"
+    assert partials[-1] == "".join(chunks)
+    # Contract 3 checked at the write itself, not only at the resulting item. Asserting
+    # only "no partial text ended up in messages" trusts the fake table to have modelled
+    # whatever expression the sink used; a negative control that made the sink append to
+    # `messages` still passed, because the fake ignored the malformed clause. The write
+    # that carries the draft must not name `messages` at all.
+    for u in wired.tasks.updates:
+        if ":p" in (u.get("ExpressionAttributeValues") or {}):
+            touched = u.get("UpdateExpression", "") + str(u.get(
+                "ExpressionAttributeNames") or {})
+            assert "messages" not in touched, (
+                f"the streaming write must not touch messages: {u!r}")
+
+    # Throttled -- but the FIRST delta must still publish immediately. Time-to-first-word
+    # is the entire point of this change; making the customer wait _STREAM_FLUSH_S to see
+    # anything would reintroduce a smaller version of the bug. Pin the interval absurdly
+    # high: exactly one write may survive, and it must be the first words.
+    before = len(wired.tasks.updates)
+    monkeypatch.setattr(console, "_STREAM_FLUSH_S", 3600.0)
+    console.run_task_turn(_mk_task(wired, status="thinking"), accept=False)
+    throttled = [str(u["ExpressionAttributeValues"][":p"])
+                 for u in wired.tasks.updates[before:]
+                 if ":p" in (u.get("ExpressionAttributeValues") or {})]
+    assert throttled == [chunks[0]], (
+        f"_STREAM_FLUSH_S must gate every write after the first (got {throttled}); "
+        f"one write per delta was 214 writes on a real measured turn, and gating the "
+        f"first one too would hide the reply for {console._STREAM_FLUSH_S}s")
+
+    # The committed record is clean: one whole assistant message, no draft left behind.
+    item = wired.tasks.items[tid]
+    assert "partial_reply" not in item, (
+        "the draft must die in the same write that commits the message, or a poll "
+        "catches both and the reply renders twice")
+    assistant = [m for m in item["messages"] if m.get("role") == "assistant"]
+    assert len(assistant) == 1 and assistant[0]["text"] == "".join(chunks)
+    for m in item["messages"]:
+        for p in partials[:-1]:
+            assert m.get("text") != p, (
+                f"a partial reached messages: {p!r} -- _replay_context feeds that back "
+                f"to the agent and an approval is signed against this record")
+
+    # The turn's log line must say how many flushes happened. Without it, "no
+    # partial_reply was ever seen" is ambiguous between "the sink never fired" and "the
+    # poll missed a short turn" -- and those need opposite fixes. That ambiguity cost a
+    # live diagnosis, so it is a contract now.
+    logged = capsys.readouterr().out
+    assert re.search(r"\[task-chat\].*flushes=[1-9]", logged), (
+        "the per-turn log line must report the flush count, or a missing draft is "
+        f"undiagnosable: {logged[-300:]!r}")
+
+    # A failed turn must not leave a draft advertising text the agent never finished.
+    tid3 = _mk_task(wired, status="thinking")
+    wired.tasks.items[tid3]["partial_reply"] = "half a sentence that never la"
+    console._task_fail(tid3, "boom")
+    assert "partial_reply" not in wired.tasks.items[tid3]
+
+    # The frontend must render it, and must not render it as a committed message.
+    # Comments are stripped first: this file EXPLAINS partial_reply in prose right above
+    # the code that uses it, so a bare `"partial_reply" in html` stays true even if the
+    # render is gutted to `const partial = ""`. A negative control caught that -- the
+    # assertion was reading the comment, not the behaviour.
+    html = (REPO / "deploy/console/frontend.html").read_text()
+    code = "\n".join(ln for ln in html.splitlines() if not ln.lstrip().startswith("//"))
+    assert "t.partial_reply" in code, \
+        "the frontend must read the streaming draft off the task record"
+    assert re.search(r"t\.partial_reply[\s\S]{0,400}?writing", code), \
+        "the draft must be labelled as in-progress, not shown as a finished reply"
 
 
 def test_worker_salvages_an_interrupted_stream_once(wired, monkeypatch):

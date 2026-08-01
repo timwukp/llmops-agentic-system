@@ -1658,10 +1658,19 @@ function renderChat(t){
     const text = m.role==="assistant" ? stripChoiceFences(String(m.text||"")) : String(m.text||"");
     return `<div class="msg ${role}"><div class="who">${esc(who)} · ${esc(String(m.at||"").slice(0,19))}</div>${mdLite(text)}</div>`;
   }).join("");
-  el.innerHTML = (body || '<span class="sub">no messages yet</span>')
-    + planArtifactHtml(t)
-    + (String(t.status)==="thinking"||String(t.status)==="accepting"
-       ? '<div class="msg m-system">orchestrator is thinking&hellip;</div>' : "");
+  // The reply as it is being written. The turn's text streams in over ~65% of its wall
+  // clock (measured: first delta at 8.4s of a 24.65s turn), and the worker now writes it
+  // to partial_reply every 2s -- so showing it turns a 40s blank wait into a few seconds.
+  // It is deliberately NOT a real message: partial_reply never enters t.messages, so a
+  // half-sentence cannot reach the transcript or an approval record.
+  const busy = String(t.status)==="thinking"||String(t.status)==="accepting";
+  const partial = busy ? String(t.partial_reply||"") : "";
+  const tail = partial
+    ? `<div class="msg m-assistant"><div class="who">orchestrator · writing&hellip;</div>`
+      + `${mdLite(stripChoiceFences(partial))}</div>`
+    : (busy ? '<div class="msg m-system">orchestrator is thinking&hellip;</div>' : "");
+  el.innerHTML = (body || (partial ? "" : '<span class="sub">no messages yet</span>'))
+    + planArtifactHtml(t) + tail;
   el.scrollTop = el.scrollHeight;
 }
 
