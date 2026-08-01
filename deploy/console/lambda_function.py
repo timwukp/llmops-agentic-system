@@ -2259,6 +2259,87 @@ def close_task(task_id, body, user):
     return {"ok": True, "status": "closed"}
 
 
+# The consult protocol's step-2 "data" block, as the orchestrator is told to write it.
+# Each entry is (dotted path into the plan's data block, label, why the customer should
+# care). The WHY is shipped to the browser rather than written into the frontend,
+# because these are the same six questions the orchestrator asks at step 0 -- if the
+# wording drifts between the agent and the panel the customer sees two different
+# checklists for one consultation.
+DATA_READINESS_FIELDS = (
+    ("source_uri", "Where the data is",
+     "an S3 URI under customer-data/ — until this exists there is nothing to audit"),
+    ("verification_method", "How outputs are verified",
+     "tests, exact answers or rules; without one, quality gates fall back to an "
+     "LLM judge and are marked low-confidence"),
+    ("datasheet.license", "License / provenance",
+     "whether the data may legally be used to train, and where it came from"),
+    ("datasheet.pii_disposition", "PII disposition",
+     "what personal data is present and what happens to it"),
+    ("datasheet.consent", "Consent to send to the teacher",
+     "distillation sends this data to the teacher model; the customer has to know"),
+    ("customer_eval_uri", "Held-out acceptance set",
+     "the gates are anchored to this; scored against training data they measure "
+     "nothing"),
+    ("decontamination", "Decontamination",
+     "training on the held-out set inflates every score that follows"),
+)
+
+
+def _dig(obj, dotted):
+    for part in dotted.split("."):
+        if not isinstance(obj, dict):
+            return None
+        obj = obj.get(part)
+    return obj
+
+
+def task_readiness(task_id):
+    """What the plan actually says about the customer's data, and what it does not.
+
+    Answered from plan.json rather than from the chat, because the plan is the artifact
+    the customer signs -- a fact stated in conversation and then missing from the plan
+    is exactly the gap worth surfacing.
+
+    Unanswered fields are returned EXPLICITLY as answered=False with the reason they
+    matter, never as an empty string. A blank row reads as "fine"; the whole point of
+    this panel is showing which of the six data questions nobody has answered yet.
+    """
+    task = _task_get(task_id)
+    if not task:
+        return {"error": "unknown task", "status_code": 404}
+    uri = str(task.get("plan_uri") or "")
+    plan, note = {}, ""
+    if not uri:
+        note = "no plan yet — the orchestrator writes plan.json once it has enough to price"
+    else:
+        try:
+            raw = s3.get_object(Bucket=data_bucket(),
+                                Key=uri[5:].partition("/")[2])["Body"].read()
+            plan = json.loads(raw)
+        except Exception as e:
+            # A 200 with a note, not a 5xx: "the plan is unreadable" is itself a
+            # readiness answer the customer needs, and a failed panel would just
+            # disappear from the thread.
+            note = f"plan.json could not be read ({str(e)[:120]})"
+    # Both guards are load-bearing. plan.json is written by a model, so it is not
+    # guaranteed to be an object at all: a top-level list parses fine and then
+    # AttributeErrors on .get, which surfaced as a 500 on the whole panel.
+    if not isinstance(plan, dict):
+        note = note or "plan.json is not a JSON object"
+        plan = {}
+    data = plan.get("data") if isinstance(plan.get("data"), dict) else {}
+    fields = []
+    for path, label, why in DATA_READINESS_FIELDS:
+        val = _dig(data, path)
+        answered = val not in (None, "", [], {})
+        fields.append({"field": path, "label": label, "why": why,
+                       "answered": bool(answered),
+                       "value": str(val)[:300] if answered else ""})
+    return {"task_id": task_id, "plan_uri": uri, "note": note,
+            "answered": sum(1 for f in fields if f["answered"]),
+            "total": len(fields), "fields": fields}
+
+
 def task_approval(task_id):
     """The auditor's endpoint: records + chain + how to verify independently."""
     task = _task_get(task_id)
@@ -2970,6 +3051,8 @@ def handler(event, context):
                 return _resp_result(get_task(seg[0]))
             if len(seg) == 2 and seg[1] == "approval":
                 return _resp_result(task_approval(seg[0]))
+            if len(seg) == 2 and seg[1] == "readiness":
+                return _resp_result(task_readiness(seg[0]))
 
         raw = event.get("body") or "{}"
         if event.get("isBase64Encoded"):
