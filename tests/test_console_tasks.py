@@ -695,6 +695,15 @@ def test_the_log_reports_the_real_model_round_trips_not_just_the_ones_we_service
         f"model_ms must sum every metadata latencyMs in the turn: {line!r}")
     assert re.search(r"tok=\d+/\d+", line), (
         f"token usage is in the stream and is what a cost question needs: {line!r}")
+    # `tool=` has the same naming defect one field over. `tool_use` is sticky across the
+    # whole drain, so a turn that ended in end_turn still reported the last toolUse the
+    # HARNESS ran itself -- the live line read `stop=end_turn tool=shell`, which is
+    # indistinguishable from a call we failed to answer, and the servicing condition
+    # below deliberately skips exactly those. Only a call we OWE belongs here.
+    assert re.search(r"\btool=None\b", line), (
+        f"this turn ended in end_turn, so no inline function is owed and tool= must be "
+        f"None; naming a tool the harness already ran reads as an unserviced call: "
+        f"{line!r}")
 
 
 def test_the_per_turn_totals_accumulate_across_every_invoke_the_turn_makes(
