@@ -172,20 +172,52 @@ def test_every_tracked_executable_in_this_repo_would_push_as_executable():
 # create-vs-advance decision is checked offline.
 
 class FakeGH:
-    """A GitHub double that records calls and 404s on refs it does not have."""
+    """A GitHub double that records calls and 404s on refs it does not have.
 
-    def __init__(self, refs, commits=()):
+    Models GitHub's eventual consistency on ref reads via `stale_reads`: the first N
+    GETs of a ref that DOES exist answer 404, exactly as the real API does for seconds
+    after a branch is created. Without this the double is more consistent than GitHub,
+    and the bug that cost a commit on 2026-08-01 cannot be reproduced offline.
+    """
+
+    def __init__(self, refs, commits=(), stale_reads=0):
         self.refs = dict(refs)          # "heads/<branch>" -> sha
         self.commits = set(commits)     # shas the remote can resolve
         self.calls = []                 # (method, path, data)
+        self.stale_reads = stale_reads  # ref GETs to answer 404 despite the ref existing
+        self.slept = []                 # backoff delays, so a retry loop is observable
 
-    def call(self, path, data=None, method=None, absent_ok=False):
+    # read_ref lives on the real GitHub class, so the double must provide it too.
+    # Delegating keeps the RETRY POLICY under test instead of reimplemented here — a
+    # double with its own retry loop would pass no matter what the tool does. Bound at
+    # class-definition time because _run_main monkeypatches push.GitHub with a lambda,
+    # so looking it up through the module at call time finds that lambda, not the class.
+    #
+    # `attempts` is NOT restated here on purpose. The first draft signed this
+    # `read_ref(self, branch, attempts=4, sleep=None)`, which pinned the retry count in
+    # the double: dropping the tool's own default to attempts=1 -- i.e. reinstating the
+    # believe-the-first-404 bug that cost a commit -- kept all 28 tests green, because
+    # the double supplied the 4 the tool had stopped asking for. Only **kwargs the caller
+    # actually passes; let the tool's default be the tool's.
+    # (Verified by patching the default to 1, 2026-08-01.)
+    _real_read_ref = push.GitHub.read_ref
+
+    def read_ref(self, branch, **kw):
+        kw.setdefault("sleep", self.slept.append)
+        return FakeGH._real_read_ref(self, branch, **kw)
+
+    def call(self, path, data=None, method=None, absent_ok=False, conflict_ok=False):
         method = method or ("POST" if data is not None else "GET")
         self.calls.append((method, path, data))
         if path == "":
             return {"default_branch": "main"}
         if path.startswith("/git/ref/heads/") and method == "GET":
             name = path[len("/git/ref/"):]
+            if name in self.refs and self.stale_reads > 0:
+                self.stale_reads -= 1
+                if absent_ok:
+                    return None
+                raise SystemExit(f"GitHub 404 on GET {path}")
             if name not in self.refs:
                 if absent_ok:
                     return None
@@ -205,7 +237,14 @@ class FakeGH:
         if path == "/git/commits":
             return {"sha": "new-commit"}
         if path == "/git/refs" and method == "POST":
-            self.refs[data["ref"][len("refs/"):]] = data["sha"]
+            name = data["ref"][len("refs/"):]
+            if name in self.refs:
+                # The real API's answer, and the one that saved a commit on 2026-08-01:
+                # creating an existing ref is a 422, not an overwrite.
+                if conflict_ok:
+                    return None
+                raise SystemExit(f"GitHub 422 on POST {path}: Reference already exists")
+            self.refs[name] = data["sha"]
             return {"ref": data["ref"]}
         if path.startswith("/git/refs/heads/") and method == "PATCH":
             self.refs[path[len("/git/refs/"):]] = data["sha"]
@@ -342,3 +381,79 @@ def test_a_first_push_still_verifies_the_tree_matches_local_head(monkeypatch):
         "R", (), {"returncode": 0, "stdout": "tok\n"})())
     assert push.main(["--branch", "fix/new"]) == 1, (
         "a tree that does not match local HEAD must be reported, not called success")
+
+
+# ── the eventually-consistent ref read ────────────────────────────────────────
+# Found live on 2026-08-01 replaying three commits onto a fresh branch. Push 1 created
+# the branch. Push 2's ref GET still 404'd (GitHub's ref reads lag by seconds), so the
+# tool concluded the branch did not exist, based its commit on main, and tried to CREATE
+# the ref -- discarding push 1. It survived only because POST /git/refs answered 422.
+# The content was saved by the tree-parity check at the end; the HISTORY was not: push
+# 2's commit message never reached the remote.
+
+def test_a_stale_404_on_the_ref_does_not_turn_an_advance_into_a_create(monkeypatch):
+    """The bug. The branch exists and the first ref read 404s anyway.
+
+    Believing that 404 means basing the commit on the default branch, which drops every
+    commit already pushed. The retry must find the ref and take the advance path.
+    """
+    gh = FakeGH({"heads/main": "mainsha", "heads/feat/x": "remotesha"},
+                commits=["parentsha", "remotesha"], stale_reads=1)
+    rc, gh = _run_main(monkeypatch, gh, branch="feat/x")
+    assert rc == 0
+    assert gh.refs["heads/feat/x"] == "new-commit"
+    # advanced, not created
+    assert [c for c in gh.calls if c[0] == "PATCH"], "must PATCH the existing ref"
+    assert not [c for c in gh.calls if c[1] == "/git/refs" and c[0] == "POST"], \
+        "a stale 404 must not lead to a ref CREATE on a branch that exists"
+    # ...and the commit is parented on the REMOTE head, not on main
+    made = [c for c in gh.calls if c[1] == "/git/commits" and c[0] == "POST"][0]
+    assert made[2]["parents"] == ["remotesha"], made[2]
+
+
+def test_the_ref_read_backs_off_between_attempts(monkeypatch):
+    """A tight retry loop would hammer the API and still lose the race. Exponential,
+    and observable, so "it retried" is not taken on faith."""
+    gh = FakeGH({"heads/main": "mainsha", "heads/feat/x": "remotesha"},
+                commits=["remotesha"], stale_reads=2)
+    rc, gh = _run_main(monkeypatch, gh, branch="feat/x")
+    assert rc == 0
+    assert gh.slept == [1, 2], gh.slept
+
+
+def test_a_genuinely_new_branch_is_still_created_after_the_retries(monkeypatch):
+    """The retry must not turn a real 404 into a failure: a first push is the normal
+    case, and it pays a few seconds of backoff rather than losing the create path."""
+    gh = FakeGH({"heads/main": "mainsha"}, commits=["parentsha"])
+    rc, gh = _run_main(monkeypatch, gh, branch="fix/brand-new")
+    assert rc == 0
+    assert gh.refs["heads/fix/brand-new"] == "new-commit"
+    assert len(gh.slept) == 3, "all attempts used before concluding the branch is new"
+
+
+def test_losing_the_create_race_refuses_rather_than_overwriting_the_branch(monkeypatch):
+    """The last line of defence: the ref read says absent for EVERY attempt, so the
+    commit gets built on the wrong base, and only then does the create come back 422.
+
+    Falling back to PATCH here would point the branch at a commit parented on main --
+    silently orphaning every commit already on it. That is the one outcome worse than
+    failing, so this must exit non-zero and move nothing.
+    """
+    gh = FakeGH({"heads/main": "mainsha", "heads/feat/x": "remotesha"},
+                commits=["parentsha", "remotesha"], stale_reads=99)
+    # SystemExit, matching how every other unrecoverable API disagreement in this tool
+    # reports itself; the message must name the re-run, since re-running is the fix.
+    with pytest.raises(SystemExit, match="Re-run this command"):
+        _run_main(monkeypatch, gh, branch="feat/x")
+    assert gh.refs["heads/feat/x"] == "remotesha", "the branch must not have moved"
+    assert not [c for c in gh.calls if c[0] == "PATCH"], \
+        "PATCHing here would orphan the commits already on the branch"
+
+
+def test_conflict_ok_is_confined_to_the_ref_create(monkeypatch):
+    """A 422 anywhere else (an unprocessable tree, a bad commit) is a real failure. If
+    conflict_ok leaked onto those calls it would turn corruption into silent success."""
+    src = (pathlib.Path(push.__file__)).read_text()
+    assert src.count("conflict_ok=True") == 1, "exactly one caller may swallow a 422"
+    create = src[src.index('gh.call("/git/refs"'):]
+    assert "conflict_ok=True" in create[:300]
