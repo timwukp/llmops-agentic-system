@@ -143,11 +143,12 @@
           "arn:aws:s3:::<DATA_BUCKET>/reports/*",
           "arn:aws:s3:::<DATA_BUCKET>/skills-mirror/*",
           "arn:aws:s3:::<DATA_BUCKET>/finops/*",
-          "arn:aws:s3:::<DATA_BUCKET>/contracts/*"
+          "arn:aws:s3:::<DATA_BUCKET>/contracts/*",
+          "arn:aws:s3:::<DATA_BUCKET>/cost/*"
         ]
       },
       {
-        "_comment": "The prefix list must match S3PipelineObjects: ListBucket is condition-scoped, so a prefix granted for Get/Put but absent here can be read object-by-object and never enumerated -- which is exactly the shape of 'the rate card history is there but the agent reports no card exists'.",
+        "_comment": "The prefix list must match S3PipelineObjects: ListBucket is condition-scoped, so a prefix granted for Get/Put but absent here can be read object-by-object and never enumerated -- which is exactly the shape of 'the rate card history is there but the agent reports no card exists'. cost/* joined both lists after the first live reconcile completed its evidence-gathering and then could not write cost/actuals-<period>.json — the docs/COST.md contract names cost/ as the actuals+report prefix, but only finops/ was ever granted.",
         "Sid": "S3PipelineList",
         "Effect": "Allow",
         "Action": ["s3:ListBucket"],
@@ -155,9 +156,25 @@
         "Condition": {
           "StringLike": {
             "s3:prefix": ["runs/*", "reports/*", "skills-mirror/*",
-                          "finops/*", "contracts/*"]
+                          "finops/*", "contracts/*", "cost/*"]
           }
         }
+      },
+      {
+        "_comment": "gen_ai.usage token spans land in the aws/spans log group (an AgentCore-managed group OUTSIDE /aws/bedrock-agentcore/*, so BaselineLogs does not cover it). The finops reconcile task needs to read them to attribute shared Bedrock inference-profile spend per session id — this account runs other agents on the same Claude profiles, so without spans the shared spend is unattributable and stays pending. Read-only, this one group.",
+        "Sid": "SpansReadForCostAttribution",
+        "Effect": "Allow",
+        "Action": [
+          "logs:FilterLogEvents",
+          "logs:GetLogEvents",
+          "logs:StartQuery",
+          "logs:GetQueryResults",
+          "logs:StopQuery"
+        ],
+        "Resource": [
+          "arn:aws:logs:<REGION>:<ACCOUNT_ID>:log-group:aws/spans",
+          "arn:aws:logs:<REGION>:<ACCOUNT_ID>:log-group:aws/spans:*"
+        ]
       },
       {
         "Sid": "SageMakerLifecycleScoped",
