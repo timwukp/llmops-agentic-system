@@ -177,6 +177,26 @@ Two spine details that are policy, not plumbing:
   the documented-test-count guard — when the source of truth is a model prompt, parse the
   prompt. (`renderReadiness` in `frontend.html` is data-driven from the API's `fields`, so the
   two restored rows needed no frontend change.)
+- **Nothing scanned the customer's data, and every signal said otherwise.** The readiness
+  panel above links the Data Readiness Report, whose PII section is a *heuristic regex* pass —
+  the data-prep prompt says so in as many words. Anyone checking whether more than that
+  existed found a Macie session `ENABLED` and a COMPLETE classification job, which reads as
+  yes. That job was `ONE_TIME`, created **2021-02-23**, named 25 unrelated buckets, and
+  processed **0 objects**; `customer-data/` was scanned by nothing. `ensure_pii_scan` in
+  `deploy/03_storage.py` now answers the real question on its own line of the deploy output,
+  and `macie_job_covers()` decides it from the bucket list **plus the scoping** — a job can
+  name our bucket and still read only `runs/`, and a `bucketCriteria` job is reported as
+  undecidable rather than credited. Creating the job is opt-in (`--enable-pii-scan`): a
+  `SCHEDULED` job is recurring per-GB spend, and starting it silently is the billing analogue
+  of a silent security downgrade. Two API constraints shape it, neither documented:
+  `UpdateClassificationJob` takes only `(jobId, jobStatus)`, so a job's scope is immutable and
+  the wrong one must be cancelled rather than converged; and `CreateClassificationJob`'s
+  `clientToken` means a repeat creates a *second* scanner, so idempotency comes from looking
+  up our own job by name. The finding that made the rest matter: the harness execution role
+  had **implicitDeny** on every `macie2` read, so the scan would have billed and stayed
+  invisible to the very agent that writes the report — `MacieFindingsReadForDataAudit` fixes
+  that, read-only in both directions (no job creation, no session disable), and the audit
+  prompt must now state *"no Macie classification job covers this data"* whenever none does.
 - **`Teardown` always runs after deploy** — even when `SmokeTest` fails, its `Catch`
   routes to `Teardown` first. Orphaned endpoints are the #1 cost risk (Phase 4 found an
   unrelated endpoint in the account that had been InService since 2024-04).

@@ -176,6 +176,20 @@
         "Resource": "arn:aws:s3:::<DATA_BUCKET>/customer-data/*"
       },
       {
+        "Sid": "MacieFindingsReadForDataAudit",
+        "_comment": "Read-only Macie so the data-prep `audit` task can cite real classification results in the Data Readiness Report instead of only its own regex pass. The prompt states outright that its scan is HEURISTIC and not compliance-grade, and the console's readiness panel links that report as the answer behind `PII disposition` -- so if the agent cannot read Macie, adding a classification job changes nothing a customer can see. simulate_principal_policy on this role returned implicitDeny for ListFindings/GetFindings/GetFindingStatistics/DescribeClassificationJob, which is why this is asserted rather than assumed: nothing in this repo granted macie2 at all. Read-only and deliberately WITHOUT CreateClassificationJob: a per-GB billable scan is the deploy's decision (03_storage.py --enable-pii-scan), not something an agent should be able to launch mid-turn, and without UpdateMacieSession/DisableMacie it also cannot turn off the check it is judged by. No Resource scoping: the macie2 read actions do not support it (findings are account-scoped), so the narrowing is the action list.",
+        "Effect": "Allow",
+        "Action": [
+          "macie2:GetMacieSession",
+          "macie2:ListFindings",
+          "macie2:GetFindings",
+          "macie2:GetFindingStatistics",
+          "macie2:ListClassificationJobs",
+          "macie2:DescribeClassificationJob"
+        ],
+        "Resource": "*"
+      },
+      {
         "_comment": "The prefix list must match S3PipelineObjects: ListBucket is condition-scoped, so a prefix granted for Get/Put but absent here can be read object-by-object and never enumerated -- which is exactly the shape of 'the rate card history is there but the agent reports no card exists'. cost/* joined both lists after the first live reconcile completed its evidence-gathering and then could not write cost/actuals-<period>.json \u2014 the docs/COST.md contract names cost/ as the actuals+report prefix, but only finops/ was ever granted.",
         "Sid": "S3PipelineList",
         "Effect": "Allow",

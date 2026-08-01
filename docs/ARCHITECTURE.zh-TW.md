@@ -154,6 +154,23 @@ prompt 明文禁止它刪東西的 agent。
   而不是又一份寫死的清單。規則與「文件裡的測試數」守門一致 —— 當事實來源是一段模型 prompt，
   就去解析那段 prompt。（`frontend.html` 的 `renderReadiness` 是由 API 的 `fields` 驅動的，
   所以補回的兩列不需要動前端。）
+- **沒有任何東西掃過客戶的資料，而每一個訊號都說有。** 上面那個就緒面板會連到 Data Readiness
+  Report，而該報告的 PII 段落是**啟發式 regex** 掃描 —— data-prep 的 prompt 就是這樣寫的。任何人想
+  確認「是不是還有更嚴謹的」，看到的是 Macie session `ENABLED` 加上一個 COMPLETE 的分類作業，讀起來
+  就是「有」。但那個作業是 `ONE_TIME`、建立於 **2021-02-23**、指名 25 個無關的 bucket、處理了
+  **0 個物件**；`customer-data/` 根本沒有被任何東西掃過。現在 `deploy/03_storage.py` 的
+  `ensure_pii_scan` 會在部署輸出裡用獨立一行回答真正的問題，而 `macie_job_covers()` 是依「bucket
+  清單**加上** scoping」來判斷 —— 一個作業可以指名我們的 bucket 卻只讀 `runs/`，而
+  `bucketCriteria` 型的作業會被報成「無法判定」，而不是被算成有覆蓋。建立作業是選擇性加入的
+  （`--enable-pii-scan`）：`SCHEDULED` 作業是按 GB 反覆計費的工作，靜靜地把它開起來，等於是帳單版的
+  「無聲安全降級」。有兩個 API 限制決定了它的形狀，而兩者都沒寫在文件裡：
+  `UpdateClassificationJob` 只接受 `(jobId, jobStatus)`，所以作業的範圍是不可變的，錯的那個必須取消
+  而不是收斂；而 `CreateClassificationJob` 的 `clientToken` 意味著重跑一次會建立**第二個**掃描器，
+  所以幂等性只能靠先用名字找出我們自己的作業。而讓上述一切變得有意義的那個發現是：harness 執行角色
+  對每一個 `macie2` 讀取動作都是 **implicitDeny**，也就是說掃描會照樣計費，卻對那個真正撰寫報告的
+  agent 完全不可見 —— `MacieFindingsReadForDataAudit` 修掉這點，且雙向都是唯讀（不能建立作業、也不能
+  停用 session）；audit 的 prompt 現在也必須在沒有任何覆蓋時明確寫出
+  「no Macie classification job covers this data」。
 - **deploy 之後必然執行 `Teardown`** —— 即使 `SmokeTest` 失敗，其 `Catch` 也先路由到
   `Teardown`。孤兒 endpoint 是第一大成本風險（Phase 4 就在帳號裡發現一個無關的
   endpoint 自 2024-04 起一直 InService）。

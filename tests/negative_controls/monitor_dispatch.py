@@ -689,6 +689,120 @@ case("test: the readiness guard restates the checklist instead of deriving it",
      ["tests/test_console_tasks.py::test_the_readiness_guard_is_derived_from_the_prompt"])
 
 
+
+# ── nothing scans the customer's data, and the deploy must say so ─────────────────────
+#
+# 53. The gap goes quiet: the no-job branch reports a bland status instead of naming it.
+#     This is the exact prior state -- Macie ENABLED plus a COMPLETE job over 25 unrelated
+#     buckets read as coverage everywhere anyone looked, and the deploy output is the only
+#     place the absence is visible.
+def m53(t):
+    old = '        res["coverage"] = (\n            f"NO JOB SCANS {CUSTOMER_DATA_PREFIX}/ -- '
+    assert old in t, "the no-coverage report has moved; re-anchor this mutation"
+    return t.replace(
+        old,
+        '        res["coverage"] = (\n            f"no llmops job for {CUSTOMER_DATA_PREFIX}/ -- ', 1)
+case("storage: the deploy stops naming the missing PII scan",
+     "deploy/03_storage.py", m53,
+     ["tests/test_console_tasks.py::test_the_deploy_reports_the_gap_loudly_when_nothing_scans",
+      "tests/test_console_tasks.py::test_a_gap_is_reported_even_though_the_session_says_enabled"])
+
+# 54. Coverage is decided by the bucket list alone, ignoring scoping. A job that names our
+#     bucket but includes only runs/ then counts as scanning customer-data/ -- reported
+#     coverage of a prefix nothing reads.
+def m54(t):
+    old = "    includes = ((defn.get(\"scoping\") or {}).get(\"includes\") or {}).get(\"and\") or []"
+    assert old in t, "the includes-scoping read has moved; re-anchor this mutation"
+    head, _, tail = t.partition(old)
+    rest = tail.partition("    return True")[2]
+    return head + "    return True" + rest
+
+case("storage: coverage ignores scoping, so a runs/-only job counts as scanning customer data",
+     "deploy/03_storage.py", m54,
+     ["tests/test_console_tasks.py::test_naming_the_bucket_is_not_enough_if_the_prefix_is_scoped_out"])
+
+# 55. A bucketCriteria job is treated as covering us rather than as undecidable. A tag-
+#     matching job nobody has verified then silences the gap warning entirely.
+def m55(t):
+    old = "        return None  # cannot be decided from the definition alone"
+    assert old in t, "the undecidable branch has moved; re-anchor this mutation"
+    return t.replace(old, "        return True", 1)
+case("storage: an unverified criteria job is counted as PII coverage",
+     "deploy/03_storage.py", m55,
+     ["tests/test_console_tasks.py::test_a_criteria_based_job_is_undecidable_not_covered_and_not_uncovered",
+      "tests/test_console_tasks.py::test_an_undecidable_job_is_never_counted_as_coverage"])
+
+# 56. The created job loses its prefix scoping, so it pays to read runs/, finops/ and
+#     models-mirror/ as well -- our own artifacts, billed per GB, none of it customer data.
+def m56(t):
+    old = ('            "scoping": {"includes": {"and": [{"simpleScopeTerm": {\n'
+           '                "comparator": "STARTS_WITH", "key": "OBJECT_KEY",\n'
+           '                "values": [f"{CUSTOMER_DATA_PREFIX}/"]}}]}},\n')
+    assert old in t, "the created job's scoping has moved; re-anchor this mutation"
+    return t.replace(old, "", 1)
+case("storage: the new scan job reads the whole bucket instead of customer-data/",
+     "deploy/03_storage.py", m56,
+     ["tests/test_console_tasks.py::test_the_created_job_is_scoped_to_customer_data_only"])
+
+# 57. Idempotency-by-name is dropped, so every deploy with the flag creates ANOTHER paid
+#     scheduled scanner (create_classification_job takes a clientToken; a fresh one does
+#     not collide, it duplicates).
+def m57(t):
+    old = "    if ours:\n"
+    assert old in t, "the existing-job branch has moved; re-anchor this mutation"
+    return t.replace(old, "    if ours and False:\n", 1)
+case("storage: a second Macie scanner is created on every deploy",
+     "deploy/03_storage.py", m57,
+     ["tests/test_console_tasks.py::test_the_job_is_idempotent_by_name_because_create_is_not",
+      "tests/test_console_tasks.py::test_a_wrongly_scoped_job_of_ours_says_so_instead_of_claiming_an_update"])
+
+# 58. The opt-in becomes opt-out: the deploy starts recurring billable classification work
+#     without anyone asking for it.
+def m58(t):
+    old = "    if not enable:\n"
+    assert old in t, "the enable gate has moved; re-anchor this mutation"
+    return t.replace(old, "    if False:\n", 1)
+case("storage: a plain deploy silently starts a billable recurring scan",
+     "deploy/03_storage.py", m58,
+     ["tests/test_console_tasks.py::test_nothing_is_created_without_the_flag_or_in_a_dry_run"])
+
+
+# 59. The macie2 read grant is removed from the harness role -- the live pre-fix state
+#     (simulate_principal_policy returned implicitDeny for every macie2 read). The scan then
+#     runs, costs money per GB, and the audit that writes the report the readiness panel
+#     links cannot see a single finding.
+def m59(t):
+    old = '          "macie2:ListFindings",\n          "macie2:GetFindings",\n'
+    assert old in t, "the macie2 read grant has moved; re-anchor this mutation"
+    return t.replace(old, "", 1)
+case("iam: the audit agent loses its read access to Macie findings",
+     "deploy/iam/harness_execution_role.json", m59,
+     ["tests/test_console_tasks.py::test_the_audit_agent_can_actually_read_macie"])
+
+# 60. The grant widens to let the agent start its own classification job -- billable work an
+#     agent launches mid-turn, and the same statement shape would let it disable the session
+#     it is judged by.
+def m60(t):
+    old = '          "macie2:GetMacieSession",\n'
+    assert old in t, "the macie2 action list has moved; re-anchor this mutation"
+    return t.replace(old, old + '          "macie2:CreateClassificationJob",\n', 1)
+case("iam: the agent can start its own billable Macie scan",
+     "deploy/iam/harness_execution_role.json", m60,
+     ["tests/test_console_tasks.py::test_the_audit_agent_cannot_start_or_stop_a_scan"])
+
+# 61. The audit prompt drops the "no job covers this data" sentence, so a run with zero
+#     classification coverage produces a report whose PII line reads exactly like one backed
+#     by a real scan. This is the trap the whole task exists to close.
+def m61(t):
+    old = ("If NO job covers the prefix, write exactly that: 'no Macie classification job "
+           "covers this data; the PII finding below is a heuristic regex scan only'. ")
+    assert old in t, "the no-coverage instruction has moved; re-anchor this mutation"
+    return t.replace(old, "", 1)
+case("prompt: the audit stops disclosing that nothing classified the data",
+     "agents/data-prep/harness.json", m61,
+     ["tests/test_console_tasks.py::test_the_audit_prompt_refuses_to_read_enabled_as_coverage"])
+
+
 failed = []
 for name, rel, mutate, tests in CASES:
     p = REPO / rel

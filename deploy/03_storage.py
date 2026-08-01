@@ -18,6 +18,10 @@ Creates (all tagged project=llmops-agentic-system):
   - DynamoDB llmops-cost-actuals   (PK project S, SK sk S; PITR on)
   - EventBridge custom bus llmops-pipeline
   - SNS topic llmops-escalations
+  - Macie coverage over customer-data/: always REPORTED, created only with
+      --enable-pii-scan (a scheduled job is recurring paid work; and an ENABLED Macie
+      session is not coverage — live, the account's only job was a ONE_TIME job from
+      2021 over 25 unrelated buckets that processed 0 objects)
   - SSM parameters /llmops/storage/{bucket,runs_table,events_table,event_bus,escalations_topic_arn}
 
 --dry-run prints the would-create plan without any AWS write. STS is only needed to
@@ -58,6 +62,10 @@ RUNS_EXPIRE_DAYS = 90
 #: The admin console Lambda, whose HTTP API origin is the only origin allowed to upload.
 #: Must match FN in deploy/console/deploy.sh.
 CONSOLE_FN = "llmops-admin"
+#: Where the console's presigned PUT lands a customer's dataset, and therefore the only
+#: prefix a PII classification job should pay to read. Must match CUSTOMER_DATA_PREFIX in
+#: deploy/console/lambda_function.py and the prefix both agent prompts name.
+CUSTOMER_DATA_PREFIX = "customer-data"
 
 
 def safe_client(service, region, dry):
@@ -385,6 +393,158 @@ def ensure_approval_key(kms_client, account_id, dry):
     return "created", arn
 
 
+def macie_job_covers(job_def, bucket, account_id, prefix=CUSTOMER_DATA_PREFIX):
+    """Does this classification job's definition actually include <bucket>/<prefix>?
+
+    Split out and pure so the coverage question is testable, because the live answer was
+    counter-intuitive: the account's Macie session is ENABLED and `list_classification_jobs`
+    returns a job named `scan` with status COMPLETE, which reads as "PII scanning is on".
+    That job is ONE_TIME, was created 2021-02-23, names 25 unrelated buckets, and reports
+    `approximateNumberOfObjectsToProcess: 0.0`. A session status is not coverage and a job
+    list is not coverage; only the bucket list plus the scoping is.
+
+    `bucketCriteria` (the tag/attribute-matching alternative to an explicit bucket list) is
+    reported as unknown rather than assumed to cover or not cover -- a criteria-based job
+    could match our bucket in future without this deploy knowing, and claiming either answer
+    would be inventing one.
+    """
+    defn = job_def or {}
+    if defn.get("bucketCriteria") and not defn.get("bucketDefinitions"):
+        return None  # cannot be decided from the definition alone
+    named = False
+    for bd in defn.get("bucketDefinitions") or []:
+        if bd.get("accountId") not in (None, account_id):
+            continue
+        if bucket in (bd.get("buckets") or []):
+            named = True
+    if not named:
+        return False
+    # A job may name our bucket and still exclude the prefix, or include only some other
+    # one. An includes-block that mentions OBJECT_KEY at all is treated as authoritative:
+    # if it exists and no term admits our prefix, the prefix is not covered.
+    includes = ((defn.get("scoping") or {}).get("includes") or {}).get("and") or []
+    key_terms = [t.get("simpleScopeTerm") for t in includes
+                 if (t.get("simpleScopeTerm") or {}).get("key") == "OBJECT_KEY"]
+    if key_terms and not any(
+            any(str(v).startswith(prefix) or prefix.startswith(str(v))
+                for v in (t.get("values") or []))
+            for t in key_terms if t):
+        return False
+    excludes = ((defn.get("scoping") or {}).get("excludes") or {}).get("and") or []
+    for term in excludes:
+        simple = term.get("simpleScopeTerm") or {}
+        if simple.get("key") == "OBJECT_KEY" and any(
+                str(v).startswith(prefix) for v in (simple.get("values") or [])):
+            return False
+    return True
+
+
+def ensure_pii_scan(macie, bucket, account_id, dry, enable=False):
+    """Make sure something actually scans the customer's data for PII -- or say it doesn't.
+
+    The data-prep `audit` task runs a HEURISTIC regex PII scan and states plainly in its own
+    report that it is not compliance-grade. That is the honest position for an agent with a
+    shell, and it is not a substitute for classification: the console's readiness panel shows
+    `PII disposition` from the plan, and the customer's reasonable reading of a green panel is
+    that someone looked. So this step exists to answer one question in the deploy output --
+    is `s3://<bucket>/customer-data/` covered by a Macie classification job? -- and to create
+    the job when asked.
+
+    Deliberately opt-in via --enable-pii-scan, unlike every other step here. A classification
+    job costs per GB scanned and, more importantly, a SCHEDULED job re-scans on its own
+    forever: a deploy script that silently starts recurring paid work in someone's account is
+    the same class of surprise as a silent security downgrade, just billed instead. When not
+    enabled it still REPORTS the coverage gap rather than staying quiet, which is the whole
+    reason the step is not simply absent (cf. ensure_topic's NO SUBSCRIBERS note).
+
+    Two live API constraints drive the shape and neither is discoverable from the docs:
+      - `UpdateClassificationJob` takes only (jobId, jobStatus). A job's bucket list and
+        scoping are IMMUTABLE, so this cannot converge an existing job onto a new scope the
+        way every other ensure_* here does; a wrong job must be cancelled and replaced, and
+        the code says so instead of pretending an update happened.
+      - `CreateClassificationJob` needs `clientToken`, and a repeat with a fresh token
+        creates a SECOND job. Idempotency has to come from looking for our own job by name
+        first, or every deploy adds another scanner.
+    """
+    job_name = f"llmops-{CUSTOMER_DATA_PREFIX}-pii"
+    if macie is None:
+        return {"coverage": "unknown (no macie client; offline dry-run)"}
+    try:
+        session = macie.get_macie_session().get("status")
+    except Exception as exc:  # noqa: BLE001 — Macie not enabled in this region is a fact
+        return {"coverage": "unknown", "session": f"unavailable: {type(exc).__name__}",
+                "note": "Macie is not reachable here; the audit's regex scan is the only "
+                        "PII check, and the readiness report must not imply otherwise."}
+
+    ours, foreign, undecidable = None, [], []
+    try:
+        for item in macie.list_classification_jobs().get("items", []):
+            covers = macie_job_covers(item.get("s3JobDefinition"), bucket, account_id)
+            if item.get("name") == job_name:
+                ours = item
+            elif covers:
+                foreign.append(f"{item.get('name')} ({item.get('jobStatus')})")
+            elif covers is None:
+                undecidable.append(item.get("name"))
+    except Exception as exc:  # noqa: BLE001
+        return {"coverage": "unknown", "session": session,
+                "note": f"could not list classification jobs: {exc}"}
+
+    res = {"session": session, "job": job_name}
+    if foreign:
+        res["also_covered_by"] = foreign
+    if undecidable:
+        # Not folded into "covered": a bucketCriteria job might match our bucket by tag.
+        res["undecidable_jobs"] = undecidable
+    if ours:
+        status = ours.get("jobStatus")
+        res["coverage"] = f"job exists ({ours.get('jobType')}, {status})"
+        res["job_id"] = ours.get("jobId")
+        if not macie_job_covers(ours.get("s3JobDefinition"), bucket, account_id):
+            # The name matches but the scope does not, and no API can fix that in place.
+            res["coverage"] = (f"job {job_name} exists but does NOT cover "
+                               f"{CUSTOMER_DATA_PREFIX}/ -- a job's scope is immutable "
+                               "(UpdateClassificationJob takes only jobStatus); cancel it "
+                               "and re-run to create a correctly scoped replacement")
+        return res
+    if not enable:
+        res["coverage"] = (
+            f"NO JOB SCANS {CUSTOMER_DATA_PREFIX}/ -- the only PII check on customer data is "
+            "the data-prep audit's heuristic regex scan, which says so in its own report. "
+            "Re-run with --enable-pii-scan to create a scheduled Macie job (billed per GB).")
+        return res
+    if dry:
+        res["coverage"] = f"would create SCHEDULED daily job over {CUSTOMER_DATA_PREFIX}/"
+        return res
+    job = macie.create_classification_job(
+        name=job_name,
+        # >=33 chars, and stable per (bucket, prefix): a fresh random token on every deploy
+        # would create a second job each time rather than failing as a duplicate.
+        clientToken=f"llmops-pii-{bucket}-{CUSTOMER_DATA_PREFIX}"[:64],
+        jobType="SCHEDULED",
+        scheduleFrequency={"dailySchedule": {}},
+        initialRun=True,
+        description="llmops: classify customer-uploaded datasets for PII. The data-prep "
+                    "audit's own scan is heuristic regex and not compliance-grade; this is.",
+        s3JobDefinition={
+            "bucketDefinitions": [{"accountId": account_id, "buckets": [bucket]}],
+            # Scoped to the prefix the console's presigned upload writes to. Without this the
+            # job would also read runs/ and finops/ -- our own artifacts, paid for by the GB,
+            # and none of them customer data.
+            "scoping": {"includes": {"and": [{"simpleScopeTerm": {
+                "comparator": "STARTS_WITH", "key": "OBJECT_KEY",
+                "values": [f"{CUSTOMER_DATA_PREFIX}/"]}}]}},
+        },
+        # RECOMMENDED, not ALL: ALL turns on all 166 managed identifiers including ones for
+        # regions and document types this pipeline never sees, and every extra identifier is
+        # a false positive an operator has to triage before the real ones are visible.
+        managedDataIdentifierSelector="RECOMMENDED",
+        tags={TAG_KEY: TAG_VAL})
+    res["job_id"] = job.get("jobId")
+    res["coverage"] = f"created SCHEDULED daily job over {CUSTOMER_DATA_PREFIX}/"
+    return res
+
+
 def ensure_bus(events, dry):
     try:
         events.describe_event_bus(Name=EVENT_BUS)
@@ -463,6 +623,12 @@ def main():
                          "frontmatter BEFORE upload, because a bad skill source is "
                          "accepted by UpdateHarness and then fails at session start. "
                          "Omitted: the step is skipped and says so.")
+    ap.add_argument("--enable-pii-scan", action="store_true",
+                    help=f"create a SCHEDULED Macie classification job over "
+                         f"{CUSTOMER_DATA_PREFIX}/ (billed per GB scanned, and it re-scans "
+                         "daily on its own). Omitted: nothing is created, but the coverage "
+                         "gap is still REPORTED -- the account's Macie session being "
+                         "ENABLED is not coverage.")
     ap.add_argument("--escalation-email",
                     help="subscribe this address to llmops-escalations (idempotent). "
                          "Without a subscriber, escalate_human publishes into the void.")
@@ -492,6 +658,11 @@ def main():
         # output is the only place anyone will see it.
         "cors": ensure_cors(s3, bucket, origin, args.dry_run),
     }
+    # Its own line for the same reason as CORS and skills: when nothing scans the customer's
+    # data the only other symptom is a readiness panel that reads as if someone had.
+    results["pii_scan"] = ensure_pii_scan(
+        safe_client("macie2", args.region, args.dry_run), bucket, account_id,
+        args.dry_run, args.enable_pii_scan)
     results["contracts"] = ensure_contracts(s3, bucket, args.dry_run)
     # Reported on its own line for the same reason as CORS: when this is skipped there is
     # no other visible symptom until a source is switched and every session fails at start.

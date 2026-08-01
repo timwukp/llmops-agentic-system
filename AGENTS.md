@@ -152,10 +152,29 @@ versions and introspects the live CreateHarness/UpdateHarness schemas.
   of `agents/orchestrator/harness.json`, and a second guard asserts that derivation is
   still a derivation. Same rule as the documented-test-count guard: derive from the real
   source, and if the source is a model prompt, parse the prompt.
-- **Macie is ENABLED in this account but scans nothing of ours** — the only classification
-  job is a `ONE_TIME` job from 2021 over unrelated buckets, so nothing looks at
-  `customer-data/`. The audit's PII scan is heuristic regex by design and says so in its
-  own report; do not read "Macie: ENABLED" as coverage.
+- **A Macie session being ENABLED is not coverage, and a job list is not coverage.** Live,
+  this account's session was `ENABLED` and `list_classification_jobs` returned a COMPLETE job
+  named `scan` — which was `ONE_TIME`, created **2021-02-23**, named 25 unrelated buckets and
+  processed **0 objects**. Nothing looked at `customer-data/`. Only the bucket list plus the
+  scoping answers the question, which is why `macie_job_covers()` in `deploy/03_storage.py` is
+  a pure function with its own tests: a job can name our bucket and still include only
+  `runs/`, and a `bucketCriteria` job is **undecidable** from its definition (reported
+  separately, never counted as coverage). `ensure_pii_scan` always REPORTS the gap and creates
+  the job only under `--enable-pii-scan`, because a `SCHEDULED` job is recurring per-GB work
+  and a deploy that starts billing silently is the same class of surprise as a silent security
+  downgrade. Two live API constraints, neither in the docs: `UpdateClassificationJob` accepts
+  only `(jobId, jobStatus)`, so a job's scope is **immutable** and a wrongly-scoped job must be
+  cancelled and replaced (the step says so rather than claiming an update); and
+  `CreateClassificationJob` takes a `clientToken`, so a repeat with a fresh token creates a
+  **second** job — idempotency has to come from finding our own job by name.
+  And the grant that makes any of it visible: `simulate_principal_policy` on
+  `llmops-harness-execution` returned **implicitDeny** for every `macie2` read, so a scan
+  would have run, billed, and been unreadable by the `audit` task that writes the Data
+  Readiness Report the console links. `MacieFindingsReadForDataAudit` is read-only in both
+  directions — no `CreateClassificationJob` (billable work is the deploy's call) and no
+  `UpdateMacieSession` (an agent must not be able to switch off the check it is judged by).
+  The audit's own scan stays heuristic regex and still says so; the prompt now also requires
+  it to write *"no Macie classification job covers this data"* when nothing does.
 - **Notify on independent channels, and never let the weakest one gate the rest.** The
   driver's escalate path publishes to SNS, writes a stage event, emits `EscalatedToHuman`,
   and settles the task token. The SNS publish was first and unwrapped, so one failed publish
