@@ -604,3 +604,157 @@ def test_the_plan_names_every_commit_it_will_replay(monkeypatch, capsys):
     assert "First change" in out and "Second change" in out, (
         f"each commit's subject must be visible before anything is pushed: {out!r}")
     assert not gh.created_commits, "--dry-run must not create commits"
+
+
+def test_a_rebased_branch_replays_onto_the_named_base_not_the_stale_remote_head(
+        monkeypatch):
+    """After a local rebase the remote head is no longer an ancestor of HEAD.
+
+    Basing on it makes the tool replay everything between the two -- including the
+    merge commits it just rebased onto -- as if they were this branch's own work. The
+    plan for the real rebase of this very branch listed three of main's merge commits
+    for replay. `--onto` says what the branch was actually rebased onto.
+    """
+    gh = FakeGH({"heads/main": "mainsha", "heads/feat/x": "stale-remote-head"},
+                commits=["mainsha", "stale-remote-head"])
+    code, gh = _run_main(monkeypatch, gh, branch="feat/x", revs=["c1sha"],
+                         extra_argv=["--onto", "mainsha"])
+    assert code == 0
+    # The first replayed commit must parent on the named base, NOT on the stale head.
+    parents = [c["parents"] for c in gh.created_commits]
+    assert parents[0] == ["mainsha"], (
+        f"with --onto mainsha the replay must start at mainsha, not at the stale "
+        f"remote head: {parents!r}")
+    assert all("stale-remote-head" not in p for p in parents), (
+        f"nothing may parent on the pre-rebase head: {parents!r}")
+
+
+def test_the_diff_base_follows_onto_so_the_replay_is_not_a_diff_against_the_old_head(
+        monkeypatch):
+    """--onto that only changed the parent would still diff against the stale head.
+
+    The parent and the diff base must be the SAME commit, or the commit's tree
+    describes a change relative to one base while claiming another as its parent --
+    a commit that is internally inconsistent and silently wrong.
+    """
+    seen = []
+    gh = FakeGH({"heads/main": "mainsha", "heads/feat/x": "stale-remote-head"},
+                commits=["mainsha", "stale-remote-head"])
+
+    def fake_git(*args, binary=False):
+        if args[0] == "diff":
+            seen.append(args)
+            return raw(":100644 100644 aaa bbb M", "a.py") if binary else ""
+        if args[0] == "config":
+            return "https://github.com/acme/llmops.git"
+        if args[:2] == ("rev-parse", "HEAD"):
+            return "headsha"
+        if args[:2] == ("rev-parse", "HEAD^"):
+            return "parentsha"
+        if args[0] == "rev-parse" and args[1].endswith("^{tree}"):
+            return "local-tree"
+        if args[:2] == ("rev-list", "--count"):
+            return "7"
+        if args[:2] == ("rev-list", "--reverse"):
+            return "c1sha"
+        if args[0] == "show":
+            return b"content" if binary else "content"
+        if args[0] == "log":
+            return "a message"
+        raise AssertionError(f"unexpected git {args}")
+
+    monkeypatch.setattr(push, "git", fake_git)
+    monkeypatch.setattr(push, "GitHub", lambda repo, token: gh)
+    monkeypatch.setattr(push.subprocess, "run", lambda *a, **k: type(
+        "R", (), {"returncode": 0, "stdout": "tok\n"})())
+    push.main(["--branch", "feat/x", "--onto", "mainsha"])
+    bases = [a[4] for a in seen if len(a) > 4]
+    assert bases and bases[0] == "mainsha", (
+        f"the first diff must be against the --onto base: {seen!r}")
+    assert all("stale-remote-head" not in a for a in bases), (
+        f"no diff may use the pre-rebase head as its base: {seen!r}")
+
+
+def test_rev_list_is_scoped_to_onto_so_the_merges_rebased_onto_are_not_replayed(
+        monkeypatch):
+    """The observed symptom: `rev-list stale..HEAD` includes main's merge commits.
+
+    Those merges are already on the remote; replaying them as this branch's commits
+    is how a rebased push turns 3 commits into 6 and attributes main's work here.
+    """
+    seen = []
+    gh = FakeGH({"heads/main": "mainsha", "heads/feat/x": "stale-remote-head"},
+                commits=["mainsha", "stale-remote-head"])
+
+    def fake_git(*args, binary=False):
+        if args[:2] == ("rev-list", "--reverse"):
+            seen.append(args[2])
+            return "c1sha"
+        if args[0] == "config":
+            return "https://github.com/acme/llmops.git"
+        if args[:2] == ("rev-parse", "HEAD"):
+            return "headsha"
+        if args[:2] == ("rev-parse", "HEAD^"):
+            return "parentsha"
+        if args[0] == "rev-parse" and args[1].endswith("^{tree}"):
+            return "local-tree"
+        if args[:2] == ("rev-list", "--count"):
+            return "7"
+        if args[0] == "diff":
+            return raw(":100644 100644 aaa bbb M", "a.py") if binary else ""
+        if args[0] == "show":
+            return b"content" if binary else "content"
+        if args[0] == "log":
+            return "a message"
+        raise AssertionError(f"unexpected git {args}")
+
+    monkeypatch.setattr(push, "git", fake_git)
+    monkeypatch.setattr(push, "GitHub", lambda repo, token: gh)
+    monkeypatch.setattr(push.subprocess, "run", lambda *a, **k: type(
+        "R", (), {"returncode": 0, "stdout": "tok\n"})())
+    push.main(["--branch", "feat/x", "--onto", "mainsha"])
+    assert seen == ["mainsha..headsha"], (
+        f"the commit list must be scoped to the --onto base: {seen!r}")
+
+
+def test_onto_still_moves_the_branch_ref_to_the_new_tip(monkeypatch):
+    """A rebase push is a ref REWRITE: the branch must end on the replayed tip.
+
+    Leaving the ref where it was would make the whole replay invisible while the
+    tool reported success.
+    """
+    gh = FakeGH({"heads/main": "mainsha", "heads/feat/x": "stale-remote-head"},
+                commits=["mainsha", "stale-remote-head"])
+    code, gh = _run_main(monkeypatch, gh, branch="feat/x", revs=["c1sha", "c2sha"],
+                         extra_argv=["--onto", "mainsha"])
+    assert code == 0
+    tip = gh.created_commits[-1]
+    assert gh.refs["heads/feat/x"] not in ("stale-remote-head", "mainsha"), (
+        f"the branch still points at a pre-rebase commit: {gh.refs!r}")
+    assert gh.refs["heads/feat/x"] == tip["sha"], (
+        f"the branch must point at the last replayed commit: {gh.refs!r}")
+
+
+def test_onto_refuses_a_base_the_remote_does_not_have(monkeypatch):
+    """A typo'd --onto must fail before any commit is built.
+
+    Basing on a sha the remote cannot resolve produces commits whose parent does not
+    exist there -- rejected late, after blobs have already been uploaded.
+
+    The blob assertion is the one that bites. Without an upfront check the run still
+    dies, because the base_tree lookup 404s on the same sha -- so "it raised
+    SystemExit naming typosha" is true either way and proves nothing. What differs is
+    WHEN: the late failure happens after tree_entries() has already POSTed every
+    changed file as a blob, leaving orphaned objects on the repo for a typo.
+    """
+    gh = FakeGH({"heads/main": "mainsha", "heads/feat/x": "stale-remote-head"},
+                commits=["mainsha", "stale-remote-head"])
+    with pytest.raises(SystemExit) as exc:
+        _run_main(monkeypatch, gh, branch="feat/x", revs=["c1sha"],
+                  extra_argv=["--onto", "typosha"])
+    assert "typosha" in str(exc.value), (
+        f"the error must name the base it could not find: {exc.value}")
+    assert not gh.created_commits, "nothing may be created on a bad --onto"
+    assert not [c for c in gh.calls if c[1] == "/git/blobs"], (
+        f"a bad --onto must be caught BEFORE any blob is uploaded; these went up "
+        f"anyway: {[c for c in gh.calls if c[1] == '/git/blobs']!r}")
