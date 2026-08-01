@@ -224,9 +224,13 @@ Harness configs (`agents/*/harness.json`) run PUBLIC-network for iteration speed
 VPC itself is built by `deploy/02_network.py` and the Lambdas can run **VPC-isolated with
 interface endpoints — no internet egress**.
 
-**Not yet built** (tracked as the s3-skill-source work): the VPC-mode harness variants
-and the S3 skill mirror they require. All **19 skill sources across the 7 harnesses are
-`git` sources today; none are `s3`** — verified by
+**Not yet built** (tracked as the s3-skill-source work): the VPC-mode harness variants,
+and the *switch* of the sources themselves. The mirror they require now exists —
+`ensure_skills` in `deploy/03_storage.py` derives what to mirror from the harness configs,
+validates each `SKILL.md`'s frontmatter before uploading, and reads every one back, with
+the harness role granted `GetObject` + `ListBucket` on `skills/*` and no write. All
+**19 skill sources across the 7 harnesses are `git` sources today; none are `s3`** —
+verified by
 `tests/test_docs_claims.py::test_the_skill_source_claims_match_the_harness_configs`,
 which reads the configs rather than trusting this paragraph. Earlier revisions of this
 file described `agents/*/harness.prod.json` and `deploy/05_mirror_skills.py` as existing;
@@ -238,7 +242,12 @@ optimization:
 
 - VPC-mode harnesses can't reach GitHub, so a git skill source cannot resolve at all —
   and a bad or unreachable source fails at **session start**, not at `UpdateHarness`, so
-  the harness would be accepted and then fail every invocation.
+  the harness would be accepted and then fail every invocation. That asymmetry also makes
+  the mirror's *permissions* part of the prerequisite rather than a follow-up: the fetch
+  runs as `llmops-harness-execution`, so the deployer's own successful read-back of an
+  uploaded object proves nothing. Measured with `simulate_principal_policy` after the
+  first upload, that role was **implicitly denied** on the very keys it would have been
+  asked for.
 - It is also correctness, not just connectivity: the git skill source reads the default
   branch only (there is no branch field), so main-branch drift in the skills repo
   silently changes production agent behavior. An S3 snapshot pins what agents run.

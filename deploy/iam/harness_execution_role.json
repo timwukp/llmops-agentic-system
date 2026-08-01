@@ -149,13 +149,21 @@
         "Resource": [
           "arn:aws:s3:::<DATA_BUCKET>/runs/*",
           "arn:aws:s3:::<DATA_BUCKET>/reports/*",
-          "arn:aws:s3:::<DATA_BUCKET>/skills-mirror/*",
           "arn:aws:s3:::<DATA_BUCKET>/finops/*",
           "arn:aws:s3:::<DATA_BUCKET>/contracts/*",
           "arn:aws:s3:::<DATA_BUCKET>/pipeline/contracts/*",
           "arn:aws:s3:::<DATA_BUCKET>/cost/*",
           "arn:aws:s3:::<DATA_BUCKET>/models-mirror/*"
         ]
+      },
+      {
+        "Sid": "S3SkillsReadOnly",
+        "_comment": "The skill trees an s3 skill source fetches at SESSION START, under THIS role -- not under the deployer's credentials. deploy/03_storage.py mirrors them to skills/<repo-relative path>/ and read-back verified each SKILL.md, but that read-back ran as the admin who deployed; simulate_principal_policy for this role on skills/llmops/llm-agent-orchestration/SKILL.md returned implicitDeny, so switching a source to s3 would have been accepted by UpdateHarness, reported READY, and then failed every single session. GetObject only, and deliberately NOT folded into S3PipelineObjects: that statement carries PutObject, and an agent that can write its own skill tree can rewrite the instructions it is judged against on the next session. S3PipelineObjects previously granted Get+Put on a skills-mirror/* prefix instead; that prefix never held a single object in the bucket's lifetime, nothing in the repo ever wrote to it, and it was writable, so it is removed here rather than reused.",
+        "Effect": "Allow",
+        "Action": [
+          "s3:GetObject"
+        ],
+        "Resource": "arn:aws:s3:::<DATA_BUCKET>/skills/*"
       },
       {
         "Sid": "S3CustomerDataReadOnly",
@@ -179,13 +187,13 @@
             "s3:prefix": [
               "runs/*",
               "reports/*",
-              "skills-mirror/*",
               "finops/*",
               "contracts/*",
               "pipeline/contracts/*",
               "cost/*",
               "models-mirror/*",
-              "customer-data/*"
+              "customer-data/*",
+              "skills/*"
             ]
           }
         }

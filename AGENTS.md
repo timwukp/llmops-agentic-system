@@ -73,16 +73,31 @@ versions and introspects the live CreateHarness/UpdateHarness schemas.
 - **Git skill source reads the DEFAULT branch only** (there is no branch field) — a
   skill change must merge to the skill repo's main before a fresh session picks it up.
   **All 19 skill sources across the 7 harnesses are `git` today; none are `s3`.** An S3
-  mirror is the planned fix, for two reasons: VPC-mode harnesses can't reach GitHub at
-  all, and main-branch drift otherwise silently changes agent behavior. It does not
-  exist yet — `deploy/05_mirror_skills.py` and `agents/*/harness.prod.json` were
-  described here as existing files and have never existed in any branch.
+  mirror is the fix, for two reasons: VPC-mode harnesses can't reach GitHub at
+  all, and main-branch drift otherwise silently changes agent behavior. The mirror and
+  its IAM now exist (`ensure_skills` in `deploy/03_storage.py`); the source *switch* is
+  what has not happened. `deploy/05_mirror_skills.py` and `agents/*/harness.prod.json`
+  were described here as existing files and have never existed in any branch.
   `tests/test_docs_claims.py` now derives the counts from the configs, so this line
   cannot go stale silently.
 - **A bad skill source fails at SESSION START, not at `UpdateHarness`** — a wrong path
   or a `SKILL.md` missing its YAML frontmatter is accepted by the control plane and then
   fails every invocation. So switching sources requires the objects to be in place
   first; the switch is not reversible by config alone once sessions start failing.
+- **The mirror is live at `s3://<bucket>/skills/` but no source points at it yet.**
+  `deploy/03_storage.py --skills-src <checkout>` derives what to mirror from
+  `agents/*/harness.json`, validates every `SKILL.md`'s frontmatter *before* uploading,
+  and reads each one back. 66 files / 11 distinct skills behind the 19 mounts.
+- **An s3 skill source is fetched by `llmops-harness-execution`, NOT by the deployer.**
+  The mirror's own `head_object` read-back passes under admin credentials and proves
+  nothing about the role that actually fetches at session start:
+  `simulate_principal_policy` on that role returned **implicitDeny** for
+  `skills/*` while the role file granted `skills-mirror/*` — a prefix that never held a
+  single object. Verify a new prefix with `simulate_principal_policy`, not with your own
+  `aws s3` call. The grant is `GetObject` + condition-scoped `ListBucket` only (a source
+  resolves a whole tree, so Get without List strands it), and deliberately separate from
+  `S3PipelineObjects`, which carries `PutObject`: an agent that can write its own skill
+  tree can rewrite the instructions it is judged against next session.
 - **Observability**: `OTEL_TRACES_SAMPLER=always_on` env var is mandatory or
   evaluations/insights sit at zero forever. X-Ray delivery takes no `outputFormat`.
 - **Turn budget**: harness `timeoutSeconds` is 840 here (driver Lambda caps at 900s).

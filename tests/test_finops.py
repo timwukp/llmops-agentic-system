@@ -392,8 +392,16 @@ def _prefixes(sid):
 
 
 def _readable_prefixes():
-    """Prefixes the role can GET: the read/write set plus the read-only ones."""
-    return _prefixes("S3PipelineObjects") | _prefixes("S3CustomerDataReadOnly")
+    """Prefixes the role can GET: the read/write set plus every read-only statement.
+
+    Each read-only Sid is named rather than globbed, so adding a new one is a deliberate
+    edit here. Both exist because their prefix must NOT be writable: customer-data/ holds
+    the held-out set the gates are judged on, and skills/ holds the instructions the agent
+    itself is judged against.
+    """
+    return (_prefixes("S3PipelineObjects")
+            | _prefixes("S3CustomerDataReadOnly")
+            | _prefixes("S3SkillsReadOnly"))
 
 
 def test_every_s3_prefix_the_auditor_writes_is_one_its_role_can_write():
