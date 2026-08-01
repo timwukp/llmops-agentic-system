@@ -139,6 +139,7 @@ class _Body:
 class FakeS3:
     def __init__(self):
         self.objects = {}
+        self.signed = []          # every generate_presigned_url call, in order
 
     def put_object(self, Bucket, Key, Body, **kw):
         self.objects[f"{Bucket}/{Key}"] = Body if isinstance(Body, bytes) else Body
@@ -153,6 +154,20 @@ class FakeS3:
         if f"{Bucket}/{Key}" not in self.objects:
             raise KeyError("404")
         return {}
+
+    def generate_presigned_url(self, ClientMethod, Params=None, ExpiresIn=None):
+        """Records the call and returns a URL shaped like the real one.
+
+        Deliberately NOT a signature: what these tests assert is which Key and
+        ContentType were signed, and that is in `Params`. Returning a plausible URL
+        while recording the exact params keeps the assertions on the thing that
+        matters -- a key that escapes its prefix -- rather than on boto's crypto.
+        """
+        self.signed.append({"method": ClientMethod, "params": dict(Params or {}),
+                            "expires_in": ExpiresIn})
+        p = Params or {}
+        return (f"https://{p.get('Bucket')}.s3.us-east-1.amazonaws.com/"
+                f"{p.get('Key')}?X-Amz-Signature=fake")
 
 
 class FakeLambda:
@@ -1509,3 +1524,763 @@ def test_the_frontend_has_a_colour_for_every_status_the_api_can_return():
     assert not missing, (
         f"pipeline_detail can return stage status {missing}, and stageColor() has no "
         "branch for it, so it falls through to the pending colour")
+
+
+# ── the presigned data upload: the customer's only way to hand us a dataset ────
+# Before this route the consult prompt opened every consultation by asking for "an S3
+# URI under customer-data/", which the product had no way to help answer: the console's
+# IAM could PutObject only into tasks/*, and the UI had no file input at all. The live
+# customer-data/arc-demo/ files were uploaded by CLI, not by the product. So these tests
+# guard a route whose whole purpose is to close that hole -- and the key-composition
+# tests below are what make it safe to expose at all.
+
+def test_upload_url_requires_a_console_group(wired):
+    tid = _mk_task(wired, status="plan_proposed")
+    r = wired.console.data_upload_url(
+        {"task_id": tid, "filename": "train.jsonl", "content_length": 10}, NOBODY)
+    assert r["status_code"] == 403
+    assert not wired.s3.signed, "a refused caller must not get a URL signed for them"
+
+
+def test_upload_url_signs_a_key_under_the_task_prefix(wired):
+    tid = _mk_task(wired, status="plan_proposed")
+    r = wired.console.data_upload_url(
+        {"task_id": tid, "filename": "train.jsonl", "content_length": 4096}, DS_USER)
+    assert r["ok"], r
+    assert r["key"] == f"customer-data/{tid}/train.jsonl"
+    assert r["uri"] == f"s3://test-bucket/customer-data/{tid}/train.jsonl"
+    assert r["expires_in"] == wired.console.UPLOAD_URL_TTL_S
+    call = wired.s3.signed[-1]
+    assert call["method"] == "put_object"
+    assert call["params"]["Key"] == r["key"]
+    # ContentType is signed IN so the browser cannot store a dataset as text/html, and
+    # SSE matches the bucket default rather than relying on it.
+    assert call["params"]["ContentType"] == "application/x-ndjson"
+    assert call["params"]["ServerSideEncryption"] == "AES256"
+
+
+def test_an_approver_may_also_upload(wired):
+    """Same bar as create_task: _user_may_task, not merely authenticated. The approver
+    group is in that set, so an approver walking a customer through onboarding is not
+    blocked by an authorization rule nobody intended."""
+    tid = _mk_task(wired, status="plan_proposed")
+    r = wired.console.data_upload_url(
+        {"task_id": tid, "filename": "eval.csv", "content_length": 10}, APPROVER)
+    assert r["ok"] and r["content_type"] == "text/csv"
+
+
+@pytest.mark.parametrize("filename", [
+    "../../runs/run-x/manifest.json",          # climb out of the prefix
+    "../../../finops/cost_model.json",         # into the ledger's prefix
+    "a/b/train.jsonl",                         # a nested path
+    "/etc/passwd.txt",                         # absolute
+    "C:\\Users\\me\\data\\set.jsonl",           # a Windows client's idea of a name
+    "..%2f..%2fruns%2fx.json",                 # pre-encoded traversal
+    "x" * 500 + ".jsonl",                      # a name longer than any key we want
+])
+def test_no_filename_can_escape_the_customer_data_prefix(wired, filename):
+    """The test that makes this route safe to ship. The key is composed server-side from
+    the task id and a sanitised name; nothing the client sent may reach it verbatim. Each
+    input must either be refused or land under customer-data/<task_id>/ with no path
+    separators left in the final segment.
+
+    Negative-control result worth recording: removing the basename split ALONE, or the
+    [A-Za-z0-9._-] whitelist ALONE, leaves this test green -- each guard is independently
+    sufficient, which is the point of having both. Removing BOTH fails 5 of these 7 cases.
+    So do not read a green run here as evidence that either guard is redundant; read it as
+    the redundancy working. (Verified by patching both out, 2026-08-01.)
+    """
+    tid = _mk_task(wired, status="plan_proposed")
+    r = wired.console.data_upload_url(
+        {"task_id": tid, "filename": filename, "content_length": 10}, DS_USER)
+    if r.get("ok"):
+        prefix = f"customer-data/{tid}/"
+        assert r["key"].startswith(prefix), f"{filename!r} escaped to {r['key']!r}"
+        tail = r["key"][len(prefix):]
+        assert "/" not in tail and "\\" not in tail and ".." not in tail, tail
+        assert len(r["key"]) < 300, "an unbounded name makes an unbounded key"
+        # and the SIGNED key must be the same one we reported
+        assert wired.s3.signed[-1]["params"]["Key"] == r["key"]
+    else:
+        assert r["status_code"] == 400
+        assert not wired.s3.signed, "a rejected name must not reach the signer"
+
+
+def test_upload_url_refuses_an_extension_the_pipeline_cannot_read(wired):
+    """Refused by extension rather than sniffed: this console never opens the bytes, so
+    the extension is the only honest signal. .html matters most -- a bucket that also
+    serves content plus an uploaded document is a stored-XSS shape."""
+    tid = _mk_task(wired, status="plan_proposed")
+    for name in ("payload.html", "logo.svg", "run.sh", "noextension"):
+        r = wired.console.data_upload_url(
+            {"task_id": tid, "filename": name, "content_length": 10}, DS_USER)
+        assert r.get("status_code") == 400, name
+    assert not wired.s3.signed
+
+
+def test_upload_url_for_an_unknown_task_is_404_not_400(wired):
+    """The upload is scoped to a consultation. An unknown task is not a complaint about a
+    field -- there is nothing to attach the data to, and minting a URL anyway would write
+    an orphan object into customer-data/ that no consultation ever reads."""
+    r = wired.console.data_upload_url(
+        {"task_id": "task-nope", "filename": "t.jsonl", "content_length": 10}, DS_USER)
+    assert r["status_code"] == 404
+    r2 = wired.console.data_upload_url({"filename": "t.jsonl", "content_length": 10}, DS_USER)
+    assert r2["status_code"] == 404
+    assert not wired.s3.signed
+
+
+@pytest.mark.parametrize("status", ["dispatched", "closed", "error", "completed", "failed"])
+def test_upload_url_is_refused_once_the_consultation_is_over(wired, status):
+    """Both lifecycle tuples, deliberately. TASK_TERMINAL predates the state machine,
+    which closes a task row out with completed/failed (TASK_SETTLED) -- a check that
+    tested only TASK_TERMINAL would happily hand out a write URL for a finished
+    consultation, and the object would land where no one is looking for it."""
+    tid = _mk_task(wired, status=status)
+    r = wired.console.data_upload_url(
+        {"task_id": tid, "filename": "t.jsonl", "content_length": 10}, DS_USER)
+    # .get, not [...]: when the guard is missing this returns a successful mint, and a
+    # bare KeyError reads as a broken test rather than as the open write grant it is.
+    assert r.get("status_code") == 409, \
+        f"status {status!r} still got an upload URL minted: {r}"
+    assert not wired.s3.signed
+
+
+def test_the_settled_statuses_are_the_ones_the_state_machine_writes(console):
+    """Guards the pair above against drift: if the state machine starts writing a third
+    closing status, this fails rather than the upload route silently accepting it.
+    Derived from the ASL, not from a hand-copied list."""
+    asl = json.loads((REPO / "orchestration/state_machine.asl.json").read_text())
+    written = set()
+    for st in asl["States"].values():
+        p = st.get("Parameters", {})
+        if p.get("TableName") != "llmops-tasks":
+            continue
+        for name, val in p.get("ExpressionAttributeValues", {}).items():
+            if f"#s = {name}" in p.get("UpdateExpression", ""):
+                written.add(val["S"])
+    assert written, "no llmops-tasks closer found -- did the state names change?"
+    covered = set(console.TASK_TERMINAL) | set(console.TASK_SETTLED)
+    missing = sorted(s for s in written if s not in covered)
+    assert not missing, (
+        f"the state machine closes a task with status {missing}, which is in neither "
+        "TASK_TERMINAL nor TASK_SETTLED -- data_upload_url would hand out a write URL "
+        "for a finished consultation and the object would land where nobody looks")
+
+
+def test_upload_url_needs_a_real_size(wired):
+    tid = _mk_task(wired, status="plan_proposed")
+    for cl in (None, 0, "", "abc"):
+        r = wired.console.data_upload_url(
+            {"task_id": tid, "filename": "t.jsonl", "content_length": cl}, DS_USER)
+        assert r.get("status_code") == 400, cl
+    assert not wired.s3.signed
+
+
+def test_upload_url_refuses_more_than_one_put_can_carry(wired):
+    """5 GiB is S3's single-PUT ceiling. Declared with a number rather than left to fail
+    at the END of a long upload, which is the worst possible time to learn it."""
+    tid = _mk_task(wired, status="plan_proposed")
+    r = wired.console.data_upload_url(
+        {"task_id": tid, "filename": "big.parquet",
+         "content_length": wired.console.UPLOAD_MAX_BYTES + 1}, DS_USER)
+    assert r["status_code"] == 413
+    assert not wired.s3.signed
+
+
+def test_upload_url_is_short_lived(console):
+    """A presigned PUT is a bearer write grant. It rides in browser history, proxy logs,
+    and any error report the customer pastes to us, so its lifetime is the blast radius."""
+    assert 0 < console.UPLOAD_URL_TTL_S <= 3600
+
+
+def test_upload_url_leaves_an_audit_event(wired):
+    tid = _mk_task(wired, status="plan_proposed")
+    wired.console.data_upload_url(
+        {"task_id": tid, "filename": "train.jsonl", "content_length": 4096}, DS_USER)
+    ev = [p for p in wired.events.puts if p.get("event_name") == "DataUploadUrlIssued"]
+    assert ev, ("an issued write grant that leaves no trace cannot be investigated later; "
+                f"events were {[p.get('event_name') for p in wired.events.puts]}")
+    detail = json.loads(ev[-1]["detail"])
+    assert detail["actor"] == "alice"
+    assert detail["key"] == f"customer-data/{tid}/train.jsonl"
+    assert detail["bytes"] == "4096"
+
+
+def test_a_signing_failure_is_a_502_not_a_broken_url(wired, monkeypatch):
+    """If S3 cannot sign, the caller must learn that instead of receiving something
+    URL-shaped that fails in the browser as an opaque CORS error."""
+    def _boom(*a, **k):
+        raise RuntimeError("kms/sts unavailable")
+    monkeypatch.setattr(wired.s3, "generate_presigned_url", _boom)
+    tid = _mk_task(wired, status="plan_proposed")
+    r = wired.console.data_upload_url(
+        {"task_id": tid, "filename": "t.jsonl", "content_length": 10}, DS_USER)
+    assert r["status_code"] == 502 and "url" not in r
+
+
+def test_the_upload_route_is_registered_inside_the_authenticated_post_block(console):
+    """An upload-URL minter above the auth check is an unauthenticated write grant on the
+    data bucket. Asserted structurally because the route list is long enough that a new
+    entry can land on the wrong side of `if user is None` unnoticed."""
+    src = (REPO / "deploy/console/lambda_function.py").read_text()
+    assert '"/api/data-upload-url"' in src
+    post_block = src.split('if user is None')[-1]
+    assert "/api/data-upload-url" in post_block
+
+
+# ── the CSP must permit the upload it is deployed alongside ────────────────────
+
+def test_the_csp_names_the_upload_origin_so_our_own_header_does_not_block_it(wired):
+    """connect-src 'self' alone blocks a browser PUT to S3, and the failure reads as a
+    broken S3 permission rather than as our own header -- the single most expensive way
+    this feature could fail. Scoped to the one bucket: 'https://*.s3.amazonaws.com'
+    would authorise every bucket on earth as a fetch target from this page."""
+    csp = wired.console._csp()
+    assert "connect-src 'self' https://test-bucket.s3." in csp
+    assert "*.s3." not in csp, "a wildcard S3 origin is not a scope"
+    # the rest of the policy must survive the edit
+    for d in ("default-src 'self'", "base-uri 'none'", "object-src 'none'",
+              "frame-ancestors 'self'"):
+        assert d in csp, d
+
+
+def test_the_csp_is_built_per_response_not_frozen_at_import(console):
+    """data_bucket() may resolve through SSM. A module-level constant means one transient
+    cold-start failure bakes an upload-less CSP into that container for its whole life.
+    Asserted by changing the bucket and re-reading the header, which a constant cannot
+    reflect -- and by the header NOT being in _SEC_HEADERS, which is the shape that
+    would silently reintroduce the freeze."""
+    assert "content-security-policy" not in console._SEC_HEADERS
+    import unittest.mock as _m
+    with _m.patch.object(console, "data_bucket", lambda: "bucket-one"):
+        first = console._resp(200, {})["headers"]["content-security-policy"]
+    with _m.patch.object(console, "data_bucket", lambda: "bucket-two"):
+        second = console._resp(200, {})["headers"]["content-security-policy"]
+    assert "bucket-one" in first and "bucket-two" in second
+
+
+def test_an_unresolvable_bucket_degrades_to_self_and_never_to_a_wildcard(console):
+    """Uploads are broken either way if the bucket cannot be resolved; a wildcard would
+    trade a real security boundary for nothing."""
+    import unittest.mock as _m
+    def _boom():
+        raise RuntimeError("ssm unavailable")
+    with _m.patch.object(console, "data_bucket", _boom):
+        csp = console._csp()
+    assert "connect-src 'self';" in csp and "s3." not in csp
+
+
+# ── the infrastructure the upload silently depends on ─────────────────────────
+
+def test_the_console_role_may_write_customer_data(console):
+    """generate_presigned_url signs with the CALLER's credentials: a URL signed by a role
+    without s3:PutObject on the key is minted happily and then 403s in the browser at the
+    end of the upload. So the grant is part of the feature, not an afterthought."""
+    pol = json.loads((REPO / "deploy/console/iam-policy.json").read_text())
+    puts = [s for s in pol["Statement"]
+            if "s3:PutObject" in (s["Action"] if isinstance(s["Action"], list) else [s["Action"]])]
+    res = [r for s in puts for r in (s["Resource"] if isinstance(s["Resource"], list) else [s["Resource"]])]
+    assert any("customer-data/*" in r for r in res), \
+        f"no PutObject grant on customer-data/*; found {res}"
+    # and it must stay scoped -- a bucket-wide PutObject lets the console overwrite
+    # manifests and signed approval records under runs/.
+    assert not any(r.rstrip("*").endswith(":::") or r.endswith(":::*") for r in res)
+
+
+def test_the_bucket_is_configured_for_browser_uploads(console):
+    """A presigned PUT from a page on another origin is a cross-origin request: without a
+    CORS rule the browser fails at the preflight no matter how correct the URL is. The
+    bucket had NO CORS configuration (NoSuchCORSConfiguration) and 03_storage.py had no
+    step to add one, so this is asserted rather than assumed."""
+    src = (REPO / "deploy/03_storage.py").read_text()
+    assert "put_bucket_cors" in src, "ensure_bucket never configures CORS"
+    block = src[src.index("put_bucket_cors") - 2000:src.index("put_bucket_cors") + 1200]
+    assert '"PUT"' in block or "'PUT'" in block, "the CORS rule must allow PUT"
+    assert "AllowedOrigins" in block
+    assert '"*"' not in block.split("AllowedOrigins")[1][:200], \
+        "AllowedOrigins '*' lets any page on the internet use a leaked presigned URL"
+
+
+def test_the_pipeline_role_still_cannot_write_customer_data(console):
+    """The console signs writes; the harness only reads. deploy/iam/harness_execution_role.json
+    explains why: a pipeline that can rewrite the customer's data can destroy the held-out
+    set its own gates are judged on. Adding an upload path must not have relaxed that."""
+    doc = json.loads((REPO / "deploy/iam/harness_execution_role.json").read_text())
+    # The file holds BOTH policies keyed separately (trustPolicy / permissionsPolicy);
+    # deploy/01_iam.py applies each. Reading doc["Statement"] would KeyError, and a
+    # `.get("Statement", [])` would silently iterate nothing and pass vacuously.
+    pol = doc["permissionsPolicy"]
+    for s in pol["Statement"]:
+        acts = s["Action"] if isinstance(s["Action"], list) else [s["Action"]]
+        res = s["Resource"] if isinstance(s["Resource"], list) else [s["Resource"]]
+        writes = [a for a in acts if a.startswith("s3:Put") or a.startswith("s3:Delete")
+                  or a == "s3:*"]
+        if writes:
+            assert not any("customer-data" in r for r in res), \
+                f"{writes} granted on {res} -- customer data must stay read-only here"
+
+
+# ── the CORS step, exercised rather than grepped ──────────────────────────────
+# The guard above proves put_bucket_cors exists in the source; these prove it does the
+# right thing. A structural assertion alone would pass on a step that wildcards its
+# origin, skips silently, or allows DELETE.
+
+@pytest.fixture(scope="module")
+def storage():
+    """deploy/03_storage.py loaded as a module. Its name starts with a digit so it is
+    not importable normally; nothing at import time calls AWS."""
+    spec = importlib.util.spec_from_file_location(
+        "llmops_03_storage", REPO / "deploy/03_storage.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class _CorsS3:
+    def __init__(self):
+        self.cors = None
+
+    def put_bucket_cors(self, Bucket, CORSConfiguration):
+        self.cors = {"bucket": Bucket, "config": CORSConfiguration}
+
+
+def test_cors_allows_the_upload_and_nothing_more(storage):
+    s3 = _CorsS3()
+    note = storage.ensure_cors(s3, "b", "https://api.example.com", dry=False)
+    rule = s3.cors["config"]["CORSRules"][0]
+    assert rule["AllowedOrigins"] == ["https://api.example.com"]
+    assert "PUT" in rule["AllowedMethods"]
+    # No DELETE: nothing in the product asks a browser to remove a customer's dataset,
+    # and a presigned URL is a bearer token -- a DELETE rule widens what a leaked one does.
+    assert "DELETE" not in rule["AllowedMethods"]
+    assert "POST" not in rule["AllowedMethods"]
+    # the preflight must be allowed to ask for the headers the signature covers
+    assert "content-type" in rule["AllowedHeaders"]
+    assert "x-amz-server-side-encryption" in rule["AllowedHeaders"]
+    assert "https://api.example.com" in note
+
+
+def test_cors_is_skipped_and_reported_never_wildcarded(storage):
+    """The whole point of a 15-minute presigned URL is that it is a narrow grant.
+    AllowedOrigins '*' would let any page on the internet spend one it got hold of, so an
+    unresolved origin must skip the rule and SAY so -- the deploy output is the only place
+    a skip is visible, because the symptom is a browser failure with no server-side trace.
+    """
+    s3 = _CorsS3()
+    note = storage.ensure_cors(s3, "b", "", dry=False)
+    assert s3.cors is None, "no CORS rule may be written without a known origin"
+    assert "skip" in note.lower() and "console-origin" in note
+
+
+def test_cors_dry_run_writes_nothing(storage):
+    s3 = _CorsS3()
+    note = storage.ensure_cors(s3, "b", "https://api.example.com", dry=True)
+    assert s3.cors is None and "would" in note
+
+
+def test_console_origin_prefers_an_explicit_override_over_any_aws_call(storage):
+    """--console-origin must work with no credentials at all: the offline dry-run path
+    (--account-id, no STS) is the one people use to review a deploy, and an AWS call in
+    that path turns a review into a failure."""
+    assert storage.console_origin("us-east-1", dry=True,
+                                  override="https://x.example.com/") == "https://x.example.com"
+
+
+def test_console_origin_matches_the_api_the_console_deploy_actually_creates(storage):
+    """deploy/console/deploy.sh names its HTTP API "$FN-api" with FN=llmops-admin. If
+    these two spellings drift, CORS is silently skipped on every deploy and browser
+    upload breaks with no error anywhere on the server side."""
+    sh = (REPO / "deploy/console/deploy.sh").read_text()
+    assert f"FN={storage.CONSOLE_FN}" in sh
+    assert '--name "$FN-api"' in sh
+
+
+def test_console_origin_is_empty_rather_than_wrong_when_the_api_is_absent(storage, monkeypatch):
+    class _Api:
+        def get_apis(self):
+            return {"Items": [{"Name": "some-other-api", "ApiId": "zzz"}]}
+    monkeypatch.setattr(storage.boto3, "client", lambda *a, **k: _Api())
+    assert storage.console_origin("us-east-1", dry=False) == ""
+
+
+def test_console_origin_resolves_the_real_api(storage, monkeypatch):
+    class _Api:
+        def get_apis(self):
+            return {"Items": [{"Name": "unrelated", "ApiId": "aaa"},
+                              {"Name": f"{storage.CONSOLE_FN}-api", "ApiId": "deovqcv4m7"}]}
+    monkeypatch.setattr(storage.boto3, "client", lambda *a, **k: _Api())
+    assert storage.console_origin("us-east-1", dry=False) == \
+        "https://deovqcv4m7.execute-api.us-east-1.amazonaws.com"
+
+
+def test_the_deploy_reports_cors_on_its_own_line(storage):
+    """Folded into the `settings` string it would be one word in a sentence nobody reads.
+    A skipped CORS step has no other visible symptom until a customer's upload fails."""
+    src = (REPO / "deploy/03_storage.py").read_text()
+    main = src[src.index("def main("):]
+    assert '"cors": ensure_cors(' in main
+
+
+# ── the session: login, reload-survival, sign-out ──────────────────────────────
+# Before this block the whole auth path had zero test coverage, which is how the
+# refresh-logout bug shipped: the access token lived in one JS variable and a reload
+# wiped it, so "signed in" lasted exactly as long as the page did. The fix is an
+# httpOnly refresh cookie, and each of its properties (httpOnly, Secure, SameSite,
+# narrow Path, cleared-on-failure, revoked-on-sign-out) is a separate assertion below —
+# a cookie that survives a reload but is readable by script would be the bug traded for
+# a worse one.
+
+class _CognitoAuth:
+    """Enough of cognito-idp to exercise both auth flows and revocation.
+
+    Refresh tokens are tracked as a live set, so revocation is observable: a revoked
+    token must make REFRESH_TOKEN_AUTH fail, which is the only thing that makes
+    sign-out more than a cosmetic cookie delete.
+    """
+
+    class exceptions:
+        class NotAuthorizedException(Exception):
+            pass
+
+    def __init__(self, password="pw-correct"):
+        self.password = password
+        self.live_refresh = set()
+        self.revoked = []
+        self.auth_calls = []
+        self.n = 0
+
+    def initiate_auth(self, ClientId, AuthFlow, AuthParameters):
+        self.auth_calls.append((AuthFlow, dict(AuthParameters)))
+        self.n += 1
+        if AuthFlow == "USER_PASSWORD_AUTH":
+            if AuthParameters.get("PASSWORD") != self.password:
+                raise self.exceptions.NotAuthorizedException("bad password")
+            rt = f"refresh-{self.n}"
+            self.live_refresh.add(rt)
+            return {"AuthenticationResult": {"AccessToken": f"access-{self.n}",
+                                             "ExpiresIn": 28800, "RefreshToken": rt}}
+        if AuthFlow == "REFRESH_TOKEN_AUTH":
+            rt = AuthParameters.get("REFRESH_TOKEN", "")
+            if rt not in self.live_refresh:
+                raise self.exceptions.NotAuthorizedException("Refresh Token has been revoked")
+            # Cognito returns NO new refresh token here (rotation off) — modelled, so a
+            # test cannot accidentally depend on one appearing.
+            return {"AuthenticationResult": {"AccessToken": f"access-{self.n}",
+                                             "ExpiresIn": 28800}}
+        raise AssertionError(f"unexpected auth flow {AuthFlow}")
+
+    def revoke_token(self, Token, ClientId):
+        self.revoked.append(Token)
+        self.live_refresh.discard(Token)
+        return {}
+
+
+@pytest.fixture
+def auth(console, monkeypatch):
+    """The console with a working Cognito and the session routes reachable."""
+    cog = _CognitoAuth()
+    monkeypatch.setattr(console, "cognito", cog)
+    monkeypatch.setattr(console, "COGNITO_CLIENT_ID", "client-test")
+    monkeypatch.setattr(console, "COGNITO_POOL_ID", "us-east-1_test")
+    monkeypatch.setattr(console, "data_bucket", lambda: "test-bucket")
+    return types.SimpleNamespace(console=console, cog=cog)
+
+
+def _post(console, path, body=None, cookies=None):
+    """Drive handler() the way API Gateway does, payload format 2.0.
+
+    Deliberately through handler() rather than the helpers: format 2.0 carries cookies in
+    event["cookies"] (a list) and Set-Cookie in the response's "cookies" key, NOT in
+    headers. A test that called cognito_refresh() directly would pass while the live
+    route read a cookie that is never there.
+    """
+    ev = {"requestContext": {"http": {"method": "POST", "path": path,
+                                      "sourceIp": "10.0.0.9"}},
+          "headers": {}, "body": json.dumps(body or {})}
+    if cookies is not None:
+        ev["cookies"] = list(cookies)
+    return console.handler(ev, None)
+
+
+def _set_cookies(resp):
+    return list(resp.get("cookies") or [])
+
+
+def _cookie_named(resp, name):
+    for c in _set_cookies(resp):
+        if c.split("=", 1)[0] == name:
+            return c
+    return ""
+
+
+def test_login_returns_a_token_and_sets_the_refresh_cookie(auth):
+    r = _post(auth.console, "/api/login", {"username": "admin", "password": "pw-correct"})
+    assert r["statusCode"] == 200
+    body = json.loads(r["body"])
+    assert body["accessToken"] == "access-1" and body["expiresIn"] == 28800
+    c = _cookie_named(r, auth.console.REFRESH_COOKIE)
+    assert c, f"login must set {auth.console.REFRESH_COOKIE}; got {_set_cookies(r)}"
+    assert "refresh-1" in c
+
+
+def test_the_refresh_token_never_reaches_the_response_body(auth):
+    """The entire point of the cookie. A refresh token in the JSON body is readable by
+    any script on the page, which would make the httpOnly flag decorative: an XSS bug
+    would harvest 30 days of re-issue instead of one 8-hour access token."""
+    r = _post(auth.console, "/api/login", {"username": "admin", "password": "pw-correct"})
+    raw = r["body"]
+    assert "refresh-1" not in raw, "the refresh token must not be in the response body"
+    assert "refreshToken" not in json.loads(raw)
+
+
+def test_the_refresh_cookie_is_unreachable_from_script_and_from_other_sites(auth):
+    """Three flags, three distinct attacks, so three assertions rather than one regex.
+
+    HttpOnly: script cannot read it (the XSS blast radius).
+    Secure: it never rides a plaintext hop.
+    SameSite=Strict: no other origin can make the browser attach it — the CSRF answer
+    for a route whose entire input is a cookie.
+    """
+    r = _post(auth.console, "/api/login", {"username": "admin", "password": "pw-correct"})
+    c = _cookie_named(r, auth.console.REFRESH_COOKIE)
+    assert "HttpOnly" in c
+    assert "Secure" in c
+    assert "SameSite=Strict" in c
+
+
+def test_the_refresh_cookie_is_scoped_to_the_route_that_consumes_it(auth):
+    """Path=/api/refresh means the browser never attaches the 30-day credential to
+    /api/tasks, /api/cost-approval or the dashboard HTML. A Path=/ cookie would ride
+    along on every request for no benefit, widening where it can leak."""
+    r = _post(auth.console, "/api/login", {"username": "admin", "password": "pw-correct"})
+    c = _cookie_named(r, auth.console.REFRESH_COOKIE)
+    assert f"Path={auth.console.REFRESH_COOKIE_PATH}" in c
+    assert auth.console.REFRESH_COOKIE_PATH == "/api/refresh"
+    # ...and the revoke route must path-match it, or sign-out arrives with no cookie to
+    # revoke and silently degrades to a client-side forget.
+    assert "/api/refresh/revoke".startswith(auth.console.REFRESH_COOKIE_PATH)
+
+
+def test_a_failed_login_sets_no_cookie(auth):
+    """A cookie holding "" would be a session by another name: /api/refresh would find
+    the cookie present, call Cognito with an empty token, and answer 401 — turning a
+    typo'd password into a doomed round-trip on every later page load."""
+    r = _post(auth.console, "/api/login", {"username": "admin", "password": "wrong"})
+    assert json.loads(r["body"])["error"] == "invalid username or password"
+    assert _set_cookies(r) == []
+
+
+def test_a_reload_restores_the_session_without_a_password(auth):
+    """The bug, stated as a test: sign in, throw the page away, and come back with only
+    the cookie. Before the fix there was nothing to come back with."""
+    login = _post(auth.console, "/api/login", {"username": "admin", "password": "pw-correct"})
+    cookie = _cookie_named(login, auth.console.REFRESH_COOKIE).split(";")[0]
+    r = _post(auth.console, "/api/refresh", cookies=[cookie])
+    assert r["statusCode"] == 200
+    assert json.loads(r["body"])["accessToken"].startswith("access-")
+    assert ("REFRESH_TOKEN_AUTH", {"REFRESH_TOKEN": "refresh-1"}) in auth.cog.auth_calls
+
+
+def test_refresh_reads_the_cookie_from_where_api_gateway_puts_it(auth):
+    """Payload format 2.0 delivers cookies in event["cookies"], never in headers.
+    Reading headers["cookie"] would pass any hand-written test and find nothing live —
+    and the symptom would be "the fix didn't work", with no error anywhere.
+
+    Both halves use a token that is genuinely VALID, which is what makes this test able
+    to fail. The first draft sent a bogus token and asserted 401 on both channels — but a
+    header-reading implementation also answers 401 for a bogus token (it just finds
+    nothing), so the test passed with the guard removed. Only a live token distinguishes
+    "read it and Cognito said no" from "never read it at all".
+    (Verified by patching the reader over to headers, 2026-08-01.)
+    """
+    login = _post(auth.console, "/api/login", {"username": "admin", "password": "pw-correct"})
+    cookie = _cookie_named(login, auth.console.REFRESH_COOKIE).split(";")[0]
+    assert "refresh-1" in cookie
+    # the right channel: a valid token restores the session
+    assert _post(auth.console, "/api/refresh", cookies=[cookie])["statusCode"] == 200
+    # the wrong channel: the SAME valid token in a header must not be honoured
+    ev = {"requestContext": {"http": {"method": "POST", "path": "/api/refresh"}},
+          "headers": {"cookie": cookie}, "body": "{}"}
+    r = auth.console.handler(ev, None)
+    assert r["statusCode"] == 401 and json.loads(r["body"])["error"] == "no session"
+
+
+def test_refresh_without_a_cookie_is_401_and_never_calls_cognito(auth):
+    """A first-time visitor must not cost a Cognito round-trip on page load — the page
+    calls this route unconditionally."""
+    r = _post(auth.console, "/api/refresh")
+    assert r["statusCode"] == 401
+    assert json.loads(r["body"])["error"] == "no session"
+    assert auth.cog.auth_calls == []
+
+
+def test_a_rejected_refresh_cookie_is_cleared_so_it_cannot_fail_forever(auth):
+    """A refresh token Cognito rejects will be rejected on every future reload. Leaving
+    it makes each page load pay a doomed round-trip; clearing it means the next load
+    goes straight to the sign-in prompt."""
+    r = _post(auth.console, "/api/refresh", cookies=["llmops_rt=refresh-bogus"])
+    assert r["statusCode"] == 401
+    c = _cookie_named(r, auth.console.REFRESH_COOKIE)
+    assert "Max-Age=0" in c, f"a rejected cookie must be expired; got {c!r}"
+    assert f"Path={auth.console.REFRESH_COOKIE_PATH}" in c, \
+        "cleared with a different Path, the browser keeps the original alongside it"
+
+
+def test_sign_out_revokes_the_token_server_side_and_clears_the_cookie(auth):
+    """Without RevokeToken, sign-out on a shared machine only hides the credential:
+    the refresh token stays valid in Cognito for the rest of its 30 days."""
+    login = _post(auth.console, "/api/login", {"username": "admin", "password": "pw-correct"})
+    cookie = _cookie_named(login, auth.console.REFRESH_COOKIE).split(";")[0]
+    r = _post(auth.console, "/api/refresh/revoke", cookies=[cookie])
+    assert r["statusCode"] == 200 and json.loads(r["body"])["revoked"] is True
+    assert auth.cog.revoked == ["refresh-1"]
+    assert "Max-Age=0" in _cookie_named(r, auth.console.REFRESH_COOKIE)
+    # ...and the revoked cookie no longer restores anything.
+    assert _post(auth.console, "/api/refresh", cookies=[cookie])["statusCode"] == 401
+
+
+def test_sign_out_still_clears_the_cookie_when_revocation_fails(auth, monkeypatch):
+    """A sign-out that reports failure and leaves the browser signed in is worse than one
+    that clears locally while an unreachable token runs out its window."""
+    def _boom(**kw):
+        raise RuntimeError("ThrottlingException")
+    monkeypatch.setattr(auth.cog, "revoke_token", _boom)
+    r = _post(auth.console, "/api/refresh/revoke", cookies=["llmops_rt=refresh-1"])
+    assert r["statusCode"] == 200 and json.loads(r["body"])["revoked"] is False
+    assert "Max-Age=0" in _cookie_named(r, auth.console.REFRESH_COOKIE)
+
+
+def test_the_session_routes_are_the_only_unauthenticated_posts(console):
+    """Structural, because this is the one place in the file where being above the auth
+    check is CORRECT — which makes it the easiest place for a fourth route to be added
+    above it by accident and become an unauthenticated write."""
+    src = (REPO / "deploy/console/lambda_function.py").read_text()
+    pre_auth = src.split("if user is None")[0]
+    # everything from the body parse to the auth check: the unauthenticated zone
+    zone = pre_auth[pre_auth.index('raw = event.get("body")'):]
+    paths = set(re.findall(r'path == "(/api/[^"]+)"', zone))
+    assert paths == {"/api/login", "/api/refresh", "/api/refresh/revoke"}, \
+        f"unauthenticated POST routes drifted: {sorted(paths)}"
+
+
+def test_a_non_session_post_is_unaffected_by_the_cookie(auth):
+    """The cookie authenticates the session routes and nothing else. If a Bearer-less
+    POST to /api/tasks started succeeding because a cookie was present, the cookie would
+    have quietly become a second credential on every write route."""
+    r = _post(auth.console, "/api/tasks", {"goal": "x"}, cookies=["llmops_rt=refresh-1"])
+    assert r["statusCode"] == 401
+
+
+def test_cookies_are_absent_from_responses_that_set_none(auth):
+    """Format 2.0 accepts the key only as a list; emitting "cookies": [] or None on every
+    response would add a field to all 40-odd routes to prove one route works."""
+    r = _post(auth.console, "/api/tasks", {"goal": "x"})
+    assert "cookies" not in r
+    ok = auth.console._resp(200, {"a": 1})
+    assert "cookies" not in ok
+
+
+def test_set_cookie_rides_the_payload_2_0_cookies_list_not_a_header(auth):
+    """Duplicated in headers AND cookies, a browser could apply the value twice; put
+    only in headers, format 2.0 drops it when there is more than one. This asserts the
+    single correct channel."""
+    r = _post(auth.console, "/api/login", {"username": "admin", "password": "pw-correct"})
+    assert isinstance(r.get("cookies"), list)
+    hdrs = {k.lower() for k in r["headers"]}
+    assert "set-cookie" not in hdrs
+
+
+def test_login_without_cognito_configured_sets_no_cookie(console, monkeypatch):
+    """Unconfigured must fail closed. The tuple return exists so this path cannot
+    accidentally return a cookie built from a missing token."""
+    monkeypatch.setattr(console, "COGNITO_CLIENT_ID", "")
+    out, rt = console.cognito_login("admin", "pw")
+    assert out == {"error": "Cognito not configured"} and rt == ""
+    assert console.cognito_refresh("refresh-1")["error"] == "Cognito not configured"
+
+
+def test_the_console_role_may_revoke_a_refresh_token(console):
+    """boto3 signs RevokeToken with this role's credentials, so IAM authorizes it even
+    though Cognito accepts unauthenticated callers. Without the grant, sign-out clears
+    the cookie and silently fails to invalidate anything — the failure is a print in a
+    log, not an error the user sees."""
+    doc = json.loads((REPO / "deploy/console/iam-policy.json").read_text())
+    st = next(s for s in doc["Statement"] if s.get("Sid") == "CognitoAuth")
+    for action in ("cognito-idp:InitiateAuth", "cognito-idp:RevokeToken"):
+        assert action in st["Action"], action
+
+
+def test_the_deploy_reports_the_client_settings_the_session_depends_on(console):
+    """ALLOW_REFRESH_TOKEN_AUTH missing = every reload forces a re-login, with no error
+    anywhere. Token revocation off = sign-out cannot invalidate. Both are client-level,
+    so the existing pool-level drift query cannot see them."""
+    src = (REPO / "deploy/console/deploy.sh").read_text()
+    assert "describe-user-pool-client" in src
+    assert "ALLOW_REFRESH_TOKEN_AUTH" in src.split("describe-user-pool-client")[1]
+    assert "EnableTokenRevocation" in src
+
+
+# ── the browser half: what a reload actually does ─────────────────────────────
+
+def test_the_page_restores_its_session_on_load(auth):
+    """Without a call at load time the server half is dead code and the bug is unfixed.
+    setAuthUi() alone renders "Sign in" and stops there.
+
+    Asserted against COMMENT-STRIPPED source. The first draft searched the init block's
+    raw text, which passed with the call deleted because the comment above it still said
+    "restoreSession()" -- a test satisfied by prose describing the code it is meant to
+    check. (Verified by deleting the call, 2026-08-01.)
+    """
+    front = (REPO / "deploy/console/frontend.html").read_text()
+    assert "async function restoreSession()" in front
+    assert '"/api/refresh"' in front
+    code = "\n".join(ln for ln in front.splitlines() if not ln.lstrip().startswith("//"))
+    init = code[code.rindex("setAuthUi();"):]
+    assert "restoreSession()" in init, "restoreSession must be CALLED during page init"
+
+
+def test_an_expired_access_token_does_not_throw_away_the_refresh_cookie(auth):
+    """The subtlest way to reintroduce the bug: reuse signOut() for token expiry. The
+    access token lasts 8 hours and the session 30 days, so treating expiry as sign-out
+    would revoke a good session eight hours into it."""
+    front = (REPO / "deploy/console/frontend.html").read_text()
+    assert "function clearSession()" in front
+    # signOut is the only thing allowed to hit the revoke route
+    revoke_users = [ln for ln in front.splitlines() if "/api/refresh/revoke" in ln]
+    assert len(revoke_users) == 1, revoke_users
+    sign_out = front[front.index("function signOut()"):]
+    sign_out = sign_out[:sign_out.index("\n}")]
+    assert "/api/refresh/revoke" in sign_out
+    # the 401 handler and the expiry check must both use clearSession, not signOut
+    for marker in ("if (resp.status===401) { clearSession();",
+                   "Date.now() > SESSION.exp) clearSession();"):
+        assert marker in front, marker
+    assert 'r.error==="unauthorized") { signOut()' not in front
+
+
+def test_ensureToken_tries_the_cookie_before_prompting_for_a_password(auth):
+    """A password prompt the cookie could have avoided is the user-visible symptom of
+    this whole bug. Order matters: restoreSession must come before signIn."""
+    front = (REPO / "deploy/console/frontend.html").read_text()
+    body = front[front.index("async function ensureToken()"):]
+    body = body[:body.index("\n}")]
+    assert body.index("restoreSession()") < body.index("signIn()"), body
+
+
+def test_the_session_fetches_send_the_cookie(auth):
+    """fetch() omits cookies unless credentials is set. Without this the cookie is set
+    by login and then never sent back — the feature silently does nothing."""
+    front = (REPO / "deploy/console/frontend.html").read_text()
+    for route in ("/api/login", "/api/refresh", "/api/refresh/revoke"):
+        i = front.index('API+"' + route + '"')
+        assert 'credentials:"same-origin"' in front[i:i + 200], route
+
+
+def test_the_in_memory_token_comment_still_describes_the_truth(auth):
+    """The comment at the top of the auth block was the diagnosis for this bug ("a
+    reload costs one sign-in"). Left unchanged it would now be a false claim sitting
+    directly above the code that contradicts it."""
+    front = (REPO / "deploy/console/frontend.html").read_text()
+    assert "A reload costs one sign-in" not in front
+    assert "httpOnly refresh cookie" in front

@@ -234,11 +234,12 @@
       ]
     },
     {
-      "_comment": "AdminListGroupsForUser is required for the approver check: GetUser returns the username and attributes but NOT group membership, and a bearer access token carries no cognito:groups claim. Without this call the separation-of-duties gate has nothing to check.",
+      "_comment": "AdminListGroupsForUser is required for the approver check: GetUser returns the username and attributes but NOT group membership, and a bearer access token carries no cognito:groups claim. Without this call the separation-of-duties gate has nothing to check. RevokeToken is what makes sign-out mean something: the refresh cookie is cleared client-side regardless, but without this grant the 30-day refresh token stays valid in Cognito for its whole window, so a sign-out on a shared machine would be cosmetic. These operations accept unauthenticated callers, but boto3 signs them with this role's credentials, and a signed request IS authorized against IAM -- so the grant is required, not decorative. InitiateAuth covers both USER_PASSWORD_AUTH (login) and REFRESH_TOKEN_AUTH (session restore); it is one action, not two.",
       "Sid": "CognitoAuth",
       "Effect": "Allow",
       "Action": [
         "cognito-idp:InitiateAuth",
+        "cognito-idp:RevokeToken",
         "cognito-idp:GetUser",
         "cognito-idp:AdminListGroupsForUser"
       ],
@@ -317,6 +318,17 @@
       ],
       "Resource": [
         "arn:aws:s3:::llmops-agentic-ACCOUNT_ID-REGION/tasks/*"
+      ]
+    },
+    {
+      "_comment": "The customer's own dataset, uploaded by their browser through a presigned PUT this role signs (see data_upload_url). generate_presigned_url signs with THIS role's credentials and never calls AWS, so without this grant the URL is minted happily and then 403s in the browser at the end of the upload -- the grant is part of the feature, not an afterthought. Scoped to customer-data/ and NOT merged into S3TasksWrite: a bucket-wide PutObject would let a console bug overwrite run manifests and the signed approval records under runs/, which are the evidence trail for spend. The harness execution role deliberately keeps this prefix read-only (deploy/iam/harness_execution_role.json): a pipeline that can rewrite the customer's data can destroy the held-out set its own gates are judged on. The console signs writes; the pipeline only reads.",
+      "Sid": "S3CustomerDataWrite",
+      "Effect": "Allow",
+      "Action": [
+        "s3:PutObject"
+      ],
+      "Resource": [
+        "arn:aws:s3:::llmops-agentic-ACCOUNT_ID-REGION/customer-data/*"
       ]
     },
     {

@@ -7,8 +7,12 @@ dashboard HTML (GET /) and the JSON API (GET/POST /api/*). Design and most of th
 code are ported from bedrock-agentcore-agent-ops-console
 (github.com/timwukp/bedrock-agentcore-agent-ops-console).
 
-Auth model (ported): GET routes are public read-only; every POST except /api/login
-requires a Cognito access token (validated server-side via cognito-idp GetUser).
+Auth model (ported): GET routes are public read-only; every POST except the three
+session routes (/api/login, /api/refresh, /api/refresh/revoke) requires a Cognito access
+token (validated server-side via cognito-idp GetUser). Those three are unauthenticated
+because they establish, restore and end a session -- demanding a live token to recover
+from having lost one is circular. Reload survival rides on an httpOnly refresh cookie
+scoped to Path=/api/refresh, which page script cannot read.
 
 The frontend ships as frontend.html in the same zip and is read ONCE at cold start
 into a module global — no giant inline HTML string in this file.
@@ -1838,6 +1842,13 @@ def finops_run(body):
 
 TASK_ACTIVE = ("thinking", "accepting")           # one in-flight turn per task
 TASK_TERMINAL = ("dispatched", "closed", "error")
+#: The state machine closes a task row out with "completed"/"failed" (see
+#: orchestration/state_machine.asl.json), which TASK_TERMINAL predates and does not
+#: list. Kept as a SEPARATE tuple rather than folded into TASK_TERMINAL: widening that
+#: one would also change what post_task_message and close_task refuse, which is a
+#: lifecycle decision this change has no business making quietly. New checks that mean
+#: "this consultation is over" should test both.
+TASK_SETTLED = ("completed", "failed")
 STALE_TURN_MIN = 20                               # zombie 'thinking' escape hatch
 
 
@@ -1925,6 +1936,128 @@ def create_task(body, user):
     _task_event(task_id, "TaskCreated", user["username"], {"goal": goal[:200]})
     _enqueue_task_turn(task_id)
     return {"ok": True, "task": item}
+
+
+#: Where a customer's own data lands. Read-only to the pipeline (see
+#: deploy/iam/harness_execution_role.json: a pipeline that can rewrite customer data can
+#: destroy the held-out set its own gates are judged on), writable only by this console
+#: signing a short-lived presigned PUT.
+CUSTOMER_DATA_PREFIX = "customer-data"
+#: 15 min: long enough to upload a large file over a slow link, short enough that a URL
+#: leaked from a browser history or a proxy log is not a standing write grant.
+UPLOAD_URL_TTL_S = 900
+#: 5 GiB is S3's single-PUT ceiling. Declared rather than implied so the caller gets a
+#: 400 with a number instead of an opaque S3 failure at the end of a long upload.
+UPLOAD_MAX_BYTES = 5 * 1024 * 1024 * 1024
+#: A dataset the pipeline can actually read. Everything else is refused by extension
+#: rather than sniffed: this console never opens the bytes, so the extension is the only
+#: honest signal, and .html/.svg in a bucket that also serves content is a stored-XSS
+#: shape we simply do not accept.
+UPLOAD_EXTS = ("jsonl", "json", "csv", "tsv", "txt", "parquet", "zip", "gz")
+#: Only for the Content-Type pinned INTO the presigned URL. A dataset is never served as
+#: a document, so anything unrecognised becomes a stream rather than guessing.
+_UPLOAD_CTYPES = {"jsonl": "application/x-ndjson", "json": "application/json",
+                  "csv": "text/csv", "tsv": "text/tab-separated-values",
+                  "txt": "text/plain", "parquet": "application/vnd.apache.parquet",
+                  "zip": "application/zip", "gz": "application/gzip"}
+
+
+def _safe_upload_name(filename):
+    """A filename reduced to something that cannot escape its prefix.
+
+    The key is built server-side from this, never taken from the client. `basename`
+    alone is not enough: "..%2f" style input, backslashes (a Windows client sends
+    "C:\\data\\set.jsonl"), and leading dots all survive it. So: split on both
+    separators, keep the last segment, then keep only [A-Za-z0-9._-] and collapse the
+    rest. Returns "" when nothing usable remains, which the caller turns into a 400 --
+    silently inventing a name would store a file the customer cannot recognise later.
+    """
+    raw = str(filename or "").strip().replace("\\", "/")
+    raw = raw.split("/")[-1]
+    cleaned = "".join(ch if (ch.isalnum() or ch in "._-") else "-" for ch in raw)
+    # Collapse dot runs. Percent-encoded traversal ("..%2f..%2fruns%2fx.json") survives
+    # the character filter as "..-2f..-2fruns-2fx.json" -- harmless as an S3 key, since
+    # S3 does not resolve "..", but it leaves a name that READS like a traversal in every
+    # log and audit event that quotes it. Collapsing means no reviewer ever has to decide
+    # whether a ".." in our own bucket listing is the dangerous kind.
+    while ".." in cleaned:
+        cleaned = cleaned.replace("..", ".")
+    # No leading dots: ".." collapses to nothing usable, and a dotfile is not a dataset.
+    cleaned = cleaned.lstrip(".")[:120]
+    if not cleaned or cleaned in (".", ".."):
+        return ""
+    ext = cleaned.rsplit(".", 1)[-1].lower() if "." in cleaned else ""
+    if ext not in UPLOAD_EXTS:
+        return ""
+    return cleaned
+
+
+def data_upload_url(body, user):
+    """Mint a short-lived presigned PUT so the customer's browser can upload a dataset
+    straight to S3.
+
+    Why presigned rather than posting the file here: API Gateway caps a payload at 6 MB
+    and this Lambda has a 900s timeout, so routing an enterprise dataset through it
+    would fail on size or cost minutes of Lambda time per upload. The bytes go
+    browser -> S3; only the signature comes from here.
+
+    Before this route existed the consult prompt opened every consultation by asking
+    "where is your data (an S3 URI under customer-data/)" -- a question the product had
+    no way to help answer, because the console's IAM could write only tasks/* and the UI
+    had no file input. Someone with AWS credentials had to upload out of band.
+    """
+    if not _user_may_task(user):
+        return {"error": f"membership in {DS_GROUP} or {APPROVER_GROUP} required",
+                "status_code": 403}
+    task_id = str(body.get("task_id", "")).strip()
+    task = _task_get(task_id) if task_id else None
+    if not task:
+        # The upload is scoped to a consultation, so an unknown task is not a 400 about
+        # a field -- there is nothing to attach the data to.
+        return {"error": "unknown task_id", "status_code": 404}
+    status = str(task.get("status", ""))
+    if status in TASK_TERMINAL or status in TASK_SETTLED:
+        return {"error": f"task is {status}; data can only be added to an open "
+                         "consultation", "status_code": 409}
+    name = _safe_upload_name(body.get("filename"))
+    if not name:
+        return {"error": "filename must be a plain name ending in one of: "
+                         + ", ".join(UPLOAD_EXTS), "status_code": 400}
+    try:
+        size = int(body.get("content_length") or 0)
+    except (TypeError, ValueError):
+        return {"error": "content_length must be an integer", "status_code": 400}
+    if size <= 0:
+        return {"error": "content_length is required (an empty upload is not data)",
+                "status_code": 400}
+    if size > UPLOAD_MAX_BYTES:
+        return {"error": f"{size} bytes exceeds the {UPLOAD_MAX_BYTES} byte limit for a "
+                         "single upload", "status_code": 413}
+
+    bucket = data_bucket()
+    # The key is composed here from the task id and the sanitised name. Nothing the
+    # client sent reaches it verbatim, so a crafted filename cannot write into runs/,
+    # finops/, or another task's prefix.
+    key = f"{CUSTOMER_DATA_PREFIX}/{task_id}/{name}"
+    ext = name.rsplit(".", 1)[-1].lower()
+    ctype = _UPLOAD_CTYPES.get(ext, "application/octet-stream")
+    try:
+        url = s3.generate_presigned_url(
+            "put_object",
+            # ContentType is signed IN, so the browser must send this exact value and
+            # cannot store a dataset as text/html. ServerSideEncryption matches the
+            # bucket default (AES256) rather than relying on it.
+            Params={"Bucket": bucket, "Key": key, "ContentType": ctype,
+                    "ServerSideEncryption": "AES256"},
+            ExpiresIn=UPLOAD_URL_TTL_S)
+    except Exception as e:
+        return {"error": f"could not sign an upload URL: {str(e)[:200]}",
+                "status_code": 502}
+    _task_event(task_id, "DataUploadUrlIssued", user["username"],
+                {"key": key, "bytes": str(size)})
+    return {"ok": True, "url": url, "key": key, "bucket": bucket,
+            "uri": f"s3://{bucket}/{key}", "content_type": ctype,
+            "expires_in": UPLOAD_URL_TTL_S}
 
 
 def _enqueue_task_turn(task_id, accept=False):
@@ -2522,23 +2655,53 @@ def _chat_tool_result(tool_use, payload):
 # 'unsafe-inline' is unavoidable today (inline <script> + onclick handlers); CSP is
 # defence-in-depth, escaping at the sink (esc()/jstr() in frontend.html) is the
 # primary XSS control.
-CSP = ("default-src 'self'; script-src 'self' 'unsafe-inline'; "
-       "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
-       "connect-src 'self'; frame-src 'self'; frame-ancestors 'self'; "
-       "form-action 'self'; base-uri 'none'; object-src 'none'")
+def _upload_origin():
+    """The single S3 origin the browser may PUT a dataset to.
+
+    connect-src must name it explicitly or our own CSP blocks the presigned upload --
+    the failure looks like a broken S3 permission but is this header. Scoped to this one
+    bucket rather than a wildcard: 'https://*.s3.amazonaws.com' would authorise every
+    bucket on earth as a fetch target from this page.
+
+    Falls back to a bare-bucket-less origin only if the bucket cannot be resolved at
+    cold start, in which case uploads are broken anyway and a wildcard would be a
+    silent security downgrade in exchange for nothing.
+    """
+    try:
+        return f"https://{data_bucket()}.s3.{REGION}.amazonaws.com"
+    except Exception:
+        return ""
+
+
+def _csp():
+    """Built per response, not once at import.
+
+    The upload origin needs data_bucket(), which may resolve through SSM. Freezing this
+    into a module constant means a single transient SSM failure at cold start bakes an
+    upload-less CSP into that container for its whole life -- and the symptom is a
+    browser upload blocked by a header, which reads as an S3 permission problem and
+    would cost hours. data_bucket() caches on success, so this stays a dict lookup after
+    the first resolve.
+    """
+    origin = _upload_origin()
+    connect = f"connect-src 'self' {origin}".rstrip() if origin else "connect-src 'self'"
+    return ("default-src 'self'; script-src 'self' 'unsafe-inline'; "
+            "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+            + connect + "; frame-src 'self'; frame-ancestors 'self'; "
+            "form-action 'self'; base-uri 'none'; object-src 'none'")
 
 _SEC_HEADERS = {
     "x-content-type-options": "nosniff",
     "x-frame-options": "SAMEORIGIN",
     "referrer-policy": "strict-origin-when-cross-origin",
     "strict-transport-security": "max-age=31536000; includeSubDomains",
-    "content-security-policy": CSP,
 }
 
 
-def _resp(code, body, ctype="application/json"):
+def _resp(code, body, ctype="application/json", cookies=None):
     headers = {"content-type": ctype}
     headers.update(_SEC_HEADERS)
+    headers["content-security-policy"] = _csp()
     if ctype.startswith("application/json"):
         headers["cache-control"] = "no-store"
     if ALLOWED_ORIGIN:
@@ -2546,8 +2709,15 @@ def _resp(code, body, ctype="application/json"):
                         "access-control-allow-methods": "GET,POST,OPTIONS",
                         "access-control-allow-headers": "content-type,authorization",
                         "vary": "origin"})
-    return {"statusCode": code, "headers": headers,
-            "body": body if isinstance(body, str) else json.dumps(body, default=str)}
+    out = {"statusCode": code, "headers": headers,
+           "body": body if isinstance(body, str) else json.dumps(body, default=str)}
+    # Payload format 2.0 takes Set-Cookie as a LIST under "cookies", not as a header:
+    # a "set-cookie" key in `headers` is silently dropped when there is more than one,
+    # and the refresh-cookie feature would look like a browser bug. The key is omitted
+    # entirely when there are no cookies so every existing response byte is unchanged.
+    if cookies:
+        out["cookies"] = list(cookies)
+    return out
 
 
 def _resp_result(result):
@@ -2569,19 +2739,114 @@ def _resp_result(result):
 
 
 def cognito_login(username, password):
-    """Exchange username/password for a Cognito access token (USER_PASSWORD_AUTH)."""
+    """Exchange username/password for a Cognito access token (USER_PASSWORD_AUTH).
+
+    Returns (response_body, refresh_token). The refresh token is returned SEPARATELY,
+    never inside the body, because the body is JSON that page script reads: the whole
+    point of the refresh cookie is that a 30-day credential is unreachable from script,
+    and a single forgotten `del body["refreshToken"]` would undo that silently. A tuple
+    cannot be leaked by forgetting to strip a key.
+    """
     if not COGNITO_CLIENT_ID:
-        return {"error": "Cognito not configured"}
+        return {"error": "Cognito not configured"}, ""
     try:
         r = cognito.initiate_auth(ClientId=COGNITO_CLIENT_ID, AuthFlow="USER_PASSWORD_AUTH",
                                   AuthParameters={"USERNAME": username, "PASSWORD": password})
         a = r["AuthenticationResult"]
-        return {"accessToken": a["AccessToken"], "expiresIn": a["ExpiresIn"],
-                "refreshToken": a.get("RefreshToken", "")}
+        return ({"accessToken": a["AccessToken"], "expiresIn": a["ExpiresIn"]},
+                a.get("RefreshToken", ""))
     except cognito.exceptions.NotAuthorizedException:
-        return {"error": "invalid username or password"}
+        return {"error": "invalid username or password"}, ""
+    except Exception as e:
+        return {"error": str(e)[:200]}, ""
+
+
+# The refresh cookie is scoped to this path and nothing else. Every other API route
+# authenticates with a Bearer access token in a header, so no other route has any use
+# for the cookie -- and a cookie the browser never attaches to /api/tasks cannot be
+# replayed against /api/tasks. /api/refresh/revoke path-matches this prefix (RFC 6265
+# path-match), which is what lets sign-out revoke the token server-side instead of
+# merely forgetting it client-side.
+REFRESH_COOKIE = "llmops_rt"
+REFRESH_COOKIE_PATH = "/api/refresh"
+# Cognito's refresh validity (30 days on this pool) is the real authority; this is only
+# how long the browser bothers to keep the cookie. If the two ever disagree, the worst
+# case is one /api/refresh returning 401 and the user signing in -- so this number is
+# allowed to be approximate, and deliberately is not read back from Cognito on the login
+# hot path.
+REFRESH_COOKIE_MAX_AGE_S = int(os.environ.get("REFRESH_COOKIE_MAX_AGE_S", 30 * 24 * 3600))
+
+
+def _refresh_cookie(token, max_age=None):
+    """Serialise the refresh cookie. HttpOnly+Secure+SameSite=Strict, all three needed.
+
+    HttpOnly is the feature: script cannot read it, so an XSS bug costs the attacker one
+    8-hour access token instead of 30 days of re-issue. Secure keeps it off any plaintext
+    hop. SameSite=Strict means no other site can make the browser attach it, which is the
+    CSRF answer for a route whose whole input is a cookie.
+    """
+    age = REFRESH_COOKIE_MAX_AGE_S if max_age is None else int(max_age)
+    return (f"{REFRESH_COOKIE}={token}; Path={REFRESH_COOKIE_PATH}; Max-Age={age}; "
+            "HttpOnly; Secure; SameSite=Strict")
+
+
+def _clear_refresh_cookie():
+    """Expire the cookie. Same name+path, or the browser keeps the original alongside."""
+    return _refresh_cookie("", max_age=0)
+
+
+def _event_cookie(event, name):
+    """Read one cookie from a payload-format-2.0 event.
+
+    2.0 hands cookies over as a list of "k=v" strings in event["cookies"], NOT in the
+    headers dict. Reading headers["cookie"] here would work in a hand-written test and
+    return nothing in production.
+    """
+    for raw in (event.get("cookies") or []):
+        k, _, v = str(raw).partition("=")
+        if k.strip() == name:
+            return v.strip()
+    return ""
+
+
+def cognito_refresh(refresh_token):
+    """Mint a fresh access token from the refresh cookie (REFRESH_TOKEN_AUTH).
+
+    A failure here is NOT an error to surface as 500: an expired or revoked refresh token
+    is the normal end of a 30-day session, and the client's correct response is to show
+    the sign-in prompt. So this returns {"error": ...} and the route answers 401.
+    """
+    if not COGNITO_CLIENT_ID:
+        return {"error": "Cognito not configured"}
+    if not refresh_token:
+        return {"error": "no session"}
+    try:
+        r = cognito.initiate_auth(ClientId=COGNITO_CLIENT_ID, AuthFlow="REFRESH_TOKEN_AUTH",
+                                  AuthParameters={"REFRESH_TOKEN": refresh_token})
+        a = r["AuthenticationResult"]
+        # REFRESH_TOKEN_AUTH returns no new refresh token (rotation is off), so the
+        # cookie is left exactly as it is rather than being rewritten with "".
+        return {"accessToken": a["AccessToken"], "expiresIn": a["ExpiresIn"]}
     except Exception as e:
         return {"error": str(e)[:200]}
+
+
+def cognito_revoke(refresh_token):
+    """Best-effort RevokeToken on sign-out; the cookie is cleared either way.
+
+    Token revocation is enabled on this pool, so revoking kills the whole token family.
+    If the call fails we still clear the cookie: a sign-out that reports failure and
+    leaves the browser signed in is worse than one that reports success while an
+    unreachable token stays technically valid for its remaining window.
+    """
+    if not (refresh_token and COGNITO_CLIENT_ID):
+        return False
+    try:
+        cognito.revoke_token(Token=refresh_token, ClientId=COGNITO_CLIENT_ID)
+        return True
+    except Exception as e:
+        print(f"[auth] revoke_token failed: {e}")
+        return False
 
 
 def _authed_user(headers):
@@ -2715,7 +2980,26 @@ def handler(event, context):
         except Exception:
             body = {}
         if method == "POST" and path == "/api/login":
-            return _resp(200, cognito_login(str(body.get("username", "")), str(body.get("password", ""))))
+            out, rt = cognito_login(str(body.get("username", "")), str(body.get("password", "")))
+            # The cookie is set only on success. Setting it on a failed login would be a
+            # cookie holding "" that a later /api/refresh would treat as a session.
+            return _resp(200, out, cookies=[_refresh_cookie(rt)] if rt else None)
+        # Restore a session after a page reload. Unauthenticated by design -- the cookie
+        # IS the credential, and requiring a Bearer token here would mean needing a live
+        # session to recover from having lost one.
+        if method == "POST" and path == "/api/refresh":
+            out = cognito_refresh(_event_cookie(event, REFRESH_COOKIE))
+            if out.get("error"):
+                # Clear the cookie on failure: a refresh token Cognito rejects will be
+                # rejected on every reload forever, and leaving it makes each page load
+                # pay a doomed Cognito round-trip.
+                return _resp(401, out, cookies=[_clear_refresh_cookie()])
+            return _resp(200, out)
+        # Sign-out. Also unauthenticated: the access token may already be expired, and
+        # refusing to revoke a session because it is too old to prove is backwards.
+        if method == "POST" and path == "/api/refresh/revoke":
+            revoked = cognito_revoke(_event_cookie(event, REFRESH_COOKIE))
+            return _resp(200, {"revoked": revoked}, cookies=[_clear_refresh_cookie()])
         if method == "POST":
             # One auth call for every POST, resolved to a user rather than a bool: the
             # cost routes need the username (self-approval check) and the groups
@@ -2739,6 +3023,8 @@ def handler(event, context):
                         return _resp_result(accept_task(tid, user))
                     if action == "close":
                         return _resp_result(close_task(tid, body, user))
+            if path == "/api/data-upload-url":
+                return _resp_result(data_upload_url(body, user))
             if path == "/api/start-run":
                 return _resp_result(start_run(body))
             if path == "/api/cost-estimate":
