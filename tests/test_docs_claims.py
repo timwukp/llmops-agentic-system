@@ -169,6 +169,78 @@ def test_the_skill_source_claims_match_the_harness_configs():
         "Update the docs and this guard together.")
 
 
+#: Docs that describe which model each harness runs.
+DOC_MODEL_CLAIMS = (REPO / "docs" / "ARCHITECTURE.md", REPO / "docs" / "ARCHITECTURE.zh-TW.md")
+
+_MODEL_ID = re.compile(r"global\.anthropic\.claude-[a-z0-9.-]+")
+
+
+def _configured_models() -> dict[str, str]:
+    """modelId per harness config, read from the file the deployer actually applies."""
+    out = {}
+    for cfg in sorted((REPO / "agents").glob("*/harness.json")):
+        model = json.loads(cfg.read_text()).get("model") or {}
+        out[str(cfg.relative_to(REPO))] = (
+            model.get("bedrockModelConfig") or {}).get("modelId")
+    return out
+
+
+def test_the_model_allocation_claim_matches_the_harness_configs():
+    """§9 item 3 said the premium/fallback split was in production. It never was.
+
+    Same failure mode as the skill-source claim above and the §11 VPC claim: a designed
+    lever read back as a delivered feature. All 7 configs carry one model id, and
+    `GetHarness` agreed when checked live, so the split is available -- not deployed.
+    Derive the fleet's shape from the configs, then require the docs to state THAT:
+
+      * the uniform model id and the harness count both come from the files;
+      * any OTHER model id the docs name must sit in a paragraph that marks it
+        undeployed or a fallback, so "orchestrator runs Opus 5" cannot be reasserted
+        as fact without failing here.
+    """
+    models = _configured_models()
+    assert models, "no agents/*/harness.json found"
+    missing = [p for p, m in models.items() if not m]
+    assert not missing, f"these harness configs declare no modelId: {missing}"
+    distinct = sorted(set(models.values()))
+    assert len(distinct) == 1, (
+        f"harness model ids are no longer uniform: {models}. That is a real change of "
+        "state, not a test failure -- §9 item 3 in BOTH language variants says the mixed "
+        "allocation is a lever and not deployed, so update the prose and this guard "
+        "together, in the same commit.")
+    deployed = distinct[0]
+
+    # The sentence that carries the claim, per language, with both numbers derived.
+    patterns = {
+        "ARCHITECTURE.md": re.compile(
+            rf"[Aa]ll (\d+) live\s+harnesses run `{re.escape(deployed)}`"),
+        "ARCHITECTURE.zh-TW.md": re.compile(
+            rf"(\d+) 個 harness 全部運行 `{re.escape(deployed)}`"),
+    }
+    for doc in DOC_MODEL_CLAIMS:
+        text = doc.read_text()
+        m = patterns[doc.name].search(text)
+        assert m, (
+            f"{doc.name} no longer states which model the fleet runs in the form this "
+            f"guard checks (expected the deployed id {deployed!r} next to a harness "
+            "count). Deleting the sentence removes the check rather than passing it.")
+        assert int(m.group(1)) == len(models), (
+            f"{doc.name} says {m.group(1)} harnesses run {deployed}; there are "
+            f"{len(models)} configs: {sorted(models)}")
+
+    # A non-deployed model id may only be named as a lever, never as current state.
+    lever = ("not what is deployed", "fallback", "designed", "not a state",
+             "後備", "尚未", "不是", "設計")
+    stray = []
+    for doc in DOC_MODEL_CLAIMS:
+        for para in re.split(r"\n\s*\n", doc.read_text()):
+            others = {i for i in _MODEL_ID.findall(para) if i != deployed}
+            if others and not any(mark in para for mark in lever):
+                stray.append(f"{doc.name}: {sorted(others)} asserted without marking it "
+                             f"undeployed, in: {para.strip()[:120]!r}")
+    assert not stray, "; ".join(stray)
+
+
 def test_no_doc_claims_a_file_that_does_not_exist():
     """Seven docs pointed at two files that were never committed on any branch.
 
