@@ -293,8 +293,16 @@ recurred across a single day. Design rules (full text in [AGENTS.md](../AGENTS.m
 2. The "switch" signature: repeated `InternalServerException`/`ServiceUnavailableException`
    from ConverseStream while a direct single-shot probe of the same model succeeds —
    quota pressure, not an outage (it never surfaces as an explicit ThrottlingException).
-3. Mixed allocation spreads quota pressure: premium tier for judgment-heavy agents
-   (orchestrator, eval), Opus 5 for process-execution agents (data-prep, deploy, monitor).
+3. Mixed allocation is the **designed** way to spread quota pressure — premium tier for
+   judgment-heavy agents (orchestrator, eval), the fallback tier for process-execution
+   agents (data-prep, deploy, monitor) — and it is **not what is deployed**. All 7 live
+   harnesses run `global.anthropic.claude-fable-5`, verified against `GetHarness` and
+   against `agents/*/harness.json`, which agree. So the mixed configuration is a lever
+   the failover chain makes available, not a state the platform is currently in; the
+   whole fleet shares one model's quota today. Previous versions of this list read as
+   though the split had shipped, which is the same mistake as the diagram claiming
+   VPC-isolated harnesses (§11) — an intended design read back as delivered fact.
+   `tests/test_docs_claims.py` now asserts the model claim against the real configs.
 4. The driver detects model-5xx during stream salvage and hot-swaps to the fallback,
    emitting an informational failover event (`_maybe_failover_model` in
    `orchestration/harness_driver/handler.py`); full automated-failover hardening is Phase 6.
@@ -382,3 +390,77 @@ See [COST.md](COST.md).
 Least-privilege IAM throughout (no `*FullAccess`), all resources scoped to `llmops-*`,
 and this being a public repo: no account IDs anywhere — deploy scripts substitute
 `<ACCOUNT_ID>` at run time, enforced by a pre-commit hook and CI redaction scan.
+
+## 13. The admin console — one Lambda, three planes with different rules
+
+![Console architecture](architecture-console.svg)
+
+The dashboard ([live](https://deovqcv4m7.execute-api.us-east-1.amazonaws.com/)) is a single
+Lambda serving the HTML and all **30 route handlers** across **8 tabs**, with **no build step
+and no CDN**:
+`frontend.html` is embedded at cold start and the page ships with `CSP connect-src 'self'`
+plus the S3 origin the upload path needs. One artifact means the UI can never be a version
+out of step with the API it calls — the failure mode a separately-deployed SPA invites.
+
+Its design is three planes that deliberately do **not** share rules:
+
+| plane | handlers | rule |
+|---|---|---|
+| **read** | 13 GETs (`/api/overview`, `/api/pipeline`, `/api/run`, `/api/observability`, `/api/cost-overview`, `/api/tasks`, …) | public, aggregated server-side |
+| **session** | 3 POSTs: `/api/login`, `/api/refresh`, `/api/refresh/revoke` | unauthenticated **by necessity** — these mint or revoke the credential |
+| **write** | 14 POSTs: `/api/start-run`, `/api/cost-approval*`, `/api/finops-run`, `/api/optimize*`, `/api/native-rec*`, `/api/batch-eval`, … | Cognito at one chokepoint |
+| **consult** | `/api/tasks`, `/api/tasks/{id}/{message,accept,close}`, `/api/data-upload-url` | authed **and** group-checked; the only plane that invokes an agent |
+
+**Every POST that acts on the platform is authenticated in exactly one place.** The router
+resolves `_authed_user(headers)` once, before dispatching any POST, and returns 401 on
+failure — so adding a route cannot accidentally add an unauthenticated write. It resolves to
+a *user* rather than a boolean because two downstream checks need identity, not just
+authentication: the approver-group test, and the never-self-approve test that compares the
+approver's username to the requester's. Verified live, unauthenticated: `/api/tasks`,
+`/api/start-run`, `/api/cost-approval`, `/api/data-upload-url`, `/api/finops-run` and
+`/api/tasks/{id}/message` all return **401**, while `/api/overview`, `/api/tasks` and
+`/api/cost-overview` GET **200**.
+
+**Three POSTs sit above that chokepoint, and naming them is part of the design.** `/api/login`
+mints a session; `/api/refresh` restores one from the httpOnly cookie after a page reload (the
+cookie *is* the credential, so demanding a Bearer token here would require a live session to
+recover from having lost one); `/api/refresh/revoke` signs out, and refusing to revoke a
+session because its access token already expired is backwards. An earlier version of this
+section claimed Cognito ran on **every** POST — false in the flattering direction, the same
+mistake as the §9 model split and the §11 VPC claim. `tests/test_console_routes.py` now derives
+all four numbers from the router and compares the pre-chokepoint set against an explicit
+allowlist, so a *fourth* unauthenticated POST fails the suite by name. A count alone would not
+have caught it: a new unauthenticated write that replaced a session route keeps the count.
+
+**Reads are public on purpose, writes never are.** Everything on the read plane is
+already-reconciled operational fact — what ran, what it scored, what it cost. Gating it would
+add friction to the thing an operator does fifty times a day while protecting nothing that
+isn't in the diagrams. Authority is a different question from visibility, so it attaches only
+to the writes.
+
+**The cost gate is server-side, and advisory by configuration rather than by accident.**
+`APPROVAL_LIMIT_USD` (default 2000) and `BUDGET_MODE` (`advisory`, or `blocking`) live in the
+Lambda, not the UI: a gate a client enforces is a gate a client can skip. `advisory` names an
+over-budget dispatch and lets it through with the estimate recorded; `blocking` refuses it.
+Approvals are **KMS-signed and hash-chained** (`conductor_tools.sign_record`), carrying the
+approver's identity and source IP, so an approval is evidence rather than a UI state.
+
+**The Tasks tab is the only plane that talks to an agent**, and it is the customer-facing
+half of the product: one thread per engagement, where `llmops_orchestrator` runs its consult
+protocol, the customer hands over data via a **presigned** `customer-data/` upload (the key is
+always server-chosen — a client-supplied key is a path-traversal write), and the output is a
+priced plan whose acceptance is signed. The console signs those writes; the pipeline's own
+role gets `customer-data` **read-only**, because a pipeline that can rewrite customer data can
+destroy the held-out set its own gates are judged against.
+
+**The run view reads the timeline as two bounded queries, not one filtered list** — stage
+events under `sk < "A"`, parked verdicts under `sk begins_with "directive#"` — and renders
+verdicts in their own panel labelled *delivered* / *parked* / *never delivered*. §3 has the
+reasoning: a prefix is not a filter, and a verdict that could never be read must not look like
+one an agent acted on.
+
+The layout of all three diagrams in this document is enforced, not eyeballed:
+`tests/test_svg_geometry.py` fails the build if any two wires cross, if two wires share a
+corridor (which draws as one wire and silently loses a connection), if a wire passes through a
+card, if two cards overlap, or if a committed SVG no longer matches
+`docs/gen_architecture_svg.py` — the diagrams are generated and must never be hand-edited.

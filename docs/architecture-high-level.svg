@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1240 780" font-family="system-ui,-apple-system,'Segoe UI',Roboto,sans-serif">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1240 900" font-family="system-ui,-apple-system,'Segoe UI',Roboto,sans-serif">
 
   <defs>
     <marker id="ahB" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto">
@@ -36,9 +36,9 @@
     </style>
   </defs>
 
-  <rect class="bg" x="0" y="0" width="1240" height="780" rx="16"/>
+  <rect class="bg" x="0" y="0" width="1240" height="900" rx="16"/>
   <text class="title" x="30" y="40" font-size="18">llmops-agentic-system — autonomous LLMOps on AgentCore</text>
-  <text class="sub" x="30" y="60">teacher DeepSeek-R1 (Bedrock) → student Qwen3-1.7B (SageMaker QLoRA) · 7 harnesses · click any card</text>
+  <text class="sub" x="30" y="60">teacher DeepSeek-R1 (Bedrock) → student Qwen3-1.7B (SageMaker QLoRA) · 7 harnesses, all on Fable 5 · click any card</text>
   <a href="https://github.com/timwukp/llmops-agentic-system/blob/main/docs/TRIGGERS.md" target="_top">
     <g>
       <rect class="card cTrig" x="30" y="92" width="180" height="56" rx="12"/>
@@ -91,7 +91,7 @@
     <g>
       <rect class="card cSpine" x="286" y="282" width="180" height="56" rx="12"/>
       <text class="title" x="376.0" y="306" text-anchor="middle">🧭 Step Functions</text>
-      <text class="sub" x="376.0" y="324" text-anchor="middle">stage DAG · waitForTaskToken</text>
+      <text class="sub" x="376.0" y="324" text-anchor="middle">stage DAG · data_audit mode · waitForTaskToken</text>
     </g>
   </a>
 
@@ -199,15 +199,15 @@
 
   <a href="https://github.com/timwukp/llmops-agentic-system/blob/main/orchestration/resume_pipeline/handler.py" target="_top">
     <g>
-      <rect class="card cSpine" x="850" y="505" width="180" height="56" rx="12"/>
-      <text class="title" x="940.0" y="529" text-anchor="middle">📡 EventBridge rule</text>
-      <text class="sub" x="940.0" y="547" text-anchor="middle">job state change → resume λ</text>
+      <rect class="card cSpine" x="1040" y="240" width="180" height="56" rx="12"/>
+      <text class="title" x="1130.0" y="264" text-anchor="middle">📡 EventBridge rule</text>
+      <text class="sub" x="1130.0" y="282" text-anchor="middle">job state change → resume λ</text>
     </g>
   </a>
 
-  <path class="wire" d="M940.0,296 L940.0,501" marker-end="url(#ahB)"/>
+  <path class="wire" d="M1030,260 L1036,260" marker-end="url(#ahB)"/>
 
-  <path class="wire" d="M850,533.0 L376.0,533.0 L376.0,342" marker-end="url(#ahB)"/>
+  <path class="wire" d="M1130.0,296 L1130.0,320 L1035,320 L1035,545 L272,545 L272,310 L282,310" marker-end="url(#ahB)"/>
 
   <a href="https://github.com/timwukp/llmops-agentic-system/blob/main/deploy/console/README.md" target="_top">
     <g>
@@ -258,13 +258,14 @@
   <text class="sub" x="511" y="580.0" text-anchor="middle">via harness-driver λ</text>
   <path class="wireG" d="M740,610.0 L846,610.0" marker-end="url(#ahG)"/>
 
-  <path class="wireR" d="M560,316.0 L540,316.0 L540,234.0 L556,234.0" marker-end="url(#ahR)"/>
+  <path class="wireR" d="M650.0,284 L650.0,250" marker-end="url(#ahR)"/>
 
-  <text class="sub" x="650.0" y="274" text-anchor="middle" fill="#ff6b81">gate fail → remediate (≤3)</text>
+  <text class="sub" x="806" y="270" text-anchor="middle" fill="#ff6b81">gate fail → remediate (≤3)</text>
   <path class="wireR" d="M650.0,92 L650.0,78 L406.0,78 L406.0,88" marker-end="url(#ahR)"/>
 
   <text class="sub" x="460" y="72" text-anchor="middle" fill="#ff6b81">escalations → conductor triage first · page human only if needed</text>
-  <rect class="band" x="30" y="680" width="1180" height="72" rx="14"/>
-  <text class="bandT" x="50" y="706">STATE — S3 runs/&lt;run_id&gt;/manifest.json · finops/rates rate card · DynamoDB runs + stage-events + cost-actuals + cost-estimates · shared Memory</text>
-  <text class="sub" x="50" y="728">skills mounted from MLOps-agent-skills (git in dev, S3 mirror in prod) · VPC-isolated in production · least-privilege IAM · TEST-PROVEN gates per phase</text>
+  <rect class="band" x="30" y="700" width="1180" height="86" rx="14"/>
+  <text class="bandT" x="50" y="726">STATE — S3 runs/&lt;run_id&gt;/manifest.json · finops/rates rate card · customer-data/ uploads · DynamoDB runs + stage-events + tasks + cost-actuals + cost-estimates · shared Memory</text>
+  <text class="sub" x="50" y="748">skills mounted from MLOps-agent-skills — all 19 mounts across all 7 harnesses are git today; the S3 mirror exists (ensure_skills) but nothing is switched to it yet</text>
+  <text class="sub" x="50" y="766">network: all 7 harnesses run PUBLIC (no networkConfiguration); the VPC is built but no VPC harness variant ships · least-privilege IAM, no *FullAccess · TEST-PROVEN gates per phase</text>
 </svg>
