@@ -1,21 +1,23 @@
 {
-  "_comment": "Execution role for ALL 5 llmops worker harnesses (data-prep, finetune, eval, deploy, monitor). Extends deploy/iam/execution_role_base.json (the agentcore-harness-builder skill baseline) with the pipeline's needs: S3 run/report/skills-mirror prefixes, teacher-model Bedrock access (DeepSeek-R1), scoped SageMaker lifecycle + model registry, CloudWatch/Logs read for monitoring, and the llmops-pipeline event bus. Placeholders <REGION>, <ACCOUNT_ID>, <DATA_BUCKET>, <MEMORY_ID> are substituted by deploy/01_iam.py at deploy time (account id from sts get-caller-identity — never committed). SCOPING NOTE: the base's InvokeModel statement was foundation-model/* + inference-profile/* — here it is narrowed to exactly the models this pipeline uses (anthropic.* for the harness model global.anthropic.claude-sonnet-5 incl. cross-region routing targets, deepseek.r1* as the distillation teacher), so the teacher grant is NOT a duplicate statement but a narrowing of the base one. BYOMemory* statements are dropped by 01_iam.py unless --memory-id is passed (deploy/wire_memory.py re-adds them per-Memory later, matching the base's contract). Statements with Resource '*' (BaselineImagePull, BaselineTelemetry, SageMakerList, CloudWatchMetricsRead) are actions that do not support resource-level permissions.",
-
+  "_comment": "Execution role for ALL 5 llmops worker harnesses (data-prep, finetune, eval, deploy, monitor). Extends deploy/iam/execution_role_base.json (the agentcore-harness-builder skill baseline) with the pipeline's needs: S3 run/report/skills-mirror prefixes, teacher-model Bedrock access (DeepSeek-R1), scoped SageMaker lifecycle + model registry, CloudWatch/Logs read for monitoring, and the llmops-pipeline event bus. Placeholders <REGION>, <ACCOUNT_ID>, <DATA_BUCKET>, <MEMORY_ID> are substituted by deploy/01_iam.py at deploy time (account id from sts get-caller-identity \u2014 never committed). SCOPING NOTE: the base's InvokeModel statement was foundation-model/* + inference-profile/* \u2014 here it is narrowed to exactly the models this pipeline uses (anthropic.* for the harness model global.anthropic.claude-sonnet-5 incl. cross-region routing targets, deepseek.r1* as the distillation teacher), so the teacher grant is NOT a duplicate statement but a narrowing of the base one. BYOMemory* statements are dropped by 01_iam.py unless --memory-id is passed (deploy/wire_memory.py re-adds them per-Memory later, matching the base's contract). Statements with Resource '*' (BaselineImagePull, BaselineTelemetry, SageMakerList, CloudWatchMetricsRead) are actions that do not support resource-level permissions.",
   "trustPolicy": {
     "Version": "2012-10-17",
     "Statement": [
       {
         "Sid": "AllowAgentCoreToAssume",
         "Effect": "Allow",
-        "Principal": { "Service": "bedrock-agentcore.amazonaws.com" },
+        "Principal": {
+          "Service": "bedrock-agentcore.amazonaws.com"
+        },
         "Action": "sts:AssumeRole",
         "Condition": {
-          "StringEquals": { "aws:SourceAccount": "<ACCOUNT_ID>" }
+          "StringEquals": {
+            "aws:SourceAccount": "<ACCOUNT_ID>"
+          }
         }
       }
     ]
   },
-
   "permissionsPolicy": {
     "Version": "2012-10-17",
     "Statement": [
@@ -62,7 +64,10 @@
       {
         "Sid": "InvokeModel",
         "Effect": "Allow",
-        "Action": ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"],
+        "Action": [
+          "bedrock:InvokeModel",
+          "bedrock:InvokeModelWithResponseStream"
+        ],
         "Resource": [
           "arn:aws:bedrock:*::foundation-model/anthropic.*",
           "arn:aws:bedrock:*::foundation-model/deepseek.r1*",
@@ -134,25 +139,96 @@
         }
       },
       {
+        "_comment": "finops/* and contracts/* are the audit runtime's two paths and were both missing until a live pricing_refresh proved it: the agent derived a complete 37-SKU rate card, then failed to write it (PutObject denied on finops/rates/rate_card_latest.json) AND failed to load the canonical cost_model.py (GetObject denied on contracts/), so it published nothing and stamped its own output non-canonical. A prefix nobody granted is a feature that runs to completion and then throws its work away. monitoring/* joined both lists with the first monitor dispatch: the prompt writes monitoring/health.json, monitoring/sweep.json and monitoring/report.{json,md}. The run-scoped two resolve under runs/<run_id>/, but the SCHEDULED sweep has no run to sit under, and filing an account-level finding inside whichever run happened to look would bury it -- so the sweep writes a top-level monitoring/ prefix that nothing granted until now.",
         "Sid": "S3PipelineObjects",
         "Effect": "Allow",
-        "Action": ["s3:GetObject", "s3:PutObject"],
+        "Action": [
+          "s3:GetObject",
+          "s3:PutObject"
+        ],
         "Resource": [
           "arn:aws:s3:::<DATA_BUCKET>/runs/*",
           "arn:aws:s3:::<DATA_BUCKET>/reports/*",
-          "arn:aws:s3:::<DATA_BUCKET>/skills-mirror/*"
+          "arn:aws:s3:::<DATA_BUCKET>/finops/*",
+          "arn:aws:s3:::<DATA_BUCKET>/contracts/*",
+          "arn:aws:s3:::<DATA_BUCKET>/pipeline/contracts/*",
+          "arn:aws:s3:::<DATA_BUCKET>/monitoring/*",
+          "arn:aws:s3:::<DATA_BUCKET>/cost/*",
+          "arn:aws:s3:::<DATA_BUCKET>/models-mirror/*"
         ]
       },
       {
+        "Sid": "S3SkillsReadOnly",
+        "_comment": "The skill trees an s3 skill source fetches at SESSION START, under THIS role -- not under the deployer's credentials. deploy/03_storage.py mirrors them to skills/<repo-relative path>/ and read-back verified each SKILL.md, but that read-back ran as the admin who deployed; simulate_principal_policy for this role on skills/llmops/llm-agent-orchestration/SKILL.md returned implicitDeny, so switching a source to s3 would have been accepted by UpdateHarness, reported READY, and then failed every single session. GetObject only, and deliberately NOT folded into S3PipelineObjects: that statement carries PutObject, and an agent that can write its own skill tree can rewrite the instructions it is judged against on the next session. S3PipelineObjects previously granted Get+Put on a skills-mirror/* prefix instead; that prefix never held a single object in the bucket's lifetime, nothing in the repo ever wrote to it, and it was writable, so it is removed here rather than reused.",
+        "Effect": "Allow",
+        "Action": [
+          "s3:GetObject"
+        ],
+        "Resource": "arn:aws:s3:::<DATA_BUCKET>/skills/*"
+      },
+      {
+        "Sid": "S3CustomerDataReadOnly",
+        "_comment": "The customer's own data: readable, never writable. Both prompts point data-prep at customer-data/ and nothing granted it, so the first real consult run dispatched, reached DataPrepGenerate and died on s3:ListBucket/GetObject without reading one task. Read-only because a pipeline that can rewrite the customer's data can destroy the held-out set its own gates are judged on.",
+        "Effect": "Allow",
+        "Action": [
+          "s3:GetObject"
+        ],
+        "Resource": "arn:aws:s3:::<DATA_BUCKET>/customer-data/*"
+      },
+      {
+        "Sid": "MacieFindingsReadForDataAudit",
+        "_comment": "Read-only Macie so the data-prep `audit` task can cite real classification results in the Data Readiness Report instead of only its own regex pass. The prompt states outright that its scan is HEURISTIC and not compliance-grade, and the console's readiness panel links that report as the answer behind `PII disposition` -- so if the agent cannot read Macie, adding a classification job changes nothing a customer can see. simulate_principal_policy on this role returned implicitDeny for ListFindings/GetFindings/GetFindingStatistics/DescribeClassificationJob, which is why this is asserted rather than assumed: nothing in this repo granted macie2 at all. Read-only and deliberately WITHOUT CreateClassificationJob: a per-GB billable scan is the deploy's decision (03_storage.py --enable-pii-scan), not something an agent should be able to launch mid-turn, and without UpdateMacieSession/DisableMacie it also cannot turn off the check it is judged by. No Resource scoping: the macie2 read actions do not support it (findings are account-scoped), so the narrowing is the action list.",
+        "Effect": "Allow",
+        "Action": [
+          "macie2:GetMacieSession",
+          "macie2:ListFindings",
+          "macie2:GetFindings",
+          "macie2:GetFindingStatistics",
+          "macie2:ListClassificationJobs",
+          "macie2:DescribeClassificationJob"
+        ],
+        "Resource": "*"
+      },
+      {
+        "_comment": "The prefix list must match S3PipelineObjects: ListBucket is condition-scoped, so a prefix granted for Get/Put but absent here can be read object-by-object and never enumerated -- which is exactly the shape of 'the rate card history is there but the agent reports no card exists'. cost/* joined both lists after the first live reconcile completed its evidence-gathering and then could not write cost/actuals-<period>.json \u2014 the docs/COST.md contract names cost/ as the actuals+report prefix, but only finops/ was ever granted.",
         "Sid": "S3PipelineList",
         "Effect": "Allow",
-        "Action": ["s3:ListBucket"],
+        "Action": [
+          "s3:ListBucket"
+        ],
         "Resource": "arn:aws:s3:::<DATA_BUCKET>",
         "Condition": {
           "StringLike": {
-            "s3:prefix": ["runs/*", "reports/*", "skills-mirror/*"]
+            "s3:prefix": [
+              "runs/*",
+              "reports/*",
+              "finops/*",
+              "contracts/*",
+              "pipeline/contracts/*",
+              "monitoring/*",
+              "cost/*",
+              "models-mirror/*",
+              "customer-data/*",
+              "skills/*"
+            ]
           }
         }
+      },
+      {
+        "_comment": "gen_ai.usage token spans land in the aws/spans log group (an AgentCore-managed group OUTSIDE /aws/bedrock-agentcore/*, so BaselineLogs does not cover it). The finops reconcile task needs to read them to attribute shared Bedrock inference-profile spend per session id \u2014 this account runs other agents on the same Claude profiles, so without spans the shared spend is unattributable and stays pending. Read-only, this one group.",
+        "Sid": "SpansReadForCostAttribution",
+        "Effect": "Allow",
+        "Action": [
+          "logs:FilterLogEvents",
+          "logs:GetLogEvents",
+          "logs:StartQuery",
+          "logs:GetQueryResults",
+          "logs:StopQuery"
+        ],
+        "Resource": [
+          "arn:aws:logs:<REGION>:<ACCOUNT_ID>:log-group:aws/spans",
+          "arn:aws:logs:<REGION>:<ACCOUNT_ID>:log-group:aws/spans:*"
+        ]
       },
       {
         "Sid": "SageMakerLifecycleScoped",
@@ -166,7 +242,6 @@
           "sagemaker:CreateEndpoint",
           "sagemaker:UpdateEndpoint",
           "sagemaker:DeleteEndpoint",
-          "sagemaker:DescribeEndpoint",
           "sagemaker:InvokeEndpoint",
           "sagemaker:AddTags"
         ],
@@ -192,10 +267,22 @@
         ]
       },
       {
+        "_comment": "Account-wide READ of endpoint shape, split out of SageMakerLifecycleScoped after the first live sweep proved the scoped version unusable for the job. That sweep found the account's one real orphan (jumpstart-dft-hf-asr-whisper-large-v2, InService 842 days, 0 invocations over both a 2h and a 7d window) and then had to file this in its own output: \"sagemaker:DescribeEndpoint / DescribeEndpointConfig denied to llmops-harness-execution -- instance type and instance count could not be confirmed; cost figures are estimates based on JumpStart defaults\". So it reported ~$1106/month and ~$30.6k since creation as a GUESS at the JumpStart default instance type. A cost control whose headline number is an assumption is one an owner can dismiss, and dismissing it correctly -- the whole value of the finding is the figure. Same shape as the ListTags argument one statement below: you cannot describe only the endpoints you already know are yours and expect to characterise the ones you do not. Resource \"*\" and Describe-only; every mutation (Create/Update/Delete/AddTags) stays scoped to llmops-* in SageMakerLifecycleScoped, so the sweep can fully characterise an orphan it still cannot touch -- exactly the authority its prompt grants ('do NOT delete endpoints yourself -- report them').",
+        "Sid": "SageMakerDescribeReadOnly",
+        "Effect": "Allow",
+        "Action": [
+          "sagemaker:DescribeEndpoint",
+          "sagemaker:DescribeEndpointConfig"
+        ],
+        "Resource": "*"
+      },
+      {
+        "_comment": "ListTags is what makes a sweep possible at all: the prompt's `sweep` task is 'list-endpoints + list-tags', and simulate_principal_policy reported implicitDeny for sagemaker:ListTags -- even on a scoped endpoint/llmops-* ARN, so scoping was not the issue, the action was simply absent. Resource '*' here rather than endpoint/llmops-*, and that width is the POINT rather than convenience: the sweep exists to find endpoints nobody claimed, and this account's only genuine orphan (jumpstart-dft-hf-asr-whisper-large-v2, InService since 2024-04-11) is named nothing like llmops-* and carries no project tag at all. A sweep that can only read the tags of endpoints we already named ours cannot find an unclaimed one. Enumeration and metadata only -- Describe/Delete stay scoped to llmops-* in SageMakerLifecycleScoped, so the sweep can SEE an orphan it may not touch, which is exactly the authority the prompt grants it ('do NOT delete endpoints yourself -- report them').",
         "Sid": "SageMakerList",
         "Effect": "Allow",
         "Action": [
           "sagemaker:ListEndpoints",
+          "sagemaker:ListTags",
           "sagemaker:ListTrainingJobs"
         ],
         "Resource": "*"
@@ -206,14 +293,18 @@
         "Action": "iam:PassRole",
         "Resource": "arn:aws:iam::<ACCOUNT_ID>:role/llmops-sagemaker-execution",
         "Condition": {
-          "StringEquals": { "iam:PassedToService": "sagemaker.amazonaws.com" }
+          "StringEquals": {
+            "iam:PassedToService": "sagemaker.amazonaws.com"
+          }
         }
       },
       {
+        "_comment": "GetMetricStatistics was missing while the monitor prompt names that exact API FIRST for its `health` task ('aws cloudwatch get-metric-statistics'). Verified with simulate_principal_policy against this role: implicitDeny. It went unnoticed because no monitor task had ever been dispatched anywhere in the platform -- the prompt, the grant and the code disagreed and nothing ran to find out. Both APIs are granted rather than only the newer one because the prompt legitimately offers either: GetMetricStatistics answers one metric with server-side percentiles in a single call (ModelLatency p50/p90), which is what a per-endpoint health check wants, while GetMetricData batches many. Read-only metric reads, $0.",
         "Sid": "CloudWatchMetricsRead",
         "Effect": "Allow",
         "Action": [
           "cloudwatch:GetMetricData",
+          "cloudwatch:GetMetricStatistics",
           "cloudwatch:ListMetrics"
         ],
         "Resource": "*"
@@ -236,6 +327,50 @@
         "Effect": "Allow",
         "Action": "events:PutEvents",
         "Resource": "arn:aws:events:<REGION>:<ACCOUNT_ID>:event-bus/llmops-pipeline"
+      },
+      {
+        "_comment": "For llmops_finops (the audit runtime). READ-ONLY on billing, by design: an auditor able to change what it audits is not an auditor. Every verb here is a read -- notably NO ce:CreateCostCategoryDefinition, NO ce:UpdateCostAllocationTagsStatus, NO budgets:ModifyBudget. budgets:ViewBudget is the read: the Budgets API authorizes DescribeBudgets against the IAM action budgets:ViewBudget, so a policy naming only budgets:DescribeBudgets denies the call (live AccessDeniedException named budgets:ViewBudget). Both are listed -- ViewBudget is the one enforced. Resource must be * because ce:* and pricing:* have no resource-level ARNs; the scoping is the verb list. All six harnesses share this role, so the other five gain read-only billing visibility they do not use -- the alternative is a second execution role, which the harness create path does not support today.",
+        "Sid": "BillingReadOnlyForFinOps",
+        "Effect": "Allow",
+        "Action": [
+          "ce:GetCostAndUsage",
+          "ce:GetCostAndUsageWithResources",
+          "ce:GetDimensionValues",
+          "ce:GetTags",
+          "ce:GetCostForecast",
+          "ce:ListCostAllocationTags",
+          "pricing:GetProducts",
+          "pricing:GetAttributeValues",
+          "pricing:DescribeServices",
+          "budgets:ViewBudget",
+          "budgets:DescribeBudgets"
+        ],
+        "Resource": "*"
+      },
+      {
+        "_comment": "The finops agent reads estimates to compare against, and reads/writes the actuals ledger it owns. It must NOT be able to change an approval decision, so no write verbs on llmops-cost-estimates -- an auditor that can flip a rejected estimate to approved has defeated the gate.",
+        "Sid": "CostLedgerForFinOps",
+        "Effect": "Allow",
+        "Action": [
+          "dynamodb:GetItem",
+          "dynamodb:Query",
+          "dynamodb:Scan"
+        ],
+        "Resource": [
+          "arn:aws:dynamodb:<REGION>:<ACCOUNT_ID>:table/llmops-cost-estimates",
+          "arn:aws:dynamodb:<REGION>:<ACCOUNT_ID>:table/llmops-cost-estimates/index/*"
+        ]
+      },
+      {
+        "Sid": "CostActualsLedgerForFinOps",
+        "Effect": "Allow",
+        "Action": [
+          "dynamodb:GetItem",
+          "dynamodb:Query",
+          "dynamodb:PutItem",
+          "dynamodb:UpdateItem"
+        ],
+        "Resource": "arn:aws:dynamodb:<REGION>:<ACCOUNT_ID>:table/llmops-cost-actuals"
       }
     ]
   }

@@ -16,8 +16,12 @@ Usage:
 """
 import argparse
 import json
+import pathlib
 import secrets
 import sys
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import config_subst  # noqa: E402 — deploy/ is not a package; path is set just above
 
 # 'name'/'harnessName' are not UpdateHarness inputs (it uses harnessId from the CLI).
 NON_API_KEYS = {"name", "harnessName"}
@@ -69,6 +73,8 @@ def main() -> int:
     ap.add_argument("--config", required=True)
     ap.add_argument("--fields", nargs="*", help="Restrict update to these top-level fields")
     ap.add_argument("--region", default="us-east-1")
+    ap.add_argument("--account-id", help="Resolve <ACCOUNT_ID>/<DATA_BUCKET> offline (dry-run)")
+    ap.add_argument("--bucket", help="Override the data bucket used for <DATA_BUCKET>")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
@@ -82,6 +88,16 @@ def main() -> int:
 
     if args.dry_run:
         # no boto3 needed in dry-run — use the known optionalValue set
+        if config_subst.unresolved(cfg):
+            if not args.account_id:
+                print("FAIL  config carries placeholders "
+                      f"{config_subst.unresolved(cfg)} and no --account-id was given to "
+                      "resolve them offline. Printing the unresolved config would show a "
+                      "payload nobody will ever send.")
+                return 1
+            cfg = config_subst.resolve(
+                cfg, config_subst.mapping_for(args.account_id, args.region, args.bucket),
+                where=args.config)
         payload = wrap_payload(cfg, fallback_fields, args.fields)
         payload["harnessId"] = args.harness_id
         payload["clientToken"] = secrets.token_hex(20)
@@ -94,6 +110,25 @@ def main() -> int:
 
     import boto3
     client = boto3.client("bedrock-agentcore-control", region_name=args.region)
+
+    # Resolve placeholders BEFORE any API call. An unresolved <DATA_BUCKET> in a skill
+    # URI is accepted by UpdateHarness, mints a version and reports READY -- and then
+    # every session fails at start. config_subst.resolve raises rather than send one.
+    if config_subst.unresolved(cfg):
+        account_id = args.account_id or boto3.client(
+            "sts", region_name=args.region).get_caller_identity()["Account"]
+        bucket = args.bucket
+        if not bucket:
+            ssm = boto3.client("ssm", region_name=args.region)
+            try:
+                bucket = ssm.get_parameter(
+                    Name="/llmops/storage/bucket")["Parameter"]["Value"]
+            except ssm.exceptions.ParameterNotFound:
+                pass  # mapping_for derives the default name
+        cfg = config_subst.resolve(
+            cfg, config_subst.mapping_for(account_id, args.region, bucket),
+            where=args.config)
+        print(f"OK    resolved placeholders (bucket={bucket or 'derived'})")
 
     try:
         structure_fields = get_structure_fields(client)

@@ -1,10 +1,25 @@
 #!/usr/bin/env python3
-"""Generate the two architecture SVGs in the house style (dark navy cards,
+"""Generate the three architecture SVGs in the house style (dark navy cards,
 per-tier accent strokes, animated dashed wires, rounded corners, clickable cards).
 
-Layout law (enforced by tests/check_svg_geometry.py): one corridor per wire,
-distinct anchor edges per target — no two wires may intersect, no wire may pass
-through a card. Regenerate + re-verify after every edit; never hand-edit the SVGs.
+Layout law (enforced by tests/test_svg_geometry.py): one corridor per wire,
+distinct anchor edges per target — no two wires may cross, no two may share a
+corridor, and none may pass through a card. Regenerate + re-verify after every
+edit; never hand-edit the SVGs.
+
+Every label here is a claim about the running system, so each is derived from a
+file in this repo and cross-checked against the deployed resource. Two labels in
+the previous version were falsified by that check and are fixed:
+
+  * "git in dev, S3 mirror in prod" — all 19 skill mounts across all 7 live
+    harnesses are `git`; no `s3` source exists anywhere. The mirror exists
+    (`ensure_skills` in deploy/03_storage.py) but nothing has been switched to it.
+  * "VPC-isolated in production" — no live harness carries a
+    networkConfiguration, so all 7 run PUBLIC. ARCHITECTURE.md §11 says as much;
+    the diagram was asserting the aspiration as shipped fact.
+
+Both were the same failure mode as the stale doc counts: a design read as a
+delivered feature. The footer now states what is true and names the gap.
 """
 import os
 
@@ -66,14 +81,14 @@ def wire(d, cls="wire", marker="ahB"):
     return f'  <path class="{cls}" d="{d}" marker-end="url(#{marker})"/>\n'
 
 
-# ================= HIGH-LEVEL (1240 x 700) =================
-W, H = 1240, 700
+# ================= HIGH-LEVEL (1240 x 900) =================
+W, H = 1240, 900
 CW, CH = 180, 56
 svg = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" font-family="system-ui,-apple-system,\'Segoe UI\',Roboto,sans-serif">']
 svg.append(STYLE)
 svg.append(f'  <rect class="bg" x="0" y="0" width="{W}" height="{H}" rx="16"/>')
 svg.append('  <text class="title" x="30" y="40" font-size="18">llmops-agentic-system — autonomous LLMOps on AgentCore</text>')
-svg.append('  <text class="sub" x="30" y="60">teacher DeepSeek-R1 (Bedrock) → student Qwen3-1.7B (SageMaker QLoRA) · click any card</text>')
+svg.append('  <text class="sub" x="30" y="60">teacher DeepSeek-R1 (Bedrock) → student Qwen3-1.7B (SageMaker QLoRA) · 7 harnesses, all on Fable 5 · click any card</text>')
 
 # Column 1 (x=30): triggers, stacked
 trig_y = [92, 168, 244, 320]
@@ -84,10 +99,11 @@ trigs = [("⏰", "EventBridge Scheduler", "cron · nightly runs"),
 for (icon, name, sub), y in zip(trigs, trig_y):
     svg.append(card(30, y, CW, CH, "cTrig", icon, name, sub, "docs/TRIGGERS.md"))
 
+
 # Column 2 (x=286): conductor on top, then spine, stacked
 svg.append(card(286, 92, CW, CH, "cAgent", "🎼", "llmops_orchestrator", "goal → plan → dispatch · triage", "agents/orchestrator/harness.json"))
 svg.append(card(286, 168, CW, CH, "cSpine", "🚀", "start_pipeline λ", "run_id · manifest seed", "orchestration/start_pipeline/handler.py"))
-svg.append(card(286, 282, CW, CH, "cSpine", "🧭", "Step Functions", "stage DAG · waitForTaskToken", "orchestration/state_machine.asl.json"))
+svg.append(card(286, 282, CW, CH, "cSpine", "🧭", "Step Functions", "stage DAG · data_audit mode · waitForTaskToken", "orchestration/state_machine.asl.json"))
 svg.append(card(286, 396, CW, CH, "cSpine", "🔌", "harness-driver λ", "InvokeHarness · inline-fn loop", "orchestration/harness_driver/handler.py"))
 
 # triggers -> conductor (goal intake; each its own corridor into left edge, staggered entry y)
@@ -130,18 +146,56 @@ svg.append(wire(f"M{560+CW},{92+CH/2} L{846},{92+CH/2}", "wireG", "ahG"))
 svg.append(wire(f"M{560+CW},{190+CH/2} L{800},{190+CH/2} L{800},{240+CH/2} L{846},{240+CH/2}", "wireG", "ahG"))
 svg.append(wire(f"M{560+CW},{386+CH/2} L{800},{386+CH/2} L{800},{388+CH/2+14} L{846},{388+CH/2+14}", "wireG", "ahG"))
 
-# training-complete resume: SageMaker Training -> (EventBridge rule) -> SFN. Own low corridor.
-svg.append(card(850, 505, CW, CH, "cSpine", "📡", "EventBridge rule", "job state change → resume λ", "orchestration/resume_pipeline/handler.py"))
-svg.append(wire(f"M{850+CW/2},{240+CH} L{850+CW/2},{505-4}", "wire", "ahB"))
-svg.append(wire(f"M{850},{505+CH/2} L{286+CW/2},{505+CH/2} L{286+CW/2},{282+CH+4}", "wire", "ahB").replace('marker-end="url(#ahB)"', 'marker-end="url(#ahB)"'))
+# training-complete resume: SageMaker Training -> EventBridge rule -> Step Functions.
+#
+# Both wires here used to pierce cards, invisibly to the old geometry check
+# (it sampled only segment ENDPOINTS, so a wire spanning a card looked fine):
+#   * the Training->rule drop ran down x=940, straight through the SageMaker
+#     Endpoint card at (850,388);
+#   * the rule->SFN return ran along y=533 from x=850 to x=376, crossing the
+#     llmops_monitor card and ENDING INSIDE the driver card.
+#
+# The state machine is boxed in on all four sides -- conductor and start_pipeline
+# above, driver below, the trigger fan-in left, the driver's five-way fan-out
+# right -- so this feedback wire gets a dedicated lane rather than a shortcut:
+# out of the rule's bottom, down the clear column at x=1035 (between the
+# SageMaker column that ends at 1030 and the console that starts at 1040), west
+# along y=545 (below every pipeline card, above the audit row at y=560), then up
+# x=272 (between the trigger column ending at 210 and the spine at 286, and to
+# the right of the fan-in corridors that stop at 268) into the state machine's
+# left edge. The rule card moves beside Training instead of below the Endpoint,
+# which is what forced the original wire through a card in the first place.
+svg.append(card(1040, 240, CW, CH, "cSpine", "📡", "EventBridge rule", "job state change → resume λ", "orchestration/resume_pipeline/handler.py"))
+svg.append(wire(f"M{850+CW},{260} L{1036},{260}", "wire", "ahB"))
+svg.append(wire(f"M{1040+CW/2},{240+CH} L{1040+CW/2},{320} L{1035},{320} "
+                f"L{1035},{545} L{272},{545} L{272},{310} L{282},{310}", "wire", "ahB"))
 
 # Console (x=1080 vertical strip) reads everything — dim wires, no crossings (right margin corridor)
-svg.append(card(1040, 505, 186, CH, "cOps", "🖥️", "llmops-admin console", "obs · evals · optimizations", "deploy/console/wire_console.py"))
-svg.append(f'  <text class="sub" x="{1040+93}" y="{505-10}" text-anchor="middle" fill="#ff6b81">reads traces · reports · runs</text>')
+svg.append(card(1040, 505, 186, CH, "cOps", "🖥️", "llmops-admin console", "obs · evals · opts · cost", "deploy/console/README.md"))
+svg.append(f'  <text class="sub" x="{1040+93}" y="{505-10}" text-anchor="middle" fill="#ff6b81">reads traces · reports · runs · spend</text>')
 
-# Self-iteration loop label (eval -> finetune remediation) — left-side corridor between columns
-svg.append(wire(f"M{560},{288+CH/2} L{540},{288+CH/2} L{540},{190+CH/2+16} L{556},{190+CH/2+16}", "wireR", "ahR"))
-svg.append(f'  <text class="sub" x="{560+CW/2}" y="{288-14}" text-anchor="middle" fill="#ff6b81">gate fail → remediate (≤3)</text>')
+# ---- FinOps audit plane (its own row below the pipeline: it runs beside the
+# state machine, not inside it — daily, spanning many finished runs) ----
+svg.append(f'  <text class="bandT" x="30" y="550">AUDIT PLANE — reconciles what was actually spent · cannot stop a run · read-only billing IAM</text>')
+svg.append(card(30, 560, CW, CH, "cTrig", "⏰", "finops-daily", "cron 09:00 UTC · billing reads only", "docs/COST.md"))
+svg.append(card(286, 560, CW, CH, "cSpine", "🧮", "finops-reconcile λ", "period select · D-2 + re-settle", "orchestration/finops_reconcile/handler.py"))
+svg.append(card(560, 582, CW, CH, "cAgent", "🧾", "llmops_finops", "auditor · reconcile / rates / report", "agents/finops/harness.json"))
+svg.append(card(850, 582, CW, CH, "cAws", "💰", "Cost Explorer · Price List", "resource-level actuals · unit rates", "docs/COST.md"))
+svg.append(wire(f"M{30+CW},{560+CH/2} L{282},{560+CH/2}", "wireP", "ahP"))
+svg.append(wire(f"M{466},{560+CH/2} L{511},{560+CH/2} L{511},{582+CH/2} L{556},{582+CH/2}", "wireO", "ahO"))
+svg.append(f'  <text class="sub" x="511" y="{560+CH/2-8}" text-anchor="middle">via harness-driver λ</text>')
+svg.append(wire(f"M{740},{582+CH/2} L{846},{582+CH/2}", "wireG", "ahG"))
+
+# Self-iteration loop (eval -> finetune remediation).
+#
+# This used to detour left to a corridor at x=540 and share 16px of the y=316
+# approach with the driver->eval wire — two wires drawn on top of each other,
+# which reads as one wire and loses a connection from the picture. The gap
+# between the finetune and eval cards (y 246..288) is empty, so the honest route
+# is straight up it: eval's TOP edge to finetune's BOTTOM edge, two edges no
+# other wire uses.
+svg.append(wire(f"M{560+CW/2},{288-4} L{560+CW/2},{190+CH+4}", "wireR", "ahR"))
+svg.append(f'  <text class="sub" x="{560+CW+66}" y="{270}" text-anchor="middle" fill="#ff6b81">gate fail → remediate (≤3)</text>')
 
 # escalation triage: EscalatedToHuman events -> conductor first (top-margin corridor, no crossings)
 svg.append(wire(f"M{560+CW/2},{92-4+0} M0,0", "wireDim", "ahR"))  # placeholder no-op keeps numbering
@@ -149,11 +203,13 @@ svg.pop()
 svg.append(wire(f"M{560+CW/2},{92} L{560+CW/2},{78} L{286+CW/2+30},{78} L{286+CW/2+30},{92-4}", "wireR", "ahR"))
 svg.append(f'  <text class="sub" x="{460}" y="{72}" text-anchor="middle" fill="#ff6b81">escalations → conductor triage first · page human only if needed</text>')
 
-# State band at bottom
-yb = 600
-svg.append(f'  <rect class="band" x="30" y="{yb}" width="{W-60}" height="72" rx="14"/>')
-svg.append(f'  <text class="bandT" x="50" y="{yb+26}">STATE — S3 runs/&lt;run_id&gt;/manifest.json · DynamoDB runs + stage-events · shared AgentCore Memory · EventBridge bus llmops-pipeline</text>')
-svg.append(f'  <text class="sub" x="50" y="{yb+48}">skills mounted from MLOps-agent-skills (git in dev, S3 mirror in prod) · VPC-isolated in production · least-privilege IAM · TEST-PROVEN gates per phase</text>')
+# State band at bottom. Table list matches the five that actually exist:
+# llmops-pipeline-runs, -stage-events, -tasks, -cost-actuals, -cost-estimates.
+yb = 700
+svg.append(f'  <rect class="band" x="30" y="{yb}" width="{W-60}" height="86" rx="14"/>')
+svg.append(f'  <text class="bandT" x="50" y="{yb+26}">STATE — S3 runs/&lt;run_id&gt;/manifest.json · finops/rates rate card · customer-data/ uploads · DynamoDB runs + stage-events + tasks + cost-actuals + cost-estimates · shared Memory</text>')
+svg.append(f'  <text class="sub" x="50" y="{yb+48}">skills mounted from MLOps-agent-skills — all 19 mounts across all 7 harnesses are git today; the S3 mirror exists (ensure_skills) but nothing is switched to it yet</text>')
+svg.append(f'  <text class="sub" x="50" y="{yb+66}">network: all 7 harnesses run PUBLIC (no networkConfiguration); the VPC is built but no VPC harness variant ships · least-privilege IAM, no *FullAccess · TEST-PROVEN gates per phase</text>')
 
 svg.append('</svg>')
 open(os.path.join(OUT, "architecture-high-level.svg"), "w").write("\n".join(svg))
@@ -175,7 +231,7 @@ svg.append('  <text class="bandT" x="306" y="128">AGENTCORE HARNESS SESSION (mic
 svg.append(card(316, 150, CW, CH, "cAgent", "🧠", "Fable 5 agent loop", "Strands · maxIterations 100", "agents/README.md"))
 svg.append(card(316, 260, CW, CH, "cDim", "📚", "mounted skills", "MLOps-agent-skills llmops/*", "agents/data-prep/harness.json"))
 svg.append(card(316, 370, CW, CH, "cDim", "🐚", "shell + code interpreter", "aws cli · python", "agents/README.md"))
-svg.append(card(660, 150, CW + 40, CH, "cOps", "🧩", "inline functions", "stage_complete · checkpoint · job_launched …", "agents/README.md"))
+svg.append(card(660, 150, CW + 40, CH, "cOps", "🧩", "inline functions", "stage_complete · job_launched · finops audit tools …", "agents/README.md"))
 svg.append(card(660, 260, CW + 40, CH, "cDim", "🗃️", "shared BYO memory", "SEMANTIC + EPISODIC · cross-run", "deploy/04_wire_memory.py"))
 svg.append(card(660, 370, CW + 40, CH, "cDim", "🛰️", "OTel traces", "always_on → console evals", "deploy/06_observability.py"))
 
@@ -200,4 +256,136 @@ svg.append(wire(f"M{660+CW+40},{260+CH/2} L{982},{260+CH/2}", "wireG", "ahG"))
 
 svg.append('</svg>')
 open(os.path.join(OUT, "architecture-low-level.svg"), "w").write("\n".join(svg))
+
+# ================= CONSOLE: the LLMOps Admin dashboard's own plumbing (1240 x 760) =================
+#
+# Layout law here is a band-per-plane, because the dashboard's whole design claim
+# is that the three planes have different rules: GETs are public, every POST is
+# authed at ONE chokepoint, and the customer-facing consult plane is the only one
+# that talks to an agent. Bands keep each plane's wires inside its own horizontal
+# strip, so no wire needs to cross another plane to reach its target.
+#
+# Verified live against the deployment (2026-08-01), unauthenticated:
+#   GET  /api/overview, /api/tasks, /api/cost-overview           -> 200
+#   POST /api/tasks, /api/start-run, /api/cost-approval,
+#        /api/data-upload-url, /api/finops-run                   -> 401
+# so "public GETs, authed POSTs" is measured, not asserted.
+#
+# Counts are read off the router, not remembered: 30 handlers = 13 GET + 3
+# session POST + 14 authed POST, and /api/tasks/{id}/ fans into 3 sub-actions
+# (message, accept, close). An earlier version of this diagram said "26 routes"
+# and "Cognito on EVERY POST"; both were wrong in the same direction -- flattering.
+# /api/login, /api/refresh and /api/refresh/revoke are handled BEFORE the
+# chokepoint on purpose, and that is not a gap: requiring a live session to log
+# in, or to recover one after a page reload, is a contradiction. They are the only
+# three, they mint or revoke sessions rather than acting on the platform, and
+# tests/test_console_routes.py derives all four numbers from the router so the
+# next added POST cannot slip in above the chokepoint unnoticed.
+CH2 = 760
+svg = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1240 {CH2}" font-family="system-ui,-apple-system,\'Segoe UI\',Roboto,sans-serif">']
+svg.append(STYLE)
+svg.append(f'  <rect class="bg" x="0" y="0" width="1240" height="{CH2}" rx="16"/>')
+svg.append('  <text class="title" x="30" y="40" font-size="18">LLMOps Admin console — one Lambda, read-mostly, server-enforced gates</text>')
+svg.append('  <text class="sub" x="30" y="60">deploy/console/ · 8 tabs · self-contained HTML from cold start · public GETs · Cognito on every POST except the 3 session routes that establish it</text>')
+
+# ---- the operator path in (left column, top to bottom) ----
+svg.append(card(30, 96, CW, CH, "cOps", "🧑‍💻", "Operator browser", "one HTML file · no CDN · CSP self", "deploy/console/frontend.html"))
+svg.append(card(30, 196, CW, CH, "cTrig", "🚪", "HTTP API Gateway", "routes / and /api/*", "deploy/console/deploy.sh"))
+svg.append(card(30, 296, CW, CH, "cTrig", "🔐", "Cognito user pool", "access token + httpOnly refresh", "deploy/console/README.md"))
+svg.append(wire(f"M{30+CW/2},{96+CH} L{30+CW/2},{196-4}", "wireP", "ahP"))
+svg.append(wire(f"M{30+CW/2},{196+CH} L{30+CW/2},{296-4}", "wireP", "ahP"))
+svg.append(f'  <text class="sub" x="{30+CW/2}" y="{296-10}" text-anchor="middle">POSTs carry the access token</text>')
+
+# ---- the one handler ----
+LAMX, LAMY, LAMW = 286, 196, CW + 20
+svg.append(card(LAMX, LAMY, LAMW, CH, "cSpine", "🖥️", "llmops-admin λ", "frontend + 30 route handlers in one λ", "deploy/console/lambda_function.py"))
+svg.append(wire(f"M{30+CW},{196+CH/2} L{LAMX-4},{196+CH/2}", "wireP", "ahP"))
+lam_r, lam_cx = LAMX + LAMW, LAMX + LAMW / 2
+
+# ---- READ PLANE (top right): four sources, nested corridors, no crossings ----
+svg.append('  <text class="bandT" x="640" y="90">READ PLANE — public GETs, aggregated server-side</text>')
+reads = [("🛰️", "AgentCore planes", "fleet · evals · optimizations", "deploy/06_observability.py", 640, 108),
+         ("📈", "CloudWatch + spans", "metrics · aws/spans sessions", "deploy/06_observability.py", 640, 180),
+         ("🗄️", "DynamoDB", "runs · stage-events · tasks · cost", "docs/COST.md", 640, 252),
+         ("🪣", "S3", "reports · rate card · customer-data", "docs/COST.md", 640, 324)]
+for icon, name, sub, href, x, y in reads:
+    svg.append(card(x, y, CW + 40, CH, "cAws", icon, name, sub, href))
+# Corridor nesting, which is a rule and not a fiddle: exits are ordered top-down
+# along the Lambda's right edge, and each wire's corridor is assigned so that the
+# wire travelling FURTHEST from its exit gets the NEAREST corridor. Upward and
+# downward wires are nested separately.
+#
+# Assigning corridors in plain card order instead (left-to-right for top-to-
+# bottom) crosses every downward pair: a wire that exits higher but turns down
+# later runs its horizontal leg straight across the vertical leg of the wire
+# below it. Verified — that naive version produced CROSS at (552,242) and
+# (578,280) before this nesting replaced it.
+CORRIDORS = [500, 526, 552, 578]
+exits = [LAMY + 10 + i * 12 for i in range(len(reads))]
+ups = [i for i, r in enumerate(reads) if r[5] + CH / 2 < exits[i]]
+downs = [i for i, r in enumerate(reads) if r[5] + CH / 2 >= exits[i]]
+# furthest-travelling wire first in each group -> nearest free corridor
+order = (sorted(ups, key=lambda i: reads[i][5]) +
+         sorted(downs, key=lambda i: -reads[i][5]))
+corridor_of = {}
+for slot, i in enumerate(order):
+    corridor_of[i] = CORRIDORS[slot]
+for i, (_, _, _, _, x, y) in enumerate(reads):
+    corr, src_y = corridor_of[i], exits[i]
+    svg.append(wire(f"M{lam_r},{src_y} L{corr},{src_y} L{corr},{y+CH/2} L{x-4},{y+CH/2}", "wireG", "ahG"))
+
+# ---- WRITE PLANE (middle): every POST through one auth chokepoint ----
+svg.append('  <text class="bandT" x="286" y="424">WRITE PLANE — one auth chokepoint for every POST; the cost gate is server-side, not in the UI</text>')
+WW = CW + 76
+wy = 444
+svg.append(card(286, wy, WW, CH, "cOps", "▶️", "POST /api/start-run", "dispatch a pipeline run", "orchestration/start_pipeline/handler.py"))
+svg.append(card(286 + WW + 24, wy, WW, CH, "cOps", "⚖️", "POST /api/cost-approval", "approver group · never self-approve", "docs/COST.md"))
+svg.append(card(286 + 2 * (WW + 24), wy, WW, CH, "cOps", "💸", "POST /api/finops-run", "reconcile · pricing_refresh · report", "orchestration/finops_reconcile/handler.py"))
+# Each write card is entered on its TOP edge from its own vertical corridor off a
+# shared horizontal lane at y=404 -- above the write cards, below the read cards.
+# Exits are staggered along the Lambda's bottom edge, left-to-right in the same
+# order as the targets, so the three wires never need to swap sides.
+for i in range(3):
+    tx = 286 + i * (WW + 24) + WW / 2
+    ex = LAMX + 30 + i * 40
+    svg.append(wire(f"M{ex},{LAMY+CH} L{ex},{404-i*10} L{tx},{404-i*10} L{tx},{wy-4}", "wireR", "ahR"))
+svg.append(f'  <text class="sub" x="{286 + 2*(WW+24) + WW/2}" y="{wy+CH+20}" text-anchor="middle">async → finops-reconcile λ → harness-driver λ → llmops_finops</text>')
+svg.append(f'  <text class="sub" x="{286 + WW/2}" y="{wy+CH+20}" text-anchor="middle">$2000 gate: advisory now, blocking by env</text>')
+
+# ---- CONSULT PLANE (bottom): the Tasks tab -- the only plane that talks to an agent ----
+#
+# This plane was missing from the diagram entirely, which mattered: it is the
+# customer-facing half of the product (a consultation thread that produces a
+# priced, KMS-signed plan) and the only console path that invokes a harness.
+svg.append('  <text class="bandT" x="286" y="570">CONSULT PLANE — Tasks tab: one thread per engagement · the only console path that invokes an agent</text>')
+# Four cards across a 1240 viewBox: three at WW=256 plus a fourth would overflow
+# the canvas (286 + 3*280 + 170 = 1296) and the verdicts panel at x=1040 landed
+# ON TOP of the third card, which ends at x=1102. Overlapping cards is the one
+# failure the geometry check reports as THROUGH-CARD on a wire that is in fact
+# drawn correctly, so the fix is the layout, not the wire. CWW is sized so all
+# four fit with real gutters: 286 + 3*(212+18) + 212 = 1188 < 1210.
+CWW, GUT = 212, 18
+cy = 590
+cx = [286 + i * (CWW + GUT) for i in range(4)]
+svg.append(card(cx[0], cy, CWW, CH, "cAgent", "💬", "POST /api/tasks/*", "create · message · accept · close", "deploy/console/lambda_function.py"))
+svg.append(card(cx[1], cy, CWW, CH, "cAgent", "🎼", "llmops_orchestrator", "consult · priced plan · launch_run", "agents/orchestrator/harness.json"))
+svg.append(card(cx[2], cy, CWW, CH, "cAws", "🔑", "KMS-signed acceptance", "hash-chained · approver identity", "orchestration/harness_driver/conductor_tools.py"))
+# The consult wire drops down the clear column at x=254 -- left of every card in
+# the write and consult bands (both start at x=286), right of the Cognito card
+# that ends at x=210 -- and enters the first consult card on its LEFT edge.
+# Descending inside the band at LAMX+10 (my first attempt) put the vertical leg
+# straight through both the /api/start-run card and the /api/tasks card, since
+# those cards are 256px wide and start at exactly x=286.
+svg.append(wire(f"M{LAMX-4},{LAMY+CH-14} L{254},{LAMY+CH-14} L{254},{cy+CH/2} L{cx[0]-4},{cy+CH/2}", "wireR", "ahR"))
+for i in range(3):
+    svg.append(wire(f"M{cx[i]+CWW},{cy+CH/2} L{cx[i+1]-4},{cy+CH/2}", "wireO", "ahO"))
+svg.append(f'  <text class="sub" x="{cx[1]+CWW/2}" y="{cy+CH+20}" text-anchor="middle">via harness-driver λ · streamed reply · presigned customer-data upload</text>')
+
+# ---- what the run view shows about verdicts (the two-bounded-queries fix, drawn) ----
+svg.append(card(cx[3], cy, CWW, CH, "cOps", "⚖️", "verdicts panel", "delivered · parked · never delivered", "deploy/console/frontend.html"))
+
+svg.append(f'  <text class="sub" x="30" y="{CH2-22}">Two bounded queries feed the run timeline: stage events are read sk &lt; "A", parked verdicts read sk begins_with "directive#" — a prefix is not a filter, so they are separate reads, not one filtered list.</text>')
+
+svg.append('</svg>')
+open(os.path.join(OUT, "architecture-console.svg"), "w").write("\n".join(svg))
 print("SVGs written")

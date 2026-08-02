@@ -1,7 +1,67 @@
 {
   "Comment": "llmops-pipeline — stage DAG with waitForTaskToken per harness task and the self-iteration remediation loop (eval gate fail -> remediate finetune, <=3 iterations, then escalate).",
-  "StartAt": "DataPrepGenerate",
+  "StartAt": "PipelineModeChoice",
   "States": {
+    "PipelineModeChoice": {
+      "Type": "Choice",
+      "Comment": "data_audit is the conductor's starter: audit the customer's data and stop — no GPU stage may run. Default full pipeline otherwise.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.pipeline_mode",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.pipeline_mode",
+              "StringEquals": "data_audit"
+            }
+          ],
+          "Next": "DataAudit"
+        }
+      ],
+      "Default": "DataPrepGenerate"
+    },
+    "DataAudit": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+      "Parameters": {
+        "FunctionName": "${HarnessDriverArn}",
+        "Payload": {
+          "run_id.$": "$.run_id",
+          "manifest_uri.$": "$.manifest_uri",
+          "stage": "data-prep",
+          "task": "audit",
+          "harness_id": "llmops_data_prep",
+          "task_token.$": "$$.Task.Token",
+          "iteration.$": "$.iteration"
+        }
+      },
+      "ResultPath": "$.data_audit",
+      "TimeoutSeconds": 3600,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.TooManyRequestsException",
+            "Lambda.AWSLambdaException"
+          ],
+          "IntervalSeconds": 10,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "EscalateFail"
+        }
+      ],
+      "Next": "Complete"
+    },
     "DataPrepGenerate": {
       "Type": "Task",
       "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
@@ -21,14 +81,24 @@
       "TimeoutSeconds": 7200,
       "Retry": [
         {
-          "ErrorEquals": ["Lambda.ServiceException", "Lambda.TooManyRequestsException", "Lambda.AWSLambdaException"],
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.TooManyRequestsException",
+            "Lambda.AWSLambdaException"
+          ],
           "IntervalSeconds": 10,
           "MaxAttempts": 3,
           "BackoffRate": 2
         }
       ],
       "Catch": [
-        {"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "EscalateFail"}
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "EscalateFail"
+        }
       ],
       "Next": "DataPrepCurate"
     },
@@ -50,7 +120,13 @@
       "ResultPath": "$.data_prep_curate",
       "TimeoutSeconds": 7200,
       "Catch": [
-        {"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "EscalateFail"}
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "EscalateFail"
+        }
       ],
       "Next": "FinetuneLaunch"
     },
@@ -73,8 +149,20 @@
       "TimeoutSeconds": 21600,
       "HeartbeatSeconds": 18000,
       "Catch": [
-        {"ErrorEquals": ["TrainingJobFailed"], "ResultPath": "$.error", "Next": "RemediationChoice"},
-        {"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "EscalateFail"}
+        {
+          "ErrorEquals": [
+            "TrainingJobFailed"
+          ],
+          "ResultPath": "$.error",
+          "Next": "RemediationChoice"
+        },
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "EscalateFail"
+        }
       ],
       "Next": "FinetuneAnalyze"
     },
@@ -96,7 +184,42 @@
       "ResultPath": "$.training_analysis",
       "TimeoutSeconds": 3600,
       "Catch": [
-        {"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "EscalateFail"}
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "EscalateFail"
+        }
+      ],
+      "Next": "EvalGenerate"
+    },
+    "EvalGenerate": {
+      "Type": "Task",
+      "Comment": "Produce evaluation/report.json. The gate below READS that report and applies thresholds to it; this state is what writes it. Both tasks are declared in the eval harness prompt, but only 'gate' was ever dispatched, so the only eval task the pipeline could run read an input no path produced. Fail-closed gate semantics hid it perfectly: a gate that failed because its report was never generated is indistinguishable from a gate that failed because the student was bad. Phase 4's verdict stood only because eval was run DIRECTLY, outside the machine.",
+      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+      "Parameters": {
+        "FunctionName": "${HarnessDriverArn}",
+        "Payload": {
+          "run_id.$": "$.run_id",
+          "manifest_uri.$": "$.manifest_uri",
+          "stage": "eval",
+          "task": "evaluate",
+          "harness_id": "llmops_eval",
+          "task_token.$": "$$.Task.Token",
+          "iteration.$": "$.iteration"
+        }
+      },
+      "ResultPath": "$.evaluation_run",
+      "TimeoutSeconds": 21600,
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "EscalateFail"
+        }
       ],
       "Next": "EvalGate"
     },
@@ -118,14 +241,24 @@
       "ResultPath": "$.evaluation",
       "TimeoutSeconds": 7200,
       "Catch": [
-        {"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "EscalateFail"}
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "EscalateFail"
+        }
       ],
       "Next": "QualityGateChoice"
     },
     "QualityGateChoice": {
       "Type": "Choice",
       "Choices": [
-        {"Variable": "$.evaluation.gate_passed", "BooleanEquals": true, "Next": "Deploy"}
+        {
+          "Variable": "$.evaluation.gate_passed",
+          "BooleanEquals": true,
+          "Next": "Deploy"
+        }
       ],
       "Default": "RemediationChoice"
     },
@@ -133,7 +266,11 @@
       "Type": "Choice",
       "Comment": "Self-iteration budget: remediate while iteration < 3, then escalate to human.",
       "Choices": [
-        {"Variable": "$.iteration", "NumericLessThan": 3, "Next": "IncrementIteration"}
+        {
+          "Variable": "$.iteration",
+          "NumericLessThan": 3,
+          "Next": "IncrementIteration"
+        }
       ],
       "Default": "EscalateFail"
     },
@@ -165,7 +302,13 @@
       "TimeoutSeconds": 21600,
       "HeartbeatSeconds": 18000,
       "Catch": [
-        {"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "EscalateFail"}
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "EscalateFail"
+        }
       ],
       "Next": "FinetuneAnalyze"
     },
@@ -187,7 +330,13 @@
       "ResultPath": "$.deployment",
       "TimeoutSeconds": 7200,
       "Catch": [
-        {"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "EscalateFail"}
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "EscalateFail"
+        }
       ],
       "Next": "SmokeTest"
     },
@@ -209,7 +358,44 @@
       "ResultPath": "$.smoke",
       "TimeoutSeconds": 3600,
       "Catch": [
-        {"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "Teardown"}
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "MonitorHealth",
+          "Comment": "Still lands on the teardown path, now via MonitorHealth, whose own Catch goes straight to Teardown. A failed smoke test is exactly when the endpoint's metrics are worth reading, and the endpoint is still alive here."
+        }
+      ],
+      "Next": "MonitorHealth"
+    },
+    "MonitorHealth": {
+      "Type": "Task",
+      "Comment": "MonitorHealth had no state at all until now, and llmops_monitor's three declared tasks (health, sweep, report) had ZERO dispatch sites anywhere in the platform -- the same defect class as an emitted event with no rule: a capability the docs, the prompt and the IAM all describe, that nothing can ever reach. Placement is forced by the shape of the work, not by taste: `health` reads CloudWatch metrics for a LIVE endpoint, and Teardown ALWAYS deletes that endpoint (its own Comment says so, including on SmokeTest's Catch). So between SmokeTest and Teardown is the only window in a run's life where the thing being monitored exists. After Teardown the endpoint is gone and get-metric-data returns an empty series that reads identically to a healthy idle endpoint.",
+      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+      "Parameters": {
+        "FunctionName": "${HarnessDriverArn}",
+        "Payload": {
+          "run_id.$": "$.run_id",
+          "manifest_uri.$": "$.manifest_uri",
+          "stage": "monitor",
+          "task": "health",
+          "harness_id": "llmops_monitor",
+          "task_token.$": "$$.Task.Token",
+          "iteration.$": "$.iteration"
+        }
+      },
+      "ResultPath": "$.health",
+      "TimeoutSeconds": 3600,
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "Health is observation, not a gate: a CloudWatch read that fails must never strand the endpoint it was watching. Routes to Teardown for the same reason SmokeTest's Catch does -- an orphaned endpoint is the #1 cost risk, and it costs money whether or not we managed to measure it.",
+          "ResultPath": "$.error",
+          "Next": "Teardown"
+        }
       ],
       "Next": "Teardown"
     },
@@ -232,12 +418,49 @@
       "ResultPath": "$.teardown",
       "TimeoutSeconds": 3600,
       "Catch": [
-        {"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "EscalateFail"}
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "EscalateFail"
+        }
+      ],
+      "Next": "MonitorReport"
+    },
+    "MonitorReport": {
+      "Type": "Task",
+      "Comment": "The run's story, consolidated once the manifest is finished. Placed AFTER Teardown rather than before it because the report enumerates the stage timeline and total estimated cost from the manifest -- run before Teardown it would publish a report whose last line is missing, and teardown is precisely the entry a cost reader looks for. It is the last harness task in the run, so it cannot be a gate either.",
+      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+      "Parameters": {
+        "FunctionName": "${HarnessDriverArn}",
+        "Payload": {
+          "run_id.$": "$.run_id",
+          "manifest_uri.$": "$.manifest_uri",
+          "stage": "monitor",
+          "task": "report",
+          "harness_id": "llmops_monitor",
+          "task_token.$": "$$.Task.Token",
+          "iteration.$": "$.iteration"
+        }
+      },
+      "ResultPath": "$.monitor_report",
+      "TimeoutSeconds": 3600,
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "A report that failed to write must not fail a run whose pipeline succeeded. The narrative is a deliverable; the run's terminal state is a fact. Complete still emits PipelineCompleted and MarkRunDone still closes the record.",
+          "ResultPath": "$.error",
+          "Next": "Complete"
+        }
       ],
       "Next": "Complete"
     },
     "Complete": {
       "Type": "Task",
+      "Comment": "ResultPath keeps $.run_id and $.task_id in the state for MarkTaskDone. Same trap EscalateFail fell into: without it the PutEvents response becomes the whole state and the next state dies on a missing path.",
       "Resource": "arn:aws:states:::events:putEvents",
       "Parameters": {
         "Entries": [
@@ -252,10 +475,97 @@
           }
         ]
       },
-      "End": true
+      "ResultPath": "$.complete_event",
+      "Next": "MarkRunDone"
+    },
+    "MarkRunDone": {
+      "Type": "Task",
+      "Comment": "The success-path twin of MarkRunFailed, and the asymmetry it closes was live for as long as the failure path was fixed: runs.status was only ever written 'running' (start_pipeline), 'escalated' (the driver) or 'failed' (MarkRunFailed). NOTHING wrote 'completed'. stage_complete updates the manifest and settles the task token; it never touches the run's own status. So a run that succeeded stayed at status=running forever while its execution read SUCCEEDED -- the same zombie MarkRunFailed exists to prevent, on the happy path. It went unseen because until run-20260801T062313Z-4d3e2e69 no execution had ever SUCCEEDED; the fix for the failure path could not have revealed it. Observed 2026-08-01: that run's task row closed correctly at 06:34:43Z while its run row still read 'running' five hours later. ConditionExpression mirrors MarkRunFailed's so a richer terminal status already written by the driver (escalated) is kept rather than overwritten, and Catch: States.ALL means a rejected condition or a DDB outage cannot fail an execution whose pipeline genuinely succeeded.",
+      "Resource": "arn:aws:states:::aws-sdk:dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "llmops-pipeline-runs",
+        "Key": {
+          "run_id": {
+            "S.$": "$.run_id"
+          }
+        },
+        "UpdateExpression": "SET #s = :done, completed_at = :now",
+        "ConditionExpression": "attribute_not_exists(#s) OR #s = :running",
+        "ExpressionAttributeNames": {
+          "#s": "status"
+        },
+        "ExpressionAttributeValues": {
+          ":done": {
+            "S": "completed"
+          },
+          ":running": {
+            "S": "running"
+          },
+          ":now": {
+            "S.$": "$$.State.EnteredTime"
+          }
+        }
+      },
+      "ResultPath": null,
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "Both exits go to MarkTaskDone for the same reason MarkRunFailed's Catch goes to MarkTaskFailed: the run record and the task record are separate records with separate reasons to go stale, so failing to close one must not leave the other open.",
+          "ResultPath": null,
+          "Next": "MarkTaskDone"
+        }
+      ],
+      "Next": "MarkTaskDone"
+    },
+    "MarkTaskDone": {
+      "Type": "Task",
+      "Comment": "Close out the conductor's task record on the SUCCESS path. A run dispatched from an approved plan has two records with lifecycles -- the run and the llmops-tasks row -- and only the run was ever closed, so the console's Tasks tab showed a finished order as still in flight and the audit trail never recorded how it ended. llmops-tasks is written only by the console Lambda, which is not in the execution path, so the state machine does it, as it already does for the run record. The ConditionExpression makes the NO_TASK sentinel a no-op: most runs (schedule, webhook) have no task, and attempting the write anyway would either mint a phantom task row or fail a healthy execution.",
+      "Resource": "arn:aws:states:::aws-sdk:dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "llmops-tasks",
+        "Key": {
+          "id": {
+            "S.$": "$.task_id"
+          }
+        },
+        "UpdateExpression": "SET #s = :done, closed_at = :now, final_run_status = :done",
+        "ConditionExpression": "attribute_exists(id) AND #s = :dispatched",
+        "ExpressionAttributeNames": {
+          "#s": "status"
+        },
+        "ExpressionAttributeValues": {
+          ":done": {
+            "S": "completed"
+          },
+          ":dispatched": {
+            "S": "dispatched"
+          },
+          ":now": {
+            "S.$": "$$.State.EnteredTime"
+          }
+        }
+      },
+      "ResultPath": null,
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "No task (sentinel), or a task already in a richer terminal state. Neither is a run failure -- the run genuinely succeeded, so swallow and end.",
+          "ResultPath": null,
+          "Next": "Succeed"
+        }
+      ],
+      "Next": "Succeed"
+    },
+    "Succeed": {
+      "Type": "Succeed"
     },
     "EscalateFail": {
       "Type": "Task",
+      "Comment": "ResultPath files the PutEvents response under a key instead of letting it become the whole state. Without it, a Task's result REPLACES its input -- and the next state, MarkRunFailed, reads $.run_id, which a PutEvents response does not contain. The zombie-closeout fix would have failed on a missing path at the exact moment it was needed, leaving the run at status=running: the bug it was written to fix.",
       "Resource": "arn:aws:states:::events:putEvents",
       "Parameters": {
         "Entries": [
@@ -265,17 +575,101 @@
             "EventBusName": "${EventBusName}",
             "Detail": {
               "run_id.$": "$.run_id",
-              "iteration.$": "$.iteration"
+              "iteration.$": "$.iteration",
+              "stage": "pipeline",
+              "reason": "Terminal failure or remediation budget exhausted -- see the stage events for the failing stage."
             }
           }
         ]
       },
-      "Next": "Fail"
+      "ResultPath": "$.escalate_fail",
+      "Next": "MarkRunFailed"
     },
     "Fail": {
       "Type": "Fail",
       "Error": "PipelineFailed",
       "Cause": "Terminal failure or remediation budget exhausted — see EscalatedToHuman event, SNS, and DDB stage events."
+    },
+    "MarkRunFailed": {
+      "Type": "Task",
+      "Comment": "Close out the run record. Every Python writer of runs.status lives inside a stage Lambda, so a stage that CRASHES leaves the run at status=running forever while its execution is FAILED -- a zombie the console shows as live. The state machine is the only participant still alive when a stage dies, so it writes the terminal status itself, through the SDK integration rather than yet another Lambda. A rejected condition means the driver already wrote a RICHER terminal status (escalated) -- the Catch keeps it and carries on to Fail. Catching States.ALL also means a DDB outage cannot hang the execution: the run still ends FAILED, just without the marker.",
+      "Resource": "arn:aws:states:::aws-sdk:dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "llmops-pipeline-runs",
+        "Key": {
+          "run_id": {
+            "S.$": "$.run_id"
+          }
+        },
+        "UpdateExpression": "SET #s = :failed, failed_at = :now",
+        "ConditionExpression": "attribute_not_exists(#s) OR #s = :running",
+        "ExpressionAttributeNames": {
+          "#s": "status"
+        },
+        "ExpressionAttributeValues": {
+          ":failed": {
+            "S": "failed"
+          },
+          ":running": {
+            "S": "running"
+          },
+          ":now": {
+            "S.$": "$$.State.EnteredTime"
+          }
+        }
+      },
+      "ResultPath": null,
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": null,
+          "Next": "MarkTaskFailed"
+        }
+      ],
+      "Next": "MarkTaskFailed"
+    },
+    "MarkTaskFailed": {
+      "Type": "Task",
+      "Comment": "The failure-path twin of MarkTaskDone. Both of MarkRunFailed's exits route here, including its Catch: a DDB error while closing the RUN must not stop us from closing the TASK, since those are separate records and separate reasons to be stale. Observed live: task-58ecde82adcd73bf sat at 'dispatched' for a day after run-20260731T183103Z-8b864805 read 'failed', because nothing on this path wrote the task at all. Ends at Fail either way, so the execution still reports FAILED.",
+      "Resource": "arn:aws:states:::aws-sdk:dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "llmops-tasks",
+        "Key": {
+          "id": {
+            "S.$": "$.task_id"
+          }
+        },
+        "UpdateExpression": "SET #s = :failed, closed_at = :now, final_run_status = :failed",
+        "ConditionExpression": "attribute_exists(id) AND #s = :dispatched",
+        "ExpressionAttributeNames": {
+          "#s": "status"
+        },
+        "ExpressionAttributeValues": {
+          ":failed": {
+            "S": "failed"
+          },
+          ":dispatched": {
+            "S": "dispatched"
+          },
+          ":now": {
+            "S.$": "$$.State.EnteredTime"
+          }
+        }
+      },
+      "ResultPath": null,
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "No task (sentinel) or already terminal -- the run still failed, so go to Fail regardless.",
+          "ResultPath": null,
+          "Next": "Fail"
+        }
+      ],
+      "Next": "Fail"
     }
   }
 }

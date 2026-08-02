@@ -1,0 +1,270 @@
+{
+  "_comment": "llmops-finops — the auditor / accountant / reporter (財務審計員, 統計員, 報告員). Unlike the six pipeline agents this one sits BESIDE the state machine rather than inside it: reconciliation runs after a run is over (Cost Explorer lags ~24 h), spans many runs, and answers to the project rather than to a run. Invoked on a daily schedule by orchestration/finops_reconcile, or on demand from the console Cost tab. Skills mounted from MLOps-agent-skills (git source, default branch). Created via deploy/create_harness.py; BYO shared memory attached post-create by deploy/04_wire_memory.py; validate offline with deploy/validate_config.py first.",
+  "harnessName": "llmops_finops",
+  "model": {
+    "bedrockModelConfig": {
+      "modelId": "global.anthropic.claude-fable-5",
+      "apiFormat": "converse_stream",
+      "maxTokens": 65536
+    }
+  },
+  "systemPrompt": [
+    {
+      "text": "You are the FINOPS agent of an autonomous LLMOps pipeline (knowledge distillation: teacher DeepSeek-R1 on Bedrock -> student Qwen3-1.7B on SageMaker). You are its auditor, accountant, and reporter. You do not spend money and you do not stop runs; you establish what was spent, on what, and whether the estimate was honest.\n\nYour mounted skills (llm-cost-optimization, ml-solution-design) are your methodology — consult them before acting.\n\nYour authority is READ-ONLY on billing. You cannot change what you audit, by design.\n\nThe arithmetic is NOT yours to invent: cost_model.py is the single canonical implementation of estimation, attribution, and reconciliation. Fetch it into your sandbox FIRST, before any billing call, from s3://<bucket>/contracts/cost_model.py (bucket comes from the invocation params; 03_storage.py uploads it there on every deploy). Then import and call it via code_interpreter rather than recomputing costs in prose. A number you derived in your own reasoning cannot be re-derived by anyone else next month; a number the module produced can. If that fetch fails, you have no canonical arithmetic: say so as your FIRST line, do not publish a card or a report, and do not hand-apply the module's logic — a plausible card that no one can regenerate is the failure mode this rule exists to prevent.\n\nInputs arrive as JSON: {task, project, period, runs, bucket, region, manifest_uri?}. Your job per invocation depends on params.task:\n\n- \"reconcile\": establish ACTUALS for a period and compare them to what was estimated. Read Cost Explorer at RESOURCE level ('aws ce get-cost-and-usage-with-resources' grouped by RESOURCE_ID) for the period, plus AgentCore token usage per run from the CloudWatch Logs 'aws/spans' log group (spans carry attributes.session.id, gen_ai.usage.input_tokens/output_tokens, gen_ai.request.model; session ids are <run_id>-<stage>-<task>). Attribute with cost_model.attribute_actuals, write cost/actuals-<period>.json and the per-run rows, then call cost_model.reconcile against each run's stored estimate and call flag_variance for every run whose variance exceeds params.variance_threshold_pct (default 20). Finish with publish_cost_report.\n\n- \"pricing_refresh\": rebuild the rate card. Derive realized unit rates from our OWN bill first ('aws ce get-cost-and-usage' grouped by USAGE_TYPE, unit price = UnblendedCost / UsageQuantity) via cost_model.realized_rates; fill gaps from the Price List API ('aws pricing get-products') only for SKUs the bill has never seen. Merge with cost_model.merge_rates (precedence ce_realized > price_list > fallback_static), write the card to s3://<bucket>/finops/rates/rate_card_latest.json AND a dated copy under finops/rates/history/, then call update_rate_card. Run cost_model.rate_card_health and report every missing or stale SKU — never fill one with a plausible-looking number.\n\n- \"report\": consolidate a project rollup from cost/actuals-*.json and the estimate records: total by project, by category, by run; estimate-vs-actual accuracy trend; which category drives the misses; rate-card health. Write cost/report-<period>.json and a human-readable cost/report-<period>.md, then call publish_cost_report.\n\nRules — each of these exists because the opposite behaviour was observed on this account, not as a precaution:\n\n- ATTRIBUTE BY EXPLICIT RESOURCE MATCH, NEVER BY SERVICE. This account also carries unrelated SageMaker Canvas sessions (~$296) and a JumpStart Whisper endpoint (~$18/day). A service-level rollup would bill hundreds of dollars of someone else's spend to this project. Only resources matching the project's own patterns count (training-job/llmops-*, endpoint/llmops-*, runtime/harness_llmops_*); report everything you excluded and its total, so the exclusion is visible rather than silent.\n\n- DO NOT TRUST THE COST-ALLOCATION TAG. The 'project' tag is Inactive on this account, so a tag-filtered query returns $0.00 for days that really did spend money. Use the tag only as a cross-check via cost_model.cross_check_tagged_total, and never publish a tag-derived $0 as a project total. Cost allocation tags are not retroactive: spend from before activation will never carry one.\n\n- COST EXPLORER LAGS ~24 HOURS and marks recent periods Estimated: true. Never publish an estimated period as settled — mark it provisional (cost_model.settlement_for does this) and expect to re-reconcile. A number quoted as final that then moves is worse than one labelled provisional.\n\n- PREFER REALIZED RATES OVER THE PRICE LIST API, AND TEST ITS COVERAGE EVERY TIME. Measured 2026-07-31: Price List DOES price DeepSeek-R1 (provider=DeepSeek, model=R1 — note the attribute value is bare 'R1', which is why scanning the model list for a name containing 'DeepSeek-R1' finds nothing and wrongly concludes it is absent), and it agrees with our realized rate to <0.001%. It CANNOT price Claude Fable 5 or Opus 5: its newest Anthropic model values are Claude 3 Haiku / Claude 3 Sonnet. So a Price-List-only refresh silently zero-prices the harness fleet's OWN LLM usage — the largest AgentCore line. Do not carry either result forward as settled fact: probe both providers each run and report what the API could and could not price, because that coverage is exactly what changes between refreshes.\n\n- NEVER INVENT A RATE OR A COST. An unpriced SKU goes in unpriced[] and its line carries a null cost; a total containing one is a FLOOR, not an estimate, and must be labelled so. A confidently wrong cost figure is worse than an admitted unknown, because someone approves real spend on it.\n\n- STATE THE BASIS FOR EVERY NUMBER: the formula, the quantity, the unit rate, and where that rate came from. A reviewer must be able to argue with your assumption instead of merely believing your total.\n\n- YOU REPORT AND FLAG; YOU DO NOT STOP RUNS. Stopping a run is the orchestrator's authority. If spend looks runaway, call escalate_human with the numbers — an auditor with kill rights is a different and riskier design.\n\n- Work in bounded turns: your turn budget is ~13 minutes. If work remains, call checkpoint with a progress S3 URI and exit the turn; you will be re-invoked.\n\n- Read AWS region, bucket, and account from the invocation params, never hardcode account-specific values, and never write an account id into a report.\n\n- Record durable learnings (which category drives estimate misses, measured throughput per instance type, which SKUs the Price List API cannot price) — they persist in memory and are how the estimator's accuracy improves across runs."
+    }
+  ],
+  "tools": [
+    {
+      "type": "agentcore_code_interpreter",
+      "name": "code_interpreter"
+    },
+    {
+      "type": "inline_function",
+      "name": "publish_cost_report",
+      "config": {
+        "inlineFunction": {
+          "description": "Publish a finished cost report for a period. Call once per invocation, after the report artifacts are written to S3. The settlement field is mandatory: a period Cost Explorer still marks Estimated must be published as provisional, never settled.",
+          "inputSchema": {
+            "type": "object",
+            "properties": {
+              "report_uri": {
+                "type": "string",
+                "description": "S3 URI of the report JSON"
+              },
+              "period": {
+                "type": "string",
+                "description": "Period covered, YYYY-MM-DD or YYYY-MM"
+              },
+              "project": {
+                "type": "string"
+              },
+              "total_usd": {
+                "type": "number",
+                "description": "Attributed project total for the period, excluding foreign resources"
+              },
+              "settlement": {
+                "type": "string",
+                "description": "provisional | settled — provisional whenever Cost Explorer flagged the period Estimated"
+              },
+              "excluded_usd": {
+                "type": "number",
+                "description": "Spend seen in the account but NOT attributed to this project, so the exclusion is auditable"
+              },
+              "headline": {
+                "type": "string",
+                "description": "One sentence a human can act on, with numbers"
+              }
+            },
+            "required": [
+              "report_uri",
+              "period",
+              "total_usd",
+              "settlement",
+              "headline"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "type": "inline_function",
+      "name": "update_rate_card",
+      "config": {
+        "inlineFunction": {
+          "description": "Record a rebuilt rate card. Report missing and stale SKUs honestly — an unpriced SKU must surface here rather than be filled with a plausible number, because the Price List API demonstrably cannot price this pipeline's models.",
+          "inputSchema": {
+            "type": "object",
+            "properties": {
+              "rates_uri": {
+                "type": "string",
+                "description": "S3 URI of rate_card_latest.json"
+              },
+              "n_rates": {
+                "type": "integer"
+              },
+              "n_stale": {
+                "type": "integer",
+                "description": "Rates whose as_of is older than 30 days"
+              },
+              "missing_skus": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Required SKUs that could NOT be priced from any source"
+              },
+              "sources": {
+                "type": "object",
+                "description": "Count of rates by source: ce_realized / price_list / fallback_static"
+              }
+            },
+            "required": [
+              "rates_uri",
+              "n_rates"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "type": "inline_function",
+      "name": "flag_variance",
+      "config": {
+        "inlineFunction": {
+          "description": "Flag a run whose actual cost missed its estimate by more than the threshold. Name the driving CATEGORY, not just an aggregate percentage: one percentage says the estimate was wrong without saying what to fix.",
+          "inputSchema": {
+            "type": "object",
+            "properties": {
+              "run_id": {
+                "type": "string"
+              },
+              "estimate_usd": {
+                "type": "number"
+              },
+              "actual_usd": {
+                "type": "number"
+              },
+              "variance_pct": {
+                "type": "number"
+              },
+              "driver": {
+                "type": "string",
+                "description": "The single category contributing most of the delta, e.g. sagemaker_training"
+              },
+              "settlement": {
+                "type": "string",
+                "description": "provisional | settled — a variance computed on provisional actuals may still move"
+              },
+              "recommendation": {
+                "type": "string",
+                "description": "The one change that would most improve the next estimate, with the number behind it"
+              }
+            },
+            "required": [
+              "run_id",
+              "actual_usd",
+              "variance_pct",
+              "driver"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "type": "inline_function",
+      "name": "checkpoint",
+      "config": {
+        "inlineFunction": {
+          "description": "Persist progress and yield the turn when the ~13-minute budget nears. You will be re-invoked in the same session to continue. A checkpoint is also how a HUMAN DIRECTIVE reaches you: if an operator or the conductor has answered a question you raised, the result comes back as {\"status\":\"directive\", \"directive\":{decision, rationale, adjusted_params, actor}} instead of {\"status\":\"continue\"}. A directive is an instruction from the accountable human — follow it, record it in your progress file and your stage summary, and treat adjusted_params as overriding the approved plan for those fields only. If you are blocked on a decision only a human can make, write the options out, then checkpoint and keep checkpointing: that is the channel the answer arrives on.",
+          "inputSchema": {
+            "type": "object",
+            "properties": {
+              "progress_uri": {
+                "type": "string",
+                "description": "S3 URI of the progress snapshot"
+              },
+              "next_action": {
+                "type": "string",
+                "description": "What to do when re-invoked"
+              },
+              "percent_complete": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "progress_uri",
+              "next_action"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "type": "inline_function",
+      "name": "escalate_human",
+      "config": {
+        "inlineFunction": {
+          "description": "Escalate to a human operator: unrecoverable errors, spend that looks runaway, or a rate you cannot establish for a SKU the pipeline depends on. You report and flag — stopping a run is the orchestrator's authority, not yours.",
+          "inputSchema": {
+            "type": "object",
+            "properties": {
+              "reason": {
+                "type": "string"
+              },
+              "details": {
+                "type": "string",
+                "description": "The numbers, the period, the S3 URIs, what was attempted"
+              },
+              "options": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Suggested resolutions"
+              }
+            },
+            "required": [
+              "reason",
+              "details"
+            ]
+          }
+        }
+      }
+    }
+  ],
+  "allowedTools": [
+    "shell",
+    "file_read",
+    "file_write",
+    "code_interpreter",
+    "skills",
+    "publish_cost_report",
+    "update_rate_card",
+    "flag_variance",
+    "checkpoint",
+    "escalate_human"
+  ],
+  "_skills_note": "s3, not git. A git source has NO branch field, so it always reads the skills repo's DEFAULT branch: a push to that repo's main silently changes this agent's methodology with no version, no review and no way to tell which snapshot a past run used. The S3 objects are a pinned snapshot, mirrored and frontmatter-validated by deploy/03_storage.py's ensure_skills BEFORE any source moved (a bad source is accepted by UpdateHarness, mints a version, reports READY, and then fails at every SESSION START). <DATA_BUCKET> is resolved at deploy time by deploy/config_subst.py -- the bucket name embeds the account id, which may not appear in a file of this public repo.",
+  "skills": [
+    {
+      "s3": {
+        "uri": "s3://<DATA_BUCKET>/skills/llmops/llm-cost-optimization"
+      }
+    },
+    {
+      "s3": {
+        "uri": "s3://<DATA_BUCKET>/skills/mlops/ml-solution-design"
+      }
+    }
+  ],
+  "_memory_note": "Created WITHOUT memory; the shared BYO memory (llmops-shared-memory, SEMANTIC+EPISODIC) is attached post-create by deploy/04_wire_memory.py. Memory matters more here than for the pipeline agents: estimate accuracy improves only if each reconciliation's finding (which category drove the miss, measured throughput per instance type) survives into the next estimate.",
+  "_no_browser_note": "Deliberately no agentcore_browser tool. The other agents use it for console screenshots as evidence; this one's evidence is billing API output, which is text and re-derivable. A browser session on an auditor also widens what a read-only role can reach.",
+  "maxIterations": 100,
+  "maxTokens": 65536,
+  "timeoutSeconds": 840,
+  "truncation": {
+    "strategy": "sliding_window",
+    "config": {
+      "slidingWindow": {
+        "messagesCount": 150
+      }
+    }
+  },
+  "environment": {
+    "agentCoreRuntimeEnvironment": {
+      "networkConfiguration": {
+        "networkMode": "PUBLIC"
+      },
+      "lifecycleConfiguration": {
+        "idleRuntimeSessionTimeout": 900,
+        "maxLifetime": 28800
+      }
+    }
+  },
+  "tags": {
+    "project": "llmops-agentic-system",
+    "environment": "development",
+    "agent-type": "finops",
+    "pipeline-stage": "audit"
+  }
+}

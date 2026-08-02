@@ -69,7 +69,7 @@
       "name": "checkpoint",
       "config": {
         "inlineFunction": {
-          "description": "Persist progress and yield the turn when the ~13-minute budget nears. You will be re-invoked in the same session to continue.",
+          "description": "Persist progress and yield the turn when the ~13-minute budget nears. You will be re-invoked in the same session to continue. A checkpoint is also how a HUMAN DIRECTIVE reaches you: if an operator or the conductor has answered a question you raised, the result comes back as {\"status\":\"directive\", \"directive\":{decision, rationale, adjusted_params, actor}} instead of {\"status\":\"continue\"}. A directive is an instruction from the accountable human — follow it, record it in your progress file and your stage summary, and treat adjusted_params as overriding the approved plan for those fields only. If you are blocked on a decision only a human can make, write the options out, then checkpoint and keep checkpointing: that is the channel the answer arrives on.",
           "inputSchema": {
             "type": "object",
             "properties": {
@@ -137,17 +137,16 @@
     "checkpoint",
     "escalate_human"
   ],
+  "_skills_note": "s3, not git. A git source has NO branch field, so it always reads the skills repo's DEFAULT branch: a push to that repo's main silently changes this agent's methodology with no version, no review and no way to tell which snapshot a past run used. The S3 objects are a pinned snapshot, mirrored and frontmatter-validated by deploy/03_storage.py's ensure_skills BEFORE any source moved (a bad source is accepted by UpdateHarness, mints a version, reports READY, and then fails at every SESSION START). <DATA_BUCKET> is resolved at deploy time by deploy/config_subst.py -- the bucket name embeds the account id, which may not appear in a file of this public repo.",
   "skills": [
     {
-      "git": {
-        "url": "https://github.com/timwukp/MLOps-agent-skills",
-        "path": "skills/llmops/llm-evaluation"
+      "s3": {
+        "uri": "s3://<DATA_BUCKET>/skills/llmops/llm-evaluation"
       }
     },
     {
-      "git": {
-        "url": "https://github.com/timwukp/MLOps-agent-skills",
-        "path": "skills/llmops/llm-guardrails"
+      "s3": {
+        "uri": "s3://<DATA_BUCKET>/skills/llmops/llm-guardrails"
       }
     }
   ],

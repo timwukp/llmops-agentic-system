@@ -1,7 +1,7 @@
 # Agents — AgentCore Harness Configs
 
-Five per-stage worker harnesses for the LLMOps distillation pipeline (teacher DeepSeek-R1 on
-Bedrock -> student Qwen3-1.7B on SageMaker). Each config is validated offline with
+Five per-stage worker harnesses, a conductor, and a FinOps auditor for the LLMOps distillation
+pipeline (teacher DeepSeek-R1 on Bedrock -> student Qwen3-1.7B on SageMaker). Each config is validated offline with
 `deploy/validate_config.py`, created with `deploy/create_harness.py`, and gets the shared BYO
 memory attached post-create by `deploy/04_wire_memory.py`.
 
@@ -13,6 +13,12 @@ memory attached post-create by `deploy/04_wire_memory.py`.
 | 4 | [deploy](deploy/harness.json) | `llmops_deploy` | llm-deployment, llm-cost-optimization | stage_complete, checkpoint, escalate_human | deploy, smoke, teardown |
 | 5 | [monitor](monitor/harness.json) | `llmops_monitor` | llm-observability, llm-cost-optimization, llm-agent-orchestration | stage_complete, checkpoint, escalate_human | health, sweep, report |
 | 6 | [orchestrator](orchestrator/harness.json) | `llmops_orchestrator` | llm-agent-orchestration, ml-solution-design, llm-cost-optimization | **launch_run, resolve_escalation, page_human, write_report**, checkpoint | plan, triage, report |
+| — | [finops](finops/harness.json) | `llmops_finops` | llm-cost-optimization, ml-solution-design | **publish_cost_report, update_rate_card, flag_variance**, checkpoint, escalate_human | reconcile, pricing_refresh, report |
+
+`llmops_finops` has **no stage number** because it is not in the state machine. It sits beside
+`llmops_orchestrator` above it: the conductor decides what to spend, the auditor reports what
+was spent, on a daily schedule that spans many finished runs. Its IAM is read-only on billing —
+it reports and flags, and cannot stop a run. See [docs/COST.md](../docs/COST.md).
 
 All agents: model `global.anthropic.claude-fable-5` with Opus 5 as the standing fallback
 (vendor-quota failover — see AGENTS.md; no temperature/topP: Claude ≥ 4.7 rejects them),
@@ -21,7 +27,16 @@ shell + code interpreter + skills; eval and monitor additionally get the managed
 console screenshot evidence. `job_launched` implements launch-and-release for SageMaker
 training jobs (Step Functions `waitForTaskToken` resumes a fresh session on job completion).
 
+**Skill sources:** all 19 skill sources here are `s3` — a pinned mirror under
+`s3://<DATA_BUCKET>/skills/`, mirrored and frontmatter-validated by `ensure_skills` in
+`deploy/03_storage.py` before any source moved. A git source has no branch field, so it
+always reads the skill repo's default branch: a push there would silently change an agent's
+methodology with no version and no way to tell which snapshot a past run used. VPC mode
+cannot reach GitHub at all. `<DATA_BUCKET>` is resolved at deploy time by
+`deploy/config_subst.py`, since the bucket name embeds the account id and these are
+public-repo files.
+
 **Dev vs prod variants:** `harness.json` (this directory) is the **dev** variant — PUBLIC
-network, skills mounted from the git source (`timwukp/MLOps-agent-skills`, default branch).
-The **prod** variant (`harness.prod.json`, added in Phase 6) uses VPC network mode with an
-S3-mirrored skill snapshot, since VPC mode cannot reach GitHub and git skills float on main.
+network. A **prod** variant (`harness.prod.json`) would use VPC network mode. **No such
+file exists for any agent** — `05_harnesses.py --prod` looks for one, but the variants are
+unbuilt; the S3 skill mirror they also needed now exists and is what every harness reads.

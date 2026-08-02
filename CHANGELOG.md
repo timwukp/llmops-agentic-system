@@ -3,6 +3,62 @@
 All notable changes to this project are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
+## [1.1.0] — 2026-07-31
+
+### FinOps — cost estimation, a $2000 approval gate, and a 7th runtime
+
+Before this release the pipeline spent real money with no cost surface anywhere: nothing
+estimated a run, nothing reconciled it, nothing could stop an expensive one. The gap was
+concrete — the 2026-07-31 QLoRA run billed **$10.77** and that figure existed only because a
+human ran `describe-training-job` and multiplied by a rate recalled from memory.
+
+- **`pipeline/contracts/cost_model.py`** — the one place estimate arithmetic lives. Line-itemised
+  estimates (never a bare total), each row carrying its `basis` formula and `rate_source`.
+  Calibrated against the $10.77 run: **0.0% delta** on the training line (0.664 rows/s and 670 s
+  setup are that run's own measurements, not guesses).
+- **7th AgentCore runtime `llmops_finops`** (財務審計員／統計員／報告員) — daily 09:00 UTC
+  reconcile, plus on-demand `pricing_refresh` and `report`. Read-only on billing: it reports and
+  flags, and cannot stop a run. Sits beside `llmops_orchestrator` above the state machine, so it
+  never appears in a run's stage sequence.
+- **Console Cost tab** — estimate, approval queue, itemised actuals by project/service/run,
+  estimate-vs-actual variance, and rate-card health.
+- **The $2000 gate is dual**: approval fires when either this run's worst case exceeds the
+  single-run limit, or project-to-date + this estimate exceeds the cumulative one. Twenty $150
+  runs are the same exposure as one $3000 run, and each passes a single-run check alone.
+- Gates on **`worst_case_usd`, not `total_usd`** — the remediation loop can re-run finetune up to
+  `max_iterations`, so approving $2000 that can become $6000 is not a gate.
+- **Separation of duties** — Cognito group `llmops-approver`, checked server-side on every call;
+  self-approval is rejected with 403, not merely flagged. `rejected` and `launched` are terminal
+  both ways, so a refusal cannot be quietly retried and one approval cannot launch two runs.
+- **Every failure path fails closed** — no cost model → approval *required*; no rate card →
+  estimate *refused* (503) rather than a $0-with-warnings total; group lookup failure → deny.
+- Two new tables (`llmops-cost-estimates`, `llmops-cost-actuals`) and an S3 rate-card cache with
+  dated history, so an old variance can be re-derived against the rates live at estimate time.
+- **147 FinOps tests** (52 cost model + 36 agent/Lambda + 59 console), all without AWS
+  credentials; 252 in the suite. Mutation-checked: breaking each guard was verified to fail a
+  test, which found two guards a green suite did not cover.
+- Bilingual [docs/COST.md](docs/COST.md) / [docs/COST.zh-TW.md](docs/COST.zh-TW.md).
+
+### Verified facts that shaped the design (live, read-only, 2026-07-31)
+
+- **The Price List API cannot price Fable 5 or Opus 5** — the models the seven harnesses run
+  on, and the largest AgentCore line in the bill. Every `provider=Anthropic` entry for
+  us-east-1 is Claude 3 or older. So realized billing rates (cost ÷ quantity from our own
+  invoice) outrank the published price list; Price List is the fallback for never-used
+  resources. It *does* price DeepSeek-R1, to within <0.001% of our realized rate — an earlier
+  claim to the contrary was wrong because the `model` attribute value is bare `R1` (with
+  `provider=DeepSeek`), which eyeballing the model list misses. Query by filter, not by eye.
+- **Cost allocation tags are unusable today** — `project`/`Project` both Inactive, and a
+  tag-filtered CE query returns **$0.00** for a day with real spend. Attribution is therefore by
+  explicit resource match (`run_id` is already inside job and endpoint names), which needs no
+  tagging at all. Tags are not retroactive, so the $10.77 run will never carry one.
+- **Attribution must never be by service.** This account's month-to-date total was **$27,491**
+  while this project's share was **~$10–15**; the rest includes unrelated SageMaker Canvas
+  (~$296) and a JumpStart Whisper endpoint (~$36.36/day). A service filter would have reported
+  thousands of dollars of someone else's spend as ours — and tripped the $2000 gate immediately.
+- **Cost Explorer lags ~24 h** and marks recent periods `Estimated: true`, so reconciliation is
+  async and re-runnable, and a run counts as settled only when *every* row for it is settled.
+
 ## [1.0.0] — 2026-07-29
 
 ### v1 complete — all six phases live-verified

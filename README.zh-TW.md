@@ -2,12 +2,12 @@
 
 **由 AWS Bedrock AgentCore Harness 自主運行的端到端 LLMOps 平台。**
 
-[English](README.md) · [架構](docs/ARCHITECTURE.zh-TW.md) · [安全](SECURITY.md) · [Agent 指引](AGENTS.md)
+[English](README.md) · [架構](docs/ARCHITECTURE.zh-TW.md) · [費用](docs/COST.zh-TW.md) · [安全](SECURITY.md) · [Agent 指引](AGENTS.md)
 
-六個 AI agent —— 指揮家（orchestrator）加上數據準備、微調、評估、部署、監控五位專家 —— 無人干預地執行完整 LLMOps 生命週期：
+七個 AI agent —— 指揮家（orchestrator）、數據準備、微調、評估、部署、監控五位階段專家，加上一位 FinOps 審計員 —— 無人干預地執行完整 LLMOps 生命週期：
 **teacher 大模型（Bedrock 上的 DeepSeek-R1）**生成訓練數據，**student 小模型（Qwen3-1.7B）**
 以 SageMaker 訓練作業做 QLoRA 微調，通過質量門檻評估後部署到 SageMaker endpoint 並持續監控 ——
-只有 agent 呼叫 `escalate_human` 時才需要人類介入。
+只有 agent 呼叫 `escalate_human`、或某次 run 的估算費用跨過 **$2000 審批閘門**時，才需要人類介入。
 
 > **TEST-PROVEN（以測試為證）**：下方每個階段門檻都是在真實 AWS 帳號上的真實調用，
 > 證據文件在 `deploy/evidence/`，結果彙總在 `docs/TEST_RESULTS.md`。
@@ -19,17 +19,22 @@
 | Skill | 在此扮演的角色 |
 |---|---|
 | [agentcore-harness-builder](https://github.com/timwukp/agent-skills-best-practice/tree/main/skills/skills/agentcore-harness-builder) | **平台構建** —— 其規定工作流（preflight → 設計 → 撰寫配置 → 建立 → 記憶 → 可觀測性 → 調用驗證 → 版本/釘選 → 評估）構建了每一個 harness；其腳本直接複用於 `deploy/` |
-| [MLOps-agent-skills](https://github.com/timwukp/MLOps-agent-skills)（LLMOps 鏈） | **Agent 能力** —— 每個 harness 在 session 啟動時通過 harness `skills` 來源掛載其階段所需的技能（開發用 git、生產用 S3 鏡像） |
+| [MLOps-agent-skills](https://github.com/timwukp/MLOps-agent-skills)（LLMOps 鏈） | **Agent 能力** —— 每個 harness 在 session 啟動時通過 harness `skills` 來源掛載其階段所需的技能（目前 19 個來源全部是 `s3` —— 由 `ensure_skills` 鏡像並先驗證 frontmatter 的釘選快照；git 來源會隨技能 repo 的 main 漂移，而且在 VPC 模式下根本連不上） |
 
 ## 架構
 
-<!-- 架構圖由 docs/gen_architecture_svg.py 生成；佈局由 tests/check_svg_geometry.py 驗證（虛線零交叉、零穿框） -->
+<!-- 架構圖由 docs/gen_architecture_svg.py 生成；佈局由 tests/test_svg_geometry.py 驗證（虛線零交叉、零穿框） -->
 
 ![高層架構](docs/architecture-high-level.svg)
 
 Worker harness 內部（依照真實配置繪製）：
 
 ![低層架構](docs/architecture-low-level.svg)
+
+管理 console 的三個平面，規則刻意不同 —— 讀公開、寫在單一關卡認證、諮詢平面另查群組且是
+唯一會調用 agent 的路徑（[設計說明](docs/ARCHITECTURE.zh-TW.md#13-管理-console--一個-lambda三個規則不同的平面)）：
+
+![Console 架構](docs/architecture-console.svg)
 
 **模型**：teacher DeepSeek-R1（Bedrock serverless）· student Qwen3-1.7B（SageMaker QLoRA → endpoint）·
 harness 主迴圈 `global.anthropic.claude-fable-5`。
@@ -41,15 +46,16 @@ Lambda + HTTP API + Cognito 獨立棧，從
 
 核心設計決策（完整論證見 [docs/ARCHITECTURE.zh-TW.md](docs/ARCHITECTURE.zh-TW.md)）：
 
-- **6 個 harness（5 位階段專家 + 指揮家），而非巨型 agent** —— 各階段獨立掛載技能、獨立版本與 endpoint
+- **7 個 harness（5 位階段專家 + 指揮家 + FinOps 審計員），而非巨型 agent** —— 各階段獨立掛載技能、獨立版本與 endpoint
   釘選、獨立評估；爆炸半徑小。
 - **確定性主幹 + 智能 worker** —— 階段 DAG 不需要 LLM 判斷，因此編排用 Step Functions；
   智能封裝在每個階段內部。
 - **訓練採 launch-and-release** —— harness 絕不空等數小時的作業：發起作業後呼叫
   `job_launched` 釋放 session，管線經 `waitForTaskToken` + EventBridge SageMaker 狀態變化
   規則在全新 session 中恢復。狀態存在 S3 manifest，絕不存在 session 裡。
-- **企業級態勢** —— 生產環境的 harness 與 Lambda 都在 VPC 內隔離運行（interface endpoints，
-  無互聯網出口）；全程最小權限 IAM；生產技能從 S3 鏡像掛載。
+- **企業級態勢** —— 全程最小權限 IAM；VPC 與 interface endpoints（無互聯網出口）由
+  `deploy/02_network.py` 建立。VPC 模式的 harness 變體與其所需的 S3 技能鏡像**尚未實作**:
+  VPC 模式的 harness 無法解析 `git` 技能來源,所以鏡像是前置條件,不是優化。
 
 ## 為什麼這些 agent 能替代 LLMOps 工程師：三層疊加，而不是單一模型
 
@@ -97,10 +103,11 @@ Gateway，搭配 Cognito 認證：讀取公開，所有寫入都必須帶 Bearer
 | 頁籤 | 運維人員在這裡做什麼 |
 |---|---|
 | **Pipeline** | 即時觀看 9 階段 Step Functions 流程（含 remediation 迴圈箭頭）；點選某次執行查看門檻、指標、證據與訓練作業；發起新的 run |
-| **Fleet** | 檢視 6 個 `llmops_*` harness —— 狀態、模型、已掛載技能、各項限制 |
+| **Fleet** | 檢視 7 個 `llmops_*` harness —— 狀態、模型、已掛載技能、各項限制 |
 | **Observability** | 各 harness 的 AgentCore 指標、每日用量、token 花費、SageMaker 訓練作業與 student endpoint |
 | **Evaluations** | 線上評估配置與分數儀表，以及批次評估 |
 | **Optimizations** | 先看 Insights 發現，再看 AWS 原生 prompt 建議與 Bedrock 起草的 prompt —— 經人工審核後才透過 `UpdateHarness` 套用 |
+| **Cost** | 逐列估算一個 run 的費用、批准或駁回超過 $2000 的請求，再依專案／服務／run 對照估算讀取實際支出 —— 見 [docs/COST.zh-TW.md](docs/COST.zh-TW.md) |
 
 有兩點是刻意做嚴的：
 
@@ -117,8 +124,8 @@ Gateway，搭配 Cognito 認證：讀取公開，所有寫入都必須帶 Bearer
 ## Repo 結構
 
 ```
-agents/           6 個 harness 配置（5 個專家 + 指揮家）+ 提示詞
-orchestration/    狀態機 + 4 個 Lambda（driver / start / resume / webhook）
+agents/           7 個 harness 配置（5 個專家 + 指揮家 + finops 審計員）+ 提示詞
+orchestration/    狀態機 + 5 個 Lambda（driver / start / resume / webhook / finops）
 deploy/           編號冪等部署腳本 + 最小權限 IAM + 驗證證據
 pipeline/         訓練入口 + 契約（manifest schema、事件、報告）
 tests/            單元測試 · golden agent 測試 · e2e 驅動 · SVG 幾何檢查

@@ -70,11 +70,185 @@ versions and introspects the live CreateHarness/UpdateHarness schemas.
   (not `harnessArn`); InvokeHarness returns `stream`; `runtimeSessionId` ≥ 33 chars.
 - **allowedTools**: plain names only. `browser_*` globs match nothing and silently
   hide the tool.
-- **Git skill source reads the DEFAULT branch only** — a skill change must merge to
-  the skill repo's main before a fresh session picks it up. Production harnesses use
-  the S3-mirrored skill snapshot instead (see `deploy/05_mirror_skills.py`), because
-  (a) VPC-mode harnesses can't reach GitHub and (b) main-branch drift must not
-  silently change production agent behavior.
+- **Git skill source reads the DEFAULT branch only** (there is no branch field) — a
+  skill change must merge to the skill repo's main before a fresh session picks it up.
+  **All 19 skill sources across the 7 harnesses are `s3` today; none are `git`.** The S3
+  mirror was the fix, for two reasons: VPC-mode harnesses can't reach GitHub at
+  all, and main-branch drift otherwise silently changes agent behavior. The mirror and
+  its IAM come from `ensure_skills` in `deploy/03_storage.py`; the sources themselves now
+  point at `s3://<DATA_BUCKET>/skills/...`, resolved at deploy time by
+  `deploy/config_subst.py` (the bucket name embeds the account id, which may not appear in
+  a file of this public repo). `tests/test_docs_claims.py` derives the counts and the KIND
+  from the configs, so this line cannot go stale silently, and it rejects a *mixed* state:
+  a partial migration means some harnesses read a pinned snapshot while others still float
+  on the skill repo's main, which is the drift the migration exists to stop.
+- **An unresolved `<TOKEN>` in a config is a deploy-time FAILURE, not a warning.**
+  `config_subst.resolve()` raises on any `<UPPER_CASE>` left after substitution — a typo
+  like `<DATABUCKET>` passes the linter, passes `validate_config.py`, and is accepted by
+  the API. `05_harnesses.py` / `update_harness.py` / `create_harness.py` all resolve before
+  the first API call, and the live bucket comes from SSM `/llmops/storage/bucket` in
+  preference to the derived name (a deploy that passed `01_iam.py --bucket` has a different
+  one).
+- **A bad skill source fails at SESSION START, not at `UpdateHarness`** — a wrong path
+  or a `SKILL.md` missing its YAML frontmatter is accepted by the control plane and then
+  fails every invocation. So switching sources requires the objects to be in place
+  first; the switch is not reversible by config alone once sessions start failing. READY is
+  therefore no evidence at all: the proof that the s3 sources work is a live session that
+  ran and wrote its artifacts.
+- **The mirror is at `s3://<bucket>/skills/` and all 19 sources are now `s3` and point
+  at it.**
+  `deploy/03_storage.py --skills-src <checkout>` derives what to mirror from
+  `agents/*/harness.json`, validates every `SKILL.md`'s frontmatter *before* uploading,
+  and reads each one back. 66 files / 11 distinct skills behind the 19 mounts. It derives
+  the list from **both** source kinds: collecting only `git` mounts inverted at exactly
+  the switch — after it, S3 is the only copy any agent reads, so that is precisely when
+  the mirror must keep syncing, and the coverage guard would have compared 0 mounts
+  against 0 git sources and passed.
+- **An s3 skill source is fetched by `llmops-harness-execution`, NOT by the deployer.**
+  The mirror's own `head_object` read-back passes under admin credentials and proves
+  nothing about the role that actually fetches at session start:
+  `simulate_principal_policy` on that role returned **implicitDeny** for
+  `skills/*` while the role file granted `skills-mirror/*` — a prefix that never held a
+  single object. Verify a new prefix with `simulate_principal_policy`, not with your own
+  `aws s3` call. The grant is `GetObject` + condition-scoped `ListBucket` only (a source
+  resolves a whole tree, so Get without List strands it), and deliberately separate from
+  `S3PipelineObjects`, which carries `PutObject`: an agent that can write its own skill
+  tree can rewrite the instructions it is judged against next session.
+- **A Lambda that is an EventBridge target cannot be deployed from a branch that does
+  not know the rule exists.** The driver shipped without `triage_event_from_bus` while
+  `llmops-escalation-triage` was ENABLED and targeting it; every escalation then arrived
+  as a raw envelope and died on `KeyError: 'run_id'`. Every offline guard stayed green,
+  because they compare `EVENTS_NEEDING_A_RULE` against the rules *this tree's* deployer
+  builds — a branch missing the declaration AND the rule AND the translator is
+  self-consistent. Only the bus knows what is live, so `07_lambdas.py` asks it at deploy
+  time (`live_bus_translator_gap`) and raises rather than warns. `BUS_DELIVERY_TRANSLATORS`
+  in `pipeline/contracts/events.py` declares which function reads which detail-type; an
+  `InputTransformer` on the rule's target is the accepted alternative.
+- **`update_item` is an UPSERT, so "update a row" and "create a row" are one call.** On a
+  key with no row DynamoDB creates one from the key plus whatever `SET` writes. The driver's
+  escalate path therefore *minted* a run for every escalation by something that is not a run
+  — live, `sweep-2026-08-01` sat in `llmops-pipeline-runs` as `{run_id, status: escalated}`
+  with none of the attributes a real run carries. Gate creation with
+  `ConditionExpression="attribute_exists(<pk>)"` rather than with a hand-maintained list of
+  callers-that-are-not-runs; the earlier list (`stage == "finops"`) is exactly why the sweep,
+  added later, reintroduced it. Absorb **only** `ConditionalCheckFailedException`, matched by
+  botocore error *code* — absorbing everything would leave a run that really escalated at
+  `running`. And note the co-defect: `FakeTable.update_item` in `tests/test_orchestration.py`
+  used to drop writes to an absent key, which made the whole class untestable. A double more
+  forgiving than production hides exactly the bugs production will have. One more thing the
+  row write was hiding: it was the *only* durable record an escalation left, because
+  `handle_escalate` wrote no stage event at all — so check what a conditional write was
+  standing in for before you make it conditional. The escalation is now recorded in
+  `llmops-stage-events` on both paths, wrapped, so a failed record cannot withhold the alert.
+- **A checklist guard that carries its own copy of the checklist cannot detect drift.**
+  The console's Data-readiness panel is supposed to ask every question the orchestrator's
+  consult protocol tells the agent to answer. Its guard hand-copied seven paths and
+  asserted the console contained them — so the test agreed with the console and with
+  itself, while the prompt's `data` block specified **nine**. `datasheet.provenance` and
+  `readiness_report_uri` were missing from the panel with every test green, and the second
+  is the pointer to the Data Readiness Report — where the audit's **PII scan** lands. The
+  panel showed "PII disposition" as answered from a claim in the plan while omitting the
+  only link to the artifact that examined the data. The guard now parses the key list out
+  of `agents/orchestrator/harness.json`, and a second guard asserts that derivation is
+  still a derivation. Same rule as the documented-test-count guard: derive from the real
+  source, and if the source is a model prompt, parse the prompt.
+- **A Macie session being ENABLED is not coverage, and a job list is not coverage.** Live,
+  this account's session was `ENABLED` and `list_classification_jobs` returned a COMPLETE job
+  named `scan` — which was `ONE_TIME`, created **2021-02-23**, named 25 unrelated buckets and
+  processed **0 objects**. Nothing looked at `customer-data/`. Only the bucket list plus the
+  scoping answers the question, which is why `macie_job_covers()` in `deploy/03_storage.py` is
+  a pure function with its own tests: a job can name our bucket and still include only
+  `runs/`, and a `bucketCriteria` job is **undecidable** from its definition (reported
+  separately, never counted as coverage). `ensure_pii_scan` always REPORTS the gap and creates
+  the job only under `--enable-pii-scan`, because a `SCHEDULED` job is recurring per-GB work
+  and a deploy that starts billing silently is the same class of surprise as a silent security
+  downgrade. Two live API constraints, neither in the docs: `UpdateClassificationJob` accepts
+  only `(jobId, jobStatus)`, so a job's scope is **immutable** and a wrongly-scoped job must be
+  cancelled and replaced (the step says so rather than claiming an update); and
+  `CreateClassificationJob` takes a `clientToken`, so a repeat with a fresh token creates a
+  **second** job — idempotency has to come from finding our own job by name.
+  And the grant that makes any of it visible: `simulate_principal_policy` on
+  `llmops-harness-execution` returned **implicitDeny** for every `macie2` read, so a scan
+  would have run, billed, and been unreadable by the `audit` task that writes the Data
+  Readiness Report the console links. `MacieFindingsReadForDataAudit` is read-only in both
+  directions — no `CreateClassificationJob` (billable work is the deploy's call) and no
+  `UpdateMacieSession` (an agent must not be able to switch off the check it is judged by).
+  The audit's own scan stays heuristic regex and still says so; the prompt now also requires
+  it to write *"no Macie classification job covers this data"* when nothing does.
+- **`additionalParams` is a raw ConverseStream pass-through, and both ways into it silently
+  drop harness state.** InvokeHarness has no prompt-caching field: a `cachePoint` block in
+  the top-level `messages` is rejected outright (`must be one of: text, toolUse, toolResult,
+  reasoningContent`). But `bedrockModelConfig.additionalParams` forwards verbatim to
+  ConverseStream — an unknown key returns its full member list (`modelId, messages, system,
+  inferenceConfig, toolConfig, guardrailConfig, additionalModelRequestFields, promptVariables,
+  additionalModelResponseFieldPaths, requestMetadata, performanceConfig, serviceTier,
+  outputConfig`), so caching *is* reachable and was measured working
+  (`cacheWriteInputTokens 3568` then `cacheReadInputTokens 3568`). Both routes are traps:
+  * `additionalParams.system` **REPLACES** the harness `systemPrompt`. Asked a question only
+    the prompt could answer, the same harness said `STARTER "Data Readiness Audit"` natively
+    and `NO-PROTOCOL` with `system` set. Input tokens *fell* 10840 → 6644 and the agent still
+    answered fluently, so every signal reads as an optimization.
+  * `additionalParams.messages` **REPLACES** the message list including session history. A
+    codeword stored one turn earlier came back `NONE` — while `cacheReadInputTokens=3568`
+    made the call look like a pure win.
+  * Echoing `GetHarness`'s `systemPrompt` back is not a fix either: the runtime **injects a
+    skills manifest the control plane does not return** (a deterministic 1148 extra input
+    tokens; 12707 native vs 11559 echoed, measured 3/3). Echoed back, the agent listed **2 of
+    4** skills and lost the `.agents/skills/s3/<name>/SKILL.md` path it reads them by.
+  Measured shape of a real consult turn: `wall=59.0s ttft=26.4s rounds=2 model_ms=52030 (88%
+  of wall) in_tok=31691` — the ~11 KB system prompt is resent uncached on every round, and the
+  round-trips ARE the turn. Caching it needs a first-class field on InvokeHarness; until then
+  the lever is fewer round-trips, not a cheaper one.
+- **A mount makes a skill readable; only the prompt makes the agent read it.** The
+  orchestrator's prompt named `(llm-agent-orchestration, ml-solution-design)` as "your
+  methodology — consult them before acting" while **four** were mounted; the two later mounts
+  were never added to the sentence, and the missing `llm-data-preparation` is the skill for
+  step 0 DATA DISCOVERY, the consult protocol's own opening move. The existing guard asserted
+  the MOUNT, which was intact. Live, the agent listed all four (the runtime manifest above),
+  so it could see them and was still told in prose that two were its methodology — and prose
+  is what says "consult them". The guard now derives the expected names from each harness's
+  `skills` list in **both** directions, across every agent: a mount nobody names fails, and a
+  name nothing mounts fails.
+- **A read-modify-write "append-only" log is neither append-only nor safe, and a cap
+  applied before the split truncates both copies.** `_transcript_append` in
+  `deploy/console/lambda_function.py` had three defects in twelve lines, all of which the
+  suite was blind to because the `wired` fixture stubs the function out (the `audited`
+  fixture now puts the real one back):
+  * It read the whole `transcript.jsonl`, concatenated, and put it back — with
+    `except Exception: old = b""` on the read. Any transient failure (503, throttle) read
+    as *"no file yet"*, so the put **replaced the entire history** with just the newest
+    lines. The one artifact whose job is to survive was one error from erasure. Fixed by
+    writing **one timestamped object per append** (`tasks/<id>/transcript/<iso>-<rand>.jsonl`),
+    which removes the read entirely — nothing to fail into silence, nothing to overwrite,
+    and two concurrent writers cannot lose each other (`close_task` is permitted while a
+    turn is in flight, because `thinking` is not in `TASK_TERMINAL`, so that race is
+    reachable — DynamoDB's `list_append` kept both messages while the S3 copy dropped one).
+    Keys sort lexicographically into chronological order.
+  * Every caller applied `[:8000]` **before** the DynamoDB/S3 split, so the "full-text
+    audit copy" held a truncated copy of a truncated record. Live, one **assistant** reply
+    sat at exactly 8000 characters in both — the kind of message an acceptance is signed
+    against. The cap now lives inside `_append_messages` (`MSG_TEXT_MAX`, for the one 400 KB
+    DynamoDB item the UI renders); the audit copy keeps the message whole under a separate,
+    declared `TRANSCRIPT_TEXT_MAX`.
+  * The audit write was **unwrapped and last** inside `_append_messages`, so one S3 failure
+    propagated out and skipped everything after that call *in the caller* — for
+    `accept_task` that is `_task_event(PlanAccepted)` **and** `_enqueue_task_turn(accept=True)`:
+    a KMS-signed acceptance stranded at `accepting` with no worker, escapable only by the
+    20-minute `STALE_TURN_MIN` hatch. Same shape as the SNS publish below. Use
+    `_safe_transcript_append`.
+  Nothing reads the transcript back today — it is a write-only audit artifact, which is
+  exactly why nothing noticed. Verify a write-only artifact by reading it.
+- **Notify on independent channels, and never let the weakest one gate the rest.** The
+  driver's escalate path publishes to SNS, writes a stage event, emits `EscalatedToHuman`,
+  and settles the task token. The SNS publish was first and unwrapped, so one failed publish
+  cost all four — including the settle, which parks a live token until the stage timeout.
+  And **`llmops-escalations` had zero subscribers** at the time, so that was the channel
+  with a known-zero audience gating the ones that work (`ensure_topic` in
+  `deploy/03_storage.py` says so out loud instead of reporting the topic healthy; fixed
+  2026-08-02 with `--escalation-email` plus the recipient's own click, and the ordering fix
+  stands on its own regardless
+  — a channel that works today is still the wrong thing to gate a token settle on).
+  Wrap each notification separately and order them so the state-releasing call is last.
 - **Observability**: `OTEL_TRACES_SAMPLER=always_on` env var is mandatory or
   evaluations/insights sit at zero forever. X-Ray delivery takes no `outputFormat`.
 - **Turn budget**: harness `timeoutSeconds` is 840 here (driver Lambda caps at 900s).
@@ -92,9 +266,10 @@ versions and introspects the live CreateHarness/UpdateHarness schemas.
   files, and commit diffs. Use `<ACCOUNT_ID>` placeholders; deploy scripts substitute
   at run time. `hooks/pre-commit` and `.github/workflows/redaction-check.yml` enforce.
 - Least-privilege IAM only. No `*FullAccess` managed policies.
-- Production harnesses run VPC-mode with interface endpoints (see `deploy/02_network.py`);
-  dev configs (`agents/*/harness.json`) are PUBLIC-network for iteration speed —
-  prod variants are `agents/*/harness.prod.json`.
+- The VPC with interface endpoints is built by `deploy/02_network.py`. Harness configs
+  (`agents/*/harness.json`) are PUBLIC-network for iteration speed. VPC-mode harness
+  variants are **not built yet** and depend on the S3 skill mirror above (a VPC-mode
+  harness cannot resolve a git skill source).
 
 ## Repo conventions
 
@@ -105,7 +280,7 @@ versions and introspects the live CreateHarness/UpdateHarness schemas.
   "Always invoke before declaring success."
 - Docs are bilingual: `X.md` (EN) + `X.zh-TW.md` (繁體中文), updated in the same PR.
 - Architecture SVGs are GENERATED (`docs/gen_architecture_svg.py`) and layout-checked
-  (`tests/check_svg_geometry.py` — no wire crossings, no wire through a card).
+  (`tests/test_svg_geometry.py` — no wire crossings, no wire through a card).
   Never hand-edit the SVGs.
 - `PROJECT_STATE.md` records deployed resource names/versions (redacted); update it
   whenever you create or delete AWS resources.

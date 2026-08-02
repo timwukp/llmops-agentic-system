@@ -13,7 +13,12 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install deps
-        run: pip install -q "boto3>=1.43.51" pytest
+        # numpy is a real test dependency, not an optional one: the eval scorer runs
+        # candidate code through verify_sandbox.py, which imports numpy at module level.
+        # Without it pytest fails at COLLECTION and zero tests run — which is how PR #9
+        # went red while every test in it passed locally. torch/transformers stay out:
+        # the generation tests stub them deliberately so CI needs no GPU stack.
+        run: pip install -q "boto3>=1.43.51" pytest numpy
       - name: Compile all Python
         run: python -m py_compile $(git ls-files '*.py')
       - name: Validate harness configs (offline)
@@ -34,10 +39,25 @@ jobs:
           echo "dry-runs OK"
       - name: Unit tests
         run: python -m pytest tests/ -q --ignore=tests/golden
-
       - name: Shell test suites (AWS stubbed, no network)
+        # Two things a bare `for f in tests/*.sh; do bash "$f"; done` gets wrong:
+        # with no match the glob is passed through literally, so an empty
+        # directory runs `bash 'tests/*.sh'` and fails for a reason that has
+        # nothing to do with the tests; and without `|| exit 1` the step's status
+        # is the LAST suite's, so a failure in any earlier suite is discarded.
+        # "No suites found" is a failure too -- these tests exist, so their
+        # absence is the guard disappearing, not a reason to skip.
         run: |
-          for f in tests/*.sh; do echo "== $f"; bash "$f"; done
-      - name: SVG geometry check (if diagrams exist)
-        run: |
-          ls docs/architecture-*.svg 2>/dev/null && python tests/check_svg_geometry.py docs/architecture-*.svg || echo "no SVGs yet"
+          shopt -s nullglob
+          suites=(tests/*.sh)
+          if [ ${#suites[@]} -eq 0 ]; then echo "no shell suites found"; exit 1; fi
+          for f in "${suites[@]}"; do echo "== $f"; bash "$f" || exit 1; done
+      - name: SVG geometry check
+        # Was: `ls *.svg && python check.py || echo "no SVGs yet"`. The trailing
+        # `||` catches the CHECKER's non-zero exit as well as a missing-file
+        # exit, so the step reported success on a broken layout -- a guard CI
+        # cannot fail. The diagrams are committed, so require them: no file is
+        # itself a failure now, not a reason to skip. (The checker is also
+        # collected by the pytest step above; this keeps the readable per-diagram
+        # report in the CI log.)
+        run: python tests/test_svg_geometry.py
