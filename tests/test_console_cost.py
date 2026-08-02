@@ -16,6 +16,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import pathlib
+import re
 import sys
 import types
 
@@ -235,6 +236,32 @@ def _mk_estimate(w, body=None, user="requester"):
     return w.m.create_estimate(b, user, "2026-07-31T00:00:00+00:00")
 
 
+#: A plan whose EXPECTED total is under the single-run reference while its WORST CASE
+#: (three remediation iterations) is over it -- the only arrangement that can tell the two
+#: fields apart, and therefore the arrangement every budget test below is built on.
+#:
+#: Derived from the reference, not typed. At $2,000 the fixture was a literal 2,000,000
+#: rows priced at $1,268 expected / $3,804 worst case. Raising the reference to $20,000
+#: put BOTH of those under it, which does not fail -- it silently makes every budget test
+#: pass by never engaging the budget check at all. The fixtures' own docstrings named this
+#: exact hazard ("if a rate change ever drops this under $2000 the launch tests would pass
+#: by never engaging the budget check"); a limit change is that hazard arriving on purpose.
+#:
+#: 0.5 x the reference targets the middle of the straddle: with max_iterations=3 the worst
+#: case is ~3x the total, so expected lands at half the reference and worst case at ~1.5x
+#: it. Both sides keep real margin, so a rate change has to move by 2x -- not by a
+#: rounding error -- before the straddle silently stops holding. `_straddling_plan` asserts
+#: the relation on every use anyway, because a derivation is still a claim.
+def _straddling_plan(w):
+    """{sample_count, max_iterations} priced to straddle w's single-run reference."""
+    limit = w.m.APPROVAL_LIMIT_USD
+    card = w.m._rate_card()
+    probe = w.cm.estimate_run({"sample_count": 1_000_000, "train_rows": 1_000_000,
+                               "endpoint_hours": 0, "max_iterations": 3}, card)
+    per_sample = probe["total_usd"] / 1_000_000
+    return {"sample_count": int(0.5 * limit / per_sample), "max_iterations": 3}
+
+
 def _submit(w, eid, user="requester"):
     return w.m.request_approval({"estimate_id": eid}, user,
                                 "2026-07-31T00:01:00+00:00")
@@ -348,59 +375,66 @@ def test_over_the_single_run_limit_is_reported_and_still_launches(wired):
     run is not stopped. The `notes`/`over_budget` assertions are the load-bearing half —
     a budget that is neither enforced nor mentioned is not a reference, it is a number
     nobody will ever act on."""
-    g = wired.m.gate_decision(2500.0)
+    g = wired.m.gate_decision(wired.m.APPROVAL_LIMIT_USD + 500.0)
     assert g["approval_required"] is False
     assert any("single-run" in r for r in g["over_budget"])
     assert g["over_budget_usd"] == 500.0
     assert g["notes"]
 
-    eid = _mk_estimate(wired, {"sample_count": 2_000_000, "max_iterations": 3})[
-        "estimate_id"]
+    eid = _mk_estimate(wired, _straddling_plan(wired))["estimate_id"]
     assert wired.m.start_run({"estimate_id": eid})["ok"]
     assert len(wired.invokes) == 1, "advisory mode must not hold the launch"
 
 
 def test_over_the_single_run_limit_still_blocks_in_blocking_mode(blocking):
-    g = blocking.m.gate_decision(2500.0)
+    g = blocking.m.gate_decision(blocking.m.APPROVAL_LIMIT_USD + 500.0)
     assert g["approval_required"] is True
     assert any("single-run" in r for r in g["reasons"])
 
 
 def test_the_cumulative_arm_still_fires_on_its_own(wired):
-    """The case a single-limit-only check misses: four $500 runs are the same $2000
-    exposure as one $2000 run, and each passes on its own. This is also the arm advisory
-    mode could most easily have dropped, since no individual run ever looks expensive."""
+    """The case a single-limit-only check misses: four runs at a quarter of the reference
+    are the same exposure as one run at the whole of it, and each passes on its own. This
+    is also the arm advisory mode could most easily have dropped, since no individual run
+    ever looks expensive.
+
+    A quarter of the reference EACH, derived: as four literal $500 rows this seeded
+    $2,000 of to-date spend, which was the entire reference and is now a tenth of it."""
+    quarter = wired.m.CUMULATIVE_LIMIT_USD / 4
     for i in range(4):
         wired.act.put_item(Item={"project": wired.m.PROJECT,
                                  "sk": f"2026-07-2{i}#run-{i}#sagemaker_training",
-                                 "cost_usd": "500", "settlement": "settled"})
+                                 "cost_usd": str(quarter), "settlement": "settled"})
     g = wired.m.gate_decision(500.0)
     assert any("cumulative" in r or "to-date" in r for r in g["over_budget"])
-    assert g["project_to_date_usd"] == 2000.0
+    assert g["project_to_date_usd"] == wired.m.CUMULATIVE_LIMIT_USD
     assert g["notes"]
 
 
 def test_the_cumulative_arm_blocks_in_blocking_mode(blocking):
+    quarter = blocking.m.CUMULATIVE_LIMIT_USD / 4
     for i in range(4):
         blocking.act.put_item(Item={"project": blocking.m.PROJECT,
                                     "sk": f"2026-07-2{i}#run-{i}#sagemaker_training",
-                                    "cost_usd": "500", "settlement": "settled"})
+                                    "cost_usd": str(quarter), "settlement": "settled"})
     g = blocking.m.gate_decision(500.0)
     assert g["approval_required"] is True
     assert any("cumulative" in r or "to-date" in r for r in g["reasons"])
 
 
 def test_the_budget_check_reads_worst_case_not_expected(wired):
-    """Reporting $1,268 for a plan that can cost $3,804 because the remediation loop ran
-    three times misstates the exposure whether or not anything blocks on it.
+    """Reporting half the reference for a plan that can cost one and a half times it,
+    because the remediation loop ran three times, misstates the exposure whether or not
+    anything blocks on it.
 
-    2M rows against the measured $1.515/h · 0.664 rows/s prices at $1,268 expected and
-    $3,804 worst case — deliberately straddling the limit, which is the only arrangement
-    that can tell the two fields apart. Read from total_usd this run reads as clean.
+    `_straddling_plan` prices at ~0.5x the reference expected and ~1.5x worst case against
+    the measured $1.515/h · 0.664 rows/s — deliberately straddling, which is the only
+    arrangement that can tell the two fields apart. Read from total_usd this run is clean.
     """
-    r = _mk_estimate(wired, {"sample_count": 2_000_000, "max_iterations": 3})
+    limit = wired.m.APPROVAL_LIMIT_USD
+    r = _mk_estimate(wired, _straddling_plan(wired))
     est = r["estimate"]
-    assert est["total_usd"] < 2000 < est["worst_case_usd"], est
+    assert est["total_usd"] < limit < est["worst_case_usd"], est
     assert r["gate"]["gating_basis"] == "worst_case_usd"
     assert r["gate"]["over_budget"], "the worst case is over the limit and must be said"
 
@@ -528,12 +562,15 @@ def test_unknown_estimate_id_is_404_on_both_paths(wired):
 def _over_limit(w):
     """An estimate whose worst case exceeds the single-run limit.
 
-    The assert is not decoration: if a rate change ever drops this under $2000 the launch
+    The assert is not decoration: if the plan ever prices under the reference, the launch
     tests would pass by never engaging the budget check at all — green, and testing
-    nothing. It asserts on `over_budget` rather than `approval_required` so it holds in
-    both modes; `approval_required` is false in advisory mode by design.
+    nothing. That is not hypothetical; it is what raising the reference to $20,000 did to
+    the literal 2,000,000 rows this used to pass, which is why the plan is now derived by
+    `_straddling_plan` and this assert is what proves the derivation still holds. It
+    asserts on `over_budget` rather than `approval_required` so it holds in both modes;
+    `approval_required` is false in advisory mode by design.
     """
-    r = _mk_estimate(w, {"sample_count": 2_000_000, "max_iterations": 3})
+    r = _mk_estimate(w, _straddling_plan(w))
     assert r["gate"]["over_budget"], "fixture must actually be over the limit"
     return r["estimate_id"]
 
@@ -659,20 +696,34 @@ def test_an_unknown_estimate_id_does_not_launch(wired):
 
 
 def _priced_clean_under_a_high_limit(w, monkeypatch):
-    """Price 2M rows under a $5000 limit, so the STORED verdict is clean.
+    """Price the straddling plan under a DOUBLED limit, so the STORED verdict is clean,
+    then restore the real reference so launch has to re-derive.
 
     Distinguishes WHICH field the launch-time re-derivation reads: only the worst case
-    ($3,804) crosses a $2000 limit — the expected total ($1,268) does not. Nothing else
+    (~1.5x the reference) crosses it — the expected total (~0.5x) does not. Nothing else
     in the suite can tell those two apart, because every other over-limit fixture is
     also over on its stored gate.
+
+    "High" is 2x the reference rather than a literal $5,000, and the restore puts back
+    whatever the module actually says rather than a literal $2,000. A literal on either
+    side is a second copy of the limit: the old $5,000 stopped being high the moment the
+    reference passed it, and the old restore-to-$2,000 would have quietly held this one
+    test at the old reference while every other test moved to the new one.
     """
-    monkeypatch.setattr(w.m, "APPROVAL_LIMIT_USD", 5000.0)
-    monkeypatch.setattr(w.m, "CUMULATIVE_LIMIT_USD", 5000.0)
-    r = _mk_estimate(w, {"sample_count": 2_000_000, "max_iterations": 3})
+    real = w.m.APPROVAL_LIMIT_USD
+    real_cum = w.m.CUMULATIVE_LIMIT_USD
+    # Derived BEFORE the limit is raised, on purpose: `_straddling_plan` reads whatever
+    # limit is in force when it is called, so deriving it after the monkeypatch would
+    # straddle the DOUBLED limit and the stored verdict would not be clean either. The
+    # plan has to straddle the real reference and clear the doubled one.
+    plan = _straddling_plan(w)
+    monkeypatch.setattr(w.m, "APPROVAL_LIMIT_USD", real * 2)
+    monkeypatch.setattr(w.m, "CUMULATIVE_LIMIT_USD", real_cum * 2)
+    r = _mk_estimate(w, plan)
     assert r["gate"]["over_budget"] == [], "the stored verdict must start clean"
-    assert r["estimate"]["total_usd"] < 2000 < r["estimate"]["worst_case_usd"]
-    monkeypatch.setattr(w.m, "APPROVAL_LIMIT_USD", 2000.0)
-    monkeypatch.setattr(w.m, "CUMULATIVE_LIMIT_USD", 2000.0)
+    monkeypatch.setattr(w.m, "APPROVAL_LIMIT_USD", real)
+    monkeypatch.setattr(w.m, "CUMULATIVE_LIMIT_USD", real_cum)
+    assert r["estimate"]["total_usd"] < real < r["estimate"]["worst_case_usd"]
     return r["estimate_id"]
 
 
@@ -685,7 +736,7 @@ def test_lowering_the_limit_re_derives_an_already_clean_estimate(wired, monkeypa
     out = wired.m.start_run({"estimate_id": eid})
     assert out["ok"] and len(wired.invokes) == 1
     assert out["result"]["gate"]["over_budget"], out
-    assert out["result"]["gate"]["gating_usd"] > 2000
+    assert out["result"]["gate"]["gating_usd"] > wired.m.APPROVAL_LIMIT_USD
 
 
 def test_lowering_the_limit_re_gates_an_already_clean_estimate(blocking, monkeypatch):
@@ -720,13 +771,18 @@ def test_an_under_limit_rejected_estimate_cannot_launch(wired):
 
 
 def _stale_cumulative(w):
-    """An estimate priced when the project had spent nothing, launched after it has
-    spent $1,999 — the same run, a different exposure."""
+    """An estimate priced when the project had spent nothing, launched after it has spent
+    a dollar short of the cumulative reference — the same run, a different exposure.
+
+    A dollar short, derived: as a literal $1,999 this sat just under a $2,000 reference,
+    and against $20,000 it stopped crossing anything at all, so the launch succeeded and
+    the blocking half of this pair asserted `status_code` on a 200."""
     eid = _mk_estimate(w, {"sample_count": 2000})["estimate_id"]
     assert json.loads(w.est.items[eid]["gate"])["over_budget"] == []
     w.act.put_item(Item={"project": w.m.PROJECT,
                          "sk": "2026-07-30#run-old#sagemaker_training",
-                         "cost_usd": "1999", "settlement": "settled"})
+                         "cost_usd": str(w.m.CUMULATIVE_LIMIT_USD - 1),
+                         "settlement": "settled"})
     return eid
 
 
@@ -909,6 +965,55 @@ def test_cost_routes_are_registered_and_public_reads_stay_public(console):
     for p in ("/api/cost-estimate", "/api/cost-approval-request", "/api/cost-approval",
               "/api/finops-run"):
         assert p in post_block, f"{p} must be inside the authenticated POST block"
+
+
+def test_the_consoles_fallback_limits_equal_the_canonical_ones():
+    """The two literals in `lambda_function.py` must equal cost_model's DEFAULT_*_LIMIT_USD.
+
+    They cannot be imported there: `cost_model` is loaded lazily by `_cost_model()` (the
+    zip may be built without it) and that needs `_HERE`, defined further down the file. So
+    the console keeps its own copy of the number, and this test is the thing that compares
+    them. Two copies of a number with nothing comparing them is exactly how one falsified
+    figure survived in four files at once; a copy is only safe when a disagreement fails
+    loudly.
+
+    Asserted against the SOURCE literal, not `console.APPROVAL_LIMIT_USD`: the module
+    attribute is `os.environ.get(..., "20000")`, so an env var set in the runner's shell
+    would make this pass while the fallback baked into the deployment package disagreed.
+    The fallback is precisely the value that applies when nothing is set.
+    """
+    import cost_model
+    src = (REPO / "deploy/console/lambda_function.py").read_text()
+    found = dict(re.findall(
+        r'^(APPROVAL_LIMIT_USD|CUMULATIVE_LIMIT_USD) = '
+        r'float\(os\.environ\.get\("\1", "([0-9.]+)"\)\)', src, re.M))
+    assert set(found) == {"APPROVAL_LIMIT_USD", "CUMULATIVE_LIMIT_USD"}, found
+    assert float(found["APPROVAL_LIMIT_USD"]) == cost_model.DEFAULT_SINGLE_RUN_LIMIT_USD
+    assert float(found["CUMULATIVE_LIMIT_USD"]) == \
+        cost_model.DEFAULT_PROJECT_CUMULATIVE_LIMIT_USD
+
+
+def test_the_deploy_script_sets_both_limits_and_reads_them_from_cost_model():
+    """A deploy that sets neither limit agrees with the code default by luck.
+
+    That was the state until 2026-08-02: `deploy.sh` set `BUDGET_MODE` but neither limit,
+    so the live function reported `APPROVAL_LIMIT_USD: null` and fell back to the console
+    literal -- which happened to agree, so nothing was wrong and nothing could have told
+    us when it stopped agreeing. Retyping the numbers here would be the same hazard with
+    an extra copy, so the script DERIVES both from the bundled `cost_model.py`; this test
+    pins that it derives rather than types.
+    """
+    sh = (REPO / "deploy/console/deploy.sh").read_text()
+    assert "DEFAULT_SINGLE_RUN_LIMIT_USD" in sh and \
+        "DEFAULT_PROJECT_CUMULATIVE_LIMIT_USD" in sh, \
+        "deploy.sh must read the limits out of cost_model, not retype them"
+    env_line = [l for l in sh.splitlines() if l.startswith("ENV_VARS=")]
+    assert len(env_line) == 1, env_line
+    assert "APPROVAL_LIMIT_USD=$APPROVAL_LIMIT_USD" in env_line[0]
+    assert "CUMULATIVE_LIMIT_USD=$CUMULATIVE_LIMIT_USD" in env_line[0]
+    # No bare four-or-five-digit dollar amount assigned to either var: that would be a
+    # third copy of the reference, and the one that decides what the LIVE function uses.
+    assert not re.search(r'^(APPROVAL|CUMULATIVE)_LIMIT_USD="?[0-9]{4}', sh, re.M), sh
 
 
 def test_the_finops_runtime_is_in_the_watched_fleet(console):

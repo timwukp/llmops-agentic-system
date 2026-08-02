@@ -113,18 +113,42 @@ a healthy card, and a check that counts rows would call it healthy.
 
 ---
 
-## 3. The $2000 gate
+## 3. The $20,000 reference
 
 Approval fires when **either** limit is crossed:
 
 | Limit | Default | Rationale |
 |---|---|---|
-| Single-run | `APPROVAL_LIMIT_USD` = **$2000** | One expensive run |
-| Cumulative | `CUMULATIVE_LIMIT_USD` = **$2000** | Project-to-date actual **+** this estimate |
+| Single-run | `APPROVAL_LIMIT_USD` = **$20,000** | One expensive run |
+| Cumulative | `CUMULATIVE_LIMIT_USD` = **$20,000** | Project-to-date actual **+** this estimate |
 
-Twenty $150 runs are the same exposure as one $3000 run, and each of the twenty passes a
+Twenty $1,500 runs are the same exposure as one $30,000 run, and each of the twenty passes a
 single-run check on its own. A gate with only the first limit is a gate against one shape of
 overspend and blind to the other.
+
+### Why $20,000, and why a number at all
+
+Raised from $2,000 on 2026-08-02 by the platform owner's instruction. This is the project's own
+design-and-test platform, not a customer's production account: the whole test-proven record —
+six agents, a trained model, a deployed and torn-down endpoint, five e2e iterations — cost
+**~$12–15**. A reference low enough to be crossed by ordinary work is a reference that gets
+ignored, and an ignored reference is worse than a high one because it trains people to click
+past it.
+
+Keeping a number is the less obvious half. With `BUDGET_MODE=advisory` (§8) the reference does
+not stop anything, so its only remaining job is to be the line that makes an over-estimate run
+get **named** in `start_run`'s `budget_notice`. Delete the number and that line goes with it:
+nothing would be left that could say "this run cost far more than it was estimated at", which is
+the failure this whole module exists to catch. A high reference still reports. No reference
+reports nothing.
+
+The number lives in exactly one place that decides — `cost_model.DEFAULT_SINGLE_RUN_LIMIT_USD`.
+`deploy.sh` reads it out of the bundled module to set `APPROVAL_LIMIT_USD`, and the console's
+own fallback literal is pinned equal to it by
+`test_console_cost.py::test_the_consoles_fallback_limits_equal_the_canonical_ones`. Until
+2026-08-02 the deploy set neither env var, so the live function reported `APPROVAL_LIMIT_USD:
+null` and fell back to the code default — which happened to agree, so nothing was wrong and
+nothing could have told us when it stopped agreeing.
 
 ### It gates on `worst_case_usd`, never `total_usd`
 
@@ -132,14 +156,21 @@ The remediation loop can re-run finetune up to `max_iterations` (default 3). So 
 has two numbers:
 
 ```
-sample_count 2,000,000, max_iterations 3:
-    total_usd       $1,268.32     (expected — one pass)
-    worst_case_usd  $3,803.95     (all three remediation iterations run)
+sample_count 15,759,216, max_iterations 3:
+    total_usd        $9,988.46     (expected — one pass)
+    worst_case_usd  $29,964.38     (all three remediation iterations run)
 ```
 
-Gating on `total_usd` would wave this through at $1,268 and permit $3,804 of spend. Approving
-$2000 that can silently become $6000 is not a gate. The estimate reports both; the gate reads
-the worst case, and `gating_basis` in the response says which field decided.
+Gating on `total_usd` would wave this through at $9,988 and permit $29,964 of spend. Reporting
+$20,000 for something that can silently become $60,000 is not a gate. The estimate reports both;
+the gate reads the worst case, and `gating_basis` in the response says which field decided.
+
+That row count is not a round number because it is not typed: the test fixture derives it from
+the reference (`0.5 × limit ÷ per-row cost`) so the expected total lands at half the reference
+and the worst case at ~1.5× it. It used to be a literal 2,000,000 rows at $1,268 / $3,804, which
+straddled $2,000 and then straddled nothing at all when the reference moved — the fixtures went
+green while never engaging the budget check. `_straddling_plan` now asserts the straddle on every
+use, because a derivation is still a claim.
 
 ### The gate is re-derived at launch, not trusted from storage
 
@@ -367,11 +398,11 @@ guardrail meaningful and what makes it blind:
 
 | File | Tests | Covers |
 |---|---|---|
-| `tests/test_cost_model.py` | 52 | estimate arithmetic, rate precedence, attribution, reconcile |
-| `tests/test_finops.py` | 36 | harness config, reconcile Lambda, storage, IAM shape |
-| `tests/test_console_cost.py` | 59 | HTTP layer, the dual gate, separation of duties, launch guards |
+| `tests/test_cost_model.py` | 64 | estimate arithmetic, rate precedence, attribution, reconcile |
+| `tests/test_finops.py` | 53 | harness config, reconcile Lambda, storage, IAM shape |
+| `tests/test_console_cost.py` | 71 | HTTP layer, the dual gate, separation of duties, launch guards |
 
-All 147 run without AWS credentials, against injected clients and account `123456789012`.
+All 188 run without AWS credentials, against injected clients and account `123456789012`.
 
 The suite was **mutation-checked**: each guard was broken in turn and the run re-executed to
 confirm a test fails. That found two guards a green suite did not cover — a launch-time gate

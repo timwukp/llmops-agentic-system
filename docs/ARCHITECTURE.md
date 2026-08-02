@@ -625,7 +625,7 @@ authority to terminate anything. Two reasons, and the second is the load-bearing
   component whose job is to *observe* puts spend-control authority in the wrong place — and an
   auditor that can act on its own findings has no independent check on those findings.
 
-The $2000 approval gate lives in the console and `cost_model.py`, not in the auditor, for the
+The $20,000 approval reference lives in the console and `cost_model.py`, not in the auditor, for the
 same reason: the thing that measures spend is not the thing that authorises it.
 See [COST.md](COST.md).
 
