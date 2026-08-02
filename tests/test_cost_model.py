@@ -534,6 +534,37 @@ def test_the_whisper_orphans_daily_figure_matches_its_instance_and_hourly_rate()
                 f"orphan billed ${daily:.2f}/day")
 
 
+def test_no_harness_prompt_states_the_falsified_orphan_rate():
+    """The agents' own prompts are a doc surface, and this guard did not cover them.
+
+    The sweep that corrected the $18/day figure edited `cost_model.py`, `docs/COST.md` and
+    `CHANGELOG.md`, and the guard above was anchored to exactly those three -- so
+    `agents/finops/harness.json` kept telling the auditor, in the very rule about not
+    publishing assumed numbers as measured ones, that the orphan cost ~$18/day. A
+    falsified figure inside a system prompt is worse than one in a doc: nobody reads the
+    doc mid-audit, and the agent reads the prompt on every single invocation.
+
+    So this scans EVERY harness config rather than naming the one that was wrong. Naming
+    the file is how the first guard came to have a hole -- the eighth agent's prompt would
+    inherit the same blind spot.
+    """
+    root = pathlib.Path(__file__).resolve().parent.parent
+    checked = sorted((root / "agents").glob("*/harness.json"))
+    assert len(checked) >= 7, f"expected the whole fleet, found {len(checked)}"
+    for cfg in checked:
+        text = cfg.read_text()
+        assert "$18/day" not in text, (
+            f"{cfg.relative_to(root)} states the falsified $18/day orphan rate; the "
+            "measured figure is $36.36/day (ml.g5.2xlarge x1 at $1.515/hr x 24)")
+    # The correction has to be PRESENT somewhere in the fleet, not merely absent: deleting
+    # the sentence would also pass an absence-only check, and the excluded-spend example is
+    # what makes the attribute-by-resource rule concrete for the agent that applies it.
+    finops = (root / "agents" / "finops" / "harness.json").read_text()
+    assert "$36.36/day" in finops, (
+        "the finops prompt no longer states the orphan's measured daily rate at all; the "
+        "attribution rule lost the example that makes it concrete")
+
+
 def test_the_orphans_monthly_figure_is_derived_and_the_budget_filter_is_stated_both_ways():
     """The account budget's CostFilters decide whether it can see this orphan at all.
 
