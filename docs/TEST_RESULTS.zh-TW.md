@@ -21,7 +21,7 @@
 
 | 檢查 | 結果 | 復現方式 |
 |---|---|---|
-| 單元測試（契約、成本模型、driver 迴圈、Lambda、狀態機文檔） | **751/751 通過** | `.venv/bin/python -m pytest tests/ -q --ignore=tests/golden` |
+| 單元測試（契約、成本模型、driver 迴圈、Lambda、狀態機文檔） | **756/756 通過** | `.venv/bin/python -m pytest tests/ -q --ignore=tests/golden` |
 | Harness 配置驗證（5 個專家 + 指揮家 + 審計員） | **7/7 `RESULT: OK`** | `python deploy/validate_config.py --config agents/<a>/harness.json` |
 | 架構 SVG 幾何檢查（虛線零交叉、零穿框） | **CLEAN** | `python tests/check_svg_geometry.py docs/architecture-*.svg` |
 | 遮蔽掃描（帳號 ID、憑證、帶帳號的 ARN） | CLEAN | `.github/workflows/redaction-check.yml` |
@@ -89,7 +89,7 @@ endpoint、五輪 e2e 迭代 —— 花費大約等於一位人類 LLMOps 工程
 
 | 檢查 | 結果 | 重現方式 |
 |---|---|---|
-| 單元測試(全部套件,含 `test_cost_model.py` + `test_finops.py`) | **751 passed** | `.venv/bin/python -m pytest tests/ -q` |
+| 單元測試(全部套件,含 `test_cost_model.py` + `test_finops.py`) | **756 passed** | `.venv/bin/python -m pytest tests/ -q` |
 | Harness 配置驗證,7 個 agent | **`RESULT: OK`** | `python deploy/validate_config.py --config agents/finops/harness.json` |
 | 線上艦隊 | **7 個 harness READY** | 用 repo 內建 boto3 呼叫 `list_harnesses` |
 | 正典模組有散佈路徑 | 印出 `would upload 4 contract files` | `python deploy/03_storage.py --region us-east-1 --account-id 123456789012 --dry-run` |

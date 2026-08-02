@@ -187,6 +187,16 @@ prompt 明文禁止它刪東西的 agent。
   四個、prompt 只名了兩個；而沒被名到的 `llm-data-preparation` 正是它自己 consult 協議第 0 步的
   方法論。原有的守衛通過了，因為 mount 本身是真的。真正說出「consult them before acting」的是
   prompt，所以守衛現在改成從每個 harness 的 `skills` 清單雙向推導。
+- **用 read-modify-write 實作的「append-only」log，離被清空只差一次暫時性錯誤。** Tasks tab
+  的 S3 稽核副本原本會把整個 `transcript.jsonl` 讀回來、接上、再寫回去，而讀取失敗被當成
+  「檔案還不存在」吞掉 —— 於是一次 503 就把整段歷史換成最新那幾行；而兩個寫入者（`close_task`
+  在回合進行中是允許的）會靜靜吃掉對方的訊息。現在改成**每次 append 寫一個帶時間戳的新物件**：
+  沒有讀取、沒有東西可被覆寫，key 的字典序就是時間序。同樣這十二行裡還有兩個相關的錯：8000 字元
+  的上限被套用在 DynamoDB/S3 **分流之前**，所以「全文」副本其實是一份被截斷紀錄的截斷副本
+  （實測有一則 **assistant** 回覆 —— 正是簽署承諾時所針對的那種訊息 —— 在兩邊都剛好停在 8000）；
+  而稽核寫入沒有被包起來，一次 S3 失敗就會跳過它後面的 `PlanAccepted` 事件與 worker 派發，
+  讓一份 KMS 已簽的承諾卡在 `accepting`。**沒有任何東西會把這個產物讀回來，這正是它壞了卻沒人
+  發現的原因 —— 只寫不讀的產物，要靠讀它來驗證。**
 - **deploy 之後必然執行 `Teardown`** —— 即使 `SmokeTest` 失敗，其 `Catch` 也先路由到
   `Teardown`。孤兒 endpoint 是第一大成本風險（Phase 4 就在帳號裡發現一個無關的
   endpoint 自 2024-04 起一直 InService）。

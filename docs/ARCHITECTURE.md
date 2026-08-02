@@ -217,6 +217,19 @@ Two spine details that are policy, not plumbing:
   guard passed because the mount was real. The prompt is what carries "consult them before
   acting", so the guard now derives the names from each harness's `skills` list in both
   directions.
+- **An "append-only" log implemented as read-modify-write is one transient error from
+  erasure.** The Tasks tab's S3 audit copy re-read `transcript.jsonl`, concatenated, and
+  put it back, with the read's failure swallowed as *"no file yet"* — so a single 503
+  replaced the whole history with the newest lines, and two writers (`close_task` is
+  allowed mid-turn) silently lost one another's messages. It now writes **one timestamped
+  object per append**: no read, nothing to overwrite, keys sorting into chronological
+  order. Two related fixes in the same twelve lines: the 8000-character cap was applied
+  *before* the DynamoDB/S3 split, so the "full-text" copy was a truncated copy of a
+  truncated record (live, an **assistant** reply — the kind an acceptance is signed
+  against — sat at exactly 8000 in both); and the audit write was unwrapped, so one S3
+  failure skipped the `PlanAccepted` event and the worker enqueue that followed it,
+  stranding a KMS-signed acceptance at `accepting`. Nothing reads this artifact back,
+  which is exactly why nothing noticed — verify a write-only artifact by reading it.
 - **`Teardown` always runs after deploy** — even when `SmokeTest` fails, its `Catch`
   routes to `Teardown` first. Orphaned endpoints are the #1 cost risk (Phase 4 found an
   unrelated endpoint in the account that had been InService since 2024-04).

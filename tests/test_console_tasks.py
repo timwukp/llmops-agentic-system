@@ -260,13 +260,18 @@ def wired(console, monkeypatch):
     monkeypatch.setattr(console, "kms", fake_kms)
     monkeypatch.setattr(console, "SELF_FUNCTION", "llmops-admin")
     monkeypatch.setattr(console, "data_bucket", lambda: "test-bucket")
+    # Captured BEFORE the stub replaces it, so the `audited` fixture can put the real
+    # append back. Reaching for console._transcript_append afterwards would only get
+    # the stub, which is the trap this hands around.
+    real_transcript_append = console._transcript_append
     monkeypatch.setattr(console, "_transcript_append", lambda *a, **k: None)
 
     import cost_model
     monkeypatch.setattr(console, "_cost_model", lambda: cost_model)
     monkeypatch.setattr(console, "project_to_date_usd", lambda *a, **k: (0.0, "none"))
     return types.SimpleNamespace(console=console, tasks=tasks, events=events,
-                                 est=est, s3=fake_s3, lam=fake_lam, kms=fake_kms)
+                                 est=est, s3=fake_s3, lam=fake_lam, kms=fake_kms,
+                                 real_transcript_append=real_transcript_append)
 
 
 @pytest.fixture
@@ -276,6 +281,29 @@ def blocking(wired, monkeypatch):
     its only approver — but the queue path is shipped code one env var away."""
     monkeypatch.setattr(wired.console, "BUDGET_MODE", "blocking")
     return wired
+
+
+@pytest.fixture
+def audited(wired, monkeypatch):
+    """`wired` stubs _transcript_append out, which is right for every test that is not
+    ABOUT the audit copy -- and is exactly why three defects lived in those 12 lines with
+    the suite green. This fixture puts the real function back."""
+    monkeypatch.setattr(wired.console, "_transcript_append", wired.real_transcript_append)
+    return wired
+
+
+def _transcript_lines(w, tid):
+    """Every audit entry for a task, in key order. Keys are timestamp-prefixed, so key
+    order IS chronological order -- the property that lets one-object-per-append replace
+    a read-modify-write of a single file."""
+    out = []
+    for k in sorted(w.s3.objects):
+        if f"tasks/{tid}/transcript/" not in k:
+            continue
+        body = w.s3.objects[k]
+        body = body if isinstance(body, bytes) else str(body).encode()
+        out += [json.loads(ln) for ln in body.decode().splitlines() if ln.strip()]
+    return out
 
 
 def _mk_task(w, status="plan_proposed", cost="50", plan_body=b'{"goal":"x"}'):
@@ -1367,6 +1395,117 @@ def test_task_events_feed_the_lifecycle_timeline(wired):
     wired.console.create_task({"goal": "g"}, DS_USER)
     names = [p.get("event_name") for p in wired.events.puts]
     assert "TaskCreated" in names
+
+
+# ── the S3 audit copy: whole text, one object per append, never gating ─────────
+
+def test_the_audit_copy_keeps_the_full_text_the_ddb_record_has_to_cap(audited):
+    """The whole conversation is ONE DynamoDB item under a 400 KB ceiling, so the record
+    the UI renders caps each message. The S3 copy exists precisely to be the uncapped one.
+
+    Live evidence this was broken: one assistant reply sat at exactly 8000 characters in
+    BOTH copies, because every caller applied `[:8000]` *before* the split -- so the
+    "full-text audit copy" in the docstring was a truncated copy of a truncated record,
+    and the message it lost was an assistant reply, the kind an acceptance is signed
+    against."""
+    console = audited.console
+    tid = _mk_task(audited, status="thinking")
+    long_text = "y" * (console.MSG_TEXT_MAX + 5000)
+    audited.console.post_task_message(tid, {"text": long_text}, DS_USER)
+
+    ddb = audited.tasks.items[tid]["messages"][-1]["text"]
+    assert len(ddb) == console.MSG_TEXT_MAX, "the DynamoDB copy must still be capped"
+
+    entries = _transcript_lines(audited, tid)
+    assert entries, "nothing was written to the audit copy at all"
+    assert entries[-1]["text"] == long_text, (
+        f"the audit copy is truncated to {len(entries[-1]['text'])} chars; it is the "
+        f"only place the full message survives")
+
+
+def test_the_audit_copy_is_bounded_too(audited):
+    """Uncapped in DynamoDB terms is not uncapped: one request must not be able to write
+    an unbounded S3 object. TRANSCRIPT_TEXT_MAX is two orders of magnitude above the
+    DynamoDB cap, so a real reply is never cut -- the ceiling exists, and is declared."""
+    console = audited.console
+    tid = _mk_task(audited, status="thinking")
+    console.post_task_message(tid, {"text": "z" * (console.TRANSCRIPT_TEXT_MAX + 10)},
+                              DS_USER)
+    entries = _transcript_lines(audited, tid)
+    assert len(entries[-1]["text"]) == console.TRANSCRIPT_TEXT_MAX
+
+
+def test_a_failed_read_can_never_erase_the_audit_log(audited, monkeypatch):
+    """The old append was a read-modify-write: get the whole file, concatenate, put it
+    back -- with `except Exception: old = b""` on the read. So ANY read failure (a 503, a
+    throttle, a slow-consistency miss) was treated as "no file yet" and the put REPLACED
+    the entire history with just the newest lines. The audit log whose one job is to
+    survive was one transient error away from erasure.
+
+    One object per append removes the read entirely: there is nothing to fail into
+    silence, and nothing to overwrite. Asserted by making every read raise -- history
+    must still be there afterwards."""
+    console = audited.console
+    tid = _mk_task(audited, status="thinking")
+    console.post_task_message(tid, {"text": "first, keep me"}, DS_USER)
+    before = _transcript_lines(audited, tid)
+    assert any("first, keep me" in str(e.get("text")) for e in before)
+
+    def boom(**kw):
+        raise RuntimeError("ServiceUnavailable")
+    monkeypatch.setattr(audited.s3, "get_object", boom)
+
+    # Back to a stale in-flight turn, so the second message clears the thinking lock
+    # (STALE_TURN_MIN) rather than being refused with a 409.
+    audited.tasks.items[tid].update({"status": "thinking",
+                                     "updated_at": "2020-01-01T00:00:00+00:00"})
+    r = console.post_task_message(tid, {"text": "second, also keep me"}, DS_USER)
+    assert r.get("ok"), f"precondition: the second message was refused: {r}"
+    after = [str(e.get("text")) for e in _transcript_lines(audited, tid)]
+    assert any("first, keep me" in t for t in after), (
+        "the earlier message is gone: an append re-read and rewrote the whole log")
+    assert any("second, also keep me" in t for t in after)
+
+
+def test_two_writers_do_not_cost_the_audit_copy_a_message(audited):
+    """Two writers for one task are reachable: close_task is permitted while a turn is in
+    flight, because 'thinking' is not in TASK_TERMINAL. Under read-modify-write the loser
+    of that race silently drops its messages from the audit copy while DynamoDB's
+    list_append keeps both -- an audit copy missing a message the audited record HAS.
+
+    One object per append cannot lose a writer: distinct keys, no shared object."""
+    console = audited.console
+    tid = _mk_task(audited, status="thinking")
+    console.post_task_message(tid, {"text": "the customer's message"}, DS_USER)
+    audited.tasks.items[tid]["status"] = "thinking"
+    console.close_task(tid, {"reason": "closed mid-turn"}, DS_USER)
+
+    audit = [str(e.get("text")) for e in _transcript_lines(audited, tid)]
+    ddb = [str(m.get("text")) for m in audited.tasks.items[tid]["messages"]]
+    for t in ("the customer's message", "closed mid-turn"):
+        assert any(t in x for x in ddb), f"precondition: {t!r} should be in the record"
+        assert any(t in x for x in audit), (
+            f"{t!r} is in the DynamoDB record but not in the audit copy")
+
+
+def test_a_failed_audit_write_does_not_strand_a_signed_acceptance(wired, monkeypatch):
+    """The audit copy is a SECOND channel and must never gate the first.
+
+    It was called unwrapped at the end of _append_messages, so one S3 failure propagated
+    out and skipped everything AFTER that call in the caller. In accept_task that is
+    _task_event(PlanAccepted) and _enqueue_task_turn(accept=True): a KMS-signed
+    acceptance would sit at 'accepting' with no worker ever launched, and the only escape
+    is the 20-minute STALE_TURN_MIN hatch. Same shape as the SNS publish that gated the
+    other three escalation channels."""
+    console = wired.console
+    monkeypatch.setattr(console, "_transcript_append",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("S3 down")))
+    tid = _mk_task(wired)
+    r = console.accept_task(tid, DS_USER)
+    assert r.get("ok"), f"the acceptance itself failed on an audit write: {r}"
+    assert any(k.get("InvocationType") == "Event" for k in wired.lam.invokes), (
+        "no accept turn was enqueued: the signed acceptance is stranded at 'accepting'")
+    assert "PlanAccepted" in [p.get("event_name") for p in wired.events.puts]
 
 
 # ── canonicalization properties ───────────────────────────────────────────────

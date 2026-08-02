@@ -209,6 +209,35 @@ versions and introspects the live CreateHarness/UpdateHarness schemas.
   is what says "consult them". The guard now derives the expected names from each harness's
   `skills` list in **both** directions, across every agent: a mount nobody names fails, and a
   name nothing mounts fails.
+- **A read-modify-write "append-only" log is neither append-only nor safe, and a cap
+  applied before the split truncates both copies.** `_transcript_append` in
+  `deploy/console/lambda_function.py` had three defects in twelve lines, all of which the
+  suite was blind to because the `wired` fixture stubs the function out (the `audited`
+  fixture now puts the real one back):
+  * It read the whole `transcript.jsonl`, concatenated, and put it back — with
+    `except Exception: old = b""` on the read. Any transient failure (503, throttle) read
+    as *"no file yet"*, so the put **replaced the entire history** with just the newest
+    lines. The one artifact whose job is to survive was one error from erasure. Fixed by
+    writing **one timestamped object per append** (`tasks/<id>/transcript/<iso>-<rand>.jsonl`),
+    which removes the read entirely — nothing to fail into silence, nothing to overwrite,
+    and two concurrent writers cannot lose each other (`close_task` is permitted while a
+    turn is in flight, because `thinking` is not in `TASK_TERMINAL`, so that race is
+    reachable — DynamoDB's `list_append` kept both messages while the S3 copy dropped one).
+    Keys sort lexicographically into chronological order.
+  * Every caller applied `[:8000]` **before** the DynamoDB/S3 split, so the "full-text
+    audit copy" held a truncated copy of a truncated record. Live, one **assistant** reply
+    sat at exactly 8000 characters in both — the kind of message an acceptance is signed
+    against. The cap now lives inside `_append_messages` (`MSG_TEXT_MAX`, for the one 400 KB
+    DynamoDB item the UI renders); the audit copy keeps the message whole under a separate,
+    declared `TRANSCRIPT_TEXT_MAX`.
+  * The audit write was **unwrapped and last** inside `_append_messages`, so one S3 failure
+    propagated out and skipped everything after that call *in the caller* — for
+    `accept_task` that is `_task_event(PlanAccepted)` **and** `_enqueue_task_turn(accept=True)`:
+    a KMS-signed acceptance stranded at `accepting` with no worker, escapable only by the
+    20-minute `STALE_TURN_MIN` hatch. Same shape as the SNS publish below. Use
+    `_safe_transcript_append`.
+  Nothing reads the transcript back today — it is a write-only audit artifact, which is
+  exactly why nothing noticed. Verify a write-only artifact by reading it.
 - **Notify on independent channels, and never let the weakest one gate the rest.** The
   driver's escalate path publishes to SNS, writes a stage event, emits `EscalatedToHuman`,
   and settles the task token. The SNS publish was first and unwrapped, so one failed publish

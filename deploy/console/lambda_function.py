@@ -2006,16 +2006,64 @@ def _task_event(task_id, event_name, actor, detail=None):
         pass  # an audit-log write must never take the user action down with it
 
 
+#: The whole conversation lives in ONE DynamoDB item under a 400 KB ceiling, so a long
+#: message is capped in the record the UI renders. The S3 copy is the one that must stay
+#: whole: it is the audit artifact, and an "audit copy" holding a truncated subset of the
+#: thing it audits answers no question worth asking. Live, one message sat at exactly
+#: 8000 characters in BOTH copies -- the cap was applied by the callers, before the split.
+MSG_TEXT_MAX = 8000
+#: A declared ceiling for the audit copy too, so one request cannot write an unbounded
+#: object. Generous by two orders of magnitude versus the DynamoDB cap: the point is that
+#: a real reply is never truncated, not that there is no limit at all.
+TRANSCRIPT_TEXT_MAX = 100_000
+
+
 def _transcript_append(task_id, entries):
-    """Append-only full-text audit copy in S3. DDB truncation never loses history."""
+    """Append the FULL text of each message to the S3 audit log.
+
+    Genuinely append-only: ONE OBJECT PER CALL, never a read-modify-write of a single
+    transcript.jsonl. The old shape re-read the whole file, concatenated, and put it back,
+    which cost two things:
+
+    1. The read's `except Exception` treated *every* failure as "no file yet", so the put
+       then REPLACED the entire history with just the newest lines. A transient 503 or a
+       throttle silently erased the audit log whose whole job is to survive.
+    2. Two writers for one task are reachable -- close_task is permitted while a turn is
+       in flight, because "thinking" is not in TASK_TERMINAL -- and under read-modify-write
+       the loser's messages vanish from the copy while DynamoDB's list_append keeps both.
+       An audit copy missing a message the audited record has is worse than no copy.
+
+    Keys sort lexicographically into chronological order, so `aws s3 cp --recursive` plus
+    a sort reassembles the thread. Callers pass UNTRUNCATED messages; only the DynamoDB
+    copy is capped (MSG_TEXT_MAX), which is the split this docstring used to claim and
+    the code did not implement. The 26 pre-existing `transcript.jsonl` objects stay where
+    they are -- they are history, and rewriting them would be the very thing this fix
+    stops.
+    """
     b = data_bucket()
-    key = f"tasks/{task_id}/transcript.jsonl"
+    key = f"tasks/{task_id}/transcript/{_now_iso()}-{secrets.token_hex(4)}.jsonl"
+    lines = b"".join(
+        json.dumps({**e, "text": str(e.get("text", ""))[:TRANSCRIPT_TEXT_MAX]},
+                   default=str).encode() + b"\n"
+        for e in entries)
+    s3.put_object(Bucket=b, Key=key, Body=lines, ContentType="application/x-ndjson")
+
+
+def _safe_transcript_append(task_id, entries):
+    """The audit copy is a SECOND channel, so it must never gate the first.
+
+    It used to be called unwrapped at the end of _append_messages, so one S3 failure
+    propagated out and skipped everything after that call in the caller. For accept_task
+    that is `_task_event(PlanAccepted)` and `_enqueue_task_turn(accept=True)`: a
+    KMS-signed acceptance would sit at "accepting" with no worker ever launched, and the
+    only escape is the 20-minute STALE_TURN_MIN hatch. Same shape as the SNS publish that
+    was gating the other three escalation channels -- write to each channel separately,
+    and never let the one with no reader take down the one the customer is waiting on.
+    """
     try:
-        old = s3.get_object(Bucket=b, Key=key)["Body"].read()
-    except Exception:
-        old = b""
-    lines = b"".join(json.dumps(e, default=str).encode() + b"\n" for e in entries)
-    s3.put_object(Bucket=b, Key=key, Body=old + lines, ContentType="application/json")
+        _transcript_append(task_id, entries)
+    except Exception as e:
+        print(f"[task-chat] transcript append failed for {task_id} (ignored): {e}")
 
 
 def _task_session(task):
@@ -2035,9 +2083,14 @@ def _append_messages(task_id, msgs, extra_update="", extra_names=None, extra_val
     drop_partial removes the streamed draft in the SAME write that commits the real
     message. Two writes would leave a window in which a poll (every 3s during a turn)
     sees both, and the customer watches the reply appear twice.
+
+    Callers pass FULL text. The DynamoDB copy is capped here (one item, 400 KB, and it is
+    what the UI renders); the S3 audit copy gets the message whole. Capping at the call
+    sites put the same truncated string in both, which made the audit copy audit nothing.
     """
+    trimmed = [{**m, "text": str(m.get("text", ""))[:MSG_TEXT_MAX]} for m in msgs]
     names = {"#m": "messages"}
-    values = {":new": msgs, ":empty": [], ":t": _now_iso()}
+    values = {":new": trimmed, ":empty": [], ":t": _now_iso()}
     expr = "SET #m = list_append(if_not_exists(#m, :empty), :new), updated_at = :t"
     if extra_update:
         expr += ", " + extra_update
@@ -2048,7 +2101,9 @@ def _append_messages(task_id, msgs, extra_update="", extra_names=None, extra_val
     tasks_tbl.update_item(Key={"id": task_id}, UpdateExpression=expr,
                           ExpressionAttributeNames=names,
                           ExpressionAttributeValues=values)
-    _transcript_append(task_id, msgs)
+    # Second channel, wrapped, and AFTER the write it must not gate. msgs, not trimmed:
+    # the audit copy is the one that keeps the whole message.
+    _safe_transcript_append(task_id, msgs)
 
 
 def create_task(body, user):
@@ -2060,15 +2115,16 @@ def create_task(body, user):
         return {"error": "goal is required", "status_code": 400}
     task_id = "task-" + secrets.token_hex(8)
     now = _now_iso()
-    first = {"role": "user", "text": goal[:8000], "at": now,
-             "by": user["username"]}
+    first = {"role": "user", "text": goal, "at": now, "by": user["username"]}
     item = {"id": task_id, "status": "thinking", "created_by": user["username"],
             "created_at": now, "updated_at": now, "goal": goal[:500],
-            "messages": [first], "plan_uri": "", "plan_summary": "",
-            "cost_estimate_usd": "", "run_id": "", "session_seq": 0,
+            "messages": [{**first, "text": goal[:MSG_TEXT_MAX]}], "plan_uri": "",
+            "plan_summary": "", "cost_estimate_usd": "", "run_id": "", "session_seq": 0,
             "error_msg": ""}
     tasks_tbl.put_item(Item=item)
-    _transcript_append(task_id, [first])
+    # Wrapped, and after the put_item: an audit write that fails must not cost the
+    # customer the task they just created (nor the _enqueue_task_turn below it).
+    _safe_transcript_append(task_id, [first])
     _task_event(task_id, "TaskCreated", user["username"], {"goal": goal[:200]})
     _enqueue_task_turn(task_id)
     return {"ok": True, "task": item}
@@ -2257,8 +2313,8 @@ def post_task_message(task_id, body, user):
         if age_min < STALE_TURN_MIN:
             return {"error": "a turn is already in flight; wait for the reply",
                     "status_code": 409}
-    msg = {"role": "user", "text": text[:8000], "at": _now_iso(),
-           "by": user["username"]}
+    # Full text: _append_messages caps the DynamoDB copy, the audit copy keeps it whole.
+    msg = {"role": "user", "text": text, "at": _now_iso(), "by": user["username"]}
     _append_messages(task_id, [msg], "#s = :s", {"#s": "status"}, {":s": "thinking"})
     _task_event(task_id, "MessageSent", user["username"])
     _enqueue_task_turn(task_id)
@@ -2590,7 +2646,8 @@ def _stream_sink(task_id):
         tasks_tbl.update_item(
             Key={"id": task_id},
             UpdateExpression="SET partial_reply = :p, updated_at = :t",
-            ExpressionAttributeValues={":p": str(text_so_far)[:8000], ":t": _now_iso()})
+            ExpressionAttributeValues={":p": str(text_so_far)[:MSG_TEXT_MAX],
+                                       ":t": _now_iso()})
 
     sink.flushes = lambda: state["n"]
     return sink
@@ -2858,7 +2915,10 @@ def run_task_turn(task_id, accept=False):
     now_status = str(task.get("status", ""))
     new_msgs = []
     if reply:
-        new_msgs.append({"role": "assistant", "text": reply[:8000], "at": _now_iso(),
+        # The agent's own words, uncut, into the audit copy. This is the message that
+        # actually hit the 8000 cap live, and it is an assistant reply -- the one an
+        # acceptance is signed against.
+        new_msgs.append({"role": "assistant", "text": reply, "at": _now_iso(),
                          "by": "orchestrator"})
 
     trailer = _parse_plan_trailer(reply) if reply else None

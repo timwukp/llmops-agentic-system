@@ -828,6 +828,51 @@ case("prompt: the orchestrator is told to consult a skill nothing mounts",
      ["tests/test_orchestration.py::TestConductorDispatch"
       "::test_every_mounted_skill_is_named_in_the_prompt_that_must_consult_it"])
 
+# 64. The message text is capped BEFORE the DynamoDB/S3 split -- the live state, in which
+#     one assistant reply sat at exactly 8000 characters in both copies and the
+#     "full-text audit copy" was a truncated copy of a truncated record.
+def m64(t):
+    old = "    trimmed = [{**m, \"text\": str(m.get(\"text\", \"\"))[:MSG_TEXT_MAX]} for m in msgs]"
+    assert old in t, "the DDB trim has moved; re-anchor this mutation"
+    return t.replace(old, "    trimmed = msgs\n"
+                          "    msgs = [{**m, \"text\": str(m.get(\"text\", \"\"))[:MSG_TEXT_MAX]}\n"
+                          "            for m in msgs]", 1)
+case("tasks: the message is truncated before the audit copy is written",
+     "deploy/console/lambda_function.py", m64,
+     ["tests/test_console_tasks.py"
+      "::test_the_audit_copy_keeps_the_full_text_the_ddb_record_has_to_cap"])
+
+# 65. The audit copy goes back to read-modify-write of one transcript.jsonl, with the
+#     read's failure treated as "no file yet" -- so a single transient S3 error replaces
+#     the whole history with the newest lines.
+def m65(t):
+    old = '    key = f"tasks/{task_id}/transcript/{_now_iso()}-{secrets.token_hex(4)}.jsonl"'
+    assert old in t, "the transcript key has moved; re-anchor this mutation"
+    return t.replace(old,
+                     '    key = f"tasks/{task_id}/transcript/one.jsonl"\n'
+                     '    try:\n'
+                     '        old_body = s3.get_object(Bucket=b, Key=key)["Body"].read()\n'
+                     '    except Exception:\n'
+                     '        old_body = b""', 1).replace(
+        "    s3.put_object(Bucket=b, Key=key, Body=lines,",
+        "    s3.put_object(Bucket=b, Key=key, Body=old_body + lines,", 1)
+case("tasks: a failed transcript read is treated as 'no file yet' and erases history",
+     "deploy/console/lambda_function.py", m65,
+     ["tests/test_console_tasks.py"
+      "::test_a_failed_read_can_never_erase_the_audit_log"])
+
+# 66. The audit write goes back to being unwrapped, so one S3 failure skips the
+#     _task_event and the _enqueue_task_turn that follow it -- stranding a KMS-signed
+#     acceptance at 'accepting' with no worker, escapable only by the 20-minute hatch.
+def m66(t):
+    old = "    _safe_transcript_append(task_id, msgs)"
+    assert old in t, "the wrapped audit call has moved; re-anchor this mutation"
+    return t.replace(old, "    _transcript_append(task_id, msgs)", 1)
+case("tasks: a failed audit write strands the signed acceptance it should not gate",
+     "deploy/console/lambda_function.py", m66,
+     ["tests/test_console_tasks.py"
+      "::test_a_failed_audit_write_does_not_strand_a_signed_acceptance"])
+
 
 failed = []
 for name, rel, mutate, tests in CASES:
