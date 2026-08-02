@@ -51,12 +51,22 @@ that have never existed._
 Zero standing billable resources CREATED BY THIS PROJECT: no llmops-* SageMaker
 endpoint, pipeline scheduler DISABLED, serverless spine idles free. Total v1 build cost
 ≈ $12–15. That scoping is load-bearing and used to be missing: the account also carries
-`jumpstart-dft-hf-asr-whisper-large-v2`, InService since 2024-04-11 with 0 invocations
-over 30 days, which Cost Explorer bills at **$36.36/day** (ml.g5.2xlarge ×1 —
-confirmed by describe_endpoint_config, not the JumpStart-default guess the first run of
-the schedule below had to make). It was found by that schedule, which scans the whole
-account precisely because one restricted to `llmops-*` cannot find an unclaimed resource.
-It is not ours to delete; reported, and awaiting the account owner. A PII scan
+`jumpstart-dft-hf-asr-whisper-large-v2`, InService since 2024-04-11 with **0 invocations
+and 0.0% GPU utilization over 90 days**, which Cost Explorer bills at **$36.36/day**
+(ml.g5.2xlarge ×1 — confirmed by describe_endpoint_config, not the JumpStart-default
+guess the first run of the schedule below had to make). It was found by that schedule,
+which scans the whole account precisely because one restricted to `llmops-*` cannot find
+an unclaimed resource — and this one carries **no owner, cost-centre or project tag at
+all**, only JumpStart's automatic model-id tags, so there is nothing on it to claim. It
+is a one-click Studio JumpStart deploy of public Whisper large-v2 weights, traced to a
+Studio domain created 2021-01-14 and a user profile created 2021-12-17; every identity
+involved predates this project by four years. Not ours to delete: reported, snapshotted
+(`deploy/evidence/whisper_endpoint_snapshot.json`), and awaiting the account owner. Note
+that "pause" is not an option that was skipped — `list_inference_components` returns 0
+and no `ManagedInstanceScaling` is configured, so this legacy ProductionVariant endpoint
+has neither scale-to-zero nor a desired count of 0. Stopping the bill means deleting, and
+substituting deletion for an instruction that said "pause" is the owner's call, not the
+agent's. A PII scan
 (`llmops-customer-data-pii`, Macie, SCHEDULED daily over `customer-data/`) went live
 2026-08-02 and bills per GB — at 0.87 MiB that is under $0.01/scan.
 
