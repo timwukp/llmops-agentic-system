@@ -930,7 +930,12 @@ def m69(t):
     misleads by omission -- the failure mode that is hardest to catch by reading, because
     every sentence left on the page is still true.
     """
-    start = t.index("- It ALSO means")
+    anchor = "- It ALSO meant"
+    assert anchor in t, (
+        "the second half of the budget-filter sentence has moved or been reworded; "
+        "re-anchor this mutation rather than letting it crash -- a control that raises "
+        "is a control that never tested its guard")
+    start = t.index(anchor)
     end = t.index("\n\n", start)
     return t[:start] + t[end:]
 

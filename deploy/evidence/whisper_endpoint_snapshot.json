@@ -123,5 +123,12 @@
 
   "note": "SageMaker real-time endpoints cannot be paused (verified above, not assumed): the minimum is one instance, so stopping the bill means deleting the endpoint. The EndpointConfig and Model below are NOT deleted -- and both are free to keep. Recreating the endpoint from them is a single create_endpoint call (~5-8 min to InService), and the weights live in AWS's public cache, so nothing needs re-uploading.",
   "restore": "aws sagemaker create-endpoint --endpoint-name jumpstart-dft-hf-asr-whisper-large-v2 --endpoint-config-name jumpstart-dft-hf-asr-whisper-large-v2 --region us-east-1",
-  "status": "NOT DELETED. Awaiting the owner's explicit authorization to delete; the standing instruction authorized 'pause', which does not exist for this endpoint."
+  "status": "DELETED 2026-08-02 on the owner's explicit authorization. delete_endpoint returned, status went Deleting, and list_endpoints in us-east-1 now returns ZERO endpoints. The owner's original instruction said 'pause'; pause does not exist here (see pause_is_impossible_verified), so deletion waited for them to say it in as many words rather than being inferred from technical necessity.",
+  "restore_path_verified_after_delete": {
+    "endpoint_config": "jumpstart-dft-hf-asr-whisper-large-v2 -- describe_endpoint_config SUCCEEDS post-delete, ml.g5.2xlarge",
+    "model": "huggingface-asr-whisper-large-v2-20240411-075215 -- describe_model SUCCEEDS post-delete",
+    "weights": "s3://jumpstart-cache-prod-us-east-1/... still AWS's public cache; nothing of ours needed re-uploading",
+    "note": "Checked AFTER the delete, not before. 'Reversible' was a claim until these two describes returned; both objects are free to keep, so the one-line restore above is a fact rather than an intention."
+  },
+  "savings": "$36.36/day, ~$1106/month, stopped as of 2026-08-02."
 }

@@ -56,17 +56,32 @@ and 0.0% GPU utilization over 90 days**, which Cost Explorer bills at **$36.36/d
 (ml.g5.2xlarge ×1 — confirmed by describe_endpoint_config, not the JumpStart-default
 guess the first run of the schedule below had to make). It was found by that schedule,
 which scans the whole account precisely because one restricted to `llmops-*` cannot find
-an unclaimed resource — and this one carries **no owner, cost-centre or project tag at
-all**, only JumpStart's automatic model-id tags, so there is nothing on it to claim. It
-is a one-click Studio JumpStart deploy of public Whisper large-v2 weights, traced to a
+an unclaimed resource — and this one carried **no owner, cost-centre or project tag at
+all**, only JumpStart's automatic model-id tags, so there was nothing on it to claim. It
+was a one-click Studio JumpStart deploy of public Whisper large-v2 weights, traced to a
 Studio domain created 2021-01-14 and a user profile created 2021-12-17; every identity
-involved predates this project by four years. Not ours to delete: reported, snapshotted
-(`deploy/evidence/whisper_endpoint_snapshot.json`), and awaiting the account owner. Note
-that "pause" is not an option that was skipped — `list_inference_components` returns 0
-and no `ManagedInstanceScaling` is configured, so this legacy ProductionVariant endpoint
-has neither scale-to-zero nor a desired count of 0. Stopping the bill means deleting, and
-substituting deletion for an instruction that said "pause" is the owner's call, not the
-agent's. A PII scan
+involved predates this project by four years.
+
+**DELETED 2026-08-02** on the owner's explicit authorization — `list_endpoints` in
+us-east-1 now returns zero endpoints, so ~$1106/month stopped. Two things about how that
+happened are worth keeping, because both are the general rule and not a detail of this
+endpoint:
+
+- **"Pause" was checked, not assumed.** `list_inference_components` returns 0 (a legacy
+  ProductionVariant endpoint, not the Inference-Component architecture that supports
+  scale-to-zero) and no `ManagedInstanceScaling` is configured, so neither scale-to-zero
+  nor a desired count of 0 was available. Only then was deleting the only way to stop the
+  bill.
+- **Technical necessity is not authorization.** The instruction said "pause". Discovering
+  that pause is impossible does not convert it into consent to delete permanently, least
+  of all for a resource belonging to someone else, so the deletion waited for the owner to
+  say so in as many words. The reverse — an agent reasoning "the only available action
+  must be what they meant" — is how irreversible operations get self-authorized.
+
+The restore path was verified **after** the delete, not before: `describe_endpoint_config`
+and `describe_model` both still succeed, and the weights live in AWS's public JumpStart
+cache, so recreating it is one `create-endpoint` call. Full capture in
+`deploy/evidence/whisper_endpoint_snapshot.json`. A PII scan
 (`llmops-customer-data-pii`, Macie, SCHEDULED daily over `customer-data/`) went live
 2026-08-02 and bills per GB — at 0.87 MiB that is under $0.01/scan.
 
