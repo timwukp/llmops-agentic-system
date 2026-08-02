@@ -45,11 +45,30 @@ corruptions live:
      message. Tree parity is blind to it (the final tree is the same either way), so the
      prefix the remote already has is now matched by TREE, not by sha.
 
+  7. A MERGE flattened, twice over. Two defects with one cause -- nothing here knew a
+     commit can have more than one parent:
+
+       * `rev-list base..HEAD` walks ALL ancestry, so merging main in put main's own
+         commits into the replay list as though this branch had authored them; and
+       * every replayed commit is built with `parents: [parent_sha]`, one parent, so the
+         merge commit itself lands as an ordinary commit.
+
+     Either alone loses the merge. Observed 2026-08-02 merging main into
+     fix/eval-generate-dispatch: `compare main...branch` read "diverged, ahead 2, behind
+     2" for a branch that contained every commit in main, and 174 lines from an
+     already-merged PR appeared in the new PR's diff. So the replay range is
+     `--first-parent` (this branch's own commits, not the merged branch's), and the merge
+     parents beyond the first are carried onto the commit.
+
 So this reads modes from git instead of assuming them, diffs against the branch's
 actual remote head instead of assuming the local parent matches it, never concludes
-"no such branch" from a single 404, and replays each local commit as its own remote
-commit with its own message. A rename becomes delete-old + add-new; a deletion becomes
-a null-sha tree entry.
+"no such branch" from a single 404, replays each local commit as its own remote commit
+with its own message, and keeps a merge a merge. A rename becomes delete-old + add-new;
+a deletion becomes a null-sha tree entry.
+
+What the tree-parity check at the end can and cannot see: it proves the remote CONTENT
+matches local HEAD, and says nothing about ancestry or about how many commits carry it.
+Defects 4, 6 and 7 all passed it.
 
 Run: .venv/bin/python tools/push_via_api.py --branch <branch> [--dry-run]
 """
@@ -257,6 +276,28 @@ def drop_already_pushed(gh: "GitHub", locals_: list[str], remote_sha: str) -> li
     return keep
 
 
+def merge_parents(gh: "GitHub", rev: str) -> tuple[list[str], list[str]]:
+    """The parents of `rev` BEYOND THE FIRST, split into (on the remote, not on it).
+
+    The first-parent slot belongs to the commit being advanced onto, and its local sha is
+    never the remote's: every remote commit here is API-built, so the two histories are
+    parallel by construction (note 2). The caller supplies that slot; sending the local
+    first parent alongside it would give every ordinary linear push a bogus second parent.
+
+    A parent the remote cannot resolve is reported and dropped rather than sent -- the API
+    rejects an unknown parent sha, and refusing the whole push over a local-only side
+    branch is worse than landing it as the linear advance it effectively is. What is
+    dropped gets SAID, because a quietly flattened merge is defect 7 itself.
+    """
+    on_remote, absent = [], []
+    for p in git("rev-list", "--parents", "-1", rev).split()[2:]:
+        if p in on_remote or p in absent:
+            continue
+        (on_remote if gh.call(f"/git/commits/{p}", absent_ok=True) is not None
+         else absent).append(p)
+    return on_remote, absent
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -348,7 +389,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.message:
         locals_ = [head]
     else:
-        locals_ = git("rev-list", "--reverse", f"{remote_sha}..{head}").split()
+        # --first-parent, or a merge puts the MERGED branch's commits in the replay list.
+        # `rev-list base..HEAD` walks all ancestry, so merging main in returns main's own
+        # commits too and each would be replayed here under its own message as though this
+        # branch had authored it. First-parent-only is exactly "the commits this branch
+        # advanced by"; what the merge brought in arrives with the merge commit's tree,
+        # which is where it belongs. Observed 2026-08-02 on fix/eval-generate-dispatch.
+        locals_ = git("rev-list", "--reverse", "--first-parent",
+                      f"{remote_sha}..{head}").split()
         if not locals_:
             # HEAD is an ancestor of the remote head (or the same commit). There may
             # still be a tree difference if the remote was built by an earlier squash,
@@ -357,13 +405,24 @@ def main(argv: list[str] | None = None) -> int:
         else:
             locals_ = drop_already_pushed(gh, locals_, remote_sha)
 
-    plan_ops = {}
+    plan_ops, plan_merges = {}, {}
     prev = remote_sha
     for c in locals_:
         plan_ops[c] = parse_raw_diff(git("diff", "--raw", "-z", "-M", prev, c,
                                          binary=True))
+        # A merge is squashed by --message, so its extra parents would point at commits
+        # this squashed commit does not represent; only a real replay carries them.
+        plan_merges[c], absent = ([], []) if args.message else merge_parents(gh, c)
+        if absent:
+            print(f"NOTE: {c[:10]} has parent(s) {[p[:10] for p in absent]} the remote "
+                  "does not have; pushing without them. It will read as a linear commit.",
+                  file=sys.stderr)
         prev = c
-    if not any(plan_ops.values()):
+    if not any(plan_ops.values()) and not any(plan_merges.values()):
+        # The merge clause is not redundant: merging a branch already contained changes no
+        # file, and what that commit carries is the ANCESTRY, not the tree. Returning here
+        # would leave the remote at a commit the merged branch is not an ancestor of --
+        # defect 7's wrong ancestry again, reached by an early return instead of a flatten.
         print(f"remote {args.branch} already matches HEAD tree; nothing to push")
         return 0
 
@@ -372,7 +431,8 @@ def main(argv: list[str] | None = None) -> int:
           f"({len(locals_)} commit{'s' if len(locals_) != 1 else ''})")
     for c in locals_:
         subject = git("log", "-1", "--format=%s", c)
-        print(f"  {c[:10]} {subject}")
+        merged = f" +merge {[p[:10] for p in plan_merges[c]]}" if plan_merges[c] else ""
+        print(f"  {c[:10]} {subject}{merged}")
         for op in plan_ops[c]:
             moved = f" (was {op['old_path']})" if op["old_path"] else ""
             chmod = f" mode {op['old_mode']}->{op['new_mode']}" \
@@ -399,8 +459,9 @@ def main(argv: list[str] | None = None) -> int:
         tree = gh.call("/git/trees", {"base_tree": base_tree,
                                       "tree": entries})["sha"] if entries else base_tree
         message = args.message or git("log", "-1", "--format=%B", c)
-        commit = gh.call("/git/commits", {"message": message, "tree": tree,
-                                         "parents": [parent_sha]})
+        commit = gh.call("/git/commits", {
+            "message": message, "tree": tree,
+            "parents": [parent_sha, *plan_merges[c]]})
         parent_sha = commit["sha"]
     if creating:
         # POST /git/refs with a full ref name creates; PATCH would 404 on a ref that

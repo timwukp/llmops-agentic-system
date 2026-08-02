@@ -280,16 +280,20 @@ class FakeGH:
 
 def _run_main(monkeypatch, gh, *, branch, parent="parentsha", commit_count="7",
               ops=(":100644 100644 aaa bbb M", "pipeline/contracts/report.py"),
-              revs=None, messages=None, extra_argv=(), trees=None):
+              revs=None, messages=None, extra_argv=(), trees=None, parents=None):
     """Drive main() with fake git + fake HTTP; return (exit code, gh).
 
     `revs` is the local commit list the tool would replay (oldest first, as
     `rev-list --reverse` returns it); it defaults to a single commit, "headsha".
     `messages` maps a rev to its full message, so a test can prove each remote commit
     carries its OWN message rather than HEAD's.
+    `parents` maps a rev to its FULL local parent list, so a test can model a merge. The
+    default is one parent per rev, which is what every non-merge test means to describe --
+    a fake that reported two would make a tool that ignores merge parents look correct.
     """
     revs = list(revs) if revs is not None else ["headsha"]
     messages = messages or {}
+    parents = parents or {}
     # Per-rev tree shas, so a test can model "the remote already has THIS commit's tree".
     # Default: every rev reports "local-tree", which keeps the parity check satisfied for
     # the tests that do not care about per-commit trees.
@@ -306,7 +310,16 @@ def _run_main(monkeypatch, gh, *, branch, parent="parentsha", commit_count="7",
             return trees.get(args[1][:-len("^{tree}")], "local-tree")
         if args[:2] == ("rev-list", "--count"):
             return commit_count
+        if args[:2] == ("rev-list", "--parents"):
+            # `rev-list --parents -1 <rev>` -> "<rev> <parent1> [<parent2> ...]"
+            rev = args[3]
+            return " ".join([rev, *parents.get(rev, [f"local-parent-of-{rev}"])])
         if args[:2] == ("rev-list", "--reverse"):
+            # --first-parent must be PASSED, not assumed: without it a merge replays the
+            # merged branch's commits as this branch's own. Asserting on the flag here is
+            # what makes the fix for defect 7 visible to a test at all.
+            assert "--first-parent" in args, (
+                f"rev-list built the replay range without --first-parent: {args}")
             return " ".join(revs)
         if args[0] == "diff":
             return raw(*ops) if binary else ""
@@ -415,6 +428,8 @@ def test_a_first_push_still_verifies_the_tree_matches_local_head(monkeypatch):
             return "a-different-tree"  # remote tree will be "local-tree"
         if args[:2] == ("rev-list", "--count"):
             return "7"
+        if args[:2] == ("rev-list", "--parents"):
+            return f"{args[3]} local-parent"
         if args[:2] == ("rev-list", "--reverse"):
             return "headsha"
         if args[0] == "diff":
@@ -670,6 +685,8 @@ def test_the_diff_base_follows_onto_so_the_replay_is_not_a_diff_against_the_old_
             return "local-tree"
         if args[:2] == ("rev-list", "--count"):
             return "7"
+        if args[:2] == ("rev-list", "--parents"):
+            return f"{args[3]} local-parent"
         if args[:2] == ("rev-list", "--reverse"):
             return "c1sha"
         if args[0] == "show":
@@ -703,7 +720,7 @@ def test_rev_list_is_scoped_to_onto_so_the_merges_rebased_onto_are_not_replayed(
 
     def fake_git(*args, binary=False):
         if args[:2] == ("rev-list", "--reverse"):
-            seen.append(args[2])
+            seen.append(args[-1])
             return "c1sha"
         if args[0] == "config":
             return "https://github.com/acme/llmops.git"
@@ -715,6 +732,8 @@ def test_rev_list_is_scoped_to_onto_so_the_merges_rebased_onto_are_not_replayed(
             return "local-tree"
         if args[:2] == ("rev-list", "--count"):
             return "7"
+        if args[:2] == ("rev-list", "--parents"):
+            return f"{args[3]} local-parent"
         if args[0] == "diff":
             return raw(":100644 100644 aaa bbb M", "a.py") if binary else ""
         if args[0] == "show":
@@ -910,3 +929,129 @@ def test_a_remote_chain_walk_that_404s_does_not_abort_the_push(monkeypatch):
                        trees={"c2": "local-tree"}, messages={"c2": "new work"})
     assert rc == 0
     assert [c["message"] for c in gh.created_commits] == ["new work"]
+
+
+# --- defect 7: a merge flattened, twice over ------------------------------------
+#
+# Two failures with one cause -- nothing knew a commit can have more than one parent.
+# The replay RANGE walked all ancestry (so main's commits replayed as this branch's),
+# and each replayed commit was built with exactly one parent (so the merge itself
+# landed linear). Tree parity is blind to both: the final tree is identical either way.
+# Observed 2026-08-02 on fix/eval-generate-dispatch -- `compare main...branch` read
+# "diverged, ahead 2, behind 2" for a branch that contained every commit in main.
+
+def test_a_merge_keeps_its_second_parent(monkeypatch):
+    gh = FakeGH({"heads/feat/x": "remote-head"}, commits=["remote-head", "mainsha"])
+    code, gh = _run_main(monkeypatch, gh, branch="feat/x", revs=["mergesha"],
+                         parents={"mergesha": ["local-first", "mainsha"]})
+    assert code == 0
+    assert gh.created_commits[0]["parents"] == ["remote-head", "mainsha"], (
+        "the merge parent is gone: the commit landed linear, so main stops being an "
+        f"ancestor of this branch. parents={gh.created_commits[0]['parents']}")
+
+
+def test_an_ordinary_push_stays_single_parent(monkeypatch):
+    """The first LOCAL parent must not be sent alongside remote_sha.
+
+    The remote's commits are API-built, so local HEAD^ and the remote head are different
+    shas for the same position (defect 2). Carrying the local first parent would give
+    every ordinary linear push a bogus second parent -- an over-correction that turns
+    every push into a fake merge. This caught exactly that bug in the first draft.
+    """
+    gh = FakeGH({"heads/feat/x": "remote-head"}, commits=["remote-head", "parentsha"])
+    code, gh = _run_main(monkeypatch, gh, branch="feat/x")
+    assert code == 0
+    assert gh.created_commits[0]["parents"] == ["remote-head"]
+
+
+def test_an_octopus_merge_keeps_every_parent(monkeypatch):
+    gh = FakeGH({"heads/feat/x": "remote-head"},
+                commits=["remote-head", "p2", "p3"])
+    code, gh = _run_main(monkeypatch, gh, branch="feat/x", revs=["mergesha"],
+                         parents={"mergesha": ["local-first", "p2", "p3"]})
+    assert code == 0
+    assert gh.created_commits[0]["parents"] == ["remote-head", "p2", "p3"]
+
+
+def test_a_merge_parent_the_remote_cannot_resolve_is_dropped_not_sent(monkeypatch):
+    """The API rejects an unknown parent sha, which would fail the whole push.
+
+    A local-only side branch is a worse reason to refuse than to land the commit as the
+    linear advance it effectively is -- so the unresolvable parent is dropped.
+    """
+    gh = FakeGH({"heads/feat/x": "remote-head"}, commits=["remote-head"])
+    code, gh = _run_main(monkeypatch, gh, branch="feat/x", revs=["mergesha"],
+                         parents={"mergesha": ["local-first", "local-only-branch"]})
+    assert code == 0
+    assert gh.created_commits[0]["parents"] == ["remote-head"]
+
+
+def test_the_dropped_parent_is_reported(monkeypatch, capsys):
+    """Dropping it silently reproduces the defect: a merge that reads as linear, with
+    nothing in the output to say so."""
+    gh = FakeGH({"heads/feat/x": "remote-head"}, commits=["remote-head"])
+    _run_main(monkeypatch, gh, branch="feat/x", revs=["mergesha"],
+              parents={"mergesha": ["local-first", "local-only-branch"]})
+    err = capsys.readouterr().err
+    assert "local-only" in err and "linear" in err, (
+        f"the dropped parent must be visible; got:\n{err}")
+
+
+def test_a_merge_that_changes_no_file_is_still_pushed(monkeypatch):
+    """Merging a branch already contained changes no file, and is the common case.
+
+    "Nothing to push" is a statement about the TREE; what this commit carries is the
+    ANCESTRY. Returning early would leave the remote at a commit the merged branch is not
+    an ancestor of -- defect 7's wrong ancestry, reached by an early return.
+    """
+    # An empty diff means the base tree already IS local HEAD's tree, so the double has
+    # to say that or the parity check fails on the fixture rather than on the tool.
+    gh = FakeGH({"heads/feat/x": "remote-head"}, commits=["remote-head", "mainsha"],
+                chain=[("remote-head", "local-tree", None)])
+    code, gh = _run_main(monkeypatch, gh, branch="feat/x", revs=["mergesha"],
+                         ops=(), trees={"mergesha": "local-tree"},
+                         parents={"mergesha": ["local-first", "mainsha"]})
+    assert code == 0
+    assert len(gh.created_commits) == 1, "the merge commit was never created"
+    assert gh.created_commits[0]["parents"] == ["remote-head", "mainsha"]
+
+
+def test_an_empty_diff_with_no_merge_still_pushes_nothing(monkeypatch):
+    """The no-op check must stay a no-op check. Widening it for merges must not make
+    every already-matching branch push an empty commit on every run."""
+    gh = FakeGH({"heads/feat/x": "remote-head"}, commits=["remote-head"])
+    code, gh = _run_main(monkeypatch, gh, branch="feat/x", ops=())
+    assert code == 0
+    assert gh.created_commits == []
+
+
+def test_a_squash_does_not_claim_the_merge_parents(monkeypatch):
+    """--message squashes N commits into one, so that commit does not represent the
+    merges inside the range; carrying their parents would assert an ancestry the
+    squashed tree does not have."""
+    gh = FakeGH({"heads/feat/x": "remote-head"}, commits=["remote-head", "mainsha"])
+    code, gh = _run_main(monkeypatch, gh, branch="feat/x",
+                         parents={"headsha": ["local-first", "mainsha"]},
+                         extra_argv=["--message", "one squashed commit"])
+    assert code == 0
+    assert gh.created_commits[0]["parents"] == ["remote-head"]
+
+
+def test_the_local_first_parent_is_not_sent_even_when_the_remote_has_it(monkeypatch):
+    """The `[2:]` slice, pinned where it is actually observable.
+
+    `test_an_ordinary_push_stays_single_parent` does not catch a `[1:]` slice: the local
+    first parent is not on the remote in that fixture, so the bogus extra parent is
+    dropped by the resolvability filter and the bug hides behind the safety net. On the
+    CREATE path the two coincide -- the base IS local HEAD^ -- so a `[1:]` slice sends a
+    resolvable sha and the commit lands with its own base listed twice. That duplicate is
+    what makes the parent list wrong rather than merely redundant, and this is the only
+    fixture where it can be seen.
+    """
+    gh = FakeGH({"heads/main": "mainsha"}, commits=["parentsha"])
+    code, gh = _run_main(monkeypatch, gh, branch="feat/new",
+                         parents={"headsha": ["parentsha"]})
+    assert code == 0
+    assert gh.created_commits[0]["parents"] == ["parentsha"], (
+        "the local first parent was carried as a merge parent: the commit lists its own "
+        f"base twice. parents={gh.created_commits[0]['parents']}")
