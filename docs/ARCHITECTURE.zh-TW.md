@@ -49,12 +49,12 @@ LLM 判斷。因此編排採用 **Step Functions Standard 狀態機**，智能�
 讓 LLM 決定「下一個階段是什麼」只會給系統中唯一不需要不確定性的部分添加不確定性、
 成本和故障模式。
 
-狀態機（`orchestration/state_machine.asl.json`）在正常路徑上有 **10 個 harness 任務狀態**
+狀態機（`orchestration/state_machine.asl.json`）在正常路徑上有 **11 個 harness 任務狀態**
 —— 每個都是帶 `waitForTaskToken` 的 harness driver Lambda 調用 —— 外加只在迴路中出現的
 `RemediateFinetune`，以及只在審計模式出現的 `DataAudit`：
 
 ```
-DataPrepGenerate → DataPrepCurate → FinetuneLaunch → FinetuneAnalyze → EvalGate
+DataPrepGenerate → DataPrepCurate → FinetuneLaunch → FinetuneAnalyze → EvalGenerate → EvalGate
                                                         │（門檻失敗）
                               RemediateFinetune ←───────┘   …門檻通過則：
              Deploy → SmokeTest → MonitorHealth → Teardown → MonitorReport
@@ -197,6 +197,17 @@ prompt 明文禁止它刪東西的 agent。
   而稽核寫入沒有被包起來，一次 S3 失敗就會跳過它後面的 `PlanAccepted` 事件與 worker 派發，
   讓一份 KMS 已簽的承諾卡在 `accepting`。**沒有任何東西會把這個產物讀回來，這正是它壞了卻沒人
   發現的原因 —— 只寫不讀的產物，要靠讀它來驗證。**
+- **門檻的輸入由讀它的那條路徑產生。** `EvalGate` 對 `evaluation/report.json` 套用閾值；
+  在 `EvalGenerate` 被插到它上面之前，**沒有任何東西派發那個寫出報告的任務**。`evaluate` 和
+  `gate` 兩者都寫在 eval harness 的 prompt 裡，但只有 `gate` 出現在 ASL 中 —— 於是管線唯一
+  能跑的 eval 任務，讀的是一個沒有任何路徑產生過的輸入：管線從來沒有走過
+  `evaluate → gate`。門檻的 fail-closed 規則（`metrics.get("gate_passed") is True`，它本身
+  正確且在別處承重）把這件事藏得完美：**因為報告從未被產生而失敗的門檻，和因為模型真的不夠好
+  而失敗的門檻，讀起來一模一樣。** Phase 4 的 FAILED 判決之所以站得住，只因為 eval 是*直接*
+  跑的、在狀態機外面；同樣的判決若經過狀態機，將是不可否證的。完成時現在也會發出
+  `ModelEvaluated` —— 它本來就在事件詞彙表（`pipeline/contracts/events.py`）裡，卻沒有任何
+  東西發出過，是同一個缺口的另一面。守護測試把每個 harness prompt 宣告的任務，和每個派發者
+  真正送出的任務做差集，剩下的孤兒是一份明列的白名單，而不是一個數字。
 - **deploy 之後必然執行 `Teardown`** —— 即使 `SmokeTest` 失敗，其 `Catch` 也先路由到
   `Teardown`。孤兒 endpoint 是第一大成本風險（Phase 4 就在帳號裡發現一個無關的
   endpoint 自 2024-04 起一直 InService）。
@@ -403,7 +414,9 @@ eval agent 發出 `gate_passed: null` + `needs_human: true`，而舊的 default-
 ## 8. 補救迴路（≤ 3 次迭代）
 
 `QualityGateChoice` 失敗 → `RemediationChoice`：只要 `iteration < 3`，就
-`IncrementIteration` → `RemediateFinetune` → 回到 `FinetuneAnalyze` → `EvalGate`。
+`IncrementIteration` → `RemediateFinetune` → 回到 `FinetuneAnalyze` → `EvalGenerate`
+→ `EvalGate`。迴路是接回產生器**之上**，而不是接在產生器與門檻之間：接在下面的話，
+第 2 輪會拿第 1 輪的報告去過門檻，一次什麼都沒改的補救也可能「通過」。
 預算耗盡 → `EscalateFail`。同一預算也寫進 agent 的任務 prompt（「診斷、修正、重試 ——
 最多 3 次；然後 `escalate_human`」），機器層與 agent 層的預算一致。
 

@@ -1632,9 +1632,13 @@ class TestStateMachine:
         assert choice["NumericLessThan"] == 3
         assert choice["Next"] == "IncrementIteration"
         assert states["IncrementIteration"]["Next"] == "RemediateFinetune"
-        # remediation loops BACK to analysis -> eval, closing the self-iteration loop
+        # remediation loops BACK to analysis -> eval, closing the self-iteration loop.
+        # Reachability, not a literal Next, for the reason _reaches documents: this
+        # asserted FinetuneAnalyze["Next"] == "EvalGate" and broke when EvalGenerate was
+        # inserted between them, though the guarantee -- remediation returns to analysis
+        # and reaches the gate again -- held throughout.
         assert states["RemediateFinetune"]["Next"] == "FinetuneAnalyze"
-        assert states["FinetuneAnalyze"]["Next"] == "EvalGate"
+        assert _reaches(states, "FinetuneAnalyze", "EvalGate")
         # budget exhausted -> escalate, never silent fail; escalation closes the run
         # record (MarkRunFailed) and the conductor's task (MarkTaskFailed) on the way
         # out. Asserted as reachability, not a literal Next: the guarantee is that an
@@ -2068,6 +2072,178 @@ class TestStateMachine:
                 f"the machine reads $.{field} but start_pipeline's execution input does "
                 f"not set it; a missing path raises the uncatchable States.Runtime and "
                 "the run can never self-close")
+
+
+#: Harness tasks a prompt DECLARES that nothing dispatches, each with the reason it is
+#: allowed to stay unreachable. Anything absent from this map must have a dispatcher.
+#:
+#: This is an allowlist, not a threshold, for the reason SESSION_POSTS is one in
+#: test_console_routes.py: a count passes when a swap happens. A newly-orphaned task
+#: that replaced a wired one keeps the total intact, and the whole failure this guards
+#: against is a task the prompt promises and no path can reach.
+#:
+#: Every entry is a real gap, not a design. Two are tracked work (#58, and the s3 skill
+#: switch that mirror_model belongs to); the rest are prompt surface written ahead of
+#: its wiring. They are listed so the suite NAMES them on every run instead of letting
+#: them stay invisible -- which is exactly how ("eval", "evaluate") survived to the
+#: point of gating a real verdict on a file no path produced.
+UNDISPATCHED_HARNESS_TASKS = {
+    # llmops_monitor's health/sweep/report were listed here as "the whole harness is
+    # unreachable" until #58 wired all three (MonitorHealth and MonitorReport in the ASL,
+    # sweep on the daily schedule). main still carried the entries because #58 lives on
+    # this branch, so the merge produced an allowlist claiming three DISPATCHED tasks are
+    # unreachable -- caught by test_the_allowlist_does_not_outlive_its_entries, which
+    # exists because a stale note here is read as evidence the wiring is still missing.
+    ("llmops_data_prep", "verify"): "superseded by audit; prompt surface kept for now",
+    ("llmops_data_prep", "mirror_model"): "needs the s3 mirror switch (task #42)",
+    ("llmops_finetune", "prepare"): "folded into launch; never separately dispatched",
+    ("llmops_finops", "pricing_refresh"): "operator-invoked, not scheduled",
+    ("llmops_finops", "report"): "operator-invoked, not scheduled",
+    ("llmops_orchestrator", "plan"): "consult supersedes it for console-driven runs",
+    ("llmops_orchestrator", "report"): "operator-invoked, not scheduled",
+    # The one entry here that is a live PRODUCTION GAP rather than unused surface.
+    # The prompt says triage begins when "an EscalatedToHuman event arrives", and
+    # list_rules(EventBusName="llmops-pipeline") returns [] -- the bus every pipeline
+    # event is published to has no rules at all, so nothing converts that event into an
+    # invocation. Task #54 made triage behave correctly once invoked; this is why it is
+    # not yet reachable. Tracked as #59; it stays listed rather than silently tolerated.
+    ("llmops_orchestrator", "triage"): "task #59 -- no rule routes EscalatedToHuman",
+}
+
+#: Places a harness task can be dispatched from, besides the state machine.
+_DISPATCH_SOURCES = ("orchestration", "deploy")
+
+
+def _declared_tasks() -> dict:
+    """(harness_id, task) -> True for every `params.task` bullet in every prompt.
+
+    Read out of the prompts because the prompt is the contract the agent is held to:
+    it tells the model "your job depends on params.task", then enumerates the values.
+    A value listed there that no caller can send is a promise with no path to it.
+    """
+    out = {}
+    for cfg in sorted((REPO / "agents").glob("*/harness.json")):
+        doc = json.loads(cfg.read_text())
+        hid = doc.get("name") or ("llmops_" + cfg.parent.name.replace("-", "_"))
+        text = "".join(b.get("text", "") for b in (doc.get("systemPrompt") or []))
+        tasks = re.findall(r'- \\?"([a-z_]+)\\?":', text)
+        assert tasks, f"{cfg}: parsed no params.task bullets -- the parse is broken"
+        for t in tasks:
+            out[(hid, t)] = str(cfg.relative_to(REPO))
+    return out
+
+
+def _dispatched_tasks(asl: dict) -> dict:
+    """(harness_id, task) -> where it is dispatched from."""
+    out = {}
+    for name, st in asl["States"].items():
+        payload = (st.get("Parameters") or {}).get("Payload") or {}
+        if "harness_id" in payload:
+            out[(payload["harness_id"], payload.get("task"))] = f"ASL:{name}"
+    # A task may also be dispatched by Python (the console's consult path, the finops
+    # schedule). Those senders name the harness elsewhere, so the task literal is
+    # matched on its own and credited to every harness that declares it -- deliberately
+    # generous, because a FALSE "dispatched" here only ever weakens this guard, while a
+    # false "orphaned" would force a real dispatcher into the allowlist above.
+    literals = set()
+    for top in _DISPATCH_SOURCES:
+        for path in (REPO / top).rglob("*.py"):
+            literals.update(re.findall(r'"task"\s*:\s*"([a-z_]+)"', path.read_text()))
+    for (hid, task) in _declared_tasks():
+        if task in literals and (hid, task) not in out:
+            out[(hid, task)] = "python"
+    return out
+
+
+class TestEveryDeclaredTaskIsReachable:
+    """A harness task the prompt declares must have some caller able to send it.
+
+    ("eval", "evaluate") was declared, documented as the producer of
+    evaluation/report.json, and dispatched from nowhere -- while ("eval", "gate") was
+    dispatched and specified to READ that report. The pipeline's only eval task
+    consumed an input no path in the repo produced.
+
+    Nothing surfaced it, because the gate's fail-closed rule (correct, and load-bearing
+    for a different bug) renders a missing report as gate_passed=False -- identical to a
+    student that genuinely failed. Phase 4's FAILED verdict is trustworthy only because
+    eval ran DIRECTLY, outside the machine; through the machine the same verdict would
+    have been unfalsifiable.
+    """
+
+    def test_no_declared_task_is_unreachable(self, asl):
+        declared, dispatched = _declared_tasks(), _dispatched_tasks(asl)
+        orphaned = {k: v for k, v in declared.items() if k not in dispatched}
+        unexpected = {k: v for k, v in orphaned.items()
+                      if k not in UNDISPATCHED_HARNESS_TASKS}
+        assert not unexpected, (
+            "these harness tasks are declared in a prompt but no caller can send them: "
+            + "; ".join(f"{h}/{t} ({src})" for (h, t), src in sorted(unexpected.items()))
+            + ". The agent is told the task is its job and no path reaches it. Either "
+            "dispatch it, or add it to UNDISPATCHED_HARNESS_TASKS with the reason.")
+
+    def test_the_allowlist_does_not_outlive_its_entries(self, asl):
+        """An entry that HAS a dispatcher must leave the allowlist.
+
+        Otherwise wiring a task up leaves behind a note saying it is unreachable, and
+        the next reader trusts the note over the machine.
+        """
+        dispatched = _dispatched_tasks(asl)
+        stale = sorted(k for k in UNDISPATCHED_HARNESS_TASKS if k in dispatched)
+        assert not stale, (
+            f"these are dispatched now but still listed as unreachable: {stale}. "
+            "Remove them from UNDISPATCHED_HARNESS_TASKS.")
+
+    def test_the_eval_report_is_produced_before_it_is_gated(self, asl):
+        """The producer of evaluation/report.json must precede its consumer.
+
+        Asserted as reachability rather than a literal Next: the guarantee is ordering,
+        and it survives a state being inserted between them.
+        """
+        states = asl["States"]
+        gen = [n for n, st in states.items()
+               if ((st.get("Parameters") or {}).get("Payload") or {}).get("task")
+               == "evaluate"]
+        assert len(gen) == 1, f"expected exactly one evaluate state, found {gen}"
+        assert _reaches(states, gen[0], "EvalGate"), (
+            f"{gen[0]} produces evaluation/report.json but cannot reach EvalGate, "
+            "which reads it")
+        # Ordering is asserted on the ENTRY paths into the gate, not by demanding the
+        # gate cannot reach the generator: it can and must, because the remediation
+        # loop goes back around and re-evaluates (the next test pins that). What must
+        # hold is that no route ARRIVES at EvalGate without passing the generator
+        # first -- that is the reading a stale report would need.
+        entries = [n for n, st in states.items() if "EvalGate" in _exits(st)]
+        assert entries, "nothing transitions into EvalGate"
+        assert entries == [gen[0]], (
+            f"EvalGate is entered from {entries}; only {gen[0]} may lead into it, or a "
+            "run can reach the gate without the report it reads having been written")
+
+    def test_the_remediation_loop_regenerates_the_report_it_regates(self, asl):
+        """A second gate attempt must re-run evaluation, not re-read the stale report.
+
+        RemediateFinetune loops back to FinetuneAnalyze. If that path rejoined below
+        the evaluate state, iteration 2 would apply the gate to iteration 1's report --
+        it would score the OLD student and could "pass" a remediation that changed
+        nothing.
+        """
+        states = asl["States"]
+        gen = next(n for n, st in states.items()
+                   if ((st.get("Parameters") or {}).get("Payload") or {}).get("task")
+                   == "evaluate")
+        assert _reaches(states, "RemediateFinetune", gen), (
+            "the remediation loop rejoins the pipeline without passing through "
+            f"{gen}, so a re-gate would read the previous iteration's report")
+
+    def test_a_stage_event_exists_for_the_evaluate_completion(self):
+        """ModelEvaluated was in the vocabulary and emitted by nothing.
+
+        The absent event and the absent dispatcher are the same gap seen from two
+        sides, so the fix is only half done if the completion stays silent.
+        """
+        assert driver.STAGE_EVENT_MAP.get(("eval", "evaluate")) == ev.MODEL_EVALUATED
+        emitted = set(driver.STAGE_EVENT_MAP.values()) | {
+            ev.QUALITY_GATE_PASSED, ev.QUALITY_GATE_FAILED}
+        assert ev.MODEL_EVALUATED in emitted
 
 
 class TestConductorDispatch:

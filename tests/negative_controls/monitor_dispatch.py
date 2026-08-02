@@ -874,6 +874,27 @@ case("tasks: a failed audit write strands the signed acceptance it should not ga
       "::test_a_failed_audit_write_does_not_strand_a_signed_acceptance"])
 
 
+def m67(t):
+    """Restore the name collision the #33 merge produced.
+
+    Both branches wrote a guard for "how many harness-task states does the happy path
+    have", and both named the helper _happy_path_harness_states. git auto-merged the two
+    bodies without complaint -- no conflict marker, no failing test -- and Python kept
+    only the second, so the first test silently ran the WRONG derivation. A shadowed
+    helper is the quietest defect a clean merge can introduce, and the two walks are
+    independent (StartAt + stage/task vs PipelineModeChoice + harness_id), so the cross
+    -check is worth a control: this mutation renames the second back onto the first.
+    """
+    old = "def _happy_path_harness_state_count() -> int:"
+    assert old in t, "the renamed helper has moved; re-anchor this mutation"
+    return (t.replace(old, "def _happy_path_harness_states() -> int:", 1)
+             .replace("n = _happy_path_harness_state_count()",
+                      "n = _happy_path_harness_states()", 1))
+case("docs: the two happy-path derivations collide under one name and one shadows the other",
+     "tests/test_docs_claims.py", m67,
+     ["tests/test_docs_claims.py::test_the_documented_spine_matches_the_state_machine"])
+
+
 failed = []
 for name, rel, mutate, tests in CASES:
     p = REPO / rel

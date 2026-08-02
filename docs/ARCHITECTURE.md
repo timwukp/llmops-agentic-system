@@ -55,12 +55,12 @@ and intelligence lives *inside* each stage. An LLM deciding "what stage comes ne
 add nondeterminism, cost, and failure modes to the one part of the system that benefits
 from having none.
 
-The state machine (`orchestration/state_machine.asl.json`) has **10 harness-task states
+The state machine (`orchestration/state_machine.asl.json`) has **11 harness-task states
 on the happy path** — each a `waitForTaskToken` Lambda invocation of the harness driver
 — plus the loop-only `RemediateFinetune` and the audit-only `DataAudit`:
 
 ```
-DataPrepGenerate → DataPrepCurate → FinetuneLaunch → FinetuneAnalyze → EvalGate
+DataPrepGenerate → DataPrepCurate → FinetuneLaunch → FinetuneAnalyze → EvalGenerate → EvalGate
                                                         │ (gate fail)
                               RemediateFinetune ←───────┘   … then, on gate pass:
              Deploy → SmokeTest → MonitorHealth → Teardown → MonitorReport
@@ -230,6 +230,21 @@ Two spine details that are policy, not plumbing:
   failure skipped the `PlanAccepted` event and the worker enqueue that followed it,
   stranding a KMS-signed acceptance at `accepting`. Nothing reads this artifact back,
   which is exactly why nothing noticed — verify a write-only artifact by reading it.
+- **The gate's input is produced on the path that reads it.** `EvalGate` applies thresholds
+  to `evaluation/report.json`; until `EvalGenerate` was inserted above it, **nothing
+  dispatched the task that writes that report**. Both `evaluate` and `gate` are declared in
+  the eval harness prompt; only `gate` appeared in the ASL, so the only eval task the
+  pipeline could run read an input no path produced — the pipeline had never traversed
+  `evaluate → gate`. The gate's fail-closed rule (`metrics.get("gate_passed") is True`,
+  correct and load-bearing elsewhere) hid it perfectly: **a gate that failed because its
+  report was never generated reads exactly like a gate that failed because the student was
+  bad.** Phase 4's FAILED verdict stands only because eval was run *directly*, outside the
+  machine; through the machine the same verdict would have been unfalsifiable. The
+  completion now also emits `ModelEvaluated`, which was in the event vocabulary
+  (`pipeline/contracts/events.py`) and emitted by nothing — the same absence from the other
+  side. Guarded by tests that diff every task declared in a harness prompt against every
+  task any dispatcher actually sends, with the remaining orphans an explicit allowlist
+  rather than a count.
 - **`Teardown` always runs after deploy** — even when `SmokeTest` fails, its `Catch`
   routes to `Teardown` first. Orphaned endpoints are the #1 cost risk (Phase 4 found an
   unrelated endpoint in the account that had been InService since 2024-04).
@@ -468,7 +483,10 @@ and the old default-True coercion *promoted a null to a pass*. The fix in the dr
 ## 8. The remediation loop (≤ 3 iterations)
 
 `QualityGateChoice` fail → `RemediationChoice`: while `iteration < 3`,
-`IncrementIteration` → `RemediateFinetune` → back to `FinetuneAnalyze` → `EvalGate`.
+`IncrementIteration` → `RemediateFinetune` → back to `FinetuneAnalyze` →
+`EvalGenerate` → `EvalGate`. The loop rejoins **above** the generator, not between it
+and the gate: rejoining below would have iteration 2 re-gate iteration 1's report, and a
+remediation that changed nothing could "pass".
 Budget exhausted → `EscalateFail`. The same budget appears inside the agents' task
 prompts ("diagnose, fix, retry — max 3; then `escalate_human`"), so the machine-level
 and agent-level budgets agree.

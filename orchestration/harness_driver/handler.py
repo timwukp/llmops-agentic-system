@@ -45,6 +45,9 @@ STAGE_EVENT_MAP = {
     ("data-prep", "generate"): ev.DATASET_GENERATED,
     ("data-prep", "curate"): ev.DATASET_CURATED,
     ("finetune", "analyze"): ev.MODEL_TRAINED,
+    # ModelEvaluated was declared in the event vocabulary and emitted by NOTHING --
+    # the same absence as the evaluate task itself, from the other side.
+    ("eval", "evaluate"): ev.MODEL_EVALUATED,
     ("deploy", "deploy"): ev.MODEL_DEPLOYED,
     ("deploy", "smoke"): ev.SMOKE_TEST_PASSED,
     ("deploy", "teardown"): ev.ENDPOINT_DELETED,
