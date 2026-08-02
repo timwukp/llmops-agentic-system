@@ -67,7 +67,7 @@
 
   <path class="wireP" d="M120.0,252 L120.0,292" marker-end="url(#ahP)"/>
 
-  <text class="sub" x="120.0" y="286" text-anchor="middle">POSTs carry the access token</text>
+  <text class="sub" x="30" y="370">POSTs carry the access token</text>
   <a href="https://github.com/timwukp/llmops-agentic-system/blob/main/deploy/console/lambda_function.py" target="_top">
     <g>
       <rect class="card cSpine" x="286" y="196" width="200" height="56" rx="12"/>
@@ -119,7 +119,7 @@
 
   <path class="wireG" d="M486,242 L552,242 L552,352.0 L636,352.0" marker-end="url(#ahG)"/>
 
-  <text class="bandT" x="286" y="424">WRITE PLANE — one auth chokepoint for every POST; the cost gate is server-side, not in the UI</text>
+  <text class="bandT" x="430" y="424">WRITE PLANE — one auth chokepoint</text>
   <a href="https://github.com/timwukp/llmops-agentic-system/blob/main/orchestration/start_pipeline/handler.py" target="_top">
     <g>
       <rect class="card cOps" x="286" y="444" width="256" height="56" rx="12"/>
@@ -151,7 +151,7 @@
   <path class="wireR" d="M396,252 L396,384 L974.0,384 L974.0,440" marker-end="url(#ahR)"/>
 
   <text class="sub" x="974.0" y="520" text-anchor="middle">async → finops-reconcile λ → harness-driver λ → llmops_finops</text>
-  <text class="sub" x="414.0" y="520" text-anchor="middle">$2000 gate: advisory now, blocking by env</text>
+  <text class="sub" x="286" y="520">$2000 gate, server-side not in the UI: advisory now, blocking by env</text>
   <text class="bandT" x="286" y="570">CONSULT PLANE — Tasks tab: one thread per engagement · the only console path that invokes an agent</text>
   <a href="https://github.com/timwukp/llmops-agentic-system/blob/main/deploy/console/lambda_function.py" target="_top">
     <g>

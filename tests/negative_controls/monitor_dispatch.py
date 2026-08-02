@@ -940,6 +940,83 @@ case("finops: COST.md states the budget's Bedrock filter without saying what it 
      ["tests/test_cost_model.py::test_the_orphans_monthly_figure_is_derived_and_the_budget_filter_is_stated_both_ways"])
 
 
+def m70(t):
+    """Put the stale Lambda count back in the English README.
+
+    The count guard existed and passed for 21 merged PRs while both READMEs said 5 and the
+    deployer deployed 6, because the guard read PROJECT_STATE.md only. That is the shape of
+    the drift: the one file a count guard watches is the one file that gets corrected, since
+    it is the only file the failure names. This mutation restores the stale digit in a file
+    the guard did not used to read.
+    """
+    old = "state machine + 6 Lambdas"
+    assert old in t, "the README's Lambda line has moved; re-anchor this mutation"
+    return t.replace(old, "state machine + 5 Lambdas", 1)
+
+
+case("docs: the English README states 5 Lambdas again while the deployer deploys 6",
+     "README.md", m70,
+     ["tests/test_docs_claims.py::test_the_documented_state_and_lambda_counts_match_the_deployers"])
+
+
+def m71(t):
+    """Drop monitor-sweep from the README's Lambda list but leave the digit at 6.
+
+    This is the more interesting half, and the half a digit-only guard cannot see: the
+    stale README did not just miscount, it named four functions for a fleet of six. A
+    reader who trusts the list goes looking for the sweep's code and concludes it does not
+    exist. So the names beside the number are asserted too, and this mutation breaks only
+    the names.
+    """
+    old = "(driver / start / resume / webhook / finops / monitor-sweep)"
+    assert old in t, "the README's Lambda name list has moved; re-anchor this mutation"
+    return t.replace(old, "(driver / start / resume / webhook / finops)", 1)
+
+
+case("docs: the README's Lambda list omits monitor-sweep while the count still reads 6",
+     "README.md", m71,
+     ["tests/test_docs_claims.py::test_the_documented_state_and_lambda_counts_match_the_deployers"])
+
+
+def m72(t):
+    """Turn the negative-control claim back into an adjective with no number in it.
+
+    "Every guard was mutation-checked" is the exact sentence that stood while nothing
+    counted the controls: a control deleted, or a guard added with no control at all, left
+    it reading true. An adjective cannot go stale, which is why it is worthless as evidence.
+    This mutation removes the count and the guard must refuse the sentence that remains.
+    """
+    start = t.index("reverted one at a time and the test confirmed to fail")
+    end = t.index("\n", start)
+    line = t[start:end]
+    assert "negative controls" in line, "the count has moved out of this sentence"
+    return t[:start] + "reverted one at a time and the test confirmed to fail. A test that" + t[end:]
+
+
+case("docs: TEST_RESULTS' mutation-check claim loses its count and becomes an adjective",
+     "docs/TEST_RESULTS.md", m72,
+     ["tests/test_docs_claims.py::test_the_documented_negative_control_count_matches_the_runner"])
+
+
+def m73(t):
+    """Delete the shell suite's row from the evidence file.
+
+    This is not hypothetical: `test_capacity_race_guard.sh` ran in CI on every push for
+    days while both TEST_RESULTS variants reported the pytest total alone, so the evidence
+    understated what was verified. The pytest-derived count guard is structurally unable to
+    notice -- a shell suite is not a pytest test -- so a second suite needs a second
+    derivation, and this mutation removes what that derivation checks.
+    """
+    start = t.index("| Shell suite")
+    end = t.index("\n", start) + 1
+    return t[:start] + t[end:]
+
+
+case("docs: the shell suite CI runs on every push vanishes from the evidence file",
+     "docs/TEST_RESULTS.md", m73,
+     ["tests/test_docs_claims.py::test_the_shell_suite_is_documented_with_its_assertion_count"])
+
+
 failed = []
 for name, rel, mutate, tests in CASES:
     p = REPO / rel

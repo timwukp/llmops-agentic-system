@@ -8,23 +8,79 @@ corridor, and none may pass through a card. Regenerate + re-verify after every
 edit; never hand-edit the SVGs.
 
 Every label here is a claim about the running system, so each is derived from a
-file in this repo and cross-checked against the deployed resource. Two labels in
-the previous version were falsified by that check and are fixed:
+file in this repo and cross-checked against the deployed resource. That check has
+caught the same failure mode three times now, and the third catch is the one worth
+keeping, because what it falsified was this docstring:
 
-  * "git in dev, S3 mirror in prod" — all 19 skill mounts across all 7 live
-    harnesses are `git`; no `s3` source exists anywhere. The mirror exists
-    (`ensure_skills` in deploy/03_storage.py) but nothing has been switched to it.
   * "VPC-isolated in production" — no live harness carries a
     networkConfiguration, so all 7 run PUBLIC. ARCHITECTURE.md §11 says as much;
     the diagram was asserting the aspiration as shipped fact.
+  * "git in dev, S3 mirror in prod" — corrected once to "all 19 mounts are `git`;
+    the mirror exists but nothing is switched to it", which was true when written.
+  * That correction was then falsified by the migration it described. All 19 skill
+    mounts across all 7 live harnesses are `s3`; no `git` source exists anywhere.
+    The band text and this paragraph both went on saying `git` afterwards — a
+    corrected claim decaying back into a false one, with the correction's own prose
+    vouching for it.
 
-Both were the same failure mode as the stale doc counts: a design read as a
-delivered feature. The footer now states what is true and names the gap.
+So stating the right value is not the fix; deriving it is.
+tests/test_docs_claims.py::test_the_diagram_text_states_the_real_skill_source_kind
+reads the harness configs and requires the band to name whichever kind is actually
+configured, so the next migration fails a test instead of ageing a comment.
 """
+import glob as _glob
+import json as _json
 import os
 
 OUT = os.path.dirname(os.path.abspath(__file__))
 REPO = "https://github.com/timwukp/llmops-agentic-system/blob/main/"
+
+
+def _repo_root():
+    """Locate the repo whose configs the labels are derived from.
+
+    `docs/..` normally, but tests/test_svg_geometry.py copies this file into a temp
+    dir and runs it with cwd=repo to compare bytes, so `docs/..` is that temp dir
+    there. Falling back to cwd keeps that comparison meaningful; without it the
+    generator would read no configs under test and could emit anything.
+    """
+    for root in (os.path.dirname(OUT), os.getcwd()):
+        if os.path.isdir(os.path.join(root, "agents")):
+            return root
+    raise SystemExit(
+        "cannot find the agents/ configs this generator derives its labels from; "
+        "run it from the repo root (python3 docs/gen_architecture_svg.py)")
+
+
+def skill_mounts():
+    """(count, kind) of skill sources across every live harness config.
+
+    Derived, not written down. The band used to state the kind as prose and it went
+    on saying `git` for two days after every mount became `s3` — see the module
+    docstring. A generator that reads the configs cannot make that mistake; a stale
+    committed SVG is then caught twice over, by the geometry suite's byte comparison
+    against this generator and by the docs-claims guard on the band text itself.
+    """
+    root, kinds = _repo_root(), {}
+    cfgs = sorted(_glob.glob(os.path.join(root, "agents", "*", "harness*.json")))
+    assert cfgs, f"no agents/*/harness*.json under {root}"
+    for cfg in cfgs:
+        with open(cfg) as fh:
+            for skill in _json.load(fh).get("skills") or []:
+                for kind in ("git", "s3", "path", "awsSkills"):
+                    if kind in skill:
+                        kinds[kind] = kinds.get(kind, 0) + 1
+    total = sum(kinds.values())
+    # A mixed fleet is a real condition, not a label problem: some harnesses would
+    # read a pinned snapshot and others float on a branch. Say so rather than
+    # picking a majority kind and printing a sentence that is half true.
+    if len(kinds) != 1:
+        return total, "+".join(f"{n} {k}" for k, n in sorted(kinds.items()))
+    return total, next(iter(kinds))
+
+
+SKILL_N, SKILL_KIND = skill_mounts()
+HARNESS_N = len(sorted(_glob.glob(os.path.join(_repo_root(), "agents", "*", "harness.json"))))
 
 STYLE = """
   <defs>
@@ -81,8 +137,8 @@ def wire(d, cls="wire", marker="ahB"):
     return f'  <path class="{cls}" d="{d}" marker-end="url(#{marker})"/>\n'
 
 
-# ================= HIGH-LEVEL (1240 x 900) =================
-W, H = 1240, 900
+# ================= HIGH-LEVEL (1240 x 1060) =================
+W, H = 1240, 1060
 CW, CH = 180, 56
 svg = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" font-family="system-ui,-apple-system,\'Segoe UI\',Roboto,sans-serif">']
 svg.append(STYLE)
@@ -103,7 +159,7 @@ for (icon, name, sub), y in zip(trigs, trig_y):
 # Column 2 (x=286): conductor on top, then spine, stacked
 svg.append(card(286, 92, CW, CH, "cAgent", "🎼", "llmops_orchestrator", "goal → plan → dispatch · triage", "agents/orchestrator/harness.json"))
 svg.append(card(286, 168, CW, CH, "cSpine", "🚀", "start_pipeline λ", "run_id · manifest seed", "orchestration/start_pipeline/handler.py"))
-svg.append(card(286, 282, CW, CH, "cSpine", "🧭", "Step Functions", "stage DAG · data_audit mode · waitForTaskToken", "orchestration/state_machine.asl.json"))
+svg.append(card(286, 282, CW, CH, "cSpine", "🧭", "Step Functions", "stage DAG · waitForTaskToken", "orchestration/state_machine.asl.json"))
 svg.append(card(286, 396, CW, CH, "cSpine", "🔌", "harness-driver λ", "InvokeHarness · inline-fn loop", "orchestration/harness_driver/handler.py"))
 
 # triggers -> conductor (goal intake; each its own corridor into left edge, staggered entry y)
@@ -143,7 +199,11 @@ svg.append(card(850, 388, CW, CH, "cAws", "🌐", "SageMaker Endpoint", "student
 
 # harnesses -> AWS (data-prep->bedrock, finetune->training, deploy->endpoint; own corridors)
 svg.append(wire(f"M{560+CW},{92+CH/2} L{846},{92+CH/2}", "wireG", "ahG"))
-svg.append(wire(f"M{560+CW},{190+CH/2} L{800},{190+CH/2} L{800},{240+CH/2} L{846},{240+CH/2}", "wireG", "ahG"))
+# Enters Training's left edge at y=252, not at its mid-height y=268: the
+# "gate fail → remediate" label occupies y 262..274 across x 738..873, so ANY
+# horizontal leg at 268 struck through it -- moving the corner sideways cannot help,
+# only going above the label can. Both legs now sit above y=262.
+svg.append(wire(f"M{560+CW},{190+CH/2} L{800},{190+CH/2} L{800},{252} L{846},{252}", "wireG", "ahG"))
 svg.append(wire(f"M{560+CW},{386+CH/2} L{800},{386+CH/2} L{800},{388+CH/2+14} L{846},{388+CH/2+14}", "wireG", "ahG"))
 
 # training-complete resume: SageMaker Training -> EventBridge rule -> Step Functions.
@@ -172,19 +232,41 @@ svg.append(wire(f"M{1040+CW/2},{240+CH} L{1040+CW/2},{320} L{1035},{320} "
 
 # Console (x=1080 vertical strip) reads everything — dim wires, no crossings (right margin corridor)
 svg.append(card(1040, 505, 186, CH, "cOps", "🖥️", "llmops-admin console", "obs · evals · opts · cost", "deploy/console/README.md"))
-svg.append(f'  <text class="sub" x="{1040+93}" y="{505-10}" text-anchor="middle" fill="#ff6b81">reads traces · reports · runs · spend</text>')
+# Left-anchored at the card's own left edge, not centred on it: centred, this caption
+# began at x=1037 and the resume wire's descent down the x=1035 corridor ran along its
+# left end. The corridor is deliberately just west of the console column (see the
+# comment above), so any label centred on that column reaches back into it.
+svg.append(f'  <text class="sub" x="1042" y="{505-10}" fill="#ff6b81">reads traces · reports · runs · spend</text>')
 
 # ---- FinOps audit plane (its own row below the pipeline: it runs beside the
 # state machine, not inside it — daily, spanning many finished runs) ----
-svg.append(f'  <text class="bandT" x="30" y="550">AUDIT PLANE — reconciles what was actually spent · cannot stop a run · read-only billing IAM</text>')
-svg.append(card(30, 560, CW, CH, "cTrig", "⏰", "finops-daily", "cron 09:00 UTC · billing reads only", "docs/COST.md"))
-svg.append(card(286, 560, CW, CH, "cSpine", "🧮", "finops-reconcile λ", "period select · D-2 + re-settle", "orchestration/finops_reconcile/handler.py"))
-svg.append(card(560, 582, CW, CH, "cAgent", "🧾", "llmops_finops", "auditor · reconcile / rates / report", "agents/finops/harness.json"))
-svg.append(card(850, 582, CW, CH, "cAws", "💰", "Cost Explorer · Price List", "resource-level actuals · unit rates", "docs/COST.md"))
-svg.append(wire(f"M{30+CW},{560+CH/2} L{282},{560+CH/2}", "wireP", "ahP"))
-svg.append(wire(f"M{466},{560+CH/2} L{511},{560+CH/2} L{511},{582+CH/2} L{556},{582+CH/2}", "wireO", "ahO"))
-svg.append(f'  <text class="sub" x="511" y="{560+CH/2-8}" text-anchor="middle">via harness-driver λ</text>')
-svg.append(wire(f"M{740},{582+CH/2} L{846},{582+CH/2}", "wireG", "ahG"))
+# y=556, not y=550: the resume wire runs west along y=545, and an 11px band label
+# baselined at 550 has its ascenders at ~541 -- so the wire struck through the text.
+# Nothing caught it, because no check read text against wires until
+# `wire_through_text` in tests/test_svg_geometry.py. Four labels on main were being
+# crossed this way, this one included.
+#
+# 556 and not 554, which is what the check first accepted: at 554 the estimated
+# ascent line lands at 545.2 and clears the wire by 0.2px, i.e. it PASSES a check
+# built on an estimate while rendering as a strikethrough. TEXT_WIRE_CLEARANCE_PX in
+# the check now demands real separation, because a threshold of zero on an estimated
+# box is a threshold on rounding.
+#
+# Which then showed that 556 does not fit either: the lane between the last pipeline
+# card and the audit row is only 15px, and an 11px heading cannot sit in it with real
+# clearance on both sides. So the whole audit row moves DOWN 16px (AY/AY2 below)
+# rather than the heading being squeezed -- the canvas has the room, and shaving the
+# clearance to make a check pass is how the strikethrough shipped in the first place.
+AY, AY2 = 576, 598
+svg.append(f'  <text class="bandT" x="30" y="{AY-8}">AUDIT PLANE — reconciles what was actually spent · cannot stop a run · read-only billing IAM</text>')
+svg.append(card(30, AY, CW, CH, "cTrig", "⏰", "finops-daily", "cron 09:00 UTC · billing reads only", "docs/COST.md"))
+svg.append(card(286, AY, CW, CH, "cSpine", "🧮", "finops-reconcile λ", "period select · D-2 + re-settle", "orchestration/finops_reconcile/handler.py"))
+svg.append(card(560, AY2, CW, CH, "cAgent", "🧾", "llmops_finops", "auditor · reconcile / rates / report", "agents/finops/harness.json"))
+svg.append(card(850, AY2, CW, CH, "cAws", "💰", "Cost Explorer · Prices", "resource-level actuals · unit rates", "docs/COST.md"))
+svg.append(wire(f"M{30+CW},{AY+CH/2} L{282},{AY+CH/2}", "wireP", "ahP"))
+svg.append(wire(f"M{466},{AY+CH/2} L{511},{AY+CH/2} L{511},{AY2+CH/2} L{556},{AY2+CH/2}", "wireO", "ahO"))
+svg.append(f'  <text class="sub" x="511" y="{AY+CH/2-8}" text-anchor="middle">via harness-driver λ</text>')
+svg.append(wire(f"M{740},{AY2+CH/2} L{846},{AY2+CH/2}", "wireG", "ahG"))
 
 # Self-iteration loop (eval -> finetune remediation).
 #
@@ -195,21 +277,122 @@ svg.append(wire(f"M{740},{582+CH/2} L{846},{582+CH/2}", "wireG", "ahG"))
 # is straight up it: eval's TOP edge to finetune's BOTTOM edge, two edges no
 # other wire uses.
 svg.append(wire(f"M{560+CW/2},{288-4} L{560+CW/2},{190+CH+4}", "wireR", "ahR"))
-svg.append(f'  <text class="sub" x="{560+CW+66}" y="{270}" text-anchor="middle" fill="#ff6b81">gate fail → remediate (≤3)</text>')
+# Left-anchored at x=660 rather than centred at x=806: centred, this label ran from
+# x 738 to 873 and its last 23px lay ON TOP of the SageMaker Training card at x=850
+# -- a free-standing label overlapping an unrelated card, which the geometry checks
+# could not see because they only test wires against cards. `label_over_card` in
+# tests/test_svg_geometry.py tests this now. x 655..845 is the one clear lane here:
+# right of the remediation wire at x=650, left of the card at x=850, in the empty
+# gap between the finetune and eval cards.
+svg.append(f'  <text class="sub" x="660" y="{270}" fill="#ff6b81">gate fail → remediate (≤3)</text>')
 
 # escalation triage: EscalatedToHuman events -> conductor first (top-margin corridor, no crossings)
 svg.append(wire(f"M{560+CW/2},{92-4+0} M0,0", "wireDim", "ahR"))  # placeholder no-op keeps numbering
 svg.pop()
 svg.append(wire(f"M{560+CW/2},{92} L{560+CW/2},{78} L{286+CW/2+30},{78} L{286+CW/2+30},{92-4}", "wireR", "ahR"))
-svg.append(f'  <text class="sub" x="{460}" y="{72}" text-anchor="middle" fill="#ff6b81">escalations → conductor triage first · page human only if needed</text>')
+# On the subtitle's own line, east of where it ends, rather than in the 32px gap
+# between the subtitle and the first card row. That gap has to hold this label AND
+# the triage wire's horizontal run at y=78, and it cannot: centred at (460,72) the
+# wire ran 5px under the text; raised to y=68 the label then overlapped the subtitle
+# above it. Text-over-text is a fourth defect class the geometry checks were blind to
+# -- cards-vs-cards, wires-vs-cards, wires-vs-text and labels-vs-cards were all
+# checked by then, and two labels on top of each other was the combination left over.
+# `overlapping_labels` in tests/test_svg_geometry.py covers it now.
+svg.append(f'  <text class="sub" x="666" y="60" fill="#ff6b81">escalations → conductor triage first · page human only if needed</text>')
+
+# ---- GOVERNANCE / OPERATIONS row (y 690..746): the live subsystems the drawing
+# omitted. Every wire here was traced in the source before it was drawn, and three
+# wires the plan for this row named DO NOT EXIST:
+#
+#   * monitor-sweep -> SNS. monitor_sweep/handler.py builds an SNS client (line 63)
+#     and never publishes. Its only outbound calls are invoke(DRIVER_FN) and a
+#     record_outcome write to EVENTS_TABLE. All three publishes live in the DRIVER
+#     (handle_escalate, page_human, flag_variance), so the topic hangs off the
+#     driver, not the sweep.
+#   * monitor-sweep -> Macie. The macie2 reads are in the DATA-PREP harness prompt
+#     (read-only: list/describe-classification-job, list-findings). The sweep never
+#     touches Macie; the scan covers customer-data/ uploads, which is a data-prep
+#     concern, so Macie is drawn against the upload prefix it actually scans.
+#   * the four triggers -> conductor. Three of the four go straight to
+#     start-pipeline (verified: 08_triggers.py:263 nightly, run-pipeline.yml:50
+#     `aws lambda invoke --function-name llmops-start-pipeline`, and the console's
+#     START_FN default). Only the Tasks tab reaches the orchestrator, and it does so
+#     by invoke_harness on the data plane, not through the driver.
+#
+# Drawing a wire that does not exist is the same defect class as a label that has
+# decayed -- it is just harder to catch, because no test reads a picture. So the row
+# is deliberately sparse: four cards, four wires, each one traced to a line number.
+# The pipeline's interior is sealed on every side, and the geometry suite proved it
+# rather than my guessing: the audit-plane row (cards at y 576..654) plus the
+# resume wire's westward run at y=545 (x 272..1035) plus the finops schedule wire
+# at y=604 (x 210..282) leave no lane by which a card on a bottom row can reach the
+# driver. Every route attempted produced a real CROSS or THROUGH-CARD.
+#
+# So this row draws only the edges that are BOTH true and local, and states the
+# cross-plane ones as text. That is not a cop-out; it is the pattern this file
+# already uses one row up, where reconcile λ -> llmops_finops carries the sub-label
+# "via harness-driver λ" instead of a wire snaking through the spine. A wire I cannot
+# draw cleanly becomes a sentence; a wire that is not true does not get drawn at all:
+#
+#   * monitor-sweep -> SNS does not exist. monitor_sweep/handler.py builds an SNS
+#     client (line 63) and never publishes. Its only outbound calls are
+#     invoke(DRIVER_FN) (145-146) and a record_outcome write to EVENTS_TABLE (115).
+#     All three publishes are the DRIVER's: handle_escalate, page_human, flag_variance.
+#   * monitor-sweep -> Macie does not exist either. The macie2 reads (list/describe
+#     -classification-job, list-findings, read-only) are in the DATA-PREP harness
+#     prompt, over the customer-data/ uploads it audits.
+yg = 690
+svg.append(f'  <text class="bandT" x="30" y="{yg-12}">GOVERNANCE / OPERATIONS — runs on its own schedule, outside any run\'s lifetime · the sweep looks for spend nobody has claimed</text>')
+svg.append(card(30, yg, CW, CH, "cTrig", "⏰", "monitor-sweep-daily", "cron 08:00 UTC · ENABLED", "deploy/08_triggers.py"))
+svg.append(card(286, yg, CW, CH, "cSpine", "🧹", "monitor-sweep λ", "account-wide idle scan", "orchestration/monitor_sweep/handler.py"))
+svg.append(card(560, yg, CW, CH, "cOps", "🗂️", "stage-events row", "sweep outcome · never a runs row", "orchestration/monitor_sweep/handler.py"))
+
+# Both wires are row-local horizontals on y=688, an entirely new corridor: schedule
+# -> sweep λ -> its stage-events write. These are the sweep's only two real edges
+# besides the driver invoke, which the card's own sub-label names.
+svg.append(wire(f"M{30+CW},{yg+CH/2} L{282},{yg+CH/2}", "wireP", "ahP"))
+svg.append(wire(f"M{286+CW},{yg+CH/2} L{556},{yg+CH/2}", "wire", "ahB"))
+
+# The two facts that have no clean wire, said plainly rather than drawn wrongly.
+# Wrapped by hand to the 1240 canvas: the geometry suite checks wires and cards, not
+# text width, so an over-long line runs off the edge and every check still passes.
+# The widths below are measured against W-30, not eyeballed.
+_GOV_NOTES = [
+    ('📣 SNS llmops-escalations (1 confirmed subscriber) is published by the ', "#ff6b81", 'harness-driver λ',
+     ' — escalate ·'),
+    ('page_human · flag_variance — not by the sweep, which only invokes it. 🔍 Macie job ', None, '',
+     'llmops-customer-data-pii'),
+    ('(SCHEDULED daily, scoped customer-data/) is read read-only by the ', "#ffb454", 'data-prep harness',
+     ', whose audit'),
+    ('must state "no Macie job covers this data" whenever none does.', None, '', ''),
+]
+for i, (pre, colour, mid, post) in enumerate(_GOV_NOTES):
+    span = f'<tspan fill="{colour}">{mid}</tspan>' if colour else mid
+    svg.append(f'  <text class="sub" x="560" y="{yg + 78 + i*18}">{pre}{span}{post}</text>')
 
 # State band at bottom. Table list matches the five that actually exist:
 # llmops-pipeline-runs, -stage-events, -tasks, -cost-actuals, -cost-estimates.
-yb = 700
-svg.append(f'  <rect class="band" x="30" y="{yb}" width="{W-60}" height="86" rx="14"/>')
-svg.append(f'  <text class="bandT" x="50" y="{yb+26}">STATE — S3 runs/&lt;run_id&gt;/manifest.json · finops/rates rate card · customer-data/ uploads · DynamoDB runs + stage-events + tasks + cost-actuals + cost-estimates · shared Memory</text>')
-svg.append(f'  <text class="sub" x="50" y="{yb+48}">skills mounted from MLOps-agent-skills — all 19 mounts across all 7 harnesses are git today; the S3 mirror exists (ensure_skills) but nothing is switched to it yet</text>')
-svg.append(f'  <text class="sub" x="50" y="{yb+66}">network: all 7 harnesses run PUBLIC (no networkConfiguration); the VPC is built but no VPC harness variant ships · least-privilege IAM, no *FullAccess · TEST-PROVEN gates per phase</text>')
+#
+# The band title is TWO lines, one per store, because as one line it was ~1216px
+# wide on a 1240 canvas starting at x=50 -- i.e. it ran off the right edge, and had
+# done so on main. Every geometry check passed the whole time: none of them read
+# text. `overflowing_text` in tests/test_svg_geometry.py now does, so a line that
+# does not fit fails the suite instead of being noticed by eye or not at all.
+yb = 860
+svg.append(f'  <rect class="band" x="30" y="{yb}" width="{W-60}" height="104" rx="14"/>')
+svg.append(f'  <text class="bandT" x="50" y="{yb+24}">STATE — S3: runs/&lt;run_id&gt;/manifest.json · finops/rates rate card · customer-data/ uploads</text>')
+svg.append(f'  <text class="bandT" x="50" y="{yb+44}">DynamoDB: runs + stage-events + tasks + cost-actuals + cost-estimates · AgentCore: shared Memory</text>')
+# The kind is interpolated from the configs (see skill_mounts) rather than typed,
+# because typing it is precisely what decayed. The trailing clause says what the
+# kind MEANS operationally, since "s3" alone does not tell a reader that no harness
+# reaches GitHub at session start any more.
+_MOUNT_MEANS = {
+    "s3": "a pinned snapshot in the platform bucket (ensure_skills), so no harness reads GitHub at session start",
+    "git": "read from GitHub at session start; the S3 mirror exists (ensure_skills) but nothing is switched to it yet",
+}
+svg.append(f'  <text class="sub" x="50" y="{yb+68}">skills mounted from MLOps-agent-skills — all {SKILL_N} mounts across all {HARNESS_N} harnesses are {SKILL_KIND}: '
+           f'{_MOUNT_MEANS.get(SKILL_KIND, "a MIXED fleet — some pinned, some floating on a branch; that is a partial migration, not a steady state")}</text>')
+svg.append(f'  <text class="sub" x="50" y="{yb+86}">network: all 7 harnesses run PUBLIC (no networkConfiguration); the VPC is built but no VPC harness variant ships · least-privilege IAM, no *FullAccess · TEST-PROVEN gates per phase</text>')
 
 svg.append('</svg>')
 open(os.path.join(OUT, "architecture-high-level.svg"), "w").write("\n".join(svg))
@@ -231,7 +414,7 @@ svg.append('  <text class="bandT" x="306" y="128">AGENTCORE HARNESS SESSION (mic
 svg.append(card(316, 150, CW, CH, "cAgent", "🧠", "Fable 5 agent loop", "Strands · maxIterations 100", "agents/README.md"))
 svg.append(card(316, 260, CW, CH, "cDim", "📚", "mounted skills", "MLOps-agent-skills llmops/*", "agents/data-prep/harness.json"))
 svg.append(card(316, 370, CW, CH, "cDim", "🐚", "shell + code interpreter", "aws cli · python", "agents/README.md"))
-svg.append(card(660, 150, CW + 40, CH, "cOps", "🧩", "inline functions", "stage_complete · job_launched · finops audit tools …", "agents/README.md"))
+svg.append(card(660, 150, CW + 40, CH, "cOps", "🧩", "inline functions", "stage_complete · job_launched · audit …", "agents/README.md"))
 svg.append(card(660, 260, CW + 40, CH, "cDim", "🗃️", "shared BYO memory", "SEMANTIC + EPISODIC · cross-run", "deploy/04_wire_memory.py"))
 svg.append(card(660, 370, CW + 40, CH, "cDim", "🛰️", "OTel traces", "always_on → console evals", "deploy/06_observability.py"))
 
@@ -239,7 +422,12 @@ svg.append(card(660, 370, CW + 40, CH, "cDim", "🛰️", "OTel traces", "always
 svg.append(wire(f"M{30+CW},{240+CH/2-10} L{286-4},{240+CH/2-10}", "wireO", "ahO"))
 svg.append(wire(f"M{286},{240+CH/2+12} L{30+CW+4},{240+CH/2+12}", "wireR", "ahR"))
 svg.append(f'  <text class="sub" x="245" y="{240+CH/2-18}" text-anchor="middle">invoke</text>')
-svg.append(f'  <text class="sub" x="250" y="{240+CH+26}" text-anchor="middle">pause: stopReason=tool_use</text>')
+# Centred at x=230, not 250: at 250 the estimated right edge reached x=318 and grazed
+# the mounted-skills card that starts at x=316. Two px of overlap is not a legibility
+# problem by itself, but the reason to move it is that the check cannot tell 2px of
+# real overlap from 2px of width-estimate error -- and a label that has to be argued
+# about is a label in the wrong place.
+svg.append(f'  <text class="sub" x="230" y="{240+CH+26}" text-anchor="middle">pause: stopReason=tool_use</text>')
 
 # inside wiring: agent loop -> skills -> shell (vertical), agent -> inline fns (horizontal)
 svg.append(wire(f"M{316+CW/2},{150+CH} L{316+CW/2},{260-4}", "wireDim", "ahB").replace("wireDim", "wire"))
@@ -294,7 +482,12 @@ svg.append(card(30, 196, CW, CH, "cTrig", "🚪", "HTTP API Gateway", "routes / 
 svg.append(card(30, 296, CW, CH, "cTrig", "🔐", "Cognito user pool", "access token + httpOnly refresh", "deploy/console/README.md"))
 svg.append(wire(f"M{30+CW/2},{96+CH} L{30+CW/2},{196-4}", "wireP", "ahP"))
 svg.append(wire(f"M{30+CW/2},{196+CH} L{30+CW/2},{296-4}", "wireP", "ahP"))
-svg.append(f'  <text class="sub" x="{30+CW/2}" y="{296-10}" text-anchor="middle">POSTs carry the access token</text>')
+# Below the Cognito card, not between the cards: at y=286 this caption was crossed
+# first by the very wire it annotates (centred on x=120) and then, once moved east,
+# by the consult drop at x=254. The band y 278..289 is pierced by five verticals
+# (120, 254, and the three write-plane exits at 316/356/396), so no x in it is
+# clear. Under the card at y=370 nothing crosses at all.
+svg.append(f'  <text class="sub" x="30" y="{296+CH+18}">POSTs carry the access token</text>')
 
 # ---- the one handler ----
 LAMX, LAMY, LAMW = 286, 196, CW + 20
@@ -335,7 +528,13 @@ for i, (_, _, _, _, x, y) in enumerate(reads):
     svg.append(wire(f"M{lam_r},{src_y} L{corr},{src_y} L{corr},{y+CH/2} L{x-4},{y+CH/2}", "wireG", "ahG"))
 
 # ---- WRITE PLANE (middle): every POST through one auth chokepoint ----
-svg.append('  <text class="bandT" x="286" y="424">WRITE PLANE — one auth chokepoint for every POST; the cost gate is server-side, not in the UI</text>')
+# Placed at x=430, not x=286, and shortened: this band is full of vertical corridors
+# (the three lambda exits at x 316/356/396, the three card entries at 414/694/974,
+# and the consult drop at 254), so the long heading at x=286 was struck through by
+# two of them. The only clear gap in the row is x 430..690, which is 260px -- hence
+# the shorter wording. The dropped clause is not dropped: "server-side" moved onto
+# the gate label below, which is where a reader looks for it anyway.
+svg.append('  <text class="bandT" x="430" y="424">WRITE PLANE — one auth chokepoint</text>')
 WW = CW + 76
 wy = 444
 svg.append(card(286, wy, WW, CH, "cOps", "▶️", "POST /api/start-run", "dispatch a pipeline run", "orchestration/start_pipeline/handler.py"))
@@ -350,7 +549,9 @@ for i in range(3):
     ex = LAMX + 30 + i * 40
     svg.append(wire(f"M{ex},{LAMY+CH} L{ex},{404-i*10} L{tx},{404-i*10} L{tx},{wy-4}", "wireR", "ahR"))
 svg.append(f'  <text class="sub" x="{286 + 2*(WW+24) + WW/2}" y="{wy+CH+20}" text-anchor="middle">async → finops-reconcile λ → harness-driver λ → llmops_finops</text>')
-svg.append(f'  <text class="sub" x="{286 + WW/2}" y="{wy+CH+20}" text-anchor="middle">$2000 gate: advisory now, blocking by env</text>')
+# Left-anchored on the card's left edge rather than centred under it: centred, this
+# label began at x~253 and the consult drop down x=254 struck through it.
+svg.append(f'  <text class="sub" x="286" y="{wy+CH+20}">$2000 gate, server-side not in the UI: advisory now, blocking by env</text>')
 
 # ---- CONSULT PLANE (bottom): the Tasks tab -- the only plane that talks to an agent ----
 #

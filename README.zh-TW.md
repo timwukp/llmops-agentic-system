@@ -125,7 +125,7 @@ Gateway，搭配 Cognito 認證：讀取公開，所有寫入都必須帶 Bearer
 
 ```
 agents/           7 個 harness 配置（5 個專家 + 指揮家 + finops 審計員）+ 提示詞
-orchestration/    狀態機 + 5 個 Lambda（driver / start / resume / webhook / finops）
+orchestration/    狀態機 + 6 個 Lambda（driver / start / resume / webhook / finops / monitor-sweep）
 deploy/           編號冪等部署腳本 + 最小權限 IAM + 驗證證據
 pipeline/         訓練入口 + 契約（manifest schema、事件、報告）
 tests/            單元測試 · golden agent 測試 · e2e 驅動 · SVG 幾何檢查

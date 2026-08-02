@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1240 900" font-family="system-ui,-apple-system,'Segoe UI',Roboto,sans-serif">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1240 1060" font-family="system-ui,-apple-system,'Segoe UI',Roboto,sans-serif">
 
   <defs>
     <marker id="ahB" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto">
@@ -36,7 +36,7 @@
     </style>
   </defs>
 
-  <rect class="bg" x="0" y="0" width="1240" height="900" rx="16"/>
+  <rect class="bg" x="0" y="0" width="1240" height="1060" rx="16"/>
   <text class="title" x="30" y="40" font-size="18">llmops-agentic-system — autonomous LLMOps on AgentCore</text>
   <text class="sub" x="30" y="60">teacher DeepSeek-R1 (Bedrock) → student Qwen3-1.7B (SageMaker QLoRA) · 7 harnesses, all on Fable 5 · click any card</text>
   <a href="https://github.com/timwukp/llmops-agentic-system/blob/main/docs/TRIGGERS.md" target="_top">
@@ -91,7 +91,7 @@
     <g>
       <rect class="card cSpine" x="286" y="282" width="180" height="56" rx="12"/>
       <text class="title" x="376.0" y="306" text-anchor="middle">🧭 Step Functions</text>
-      <text class="sub" x="376.0" y="324" text-anchor="middle">stage DAG · data_audit mode · waitForTaskToken</text>
+      <text class="sub" x="376.0" y="324" text-anchor="middle">stage DAG · waitForTaskToken</text>
     </g>
   </a>
 
@@ -193,7 +193,7 @@
 
   <path class="wireG" d="M740,120.0 L846,120.0" marker-end="url(#ahG)"/>
 
-  <path class="wireG" d="M740,218.0 L800,218.0 L800,268.0 L846,268.0" marker-end="url(#ahG)"/>
+  <path class="wireG" d="M740,218.0 L800,218.0 L800,252 L846,252" marker-end="url(#ahG)"/>
 
   <path class="wireG" d="M740,414.0 L800,414.0 L800,430.0 L846,430.0" marker-end="url(#ahG)"/>
 
@@ -217,55 +217,89 @@
     </g>
   </a>
 
-  <text class="sub" x="1133" y="495" text-anchor="middle" fill="#ff6b81">reads traces · reports · runs · spend</text>
-  <text class="bandT" x="30" y="550">AUDIT PLANE — reconciles what was actually spent · cannot stop a run · read-only billing IAM</text>
+  <text class="sub" x="1042" y="495" fill="#ff6b81">reads traces · reports · runs · spend</text>
+  <text class="bandT" x="30" y="568">AUDIT PLANE — reconciles what was actually spent · cannot stop a run · read-only billing IAM</text>
   <a href="https://github.com/timwukp/llmops-agentic-system/blob/main/docs/COST.md" target="_top">
     <g>
-      <rect class="card cTrig" x="30" y="560" width="180" height="56" rx="12"/>
-      <text class="title" x="120.0" y="584" text-anchor="middle">⏰ finops-daily</text>
-      <text class="sub" x="120.0" y="602" text-anchor="middle">cron 09:00 UTC · billing reads only</text>
+      <rect class="card cTrig" x="30" y="576" width="180" height="56" rx="12"/>
+      <text class="title" x="120.0" y="600" text-anchor="middle">⏰ finops-daily</text>
+      <text class="sub" x="120.0" y="618" text-anchor="middle">cron 09:00 UTC · billing reads only</text>
     </g>
   </a>
 
   <a href="https://github.com/timwukp/llmops-agentic-system/blob/main/orchestration/finops_reconcile/handler.py" target="_top">
     <g>
-      <rect class="card cSpine" x="286" y="560" width="180" height="56" rx="12"/>
-      <text class="title" x="376.0" y="584" text-anchor="middle">🧮 finops-reconcile λ</text>
-      <text class="sub" x="376.0" y="602" text-anchor="middle">period select · D-2 + re-settle</text>
+      <rect class="card cSpine" x="286" y="576" width="180" height="56" rx="12"/>
+      <text class="title" x="376.0" y="600" text-anchor="middle">🧮 finops-reconcile λ</text>
+      <text class="sub" x="376.0" y="618" text-anchor="middle">period select · D-2 + re-settle</text>
     </g>
   </a>
 
   <a href="https://github.com/timwukp/llmops-agentic-system/blob/main/agents/finops/harness.json" target="_top">
     <g>
-      <rect class="card cAgent" x="560" y="582" width="180" height="56" rx="12"/>
-      <text class="title" x="650.0" y="606" text-anchor="middle">🧾 llmops_finops</text>
-      <text class="sub" x="650.0" y="624" text-anchor="middle">auditor · reconcile / rates / report</text>
+      <rect class="card cAgent" x="560" y="598" width="180" height="56" rx="12"/>
+      <text class="title" x="650.0" y="622" text-anchor="middle">🧾 llmops_finops</text>
+      <text class="sub" x="650.0" y="640" text-anchor="middle">auditor · reconcile / rates / report</text>
     </g>
   </a>
 
   <a href="https://github.com/timwukp/llmops-agentic-system/blob/main/docs/COST.md" target="_top">
     <g>
-      <rect class="card cAws" x="850" y="582" width="180" height="56" rx="12"/>
-      <text class="title" x="940.0" y="606" text-anchor="middle">💰 Cost Explorer · Price List</text>
-      <text class="sub" x="940.0" y="624" text-anchor="middle">resource-level actuals · unit rates</text>
+      <rect class="card cAws" x="850" y="598" width="180" height="56" rx="12"/>
+      <text class="title" x="940.0" y="622" text-anchor="middle">💰 Cost Explorer · Prices</text>
+      <text class="sub" x="940.0" y="640" text-anchor="middle">resource-level actuals · unit rates</text>
     </g>
   </a>
 
-  <path class="wireP" d="M210,588.0 L282,588.0" marker-end="url(#ahP)"/>
+  <path class="wireP" d="M210,604.0 L282,604.0" marker-end="url(#ahP)"/>
 
-  <path class="wireO" d="M466,588.0 L511,588.0 L511,610.0 L556,610.0" marker-end="url(#ahO)"/>
+  <path class="wireO" d="M466,604.0 L511,604.0 L511,626.0 L556,626.0" marker-end="url(#ahO)"/>
 
-  <text class="sub" x="511" y="580.0" text-anchor="middle">via harness-driver λ</text>
-  <path class="wireG" d="M740,610.0 L846,610.0" marker-end="url(#ahG)"/>
+  <text class="sub" x="511" y="596.0" text-anchor="middle">via harness-driver λ</text>
+  <path class="wireG" d="M740,626.0 L846,626.0" marker-end="url(#ahG)"/>
 
   <path class="wireR" d="M650.0,284 L650.0,250" marker-end="url(#ahR)"/>
 
-  <text class="sub" x="806" y="270" text-anchor="middle" fill="#ff6b81">gate fail → remediate (≤3)</text>
+  <text class="sub" x="660" y="270" fill="#ff6b81">gate fail → remediate (≤3)</text>
   <path class="wireR" d="M650.0,92 L650.0,78 L406.0,78 L406.0,88" marker-end="url(#ahR)"/>
 
-  <text class="sub" x="460" y="72" text-anchor="middle" fill="#ff6b81">escalations → conductor triage first · page human only if needed</text>
-  <rect class="band" x="30" y="700" width="1180" height="86" rx="14"/>
-  <text class="bandT" x="50" y="726">STATE — S3 runs/&lt;run_id&gt;/manifest.json · finops/rates rate card · customer-data/ uploads · DynamoDB runs + stage-events + tasks + cost-actuals + cost-estimates · shared Memory</text>
-  <text class="sub" x="50" y="748">skills mounted from MLOps-agent-skills — all 19 mounts across all 7 harnesses are git today; the S3 mirror exists (ensure_skills) but nothing is switched to it yet</text>
-  <text class="sub" x="50" y="766">network: all 7 harnesses run PUBLIC (no networkConfiguration); the VPC is built but no VPC harness variant ships · least-privilege IAM, no *FullAccess · TEST-PROVEN gates per phase</text>
+  <text class="sub" x="666" y="60" fill="#ff6b81">escalations → conductor triage first · page human only if needed</text>
+  <text class="bandT" x="30" y="678">GOVERNANCE / OPERATIONS — runs on its own schedule, outside any run's lifetime · the sweep looks for spend nobody has claimed</text>
+  <a href="https://github.com/timwukp/llmops-agentic-system/blob/main/deploy/08_triggers.py" target="_top">
+    <g>
+      <rect class="card cTrig" x="30" y="690" width="180" height="56" rx="12"/>
+      <text class="title" x="120.0" y="714" text-anchor="middle">⏰ monitor-sweep-daily</text>
+      <text class="sub" x="120.0" y="732" text-anchor="middle">cron 08:00 UTC · ENABLED</text>
+    </g>
+  </a>
+
+  <a href="https://github.com/timwukp/llmops-agentic-system/blob/main/orchestration/monitor_sweep/handler.py" target="_top">
+    <g>
+      <rect class="card cSpine" x="286" y="690" width="180" height="56" rx="12"/>
+      <text class="title" x="376.0" y="714" text-anchor="middle">🧹 monitor-sweep λ</text>
+      <text class="sub" x="376.0" y="732" text-anchor="middle">account-wide idle scan</text>
+    </g>
+  </a>
+
+  <a href="https://github.com/timwukp/llmops-agentic-system/blob/main/orchestration/monitor_sweep/handler.py" target="_top">
+    <g>
+      <rect class="card cOps" x="560" y="690" width="180" height="56" rx="12"/>
+      <text class="title" x="650.0" y="714" text-anchor="middle">🗂️ stage-events row</text>
+      <text class="sub" x="650.0" y="732" text-anchor="middle">sweep outcome · never a runs row</text>
+    </g>
+  </a>
+
+  <path class="wireP" d="M210,718.0 L282,718.0" marker-end="url(#ahP)"/>
+
+  <path class="wire" d="M466,718.0 L556,718.0" marker-end="url(#ahB)"/>
+
+  <text class="sub" x="560" y="768">📣 SNS llmops-escalations (1 confirmed subscriber) is published by the <tspan fill="#ff6b81">harness-driver λ</tspan> — escalate ·</text>
+  <text class="sub" x="560" y="786">page_human · flag_variance — not by the sweep, which only invokes it. 🔍 Macie job llmops-customer-data-pii</text>
+  <text class="sub" x="560" y="804">(SCHEDULED daily, scoped customer-data/) is read read-only by the <tspan fill="#ffb454">data-prep harness</tspan>, whose audit</text>
+  <text class="sub" x="560" y="822">must state "no Macie job covers this data" whenever none does.</text>
+  <rect class="band" x="30" y="860" width="1180" height="104" rx="14"/>
+  <text class="bandT" x="50" y="884">STATE — S3: runs/&lt;run_id&gt;/manifest.json · finops/rates rate card · customer-data/ uploads</text>
+  <text class="bandT" x="50" y="904">DynamoDB: runs + stage-events + tasks + cost-actuals + cost-estimates · AgentCore: shared Memory</text>
+  <text class="sub" x="50" y="928">skills mounted from MLOps-agent-skills — all 19 mounts across all 7 harnesses are s3: a pinned snapshot in the platform bucket (ensure_skills), so no harness reads GitHub at session start</text>
+  <text class="sub" x="50" y="946">network: all 7 harnesses run PUBLIC (no networkConfiguration); the VPC is built but no VPC harness variant ships · least-privilege IAM, no *FullAccess · TEST-PROVEN gates per phase</text>
 </svg>

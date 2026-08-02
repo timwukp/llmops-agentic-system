@@ -190,6 +190,215 @@ def out_of_canvas(rects, raw):
             for (x, y, w, h) in rects if x < 0 or y < 0 or x + w > W or y + h > H]
 
 
+#: Rough advance width per character as a fraction of font-size, for the UI stack the
+#: diagrams declare. Deliberately an UNDER-estimate (a real renderer is wider for most
+#: strings), so this check flags only text that genuinely runs off and never blocks a
+#: line that merely looks close.
+_CHAR_W = 0.52
+_FONT_PX = {"sub": 10.0, "bandT": 11.0, "title": 14.0}
+#: Extra px per character from the class's letter-spacing. Omitting this is not a
+#: rounding error: .bandT sets letter-spacing:1px, and on the ~150-character STATE
+#: band that is 150px of unaccounted width -- enough that the first version of this
+#: check called a visibly clipped line clean. Measured from STYLE above, so a change
+#: there has to be reflected here.
+_LETTER_SPACING = {"sub": 0.0, "bandT": 1.0, "title": 0.0}
+
+
+def overflowing_text(raw):
+    """Text that runs past the right edge of the canvas, or past its own card.
+
+    Neither is a wire or a card, so every check above is blind to it -- and both are
+    silent: the SVG stays valid, the layout suite stays green, and the sentence is
+    simply cut off in a browser. Found by rendering the diagram to a PNG and looking
+    at it, which is exactly the step a machine check is supposed to replace.
+
+    Two cases, because they fail for different reasons:
+      * a left-anchored line whose start x plus its own width exceeds the viewBox --
+        how three GOVERNANCE-row notes ran off the 1240-wide canvas;
+      * a centred card label wider than the card it names, which collides with the
+        neighbouring column instead of being clipped.
+
+    Width is estimated, so the threshold is generous (TOLERANCE_PX) and the estimate
+    is an under-count. This catches the sentence-length mistakes it exists to catch,
+    not kerning.
+    """
+    m = re.search(r'viewBox="0 0 ([\d.]+) ([\d.]+)"', raw)
+    if not m:
+        return []
+    W = float(m.group(1))
+    TOLERANCE_PX = 12.0
+    bad = []
+    cards = [(float(a), float(b), float(c)) for a, b, c in re.findall(
+        r'<rect class="card [^"]*" x="([\d.]+)" y="([\d.]+)" width="([\d.]+)"', raw)]
+    for t in re.finditer(
+            r'<text class="(sub|bandT|title)"([^>]*)>(.*?)</text>', raw, re.S):
+        cls, attrs, body = t.group(1), t.group(2), re.sub(r"<[^>]+>", "", t.group(3))
+        xm = re.search(r'x="([\d.]+)"', attrs)
+        ym = re.search(r'y="([\d.]+)"', attrs)
+        if not xm or not ym:
+            continue
+        x, y = float(xm.group(1)), float(ym.group(1))
+        # A font-size attribute on the element overrides the class default.
+        fs = re.search(r'font-size="([\d.]+)"', attrs)
+        px = float(fs.group(1)) if fs else _FONT_PX[cls]
+        width = len(body) * (px * _CHAR_W + _LETTER_SPACING[cls])
+        centred = 'text-anchor="middle"' in attrs
+        left, right = (x - width / 2, x + width / 2) if centred else (x, x + width)
+        if right > W + TOLERANCE_PX or left < -TOLERANCE_PX:
+            bad.append(f"TEXT-OFF-CANVAS at ({x:.0f},{y:.0f}) est. spans "
+                       f"{left:.0f}..{right:.0f} beyond 0..{W:.0f}: {body[:60]!r}")
+            continue
+        if not centred:
+            continue
+        # Centred labels belong to the card they sit on: find it by centre-x and a y
+        # inside the card's own band. Only card titles/subs are anchored this way.
+        for cx, cy, cw in cards:
+            if abs((cx + cw / 2) - x) < 1.0 and cy <= y <= cy + 60:
+                if width > cw + TOLERANCE_PX:
+                    bad.append(
+                        f"TEXT-WIDER-THAN-CARD at ({x:.0f},{y:.0f}) est. {width:.0f}px "
+                        f"in a {cw:.0f}px card: {body[:60]!r}")
+                break
+    return bad
+
+
+#: Minimum gap demanded between a free-standing label's estimated glyph band and any
+#: wire. NOT zero: with a 0 threshold the AUDIT PLANE heading cleared the resume wire
+#: by 0.2 estimated px and passed, while rendering as a strikethrough. A tolerance of
+#: zero on an estimated box is a tolerance on rounding error, so it certifies nothing.
+TEXT_WIRE_CLEARANCE_PX = 4.0
+
+
+def text_boxes(raw):
+    """Estimated (x, y, w, h) box and body for every free-standing label.
+
+    Labels that sit INSIDE a card are excluded: a card's own title and subtitle are
+    drawn over its rect by design, and the wires that arrive at that card touch its
+    edges. Only the free-floating labels -- band headings and the annotations beside
+    a wire -- are in play here.
+    """
+    cards = [(float(a), float(b), float(c), float(d)) for a, b, c, d in re.findall(
+        r'<rect class="card [^"]*" x="([\d.]+)" y="([\d.]+)" '
+        r'width="([\d.]+)" height="([\d.]+)"', raw)]
+    boxes = []
+    for t in re.finditer(r'<text class="(sub|bandT|title)"([^>]*)>(.*?)</text>', raw, re.S):
+        cls, attrs, body = t.group(1), t.group(2), re.sub(r"<[^>]+>", "", t.group(3))
+        xm, ym = re.search(r'x="([\d.]+)"', attrs), re.search(r'y="([\d.]+)"', attrs)
+        if not xm or not ym:
+            continue
+        x, y = float(xm.group(1)), float(ym.group(1))
+        fs = re.search(r'font-size="([\d.]+)"', attrs)
+        px = float(fs.group(1)) if fs else _FONT_PX[cls]
+        w = len(body) * (px * _CHAR_W + _LETTER_SPACING[cls])
+        if 'text-anchor="middle"' in attrs:
+            x -= w / 2
+        box = (x, y - px * 0.8, w, px * 1.1)          # baseline -> ascent..descent
+        # Ownership, not containment: a label BELONGS to a card when it is centred on
+        # that card's centre-x with a baseline inside the card's band. Testing
+        # containment instead (does the estimated box fit inside the rect?) wrongly
+        # freed four card subtitles into this list -- their estimated width exceeds
+        # the card, so they "escaped" their own card and then registered as floating
+        # labels overlapping it. Over-long card labels are already `overflowing_text`'s
+        # job; conflating the two makes both reports untrustworthy.
+        centred = 'text-anchor="middle"' in attrs
+        if centred and any(abs((cx + cw / 2) - (x + w / 2)) < 1.0 and cy <= y <= cy + ch
+                           for cx, cy, cw, ch in cards):
+            continue
+        if any(cx <= x <= cx + cw and cy <= y <= cy + ch for cx, cy, cw, ch in cards):
+            continue                                   # left-anchored label inside a card
+        boxes.append((box, body))
+    return boxes
+
+
+def wire_through_text(raw):
+    """Wires that strike through a free-standing label.
+
+    The requirement this file exists to enforce is that the wires, the boxes and
+    their relationships are all legible. A wire drawn across a sentence defeats that
+    exactly as much as a wire drawn across a card -- but every check above tests
+    wires against RECTS, and a label has no rect, so a struck-through sentence was
+    invisible to the whole suite. Four labels on the high-level diagram were being
+    crossed when this was added, among them the AUDIT PLANE heading, and the layout
+    suite was green for all of them. Found by rendering to PNG and looking.
+
+    The box is estimated from the same width model as `overflowing_text`, so the
+    margin is 0 (the estimate already under-counts width) and a label is only
+    reported when a wire segment genuinely enters the estimated glyph band.
+    """
+    wires = [(m.group(1), segs(parse_path(m.group(2)))) for m in
+             re.finditer(r'<path class="(wire\w*)" d="([^"]+)"', raw)]
+    bad = []
+    C = TEXT_WIRE_CLEARANCE_PX
+    for (x, y, w, h), body in text_boxes(raw):
+        grown = (x - C, y - C, w + 2 * C, h + 2 * C)
+        for name, ss in wires:
+            if any(seg_enters_rect(s, grown, margin=0.0) for s in ss):
+                bad.append(f"WIRE-THROUGH-TEXT {name} crosses (or comes within "
+                           f"{C:.0f}px of) the label at ({x:.0f},{y:.0f}): {body[:60]!r}")
+                break
+    return bad
+
+
+def label_over_card(raw):
+    """Free-standing labels that overlap a card they do not belong to.
+
+    A third thing the wire checks cannot see, and the third one found by rendering to
+    PNG rather than by any assertion: "gate fail → remediate (≤3)" was centred such
+    that its last ~23px lay on top of the SageMaker Training card, so the annotation
+    and the card's title were drawn over each other. Cards-vs-cards is checked
+    (`overlapping_cards`) and wires-vs-cards is checked (`seg_enters_rect`), but a
+    label is neither, and it was the one combination with no test at all.
+
+    Labels that sit inside a card are excluded upstream by `text_boxes`, so anything
+    reaching here is a floating annotation and any card overlap is unintended.
+    """
+    cards = [(float(a), float(b), float(c), float(d)) for a, b, c, d in re.findall(
+        r'<rect class="card [^"]*" x="([\d.]+)" y="([\d.]+)" '
+        r'width="([\d.]+)" height="([\d.]+)"', raw)]
+    bad = []
+    for (x, y, w, h), body in text_boxes(raw):
+        for cx, cy, cw, ch in cards:
+            ox = min(x + w, cx + cw) - max(x, cx)
+            oy = min(y + h, cy + ch) - max(y, cy)
+            if ox > 1.0 and oy > 1.0:
+                bad.append(f"LABEL-OVER-CARD label at ({x:.0f},{y:.0f}) overlaps "
+                           f"rect({cx:.0f},{cy:.0f},{cw:.0f},{ch:.0f}) by "
+                           f"{ox:.0f}x{oy:.0f}px: {body[:60]!r}")
+                break
+    return bad
+
+
+def overlapping_labels(raw):
+    """Free-standing labels drawn on top of each other.
+
+    The fourth and last pairing: by the time this was added, cards-vs-cards,
+    wires-vs-cards, wires-vs-text and labels-vs-cards were all checked, and two
+    labels overlapping was the combination nothing looked at. It bit immediately --
+    moving the escalation annotation up by 4px to clear a wire dropped it onto the
+    header subtitle, trading a checked defect for an unchecked one. Two sentences
+    printed over each other are less readable than either failure this file started
+    out guarding against.
+
+    The threshold on both axes is 1px, and that is load-bearing. The first version
+    demanded half a line of vertical overlap on the theory that it would otherwise
+    flag adjacent rows of the same block -- and then its own negative control passed:
+    restoring the overlapping label produced 3px of overlap, under the 5.5px bar, so
+    the check called the defect clean. It never needed the allowance: rows in a block
+    are 18-20px apart with ~11-12px boxes, so they do not overlap at all, and a
+    threshold set to head off a collision that cannot happen only masked one that did.
+    """
+    boxes = text_boxes(raw)
+    bad = []
+    for (a, ta), (b, tb) in itertools.combinations(boxes, 2):
+        ox = min(a[0] + a[2], b[0] + b[2]) - max(a[0], b[0])
+        oy = min(a[1] + a[3], b[1] + b[3]) - max(a[1], b[1])
+        if ox > 1.0 and oy > 1.0:
+            bad.append(f"LABEL-OVER-LABEL {ta[:34]!r} at ({a[0]:.0f},{a[1]:.0f}) "
+                       f"overlaps {tb[:34]!r} at ({b[0]:.0f},{b[1]:.0f}) "
+                       f"by {ox:.0f}x{oy:.0f}px")
+    return bad
+
+
 def check(path, verbose=True):
     """Return a list of human-readable layout problems in one SVG."""
     raw = open(path).read()
@@ -227,6 +436,10 @@ def check(path, verbose=True):
 
     problems += overlapping_cards(rects)
     problems += out_of_canvas(rects, raw)
+    problems += overflowing_text(raw)
+    problems += wire_through_text(raw)
+    problems += label_over_card(raw)
+    problems += overlapping_labels(raw)
 
     if verbose:
         for p in dict.fromkeys(problems):
