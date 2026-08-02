@@ -329,6 +329,18 @@ orchestrator（透過 `page_human`），不屬於一個職責是「觀察」的�
 在這個系統的閘門之下，帳戶層級本來就已經有一道護欄：一個 AWS Budget，
 `bedrock-monthly-dev`，**每月 $1000**。Cost 分頁把它顯示出來，而不是再做一個。
 
+**那個 budget 被過濾成 `Service: ["Amazon Bedrock"]`**（`describe_budgets`，2026-08-02）——
+這件事值得兩個方向都講清楚，因為這個 filter 同時是護欄還有意義的原因、也是它看不見東西的原因：
+
+- 它代表 `jumpstart-dft-hf-asr-whisper-large-v2` 孤兒（§4，$36.36/天 = 每月約 **$1106**，
+  即 730 小時 × $1.515/hr）**不會**吃掉我們的 Bedrock
+  額度。一個沒有 filter 的 $1000 budget 早就被一個比這個專案更早存在的資源默默吃掉 100% 以上，
+  而第一筆真正的 Bedrock 花費就會觸發一個與 Bedrock 無關的警報。
+- 它同時也代表**帳戶層級的控制永遠不會標記出那個 endpoint**。一個只涵蓋單一服務的 budget，
+  沒辦法注意到另一個服務裡的浪費。找到它的是 monitor sweep，而 sweep 之所以掃整個帳戶，正是
+  因為一個只限於「我們已經認領的東西」的檢查，找不到沒有人認領的東西。這兩道控制不是重複的：
+  budget 管住**我們的**花費，sweep 去找沒有人認領的花費。
+
 ---
 
 ## 11. 測試

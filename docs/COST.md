@@ -346,6 +346,20 @@ describes.
 An account-level guardrail already exists below this system's gate: one AWS Budget,
 `bedrock-monthly-dev`, at **$1000/month**. The Cost tab surfaces it rather than duplicating it.
 
+**That budget is filtered to `Service: ["Amazon Bedrock"]`** (`describe_budgets`, 2026-08-02) —
+which is worth stating in both directions, because the filter is simultaneously what keeps the
+guardrail meaningful and what makes it blind:
+
+- It means the `jumpstart-dft-hf-asr-whisper-large-v2` orphan (§4, $36.36/day = **~$1106/month**
+  at 730 h × $1.515/hr) does **not** consume our Bedrock headroom. An unfiltered $1000 budget
+  would have been silently 100%+ eaten by a resource that predates this project, and the first
+  real Bedrock spend would have tripped an alarm that had nothing to do with Bedrock.
+- It ALSO means **no account-level control would ever have flagged that endpoint.** A budget
+  scoped to one service cannot notice waste in another. What found it was the monitor sweep, which
+  scans the whole account precisely because a check restricted to what we already call ours cannot
+  find something unclaimed. The two controls are not redundant; the budget bounds *our* spend and
+  the sweep looks for spend nobody has claimed.
+
 ---
 
 ## 11. Tests

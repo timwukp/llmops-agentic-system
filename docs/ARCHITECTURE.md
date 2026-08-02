@@ -158,11 +158,13 @@ Two spine details that are policy, not plumbing:
   `deploy/03_storage.py` reports it as
   `NO SUBSCRIBERS — every escalate_human call publishes into the void` rather than calling
   the topic healthy, because a deploy cannot invent an address; the fix is
-  `--escalation-email <addr>`, supplied 2026-08-02. Note what that fix does NOT settle: an
-  email subscription is `PendingConfirmation` until the recipient clicks the link, and
-  `ensure_topic` reports pending separately for exactly that reason — unconfirmed is the
-  same silence one step further along. The ordering below is therefore still required, not
-  superseded: a channel's audience can go back to zero without any code changing. Each notification is now wrapped and logged on its own, in ascending
+  `--escalation-email <addr>`, supplied 2026-08-02; `PendingConfirmation` is now `false`, so
+  the topic has one confirmed recipient. Getting there took two steps, not one, and
+  `ensure_topic` reports them separately for that reason: an email subscription exists but
+  delivers nothing until the recipient clicks the link, which is the same silence one step
+  further along, and no deploy can click it for them. The ordering below is therefore still
+  required, not superseded: a channel's audience can go back to zero without any code
+  changing. Each notification is now wrapped and logged on its own, in ascending
   order of what it costs to lose: SNS, then the timeline row, then the bus event, and the
   token settle last so it happens even when every notification failed.
 - **A readiness checklist must be derived from the prompt, not copied from it.** The console's

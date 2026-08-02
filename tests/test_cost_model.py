@@ -488,6 +488,53 @@ def test_the_whisper_orphans_daily_figure_matches_its_instance_and_hourly_rate()
         assert "$18/day" not in text, f"{doc} still carries the falsified $18/day figure"
 
 
+def test_the_orphans_monthly_figure_is_derived_and_the_budget_filter_is_stated_both_ways():
+    """The account budget's CostFilters decide whether it can see this orphan at all.
+
+    `describe_budgets` (2026-08-02) returns `{"Service": ["Amazon Bedrock"]}` for
+    `bedrock-monthly-dev`, and that single field cuts both ways, so COST.md has to say
+    both halves or it misleads whichever reader it leaves out:
+
+      * filtered means the orphan's ~$1106/month does NOT eat our $1000 Bedrock headroom.
+        Unfiltered, the guardrail would have sat permanently over 100% on somebody else's
+        endpoint, and the first real Bedrock spend would have tripped an alarm about
+        something it had nothing to do with.
+      * filtered ALSO means no account-level control would ever have flagged that
+        endpoint. A budget scoped to one service is blind to waste in another. What found
+        it was the whole-account monitor sweep. The two controls are not redundant.
+
+    The monthly number is derived here for the same reason the daily one is: $1106 was
+    typed as $1107 on the first pass, and a figure nobody recomputes is a figure that
+    drifts. 730 h is the AWS convention for a month, not 30 x 24.
+    """
+    hourly = 1.515
+    monthly = hourly * 730
+    assert monthly == pytest.approx(1105.95, abs=0.01), (
+        f"ml.g5.2xlarge at ${hourly}/hr over 730h is ${monthly:.2f}/month")
+    stated = f"${round(monthly):,}".replace(",", "")   # ~$1106
+
+    repo = pathlib.Path(__file__).resolve().parent.parent
+    for doc in ("docs/COST.md", "docs/COST.zh-TW.md"):
+        text = (repo / doc).read_text()
+        # Anchor to the budget passage. Searching the whole file would let a stray
+        # "Amazon Bedrock" or "sweep" anywhere in a 370-line doc satisfy a guard about
+        # THIS paragraph -- the same way a repeated phrase elsewhere once silently
+        # disarmed test_every_schedule_the_deployer_creates_is_named_in_the_cost_posture.
+        assert "bedrock-monthly-dev" in text, f"{doc} no longer names the account budget"
+        para = text.partition("bedrock-monthly-dev")[2][:1600]
+
+        assert stated in para, (
+            f"{doc} does not state the orphan's monthly cost as {stated} alongside the "
+            f"budget, which is what ${hourly}/hr x 730h comes to")
+        assert "Amazon Bedrock" in para, (
+            f"{doc} does not say what bedrock-monthly-dev is filtered to; an unqualified "
+            f"$1000 guardrail reads as covering all account spend, which it does not")
+        # Both halves of the consequence, or the sentence misleads by omission.
+        assert "sweep" in para, (
+            f"{doc} states the budget filter without saying which control DOES cover "
+            f"non-Bedrock spend -- a reader is left thinking nothing does")
+
+
 def test_attribution_is_an_allowlist_so_unknown_shapes_are_excluded():
     assert is_project_resource("training-job/llmops-qlora-x") is True
     assert is_project_resource("training-job/someone-elses-job") is False

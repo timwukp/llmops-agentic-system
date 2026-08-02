@@ -917,6 +917,29 @@ case("finops: the Whisper orphan's daily cost is restated from the sweep's guess
      ["tests/test_cost_model.py::test_the_whisper_orphans_daily_figure_matches_its_instance_and_hourly_rate"])
 
 
+def m69(t):
+    """Delete the half of the budget-filter sentence that says which control DOES cover
+    non-Bedrock spend.
+
+    `bedrock-monthly-dev` is filtered to `Service: ["Amazon Bedrock"]`. Saying only that
+    the filter protects our $1000 headroom is true and reassuring and leaves the reader
+    believing the account has a spend guardrail over it. It does not: a budget scoped to
+    one service is blind to waste in another, which is exactly why nothing at the account
+    level ever flagged a $1106/month endpoint sitting InService for 838 days. The whole-
+    account monitor sweep is what found it. Drop the second half and the paragraph
+    misleads by omission -- the failure mode that is hardest to catch by reading, because
+    every sentence left on the page is still true.
+    """
+    start = t.index("- It ALSO means")
+    end = t.index("\n\n", start)
+    return t[:start] + t[end:]
+
+
+case("finops: COST.md states the budget's Bedrock filter without saying what it is blind to",
+     "docs/COST.md", m69,
+     ["tests/test_cost_model.py::test_the_orphans_monthly_figure_is_derived_and_the_budget_filter_is_stated_both_ways"])
+
+
 failed = []
 for name, rel, mutate, tests in CASES:
     p = REPO / rel
