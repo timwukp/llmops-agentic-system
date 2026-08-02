@@ -27,6 +27,11 @@ sys.path.insert(0, str(REPO / "pipeline" / "contracts"))
 sys.path.insert(0, str(REPO / "orchestration"))
 
 ACCOUNT = "123456789012"
+#: A *different* account, for the tests that check an id is compared rather than ignored.
+#: Derived from ACCOUNT rather than written out: hooks/pre-commit rejects bare 12-digit
+#: literals and allow-lists only the documentation account above, so a second literal here
+#: would block the commit — correctly, since the hook cannot tell a fake id from a real one.
+OTHER_ACCOUNT = ACCOUNT[::-1]
 
 # Reuse the cost-tab test's import-time isolation wholesale: same module under
 # test, same reason (the console builds ~14 clients at import).
@@ -255,13 +260,18 @@ def wired(console, monkeypatch):
     monkeypatch.setattr(console, "kms", fake_kms)
     monkeypatch.setattr(console, "SELF_FUNCTION", "llmops-admin")
     monkeypatch.setattr(console, "data_bucket", lambda: "test-bucket")
+    # Captured BEFORE the stub replaces it, so the `audited` fixture can put the real
+    # append back. Reaching for console._transcript_append afterwards would only get
+    # the stub, which is the trap this hands around.
+    real_transcript_append = console._transcript_append
     monkeypatch.setattr(console, "_transcript_append", lambda *a, **k: None)
 
     import cost_model
     monkeypatch.setattr(console, "_cost_model", lambda: cost_model)
     monkeypatch.setattr(console, "project_to_date_usd", lambda *a, **k: (0.0, "none"))
     return types.SimpleNamespace(console=console, tasks=tasks, events=events,
-                                 est=est, s3=fake_s3, lam=fake_lam, kms=fake_kms)
+                                 est=est, s3=fake_s3, lam=fake_lam, kms=fake_kms,
+                                 real_transcript_append=real_transcript_append)
 
 
 @pytest.fixture
@@ -271,6 +281,29 @@ def blocking(wired, monkeypatch):
     its only approver — but the queue path is shipped code one env var away."""
     monkeypatch.setattr(wired.console, "BUDGET_MODE", "blocking")
     return wired
+
+
+@pytest.fixture
+def audited(wired, monkeypatch):
+    """`wired` stubs _transcript_append out, which is right for every test that is not
+    ABOUT the audit copy -- and is exactly why three defects lived in those 12 lines with
+    the suite green. This fixture puts the real function back."""
+    monkeypatch.setattr(wired.console, "_transcript_append", wired.real_transcript_append)
+    return wired
+
+
+def _transcript_lines(w, tid):
+    """Every audit entry for a task, in key order. Keys are timestamp-prefixed, so key
+    order IS chronological order -- the property that lets one-object-per-append replace
+    a read-modify-write of a single file."""
+    out = []
+    for k in sorted(w.s3.objects):
+        if f"tasks/{tid}/transcript/" not in k:
+            continue
+        body = w.s3.objects[k]
+        body = body if isinstance(body, bytes) else str(body).encode()
+        out += [json.loads(ln) for ln in body.decode().splitlines() if ln.strip()]
+    return out
 
 
 def _mk_task(w, status="plan_proposed", cost="50", plan_body=b'{"goal":"x"}'):
@@ -1364,6 +1397,117 @@ def test_task_events_feed_the_lifecycle_timeline(wired):
     assert "TaskCreated" in names
 
 
+# ── the S3 audit copy: whole text, one object per append, never gating ─────────
+
+def test_the_audit_copy_keeps_the_full_text_the_ddb_record_has_to_cap(audited):
+    """The whole conversation is ONE DynamoDB item under a 400 KB ceiling, so the record
+    the UI renders caps each message. The S3 copy exists precisely to be the uncapped one.
+
+    Live evidence this was broken: one assistant reply sat at exactly 8000 characters in
+    BOTH copies, because every caller applied `[:8000]` *before* the split -- so the
+    "full-text audit copy" in the docstring was a truncated copy of a truncated record,
+    and the message it lost was an assistant reply, the kind an acceptance is signed
+    against."""
+    console = audited.console
+    tid = _mk_task(audited, status="thinking")
+    long_text = "y" * (console.MSG_TEXT_MAX + 5000)
+    audited.console.post_task_message(tid, {"text": long_text}, DS_USER)
+
+    ddb = audited.tasks.items[tid]["messages"][-1]["text"]
+    assert len(ddb) == console.MSG_TEXT_MAX, "the DynamoDB copy must still be capped"
+
+    entries = _transcript_lines(audited, tid)
+    assert entries, "nothing was written to the audit copy at all"
+    assert entries[-1]["text"] == long_text, (
+        f"the audit copy is truncated to {len(entries[-1]['text'])} chars; it is the "
+        f"only place the full message survives")
+
+
+def test_the_audit_copy_is_bounded_too(audited):
+    """Uncapped in DynamoDB terms is not uncapped: one request must not be able to write
+    an unbounded S3 object. TRANSCRIPT_TEXT_MAX is two orders of magnitude above the
+    DynamoDB cap, so a real reply is never cut -- the ceiling exists, and is declared."""
+    console = audited.console
+    tid = _mk_task(audited, status="thinking")
+    console.post_task_message(tid, {"text": "z" * (console.TRANSCRIPT_TEXT_MAX + 10)},
+                              DS_USER)
+    entries = _transcript_lines(audited, tid)
+    assert len(entries[-1]["text"]) == console.TRANSCRIPT_TEXT_MAX
+
+
+def test_a_failed_read_can_never_erase_the_audit_log(audited, monkeypatch):
+    """The old append was a read-modify-write: get the whole file, concatenate, put it
+    back -- with `except Exception: old = b""` on the read. So ANY read failure (a 503, a
+    throttle, a slow-consistency miss) was treated as "no file yet" and the put REPLACED
+    the entire history with just the newest lines. The audit log whose one job is to
+    survive was one transient error away from erasure.
+
+    One object per append removes the read entirely: there is nothing to fail into
+    silence, and nothing to overwrite. Asserted by making every read raise -- history
+    must still be there afterwards."""
+    console = audited.console
+    tid = _mk_task(audited, status="thinking")
+    console.post_task_message(tid, {"text": "first, keep me"}, DS_USER)
+    before = _transcript_lines(audited, tid)
+    assert any("first, keep me" in str(e.get("text")) for e in before)
+
+    def boom(**kw):
+        raise RuntimeError("ServiceUnavailable")
+    monkeypatch.setattr(audited.s3, "get_object", boom)
+
+    # Back to a stale in-flight turn, so the second message clears the thinking lock
+    # (STALE_TURN_MIN) rather than being refused with a 409.
+    audited.tasks.items[tid].update({"status": "thinking",
+                                     "updated_at": "2020-01-01T00:00:00+00:00"})
+    r = console.post_task_message(tid, {"text": "second, also keep me"}, DS_USER)
+    assert r.get("ok"), f"precondition: the second message was refused: {r}"
+    after = [str(e.get("text")) for e in _transcript_lines(audited, tid)]
+    assert any("first, keep me" in t for t in after), (
+        "the earlier message is gone: an append re-read and rewrote the whole log")
+    assert any("second, also keep me" in t for t in after)
+
+
+def test_two_writers_do_not_cost_the_audit_copy_a_message(audited):
+    """Two writers for one task are reachable: close_task is permitted while a turn is in
+    flight, because 'thinking' is not in TASK_TERMINAL. Under read-modify-write the loser
+    of that race silently drops its messages from the audit copy while DynamoDB's
+    list_append keeps both -- an audit copy missing a message the audited record HAS.
+
+    One object per append cannot lose a writer: distinct keys, no shared object."""
+    console = audited.console
+    tid = _mk_task(audited, status="thinking")
+    console.post_task_message(tid, {"text": "the customer's message"}, DS_USER)
+    audited.tasks.items[tid]["status"] = "thinking"
+    console.close_task(tid, {"reason": "closed mid-turn"}, DS_USER)
+
+    audit = [str(e.get("text")) for e in _transcript_lines(audited, tid)]
+    ddb = [str(m.get("text")) for m in audited.tasks.items[tid]["messages"]]
+    for t in ("the customer's message", "closed mid-turn"):
+        assert any(t in x for x in ddb), f"precondition: {t!r} should be in the record"
+        assert any(t in x for x in audit), (
+            f"{t!r} is in the DynamoDB record but not in the audit copy")
+
+
+def test_a_failed_audit_write_does_not_strand_a_signed_acceptance(wired, monkeypatch):
+    """The audit copy is a SECOND channel and must never gate the first.
+
+    It was called unwrapped at the end of _append_messages, so one S3 failure propagated
+    out and skipped everything AFTER that call in the caller. In accept_task that is
+    _task_event(PlanAccepted) and _enqueue_task_turn(accept=True): a KMS-signed
+    acceptance would sit at 'accepting' with no worker ever launched, and the only escape
+    is the 20-minute STALE_TURN_MIN hatch. Same shape as the SNS publish that gated the
+    other three escalation channels."""
+    console = wired.console
+    monkeypatch.setattr(console, "_transcript_append",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("S3 down")))
+    tid = _mk_task(wired)
+    r = console.accept_task(tid, DS_USER)
+    assert r.get("ok"), f"the acceptance itself failed on an audit write: {r}"
+    assert any(k.get("InvocationType") == "Event" for k in wired.lam.invokes), (
+        "no accept turn was enqueued: the signed acceptance is stranded at 'accepting'")
+    assert "PlanAccepted" in [p.get("event_name") for p in wired.events.puts]
+
+
 # ── canonicalization properties ───────────────────────────────────────────────
 
 def test_canonical_json_is_order_insensitive():
@@ -2235,6 +2379,296 @@ def test_the_deploy_reports_cors_on_its_own_line(storage):
     assert '"cors": ensure_cors(' in main
 
 
+# ── does anything actually scan the customer's data for PII? ───────────────────
+# The readiness panel now links the Data Readiness Report, and that report's PII section
+# is a HEURISTIC regex scan -- the data-prep prompt says so in as many words. The account
+# looks like it has more than that: the Macie session is ENABLED and list_classification_jobs
+# returns a COMPLETE job named `scan`. Live, that job is ONE_TIME, was created 2021-02-23,
+# names 25 unrelated buckets, and processed 0 objects. So "Macie: ENABLED" plus "a job
+# exists" is exactly the shape of coverage that isn't, and these tests pin the distinction:
+# only the bucket list plus the scoping answers the question.
+
+class _Macie:
+    """A Macie double whose create_classification_job records the exact request."""
+
+    def __init__(self, session="ENABLED", jobs=None):
+        self._session, self._jobs, self.created = session, jobs or [], []
+
+    def get_macie_session(self):
+        if self._session is None:
+            raise RuntimeError("AccessDeniedException: Macie is not enabled")
+        return {"status": self._session}
+
+    def list_classification_jobs(self):
+        return {"items": self._jobs}
+
+    def create_classification_job(self, **kw):
+        self.created.append(kw)
+        return {"jobId": "job-new"}
+
+
+def _job(name, buckets, acct=ACCOUNT, jtype="SCHEDULED", status="RUNNING",
+         scoping=None, criteria=None):
+    defn = {"bucketDefinitions": [{"accountId": acct, "buckets": buckets}]}
+    if scoping is not None:
+        defn["scoping"] = scoping
+    if criteria is not None:
+        defn = {"bucketCriteria": criteria}
+    return {"name": name, "jobId": f"id-{name}", "jobType": jtype,
+            "jobStatus": status, "s3JobDefinition": defn}
+
+
+def test_a_job_over_other_buckets_is_not_coverage(storage):
+    """The live failure mode, reduced. The account's one job named 25 buckets, none ours,
+    and every console-level signal (session ENABLED, job COMPLETE) read as healthy."""
+    other = _job("scan", ["someone-elses-bucket", "another-one"])
+    assert storage.macie_job_covers(other["s3JobDefinition"], "our-bucket",
+                                    ACCOUNT) is False
+    assert storage.macie_job_covers(other["s3JobDefinition"], "another-one",
+                                    ACCOUNT) is True
+
+
+def test_a_job_in_another_account_does_not_count(storage):
+    """bucketDefinitions carries an accountId. A same-named bucket in a different account
+    is a different bucket, and treating it as ours would report coverage we do not have."""
+    defn = _job("x", ["our-bucket"], acct=OTHER_ACCOUNT)["s3JobDefinition"]
+    assert storage.macie_job_covers(defn, "our-bucket", ACCOUNT) is False
+
+
+def test_naming_the_bucket_is_not_enough_if_the_prefix_is_scoped_out(storage):
+    """A job can name our bucket and still never read customer-data/ -- either by
+    including only some other prefix or by excluding ours. Both are 'not covered'."""
+    only_runs = _job("x", ["our-bucket"], scoping={"includes": {"and": [
+        {"simpleScopeTerm": {"comparator": "STARTS_WITH", "key": "OBJECT_KEY",
+                             "values": ["runs/"]}}]}})
+    assert storage.macie_job_covers(only_runs["s3JobDefinition"], "our-bucket",
+                                    ACCOUNT) is False
+    excluded = _job("x", ["our-bucket"], scoping={"excludes": {"and": [
+        {"simpleScopeTerm": {"comparator": "STARTS_WITH", "key": "OBJECT_KEY",
+                             "values": ["customer-data/"]}}]}})
+    assert storage.macie_job_covers(excluded["s3JobDefinition"], "our-bucket",
+                                    ACCOUNT) is False
+    ours = _job("x", ["our-bucket"], scoping={"includes": {"and": [
+        {"simpleScopeTerm": {"comparator": "STARTS_WITH", "key": "OBJECT_KEY",
+                             "values": ["customer-data/"]}}]}})
+    assert storage.macie_job_covers(ours["s3JobDefinition"], "our-bucket",
+                                    ACCOUNT) is True
+
+
+def test_a_scope_filter_that_is_not_about_keys_does_not_decide_coverage(storage):
+    """An includes-block scoped by OBJECT_EXTENSION says nothing about which prefix is
+    read. Reading it as 'not customer-data/' would report a covered bucket as uncovered."""
+    by_ext = _job("x", ["our-bucket"], scoping={"includes": {"and": [
+        {"simpleScopeTerm": {"comparator": "EQ", "key": "OBJECT_EXTENSION",
+                             "values": ["jsonl"]}}]}})
+    assert storage.macie_job_covers(by_ext["s3JobDefinition"], "our-bucket",
+                                    ACCOUNT) is True
+
+
+def test_a_criteria_based_job_is_undecidable_not_covered_and_not_uncovered(storage):
+    """bucketCriteria matches buckets by tag/attribute, so the definition alone cannot say
+    whether ours is in scope -- and it could start matching later. None, not a guess."""
+    crit = _job("x", [], criteria={"includes": {"and": [
+        {"tagCriterion": {"tagValues": [{"key": "env", "value": "prod"}]}}]}})
+    assert storage.macie_job_covers(crit["s3JobDefinition"], "our-bucket",
+                                    ACCOUNT) is None
+
+
+def test_the_deploy_reports_the_gap_loudly_when_nothing_scans(storage):
+    """Silence here is the defect. Nothing else in the product would show it: the audit's
+    own report is the only PII check, the readiness panel links it, and a customer reading
+    a filled-in panel has every reason to think classification ran."""
+    macie = _Macie(jobs=[_job("scan", ["someone-elses-bucket"])])
+    res = storage.ensure_pii_scan(macie, "our-bucket", ACCOUNT, dry=False)
+    assert "NO JOB SCANS customer-data/" in res["coverage"]
+    assert "heuristic regex" in res["coverage"]
+    assert "--enable-pii-scan" in res["coverage"]
+    assert macie.created == [], "reporting a gap must not create billable work"
+
+
+def test_a_gap_is_reported_even_though_the_session_says_enabled(storage):
+    """The two facts must not be conflated in the output: session ENABLED sits right next
+    to NO JOB SCANS, because the first is what made the second invisible for so long."""
+    res = storage.ensure_pii_scan(_Macie(), "our-bucket", ACCOUNT, dry=False)
+    assert res["session"] == "ENABLED"
+    assert "NO JOB SCANS" in res["coverage"]
+
+
+def test_nothing_is_created_without_the_flag_or_in_a_dry_run(storage):
+    """A scheduled classification job is recurring paid work in someone's account. It is
+    the one step here that is opt-in, and --dry-run must not create it either."""
+    m1 = _Macie()
+    storage.ensure_pii_scan(m1, "our-bucket", ACCOUNT, dry=False, enable=False)
+    assert m1.created == []
+    m2 = _Macie()
+    res = storage.ensure_pii_scan(m2, "our-bucket", ACCOUNT, dry=True, enable=True)
+    assert m2.created == [] and "would create" in res["coverage"]
+
+
+def test_the_created_job_is_scoped_to_customer_data_only(storage):
+    """Unscoped, the job would also read runs/, finops/ and models-mirror/ -- our own
+    artifacts, billed per GB, none of them the customer's data."""
+    macie = _Macie()
+    res = storage.ensure_pii_scan(macie, "our-bucket", ACCOUNT,
+                                  dry=False, enable=True)
+    (req,) = macie.created
+    defn = req["s3JobDefinition"]
+    assert defn["bucketDefinitions"] == [{"accountId": ACCOUNT,
+                                          "buckets": ["our-bucket"]}]
+    terms = defn["scoping"]["includes"]["and"]
+    assert terms == [{"simpleScopeTerm": {"comparator": "STARTS_WITH",
+                                          "key": "OBJECT_KEY",
+                                          "values": ["customer-data/"]}}]
+    # RECOMMENDED, not ALL: all 166 managed identifiers include ones for regions and
+    # document types this pipeline never sees, and each is a false positive to triage.
+    assert req["managedDataIdentifierSelector"] == "RECOMMENDED"
+    assert req["jobType"] == "SCHEDULED" and req["scheduleFrequency"] == {"dailySchedule": {}}
+    assert req["initialRun"] is True, "a daily job that waits a day scans nothing today"
+    assert res["job_id"] == "job-new"
+    # And the job it creates must satisfy our own coverage predicate, or the next deploy
+    # would report NO JOB SCANS against the job this one just made.
+    assert storage.macie_job_covers(defn, "our-bucket", ACCOUNT) is True
+
+
+def test_the_job_is_idempotent_by_name_because_create_is_not(storage):
+    """CreateClassificationJob takes a clientToken and a repeat with a fresh token creates
+    a SECOND job -- so a deploy that did not look for its own job first would add another
+    paid scanner on every run."""
+    existing = _job("llmops-customer-data-pii", ["our-bucket"],
+                    scoping={"includes": {"and": [
+                        {"simpleScopeTerm": {"comparator": "STARTS_WITH",
+                                             "key": "OBJECT_KEY",
+                                             "values": ["customer-data/"]}}]}})
+    macie = _Macie(jobs=[existing])
+    res = storage.ensure_pii_scan(macie, "our-bucket", ACCOUNT,
+                                  dry=False, enable=True)
+    assert macie.created == [], "a second scanner per deploy is the failure here"
+    assert "job exists" in res["coverage"] and res["job_id"] == "id-llmops-customer-data-pii"
+    src = (REPO / "deploy/03_storage.py").read_text()
+    assert "clientToken=" in src, "create_classification_job requires a clientToken"
+
+
+def test_a_wrongly_scoped_job_of_ours_says_so_instead_of_claiming_an_update(storage):
+    """UpdateClassificationJob accepts only (jobId, jobStatus): a job's bucket list and
+    scoping are IMMUTABLE. So unlike every other ensure_* here this cannot converge an
+    existing job onto the right scope, and reporting 'exists' would be a false all-clear."""
+    wrong = _job("llmops-customer-data-pii", ["our-bucket"],
+                 scoping={"excludes": {"and": [
+                     {"simpleScopeTerm": {"comparator": "STARTS_WITH",
+                                          "key": "OBJECT_KEY",
+                                          "values": ["customer-data/"]}}]}})
+    res = storage.ensure_pii_scan(_Macie(jobs=[wrong]), "our-bucket", ACCOUNT,
+                                  dry=False, enable=True)
+    assert "does NOT cover" in res["coverage"]
+    assert "immutable" in res["coverage"] and "cancel" in res["coverage"]
+
+
+def test_someone_elses_job_that_does_cover_us_is_credited(storage):
+    """Coverage is coverage even if we did not create it. Ignoring a third-party job would
+    push an operator to pay for a duplicate scan of the same objects."""
+    theirs = _job("security-baseline", ["our-bucket", "other"])
+    res = storage.ensure_pii_scan(_Macie(jobs=[theirs]), "our-bucket", ACCOUNT,
+                                  dry=False)
+    assert res["also_covered_by"] == ["security-baseline (RUNNING)"]
+
+
+def test_an_undecidable_job_is_never_counted_as_coverage(storage):
+    """A bucketCriteria job is reported separately, NOT folded into 'covered' -- otherwise
+    a tag-matching job nobody has checked would silence the gap warning."""
+    crit = _job("tagged-scan", [], criteria={"includes": {"and": []}})
+    res = storage.ensure_pii_scan(_Macie(jobs=[crit]), "our-bucket", ACCOUNT,
+                                  dry=False)
+    assert res["undecidable_jobs"] == ["tagged-scan"]
+    assert "NO JOB SCANS" in res["coverage"], \
+        "an unverified criteria job must not be treated as coverage"
+
+
+def test_macie_being_unreachable_is_reported_not_swallowed(storage):
+    """Macie is not enabled in every region, and this step must not break a deploy. But it
+    must also not go quiet: 'unknown' plus the reason, never an implied all-clear."""
+    res = storage.ensure_pii_scan(_Macie(session=None), "our-bucket", ACCOUNT,
+                                  dry=False, enable=True)
+    assert res["coverage"] == "unknown"
+    assert "unavailable" in res["session"]
+    assert "regex" in res["note"], "the report must name what the only real check is"
+
+
+def test_the_offline_dry_run_path_needs_no_macie_client(storage):
+    """--account-id with no credentials is the review path; safe_client returns None there
+    and an AttributeError would turn a review into a crash."""
+    res = storage.ensure_pii_scan(None, "our-bucket", ACCOUNT, dry=True)
+    assert "unknown" in res["coverage"]
+
+
+def test_the_scan_prefix_matches_where_uploads_actually_land(storage):
+    """Two spellings of the same prefix: the console signs PUTs to CUSTOMER_DATA_PREFIX and
+    the job pays to read this one. If they drift, the scan covers an empty prefix and still
+    reports 'created' -- coverage of nothing, reported as coverage."""
+    fn = (REPO / "deploy/console/lambda_function.py").read_text()
+    assert f'CUSTOMER_DATA_PREFIX = "{storage.CUSTOMER_DATA_PREFIX}"' in fn
+    role = json.loads((REPO / "deploy/iam/harness_execution_role.json").read_text())
+    reads = [s for s in role["permissionsPolicy"]["Statement"]
+             if s.get("Sid") == "S3CustomerDataReadOnly"]
+    assert reads and f"/{storage.CUSTOMER_DATA_PREFIX}/*" in json.dumps(reads)
+
+
+def test_the_audit_agent_can_actually_read_macie(storage):
+    """A classification job whose findings the agent cannot read changes nothing a customer
+    sees. The audit writes the Data Readiness Report, the readiness panel links it as the
+    answer behind `PII disposition`, and simulate_principal_policy on
+    llmops-harness-execution returned implicitDeny for ListFindings/GetFindings/
+    GetFindingStatistics/DescribeClassificationJob -- nothing in this repo granted macie2 at
+    all. So the scan would have run, cost money, and been invisible."""
+    doc = json.loads((REPO / "deploy/iam/harness_execution_role.json").read_text())
+    acts = set()
+    for st in doc["permissionsPolicy"]["Statement"]:
+        a = st["Action"] if isinstance(st["Action"], list) else [st["Action"]]
+        acts |= {x for x in a if x.startswith("macie2:")}
+    for need in ("macie2:ListFindings", "macie2:GetFindings",
+                 "macie2:ListClassificationJobs", "macie2:DescribeClassificationJob"):
+        assert need in acts, f"{need} not granted; the audit cannot cite classification"
+
+
+def test_the_audit_agent_cannot_start_or_stop_a_scan(storage):
+    """Read-only on purpose, in both directions. A per-GB billable job is the deploy's
+    decision (--enable-pii-scan), not something an agent starts mid-turn; and an agent that
+    could disable the session could switch off the check it is judged by."""
+    doc = json.loads((REPO / "deploy/iam/harness_execution_role.json").read_text())
+    for st in doc["permissionsPolicy"]["Statement"]:
+        a = st["Action"] if isinstance(st["Action"], list) else [st["Action"]]
+        for act in a:
+            if not act.startswith("macie2:"):
+                continue
+            assert act.split(":", 1)[1].startswith(("Get", "List", "Describe")), \
+                f"{act} is not a read: the agent must not create or disable a scan"
+
+
+def test_the_audit_prompt_refuses_to_read_enabled_as_coverage(storage):
+    """The grant is useless if the prompt never looks, and worse than useless if the agent
+    reports 'Macie: ENABLED' as though that meant scanned -- the exact live trap. It must
+    also state plainly when NO job covers the prefix, because that sentence is the only
+    thing standing between a heuristic regex pass and a customer reading the panel as
+    'someone classified my data'."""
+    cfg = json.loads((REPO / "agents/data-prep/harness.json").read_text())
+    prompt = cfg["systemPrompt"][0]["text"]
+    assert "macie2 list-classification-jobs" in prompt
+    assert "list-findings" in prompt
+    assert "READ-ONLY" in prompt and "cannot start a job" in prompt
+    assert "no Macie classification job covers this data" in prompt, \
+        "the report must say so explicitly when nothing scanned the data"
+    assert "ENABLED as coverage" in prompt or "session being ENABLED" in prompt
+    # The heuristic disclaimer must survive alongside the new text, not be replaced by it.
+    assert "not a compliance-grade scan" in prompt
+
+
+def test_the_deploy_reports_pii_coverage_on_its_own_line(storage):
+    """Same reason as CORS and skills: when nothing scans the customer's data, the deploy
+    output is the ONLY place that gap is visible."""
+    src = (REPO / "deploy/03_storage.py").read_text()
+    main = src[src.index("def main("):]
+    assert 'results["pii_scan"] = ensure_pii_scan(' in main
+
+
 # ── the session: login, reload-survival, sign-out ──────────────────────────────
 # Before this block the whole auth path had zero test coverage, which is how the
 # refresh-logout bug shipped: the access token lived in one JS variable and a reload
@@ -2927,18 +3361,71 @@ def _plan_with(data):
     return json.dumps({"goal": "x", "data": data}).encode()
 
 
+def _prompt_data_block_keys():
+    """The data-block keys the orchestrator's prompt actually names, parsed from it.
+
+    DERIVED, not restated. The previous version of this test hand-copied seven paths and
+    asserted the console contained them -- so it agreed with the console and with itself
+    while the prompt specified NINE, and `datasheet.provenance` and `readiness_report_uri`
+    were missing from the panel with every test green. A checklist guard that carries its
+    own copy of the checklist cannot detect the drift it exists to detect: the same lesson
+    as the documented-test-count guard, which is derived from pytest for exactly this
+    reason. The prompt is the authority here because it is what the agent is told to write.
+    """
+    import re
+    cfg = json.loads((REPO / "agents/orchestrator/harness.json").read_text())
+    prompt = cfg["systemPrompt"][0]["text"]
+    m = re.search(r'a "data" block \{(.*?)\}; and for any', prompt)
+    assert m, "the consult protocol's data block is no longer in the prompt; re-anchor"
+    spec, keys = m.group(1), []
+    for nested in re.finditer(r'(\w+)\{([^}]*)\}', spec):
+        keys += [f"{nested.group(1)}.{k.strip()}" for k in nested.group(2).split(",")]
+    for flat in re.sub(r'\w+\{[^}]*\}', '', spec).split(","):
+        if flat.strip():
+            keys.append(flat.strip())
+    return set(keys)
+
+
 def test_readiness_names_every_field_the_consult_protocol_asks_for(wired):
-    """The panel's checklist and the orchestrator's step-0 questions must be one list.
-    If the console drops a field the agent asks about, the customer sees two different
-    checklists for one consultation and can sign with an open question invisible."""
+    """The panel's checklist and the orchestrator's step-2 data block must be ONE list.
+
+    If the console drops a field the agent is told to write, the customer sees a
+    complete-looking readiness panel for an incomplete consultation and can sign with an
+    open question invisible. That was live for `readiness_report_uri` -- the pointer to
+    the Data Readiness Report, which is where the audit's PII scan lands. The panel showed
+    "PII disposition" as answered from a claim in the plan while omitting the only link to
+    the artifact that examined the data.
+    """
     tid = _mk_task(wired, plan_body=_plan_with({}))
     r = wired.console.task_readiness(tid)
     paths = [f["field"] for f in r["fields"]]
-    for expected in ("source_uri", "verification_method", "datasheet.license",
-                     "datasheet.pii_disposition", "datasheet.consent",
-                     "customer_eval_uri", "decontamination"):
-        assert expected in paths, f"{expected} missing from the readiness panel: {paths}"
+    missing = _prompt_data_block_keys() - set(paths)
+    assert not missing, (
+        f"the orchestrator is told to write {sorted(missing)}, and the readiness panel "
+        f"never asks about them: {paths}")
     assert r["total"] == len(paths) == len(wired.console.DATA_READINESS_FIELDS)
+    assert len(paths) == len(set(paths)), f"a field is listed twice: {paths}"
+
+
+def test_the_readiness_guard_is_derived_from_the_prompt(wired):
+    """A guard on the guard above, because a restated checklist is how this got through.
+
+    The test above is only worth anything if its expected list comes from the prompt. If
+    someone replaces the derivation with a literal set, every assertion still passes and
+    the panel can silently fall behind the prompt again -- which is exactly the state that
+    hid `readiness_report_uri`. So assert the derivation itself: the parsed keys must
+    include the nested datasheet paths and the report pointer, and must be more than the
+    one field a hardcoded stub would likely name.
+    """
+    keys = _prompt_data_block_keys()
+    assert "readiness_report_uri" in keys and "datasheet.provenance" in keys, (
+        f"the data-block parse lost keys the prompt names: {sorted(keys)}")
+    assert len(keys) >= 9, f"the prompt names 9 data-block keys; parsed {sorted(keys)}"
+    assert all(k.startswith("datasheet.") for k in keys if "provenance" in k)
+    # And the panel is measured against ALL of them, not a subset.
+    tid = _mk_task(wired, plan_body=_plan_with({}))
+    paths = {f["field"] for f in wired.console.task_readiness(tid)["fields"]}
+    assert keys <= paths, f"not measured against the full spec: {sorted(keys - paths)}"
 
 
 def test_an_unanswered_field_says_so_and_says_why(wired):

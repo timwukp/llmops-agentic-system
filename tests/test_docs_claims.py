@@ -106,36 +106,62 @@ def _skill_sources() -> dict[str, dict[str, int]]:
 
 
 def test_the_skill_source_claims_match_the_harness_configs():
-    """The docs state 19 git sources and 0 s3. Derive both from the configs.
+    """The docs state 19 sources and which KIND they are. Derive both from the configs.
 
     Stating "19 git, 0 s3" in prose is exactly the kind of claim that was false here
-    before, so it is checked against the files. When the s3 migration lands, this test
-    fails and names the new numbers -- which is the point: the docs must move with it,
-    in the same commit, or the next reader is told the migration never happened.
+    before, so it is checked against the files. It has now been through the migration it
+    was written to catch: the sources moved to s3 and this test failed and named the new
+    numbers, which is what forced the eight docs to move in the same commit.
+
+    Both halves are asserted, because either one alone can be true while the sentence as
+    a whole misleads:
+      * the COUNT, against the total number of sources -- not against the git total. Read
+        against git alone it would go green the moment the last git source disappeared and
+        the docs still said 19, since 19 != 0 would be the only thing that failed and a
+        doc dropping the number entirely is caught by the `silent` check above, not here.
+      * the KIND named next to the count. A doc left saying "19 sources, all `git`" is
+        precisely as wrong as one saying 4, and the count check cannot see it.
     """
     counts = _skill_sources()
     git_n = sum(k.get("git", 0) for k in counts.values())
     s3_n = sum(k.get("s3", 0) for k in counts.values())
+    total = git_n + s3_n
+    want_kind = "s3" if s3_n else "git"
     claims = []
     for doc in DOC_SKILL_CLAIMS:
         text = doc.read_text()
-        for m in re.finditer(r"(\d+)\s+(?:skill sources|sources)", text):
-            claims.append((doc.name, int(m.group(1))))
-        for m in re.finditer(r"(\d+)\s*個(?:技能)?來源", text):
-            claims.append((doc.name, int(m.group(1))))
+        # The lookbehind is load-bearing: without it the phrase "the s3 sources work"
+        # parses as a claim of THREE sources, and the guard fails on prose that states no
+        # count at all. Any count claim is preceded by whitespace or start-of-line.
+        for pattern in (r"(?<![A-Za-z0-9_])(\d+)\s+(?:skill sources|sources)",
+                        r"(?<![A-Za-z0-9_])(\d+)\s*個(?:技能)?來源"):
+            for m in re.finditer(pattern, text):
+                # The kind is whichever of git/s3 is named FIRST after the count: the
+                # corrected prose reads "are `s3` today; none are `git`", so merely
+                # looking for the expected token in the window would also accept the
+                # sentence with the two swapped.
+                after = text[m.end():m.end() + 160]
+                kinds = re.findall(r"`(git|s3)`", after)
+                claims.append((doc.name, int(m.group(1)), kinds[0] if kinds else None))
     # Per-doc, not "at least one doc". Requiring only one leaves the guard satisfied
     # while the count is quietly deleted from the other seven -- the check would then be
     # anchored to whichever file still happens to mention it. Each doc in the list either
     # states the count or is not in the list.
-    stating = {name for name, _ in claims}
+    stating = {name for name, _, _ in claims}
     silent = [d.name for d in DOC_SKILL_CLAIMS if d.name not in stating]
     assert not silent, (
         f"these docs no longer state a skill-source count: {silent}. The counts were "
         "wrong before, so dropping them removes the check rather than passing it. Either "
         "state the count or remove the file from DOC_SKILL_CLAIMS deliberately.")
-    wrong = [f"{name} says {n}, configs have {git_n} git sources"
-             for name, n in claims if n != git_n]
+    wrong = [f"{name} says {n}, configs have {total} skill sources"
+             for name, n, _ in claims if n != total]
     assert not wrong, "; ".join(wrong) + f" (per-config: {counts})"
+    miskind = [f"{name} calls the {n} sources {k!r}" for name, n, k in claims
+               if k != want_kind]
+    assert not miskind, (
+        "; ".join(miskind) + f", but the configs have {git_n} git and {s3_n} s3. "
+        "A count that is right about the number and wrong about the kind still tells the "
+        "reader the migration never happened.")
     assert s3_n == 0 or git_n == 0, (
         f"skill sources are now MIXED ({git_n} git, {s3_n} s3): {counts}. A partial "
         "migration means some harnesses read a pinned snapshot and others float on the "
@@ -319,3 +345,115 @@ def test_no_doc_claims_a_file_that_does_not_exist():
         "docs cite repo paths that do not exist: "
         + "; ".join(f"{p} (in {', '.join(sorted(set(d)))})" for p, d in sorted(cited.items()))
         + ". Either build the file, or say plainly that it does not exist yet.")
+
+
+# ── the counts that describe the spine, derived from the spine ─────────────────
+# The "8 harness-task states on the happy path" claim in both ARCHITECTURE variants, and
+# PROJECT_STATE's "9 states" and "Lambdas ×5", were all true when written and all became
+# false by addition -- silently, in two languages, exactly like the test count above. Every
+# one of them is derivable from the source it describes, so derive it.
+
+def _happy_path_harness_state_count() -> int:
+    """Harness-task states a successful default-mode run passes through.
+
+    Named apart from `_happy_path_harness_states` above deliberately. Both branches of
+    this merge wrote a guard for the same claim and gave the helper the same name, so the
+    auto-merge kept both bodies and Python kept only the SECOND -- silently disabling the
+    other test's derivation while the suite stayed green. Two independent walks that agree
+    are worth more than one (this one starts at StartAt and keys on `stage`+`task`; the
+    other starts at PipelineModeChoice's Default and keys on `harness_id`), so both are
+    kept, under distinct names.
+
+    Walks the ASL from StartAt on the success edges rather than counting Task states,
+    because `DataAudit` (audit mode only) and `RemediateFinetune` (gate-fail loop only) are
+    real states that no happy-path run touches -- and the docs make the claim about the
+    happy path specifically.
+
+    "Happy path" is a two-part definition and the Choices need both halves: default
+    pipeline mode (so PipelineModeChoice and RemediationChoice take their Default, skipping
+    the audit branch and the remediation loop) AND the quality gate passing -- where the
+    pass is the explicit `gate_passed: true` BRANCH and the Default is the failure edge.
+    Taking Default everywhere walks the failure path out of QualityGateChoice and counts 5.
+    """
+    asl = json.loads((REPO / "orchestration/state_machine.asl.json").read_text())
+    states, seen, count = asl["States"], set(), 0
+    cur = asl["StartAt"]
+    while cur and cur not in seen:
+        seen.add(cur)
+        st = states[cur]
+        payload = (st.get("Parameters") or {}).get("Payload") or {}
+        if payload.get("stage") and payload.get("task"):
+            count += 1
+        if st["Type"] != "Choice":
+            cur = st.get("Next")
+            continue
+        passing = [ch["Next"] for ch in st["Choices"]
+                   if ch.get("Variable", "").endswith("gate_passed")
+                   and ch.get("BooleanEquals") is True]
+        cur = passing[0] if passing else st.get("Default")
+    return count
+
+
+def test_the_documented_happy_path_state_count_matches_the_state_machine():
+    """Both ARCHITECTURE variants said 8; MonitorHealth and MonitorReport made it 10.
+
+    A wrong count here is not cosmetic: it is how the monitor harness stayed undispatched
+    for the platform's whole life while the docs described it as a stage. The prose was
+    read as evidence that the wiring existed.
+    """
+    n = _happy_path_harness_state_count()
+    docs = {"ARCHITECTURE.md": r"\*\*(\d+) harness-task states",
+            "ARCHITECTURE.zh-TW.md": r"\*\*(\d+) 個 harness 任務狀態"}
+    for name, pattern in docs.items():
+        text = (REPO / "docs" / name).read_text()
+        claims = re.findall(pattern, text)
+        assert claims, f"{name}: no harness-task-state count claim left to check"
+        for c in claims:
+            assert int(c) == n, f"{name} claims {c} happy-path harness states, the ASL has {n}"
+
+
+def test_the_documented_state_and_lambda_counts_match_the_deployers():
+    """PROJECT_STATE's infrastructure table is the one-screen answer to "what is running".
+
+    It said 9 states and 5 Lambdas while the ASL had 24 and LAMBDAS had 6. Both drifted by
+    addition, which is the only way this table ever goes wrong and the way no reader can
+    detect: a number that was once measured looks measured forever.
+    """
+    text = (REPO / "PROJECT_STATE.md").read_text()
+    n_states = len(json.loads(
+        (REPO / "orchestration/state_machine.asl.json").read_text())["States"])
+    claimed = re.findall(r"\| (\d+) states", text)
+    assert claimed, "PROJECT_STATE.md no longer states a state count"
+    for c in claimed:
+        assert int(c) == n_states, f"PROJECT_STATE claims {c} states, the ASL has {n_states}"
+
+    lambdas = (REPO / "deploy/07_lambdas.py").read_text()
+    n_fns = len(re.findall(r'^\s{8}"fn": "llmops-', lambdas, re.M))
+    assert n_fns, "could not count LAMBDAS entries -- did the table's shape change?"
+    claimed_fns = re.findall(r"\| Lambdas ×(\d+)", text)
+    assert claimed_fns, "PROJECT_STATE.md no longer states a Lambda count"
+    for c in claimed_fns:
+        assert int(c) == n_fns, f"PROJECT_STATE claims ×{c} Lambdas, LAMBDAS has {n_fns}"
+
+
+def test_every_schedule_the_deployer_creates_is_named_in_the_cost_posture():
+    """The cost posture called the finops reconcile "one recurring cost" and "the only
+    schedule enabled by default". The sweep schedule made both false the moment it landed.
+
+    This is the doc claim with money attached: a reader deciding whether this platform is
+    safe to leave running reads this paragraph and nothing else. A schedule that is ENABLED
+    by default and absent from it is a standing charge nobody was told about.
+    """
+    triggers = (REPO / "deploy/08_triggers.py").read_text()
+    names = set(re.findall(r'^[A-Z_]*SCHEDULE_NAME = "([a-z-]+)"', triggers, re.M))
+    assert names, "no schedule names found in 08_triggers.py"
+    # A schedule created DISABLED by default is not a standing cost, so it need not appear.
+    enabled = {n for n in names if n != "llmops-nightly"}
+    text = (REPO / "PROJECT_STATE.md").read_text()
+    posture = text.split("## Standing cost posture")[1].split("\n## ")[0]
+    for name in sorted(enabled):
+        stem = name.replace("llmops-", "").replace("-daily", "").replace("-", " ")
+        assert name in posture or stem in posture, (
+            f"{name} is ENABLED by default and the standing cost posture never mentions "
+            f"it; the paragraph a reader uses to decide what this platform costs to leave "
+            "running has to name every schedule that runs on its own")

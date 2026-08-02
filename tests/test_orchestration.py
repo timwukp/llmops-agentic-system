@@ -10,8 +10,10 @@ Run: .venv/bin/python -m pytest tests/test_orchestration.py -q
 """
 from __future__ import annotations
 
+import datetime
 import fnmatch
 import importlib.util
+import io
 import json
 import re
 import os
@@ -52,6 +54,10 @@ ENV = {
     "HARNESS_ARN_LLMOPS_DATA_PREP": "arn:aws:bedrock-agentcore:us-east-1:123456789012:harness/llmops_data_prep-TESTSUFFIX",
     "HARNESS_ARN_LLMOPS_FINETUNE": "arn:aws:bedrock-agentcore:us-east-1:123456789012:harness/llmops_finetune-TESTSUFFIX",
     "HARNESS_ARN_LLMOPS_EVAL": "arn:aws:bedrock-agentcore:us-east-1:123456789012:harness/llmops_eval-TESTSUFFIX",
+    # Added with the monitor stages. Without it _resolve_harness_arn falls through to SSM,
+    # and conftest.py refuses the socket -- which is the guard working: a driver test that
+    # reached the real control plane would be a test of production.
+    "HARNESS_ARN_LLMOPS_MONITOR": "arn:aws:bedrock-agentcore:us-east-1:123456789012:harness/llmops_monitor-TESTSUFFIX",
     # The conductor is a driver target too, since an EscalatedToHuman event routes a
     # triage to it. Without the override _resolve_harness_arn would reach SSM, i.e. the
     # network, which conftest refuses.
@@ -88,6 +94,22 @@ def _cond_matches(cond, item) -> bool:
     raise AssertionError(f"fake table cannot evaluate operator {op!r}")
 
 
+def _conditional_check_failed():
+    """The real exception shape, not a bare Exception carrying the name as a message.
+
+    Code that discriminates a rejected condition from a throttle reads
+    ``exc.response["Error"]["Code"]`` -- botocore's ClientError contract -- because the
+    typed exception classes hang off a live client instance and are unavailable under an
+    injected double. A fake raising ``Exception("ConditionalCheckFailedException")`` has
+    no ``response``, so every such check would read the rejection as an unrelated error
+    and reraise, and the test would pass for the wrong reason.
+    """
+    from botocore.exceptions import ClientError
+    return ClientError({"Error": {"Code": "ConditionalCheckFailedException",
+                                  "Message": "The conditional request failed"}},
+                       "UpdateItem")
+
+
 class FakeTable:
     def __init__(self):
         self.items, self.updates = [], []
@@ -107,20 +129,43 @@ class FakeTable:
             if all(item.get(k) == v for k, v in (kw.get("Key") or {}).items()):
                 target = item
                 break
-        if target is None:
-            return {}
         vals = kw.get("ExpressionAttributeValues") or {}
         cond = kw.get("ConditionExpression")
-        if isinstance(cond, str) and "=" in cond:
+        # attribute_exists / attribute_not_exists BEFORE the upsert below, because that
+        # is the pair whose whole purpose is to gate row CREATION.
+        for guard, want_present in (("attribute_exists(", True),
+                                    ("attribute_not_exists(", False)):
+            if isinstance(cond, str) and guard in cond:
+                attr = cond.split(guard, 1)[1].split(")", 1)[0].strip()
+                present = target is not None and attr in target
+                if present != want_present:
+                    raise _conditional_check_failed()
+        if target is None:
+            # update_item is an UPSERT: on a key with no row DynamoDB CREATES one from
+            # the Key plus whatever SET writes. Returning early here instead -- as this
+            # fake did -- made a whole class of defect untestable: the driver's escalate
+            # path minted {run_id, status: escalated} rows for invocations that are not
+            # runs (live: sweep-2026-08-01 from a scheduled orphan sweep), and no test
+            # could see it because in the fake the write simply evaporated. A double
+            # that is more forgiving than production hides exactly the bugs production
+            # will have.
+            target = dict(kw.get("Key") or {})
+            self.items.append(target)
+        if isinstance(cond, str) and "=" in cond and "attribute_" not in cond:
             attr, _, placeholder = (p.strip() for p in cond.partition("="))
             if target.get(attr) != vals.get(placeholder):
-                raise Exception("ConditionalCheckFailedException")
+                raise _conditional_check_failed()
         expr = kw.get("UpdateExpression", "")
         if expr.upper().startswith("SET"):
+            # ExpressionAttributeNames must be resolved, or a `SET #s = :v` write lands
+            # under a literal "#s" key and the row reads back with no `status` at all.
+            # Latent for as long as nothing re-read a status this fake had written; the
+            # phantom-row work reads one back, which is what surfaced it.
+            names = kw.get("ExpressionAttributeNames") or {}
             for clause in expr[3:].split(","):
                 lhs, _, rhs = (p.strip() for p in clause.partition("="))
                 if rhs in vals:
-                    target[lhs] = vals[rhs]
+                    target[names.get(lhs, lhs)] = vals[rhs]
         return {}
 
     def query(self, **kw):
@@ -725,6 +770,233 @@ class TestDriver:
         assert out["status"] == "escalated"
         assert c["sns"].published and c["sfn"].failures
         assert c["sfn"].failures[0]["error"] == "EscalatedToHuman"
+
+    # ---- escalate must never MINT a run row (#62) ----------------------------
+    #
+    # update_item is an upsert, so "set status=escalated" on an id with no row CREATES
+    # one. Live: sweep-2026-08-01 in llmops-pipeline-runs, holding {run_id, status} and
+    # nothing else -- no created_at, no trigger_source, no iteration -- filed by a
+    # scheduled orphan-endpoint sweep whose own Lambda goes out of its way not to write
+    # there. Every id below reaches handle_escalate through a real dispatch path.
+
+    @staticmethod
+    def _escalate(c, event):
+        return driver.handle_escalate(c, event, {"reason": "budget exhausted"})
+
+    def test_an_escalation_updates_the_run_row_of_a_real_run(self):
+        """The behaviour being preserved. A pipeline stage that escalates must still
+        close its own run out at status=escalated -- that value is the driver's alone,
+        and MarkRunFailed's ConditionExpression deliberately keeps it rather than
+        overwriting it with the blunter 'failed'."""
+        c = clients()
+        table = c["ddb"].Table(ENV["RUNS_TABLE"])
+        table.put_item(Item={"run_id": "run-real-1", "status": "running",
+                             "created_at": "2026-08-02T00:00:00Z",
+                             "trigger_source": "console", "iteration": 0})
+        self._escalate(c, driver_event(run_id="run-real-1"))
+        row = table.get_item(Key={"run_id": "run-real-1"})["Item"]
+        assert row["status"] == "escalated"
+        # The richer attributes survive: this is an update, not a replacement.
+        assert row["trigger_source"] == "console" and row["created_at"]
+
+    @pytest.mark.parametrize("run_id,exists", [("run-real-1", True),
+                                               ("sweep-2026-08-01", False)])
+    def test_an_escalation_is_recorded_in_the_timeline_whichever_path_it_took(
+            self, run_id, exists):
+        """The trace the row write was silently standing in for.
+
+        handle_escalate wrote no stage event at all: for a real run, runs.status WAS the
+        record, so an escalation never appeared in the timeline the console renders from
+        llmops-stage-events -- unlike a page, which records its own. Making the row write
+        conditional would have turned that into no record anywhere for a non-run, so the
+        event is written on both paths and `run_row` reports which one ran."""
+        c = clients()
+        if exists:
+            c["ddb"].Table(ENV["RUNS_TABLE"]).put_item(
+                Item={"run_id": run_id, "status": "running"})
+        self._escalate(c, driver_event(run_id=run_id, stage="monitor", task_token=""))
+        rows = [i for i in c["ddb"].Table(ENV["EVENTS_TABLE"]).items
+                if i["run_id"] == run_id and i["sk"].endswith("#escalated")]
+        assert len(rows) == 1, f"{run_id} escalated leaving no durable trace"
+        detail = json.loads(rows[0]["detail"])
+        assert detail["reason"] == "budget exhausted"
+        assert detail["run_row"] is exists, (
+            "the event has to say whether a run row was closed too, or a reader cannot "
+            "tell an escalated run from an escalating non-run")
+
+    # ---- one dead escalation channel must not close the others -----------------
+    #
+    # The channels are independent by design and the ordering used to say otherwise:
+    # SNS was the FIRST statement in handle_escalate and unwrapped, so a failed publish
+    # took the stage event, the bus event and the task-token settle with it. And SNS is
+    # the channel with a known-zero audience -- llmops-escalations has no subscribers
+    # live, which ensure_topic reports rather than papering over, because a deploy
+    # cannot invent an address. The one channel that reaches nobody was gating the two
+    # that work.
+
+    def test_a_dead_sns_topic_does_not_take_the_whole_escalation_with_it(self):
+        """The live shape of this: zero subscribers today, and a publish can fail outright
+        (topic deleted, throttle, IAM drift). The verdict still has to reach the conductor
+        on the bus, the timeline still has to show it, and the token still has to settle."""
+        c = clients()
+        c["ddb"].Table(ENV["RUNS_TABLE"]).put_item(
+            Item={"run_id": "run-real-3", "status": "running"})
+
+        def boom(**kw):
+            raise RuntimeError("Topic does not exist")
+        c["sns"].publish = boom
+        out = self._escalate(c, driver_event(run_id="run-real-3"))
+        assert out == {"escalated": True}
+        assert any(e["DetailType"] == ev.ESCALATED_TO_HUMAN for e in c["events"].entries)
+        assert [i for i in c["ddb"].Table(ENV["EVENTS_TABLE"]).items
+                if i["sk"].endswith("#escalated")]
+        assert c["ddb"].Table(ENV["RUNS_TABLE"]).get_item(
+            Key={"run_id": "run-real-3"})["Item"]["status"] == "escalated"
+        assert c["sfn"].failures, "the task token was never settled"
+
+    def test_a_failed_bus_emit_still_settles_the_task_token(self):
+        """The expensive half. The settle is what releases the state machine; skipping it
+        because a PutEvents failed parks a live token on a run that has already escalated,
+        and the only thing that frees it is the stage's own timeout -- 7200s for data_prep,
+        21600s for finetune. That is the zombie #52 and MarkRunFailed exist to prevent,
+        re-entered through the notification path."""
+        c = clients()
+
+        def boom(**kw):
+            raise RuntimeError("bus unreachable")
+        c["events"].put_events = boom
+        out = self._escalate(c, driver_event(run_id="run-real-4"))
+        assert out == {"escalated": True}
+        assert c["sfn"].failures and c["sfn"].failures[0]["error"] == "EscalatedToHuman"
+
+    def test_the_finops_audit_path_survives_a_dead_topic_too(self):
+        """The audit path returns before the bus and the settle, so SNS is its ONLY
+        channel -- which makes it the one place where an unwrapped publish would turn a
+        cost finding into a raised exception out of the auditor rather than a logged
+        miss. It still must not raise."""
+        c = clients()
+
+        def boom(**kw):
+            raise RuntimeError("Topic does not exist")
+        c["sns"].publish = boom
+        out = self._escalate(c, driver_event(run_id="finops-2026-08-02", stage="finops",
+                                            task="audit", task_token=""))
+        assert out == {"escalated": True}
+        assert c["ddb"].Table(ENV["RUNS_TABLE"]).items == []
+
+    def test_a_failed_timeline_write_never_withholds_the_escalation(self):
+        """Bookkeeping must not be able to swallow the alert. The stage event is the
+        record; SNS and the bus event are how a human finds out. If the record fails,
+        the human must still be told -- an escalation nobody hears is the failure mode
+        this whole handler exists to prevent."""
+        c = clients()
+        events_table = c["ddb"].Table(ENV["EVENTS_TABLE"])
+
+        def boom(**kw):
+            raise RuntimeError("events table gone")
+        events_table.put_item = boom
+        out = self._escalate(c, driver_event(run_id="sweep-2026-08-01", stage="monitor",
+                                            task_token=""))
+        assert out == {"escalated": True}
+        assert c["sns"].published
+        assert any(e["DetailType"] == ev.ESCALATED_TO_HUMAN for e in c["events"].entries)
+
+    @pytest.mark.parametrize("run_id,stage,task", [
+        # The live offender: EventBridge Scheduler -> llmops-monitor-sweep -> driver.
+        ("sweep-2026-08-01", "monitor", "sweep"),
+        # Triage: the driver invokes itself under triage-<subject> off the bus rule. If
+        # a triage escalates in turn, the id names no run either.
+        ("triage-run-abc", "orchestrator", "triage"),
+    ])
+    def test_an_escalation_by_something_that_is_not_a_run_mints_no_run_row(
+            self, run_id, stage, task):
+        """The runs table is the authority on what a run is, and only start_pipeline
+        writes to it. So a synthetic id has no row, and the escalate path must leave the
+        table exactly as it found it -- empty."""
+        c = clients()
+        out = self._escalate(c, driver_event(run_id=run_id, stage=stage, task=task,
+                                            task_token=""))
+        assert out == {"escalated": True}
+        assert c["ddb"].Table(ENV["RUNS_TABLE"]).items == [], (
+            f"escalating {run_id} minted a phantom run row")
+        # The escalation itself is NOT suppressed: a sweep that cannot finish still has
+        # to reach a human. Only the run-row write is conditional.
+        assert c["sns"].published, "the escalation was swallowed along with the row"
+        assert any(e["DetailType"] == ev.ESCALATED_TO_HUMAN
+                   for e in c["events"].entries)
+
+    def test_the_row_write_is_gated_on_the_row_existing_not_on_a_stage_allowlist(self):
+        """Why a condition rather than another _is_finops-style list.
+
+        The first fix for this enumerated the one non-run invoker known at the time
+        (stage == 'finops'), which is why the sweep -- added later, under its own
+        sweep-<date> id -- walked straight back into it. An allowlist of stages that are
+        not runs is a hand-maintained second copy of a fact the runs table already
+        holds, and it is wrong the moment someone adds a caller. So assert the mechanism:
+        the write carries attribute_exists(run_id)."""
+        c = clients()
+        self._escalate(c, driver_event(run_id="sweep-2026-08-01", stage="monitor",
+                                       task="sweep", task_token=""))
+        updates = c["ddb"].Table(ENV["RUNS_TABLE"]).updates
+        assert updates, "no conditional write was even attempted"
+        assert "attribute_exists(run_id)" in updates[0]["ConditionExpression"]
+
+    def test_a_throttle_on_the_row_write_is_not_read_as_this_was_not_a_run(self):
+        """The discriminating half, and the reason the fake raises a real ClientError.
+
+        Absorbing every failure would be worse than the bug it fixes: a run that DID
+        escalate would silently keep status=running, becoming the zombie MarkRunDone and
+        MarkRunFailed exist to prevent. Only a rejected condition means 'not a run'."""
+        c = clients()
+        table = c["ddb"].Table(ENV["RUNS_TABLE"])
+
+        def throttled(**kw):
+            from botocore.exceptions import ClientError
+            raise ClientError({"Error": {"Code": "ProvisionedThroughputExceededException",
+                                         "Message": "slow down"}}, "UpdateItem")
+        table.update_item = throttled
+        with pytest.raises(Exception) as ei:
+            self._escalate(c, driver_event(run_id="run-real-2"))
+        assert "ProvisionedThroughput" in str(ei.value)
+
+    def test_the_condition_is_matched_by_error_code_not_by_message_text(self):
+        """_is_condition_failure reads exc.response['Error']['Code'], because the typed
+        exception classes hang off a live client instance and cannot be referenced from a
+        module that must import under an injected double. A bare
+        Exception('ConditionalCheckFailedException') is NOT the rejection: it has no
+        response, and treating its text as one would absorb any error whose message
+        happened to contain that word."""
+        from botocore.exceptions import ClientError
+        assert driver._is_condition_failure(ClientError(
+            {"Error": {"Code": "ConditionalCheckFailedException"}}, "UpdateItem")) is True
+        assert driver._is_condition_failure(ClientError(
+            {"Error": {"Code": "ThrottlingException"}}, "UpdateItem")) is False
+        assert driver._is_condition_failure(
+            Exception("ConditionalCheckFailedException")) is False
+
+    def test_the_fake_table_upserts_like_dynamodb_does(self):
+        """A guard on the test double itself, because the double is what hid this.
+
+        This fake used to return early when update_item named a key with no row, so the
+        phantom-row write simply evaporated in every test -- the defect was not merely
+        untested, it was untestable. A double more forgiving than production hides
+        exactly the bugs production will have."""
+        t = FakeTable()
+        t.update_item(Key={"run_id": "ghost"}, UpdateExpression="SET #s = :v",
+                      ExpressionAttributeNames={"#s": "status"},
+                      ExpressionAttributeValues={":v": "escalated"})
+        assert t.items == [{"run_id": "ghost", "status": "escalated"}], (
+            "the fake dropped an unconditional write to an absent key; real DynamoDB "
+            "creates the row")
+        # ...and attribute_exists gates that creation, which is the fix under test.
+        t2 = FakeTable()
+        with pytest.raises(Exception) as ei:
+            t2.update_item(Key={"run_id": "ghost"}, UpdateExpression="SET #s = :v",
+                           ConditionExpression="attribute_exists(run_id)",
+                           ExpressionAttributeNames={"#s": "status"},
+                           ExpressionAttributeValues={":v": "escalated"})
+        assert ei.value.response["Error"]["Code"] == "ConditionalCheckFailedException"
+        assert t2.items == []
 
     def test_a_checkpoint_delivers_any_human_directive_waiting_for_this_run(self):
         """A stage agent's only way to ask a blocking question mid-run is checkpoint,
@@ -1572,9 +1844,86 @@ class TestStateMachine:
             "AccessDenied and its Catch would hide it")
 
     def test_teardown_always_follows_smoke_even_on_failure(self, asl):
-        smoke = asl["States"]["SmokeTest"]
-        assert smoke["Next"] == "Teardown"
-        assert smoke["Catch"][0]["Next"] == "Teardown"  # endpoint never orphaned
+        """Both of SmokeTest's exits must REACH Teardown -- not neighbour it.
+
+        This asserted `Next == "Teardown"` literally, and MonitorHealth landing between
+        them broke the test while strengthening the property: health reads the endpoint's
+        metrics while it is still alive, and both of its own exits go to Teardown. The
+        invariant that matters is "the endpoint is never orphaned", i.e. no path out of
+        SmokeTest can miss the delete -- so follow the path instead of naming one hop of
+        it, or the next state inserted here fails a test that should pass and, worse, a
+        state inserted with a path that ESCAPES teardown passes one that should fail.
+        """
+        states = asl["States"]
+
+        def reaches_teardown(start, seen=None):
+            seen = seen or set()
+            if start in seen:
+                return False          # a cycle that never reaches Teardown
+            if start == "Teardown":
+                return True
+            seen = seen | {start}
+            st = states[start]
+            nxt = [st["Next"]] if st.get("Next") else []
+            nxt += [c["Next"] for c in st.get("Catch", [])]
+            # A terminal state that is not Teardown is a leak, and `not nxt` -> all() is
+            # vacuously True, so say so explicitly rather than letting it pass.
+            if not nxt:
+                return False
+            return all(reaches_teardown(n, seen) for n in nxt)
+
+        smoke = states["SmokeTest"]
+        for exit_name, target in [("Next", smoke["Next"])] + \
+                [("Catch", c["Next"]) for c in smoke["Catch"]]:
+            assert reaches_teardown(target), (
+                f"SmokeTest's {exit_name} goes to {target}, from which some path never "
+                "reaches Teardown -- the endpoint can be orphaned, which is the #1 cost "
+                "risk in the platform")
+
+    def test_monitor_health_reads_metrics_while_the_endpoint_still_exists(self, asl):
+        """MonitorHealth must sit AFTER SmokeTest and BEFORE Teardown, and gate nothing.
+
+        Placement here is forced by the shape of the work, not taste. Teardown deletes the
+        endpoint on every path including SmokeTest's Catch, and after the delete
+        `cloudwatch:GetMetricData` returns an empty series for it -- indistinguishable from
+        a healthy endpoint sitting idle. So the only window in which the health task can
+        answer its question at all is between those two states. And it must not gate: a
+        CloudWatch read that fails cannot be allowed to strand the endpoint it was
+        watching, because the endpoint bills whether or not we managed to measure it.
+        """
+        states = asl["States"]
+        health = states["MonitorHealth"]
+        payload = health["Parameters"]["Payload"]
+        assert (payload["stage"], payload["task"]) == ("monitor", "health")
+        assert payload["harness_id"] == "llmops_monitor"
+
+        assert states["SmokeTest"]["Next"] == "MonitorHealth", \
+            "SmokeTest's success exit must reach health before the endpoint is deleted"
+        assert health["Next"] == "Teardown"
+        assert [c["Next"] for c in health["Catch"]] == ["Teardown"], \
+            "a failed metric read must still delete the endpoint -- observation, not a gate"
+        assert health.get("ResultPath", "").startswith("$."), \
+            "health must not replace the state: Teardown and the closeout still need $.run_id"
+
+    def test_monitor_report_runs_after_teardown_on_the_finished_manifest(self, asl):
+        """The narrative is written last, and cannot fail a run that succeeded.
+
+        `report` consolidates the run's story from the finished manifest, so it has to run
+        after the final stage has written to it -- a report composed before Teardown would
+        omit the teardown it exists to confirm. And its Catch goes to Complete: a report
+        that failed to write must not change a run's terminal state. The narrative is a
+        deliverable; the run's outcome is a fact.
+        """
+        states = asl["States"]
+        report = states["MonitorReport"]
+        payload = report["Parameters"]["Payload"]
+        assert (payload["stage"], payload["task"]) == ("monitor", "report")
+        assert states["Teardown"]["Next"] == "MonitorReport"
+        assert report["Next"] == "Complete"
+        assert [c["Next"] for c in report["Catch"]] == ["Complete"], \
+            "a failed report must not fail a run whose pipeline succeeded"
+        assert report.get("ResultPath", "").startswith("$."), \
+            "report must not replace the state: MarkRunDone still reads $.run_id"
 
     def test_every_state_on_the_failure_path_still_has_the_run_id_to_close_out(self, asl):
         """MarkRunFailed reads `$.run_id`, so every state between the crash and it has
@@ -1739,9 +2088,12 @@ class TestStateMachine:
 #: them stay invisible -- which is exactly how ("eval", "evaluate") survived to the
 #: point of gating a real verdict on a file no path produced.
 UNDISPATCHED_HARNESS_TASKS = {
-    ("llmops_monitor", "health"): "task #58 -- the whole harness is unreachable",
-    ("llmops_monitor", "sweep"): "task #58 -- the whole harness is unreachable",
-    ("llmops_monitor", "report"): "task #58 -- the whole harness is unreachable",
+    # llmops_monitor's health/sweep/report were listed here as "the whole harness is
+    # unreachable" until #58 wired all three (MonitorHealth and MonitorReport in the ASL,
+    # sweep on the daily schedule). main still carried the entries because #58 lives on
+    # this branch, so the merge produced an allowlist claiming three DISPATCHED tasks are
+    # unreachable -- caught by test_the_allowlist_does_not_outlive_its_entries, which
+    # exists because a stale note here is read as evidence the wiring is still missing.
     ("llmops_data_prep", "verify"): "superseded by audit; prompt surface kept for now",
     ("llmops_data_prep", "mirror_model"): "needs the s3 mirror switch (task #42)",
     ("llmops_finetune", "prepare"): "folded into launch; never separately dispatched",
@@ -1934,10 +2286,24 @@ class TestConductorDispatch:
 
         Asserted on both harnesses: it is a MOUNT, not a move. data-prep still needs it to
         do the work the answers describe.
+
+        The path is read from the git path OR the s3 URI, because this guard asks WHICH
+        SKILL is mounted and that question is independent of where the bytes come from. Read
+        git-only, it went quietly green-on-nothing at the s3 migration: every skill became
+        an empty string, and `want in {""}` is simply False for both agents -- so the day
+        the mount was actually intact it failed, and a day the mount was deleted it would
+        have failed identically. A guard that cannot distinguish those two is not a guard.
         """
         def skill_paths(agent):
             h = json.loads((REPO / f"agents/{agent}/harness.json").read_text())
-            return {s.get("git", {}).get("path", "") for s in (h.get("skills") or [])}
+            out = set()
+            for s in h.get("skills") or []:
+                if "git" in s:
+                    out.add(s["git"].get("path", ""))
+                elif isinstance(s.get("s3"), dict):
+                    rest = s["s3"].get("uri", "").split("://", 1)[-1]
+                    out.add(rest.split("/", 1)[1].rstrip("/") if "/" in rest else "")
+            return out
 
         want = "skills/llmops/llm-data-preparation"
         assert want in skill_paths("orchestrator"), (
@@ -1946,6 +2312,49 @@ class TestConductorDispatch:
         assert want in skill_paths("data-prep"), (
             f"{want} was MOVED off data-prep rather than also mounted -- the worker that "
             "actually prepares the data lost its guidance")
+
+    def test_every_mounted_skill_is_named_in_the_prompt_that_must_consult_it(self):
+        """A mount makes a skill READABLE; only the prompt makes the agent read it.
+
+        The orchestrator's prompt said "Your mounted skills (llm-agent-orchestration,
+        ml-solution-design) are your methodology — consult them before acting" while FOUR
+        were mounted. `llm-cost-optimization` and `llm-data-preparation` were mounted by
+        later work that never revisited the sentence, and the omitted one is the skill for
+        step 0 DATA DISCOVERY -- the protocol's own opening move. The test above asserts
+        the MOUNT, which was intact, so nothing failed.
+
+        Verified live against the harness rather than reasoned about: asked which skills it
+        had, the deployed agent listed all four -- because the RUNTIME injects a skills
+        manifest into the system prompt that `GetHarness` does not return (a deterministic
+        1148 extra input tokens; see the pass-through gotcha in AGENTS.md). So the agent can
+        SEE all four and is still told, in prose, that two of them are its methodology. Both
+        statements are in front of the model at once and the prose is the one that says
+        "consult them before acting".
+
+        Derived from the mount list in both directions, per the standing rule that a guard
+        carrying its own copy of a checklist cannot detect drift: a skill added to `skills`
+        without being named fails here, and a name left behind after a mount is removed
+        fails too. Every harness is checked, not just the one that drifted.
+        """
+        for cfg in sorted((REPO / "agents").glob("*/harness.json")):
+            h = json.loads(cfg.read_text())
+            mounted = set()
+            for s in h.get("skills") or []:
+                for kind in ("s3", "git", "path"):
+                    if isinstance(s.get(kind), dict):
+                        loc = (s[kind].get("uri") or s[kind].get("path") or "")
+                        mounted.add(loc.rstrip("/").rsplit("/", 1)[-1])
+            prompt = " ".join(b.get("text", "") for b in h.get("systemPrompt") or [])
+            # Only skill-shaped tokens, so ordinary prose cannot accidentally satisfy this.
+            named = set(re.findall(r"\b(?:llm|ml|mlops)-[a-z0-9-]+\b", prompt))
+            agent = h.get("harnessName", cfg.parent.name)
+            assert not (mounted - named), (
+                f"{agent} mounts {sorted(mounted - named)} but its prompt never names "
+                "them -- a mounted skill the prompt does not name is a skill the agent "
+                "is not told to consult")
+            assert not (named - mounted), (
+                f"{agent}'s prompt names {sorted(named - mounted)} but nothing is "
+                "mounted -- the agent is told to consult a skill it cannot read")
 
     def test_deploying_a_harness_warms_it_so_a_customer_does_not_pay_cold_start(self):
         """READY is not warm, and the deploy script used to believe it was.
@@ -2324,6 +2733,10 @@ _CLIENT_HANDOFFS = {
     ("start", "orchestration/start_pipeline/handler.py"),
     ("resume", "orchestration/resume_pipeline/handler.py"),
     ("webhook", "orchestration/webhook/handler.py"),
+    # Added with the sweep itself. A scheduled Lambda is the worst place for this defect:
+    # nobody watches an 08:00 UTC invocation, so an AccessDenied on its PutItem would make
+    # the sweep look like a sweep that ran and found nothing.
+    ("monitor_sweep", "orchestration/monitor_sweep/handler.py"),
 ])
 def test_every_aws_call_a_handler_makes_is_in_its_role(role, src):
     """Generalizes two separately-shipped defects into one guard.
@@ -2418,14 +2831,45 @@ def test_the_sync_covers_every_skill_the_configs_mount(storage_mod):
     mounts = storage_mod.mounted_skills(REPO)
     total = sum(len(v) for v in mounts.values())
     configs = sorted((REPO / "agents").glob("*/harness.json"))
+    # BOTH kinds. Counting only `git` would make this guard evaporate at exactly the
+    # moment it matters: after the migration every source is `s3`, so a git-only sync
+    # plan covers 0 mounts, a git-only expectation is also 0, and 0 == 0 passes while the
+    # mirror has stopped syncing the only copy any agent ever reads.
     from_cfg = sum(1 for c in configs
                    for s in (json.loads(c.read_text()).get("skills") or [])
-                   if "git" in s)
+                   if "git" in s or "s3" in s)
     assert total == from_cfg, (
-        f"the sync plan covers {total} mounts but the configs declare {from_cfg} git "
-        "sources; a mount the sync does not know about is a skill that vanishes when "
-        "its source is switched to s3")
+        f"the sync plan covers {total} mounts but the configs declare {from_cfg} git+s3 "
+        "sources; a mount the sync does not know about is a skill that goes stale in S3 "
+        "while every config still reads healthy")
     assert mounts, "no mounts found at all -- the glob or the config shape changed"
+
+
+def test_the_sync_still_covers_a_skill_once_its_source_is_s3(storage_mod, tmp_path):
+    """After the migration S3 is the ONLY copy an agent reads, so that is precisely when
+    the mirror must keep syncing it.
+
+    The first version of `mounted_skills` collected `git` only, reasoning that an entry
+    already on s3 needs no upload. That inverts at the switch: a git-only plan silently
+    covers nothing, and the coverage guard above compares 0 to 0 and passes, so the next
+    skill edit would never reach any agent. The path is recovered from the URI because the
+    s3 source shape is a single `uri` with no `path` field.
+    """
+    agents = tmp_path / "agents"
+    (agents / "monitor").mkdir(parents=True)
+    (agents / "monitor" / "harness.json").write_text(json.dumps({"skills": [
+        {"s3": {"uri": "s3://llmops-data/skills/llmops/llm-observability"}},
+        {"s3": {"uri": "s3://<DATA_BUCKET>/skills/llmops/llm-cost-optimization"}},
+        {"git": {"url": "u", "path": "skills/llmops/llm-agent-orchestration"}},
+    ]}))
+    mounts = storage_mod.mounted_skills(tmp_path)
+    assert set(mounts) == {"skills/llmops/llm-observability",
+                           "skills/llmops/llm-cost-optimization",
+                           "skills/llmops/llm-agent-orchestration"}, (
+        f"an s3-sourced mount was dropped from the mirror plan: {mounts}")
+    assert mounts["skills/llmops/llm-cost-optimization"] == ["monitor"], (
+        "an UNRESOLVED <DATA_BUCKET> must yield the same repo-relative path as a resolved "
+        "bucket, so the plan is identical before and after substitution")
 
 
 def test_a_skill_entry_with_sibling_keys_is_still_collected(storage_mod, tmp_path):
@@ -2657,6 +3101,681 @@ def test_the_agents_cannot_write_the_skill_tree_they_are_judged_against():
         "the harness role can WRITE the skill mirror; the skills grant must be "
         "GetObject-only and separate from the read/write pipeline prefixes")
     assert not _prefix_is_granted("s3:DeleteObject", "skills/llmops/x/SKILL.md")
+
+
+# ── declared vs dispatched: the third recurrence gets a guard ──────────────────
+# page_human (#54), eval `evaluate` (#57) and the entire monitor harness (#58) were all
+# the same defect: a capability the prompt, the docs and the IAM described, that no code
+# path could reach. Three times is a pattern, and a pattern needs a check rather than a
+# fourth fix. pipeline/contracts/tasks.py declares the rule; these tests enforce it.
+
+from pipeline.contracts.tasks import (NON_ASL_DISPATCH_SITES,          # noqa: E402
+                                      TASKS_WITHOUT_A_DISPATCH_SITE,
+                                      declared_tasks, prompt_text)
+
+
+def _asl_dispatched():
+    """(stage, task) for every state machine state that invokes a harness."""
+    asl = json.loads((REPO / "orchestration/state_machine.asl.json").read_text())
+    out = {}
+    for name, st in asl["States"].items():
+        payload = (st.get("Parameters") or {}).get("Payload") or {}
+        if payload.get("stage") and payload.get("task"):
+            out[(payload["stage"], payload["task"])] = name
+    return out
+
+
+def _declared_everywhere():
+    """(harness_dir, task) for every task any agent prompt declares."""
+    out = {}
+    for cfg_path in sorted((REPO / "agents").glob("*/harness.json")):
+        cfg = json.loads(cfg_path.read_text())
+        for task in declared_tasks(prompt_text(cfg)):
+            out[(cfg_path.parent.name, task)] = cfg_path
+    return out
+
+
+def test_every_task_a_prompt_declares_can_actually_be_dispatched():
+    """The guard the last three fixes each needed and none of them left behind.
+
+    A task clause in a system prompt is a promise: the agent is told what `params.task`
+    values mean and is judged on handling them. When nothing dispatches one, the promise
+    is unfalsifiable from inside the platform -- no error, no metric, no log line, because
+    "never dispatched" and "dispatched and did nothing" look identical from outside. That
+    is exactly how the monitor harness went the platform's whole life with three declared
+    tasks and zero dispatch sites, while ARCHITECTURE.md described it as a stage.
+
+    So each declared task must be dispatched by the state machine, or by a site named in
+    NON_ASL_DISPATCH_SITES, or listed in TASKS_WITHOUT_A_DISPATCH_SITE with a reason. The
+    allowlist is not a way around the test: writing the reason down is the work, because
+    "by design" and "we forgot" are indistinguishable until somebody says which it is.
+    """
+    dispatched = _asl_dispatched()
+    unaccounted = []
+    for (agent, task) in sorted(_declared_everywhere()):
+        if (agent, task) in dispatched:
+            continue
+        if (agent, task) in NON_ASL_DISPATCH_SITES:
+            continue
+        if (agent, task) in TASKS_WITHOUT_A_DISPATCH_SITE:
+            continue
+        unaccounted.append(f"{agent}:{task}")
+    assert not unaccounted, (
+        f"these tasks are declared in a prompt and nothing can ever dispatch them: "
+        f"{unaccounted}. Wire a dispatch site, or record WHY not in "
+        "pipeline/contracts/tasks.py -- an undispatchable task is invisible in production.")
+
+
+def test_the_dispatch_allowlists_do_not_outlive_the_tasks_they_excuse():
+    """An allowlist that keeps entries for tasks nobody declares any more is worse than
+    no allowlist: it reads as deliberate coverage of ground the prompt has abandoned, and
+    the next person adding a task with a colliding name inherits somebody else's excuse.
+    """
+    declared = set(_declared_everywhere())
+    stale = sorted(k for k in
+                   list(NON_ASL_DISPATCH_SITES) + list(TASKS_WITHOUT_A_DISPATCH_SITE)
+                   if k not in declared)
+    assert not stale, (
+        f"pipeline/contracts/tasks.py accounts for tasks no prompt declares: {stale}; "
+        "delete the entries or restore the clauses")
+
+
+def test_each_named_dispatch_site_still_dispatches_what_it_claims():
+    """A pointer to a file is only worth as much as the file's contents.
+
+    NON_ASL_DISPATCH_SITES is bookkeeping, and bookkeeping decays: the file gets renamed,
+    the task gets dropped from a TASKS tuple, the harness id changes -- and the entry keeps
+    asserting a dispatch that no longer happens, which is the precise failure this whole
+    module exists to catch, reintroduced by the fix for it. So check the file exists and
+    that it names both the harness and the task.
+    """
+    for (agent, task), rel in sorted(NON_ASL_DISPATCH_SITES.items()):
+        path = REPO / rel
+        assert path.exists(), f"{agent}:{task} points at {rel}, which does not exist"
+        text = path.read_text()
+        assert task in text, f"{rel} is named as the dispatch site for {task!r} but never mentions it"
+        harness_id = f"llmops_{agent.replace('-', '_')}"
+        assert harness_id in text, (
+            f"{rel} dispatches {task!r} but never names {harness_id}; it cannot be "
+            "reaching that harness")
+
+
+def test_the_state_machine_only_dispatches_tasks_the_prompts_declare():
+    """The reverse direction, which fails a different way: a state dispatching a task no
+    prompt declares reaches the agent, and the agent -- told to handle a closed set of
+    values -- improvises. That is worse than a state that fails, because it produces
+    plausible artifacts nobody asked for and a stage_complete that looks like success.
+    """
+    declared = set(_declared_everywhere())
+    for (stage, task), state in sorted(_asl_dispatched().items()):
+        assert (stage, task) in declared, (
+            f"{state} dispatches {stage}:{task}, which no agents/{stage}/harness.json "
+            "prompt declares; the agent would improvise a task it was never given")
+
+
+# ── prompt-named AWS APIs vs the role that must make the call ──────────────────
+# test_finops.py already checks S3 PREFIXES named in prompts against the role. That is
+# only half the surface: the monitor prompt named `aws cloudwatch get-metric-statistics`
+# and `aws sagemaker list-tags`, and the harness role granted NEITHER -- an implicitDeny
+# confirmed against the live role with simulate_principal_policy. Nobody noticed for the
+# same reason as the missing dispatch: no monitor task had ever run. So check ACTIONS too.
+
+#: `aws <service> <sub-command>` as written in a prompt -> the IAM action it performs.
+#: Only the commands the prompts actually use; a CLI-wide table would be a second source
+#: of truth for the AWS API surface and would rot faster than the prompts do.
+_CLI_TO_IAM = {
+    ("sts", "get-caller-identity"): None,  # implicitly allowed for any principal
+    ("sagemaker", "list-training-jobs"): "sagemaker:ListTrainingJobs",
+    ("sagemaker", "list-endpoints"): "sagemaker:ListEndpoints",
+    ("sagemaker", "list-tags"): "sagemaker:ListTags",
+    ("sagemaker", "describe-endpoint"): "sagemaker:DescribeEndpoint",
+    ("sagemaker", "describe-endpoint-config"): "sagemaker:DescribeEndpointConfig",
+    ("sagemaker", "delete-endpoint"): "sagemaker:DeleteEndpoint",
+    ("sagemaker", "create-training-job"): "sagemaker:CreateTrainingJob",
+    ("sagemaker", "describe-training-job"): "sagemaker:DescribeTrainingJob",
+    ("sagemaker", "create-model"): "sagemaker:CreateModel",
+    ("sagemaker", "create-model-package"): "sagemaker:CreateModelPackage",
+    ("sagemaker-runtime", "invoke-endpoint"): "sagemaker:InvokeEndpoint",
+    ("bedrock-runtime", "converse"): "bedrock:InvokeModel",
+    ("cloudwatch", "get-metric-statistics"): "cloudwatch:GetMetricStatistics",
+    ("cloudwatch", "get-metric-data"): "cloudwatch:GetMetricData",
+    ("ce", "get-cost-and-usage"): "ce:GetCostAndUsage",
+    ("ce", "get-cost-and-usage-with-resources"): "ce:GetCostAndUsageWithResources",
+    ("pricing", "get-products"): "pricing:GetProducts",
+}
+
+
+def _harness_allowed_actions():
+    allowed = set()
+    for st in _harness_role_statements():
+        if st.get("Effect") != "Allow":
+            continue
+        acts = st["Action"]
+        allowed.update([acts] if isinstance(acts, str) else acts)
+    return allowed
+
+
+def test_every_aws_api_a_prompt_tells_an_agent_to_call_is_in_the_harness_role():
+    """The action-level twin of test_every_s3_prefix_any_agent_prompt_uses_is_one_the_role
+    _can_reach, added because the prefix guard could not see this class of gap at all.
+
+    A prompt naming an API is the strongest possible statement that the agent will call it
+    -- stronger than a code path, because the agent has no fallback and no branch: it runs
+    the command it was told to run, takes AccessDeniedException in a shell, and then has to
+    decide what to do about it mid-task. Live, the monitor prompt's very first instruction
+    was `aws cloudwatch get-metric-statistics` against a role with no cloudwatch read
+    action at all.
+
+    Driven off the prompts, so an API added to any prompt fails here rather than in the
+    middle of a paid run.
+    """
+    allowed = _harness_allowed_actions()
+
+    def granted(action):
+        return action in allowed or any(
+            p.endswith("*") and action.startswith(p[:-1]) for p in allowed)
+
+    missing = {}
+    for cfg_path in sorted((REPO / "agents").glob("*/harness.json")):
+        text = cfg_path.read_text()
+        for service, sub in set(re.findall(r"aws ([a-z0-9-]+) ([a-z0-9-]+)", text)):
+            if (service, sub) not in _CLI_TO_IAM:
+                raise AssertionError(
+                    f"{cfg_path.parent.name} prompt runs `aws {service} {sub}` and this "
+                    "test has no IAM mapping for it -- add it to _CLI_TO_IAM so the grant "
+                    "is checked; an unmapped command is an unchecked permission")
+            action = _CLI_TO_IAM[(service, sub)]
+            if action and not granted(action):
+                missing[f"{cfg_path.parent.name}: aws {service} {sub}"] = action
+    assert not missing, (
+        f"prompts tell agents to call APIs the harness role denies: {missing}. The agent "
+        "takes AccessDenied in a shell, mid-task, with no fallback.")
+
+
+def test_the_sweep_can_read_tags_of_endpoints_nobody_claimed():
+    """ListEndpoints/ListTags stay on Resource "*" deliberately, and that is not laziness.
+
+    The single genuine orphan in this account is jumpstart-dft-hf-asr-whisper-large-v2:
+    InService since 2024-04-11, carrying no `project` tag at all. A sweep whose ListTags
+    were scoped to endpoint/llmops-* could never see the one endpoint it exists to catch --
+    an untagged endpoint is unattributable, not foreign, and the unattributable ones are
+    exactly what nobody is watching. Enumeration and metadata are account-wide; every
+    MUTATION stays scoped, so the sweep can SEE everything and TOUCH only ours. The reads
+    that make an orphan costable live in the sibling test below.
+    """
+    stmts = {st.get("Sid"): st for st in _harness_role_statements()}
+    lst = stmts["SageMakerList"]
+    assert set(lst["Action"]) >= {"sagemaker:ListEndpoints", "sagemaker:ListTags"}
+    assert lst["Resource"] == "*" or lst["Resource"] == ["*"], (
+        "scoping the sweep's enumeration to llmops-* hides untagged orphans, which is "
+        "the only kind of orphan there is")
+    delete = stmts["SageMakerLifecycleScoped"]
+    assert "sagemaker:DeleteEndpoint" in delete["Action"]
+    assert "*" not in ([delete["Resource"]] if isinstance(delete["Resource"], str)
+                       else delete["Resource"]), \
+        "DeleteEndpoint must stay scoped: the sweep reports, it does not get to delete "\
+        "anything in the account"
+
+
+def test_the_sweep_can_characterise_an_orphan_it_may_not_touch():
+    """Read account-wide, mutate llmops-* only -- and the split runs THROUGH Describe.
+
+    The first live sweep is the evidence. It found the orphan, then filed its own permission
+    gap: DescribeEndpoint was scoped to endpoint/llmops-*, so it could not read the instance
+    type of the one endpoint it flagged, and its headline cost -- ~$1106/month, ~$30.6k since
+    2024-04-11 -- went out as a guess at the JumpStart default. A finding whose number is an
+    assumption is a finding an owner can correctly dismiss.
+
+    So Describe is account-wide and read-only while every mutation stays scoped. That pairing
+    is the invariant worth pinning, because the tempting fix is to widen
+    SageMakerLifecycleScoped instead -- which would hand DeleteEndpoint over the whole
+    account to an agent whose prompt forbids deleting anything.
+
+    The grant is also only half the fix, which is why the prompt is asserted here too. The
+    live sweep did not fail on AccessDenied for a call it was told to make -- it was never
+    told to make the call. A permission nothing instructs the agent to use buys the same
+    guessed cost figure it bought before, and reads as fixed.
+    """
+    cfg = json.loads((REPO / "agents/monitor/harness.json").read_text())
+    sweep_clause = [ln for ln in prompt_text(cfg).splitlines() if ln.startswith('- "sweep"')]
+    assert len(sweep_clause) == 1, "the sweep clause moved; re-anchor this guard"
+    for cmd in ("aws sagemaker describe-endpoint",
+                "aws sagemaker describe-endpoint-config"):
+        assert cmd in sweep_clause[0], (
+            f"the sweep clause never tells the agent to run '{cmd}', so granting it in IAM "
+            "changes nothing: the flagged endpoint still gets priced off a guessed instance "
+            "type. The live sweep did not take an AccessDenied here -- it never tried.")
+
+    stmts = {st.get("Sid"): st for st in _harness_role_statements()}
+    read = stmts["SageMakerDescribeReadOnly"]
+    assert read["Resource"] in ("*", ["*"]), (
+        "a sweep that can only describe endpoints already named llmops-* cannot cost out "
+        "the untagged ones, which are the only orphans there are")
+    assert set(read["Action"]) >= {"sagemaker:DescribeEndpoint",
+                                   "sagemaker:DescribeEndpointConfig"}, (
+        "DescribeEndpoint alone gives the config NAME, not the instance type behind it; "
+        "the cost figure needs both calls")
+    mutations = {"sagemaker:CreateEndpoint", "sagemaker:UpdateEndpoint",
+                 "sagemaker:DeleteEndpoint", "sagemaker:CreateModel", "sagemaker:AddTags",
+                 "sagemaker:CreateEndpointConfig", "sagemaker:CreateTrainingJob",
+                 "sagemaker:StopTrainingJob"}
+    assert not (set(read["Action"]) & mutations), (
+        f"{sorted(set(read['Action']) & mutations)} is a mutation on Resource '*'; this "
+        "statement is the account-wide one and must stay read-only")
+    for sid, st in stmts.items():
+        acts = st["Action"] if isinstance(st["Action"], list) else [st["Action"]]
+        if not (set(acts) & mutations):
+            continue
+        res = st["Resource"] if isinstance(st["Resource"], list) else [st["Resource"]]
+        assert "*" not in res, (
+            f"{sid} mutates SageMaker on Resource '*'. Widening the LIFECYCLE statement is "
+            "the wrong fix for a read gap: it grants DeleteEndpoint account-wide to an "
+            "agent whose prompt says 'do NOT delete endpoints yourself -- report them'")
+
+
+# ── the DriftDetected emitter that never existed ───────────────────────────────
+# DRIFT_DETECTED was declared in pipeline/contracts/events.py from Phase 1 and emitted by
+# NOTHING, while the monitor prompt tells the agent to put its finding in
+# metrics.drift_detected "so the orchestrator can emit the event" -- naming an emitter that
+# did not exist. Unobservable at the same time as the missing dispatch, and for the same
+# reason: no monitor task had ever run.
+
+def _monitor_health_run(metrics):
+    """Run a monitor:health stage_complete through the driver; return the clients."""
+    uri = "s3://llmops-data-test/runs/run-test-1/monitoring/health.json"
+    ac = FakeAgentCore([
+        tool_use_stream("stage_complete",
+                        {"stage": "monitor", "task": "health",
+                         "outputs": [uri], "metrics": metrics}),
+        text_stream("ack")])
+    c = clients(ac, FakeS3(existing=[uri]))
+    c["s3"].objects["s3://llmops-data-test/runs/run-test-1/manifest.json"] = json.dumps(
+        {"run_id": "run-test-1", "stages": {}})
+    driver.handler(driver_event(stage="monitor", task="health",
+                               harness_id="llmops_monitor"), clients=c)
+    return c
+
+
+def test_a_health_task_that_finds_drift_emits_the_event_nothing_used_to_emit():
+    c = _monitor_health_run({"drift_detected": True, "p90_ms": 812})
+    assert any(e["DetailType"] == ev.DRIFT_DETECTED for e in c["events"].entries), (
+        "the prompt promises the orchestrator emits DriftDetected from this metric; for "
+        "the platform's whole life nothing did")
+
+
+@pytest.mark.parametrize("metrics", [
+    {"drift_detected": False},
+    {"drift_detected": None},
+    {},                              # the agent did not answer the question
+    {"drift_detected": "unknown"},   # ...or answered it in prose
+    {"drift_detected": "false"},     # a non-empty string, which bool() calls True
+    {"drift_detected": 1},           # truthy, but not the boolean the contract asks for
+])
+def test_only_a_literal_true_announces_drift(metrics):
+    """Strict `is True`, deliberately matching the eval gate rather than bool().
+
+    The failure mode is asymmetric, so the test is too. A DriftDetected event is an
+    accusation about a deployed model: whatever subscribes to it will roll back, retrain or
+    page somebody. "unknown" and "false" are both truthy strings, and an agent that could
+    not measure drift is far likelier to say one of those than to omit the key -- so bool()
+    would have the platform announcing drift nobody observed, sourced from an agent that
+    said it did not know. Under-reporting here loses a signal; over-reporting spends money
+    and burns trust in the signal itself.
+    """
+    c = _monitor_health_run(dict(metrics, p90_ms=100))
+    assert not [e for e in c["events"].entries if e["DetailType"] == ev.DRIFT_DETECTED], (
+        f"metrics={metrics!r} announced drift; only a literal True may")
+
+
+@pytest.mark.parametrize("echoed, dispatched", [
+    ({}, "sweep"),                                   # the field simply omitted -- both live sweeps
+    ({"task": ""}, "sweep"),                         # ...or present and empty
+    ({"task": "report", "stage": "finops"}, "sweep"),  # ...or confidently wrong
+])
+def test_the_event_row_records_the_task_that_was_dispatched_not_the_one_echoed(echoed, dispatched):
+    """Which task ran is the driver's fact, not the agent's.
+
+    Everything else in a stage_complete payload is the agent's to report -- nobody else
+    knows the outputs or the metrics. stage and task are the opposite: the driver was
+    handed both in its own invocation event, so the agent's copy adds nothing and can
+    subtract. Both live monitor sweeps (2026-08-01 19:59Z and 20:13Z) filed
+    ``"task": ""``, so the row said a monitor stage completed without saying which of
+    health/sweep/report it was -- the ambiguity #58 exists to remove, reintroduced one
+    layer down.
+
+    The console reads this field to decide which (stage, task) pairs a run executed
+    (``_session_ids``), and an empty task there matches ANY task of the stage, so a sweep
+    could lend its evidence to a health check that never ran. The wrong-echo case is the
+    reason the fix overwrites rather than fills-if-blank.
+    """
+    uri = "s3://llmops-data-test/monitoring/sweeps/sweep-2026-08-01.json"
+    ac = FakeAgentCore([
+        tool_use_stream("stage_complete",
+                        {"outputs": [uri], "metrics": {"endpoints_total": 1}, **echoed}),
+        text_stream("ack")])
+    c = clients(ac, FakeS3(existing=[uri]))
+    driver.handler(driver_event(stage="monitor", task=dispatched,
+                               harness_id="llmops_monitor"), clients=c)
+    rows = [i for i in c["ddb"].tables["llmops-stage-events"].items
+            if "stage_complete" in str(i.get("sk", ""))]
+    assert rows, "no stage_complete row was written at all"
+    detail = json.loads(rows[-1]["detail"])
+    assert detail["task"] == dispatched, (
+        f"the row records task={detail['task']!r}; the driver dispatched {dispatched!r}. "
+        "The agent's echo is a restatement at best -- the dispatch is the fact.")
+    assert detail["stage"] == "monitor", (
+        f"the row records stage={detail['stage']!r} for a monitor dispatch")
+
+
+def test_health_never_reports_a_gate_because_observation_is_not_a_verdict():
+    """A health task settles its token with gate_passed True by the non-gate default, and
+    that is correct: MonitorHealth has no Choice after it, and a metric read must not be
+    able to decide a run's fate. If health could fail the run, a CloudWatch hiccup would
+    strand the endpoint it was watching -- the exact cost risk it exists to reduce."""
+    c = _monitor_health_run({"drift_detected": True, "error_rate": 0.9})
+    payload = json.loads(c["sfn"].successes[0]["output"])
+    assert payload["gate_passed"] is True, (
+        "health reported a gate verdict; drift is a finding for a human and the "
+        "orchestrator, never a pipeline decision made inside the observation step")
+
+
+# ── the scheduled sweep Lambda ─────────────────────────────────────────────────
+
+sweep = _load("monitor_sweep", "orchestration/monitor_sweep/handler.py")
+
+SWEEP_ENV = {"DATA_BUCKET": "llmops-data-test", "DRIVER_FN": "llmops-harness-driver",
+             "EVENTS_TABLE": "llmops-stage-events", "PROJECT": "llmops-agentic-system",
+             "AWS_REGION": "us-east-1"}
+
+
+class _SweepLambda:
+    def __init__(self, payload=None, raises=None):
+        self.calls = []
+        self._payload = payload
+        self._raises = raises
+
+    def invoke(self, **kw):
+        self.calls.append(kw)
+        if self._raises:
+            raise self._raises
+        out = {"StatusCode": 202 if kw["InvocationType"] == "Event" else 200}
+        if self._payload is not None:
+            out["Payload"] = io.BytesIO(json.dumps(self._payload).encode())
+        return out
+
+
+def _sweep_clients(lam=None, ddb=None):
+    return {"lambda": lam or _SweepLambda(), "ddb": ddb or FakeDDB(), "sns": FakeEvents()}
+
+
+@pytest.fixture
+def sweep_env(monkeypatch):
+    for k, v in SWEEP_ENV.items():
+        monkeypatch.setenv(k, v)
+
+
+def test_the_sweep_id_is_derived_from_the_date_so_re_running_a_day_is_idempotent():
+    """A sweep has no run, but the driver keys its session id and every stage-event row
+    off run_id. Date-derived rather than random so a re-run of the same day lands in the
+    same session and the same rows: re-running a sweep is normal operations, and two
+    sweeps of one day must not read as two different sets of findings."""
+    assert sweep.sweep_id(datetime.date(2026, 8, 2)) == "sweep-2026-08-02"
+    assert sweep.sweep_id(datetime.date(2026, 8, 2)) == sweep.sweep_id(datetime.date(2026, 8, 2))
+    assert sweep.sweep_id(datetime.date(2026, 8, 3)) != sweep.sweep_id(datetime.date(2026, 8, 2))
+
+
+def test_the_sweep_payload_carries_the_idle_threshold_instead_of_restating_it():
+    """idle_hours travels in the payload rather than being described twice in prose. The
+    prompt says "flag any idle >2 hours"; if the schedule believed something else, the two
+    would disagree and nothing would say so -- the agent would apply the prompt's number
+    and the operator would read the schedule's."""
+    p = sweep.build_payload("proj", "buck", "us-east-1", "sweep-2026-08-02", idle_hours=6)
+    assert p["params"]["idle_hours"] == 6
+    assert (p["stage"], p["task"], p["harness_id"]) == ("monitor", "sweep", "llmops_monitor")
+    assert sweep.DEFAULT_IDLE_HOURS == 2, "the default must match the prompt's threshold"
+
+
+def test_the_sweep_writes_outside_any_runs_prefix():
+    """A sweep's findings are about endpoints that OUTLIVED their runs, so filing them
+    under runs/<run_id>/ would bury the account-level answer inside whichever run happened
+    to look -- and the sweep has no run to file under in the first place."""
+    p = sweep.build_payload("proj", "buck", "us-east-1", "sweep-2026-08-02")
+    for uri in (p["manifest_uri"], p["params"]["sweep_uri"]):
+        assert uri.startswith("s3://buck/monitoring/"), uri
+        assert "/runs/" not in uri
+
+
+def test_the_sweep_lambda_refuses_the_run_scoped_monitor_tasks(sweep_env):
+    """health and report are run-scoped and live in the state machine. Dispatching either
+    from here would invent a run_id for a run that does not exist, and then write into
+    another run's prefix under it."""
+    for task in ("health", "report", "reconcile", ""):
+        c = _sweep_clients()
+        out = sweep.handler({"task": task}, clients=c)
+        assert "error" in out, f"task={task!r} was accepted"
+        assert not c["lambda"].calls, f"task={task!r} reached the driver"
+
+
+def test_the_scheduler_invocation_is_async_and_a_sync_one_reads_the_driver_back(sweep_env):
+    """The schedule fires and forgets: a sweep's own work takes minutes in the harness, and
+    a 60s Lambda waiting on it would time out having done everything right. An operator
+    calling it by hand with sync=True wants the verdict, so that path reads the payload."""
+    c = _sweep_clients()
+    sweep.handler({"task": "sweep"}, clients=c)
+    assert c["lambda"].calls[0]["InvocationType"] == "Event"
+
+    c = _sweep_clients(_SweepLambda(payload={"status": "completed"}))
+    out = sweep.handler({"task": "sweep", "sync": True}, clients=c)
+    assert c["lambda"].calls[0]["InvocationType"] == "RequestResponse"
+    assert out["result"]["status"] == "completed"
+
+
+def test_every_invocation_leaves_a_row_so_a_MISSED_sweep_is_visible(sweep_env):
+    """The same argument as finops's reserved #audit# key. The failure mode worth
+    engineering against is not a sweep that reports badly -- it is a sweep that silently
+    stopped happening, at 08:00 UTC, where nobody is looking. A cost control nobody can
+    tell has stopped is not a control."""
+    c = _sweep_clients()
+    sweep.handler({"task": "sweep"}, clients=c)
+    rows = [i for t in c["ddb"].tables.values() for i in t.items]
+    assert len(rows) == 1, f"expected exactly one sweep row, got {rows}"
+    assert rows[0]["sk"].startswith("sweep#") and rows[0]["stage"] == "monitor"
+    assert rows[0]["run_id"].startswith("sweep-")
+
+
+def test_a_sweep_row_never_lands_in_the_runs_table(sweep_env):
+    """EVENTS_TABLE, not RUNS_TABLE. A synthetic sweep-<date> row in the runs table would
+    be listed by the console as a run, reconciled for cost by the auditor, and counted in
+    the run totals every doc quotes -- one phantom run per day, forever."""
+    c = _sweep_clients()
+    sweep.handler({"task": "sweep"}, clients=c)
+    assert list(c["ddb"].tables) == ["llmops-stage-events"], (
+        f"the sweep wrote to {list(c['ddb'].tables)}; a sweep is not a run")
+
+
+def test_a_bookkeeping_failure_does_not_lose_the_sweep(sweep_env):
+    """The row exists to make a missed sweep visible; it must not be able to CAUSE one.
+    If PutItem fails after the driver was already invoked, the sweep is running -- raising
+    here would make the scheduler retry it and start a second one."""
+    class _Broken:
+        def Table(self, name):
+            raise Exception("ProvisionedThroughputExceeded")
+
+    c = _sweep_clients(ddb=_Broken())
+    out = sweep.handler({"task": "sweep"}, clients=c)
+    assert c["lambda"].calls, "the driver was never invoked"
+    assert out["result"]["status"] == "invoked"
+
+
+def test_the_sweep_schedule_cannot_drift_into_the_wrong_day(sweep_env):
+    """FlexibleTimeWindow OFF, deliberately, same as the finops reconcile. sweep_id() reads
+    the CURRENT date, so a job allowed to drift past midnight UTC would file its findings
+    under a day it did not sweep -- and the row for the day it was scheduled for would be
+    missing, which is exactly the "missed sweep" signal above, fired falsely."""
+    triggers = _deploy_src("08_triggers.py")
+    assert 'SWEEP_SCHEDULE_NAME = "llmops-monitor-sweep-daily"' in triggers
+    body = triggers.split("def ensure_sweep_schedule")[1].split("\ndef ")[0]
+    assert '"Mode": "OFF"' in body, "a flexible window files findings under the wrong date"
+    assert 'cron(0 8 * * ? *)' in body
+    assert 'json.dumps({"task": "sweep"})' in body
+
+
+def test_the_scheduler_role_may_invoke_every_function_this_deploy_schedules():
+    """A schedule pointing at a function the role may not invoke fails in the scheduler's
+    own metrics and nowhere else -- indistinguishable from a schedule that ran and found
+    nothing. So the Resource list has to be exhaustive, checked against the schedules the
+    file actually creates rather than against a list somebody remembered to update."""
+    triggers = _deploy_src("08_triggers.py")
+    role_body = triggers.split("def ensure_scheduler_role")[1].split("\ndef ")[0]
+    targets = set(re.findall(r'function:(llmops-[a-z-]+)"', role_body))
+    scheduled = set(re.findall(r'function:(llmops-[a-z-]+)"', triggers)) - targets
+    scheduled |= {m for m in re.findall(r'f"arn:aws:lambda:\{region\}:\{account\}:'
+                                       r'function:(llmops-[a-z-]+)"', triggers)}
+    missing = scheduled - targets
+    assert not missing, (
+        f"08_triggers.py schedules {sorted(missing)} but llmops-scheduler-invoke may not "
+        "invoke them; the schedule would be ENABLED, healthy in the console, and dead")
+
+
+def test_the_sweep_function_is_deployed_by_the_deployer_that_schedules_it():
+    """The rule the finops entry in 07_lambdas.py already records: 08_triggers.py creates a
+    live ENABLED schedule against this function name, so omitting it from LAMBDAS leaves a
+    daily invocation of a function that does not exist."""
+    lambdas = _deploy_src("07_lambdas.py")
+    assert '"fn": "llmops-monitor-sweep"' in lambdas
+    assert '/llmops/iam/lambda_monitor_sweep_arn' in lambdas, (
+        "the sweep must get its OWN role, not the driver's -- a cost-control probe with "
+        "every permission the pipeline it probes has is not a control")
+    entry = lambdas.split('"monitor_sweep": {')[1].split("},")[0]
+    for key in ("EVENTS_TABLE", "DATA_BUCKET", "DRIVER_FN", "PROJECT"):
+        assert key in entry, f"{key} is read by the handler and not passed at deploy time"
+
+
+# --- #42: placeholder substitution for harness configs --------------------------------
+# The s3 skill-source shape is a single URI that embeds the bucket name, and this
+# account's bucket name embeds the account id -- which may not appear in a file of this
+# public repo (hooks/pre-commit + .github/workflows/redaction-check.yml). So the configs
+# carry <DATA_BUCKET> and the deploy resolves it. deploy/01_iam.py has resolved exactly
+# these tokens in its policy documents since Phase 1; this is that mechanism applied to
+# agents/*/harness.json, which had NO substitution step at all before this change.
+
+@pytest.fixture(scope="module")
+def subst():
+    return _load("llmops_config_subst", "deploy/config_subst.py")
+
+
+@pytest.fixture(scope="module")
+def harnesses_mod():
+    """deploy/05_harnesses.py as a module (name starts with a digit). Import-time safe."""
+    return _load("llmops_05_harnesses", "deploy/05_harnesses.py")
+
+
+def test_no_harness_config_contains_a_literal_account_id():
+    """The redaction scan enforces this repo-wide; this says WHY for these files.
+
+    A CI failure reading "possible account ID found" does not tell the next person that a
+    skill URI is the reason a bucket name wanted to be literal here, nor that a
+    placeholder is the supported way to write one.
+    """
+    import re as _re
+    bad = []
+    for cfg in sorted((REPO / "agents").glob("*/harness*.json")):
+        for m in _re.finditer(r"(?<![0-9.])[0-9]{12}(?![0-9.])", cfg.read_text()):
+            bad.append(f"{cfg.relative_to(REPO)}: {m.group(0)}")
+    assert not bad, (
+        f"literal 12-digit account id(s) in harness configs: {bad}. Write <ACCOUNT_ID> / "
+        "<DATA_BUCKET> instead -- deploy/config_subst.py resolves them at deploy time, "
+        "and the CI redaction scan fails the build on a literal one.")
+
+
+def test_every_s3_skill_uri_uses_the_bucket_placeholder():
+    """An s3 source must name <DATA_BUCKET>, not a bucket spelled out.
+
+    Enforced separately from the account-id guard because a hardcoded bucket without an
+    account id in the name (`my-skills-bucket`) passes redaction and still pins every
+    harness to one account's storage.
+    """
+    wrong = []
+    for cfg in sorted((REPO / "agents").glob("*/harness*.json")):
+        for i, s in enumerate(json.loads(cfg.read_text()).get("skills") or []):
+            uri = (s.get("s3") or {}).get("uri")
+            if uri and not uri.startswith("s3://<DATA_BUCKET>/"):
+                wrong.append(f"{cfg.relative_to(REPO)} skills[{i}]: {uri}")
+    assert not wrong, (
+        "s3 skill sources must be written s3://<DATA_BUCKET>/<path>: " + "; ".join(wrong))
+
+
+def test_every_placeholder_a_config_uses_has_a_value(subst):
+    """A token nobody can resolve is the failure this whole mechanism exists to prevent.
+
+    `<DATABUCKET>` would sail past the linter, past validate_config, and past
+    UpdateHarness -- which mints a version and reports READY -- and then kill every
+    session at START. So the set of tokens the configs use must be a subset of the set the
+    mapping knows.
+    """
+    known = set(subst.mapping_for("123456789012", "us-east-1"))
+    for cfg in sorted((REPO / "agents").glob("*/harness*.json")):
+        used = set(subst.unresolved(json.loads(cfg.read_text())))
+        unknown = used - known
+        assert not unknown, (
+            f"{cfg.relative_to(REPO)} uses {sorted(unknown)}, which nothing resolves. "
+            f"Known tokens: {sorted(known)}. AgentCore accepts an unresolved URI and the "
+            "harness fails at session start, not at deploy.")
+
+
+def test_resolve_refuses_a_config_with_a_token_left_in_it(subst):
+    """The load-bearing half. Substituting is easy; refusing to ship the leftover is the
+    part that turns a session-start failure into a deploy-time error."""
+    cfg = {"skills": [{"s3": {"uri": "s3://<DATA_BUCKET>/skills/x"}},
+                      {"s3": {"uri": "s3://<DATABUCKET>/skills/y"}}]}
+    mapping = subst.mapping_for("123456789012", "us-east-1")
+    with pytest.raises(SystemExit, match="DATABUCKET"):
+        subst.resolve(cfg, mapping, where="agents/x/harness.json")
+
+
+def test_resolve_reports_every_unresolved_token_not_just_the_first(subst):
+    """One deploy names every token you must supply, instead of one per re-run."""
+    cfg = {"a": "<ONE>", "b": ["<TWO>", {"c": "<THREE>"}]}
+    with pytest.raises(SystemExit) as e:
+        subst.resolve(cfg, {}, where="x")
+    for tok in ("<ONE>", "<TWO>", "<THREE>"):
+        assert tok in str(e.value), f"{tok} was not reported: {e.value}"
+
+
+def test_substitution_reaches_a_skill_uri_nested_in_a_list(subst):
+    """skills is a LIST of dicts, so a substituter that only walked dict VALUES would
+    leave every skill URI untouched while resolving the flat fields and reporting success."""
+    cfg = {"harnessName": "llmops_monitor",
+           "skills": [{"s3": {"uri": "s3://<DATA_BUCKET>/skills/llmops/llm-observability"}}]}
+    out = subst.resolve(cfg, subst.mapping_for("123456789012", "us-east-1",
+                                               bucket="llmops-agentic-x"))
+    assert out["skills"][0]["s3"]["uri"] == \
+        "s3://llmops-agentic-x/skills/llmops/llm-observability"
+
+
+def test_an_explicit_bucket_beats_the_derived_one(subst):
+    """03_storage.py PUBLISHES the bucket to SSM; a name derived from the account id would
+    disagree with it after any deploy that passed --bucket, and a skill URI pointing at a
+    bucket that does not exist fails at session start."""
+    m = subst.mapping_for("123456789012", "us-east-1", bucket="chosen-bucket")
+    assert m["<DATA_BUCKET>"] == "chosen-bucket"
+    assert subst.mapping_for("123456789012", "us-east-1")["<DATA_BUCKET>"] == \
+        "llmops-agentic-123456789012-us-east-1"
+
+
+def test_the_deployer_resolves_placeholders_before_sending_a_config(harnesses_mod):
+    """05_harnesses.load_config must return a resolved config, and must REFUSE one that
+    still carries a token. It did neither before #42: the script's only transforms were
+    strip_comments and ensure_env, so a placeholder URI had nothing to resolve it."""
+    mapping = {"<ACCOUNT_ID>": "123456789012", "<REGION>": "us-east-1",
+               "<DATA_BUCKET>": "bkt"}
+    cfg = harnesses_mod.load_config("monitor", prod=False, mapping=mapping)
+    left = [s for s in json.dumps(cfg).split() if "<DATA_BUCKET>" in s]
+    assert not left, f"load_config returned unresolved tokens: {left}"
+    for skill in cfg.get("skills") or []:
+        uri = (skill.get("s3") or {}).get("uri")
+        if uri:
+            assert uri.startswith("s3://bkt/"), f"{uri} was not substituted"
 
 
 # ---------------------------------------------------------------------------
@@ -2919,3 +4038,242 @@ def test_the_triage_rule_is_deployable_on_its_own_and_in_a_bare_run(monkeypatch,
     assert [r.get("rule") for r in report["results"]] == ["llmops-escalation-triage"]
     assert not [r for r in report["results"] if "lambda" in r or "state_machine" in r]
     assert "triage_rule" in mod.NON_LAMBDA_TARGETS, "a bare run would skip the rule"
+
+
+# ---------------------------------------------------------------------------
+# The live bus vs the bytes about to ship (#61)
+# ---------------------------------------------------------------------------
+# #59 built the escalation channel; a later deploy from a DIFFERENT branch overwrote the
+# driver with a build that had no triage_event_from_bus, while llmops-escalation-triage
+# stayed ENABLED and pointed at it. Every escalation then reached the driver as a raw
+# EventBridge envelope and died on KeyError: 'run_id' before any handler branch ran.
+#
+# Every guard above stayed green, and that is the part worth fixing rather than the
+# missing function: they compare EVENTS_NEEDING_A_RULE against the rules THIS TREE's
+# deployer builds, so a branch carrying neither the declaration, nor the rule, nor the
+# translator is perfectly self-consistent. A tree cannot know what is live on the bus.
+# So the check moved to deploy time, where both facts are available at once.
+
+class _FakeEvents:
+    """Minimal EventBridge stand-in: rules and targets, per bus."""
+
+    def __init__(self, rules):
+        self._rules = rules  # {bus: [ {Name, State, EventPattern, Targets} ]}
+
+    def list_rules(self, EventBusName):
+        return {"Rules": [{k: v for k, v in r.items() if k != "Targets"}
+                          for r in self._rules.get(EventBusName, [])]}
+
+    def list_targets_by_rule(self, Rule, EventBusName):
+        for r in self._rules.get(EventBusName, []):
+            if r["Name"] == Rule:
+                return {"Targets": r.get("Targets", [])}
+        return {"Targets": []}
+
+
+DRIVER_FN = "llmops-harness-driver"
+_TRIAGE_ARN = f"arn:aws:lambda:us-east-1:123456789012:function:{DRIVER_FN}"
+
+
+def _triage_rule_live(state="ENABLED", targets=None, detail_types=None):
+    return {"llmops-pipeline": [{
+        "Name": "llmops-escalation-triage",
+        "State": state,
+        "EventPattern": json.dumps({
+            "source": [ev.EVENT_SOURCE],
+            "detail-type": detail_types or [ev.ESCALATED_TO_HUMAN],
+            "detail": {"stage": [{"anything-but": ["orchestrator"]}]}}),
+        "Targets": targets if targets is not None else [{"Id": "triage",
+                                                        "Arn": _TRIAGE_ARN}],
+    }]}
+
+
+def test_the_real_driver_source_can_read_the_real_live_rule():
+    """The regression itself: today's handler.py against today's rule shape.
+
+    Reads the actual file rather than a fixture, so deleting the translator fails here.
+    """
+    mod = _lambdas_mod()
+    src = (REPO / "orchestration/harness_driver/handler.py").read_text()
+    gaps = mod.live_bus_translator_gap(_FakeEvents(_triage_rule_live()), src,
+                                       DRIVER_FN, "llmops-pipeline")
+    assert gaps == [], f"the driver cannot read a live rule's envelope: {gaps}"
+
+
+def test_a_driver_without_the_translator_is_a_gap_the_deploy_can_see():
+    """The branch that caused this: the rule is live, the handler has no translator.
+
+    Simulated by stripping the function name from the source, which is precisely the
+    state the deployed zip was in -- verified live by downloading it: the translator
+    string was absent while _stamp_dispatch was present.
+    """
+    mod = _lambdas_mod()
+    src = (REPO / "orchestration/harness_driver/handler.py").read_text()
+    without = src.replace("triage_event_from_bus", "some_other_function")
+    assert "triage_event_from_bus" not in without
+    gaps = mod.live_bus_translator_gap(_FakeEvents(_triage_rule_live()), without,
+                                       DRIVER_FN, "llmops-pipeline")
+    assert len(gaps) == 1, gaps
+    assert gaps[0]["rule"] == "llmops-escalation-triage"
+    assert gaps[0]["detail_type"] == ev.ESCALATED_TO_HUMAN
+    assert "triage_event_from_bus" in gaps[0]["problem"]
+
+
+def test_the_deploy_refuses_rather_than_warns_when_the_translator_is_missing():
+    """A warning is useless here: the deploy reports success and the channel is dead.
+
+    Same rule as config_subst.resolve() -- an unresolved token and an unreadable envelope
+    are both accepted by the API and both fail later, out of sight of the person
+    deploying.
+    """
+    mod = _lambdas_mod()
+    tmp = REPO / "tests" / "_tmp_driver_no_translator.py"
+    tmp.write_text((REPO / "orchestration/harness_driver/handler.py").read_text()
+                   .replace("triage_event_from_bus", "gone"))
+    try:
+        cfg = dict(mod.LAMBDAS["driver"], src=tmp)
+        with pytest.raises(SystemExit) as exc:
+            mod.deploy_lambda(None, None, "us-east-1", "123456789012", "driver", cfg,
+                              False, _FakeEvents(_triage_rule_live()))
+        # The message has to name the function AND the rule: "deploy failed" sends
+        # someone reading Lambda logs, and the fault is on the bus.
+        assert "llmops-harness-driver" in str(exc.value)
+        assert "llmops-escalation-triage" in str(exc.value)
+    finally:
+        tmp.unlink()
+
+
+def test_a_dry_run_never_reaches_the_bus_check():
+    """--dry-run must stay offline; conftest refuses the socket, so this also proves the
+    check is not on the path that reports what WOULD happen."""
+    mod = _lambdas_mod()
+
+    class _Boom:
+        def list_rules(self, **kw):
+            raise AssertionError("a dry run called EventBridge")
+
+    out = mod.deploy_lambda(None, None, "us-east-1", "", "driver",
+                            mod.LAMBDAS["driver"], True, _Boom())
+    assert out["would"] == "create/update"
+
+
+def test_an_input_transformer_on_the_rule_removes_the_need_for_a_translator():
+    """The two are alternatives, and the check must know it.
+
+    #59 chose Python over an InputTransformer deliberately (a transformer referencing a
+    path an event lacks drops it silently). But if a rule DOES carry one, EventBridge has
+    already reshaped the event and demanding the Python function would block a correct
+    deploy -- a guard that cries wolf gets bypassed, which costs more than it saves.
+    """
+    mod = _lambdas_mod()
+    src = "no translator here at all"
+    transformed = [{"Id": "triage", "Arn": _TRIAGE_ARN,
+                    "InputTransformer": {"InputPathsMap": {"r": "$.detail.run_id"},
+                                         "InputTemplate": '{"run_id": <r>}'}}]
+    assert mod.live_bus_translator_gap(
+        _FakeEvents(_triage_rule_live(targets=transformed)), src, DRIVER_FN,
+        "llmops-pipeline") == []
+
+
+def test_a_disabled_rule_delivers_nothing_and_blocks_nothing():
+    """A DISABLED rule cannot invoke anything, so it must not hold up a deploy."""
+    mod = _lambdas_mod()
+    assert mod.live_bus_translator_gap(
+        _FakeEvents(_triage_rule_live(state="DISABLED")), "no translator", DRIVER_FN,
+        "llmops-pipeline") == []
+
+
+def test_a_rule_targeting_a_different_function_is_not_this_deploys_problem():
+    """Scoped to the function being deployed. Otherwise every Lambda deploy is gated on
+    every rule on the bus, and the check becomes something people pass with --force."""
+    mod = _lambdas_mod()
+    other = [{"Id": "x", "Arn": "arn:aws:lambda:us-east-1:123456789012:function:other"}]
+    assert mod.live_bus_translator_gap(
+        _FakeEvents(_triage_rule_live(targets=other)), "no translator", DRIVER_FN,
+        "llmops-pipeline") == []
+
+
+def test_a_live_rule_for_an_undeclared_detail_type_is_itself_reported():
+    """The other direction: a rule delivering something no translator is declared for.
+
+    This is how the NEXT version of this defect arrives -- someone adds a rule pointing
+    at the driver for a detail-type nobody wrote a branch for. The handler receives an
+    envelope it has no branch for, which is the same crash by a different route, so the
+    check names it instead of silently passing an unknown.
+    """
+    mod = _lambdas_mod()
+    gaps = mod.live_bus_translator_gap(
+        _FakeEvents(_triage_rule_live(detail_types=["SomeNewEvent"])),
+        (REPO / "orchestration/harness_driver/handler.py").read_text(),
+        DRIVER_FN, "llmops-pipeline")
+    assert [g["detail_type"] for g in gaps] == ["SomeNewEvent"]
+    assert "BUS_DELIVERY_TRANSLATORS" in gaps[0]["problem"]
+
+
+def test_an_unreachable_bus_is_reported_as_unchecked_not_as_clean():
+    """No credentials, no bus, an API error: say the check did not happen.
+
+    Returning [] would make an unreachable bus indistinguishable from an agreeing one --
+    the exact "no rule and rule missing look identical" confusion #59 was about, moved
+    into the guard built to prevent it. The deploy proceeds (a network blip must not
+    block shipping) but says so on stderr.
+    """
+    mod = _lambdas_mod()
+
+    class _Down:
+        def list_rules(self, **kw):
+            raise RuntimeError("bus unreachable")
+
+    gaps = mod.live_bus_translator_gap(_Down(), "src", DRIVER_FN, "llmops-pipeline")
+    assert len(gaps) == 1 and "unchecked" in gaps[0]
+    assert "bus unreachable" in gaps[0]["unchecked"]
+
+
+def test_only_the_bus_delivered_lambda_is_checked_against_the_bus():
+    """Exactly one of the six spine Lambdas is an EventBridge target; the rest are
+    invoked by Step Functions, the console or a schedule. Marking them all would gate
+    unrelated deploys on the bus and dilute the signal."""
+    mod = _lambdas_mod()
+    marked = {k for k, v in mod.LAMBDAS.items() if v.get("bus_delivered")}
+    assert marked == {"driver"}, marked
+    assert mod.LAMBDAS["driver"]["bus_delivered"] == "llmops-pipeline"
+
+
+def test_every_declared_translator_exists_in_the_handler_it_names():
+    """BUS_DELIVERY_TRANSLATORS is a promise about code; check it against the code.
+
+    Declaring a translator that does not exist would make the deploy-time check pass on a
+    name nobody implemented -- the guard would then be asserting its own spelling.
+    """
+    src = (REPO / "orchestration/harness_driver/handler.py").read_text()
+    for detail_type, fname in ev.BUS_DELIVERY_TRANSLATORS.items():
+        assert f"def {fname}(" in src, (
+            f"{detail_type} declares translator {fname}(), absent from the driver")
+        assert hasattr(driver, fname), f"{fname} is not importable from the driver"
+
+
+def test_the_translator_declaration_covers_every_event_that_needs_a_rule():
+    """The two contracts have to agree: an event that needs a rule to the driver needs a
+    way for the driver to read it. Declaring the rule without the translator is exactly
+    the half-built channel #59 found, and #61 was its mirror image."""
+    for detail_type in ev.EVENTS_NEEDING_A_RULE:
+        assert detail_type in ev.BUS_DELIVERY_TRANSLATORS, (
+            f"{detail_type} is routed to a Lambda by a rule but no translator is "
+            "declared for it; the delivery would arrive as a raw envelope")
+
+
+def test_a_call_site_without_a_definition_does_not_satisfy_the_check():
+    """The check looks for `def <name>(`, not the bare name, and a negative control is why.
+
+    Renaming only the DEFINITION leaves the call site behind, and a bare-substring check
+    passed on that source -- a handler that would raise NameError on the first escalation.
+    A call to a function nobody defines is worse than no call: it fails at the same place
+    for a reason one step further from the fix.
+    """
+    mod = _lambdas_mod()
+    src = (REPO / "orchestration/harness_driver/handler.py").read_text().replace(
+        "def triage_event_from_bus(", "def _renamed_translator(", 1)
+    assert "triage_event_from_bus" in src, "the call site should still be there"
+    gaps = mod.live_bus_translator_gap(_FakeEvents(_triage_rule_live()), src,
+                                       DRIVER_FN, "llmops-pipeline")
+    assert len(gaps) == 1 and "triage_event_from_bus" in gaps[0]["problem"], gaps

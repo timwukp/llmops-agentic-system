@@ -86,6 +86,25 @@ EVENTS_NEEDING_A_RULE: dict = {
         "an escalated run waits for a human who was never told"),
 }
 
+#: For each detail-type an EventBridge rule may deliver straight to a Lambda, the name of
+#: the function in that Lambda's handler that translates the bus envelope into the
+#: payload the handler actually runs on.
+#:
+#: An EventBridge delivery is NOT a state-machine payload: it arrives wrapped in
+#: {source, detail-type, detail, ...}, so a handler keyed on event["run_id"] raises
+#: KeyError on the very first line. That is not hypothetical -- the driver was deployed
+#: from a branch that lacked triage_event_from_bus while llmops-escalation-triage was
+#: ENABLED and targeting it, and every escalation on the live bus died that way.
+#:
+#: Declared HERE, next to the detail-types, so deploy/07_lambdas.py can check the bytes it
+#: is about to ship against the rules that are LIVE. The offline guards cannot: they
+#: compare this tree's declarations against this tree's deployer, and a branch missing the
+#: declaration AND the rule AND the translator is self-consistent and green. Only the bus
+#: knows which rules exist.
+BUS_DELIVERY_TRANSLATORS: dict = {
+    ESCALATED_TO_HUMAN: "triage_event_from_bus",
+}
+
 #: Event source used on the custom bus.
 EVENT_SOURCE = "llmops.pipeline"
 

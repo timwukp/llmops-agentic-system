@@ -1,10 +1,10 @@
 {
-  "Comment": "llmops-pipeline \u2014 stage DAG with waitForTaskToken per harness task and the self-iteration remediation loop (eval gate fail -> remediate finetune, <=3 iterations, then escalate).",
+  "Comment": "llmops-pipeline — stage DAG with waitForTaskToken per harness task and the self-iteration remediation loop (eval gate fail -> remediate finetune, <=3 iterations, then escalate).",
   "StartAt": "PipelineModeChoice",
   "States": {
     "PipelineModeChoice": {
       "Type": "Choice",
-      "Comment": "data_audit is the conductor's starter: audit the customer's data and stop \u2014 no GPU stage may run. Default full pipeline otherwise.",
+      "Comment": "data_audit is the conductor's starter: audit the customer's data and stop — no GPU stage may run. Default full pipeline otherwise.",
       "Choices": [
         {
           "And": [
@@ -363,6 +363,37 @@
             "States.ALL"
           ],
           "ResultPath": "$.error",
+          "Next": "MonitorHealth",
+          "Comment": "Still lands on the teardown path, now via MonitorHealth, whose own Catch goes straight to Teardown. A failed smoke test is exactly when the endpoint's metrics are worth reading, and the endpoint is still alive here."
+        }
+      ],
+      "Next": "MonitorHealth"
+    },
+    "MonitorHealth": {
+      "Type": "Task",
+      "Comment": "MonitorHealth had no state at all until now, and llmops_monitor's three declared tasks (health, sweep, report) had ZERO dispatch sites anywhere in the platform -- the same defect class as an emitted event with no rule: a capability the docs, the prompt and the IAM all describe, that nothing can ever reach. Placement is forced by the shape of the work, not by taste: `health` reads CloudWatch metrics for a LIVE endpoint, and Teardown ALWAYS deletes that endpoint (its own Comment says so, including on SmokeTest's Catch). So between SmokeTest and Teardown is the only window in a run's life where the thing being monitored exists. After Teardown the endpoint is gone and get-metric-data returns an empty series that reads identically to a healthy idle endpoint.",
+      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+      "Parameters": {
+        "FunctionName": "${HarnessDriverArn}",
+        "Payload": {
+          "run_id.$": "$.run_id",
+          "manifest_uri.$": "$.manifest_uri",
+          "stage": "monitor",
+          "task": "health",
+          "harness_id": "llmops_monitor",
+          "task_token.$": "$$.Task.Token",
+          "iteration.$": "$.iteration"
+        }
+      },
+      "ResultPath": "$.health",
+      "TimeoutSeconds": 3600,
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "Health is observation, not a gate: a CloudWatch read that fails must never strand the endpoint it was watching. Routes to Teardown for the same reason SmokeTest's Catch does -- an orphaned endpoint is the #1 cost risk, and it costs money whether or not we managed to measure it.",
+          "ResultPath": "$.error",
           "Next": "Teardown"
         }
       ],
@@ -370,7 +401,7 @@
     },
     "Teardown": {
       "Type": "Task",
-      "Comment": "Always runs after deploy \u2014 orphaned endpoints are the #1 cost risk.",
+      "Comment": "Always runs after deploy — orphaned endpoints are the #1 cost risk.",
       "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
       "Parameters": {
         "FunctionName": "${HarnessDriverArn}",
@@ -393,6 +424,36 @@
           ],
           "ResultPath": "$.error",
           "Next": "EscalateFail"
+        }
+      ],
+      "Next": "MonitorReport"
+    },
+    "MonitorReport": {
+      "Type": "Task",
+      "Comment": "The run's story, consolidated once the manifest is finished. Placed AFTER Teardown rather than before it because the report enumerates the stage timeline and total estimated cost from the manifest -- run before Teardown it would publish a report whose last line is missing, and teardown is precisely the entry a cost reader looks for. It is the last harness task in the run, so it cannot be a gate either.",
+      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+      "Parameters": {
+        "FunctionName": "${HarnessDriverArn}",
+        "Payload": {
+          "run_id.$": "$.run_id",
+          "manifest_uri.$": "$.manifest_uri",
+          "stage": "monitor",
+          "task": "report",
+          "harness_id": "llmops_monitor",
+          "task_token.$": "$$.Task.Token",
+          "iteration.$": "$.iteration"
+        }
+      },
+      "ResultPath": "$.monitor_report",
+      "TimeoutSeconds": 3600,
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "A report that failed to write must not fail a run whose pipeline succeeded. The narrative is a deliverable; the run's terminal state is a fact. Complete still emits PipelineCompleted and MarkRunDone still closes the record.",
+          "ResultPath": "$.error",
+          "Next": "Complete"
         }
       ],
       "Next": "Complete"
@@ -527,7 +588,7 @@
     "Fail": {
       "Type": "Fail",
       "Error": "PipelineFailed",
-      "Cause": "Terminal failure or remediation budget exhausted \u2014 see EscalatedToHuman event, SNS, and DDB stage events."
+      "Cause": "Terminal failure or remediation budget exhausted — see EscalatedToHuman event, SNS, and DDB stage events."
     },
     "MarkRunFailed": {
       "Type": "Task",

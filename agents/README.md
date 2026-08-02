@@ -27,9 +27,16 @@ shell + code interpreter + skills; eval and monitor additionally get the managed
 console screenshot evidence. `job_launched` implements launch-and-release for SageMaker
 training jobs (Step Functions `waitForTaskToken` resumes a fresh session on job completion).
 
+**Skill sources:** all 19 skill sources here are `s3` — a pinned mirror under
+`s3://<DATA_BUCKET>/skills/`, mirrored and frontmatter-validated by `ensure_skills` in
+`deploy/03_storage.py` before any source moved. A git source has no branch field, so it
+always reads the skill repo's default branch: a push there would silently change an agent's
+methodology with no version and no way to tell which snapshot a past run used. VPC mode
+cannot reach GitHub at all. `<DATA_BUCKET>` is resolved at deploy time by
+`deploy/config_subst.py`, since the bucket name embeds the account id and these are
+public-repo files.
+
 **Dev vs prod variants:** `harness.json` (this directory) is the **dev** variant — PUBLIC
-network, skills mounted from the git source (`timwukp/MLOps-agent-skills`, default branch).
-A **prod** variant (`harness.prod.json`) would use VPC network mode with an S3-mirrored
-skill snapshot, since VPC mode cannot reach GitHub and git skills float on main. **No such
-file exists for any agent** — `05_harnesses.py --prod` looks for one, but the variants and
-the S3 mirror are both unbuilt. All 19 skill sources here are `git`.
+network. A **prod** variant (`harness.prod.json`) would use VPC network mode. **No such
+file exists for any agent** — `05_harnesses.py --prod` looks for one, but the variants are
+unbuilt; the S3 skill mirror they also needed now exists and is what every harness reads.

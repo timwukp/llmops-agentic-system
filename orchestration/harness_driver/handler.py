@@ -393,6 +393,52 @@ def _gate_event(metrics: dict) -> str:
     return ev.QUALITY_GATE_PASSED if metrics.get("gate_passed") else ev.QUALITY_GATE_FAILED
 
 
+def _health_event(metrics: dict) -> Optional[str]:
+    """DriftDetected on a monitor health task, or nothing.
+
+    DRIFT_DETECTED has been declared in events.py since Phase 1 and emitted by NOTHING,
+    while the monitor prompt tells the agent to put its finding in
+    ``metrics.drift_detected`` "so the orchestrator can emit the event" — naming an emitter
+    that does not exist. Nobody noticed because no monitor task had ever been dispatched;
+    the promise and its absence were unobservable at the same time.
+
+    It belongs here, not in the agent: emitting is the driver's job for every other stage
+    (STAGE_EVENT_MAP), the harness role's PutEvents grant is scoped to this bus for exactly
+    this reason, and an agent that self-reports an event can emit one for work it did not
+    verify.
+
+    Strict truthiness, deliberately matching the eval gate rather than ``bool()``: this
+    event is the only signal a human gets that a deployed model has started behaving
+    differently. ``is True`` means an absent or null finding stays silent instead of a
+    string like "unknown" or "none" — which is truthy — announcing drift that nobody
+    observed. The failure directions are asymmetric but both are real, so the rule is that
+    the agent must say ``true`` to be heard.
+    """
+    return ev.DRIFT_DETECTED if metrics.get("drift_detected") is True else None
+
+
+def _stamp_dispatch(norm: dict, stage: str, task: str) -> dict:
+    """Overwrite the agent's echoed stage/task with what was actually DISPATCHED.
+
+    ``normalize_stage_complete`` reads stage and task out of the agent's tool args, which
+    is right for everything else in the payload -- outputs, metrics and evidence are the
+    agent's findings and nobody else can supply them. Stage and task are the opposite kind
+    of fact: the driver was told both in its own invocation event, so the agent's copy is
+    at best a restatement and at worst wrong. Both live monitor sweeps recorded
+    ``"task": ""`` because the agent simply omitted the field, and the run's row then said
+    a monitor stage completed without saying WHICH of health/sweep/report did -- the exact
+    ambiguity #58 existed to remove. It is not cosmetic: the console derives which
+    (stage, task) pairs a run executed from this field (``_session_ids``), so an empty
+    task quietly widens to "any task of that stage".
+
+    The dispatch wins on principle, not just because the echo happened to be empty here:
+    an agent that echoes ``task: "report"`` on a sweep invocation would otherwise file its
+    sweep findings under a task that never ran.
+    """
+    return {**norm, "stage": stage or norm.get("stage", ""),
+            "task": task or norm.get("task", "")}
+
+
 def handle_stage_complete(c, event, args) -> dict:
     """Verify → normalize → canonical publish → events → settle token."""
     run_id, stage, task = event["run_id"], event["stage"], event["task"]
@@ -402,10 +448,13 @@ def handle_stage_complete(c, event, args) -> dict:
     if missing:
         return {"ok": False, "missing_outputs": missing}
 
-    _record_stage_event(c["ddb"], run_id, stage, "stage_complete", norm)
+    _record_stage_event(c["ddb"], run_id, stage, "stage_complete",
+                        _stamp_dispatch(norm, stage, task))
 
     if stage == "eval" and task == "gate":
         detail_type = _gate_event(norm.get("metrics", {}))
+    elif stage == "monitor" and task == "health":
+        detail_type = _health_event(norm.get("metrics", {}))
     else:
         detail_type = STAGE_EVENT_MAP.get((stage, task))
     if detail_type:
@@ -488,23 +537,114 @@ def _is_finops(event) -> bool:
     return event.get("stage") == FINOPS_STAGE
 
 
+def _mark_run_escalated(ddb, run_id: str) -> bool:
+    """Set status=escalated on an EXISTING run row. True if a row was updated.
+
+    `attribute_exists(run_id)` is the whole point. DynamoDB's update_item is an UPSERT:
+    on a key with no row it CREATES one carrying the key plus whatever SET writes. So
+    this call was never "update the run's status" -- for any invocation with no run, it
+    was "mint a run", and the row it minted was the two-attribute shape
+    {run_id, status: escalated} with no created_at, trigger_source or iteration.
+
+    That is not hypothetical: `sweep-2026-08-01` sat in llmops-pipeline-runs from a
+    scheduled orphan-endpoint sweep that escalated. monitor_sweep/handler.py is careful
+    -- it writes its own bookkeeping row to EVENTS_TABLE and its docstring says why a
+    sweep must never appear as a run -- and then the driver wrote one on its behalf,
+    through a path the sweep does not know exists.
+
+    The condition, rather than another `_is_finops`-style stage allowlist: the previous
+    fix enumerated the one non-run invoker known at the time (finops), which left the
+    NEXT one -- the sweep, added later, under its own synthetic sweep-<date> id -- to
+    rediscover the same defect. Triage (triage-<subject>) and any future scheduled
+    dispatch are the same shape. The runs table already knows which ids name runs; a
+    list of stages that don't is a second copy of that fact, maintained by hand, that
+    is wrong the moment someone adds a caller. Only start_pipeline creates run rows,
+    which makes "a row exists" exactly the right question.
+
+    A rejected condition is NOT an error here: it is the answer. Anything else raises,
+    because a throttle or an outage must not read as "this was not a run".
+    """
+    try:
+        ddb.Table(os.environ["RUNS_TABLE"]).update_item(
+            Key={"run_id": run_id},
+            UpdateExpression="SET #s = :v",
+            ConditionExpression="attribute_exists(run_id)",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={":v": "escalated"})
+        return True
+    except Exception as exc:  # noqa: BLE001 — only the rejected condition is absorbed
+        if _is_condition_failure(exc):
+            return False
+        raise
+
+
+def _is_condition_failure(exc) -> bool:
+    """ConditionalCheckFailedException, matched by botocore error CODE.
+
+    Same reasoning as resume_pipeline's TASK_GONE_CODES: the exception classes hang off
+    a live client instance, so referencing table.meta.client.exceptions here would make
+    this module unimportable under an injected test double.
+    """
+    code = getattr(exc, "response", {}).get("Error", {}).get("Code", "")
+    return code == "ConditionalCheckFailedException"
+
+
 def handle_escalate(c, event, args) -> dict:
+    """Raise a stage's escalation to a human, on every channel that still works.
+
+    The channels are deliberately independent, and the ordering matters. SNS used to be
+    the first statement here and unwrapped, so a failed publish took the stage event, the
+    bus event AND the task-token settle down with it -- the run would then sit at
+    `running` holding a live token until the state machine's timeout, hours later, over a
+    notification. That is the worst possible thing to gate on this particular call:
+    `llmops-escalations` has **zero subscribers** live, so SNS is the one channel already
+    known to reach nobody, and `ensure_topic` in deploy/03_storage.py reports it as
+    "NO SUBSCRIBERS -- every escalate_human call publishes into the void" precisely
+    because the deploy cannot invent an address. A channel that today delivers to no one
+    must not be able to silence the two that do deliver: the stage event the console
+    renders, and the EscalatedToHuman event the conductor triages off the bus.
+    """
     run_id = event["run_id"]
-    c["sns"].publish(TopicArn=os.environ["LLMOPS_SNS_TOPIC"],
-                     Subject=f"[llmops] escalation: {run_id}/{event['stage']}",
-                     Message=json.dumps(args, indent=2, default=str))
+    try:
+        c["sns"].publish(TopicArn=os.environ["LLMOPS_SNS_TOPIC"],
+                         Subject=f"[llmops] escalation: {run_id}/{event['stage']}",
+                         Message=json.dumps(args, indent=2, default=str))
+    except Exception as exc:  # noqa: BLE001 — one dead channel must not close the rest
+        print(f"[driver] SNS publish failed for the escalation of {run_id}: {exc}")
     if _is_finops(event):
         # No runs-table row exists for an audit invocation; updating one would mint a
         # phantom run that the console would then display alongside real pipeline runs.
+        # Kept as an early return even though _mark_run_escalated would now decline the
+        # write anyway: the audit path also has no task token and no run to emit about,
+        # so it exits before the event and the settle below, not just before the write.
         return {"escalated": True}
-    c["ddb"].Table(os.environ["RUNS_TABLE"]).update_item(
-        Key={"run_id": run_id},
-        UpdateExpression="SET #s = :v",
-        ExpressionAttributeNames={"#s": "status"},
-        ExpressionAttributeValues={":v": "escalated"})
-    ev.emit_event(os.environ["EVENT_BUS"], ev.ESCALATED_TO_HUMAN,
-                  {"run_id": run_id, "stage": event["stage"],
-                   "reason": args.get("reason", "")}, client=c["events"])
+    run_row = _mark_run_escalated(c["ddb"], run_id)
+    # Record the escalation in stage-events on BOTH paths. handle_escalate has never
+    # written one -- for a real run the runs.status write was the whole durable record,
+    # so an escalation has never appeared in the timeline the console renders from this
+    # table, unlike a page (handle_page_human records its own). Declining the row write
+    # for a non-run would have made that worse: a scheduled sweep's escalation would be
+    # left with nothing on record anywhere but an SNS email. Unconditional, so the trail
+    # does not depend on which path ran; `run_row` says which it was, and false is the
+    # signal that this id names no pipeline run. Bookkeeping only -- it must never be
+    # able to withhold the alert below.
+    try:
+        _record_stage_event(c["ddb"], run_id, event["stage"], "escalated",
+                            {"reason": args.get("reason", ""),
+                             "task": event.get("task", ""), "run_row": run_row})
+    except Exception as exc:  # noqa: BLE001 — never withhold an escalation for a log
+        print(f"[driver] could not record the escalation of {run_id}: {exc}")
+    try:
+        ev.emit_event(os.environ["EVENT_BUS"], ev.ESCALATED_TO_HUMAN,
+                      {"run_id": run_id, "stage": event["stage"],
+                       "reason": args.get("reason", "")}, client=c["events"])
+    except Exception as exc:  # noqa: BLE001 — see below: the token must still settle
+        # The settle is what releases the state machine. Letting a failed PutEvents skip
+        # it would park a live task token on a run that has already escalated, and the
+        # only thing that ever frees it is the stage's own timeout (7200s for data_prep,
+        # 21600s for finetune) -- the zombie that MarkRunDone/MarkRunFailed and #52 all
+        # exist to prevent, re-entered through the notification path.
+        print(f"[driver] could not emit {ev.ESCALATED_TO_HUMAN} for {run_id}: {exc}")
     if event.get("task_token"):
         c["sfn"].send_task_failure(taskToken=event["task_token"],
                                    error="EscalatedToHuman",

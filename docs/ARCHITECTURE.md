@@ -55,16 +55,47 @@ and intelligence lives *inside* each stage. An LLM deciding "what stage comes ne
 add nondeterminism, cost, and failure modes to the one part of the system that benefits
 from having none.
 
-The state machine (`orchestration/state_machine.asl.json`) has **9 harness-task states
+The state machine (`orchestration/state_machine.asl.json`) has **11 harness-task states
 on the happy path** — each a `waitForTaskToken` Lambda invocation of the harness driver
-— plus the loop-only `RemediateFinetune`:
+— plus the loop-only `RemediateFinetune` and the audit-only `DataAudit`:
 
 ```
 DataPrepGenerate → DataPrepCurate → FinetuneLaunch → FinetuneAnalyze → EvalGenerate → EvalGate
                                                         │ (gate fail)
                               RemediateFinetune ←───────┘   … then, on gate pass:
-                                                            Deploy → SmokeTest → Teardown
+             Deploy → SmokeTest → MonitorHealth → Teardown → MonitorReport
 ```
+
+The two monitor states are placed by the shape of their work, not by taste.
+**`MonitorHealth`** must read CloudWatch *while the endpoint exists*, and `Teardown`
+deletes it on every path including `SmokeTest`'s `Catch` — after the delete,
+`GetMetricData` returns an empty series indistinguishable from a healthy idle endpoint, so
+the window between those two states is the only one in which the question can be answered
+at all. It gates nothing: its `Catch` also goes to `Teardown`, because a metric read that
+fails must never strand the endpoint it was watching, and an orphaned endpoint bills
+whether or not we managed to measure it. **`MonitorReport`** runs after `Teardown` because
+it consolidates the *finished* manifest — a report composed earlier would omit the teardown
+it exists to confirm — and its `Catch` goes to `Complete`: the narrative is a deliverable,
+the run's terminal state is a fact.
+
+The third monitor task, **`sweep`**, is deliberately *outside* the state machine, on an
+08:00 UTC schedule (`llmops-monitor-sweep-daily` → `llmops-monitor-sweep`). It hunts
+endpoints left running by *other* runs, including runs that crashed and so never reached
+any state that could have looked — a run-scoped agent cannot answer for other runs. The
+account proves the point: its only standing endpoint,
+`jumpstart-dft-hf-asr-whisper-large-v2`, has been InService since 2024-04-11 with no
+`project` tag at all, so no run will ever be responsible for it and its `ListTags` grant
+must be account-wide (`Resource: "*"`). The boundary is **read account-wide, mutate
+`llmops-*` only** — `ListEndpoints`/`ListTags`/`DescribeEndpoint`/`DescribeEndpointConfig`
+on `"*"`, every mutation still scoped: the sweep can fully characterise an orphan it cannot
+touch. The first live sweep is why the line falls at read-vs-mutate rather than at
+`Describe`. It found that endpoint, then filed its own permission gap — `DescribeEndpoint`
+was scoped to `endpoint/llmops-*`, so the instance type behind the one endpoint it flagged
+was unreadable and its headline number (~$1106/month, ~$30.6k since 2024-04-11) went out as
+a guess at the JumpStart default. **A cost finding whose figure is an assumption is one the
+owner can correctly dismiss**, and the figure is the entire value of the finding. The
+tempting fix — widening the lifecycle statement — would have handed `DeleteEndpoint` over
+the whole account to an agent whose prompt forbids deleting anything.
 
 plus the control states that route between them: `QualityGateChoice` (gate pass → Deploy,
 else remediation), `RemediationChoice` (iteration < 3 → remediate, else escalate),
@@ -89,6 +120,116 @@ Two spine details that are policy, not plumbing:
   `MarkTaskDone` for the same reason `MarkRunFailed`'s does — failing to close one record
   must not leave the other open. Guarded by property-based tests that derive the closers
   from the ASL rather than naming them.
+- **Closing a run and MINTING one are the same DynamoDB call.** `update_item` is an
+  upsert: on a key with no row it creates one from the key plus whatever `SET` writes. So
+  the driver's `handle_escalate`, whose only intent was "mark this run escalated", filed a
+  brand-new run for every escalation by something that is not a run — a two-attribute row
+  `{run_id, status: escalated}` with no `created_at`, no `trigger_source`, no `iteration`.
+  Live: **`sweep-2026-08-01`**, from a scheduled orphan-endpoint sweep. The sweep Lambda is
+  not the culprit and could not have prevented it: it writes its own bookkeeping row to the
+  stage-events table and its docstring spells out why a sweep must never read as a run
+  (the console would list it, the auditor would reconcile its cost, and the run count every
+  doc quotes would rise by one a day). The driver wrote one on its behalf, through a path
+  the sweep does not know exists. The first fix for this named the one non-run invoker known
+  at the time — `stage == "finops"` — which is precisely why the sweep, added later under
+  its own synthetic `sweep-<date>` id, walked back into it; triage's `triage-<subject>` is
+  the same shape. So the guard is not a third entry in a list of stages that are not runs
+  but a `ConditionExpression: attribute_exists(run_id)`: **only `start_pipeline` creates run
+  rows, so "a row exists" is the question, and the table itself answers it.** A rejected
+  condition is the answer and returns quietly; every other error still raises, because
+  absorbing a throttle here would leave a run that genuinely escalated at `running` — the
+  zombie of the bullet above, reintroduced by the fix for the bullet below it. And the row
+  write turned out to be standing in for a record that was never written: `handle_escalate`
+  emitted **no** stage event, unlike `handle_page_human`, so an escalation has never
+  appeared in the timeline the console renders from `llmops-stage-events` — for a real run,
+  `runs.status` was the only durable trace. Declining the row would have made that "no trace
+  anywhere" for a sweep, so the escalation is now recorded in stage-events on **both** paths,
+  carrying `run_row` to say which one ran. That write is bookkeeping and is wrapped: a
+  failing events table must never withhold the SNS page or the `EscalatedToHuman` event.
+- **An escalation's channels are independent, and the one that reaches nobody must not be
+  the gate.** `handle_escalate` notifies four ways: SNS to a human, a stage event for the
+  console timeline, `EscalatedToHuman` on the bus for the conductor, and `send_task_failure`
+  to release the state machine. The SNS publish was the **first** statement and unwrapped,
+  so a failed publish took all three of the others with it — including the settle, leaving a
+  live task token on a run that had already escalated, freed only by the stage's own timeout
+  (7200s for data_prep, 21600s for finetune). That is the worst possible thing to gate on
+  *this* call: **`llmops-escalations` has zero subscribers**, so SNS is the one channel
+  already known to deliver to no one. `ensure_topic` in `deploy/03_storage.py` reports it as
+  `NO SUBSCRIBERS — every escalate_human call publishes into the void` rather than calling
+  the topic healthy, because a deploy cannot invent an address; the fix is
+  `--escalation-email <addr>`, and until someone supplies one the runtime has to assume that
+  channel is dead. Each notification is now wrapped and logged on its own, in ascending
+  order of what it costs to lose: SNS, then the timeline row, then the bus event, and the
+  token settle last so it happens even when every notification failed.
+- **A readiness checklist must be derived from the prompt, not copied from it.** The console's
+  Data-readiness panel exists to show, question by question, what the orchestrator's consult
+  protocol told the agent to answer — and which answers are still missing. Its guard restated
+  seven paths and asserted the console contained them, so the test agreed with the console and
+  with itself while the prompt's `data` block specified **nine**. Live, the panel was missing
+  `datasheet.provenance` (a license means little without the origin it applies to) and
+  `readiness_report_uri` — the pointer to the Data Readiness Report, which is where the
+  audit's PII scan lands. A customer could therefore read a complete-looking panel, see
+  `PII disposition: redacted` as a claim in the plan, and have no link to the one artifact
+  that examined the data. The panel and its guard now both come from
+  `agents/orchestrator/harness.json`: `_prompt_data_block_keys()` in
+  `tests/test_console_tasks.py` parses the block out of the prompt, and a second test asserts
+  that the derivation is still a derivation rather than a fresh hardcoded list. Same rule as
+  the documented-test-count guard — when the source of truth is a model prompt, parse the
+  prompt. (`renderReadiness` in `frontend.html` is data-driven from the API's `fields`, so the
+  two restored rows needed no frontend change.)
+- **Nothing scanned the customer's data, and every signal said otherwise.** The readiness
+  panel above links the Data Readiness Report, whose PII section is a *heuristic regex* pass —
+  the data-prep prompt says so in as many words. Anyone checking whether more than that
+  existed found a Macie session `ENABLED` and a COMPLETE classification job, which reads as
+  yes. That job was `ONE_TIME`, created **2021-02-23**, named 25 unrelated buckets, and
+  processed **0 objects**; `customer-data/` was scanned by nothing. `ensure_pii_scan` in
+  `deploy/03_storage.py` now answers the real question on its own line of the deploy output,
+  and `macie_job_covers()` decides it from the bucket list **plus the scoping** — a job can
+  name our bucket and still read only `runs/`, and a `bucketCriteria` job is reported as
+  undecidable rather than credited. Creating the job is opt-in (`--enable-pii-scan`): a
+  `SCHEDULED` job is recurring per-GB spend, and starting it silently is the billing analogue
+  of a silent security downgrade. Two API constraints shape it, neither documented:
+  `UpdateClassificationJob` takes only `(jobId, jobStatus)`, so a job's scope is immutable and
+  the wrong one must be cancelled rather than converged; and `CreateClassificationJob`'s
+  `clientToken` means a repeat creates a *second* scanner, so idempotency comes from looking
+  up our own job by name. The finding that made the rest matter: the harness execution role
+  had **implicitDeny** on every `macie2` read, so the scan would have billed and stayed
+  invisible to the very agent that writes the report — `MacieFindingsReadForDataAudit` fixes
+  that, read-only in both directions (no job creation, no session disable), and the audit
+  prompt must now state *"no Macie classification job covers this data"* whenever none does.
+- **The system prompt is resent uncached on every model round-trip, and the two ways to cache
+  it both silently discard harness state.** A measured consult turn: `wall=59.0s ttft=26.4s
+  rounds=2 model_ms=52030` — 88% of the wall clock is the model, and `in_tok=31691` over two
+  rounds is the ~11 KB prompt paid for twice. InvokeHarness has no caching field, but
+  `bedrockModelConfig.additionalParams` forwards raw to ConverseStream, so a `cachePoint` gets
+  through and demonstrably works (`cacheWriteInputTokens 3568` → `cacheReadInputTokens 3568`).
+  It is still the wrong lever: `additionalParams.system` **replaces** the harness prompt (the
+  same agent answered `NO-PROTOCOL` to a question it had just answered correctly, while input
+  tokens *fell* 10840 → 6644), `additionalParams.messages` **replaces** session history (a
+  codeword from the previous turn came back `NONE`), and echoing `GetHarness`'s prompt back
+  loses the skills manifest the runtime injects but the control plane never returns — 1148
+  tokens, after which the agent listed 2 of its 4 skills. Every wrong path reports fewer
+  tokens and a cache hit. Until InvokeHarness exposes caching, the lever is **fewer
+  round-trips**, not cheaper ones.
+- **A mounted skill the prompt does not name is a skill the agent is not told to consult.**
+  The orchestrator mounted four and its prompt named two; the unnamed
+  `llm-data-preparation` is the methodology for step 0 of its own consult protocol. The mount
+  guard passed because the mount was real. The prompt is what carries "consult them before
+  acting", so the guard now derives the names from each harness's `skills` list in both
+  directions.
+- **An "append-only" log implemented as read-modify-write is one transient error from
+  erasure.** The Tasks tab's S3 audit copy re-read `transcript.jsonl`, concatenated, and
+  put it back, with the read's failure swallowed as *"no file yet"* — so a single 503
+  replaced the whole history with the newest lines, and two writers (`close_task` is
+  allowed mid-turn) silently lost one another's messages. It now writes **one timestamped
+  object per append**: no read, nothing to overwrite, keys sorting into chronological
+  order. Two related fixes in the same twelve lines: the 8000-character cap was applied
+  *before* the DynamoDB/S3 split, so the "full-text" copy was a truncated copy of a
+  truncated record (live, an **assistant** reply — the kind an acceptance is signed
+  against — sat at exactly 8000 in both); and the audit write was unwrapped, so one S3
+  failure skipped the `PlanAccepted` event and the worker enqueue that followed it,
+  stranding a KMS-signed acceptance at `accepting`. Nothing reads this artifact back,
+  which is exactly why nothing noticed — verify a write-only artifact by reading it.
 - **The gate's input is produced on the path that reads it.** `EvalGate` applies thresholds
   to `evaluation/report.json`; until `EvalGenerate` was inserted above it, **nothing
   dispatched the task that writes that report**. Both `evaluate` and `gate` are declared in
@@ -124,6 +265,19 @@ calls, which are the sole channel by which an agent affects the pipeline.
 | `job_launched` | long job launched (SageMaker training) | launch-and-release: park the Step Functions task token in DynamoDB keyed by job name; release the session (§4) |
 | `checkpoint` | turn budget nearing, progress persisted | re-invoke the same session to continue (self-reinvoke if the Lambda itself is near its limit) |
 | `escalate_human` | out of budget or out of authority | SNS notification, run marked `escalated`, `EscalatedToHuman` event, task token failed |
+
+Inside that contract, **which stage and task ran is the driver's fact, not the agent's.**
+Outputs, metrics and evidence are the agent's to report — nobody else knows them. `stage`
+and `task` are the opposite: the driver was handed both in its own invocation event, so the
+agent's copy is a restatement at best. It used to be recorded anyway, and the first two live
+monitor sweeps filed `"task": ""` because the agent simply omitted the field — leaving a row
+that said a monitor stage completed without saying *which* of health/sweep/report did, which
+is the ambiguity §2's sweep wiring exists to remove, reintroduced one layer down. Not
+cosmetic either: the console derives which `(stage, task)` pairs a run executed from this
+field, and an empty task matches **any** task of that stage, so a sweep could lend its
+evidence to a health check that never ran. The dispatch now overwrites the echo rather than
+filling it in when blank, because the dangerous case is not the omitted task but the
+confidently wrong one.
 
 **Conductor contract** (`llmops_orchestrator`): `launch_run` (dispatch a planned run via
 start-pipeline), `resolve_escalation` (first-line triage within policy: relaunch a stage
@@ -211,6 +365,24 @@ is translated in Python at the driver's entry point rather than by an EventBridg
 `InputTransformer`, for the same reason the rule exists at all: a transformer referencing a
 path an event lacks drops it silently, and the two emitters of this detail-type carry
 different key sets.
+
+**That choice puts the channel's correctness in the deploy, so the deploy checks it.** A
+later driver deploy — from a branch that predated this work — shipped a handler with no
+`triage_event_from_bus` while `llmops-escalation-triage` stayed ENABLED and pointed at it.
+Every escalation then reached the driver as a raw EventBridge envelope and died on
+`KeyError: 'run_id'` before any handler branch ran. **None of the offline guards could see
+it**, and that is the part worth understanding: they compare `EVENTS_NEEDING_A_RULE`
+against the rules *this tree's* deployer builds, so a branch carrying neither the
+declaration, nor the rule, nor the translator is perfectly self-consistent and green. A
+tree cannot know which rules are live; only the bus knows. So `07_lambdas.py` now asks the
+bus, at deploy time, before `update_function_code`: for every ENABLED rule targeting the
+function being deployed, each `detail-type` it delivers must have a translator declared in
+`BUS_DELIVERY_TRANSLATORS` and *defined* in the handler about to ship — or the rule's
+target must carry an `InputTransformer`, since the two are alternatives. A gap is a
+`SystemExit`, not a warning, for the same reason `config_subst.resolve()` raises: the
+deploy reports success either way, so a warning is read by nobody. An unreachable bus is
+reported as `unchecked` rather than clean — returning "no disagreement" for "I could not
+look" would rebuild the exact ambiguity this whole section exists to remove.
 
 **A prefix is not a filter.** The verdict channel above parks directives under a
 `directive#` sort key, and the constant's own comment claimed the prefix kept them "out of
@@ -378,20 +550,28 @@ Harness configs (`agents/*/harness.json`) run PUBLIC-network for iteration speed
 VPC itself is built by `deploy/02_network.py` and the Lambdas can run **VPC-isolated with
 interface endpoints — no internet egress**.
 
-**Not yet built** (tracked as the s3-skill-source work): the VPC-mode harness variants,
-and the *switch* of the sources themselves. The mirror they require now exists —
-`ensure_skills` in `deploy/03_storage.py` derives what to mirror from the harness configs,
-validates each `SKILL.md`'s frontmatter before uploading, and reads every one back, with
-the harness role granted `GetObject` + `ListBucket` on `skills/*` and no write. All
-**19 skill sources across the 7 harnesses are `git` sources today; none are `s3`** —
-verified by
+The skill sources have moved: all **19 skill sources across the 7 harnesses are `s3`
+sources today; none are `git`** — verified by
 `tests/test_docs_claims.py::test_the_skill_source_claims_match_the_harness_configs`,
-which reads the configs rather than trusting this paragraph. Earlier revisions of this
-file described `agents/*/harness.prod.json` and `deploy/05_mirror_skills.py` as existing;
-both paths do not exist, and never have in any branch, so that was a design being read as
-a shipped feature.
+which reads the configs rather than trusting this paragraph, and which also rejects a
+*mixed* state, because a half-done migration leaves some harnesses pinned and others still
+floating on the skill repo's main. The mirror they read is built by `ensure_skills` in
+`deploy/03_storage.py`, which derives what to mirror from the harness configs, validates
+each `SKILL.md`'s frontmatter before uploading, and reads every one back, with the harness
+role granted `GetObject` + `ListBucket` on `skills/*` and no write.
 
-Two forcing functions make the mirror a prerequisite for VPC mode rather than an
+Each URI is written `s3://<DATA_BUCKET>/skills/...` and resolved at deploy time by
+`deploy/config_subst.py`, because the bucket name embeds the account id and these configs
+are public-repo files. That resolution is a hard failure, not a warning: an unresolved
+token in a skill URI is *accepted* by `UpdateHarness`, mints a version and reports READY,
+and only then fails at every session start — so `resolve()` raises rather than send it.
+
+**Still not built:** the VPC-mode harness variants. Earlier revisions of this file
+described `agents/*/harness.prod.json` and `deploy/05_mirror_skills.py` as existing; both
+paths do not exist, and never have in any branch, so that was a design being read as a
+shipped feature.
+
+Two forcing functions made the mirror a prerequisite for VPC mode rather than an
 optimization:
 
 - VPC-mode harnesses can't reach GitHub, so a git skill source cannot resolve at all —
@@ -411,12 +591,18 @@ optimization:
 `llmops_finops` is the only harness with no place in a run's stage sequence, and that follows
 from the shape of its job rather than from taste.
 
-`llmops_monitor` runs *inside* the state machine: per-run, within a run's lifetime, answering
-"is the endpoint alive now". Reconciliation is the opposite shape on all three axes — it runs
-**after** the run is over (Cost Explorer lags ~24 h), it spans **many** runs, and it answers to
-the project rather than to any one run. A run that finished yesterday has no live agent to
-attribute today's settled bill, so putting this in `monitor` would mean a per-run agent reaching
-across other runs' data.
+`llmops_monitor`'s `health` and `report` tasks run *inside* the state machine: per-run, within a
+run's lifetime, answering "is the endpoint alive now". Reconciliation is the opposite shape on all
+three axes — it runs **after** the run is over (Cost Explorer lags ~24 h), it spans **many** runs,
+and it answers to the project rather than to any one run. A run that finished yesterday has no live
+agent to attribute today's settled bill, so putting this in `monitor` would mean a per-run agent
+reaching across other runs' data.
+
+The same three axes put monitor's own `sweep` task on a schedule rather than in the spine, which
+is the clearest proof this is a shape argument and not a per-harness one: an orphaned endpoint
+belongs to a run that has already ended — often one that *crashed*, and so never reached any state
+that could have looked. Two tasks of one harness, on opposite sides of the boundary, each placed by
+what its question is about.
 
 So it sits beside `llmops_orchestrator`, above the spine: **the conductor decides what to spend,
 the auditor reports what was spent.**

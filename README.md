@@ -22,7 +22,7 @@ This repo is a reference implementation of skill-driven engineering:
 | Skill | Role here |
 |---|---|
 | [agentcore-harness-builder](https://github.com/timwukp/agent-skills-best-practice/tree/main/skills/skills/agentcore-harness-builder) | **Platform construction** — its prescribed workflow (preflight → design → author → create → memory → observability → invoke-verify → version/pin → evaluate) built every harness; its scripts are reused verbatim in `deploy/` |
-| [MLOps-agent-skills](https://github.com/timwukp/MLOps-agent-skills) (LLMOps chain) | **Agent capability** — each harness mounts its stage's skills at session start via the harness `skills` source (all 19 sources are `git` today; an S3 mirror is planned and required before VPC mode) |
+| [MLOps-agent-skills](https://github.com/timwukp/MLOps-agent-skills) (LLMOps chain) | **Agent capability** — each harness mounts its stage's skills at session start via the harness `skills` source (all 19 sources are `s3` today — a pinned mirror of this repo's skills, mirrored and frontmatter-validated by `ensure_skills`; git sources float on the skill repo's main and cannot be reached at all in VPC mode) |
 
 ## Architecture
 
