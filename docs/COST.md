@@ -189,7 +189,7 @@ This is the single most consequential decision in the design, and it comes from 
 On 2026-07-31, this AWS account's month-to-date total was **$27,491**. This project's own
 share was **~$3.50 of SageMaker plus ~$6.29 of Bedrock teacher — about $10–15.** The rest
 belongs to unrelated work in the same account, including SageMaker Canvas session hours
-(~$296) and a JumpStart Whisper endpoint (~$18/day).
+(~$296) and a JumpStart Whisper endpoint (~$36.36/day).
 
 A rollup that filtered by *service* would therefore report **thousands of dollars of somebody
 else's spend as ours** — and would trip the $2000 gate on its first evaluation. Attribution is
@@ -345,6 +345,20 @@ describes.
 
 An account-level guardrail already exists below this system's gate: one AWS Budget,
 `bedrock-monthly-dev`, at **$1000/month**. The Cost tab surfaces it rather than duplicating it.
+
+**That budget is filtered to `Service: ["Amazon Bedrock"]`** (`describe_budgets`, 2026-08-02) —
+which is worth stating in both directions, because the filter is simultaneously what keeps the
+guardrail meaningful and what makes it blind:
+
+- It means the `jumpstart-dft-hf-asr-whisper-large-v2` orphan (§4, $36.36/day = **~$1106/month**
+  at 730 h × $1.515/hr) does **not** consume our Bedrock headroom. An unfiltered $1000 budget
+  would have been silently 100%+ eaten by a resource that predates this project, and the first
+  real Bedrock spend would have tripped an alarm that had nothing to do with Bedrock.
+- It ALSO means **no account-level control would ever have flagged that endpoint.** A budget
+  scoped to one service cannot notice waste in another. What found it was the monitor sweep, which
+  scans the whole account precisely because a check restricted to what we already call ours cannot
+  find something unclaimed. The two controls are not redundant; the budget bounds *our* spend and
+  the sweep looks for spend nobody has claimed.
 
 ---
 

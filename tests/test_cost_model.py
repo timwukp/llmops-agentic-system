@@ -441,17 +441,98 @@ def test_only_approved_estimates_can_launch():
 # ── attribution: the contamination hazard ─────────────────────────────────────
 def test_foreign_resources_are_excluded_from_the_project_rollup():
     """Measured on this account: SageMaker Canvas ($296) and a JumpStart Whisper
-    endpoint ($18/day) share the account. A service-level rollup would bill both to
+    endpoint ($36.36/day) share the account. A service-level rollup would bill both to
     this project."""
     groups = [
         {"resource_id": "training-job/llmops-qlora-run-phase2-main-0001-r3", "cost_usd": 10.77},
-        {"resource_id": "endpoint/jumpstart-dft-hf-asr-whisper-large-v2", "cost_usd": 18.18},
+        {"resource_id": "endpoint/jumpstart-dft-hf-asr-whisper-large-v2", "cost_usd": 36.36},
         {"resource_id": "Canvas:Session-Hrs", "cost_usd": 296.0},
     ]
     out = attribute_actuals(groups, "llmops-agentic-system", "2026-07-30")
     assert out["total_usd"] == pytest.approx(10.77)
-    assert out["excluded_usd"] == pytest.approx(314.18)
+    assert out["excluded_usd"] == pytest.approx(332.36)
     assert len(out["excluded"]) == 2
+
+
+def test_the_whisper_orphans_daily_figure_matches_its_instance_and_hourly_rate():
+    """The orphan's daily cost is DERIVED here, not restated.
+
+    Every prose mention of this endpoint said $18/day for as long as it existed. That
+    number came from the first monitor sweep, which had to guess: the sweep's own report
+    said "sagemaker:DescribeEndpoint denied ... cost figures are estimates based on
+    JumpStart defaults". describe_endpoint_config later returned ml.g5.2xlarge x1, and
+    Cost Explorer billed $36.36 on each of seven consecutive days -- exactly 24 x the
+    $1.515/hr this module already documents for that instance. So the figure that six
+    files repeated was half the real one, and a cost control whose headline number is
+    an underestimate is one an owner can correctly dismiss.
+
+    Asserting the arithmetic rather than the string is what makes this a guard: if
+    someone re-copies a stale figure, or the documented hourly rate moves, the two sides
+    stop agreeing. The FinOps rule is the same one the sweep broke -- an assumed number
+    must be labelled as one, and a measured number must match what it is derived from.
+    """
+    hourly = 1.515          # ml.g5.2xlarge, Price List us-east-1; see this module's header
+    daily = hourly * 24
+    assert daily == pytest.approx(36.36), (
+        f"ml.g5.2xlarge at ${hourly}/hr is ${daily:.2f}/day")
+
+    src = (pathlib.Path(__file__).resolve().parent.parent
+           / "pipeline" / "contracts" / "cost_model.py").read_text()
+    assert f"${daily:.2f}/day" in src, (
+        "cost_model.py states a daily figure for the Whisper orphan that its own "
+        "documented hourly rate does not produce")
+    assert "$18/day" not in src, "the falsified $18/day figure is back in cost_model.py"
+
+    for doc in ("docs/COST.md", "CHANGELOG.md"):
+        text = (pathlib.Path(__file__).resolve().parent.parent / doc).read_text()
+        assert "$18/day" not in text, f"{doc} still carries the falsified $18/day figure"
+
+
+def test_the_orphans_monthly_figure_is_derived_and_the_budget_filter_is_stated_both_ways():
+    """The account budget's CostFilters decide whether it can see this orphan at all.
+
+    `describe_budgets` (2026-08-02) returns `{"Service": ["Amazon Bedrock"]}` for
+    `bedrock-monthly-dev`, and that single field cuts both ways, so COST.md has to say
+    both halves or it misleads whichever reader it leaves out:
+
+      * filtered means the orphan's ~$1106/month does NOT eat our $1000 Bedrock headroom.
+        Unfiltered, the guardrail would have sat permanently over 100% on somebody else's
+        endpoint, and the first real Bedrock spend would have tripped an alarm about
+        something it had nothing to do with.
+      * filtered ALSO means no account-level control would ever have flagged that
+        endpoint. A budget scoped to one service is blind to waste in another. What found
+        it was the whole-account monitor sweep. The two controls are not redundant.
+
+    The monthly number is derived here for the same reason the daily one is: $1106 was
+    typed as $1107 on the first pass, and a figure nobody recomputes is a figure that
+    drifts. 730 h is the AWS convention for a month, not 30 x 24.
+    """
+    hourly = 1.515
+    monthly = hourly * 730
+    assert monthly == pytest.approx(1105.95, abs=0.01), (
+        f"ml.g5.2xlarge at ${hourly}/hr over 730h is ${monthly:.2f}/month")
+    stated = f"${round(monthly):,}".replace(",", "")   # ~$1106
+
+    repo = pathlib.Path(__file__).resolve().parent.parent
+    for doc in ("docs/COST.md", "docs/COST.zh-TW.md"):
+        text = (repo / doc).read_text()
+        # Anchor to the budget passage. Searching the whole file would let a stray
+        # "Amazon Bedrock" or "sweep" anywhere in a 370-line doc satisfy a guard about
+        # THIS paragraph -- the same way a repeated phrase elsewhere once silently
+        # disarmed test_every_schedule_the_deployer_creates_is_named_in_the_cost_posture.
+        assert "bedrock-monthly-dev" in text, f"{doc} no longer names the account budget"
+        para = text.partition("bedrock-monthly-dev")[2][:1600]
+
+        assert stated in para, (
+            f"{doc} does not state the orphan's monthly cost as {stated} alongside the "
+            f"budget, which is what ${hourly}/hr x 730h comes to")
+        assert "Amazon Bedrock" in para, (
+            f"{doc} does not say what bedrock-monthly-dev is filtered to; an unqualified "
+            f"$1000 guardrail reads as covering all account spend, which it does not")
+        # Both halves of the consequence, or the sentence misleads by omission.
+        assert "sweep" in para, (
+            f"{doc} states the budget filter without saying which control DOES cover "
+            f"non-Bedrock spend -- a reader is left thinking nothing does")
 
 
 def test_attribution_is_an_allowlist_so_unknown_shapes_are_excluded():

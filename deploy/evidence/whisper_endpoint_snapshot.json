@@ -1,0 +1,88 @@
+{
+  "captured_at": "2026-08-02",
+  "endpoint_name": "jumpstart-dft-hf-asr-whisper-large-v2",
+  "endpoint_status_at_capture": "InService",
+  "created": "2024-04-11 15:52:21.984000+08:00",
+  "endpoint_config_name": "jumpstart-dft-hf-asr-whisper-large-v2",
+  "production_variants": [
+    {
+      "VariantName": "AllTraffic",
+      "ModelName": "huggingface-asr-whisper-large-v2-20240411-075215",
+      "InitialInstanceCount": 1,
+      "InstanceType": "ml.g5.2xlarge",
+      "InitialVariantWeight": 1.0
+    }
+  ],
+  "models": [
+    {
+      "ModelName": "huggingface-asr-whisper-large-v2-20240411-075215",
+      "PrimaryContainer": {
+        "Image": "763104351884.dkr.ecr.us-east-1.amazonaws.com/huggingface-pytorch-inference:1.13.1-transformers4.26.0-gpu-py39-cu117-ubuntu20.04",
+        "Mode": "SingleModel",
+        "ModelDataSource": {
+          "S3DataSource": {
+            "S3Uri": "s3://jumpstart-cache-prod-us-east-1/huggingface-asr/huggingface-asr-whisper-large-v2/artifacts/inference-prepack/v1.0.1/",
+            "S3DataType": "S3Prefix",
+            "CompressionType": "None"
+          }
+        },
+        "Environment": {
+          "ENDPOINT_SERVER_TIMEOUT": "3600",
+          "MODEL_CACHE_ROOT": "/opt/ml/model",
+          "SAGEMAKER_ENV": "1",
+          "SAGEMAKER_MODEL_SERVER_WORKERS": "1",
+          "SAGEMAKER_PROGRAM": "inference.py"
+        }
+      },
+      "ExecutionRoleArn": "arn:aws:iam::<ACCOUNT_ID>:role/service-role/AmazonSageMaker-ExecutionRole-20210818T141474",
+      "CreationTime": "2024-04-11 15:52:19.769000+08:00",
+      "ModelArn": "arn:aws:sagemaker:us-east-1:<ACCOUNT_ID>:model/huggingface-asr-whisper-large-v2-20240411-075215",
+      "EnableNetworkIsolation": true,
+      "DeploymentRecommendation": {
+        "RecommendationStatus": "COMPLETED",
+        "RealTimeInferenceRecommendations": [
+          {
+            "RecommendationId": "huggingface-asr-whisper-large-v2-20240411-075215/wmvJke6R",
+            "InstanceType": "ml.c6i.2xlarge",
+            "Environment": {}
+          },
+          {
+            "RecommendationId": "huggingface-asr-whisper-large-v2-20240411-075215/tGnnTr1q",
+            "InstanceType": "ml.c5.2xlarge",
+            "Environment": {}
+          },
+          {
+            "RecommendationId": "huggingface-asr-whisper-large-v2-20240411-075215/lfBwOH2O",
+            "InstanceType": "ml.c6i.large",
+            "Environment": {}
+          }
+        ]
+      }
+    }
+  ],
+  "tags": [
+    {
+      "Key": "sagemaker:user-profile-arn",
+      "Value": "arn:aws:sagemaker:us-east-1:<ACCOUNT_ID>:user-profile/d-bovyr1gh3f0f/default-1639742246842"
+    },
+    {
+      "Key": "sm-jumpstart-id",
+      "Value": "huggingface-asr-whisper-large-v2"
+    },
+    {
+      "Key": "sagemaker-sdk:jumpstart-model-version",
+      "Value": "2.0.0"
+    },
+    {
+      "Key": "sagemaker-sdk:jumpstart-model-id",
+      "Value": "huggingface-asr-whisper-large-v2"
+    },
+    {
+      "Key": "sagemaker:domain-arn",
+      "Value": "arn:aws:sagemaker:us-east-1:<ACCOUNT_ID>:domain/d-bovyr1gh3f0f"
+    }
+  ],
+  "invocations_last_30d": 0,
+  "note": "SageMaker real-time endpoints cannot be paused: the minimum is one instance, so stopping the bill means deleting the endpoint. The EndpointConfig and Model below are NOT deleted -- recreating the endpoint from them is a single create_endpoint call (~5-8 min to InService).",
+  "restore": "aws sagemaker create-endpoint --endpoint-name jumpstart-dft-hf-asr-whisper-large-v2 --endpoint-config-name jumpstart-dft-hf-asr-whisper-large-v2 --region us-east-1"
+}

@@ -242,9 +242,12 @@ versions and introspects the live CreateHarness/UpdateHarness schemas.
   driver's escalate path publishes to SNS, writes a stage event, emits `EscalatedToHuman`,
   and settles the task token. The SNS publish was first and unwrapped, so one failed publish
   cost all four — including the settle, which parks a live token until the stage timeout.
-  And **`llmops-escalations` has zero subscribers**, so that was the channel with a
-  known-zero audience gating the ones that work (`ensure_topic` in `deploy/03_storage.py`
-  says so out loud instead of reporting the topic healthy; fix with `--escalation-email`).
+  And **`llmops-escalations` had zero subscribers** at the time, so that was the channel
+  with a known-zero audience gating the ones that work (`ensure_topic` in
+  `deploy/03_storage.py` says so out loud instead of reporting the topic healthy; fixed
+  2026-08-02 with `--escalation-email` plus the recipient's own click, and the ordering fix
+  stands on its own regardless
+  — a channel that works today is still the wrong thing to gate a token settle on).
   Wrap each notification separately and order them so the state-releasing call is last.
 - **Observability**: `OTEL_TRACES_SAMPLER=always_on` env var is mandatory or
   evaluations/insights sit at zero forever. X-Ray delivery takes no `outputFormat`.

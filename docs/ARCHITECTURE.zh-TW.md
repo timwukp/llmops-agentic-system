@@ -134,11 +134,15 @@ prompt 明文禁止它刪東西的 agent。
   **第一個** 敘述且沒有包起來，所以一次 publish 失敗會把其他三個一起帶走 —— 包括那個 settle，
   於是一個已經升級的 run 上還掛著活的 task token，只能等該 stage 自己的 timeout
   （data_prep 7200s、finetune 21600s）才被釋放。而這在**這個**呼叫上是最糟的閘門選擇：
-  **`llmops-escalations` 的訂閱者是零**，SNS 正是那條已知送不到任何人的通道。
+  發現當時**`llmops-escalations` 的訂閱者是零**，SNS 正是那條已知送不到任何人的通道。
   `deploy/03_storage.py` 的 `ensure_topic` 會把它報成
   `NO SUBSCRIBERS — every escalate_human call publishes into the void`，而不是把 topic
-  報成健康，因為部署沒辦法憑空發明一個地址；解法是 `--escalation-email <addr>`，在有人提供
-  之前，runtime 必須假設那條通道是死的。現在每一種通知都各自被包住並記錄，順序依「失去它的
+  報成健康，因為部署沒辦法憑空發明一個地址；解法是 `--escalation-email <addr>`，已於
+  2026-08-02 提供，且 `PendingConfirmation` 現在已是 `false`，topic 有一個已確認的收件人。
+  但那是兩步而不是一步，`ensure_topic` 之所以把 pending 單獨報出來正是為此：email 訂閱在收件人
+  點擊確認連結之前雖然「存在」卻送不到任何人，那只是把同一種沉默往後挪了一步，而部署沒辦法
+  代替他點。所以下面的排序仍然是必要的，不是被取代了：一條通道的聽眾可以在沒有任何程式碼變動的
+  情況下重新變成零。現在每一種通知都各自被包住並記錄，順序依「失去它的
   代價」遞增排列：先 SNS、再時間軸那一列、再 bus 事件，最後才是 token settle —— 好讓即使所有
   通知都失敗，它仍然會發生。
 - **就緒檢查清單必須從 prompt 推導出來，不能從它抄一份。** console 的 Data-readiness 面板存在的

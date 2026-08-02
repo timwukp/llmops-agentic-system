@@ -132,7 +132,7 @@ ESTIMATE_STATUSES = ("draft", "pending_approval", "approved", "rejected",
 
 #: Resource-id substrings that ARE this project's. Attribution is an ALLOWLIST, never
 #: "everything in this AWS service": the same account carries SageMaker Canvas
-#: sessions ($296) and a JumpStart Whisper endpoint ($18/day) that have nothing to do
+#: sessions ($296) and a JumpStart Whisper endpoint ($36.36/day) that have nothing to do
 #: with this pipeline, and a service-level rollup would bill them to us.
 PROJECT_RESOURCE_PATTERNS = ("training-job/llmops-", "endpoint/llmops-",
                              "endpoint-config/llmops-", "runtime/harness_llmops_")
@@ -585,7 +585,7 @@ def is_project_resource(resource_id: str,
     """Allowlist test for a Cost Explorer ``RESOURCE_ID``.
 
     Measured hazard: this AWS account also bills ``USE1-Canvas:Session-Hrs`` ($296)
-    and ``endpoint/jumpstart-dft-hf-asr-whisper-large-v2`` ($18/day). Filtering by
+    and ``endpoint/jumpstart-dft-hf-asr-whisper-large-v2`` ($36.36/day). Filtering by
     service alone would report hundreds of dollars of unrelated spend as this
     project's, so a resource must MATCH to be counted — unrecognised means excluded.
     """
