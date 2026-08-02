@@ -39,6 +39,19 @@ jobs:
           echo "dry-runs OK"
       - name: Unit tests
         run: python -m pytest tests/ -q --ignore=tests/golden
+      - name: Shell test suites (AWS stubbed, no network)
+        # Two things a bare `for f in tests/*.sh; do bash "$f"; done` gets wrong:
+        # with no match the glob is passed through literally, so an empty
+        # directory runs `bash 'tests/*.sh'` and fails for a reason that has
+        # nothing to do with the tests; and without `|| exit 1` the step's status
+        # is the LAST suite's, so a failure in any earlier suite is discarded.
+        # "No suites found" is a failure too -- these tests exist, so their
+        # absence is the guard disappearing, not a reason to skip.
+        run: |
+          shopt -s nullglob
+          suites=(tests/*.sh)
+          if [ ${#suites[@]} -eq 0 ]; then echo "no shell suites found"; exit 1; fi
+          for f in "${suites[@]}"; do echo "== $f"; bash "$f" || exit 1; done
       - name: SVG geometry check
         # Was: `ls *.svg && python check.py || echo "no SVGs yet"`. The trailing
         # `||` catches the CHECKER's non-zero exit as well as a missing-file
