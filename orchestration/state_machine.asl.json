@@ -192,6 +192,35 @@
           "Next": "EscalateFail"
         }
       ],
+      "Next": "EvalGenerate"
+    },
+    "EvalGenerate": {
+      "Type": "Task",
+      "Comment": "Produce evaluation/report.json. The gate below READS that report and applies thresholds to it; this state is what writes it. Both tasks are declared in the eval harness prompt, but only 'gate' was ever dispatched, so the only eval task the pipeline could run read an input no path produced. Fail-closed gate semantics hid it perfectly: a gate that failed because its report was never generated is indistinguishable from a gate that failed because the student was bad. Phase 4's verdict stood only because eval was run DIRECTLY, outside the machine.",
+      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+      "Parameters": {
+        "FunctionName": "${HarnessDriverArn}",
+        "Payload": {
+          "run_id.$": "$.run_id",
+          "manifest_uri.$": "$.manifest_uri",
+          "stage": "eval",
+          "task": "evaluate",
+          "harness_id": "llmops_eval",
+          "task_token.$": "$$.Task.Token",
+          "iteration.$": "$.iteration"
+        }
+      },
+      "ResultPath": "$.evaluation_run",
+      "TimeoutSeconds": 21600,
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "EscalateFail"
+        }
+      ],
       "Next": "EvalGate"
     },
     "EvalGate": {
