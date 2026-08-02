@@ -1017,6 +1017,24 @@ case("docs: the shell suite CI runs on every push vanishes from the evidence fil
      ["tests/test_docs_claims.py::test_the_shell_suite_is_documented_with_its_assertion_count"])
 
 
+def m74(t):
+    """Leave VERSION at the release the CHANGELOG has moved past.
+
+    This is what actually happened: the 1.1.0 entry was written, 21 PRs merged after it, and
+    both VERSION and PROJECT_STATE's current phase went on naming 1.1.0 for two days. Nothing
+    failed, because a version string is only checkable against another version string. The
+    mutation reverts VERSION alone -- the CHANGELOG's newest entry and PROJECT_STATE stay at
+    the new release -- so the guard has to catch a disagreement, not just an old number.
+    """
+    assert t.strip() != "1.1.0", "VERSION is already 1.1.0; this mutation would be a no-op"
+    return "1.1.0\n"
+
+
+case("release: VERSION names the release the CHANGELOG has already moved past",
+     "VERSION", m74,
+     ["tests/test_docs_claims.py::test_the_version_file_and_the_changelog_agree_on_the_current_release"])
+
+
 failed = []
 for name, rel, mutate, tests in CASES:
     p = REPO / rel

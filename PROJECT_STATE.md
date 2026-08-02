@@ -5,8 +5,18 @@ created/deleted or a phase gate passes. Never record account IDs or full ARNs.
 
 ## Current phase
 
+**v1.2.0 — reachability** (2026-08-02): 21 merged PRs (#17–#38), almost all of one shape —
+a component that was deployed, tested, and never reached. The eval gate read a report nothing
+wrote; the `llmops-pipeline` bus carried ZERO rules so every escalation published into nothing;
+`llmops_monitor` had no task dispatched anywhere; the SUCCESS path had never executed, so every
+successful run was a zombie record. Also: a consultation the customer can finish end to end
+(KMS-signed plan acceptance, presigned upload, one thread), streaming replies, and the orphan
+endpoint re-costed from measured hardware at $36.36/day — 2× the $18 six files claimed — then
+deleted.
+
 **v1.1.0 — FinOps** (2026-07-31): cost estimation, the $2000 dual approval gate, and the
 7th runtime `llmops_finops`. v1 complete before it (all six phases 2026-07-28 → 2026-07-29).
+
 Next: v2 experiments — code-as-reasoning distillation + augmentation; Kimi K3 teacher A/B
 (see docs/CASE_STUDY.md).
 

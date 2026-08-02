@@ -675,3 +675,41 @@ def test_the_shell_suite_is_documented_with_its_assertion_count():
                 f"{doc.name} claims {m.group(2)} assertions for {suite.name}, it makes {n}")
             assert m.group(1) == m.group(2), (
                 f"{doc.name} claims {m.group(1)}/{m.group(2)} for {suite.name}")
+
+
+def test_the_version_file_and_the_changelog_agree_on_the_current_release():
+    """VERSION and the CHANGELOG's newest entry are two statements of one fact.
+
+    They drifted at 1.1.0: 21 PRs merged after that entry was written, and both the file and
+    the changelog went on naming a release that had stopped describing the tree. Nothing
+    failed, because a version string is only checkable against another version string --
+    which is exactly why the two have to be checked against each other.
+
+    PROJECT_STATE's current-phase paragraph is included: it is the file agents read first,
+    so a stale version there misroutes the next session's work rather than merely misleading
+    a reader.
+    """
+    version = (REPO / "VERSION").read_text().strip()
+    assert re.fullmatch(r"\d+\.\d+\.\d+", version), f"VERSION is not a SemVer: {version!r}"
+
+    changelog = (REPO / "CHANGELOG.md").read_text()
+    entries = re.findall(r"^## \[(\d+\.\d+\.\d+)\] — (\d{4}-\d{2}-\d{2})$", changelog, re.M)
+    assert entries, "CHANGELOG.md has no '## [x.y.z] — YYYY-MM-DD' entries to read"
+    newest, _ = entries[0]
+    assert newest == version, (
+        f"VERSION says {version} and the CHANGELOG's newest entry is {newest}; a release "
+        "is not cut until both say so")
+
+    # Newest first, and no version entered twice: a duplicate heading means one of the two
+    # entries is unreachable to a reader scanning for the release they are running.
+    versions = [v for v, _ in entries]
+    assert len(set(versions)) == len(versions), f"CHANGELOG lists a version twice: {versions}"
+    keyed = [tuple(int(n) for n in v.split(".")) for v in versions]
+    assert keyed == sorted(keyed, reverse=True), (
+        f"CHANGELOG entries are not newest-first: {versions}")
+
+    phase = (REPO / "PROJECT_STATE.md").read_text().split("## Current phase")[1] \
+        .split("\n## ")[0]
+    assert f"v{version}" in phase, (
+        f"PROJECT_STATE's current phase never names v{version}; it is the first file an "
+        f"agent reads, and it currently claims: {phase.strip().splitlines()[0]}")
