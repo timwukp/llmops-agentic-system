@@ -23,13 +23,18 @@
 
 ## 架構
 
-<!-- 架構圖由 docs/gen_architecture_svg.py 生成；佈局由 tests/check_svg_geometry.py 驗證（虛線零交叉、零穿框） -->
+<!-- 架構圖由 docs/gen_architecture_svg.py 生成；佈局由 tests/test_svg_geometry.py 驗證（虛線零交叉、零穿框） -->
 
 ![高層架構](docs/architecture-high-level.svg)
 
 Worker harness 內部（依照真實配置繪製）：
 
 ![低層架構](docs/architecture-low-level.svg)
+
+管理 console 的三個平面，規則刻意不同 —— 讀公開、寫在單一關卡認證、諮詢平面另查群組且是
+唯一會調用 agent 的路徑（[設計說明](docs/ARCHITECTURE.zh-TW.md#13-管理-console--一個-lambda三個規則不同的平面)）：
+
+![Console 架構](docs/architecture-console.svg)
 
 **模型**：teacher DeepSeek-R1（Bedrock serverless）· student Qwen3-1.7B（SageMaker QLoRA → endpoint）·
 harness 主迴圈 `global.anthropic.claude-fable-5`。

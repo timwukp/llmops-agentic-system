@@ -47,9 +47,19 @@ for f in $STAGED; do
 done
 
 # ---- 3. SVGs must pass the geometry check if staged ------------------------
+# The checker's absence used to SKIP this block silently, which made the hook
+# depend on a filename: renaming the file (check_svg_geometry.py ->
+# test_svg_geometry.py, so pytest would actually collect it) disabled the hook
+# and nothing said so. A missing guard is a failure, not a reason to proceed.
 if echo "$STAGED" | grep -qE 'docs/architecture.*\.svg'; then
-  if command -v python3 >/dev/null && [ -f tests/check_svg_geometry.py ]; then
-    python3 tests/check_svg_geometry.py $(echo "$STAGED" | grep -E 'docs/architecture.*\.svg') || fail=1
+  if ! command -v python3 >/dev/null; then
+    echo "✗ SVG: python3 not found, cannot verify staged diagram geometry"
+    fail=1
+  elif [ ! -f tests/test_svg_geometry.py ]; then
+    echo "✗ SVG: tests/test_svg_geometry.py is missing — diagrams cannot be verified"
+    fail=1
+  else
+    python3 tests/test_svg_geometry.py $(echo "$STAGED" | grep -E 'docs/architecture.*\.svg') || fail=1
   fi
 fi
 

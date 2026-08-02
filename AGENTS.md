@@ -129,7 +129,7 @@ versions and introspects the live CreateHarness/UpdateHarness schemas.
   "Always invoke before declaring success."
 - Docs are bilingual: `X.md` (EN) + `X.zh-TW.md` (繁體中文), updated in the same PR.
 - Architecture SVGs are GENERATED (`docs/gen_architecture_svg.py`) and layout-checked
-  (`tests/check_svg_geometry.py` — no wire crossings, no wire through a card).
+  (`tests/test_svg_geometry.py` — no wire crossings, no wire through a card).
   Never hand-edit the SVGs.
 - `PROJECT_STATE.md` records deployed resource names/versions (redacted); update it
   whenever you create or delete AWS resources.

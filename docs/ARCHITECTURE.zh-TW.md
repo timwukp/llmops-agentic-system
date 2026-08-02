@@ -245,8 +245,14 @@ eval agent 發出 `gate_passed: null` + `needs_human: true`，而舊的 default-
 2. 「該切換」的特徵：ConverseStream 反覆拋
    `InternalServerException`/`ServiceUnavailableException`，而同一模型的單發直測卻成功
    —— 這是配額壓力，不是故障（它從不以顯式 ThrottlingException 出現）。
-3. **混合配置**從設計上分散配額壓力：判斷密集的 agent（orchestrator、eval）用旗艦檔，
-   流程執行型 agent（data-prep、deploy、monitor）用 Opus 5。
+3. **混合配置**是分散配額壓力的**設計手段** —— 判斷密集的 agent（orchestrator、eval）用
+   旗艦檔，流程執行型 agent（data-prep、deploy、monitor）用後備檔 —— 而它**並不是目前
+   部署的狀態**。實測 7 個 harness 全部運行 `global.anthropic.claude-fable-5`，`GetHarness`
+   與 `agents/*/harness.json` 兩邊一致。所以混合配置是 failover 鏈**讓你可以動的槓桿**，
+   不是平台現在的狀態：今天整個機隊共用同一個模型的配額。本清單的先前版本讀起來像那個
+   分流已經上線，這與架構圖聲稱 harness 已 VPC 隔離（§11）是同一個錯誤 ——
+   把設計意圖當成已交付的事實在讀。
+   `tests/test_docs_claims.py` 現在會拿真實配置去驗證這個模型聲明。
 4. Driver 在串流搶救時檢測到模型 5xx 即熱切換到後備模型並發出資訊性 failover 事件
    （`orchestration/harness_driver/handler.py` 的 `_maybe_failover_model`）；
    完整的自動 failover 加固屬於 Phase 6。
@@ -320,3 +326,66 @@ $2000 審批閘門住在 console 與 `cost_model.py`，不在審計員身上，�
 全程最小權限 IAM（無 `*FullAccess`），所有資源限定 `llmops-*` 範圍；本 repo 公開：
 任何地方不出現帳號 ID —— 部署腳本在運行時替換 `<ACCOUNT_ID>`，由 pre-commit hook 與
 CI 遮蔽掃描強制執行。
+
+## 13. 管理 console —— 一個 Lambda，三個規則不同的平面
+
+![Console 架構](architecture-console.svg)
+
+Dashboard（[線上](https://deovqcv4m7.execute-api.us-east-1.amazonaws.com/)）是**單一個 Lambda**
+同時供應 HTML 與全部 **30 個路由 handler**、共 **8 tabs**，**沒有 build step、沒有 CDN**：`frontend.html` 在冷啟動時
+內嵌，頁面帶著 `CSP connect-src 'self'` 加上上傳路徑所需的 S3 origin。單一產物意味著 UI 永遠
+不可能比它呼叫的 API 舊一個版本 —— 那正是「前端後端分開部署」會招來的故障模式。
+
+它的設計是三個**刻意不共用規則**的平面：
+
+| 平面 | handler | 規則 |
+|---|---|---|
+| **讀** | 13 條 GET（`/api/overview`、`/api/pipeline`、`/api/run`、`/api/observability`、`/api/cost-overview`、`/api/tasks`…） | 公開，伺服器端彙總 |
+| **session** | 3 條 POST：`/api/login`、`/api/refresh`、`/api/refresh/revoke` | **必然**未認證 —— 它們是產生／撤銷憑證的那三條 |
+| **寫** | 14 條 POST：`/api/start-run`、`/api/cost-approval*`、`/api/finops-run`、`/api/optimize*`、`/api/native-rec*`、`/api/batch-eval`… | 在單一關卡過 Cognito |
+| **諮詢** | `/api/tasks`、`/api/tasks/{id}/{message,accept,close}`、`/api/data-upload-url` | 需認證**並且**查群組；唯一會調用 agent 的平面 |
+
+**每一條會對平台動手的 POST，都在同一個地方被認證。** router 在派發任何 POST *之前* 解析一次
+`_authed_user(headers)`，失敗就回 401 —— 所以新增一條路由不可能順手新增一個未認證的寫入。
+它解析出來的是一個**使用者**而不是布林值，因為下游有兩個檢查需要身分而不只是「已認證」：
+approver 群組檢查，以及比對 approver 與 requester 帳號的「不得自我核准」檢查。未認證實測：
+`/api/tasks`、`/api/start-run`、`/api/cost-approval`、`/api/data-upload-url`、`/api/finops-run`
+與 `/api/tasks/{id}/message` 全部回 **401**；而 `/api/overview`、`/api/tasks`、
+`/api/cost-overview` 的 GET 回 **200**。
+
+**有三條 POST 在那個關卡之上，而把它們指名出來本身就是設計的一部分。** `/api/login` 產生
+session；`/api/refresh` 在頁面重載後用 httpOnly cookie 復原 session（**cookie 就是憑證**，
+所以在這裡要求 Bearer token，等於要有一個活著的 session 才能從「session 掉了」裡復原）；
+`/api/refresh/revoke` 是登出，而「因為 access token 已過期所以拒絕撤銷這個 session」是反過來的。
+本節的先前版本聲稱**每一條** POST 都過 Cognito —— 那是**朝著好聽的方向**寫錯，與 §9 的模型分流、
+§11 的 VPC 聲明是同一個錯誤。現在 `tests/test_console_routes.py` 從 router 推導出全部四個數字，
+並把「關卡之上」那組拿去比對一份明確的白名單，所以**第四條**未認證的 POST 會以名字讓套件失敗。
+光靠數量抓不到：一條新的未認證寫入若替換掉一條 session 路由，數量是不變的。
+
+**讀是刻意公開的，寫永遠不是。** 讀平面上的一切都是已經對帳完的運維事實 —— 跑過什麼、
+評了幾分、花了多少。把它擋起來，只會給操作者一天要做五十次的動作加上摩擦，而保護不了任何
+架構圖裡沒有的東西。**權限**和**可見性**是兩個不同的問題，所以權限只掛在寫入上。
+
+**成本閘門在伺服器端，而且「advisory」是配置出來的，不是漏掉的。** `APPROVAL_LIMIT_USD`
+（預設 2000）與 `BUDGET_MODE`（`advisory` 或 `blocking`）住在 Lambda 裡而不是 UI 裡：
+由客戶端執行的閘門，就是客戶端能跳過的閘門。`advisory` 會**指名**這是一次超預算派發、
+放它過去、並把估算記錄下來；`blocking` 則拒絕。核准是 **KMS 簽章 + hash chain**
+（`conductor_tools.sign_record`），帶著核准者身分與來源 IP —— 所以一次核准是**證據**，
+而不是一個 UI 狀態。
+
+**Tasks 平面是唯一會跟 agent 對話的平面**，也是這個產品面向客戶的那一半：一個 engagement
+一條 thread，`llmops_orchestrator` 在裡面跑它的諮詢協議，客戶透過**預簽名**的
+`customer-data/` 上傳交付資料（key **一律由伺服器決定** —— 客戶端給的 key 就是一次路徑穿越
+寫入），產出是一份定價過的計劃，其接受動作被簽章。console 簽這些寫入；而管線自己的 role
+對 `customer-data` **唯讀**，因為一個能改寫客戶資料的管線，能毀掉那份用來評判它自己閘門的
+held-out 集。
+
+**Run 視圖把 timeline 讀成兩個各自有邊界的 query，而不是一個過濾後的清單** —— stage event 取
+`sk < "A"`，停放的裁決取 `sk begins_with "directive#"` —— 並把裁決渲染在它自己的區塊裡，
+標成 *已投遞* / *停放中* / *永遠無法投遞*。理由見 §3：prefix 不是 filter，而一筆永遠不可能
+被讀到的裁決，不能長得跟一筆 agent 真的照著做了的裁決一樣。
+
+本文件三張架構圖的佈局是**被強制**的，不是用眼睛看的：`tests/test_svg_geometry.py` 會在
+以下任一情況讓 build 失敗 —— 任兩條連線交叉、兩條連線共用同一條走道（那會畫成一條線，
+靜默弄丟一個連接）、連線穿過卡片內部、兩張卡片重疊，或某個已提交的 SVG 不再等於
+`docs/gen_architecture_svg.py` 的輸出（架構圖是生成的，**絕不可手改**）。
