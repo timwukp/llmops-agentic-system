@@ -22,9 +22,9 @@ page is its ledger.
 
 | Check | Result | How to reproduce |
 |---|---|---|
-| Unit tests (contracts, cost model, driver loop, Lambdas, state machine document) | **778/778 passed** | `.venv/bin/python -m pytest tests/ -q --ignore=tests/golden` |
+| Unit tests (contracts, cost model, driver loop, Lambdas, state machine document) | **779/779 passed** | `.venv/bin/python -m pytest tests/ -q --ignore=tests/golden` |
 | Shell suite — N-way capacity race guard (`tests/test_capacity_race_guard.sh`) | **10/10 assertions** | `bash tests/test_capacity_race_guard.sh` |
-| Negative controls — every guard broken in turn, confirmed to fail | **85/85 negative controls** | `.venv/bin/python tests/negative_controls/monitor_dispatch.py` |
+| Negative controls — every guard broken in turn, confirmed to fail | **87/87 negative controls** | `.venv/bin/python tests/negative_controls/monitor_dispatch.py` |
 | Harness config validation (5 specialists + conductor + auditor) | **7/7 `RESULT: OK`** | `python deploy/validate_config.py --config agents/<a>/harness.json` |
 | Architecture SVG geometry (no wire crossings, no wire through a card) | **CLEAN** | `python tests/test_svg_geometry.py docs/architecture-*.svg` |
 | Redaction scan (account IDs, credentials, account-bearing ARNs) | CLEAN | `.github/workflows/redaction-check.yml` |
@@ -33,7 +33,7 @@ page is its ledger.
 
 | Phase | What ran on real AWS | Key verified facts |
 |---|---|---|
-| 1 | data-prep harness created → memory → observability → invoke-verify | skills listed from git mount; `aws sagemaker list-training-jobs` exit 0; S3 write confirmed orchestrator-side (`head_object`, 80 bytes, 1 s skew); memory active (2 sessions, 10 extracted memories, 0% error); logs + X-Ray delivering. 6 live defects found and fixed in the same loop (incl. `temperature`/`top_p` deprecation for Claude ≥ 4.7 — surfaced only at INVOKE time) |
+| 1 | data-prep harness created → memory → observability → invoke-verify | skills listed from a **git** mount — which is what every mount was on 2026-07-28; all 19 moved to `s3` in v1.2.0, so this line records what ran, not what runs; `aws sagemaker list-training-jobs` exit 0; S3 write confirmed orchestrator-side (`head_object`, 80 bytes, 1 s skew); memory active (2 sessions, 10 extracted memories, 0% error); logs + X-Ray delivering. 6 live defects found and fixed in the same loop (incl. `temperature`/`top_p` deprecation for Claude ≥ 4.7 — surfaced only at INVOKE time) |
 | 2 pilot | 8 ARC-AGI-2 tasks distilled via DeepSeek-R1 (`us.deepseek.r1-v1:0`) | agent self-diagnosed token truncation from `stop_reason` (8k → 32k: format validity 1/8 → 8/8); `pilot_raw.jsonl` 213 KB verified in S3; 2 stream interruptions salvaged same-session |
 | 2 main | 24-task generation + 5-stage curation | `main_stats.json` read back from S3: 8/24 solved, 74 attempts, best-of-4 early-stop (~40% token savings); curation re-verified every grid against ground truth, dropped 16 wrong-answer records; final 6 train / 2 val |
 | 3 | QLoRA training (ml.g5.2xlarge) via launch-and-release | job Completed, 431 s billable; train_loss 0.5013 / eval_loss 0.5199; artifacts (adapter + merged bf16 + metrics.json) verified in the tarball; EventBridge → resume-Lambda chain observed twice (1.5 s, 0 errors); zero OOM at 14336 ctx with Liger fused CE |
@@ -98,14 +98,14 @@ Full record: [VERIFICATION_finops.md](../deploy/evidence/VERIFICATION_finops.md)
 
 | Check | Result | How to reproduce |
 |---|---|---|
-| Unit tests (all suites, incl. `test_cost_model.py` + `test_finops.py`) | **778 passed** | `.venv/bin/python -m pytest tests/ -q` |
+| Unit tests (all suites, incl. `test_cost_model.py` + `test_finops.py`) | **779 passed** | `.venv/bin/python -m pytest tests/ -q` |
 | Harness config validation, 7 agents | **`RESULT: OK`** | `python deploy/validate_config.py --config agents/finops/harness.json` |
 | Live fleet | **7 harnesses READY** | `list_harnesses` via the repo's vendored boto3 |
 | Canonical module has a distribution path | prints `would upload 4 contract files` | `python deploy/03_storage.py --region us-east-1 --account-id 123456789012 --dry-run` |
 
 Every guard added in this work was **mutation-checked**: the asserted behaviour was
-reverted one at a time and the test confirmed to fail — **85/85 negative controls**, 74
-mutations asserting 85 (guard, mutation) pairs, one printed PASS line each. A test that
+reverted one at a time and the test confirmed to fail — **87/87 negative controls**, 76
+mutations asserting 87 (guard, mutation) pairs, one printed PASS line each. A test that
 passes both with and against the behaviour it names is not a test.
 
 The count is in the sentence on purpose. "Mutation-checked" is an adjective, and an

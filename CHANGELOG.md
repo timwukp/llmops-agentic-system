@@ -56,8 +56,8 @@ asking what actually calls the thing, not by reading what declares it.
   first sweep's *guess* — that sweep could not call `DescribeEndpoint` and said so in its own
   report — and it understated by 2×, which is the magnitude an owner can dismiss on the merits.
   Now derived from `describe_endpoint_config` (ml.g5.2xlarge ×1) against the documented hourly
-  rate. The endpoint had been InService for 838 days; deleted 2026-08-02 under explicit
-  authorization.
+  rate. The endpoint had been InService for 843 days (2024-04-11 → 2026-08-02) with 0
+  invocations and 0.0% GPU utilization; deleted 2026-08-02 under explicit authorization.
 - **`bedrock-monthly-dev` is stated in both directions** (#37) — its `Service: ["Amazon Bedrock"]`
   filter is simultaneously what kept the $1000 guardrail meaningful and what made it blind. No
   account-level control would ever have flagged that endpoint; the whole-account monitor sweep
@@ -109,7 +109,7 @@ the pushed tree to the local one rather than by trusting a green push.
 
 ### Tests
 
-**778 pytest** (from 274 at v1.0.0), **85/85 negative controls** (74 mutations, 85
+**779 pytest** (from 274 at v1.0.0), **87/87 negative controls** (76 mutations, 87
 (guard, mutation) pairs), **10/10 shell assertions**, three SVGs geometrically CLEAN against
 six checks. Offline by construction: `tests/conftest.py` strips AWS credentials and refuses
 non-loopback sockets, so a credentialed laptop cannot turn a test that hits production into a

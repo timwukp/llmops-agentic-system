@@ -21,9 +21,9 @@
 
 | 檢查 | 結果 | 復現方式 |
 |---|---|---|
-| 單元測試（契約、成本模型、driver 迴圈、Lambda、狀態機文檔） | **778/778 通過** | `.venv/bin/python -m pytest tests/ -q --ignore=tests/golden` |
+| 單元測試（契約、成本模型、driver 迴圈、Lambda、狀態機文檔） | **779/779 通過** | `.venv/bin/python -m pytest tests/ -q --ignore=tests/golden` |
 | Shell 測試套件 —— N 路 capacity race guard（`tests/test_capacity_race_guard.sh`） | **10/10 斷言** | `bash tests/test_capacity_race_guard.sh` |
-| 反向控制 —— 逐一破壞每道 guard，確認它會失敗 | **85/85 反向控制** | `.venv/bin/python tests/negative_controls/monitor_dispatch.py` |
+| 反向控制 —— 逐一破壞每道 guard，確認它會失敗 | **87/87 反向控制** | `.venv/bin/python tests/negative_controls/monitor_dispatch.py` |
 | Harness 配置驗證（5 個專家 + 指揮家 + 審計員） | **7/7 `RESULT: OK`** | `python deploy/validate_config.py --config agents/<a>/harness.json` |
 | 架構 SVG 幾何檢查（虛線零交叉、零穿框） | **CLEAN** | `python tests/test_svg_geometry.py docs/architecture-*.svg` |
 | 遮蔽掃描（帳號 ID、憑證、帶帳號的 ARN） | CLEAN | `.github/workflows/redaction-check.yml` |
@@ -32,7 +32,7 @@
 
 | 階段 | 在真實 AWS 上跑了什麼 | 關鍵驗證事實 |
 |---|---|---|
-| 1 | data-prep harness 建立 → memory → 可觀測性 → invoke-verify | 從 git 掛載列出技能；`aws sagemaker list-training-jobs` exit 0；S3 寫入經 orchestrator 側確認（`head_object`，80 bytes，時間差 1 秒）；memory 活躍（2 sessions、10 條提取記憶、0% 錯誤）；日誌 + X-Ray 投遞正常。同一循環中發現並修復 6 個實測缺陷（含 Claude ≥ 4.7 的 `temperature`/`top_p` 棄用 —— 只在 INVOKE 時暴露） |
+| 1 | data-prep harness 建立 → memory → 可觀測性 → invoke-verify | 從 **git** 掛載列出技能 —— 2026-07-28 當天每一個掛載都是 git；19 個在 v1.2.0 全部搬到 `s3`，所以這行記錄的是當時跑了什麼，不是現在跑什麼；`aws sagemaker list-training-jobs` exit 0；S3 寫入經 orchestrator 側確認（`head_object`，80 bytes，時間差 1 秒）；memory 活躍（2 sessions、10 條提取記憶、0% 錯誤）；日誌 + X-Ray 投遞正常。同一循環中發現並修復 6 個實測缺陷（含 Claude ≥ 4.7 的 `temperature`/`top_p` 棄用 —— 只在 INVOKE 時暴露） |
 | 2 pilot | 經 DeepSeek-R1（`us.deepseek.r1-v1:0`）蒸餾 8 個 ARC-AGI-2 任務 | agent 從 `stop_reason` 自我診斷 token 截斷（8k → 32k：格式有效率 1/8 → 8/8）；`pilot_raw.jsonl` 213 KB 經 S3 驗證；2 次斷流同 session 搶救 |
 | 2 main | 24 任務生成 + 5 階段整理 | `main_stats.json` 從 S3 回讀：24 題解出 8 題、74 次嘗試、best-of-4 提前停止（省約 40% token）；curation 對每個 grid 重新對照 ground truth 驗證，剔除 16 條錯答記錄；最終 6 train / 2 val |
 | 3 | QLoRA 訓練（ml.g5.2xlarge），launch-and-release | 作業 Completed，計費 431 秒；train_loss 0.5013 / eval_loss 0.5199；產物（adapter + merged bf16 + metrics.json）經 tarball 驗證；EventBridge → resume Lambda 鏈路觀察到兩次（1.5 秒、0 錯誤）；14336 上下文長度下配合 Liger fused CE 零 OOM |
@@ -91,13 +91,13 @@ endpoint、五輪 e2e 迭代 —— 花費大約等於一位人類 LLMOps 工程
 
 | 檢查 | 結果 | 重現方式 |
 |---|---|---|
-| 單元測試(全部套件,含 `test_cost_model.py` + `test_finops.py`) | **778 passed** | `.venv/bin/python -m pytest tests/ -q` |
+| 單元測試(全部套件,含 `test_cost_model.py` + `test_finops.py`) | **779 passed** | `.venv/bin/python -m pytest tests/ -q` |
 | Harness 配置驗證,7 個 agent | **`RESULT: OK`** | `python deploy/validate_config.py --config agents/finops/harness.json` |
 | 線上艦隊 | **7 個 harness READY** | 用 repo 內建 boto3 呼叫 `list_harnesses` |
 | 正典模組有散佈路徑 | 印出 `would upload 4 contract files` | `python deploy/03_storage.py --region us-east-1 --account-id 123456789012 --dry-run` |
 
 本次新增的每一道 guard 都做過 **mutation check**:逐一還原被斷言的行為,確認測試會
-失敗 —— **85/85 反向控制**,74 個 mutation 斷言 85 組（guard, mutation）配對,runner 各印
+失敗 —— **87/87 反向控制**,76 個 mutation 斷言 87 組（guard, mutation）配對,runner 各印
 一行 PASS。一個「有這行為也過、沒這行為也過」的測試,不是測試。
 
 這個數字是刻意寫進句子裡的。「做過 mutation check」是一個形容詞,而形容詞不會過期:

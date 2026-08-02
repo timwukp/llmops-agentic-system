@@ -83,6 +83,52 @@
     }
   ],
   "invocations_last_30d": 0,
-  "note": "SageMaker real-time endpoints cannot be paused: the minimum is one instance, so stopping the bill means deleting the endpoint. The EndpointConfig and Model below are NOT deleted -- recreating the endpoint from them is a single create_endpoint call (~5-8 min to InService).",
-  "restore": "aws sagemaker create-endpoint --endpoint-name jumpstart-dft-hf-asr-whisper-large-v2 --endpoint-config-name jumpstart-dft-hf-asr-whisper-large-v2 --region us-east-1"
+
+  "what_is_actually_running": {
+    "model": "Whisper large-v2 (OpenAI speech-to-text), HuggingFace ASR build",
+    "weights_origin": "s3://jumpstart-cache-prod-us-east-1/... -- AWS's own PUBLIC JumpStart cache, not a customer bucket. No fine-tuning, no private data, no artifact of ours is inside this endpoint.",
+    "provenance": "A one-click JumpStart deploy from SageMaker Studio. The 'jumpstart-dft-' prefix is the default name JumpStart generates (dft = default).",
+    "belongs_to": {
+      "studio_domain": "d-bovyr1gh3f0f (default-1610586624622), created 2021-01-14",
+      "user_profile": "default-1639742246842, created 2021-12-17",
+      "execution_role": "AmazonSageMaker-ExecutionRole-20210818T141474, created 2021-08",
+      "conclusion": "Every identity involved predates this project by 4+ years. This is a resource we FOUND, not one we caused."
+    },
+    "ownership_tags": "NONE. The only tags are JumpStart's automatic model-id/domain/user-profile tags -- no owner, no cost centre, no project. That absence is exactly why a sweep restricted to `llmops-*` could never have found it: there is nothing on it to claim."
+  },
+
+  "utilization_90d": {
+    "Invocations_Sum": 0,
+    "GPUUtilization_Average_pct": 0.0,
+    "CPUUtilization_Average_pct": 0.169,
+    "MemoryUtilization_Average_pct": 6.559,
+    "cloudtrail_InvokeEndpoint_events": 0,
+    "reading": "The A10G never ran a single inference. The 6.6% memory is the model weights sitting resident. It idled for 843 days -- 2024-04-11 creation to 2026-08-02 deletion. The window measured here is only the last 90 of those; CloudWatch does not retain further back, so '0 invocations' is proven for 90 days and inferred for the rest from 0 CloudTrail InvokeEndpoint events."
+  },
+
+  "pause_is_impossible_verified": {
+    "list_inference_components": "0 -- this is a legacy ProductionVariant endpoint, not the Inference-Component architecture that supports scale-to-zero",
+    "ManagedInstanceScaling": "not configured on the variant or the config",
+    "InitialInstanceCount": 1,
+    "conclusion": "Checked rather than assumed. Neither scale-to-zero nor a desired-count of 0 is available here, so stopping the bill means deleting the endpoint. Substituting delete for a user's 'pause' is a scope change that needs their explicit word, not the agent's inference."
+  },
+
+  "cost_measured": {
+    "hourly_usd": 1.515,
+    "daily_usd": 36.36,
+    "monthly_usd_at_730h": 1105.95,
+    "source": "Cost Explorer USAGE_TYPE USE1-Host:ml.g5.2xlarge -- $36.36 on each of seven consecutive full days, and $1.515 on the partial day 2026-08-01. NOT a JumpStart-default estimate; the first sweep's $18/day guess was half this.",
+    "not_covered_by_the_account_budget": "bedrock-monthly-dev is filtered to Service: [\"Amazon Bedrock\"], so no account-level control would ever have flagged this. See docs/COST.md section 10."
+  },
+
+  "note": "SageMaker real-time endpoints cannot be paused (verified above, not assumed): the minimum is one instance, so stopping the bill means deleting the endpoint. The EndpointConfig and Model below are NOT deleted -- and both are free to keep. Recreating the endpoint from them is a single create_endpoint call (~5-8 min to InService), and the weights live in AWS's public cache, so nothing needs re-uploading.",
+  "restore": "aws sagemaker create-endpoint --endpoint-name jumpstart-dft-hf-asr-whisper-large-v2 --endpoint-config-name jumpstart-dft-hf-asr-whisper-large-v2 --region us-east-1",
+  "status": "DELETED 2026-08-02 on the owner's explicit authorization. delete_endpoint returned, status went Deleting, and list_endpoints in us-east-1 now returns ZERO endpoints. The owner's original instruction said 'pause'; pause does not exist here (see pause_is_impossible_verified), so deletion waited for them to say it in as many words rather than being inferred from technical necessity.",
+  "restore_path_verified_after_delete": {
+    "endpoint_config": "jumpstart-dft-hf-asr-whisper-large-v2 -- describe_endpoint_config SUCCEEDS post-delete, ml.g5.2xlarge",
+    "model": "huggingface-asr-whisper-large-v2-20240411-075215 -- describe_model SUCCEEDS post-delete",
+    "weights": "s3://jumpstart-cache-prod-us-east-1/... still AWS's public cache; nothing of ours needed re-uploading",
+    "note": "Checked AFTER the delete, not before. 'Reversible' was a claim until these two describes returned; both objects are free to keep, so the one-line restore above is a fact rather than an intention."
+  },
+  "savings": "$36.36/day, ~$1106/month, stopped as of 2026-08-02."
 }

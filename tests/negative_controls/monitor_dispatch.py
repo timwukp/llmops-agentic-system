@@ -925,12 +925,17 @@ def m69(t):
     the filter protects our $1000 headroom is true and reassuring and leaves the reader
     believing the account has a spend guardrail over it. It does not: a budget scoped to
     one service is blind to waste in another, which is exactly why nothing at the account
-    level ever flagged a $1106/month endpoint sitting InService for 838 days. The whole-
+    level ever flagged a $1106/month endpoint sitting InService for 843 days. The whole-
     account monitor sweep is what found it. Drop the second half and the paragraph
     misleads by omission -- the failure mode that is hardest to catch by reading, because
     every sentence left on the page is still true.
     """
-    start = t.index("- It ALSO means")
+    anchor = "- It ALSO meant"
+    assert anchor in t, (
+        "the second half of the budget-filter sentence has moved or been reworded; "
+        "re-anchor this mutation rather than letting it crash -- a control that raises "
+        "is a control that never tested its guard")
+    start = t.index(anchor)
     end = t.index("\n\n", start)
     return t[:start] + t[end:]
 
@@ -1033,6 +1038,50 @@ def m74(t):
 case("release: VERSION names the release the CHANGELOG has already moved past",
      "VERSION", m74,
      ["tests/test_docs_claims.py::test_the_version_file_and_the_changelog_agree_on_the_current_release"])
+
+
+def m75(t):
+    """Put the falsified figure back in the zh-TW twin, in the zh unit spelling.
+
+    This is a real escape, not a hypothetical. When m68's guard was written it checked two
+    files by name -- docs/COST.md and CHANGELOG.md -- so the correction landed in English
+    and `docs/COST.zh-TW.md` kept saying `$18/天` with the guard green for as long as it
+    existed. Two independent evasions in one: a per-file allowlist is satisfied by the
+    files it happens to name, and `$18/天` is not the string `$18/day`. The guard now walks
+    every *.md in both unit spellings, which is the only shape that cannot be escaped by
+    adding a file or translating a unit.
+    """
+    old = "Whisper endpoint（約 $36.36/天）"
+    assert old in t, (
+        "the corrected zh-TW daily figure has moved or been reworded; re-anchor this "
+        "mutation rather than letting it no-op")
+    return t.replace(old, "Whisper endpoint（約 $18/天）", 1)
+
+
+case("finops: the falsified $18 figure survives in the zh-TW twin, in the zh unit",
+     "docs/COST.zh-TW.md", m75,
+     ["tests/test_cost_model.py::test_the_whisper_orphans_daily_figure_matches_its_instance_and_hourly_rate"])
+
+
+def m76(t):
+    """Restate the orphan's idle lifetime as one of the three wrong numbers it had.
+
+    838 in the snapshot and the CHANGELOG, 842 in the IAM comment, 843 in fact. Three
+    files, three digits, and nothing that could disagree with anything -- a standalone
+    number has nothing to be checked against. The endpoint is deleted, so the interval is
+    fixed forever: a wrong value here is permanent, not merely stale. The guard derives it
+    from the snapshot's own creation and deletion dates.
+    """
+    old = "InService for 843 days"
+    assert old in t, (
+        "the CHANGELOG's derived day count has moved or been reworded; re-anchor this "
+        "mutation rather than letting it no-op")
+    return t.replace(old, "InService for 838 days", 1)
+
+
+case("finops: the orphan's idle lifetime is restated as one of its three wrong values",
+     "CHANGELOG.md", m76,
+     ["tests/test_cost_model.py::test_the_orphans_idle_lifetime_is_derived_from_its_own_two_dates"])
 
 
 failed = []

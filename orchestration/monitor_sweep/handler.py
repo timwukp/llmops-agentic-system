@@ -18,10 +18,11 @@ outside the spine, applied to the one monitor task that shares its shape:
     crashed will never be found by a sweep that only ever runs inside a healthy run.
     That is precisely the endpoint that costs money for a month.
 
-The account already proves the point: the only endpoint standing in it is
-``jumpstart-dft-hf-asr-whisper-large-v2``, InService since 2024-04-11 and carrying no
-``project`` tag at all. No run will ever be responsible for it. Something outside every
-run has to look.
+The account already proved the point: the only endpoint ever standing in it was
+``jumpstart-dft-hf-asr-whisper-large-v2``, InService 2024-04-11 → deleted 2026-08-02 and
+carrying no ``project`` tag at all. No run was ever going to be responsible for it.
+Something outside every run has to look — and it still has to, now that the account is
+clean, because "clean today" is a reading and not a property.
 
 Env: DATA_BUCKET, DRIVER_FN, EVENTS_TABLE, PROJECT (default llmops-agentic-system),
      IDLE_HOURS (default 2, matching the prompt's threshold).

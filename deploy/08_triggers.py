@@ -112,11 +112,13 @@ def ensure_sweep_schedule(sched, lam_arn, role_arn, enable, dry):
 
     It costs nothing to run (list-endpoints, list-tags and metric reads are $0) and its
     whole value is that it runs when nobody remembers to. The orphan it exists to catch is
-    by definition one no run is watching: this account's only standing endpoint is
-    ``jumpstart-dft-hf-asr-whisper-large-v2``, InService since 2024-04-11, untagged, and no
-    run will ever be responsible for it. A sweep that only ran inside a healthy run could
-    never find an endpoint left behind by a run that crashed — which is precisely the
-    endpoint that bills for a month.
+    by definition one no run is watching: the one standing endpoint this account carried was
+    ``jumpstart-dft-hf-asr-whisper-large-v2``, InService 2024-04-11 → deleted 2026-08-02,
+    untagged, and no run was ever going to be responsible for it. A sweep that only ran
+    inside a healthy run could never find an endpoint left behind by a run that crashed —
+    which is precisely the endpoint that bills for a month. That the account is clean today
+    is the argument FOR keeping this schedule enabled, not against: the finding it produced
+    is the evidence that nothing else in the account was going to produce one.
 
     08:00 UTC, one hour ahead of the finops reconcile: the sweep reports what is still
     standing, so it is better read before the auditor tallies what was spent. Same
