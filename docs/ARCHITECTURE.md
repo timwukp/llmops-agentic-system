@@ -166,6 +166,52 @@ clause, so a protocol that grows a third exit cannot leave it half-wired. A page
 now rejected unless it carries both `situation` and `recommendation`: paging an owner with
 the problem and none of the analysis leaves them exactly where they started.
 
+**An emitted event with no rule is a promise with no path to it.** The paragraph above
+says an `EscalatedToHuman` event "routes to the *driver*". It did not. The
+`llmops-pipeline` bus carried **zero** EventBridge rules from Phase 1 through Phase 5,
+while that detail-type was emitted from three places, documented here as routing to the
+conductor, and serviced by a driver branch nothing could ever reach — `task="triage"` had
+never once been dispatched. On a live bus this is the quietest possible failure: the
+`PutEvents` succeeds, the event lands, and nothing happens. There is no error, no metric
+and no log line, because "no rule" and "rule missing" are the same observation. The rule
+now exists (`llmops-escalation-triage`, on the **custom** bus — the SageMaker rule beside
+it uses the default bus because service events land there and cannot be moved, and copying
+that shape here would produce a rule that is live, healthy in the console, and matches
+nothing forever), and which detail-types *require* a listener is declared in
+`EVENTS_NEEDING_A_RULE` in the contracts, so the decision is checked offline instead of
+inferred from whichever rules happen to exist.
+
+Wiring it up forced two emitters to be **renamed**, because the discrimination has to live
+somewhere an EventBridge pattern can read it — a pattern cannot read prose:
+
+- `_maybe_failover_model` hot-swaps a model after a vendor 5xx burst and the retry
+  *continues*. It announced itself as `EscalatedToHuman` with the words "informational,
+  pipeline continuing" buried in a reason string, which was harmless only while nothing
+  subscribed. The first rule routing that detail-type to triage would have paged the
+  conductor about a run that had just healed itself. It is now `ModelFailedOver`.
+- `handle_page_human` emitted `EscalatedToHuman` *too* — but a page is what the conductor
+  emits when it has **already** triaged and found the decision above its authority, while
+  `EscalatedToHuman` means "a conductor should look at this". Sharing one detail-type made
+  the new rule feed itself: escalate → triage → page → triage, every lap a billed harness
+  turn. It is now `OwnerPaged`, and the rule *also* excludes `stage: orchestrator` as a
+  second line of defence. That exclusion uses `anything-but`, which does **not** match an
+  event lacking the key at all — so `EscalateFail`, which carried only `run_id` and
+  `iteration`, now carries `stage` too. Without it every terminal pipeline failure, the
+  escalations that most need a triager, would have been dropped by the filter meant to
+  protect them.
+
+A triage also runs under its **own** synthetic `run_id` (`triage-<subject>`), not the
+escalated run's. `take_directive` is keyed on `event["run_id"]` and the checkpoint branch
+is its only caller, so a triage invoked under the subject's id would pop the subject's own
+parked verdict — the one the conductor is in the middle of writing — and receive it as an
+instruction from an accountable human. The conductor would be answering itself. The subject
+arrives as `params.escalation.run_id`, which is what the prompt's triage clause already
+reads, and its manifest is the subject's because a triage has none of its own. The envelope
+is translated in Python at the driver's entry point rather than by an EventBridge
+`InputTransformer`, for the same reason the rule exists at all: a transformer referencing a
+path an event lacks drops it silently, and the two emitters of this detail-type carry
+different key sets.
+
 **A prefix is not a filter.** The verdict channel above parks directives under a
 `directive#` sort key, and the constant's own comment claimed the prefix kept them "out of
 the timeline the console renders". Neither console reader filtered on it — and the prefix
