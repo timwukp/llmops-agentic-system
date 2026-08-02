@@ -11,13 +11,25 @@ once at cold start (no giant inline HTML string in the handler).
 
 ## Tabs
 
+Eight, in the order they appear in the nav. This table listed five and described "the 6
+`llmops_*` harnesses"; both had drifted (three tabs were added and the fleet is seven).
+`tests/test_console_routes.py` derives the tab count from `frontend.html` now, so the
+next added tab fails the suite rather than quietly making this list wrong again.
+
 | Tab | What it shows |
 |---|---|
-| Pipeline | Animated 9-stage flow (Step Functions `llmops-pipeline`) with remediation-loop arrow, execution picker, run detail (gates / metrics / evidence / training job), Start Run |
-| Fleet | The 6 `llmops_*` harnesses: status, model, skills, limits |
+| Architecture | The generated diagrams (`docs/architecture-*.svg`), served from the same Lambda so the picture cannot lag the deployment |
+| Tasks | **The customer-facing plane** — one consultation thread per engagement with `llmops_orchestrator`: chat, presigned `customer-data/` upload, priced plan, KMS-signed acceptance, lifecycle strip |
+| Pipeline | Animated 9-stage flow (Step Functions `llmops-pipeline`) with remediation-loop arrow, execution picker, run detail (gates / metrics / evidence / training job), Start Run, and the verdicts panel (delivered / parked / never delivered) |
+| Fleet | The 7 `llmops_*` harnesses: status, model, skills, limits |
 | Observability | Per-harness AgentCore service metrics, daily bar chart, token tile, SageMaker training jobs + student endpoints |
 | Evaluations | Online eval configs with score gauges, batch evaluations, insights reports |
 | Optimizations | AWS-native system-prompt recommendations + Bedrock-drafted prompts (human-review-then-apply via UpdateHarness) |
+| Cost | Estimates vs reconciled actuals, the $2000 gate, approval queue (approver group, never self-approve), `finops-run` dispatch |
+
+Route shape: **30 handlers** — 13 public GETs, 3 session POSTs, 14 authenticated POSTs.
+See [ARCHITECTURE.md §13](../../docs/ARCHITECTURE.md#13-the-admin-console--one-lambda-three-planes-with-different-rules)
+for why the three planes carry different rules.
 
 ## Auth model (ported)
 
@@ -69,5 +81,54 @@ existing `agent-cicd-admin` stack):
 | `JUDGE_MODEL` | `global.anthropic.claude-opus-5` | Bedrock model for prompt drafts |
 | `SPANS_SINCE` | `2026-07-28T12:00:00Z` | Sessions before OTEL always_on can never score — excluded from batch eval / insights |
 | `OPTIMIZE_HARNESS` | `llmops_orchestrator` | Default optimization target |
+| `TASKS_TABLE` | `llmops-tasks` | Consultation threads (PK `id`, `task-` prefix) |
+| `ESTIMATES_TABLE` | `llmops-cost-estimates` | Cost estimates (PK `id`) |
+| `ACTUALS_TABLE` | `llmops-cost-actuals` | Reconciled actuals (PK `project`, SK `sk`) |
+| `FINOPS_FN` | `llmops-finops-reconcile` | Auditor dispatch target |
+| `PROJECT` | `llmops-agentic-system` | Cost attribution key |
+| `APPROVAL_LIMIT_USD` | `2000` | Single-run gate — **server-side**; a gate the client enforces is a gate the client can skip |
+| `CUMULATIVE_LIMIT_USD` | `2000` | Period gate, checked alongside the single-run one |
+| `BUDGET_MODE` | `advisory` | `advisory` names an over-budget dispatch and records the estimate; `blocking` refuses it |
+| `APPROVER_GROUP` | `llmops-approver` | Cognito group that may decide approvals (never the requester) |
+| `DS_GROUP` | `llmops-datascience` | Cognito group that may create/chat tasks and mint upload URLs |
+| `APPROVAL_KEY` | `alias/llmops-approval` | KMS key signing approvals and plan acceptances (hash-chained) |
+| `LLMOPS_SNS_TOPIC` | (empty) | Escalation topic for `page_human`. **Currently has zero subscribers**, so a page publishes into the void — tracked as its own fix |
+| `ALLOWED_ORIGIN` | (empty) | Leave empty: same-origin. Setting it widens CORS |
+| `REFRESH_COOKIE_MAX_AGE_S` | 30 days | httpOnly refresh cookie lifetime |
 
 Account ID is resolved at runtime from STS — nothing account-specific is hardcoded.
+
+## End-to-end: what a customer engagement actually traverses
+
+The console is one end of a chain that runs all the way to a trained student model. Every
+step below is a real deployed component, in order:
+
+1. **Consult** — customer (or operator) opens a thread on the Tasks tab. `POST /api/tasks`
+   → task row → the task-chat worker invokes `llmops_orchestrator` through the harness
+   driver, streaming the reply. The orchestrator's consult protocol opens at DATA
+   DISCOVERY, which is why `llm-data-preparation` is mounted on it.
+2. **Hand over data** — `POST /api/data-upload-url` mints a **presigned** PUT under
+   `customer-data/<task_id>/`. The key is always server-chosen; the browser uploads
+   directly to S3 (no 6 MB API Gateway cap, no Lambda timeout) and the thread auto-posts
+   the resulting URI so the upload is visible *to the agent* rather than a silent
+   side-effect. The pipeline's own role gets `customer-data` **read-only**.
+3. **Priced plan** — the orchestrator emits a plan with a `$` figure derived from the rate
+   card injected into its prompt. Acceptance is KMS-signed and hash-chained, so it is
+   evidence rather than a UI state.
+4. **Dispatch** — accepted plan → `launch_run` → `llmops-start-pipeline`, which seeds
+   `s3://<bucket>/runs/<run_id>/manifest.json` and starts the Step Functions execution.
+   Over-budget dispatches are named by the gate; `advisory` records and proceeds.
+5. **Run** — the deterministic spine drives 8 harness-task states (data-prep → finetune →
+   eval → deploy → monitor), each a `waitForTaskToken` driver invocation. Long training
+   jobs release the session and resume via EventBridge. Gate failure loops through
+   remediation ≤3 times, then escalates.
+6. **Watch** — the Pipeline and Observability tabs read the run's stage events (two bounded
+   queries: events `sk < "A"`, parked verdicts `sk begins_with "directive#"`) plus
+   AgentCore/CloudWatch metrics. Both records — run and originating task — are closed on
+   both the success and failure paths.
+7. **Reconcile** — after the run (Cost Explorer lags ~24 h), `POST /api/finops-run` dispatches
+   `llmops_finops`, the read-only auditor, which compares actuals to the estimate using
+   `cost_model.py` as the single canonical arithmetic. The Cost tab shows both sides.
+
+The auditor is outside the state machine on purpose, and its IAM is read-only on billing:
+the thing that measures spend is not the thing that authorises it.
