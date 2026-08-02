@@ -189,7 +189,7 @@ This is the single most consequential decision in the design, and it comes from 
 On 2026-07-31, this AWS account's month-to-date total was **$27,491**. This project's own
 share was **~$3.50 of SageMaker plus ~$6.29 of Bedrock teacher — about $10–15.** The rest
 belongs to unrelated work in the same account, including SageMaker Canvas session hours
-(~$296) and a JumpStart Whisper endpoint (~$18/day).
+(~$296) and a JumpStart Whisper endpoint (~$36.36/day).
 
 A rollup that filtered by *service* would therefore report **thousands of dollars of somebody
 else's spend as ours** — and would trip the $2000 gate on its first evaluation. Attribution is

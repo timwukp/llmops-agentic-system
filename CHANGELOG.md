@@ -54,7 +54,7 @@ human ran `describe-training-job` and multiplied by a rate recalled from memory.
   tagging at all. Tags are not retroactive, so the $10.77 run will never carry one.
 - **Attribution must never be by service.** This account's month-to-date total was **$27,491**
   while this project's share was **~$10–15**; the rest includes unrelated SageMaker Canvas
-  (~$296) and a JumpStart Whisper endpoint (~$18/day). A service filter would have reported
+  (~$296) and a JumpStart Whisper endpoint (~$36.36/day). A service filter would have reported
   thousands of dollars of someone else's spend as ours — and tripped the $2000 gate immediately.
 - **Cost Explorer lags ~24 h** and marks recent periods `Estimated: true`, so reconciliation is
   async and re-runnable, and a run counts as settled only when *every* row for it is settled.

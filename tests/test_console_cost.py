@@ -784,7 +784,7 @@ def test_rollup_itemises_by_category_service_and_run(wired):
 
 def test_rollup_states_that_attribution_is_by_resource_not_service(wired):
     """The measured contamination: this account also bills SageMaker Canvas ($296) and
-    a JumpStart Whisper endpoint ($18/day). A rollup silent about its method invites
+    a JumpStart Whisper endpoint ($36.36/day). A rollup silent about its method invites
     the reader to assume it covers the whole service."""
     ov = wired.m.cost_overview()
     assert "NEVER BY SERVICE" in ov["note"].upper()

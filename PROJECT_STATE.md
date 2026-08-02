@@ -30,8 +30,9 @@ Next: v2 experiments — code-as-reasoning distillation + augmentation; Kimi K3 
 | S3 bucket | (name in SSM `/llmops/storage/bucket`) | deploy/03_storage.py | versioned, SSE-S3, PAB, runs/ 90d lifecycle |
 | DynamoDB ×4 | llmops-pipeline-runs (GSI job_name-index), llmops-stage-events, llmops-cost-estimates, llmops-cost-actuals | deploy/03_storage.py | PITR on; cost tables added v1.1.0 |
 | EventBridge | bus `llmops-pipeline` + rule `llmops-sagemaker-job-state` (default bus) + rule `llmops-escalation-triage` (custom bus) | 03 + 07 | wake chain for launch-and-release; triage rule routes `EscalatedToHuman` → driver as `task=triage` (the custom bus carried ZERO rules until v1.1.x) |
-| SNS topic | llmops-escalations | deploy/03_storage.py | EscalatedToHuman notifications |
-| Harnesses ×7 | llmops_{data_prep,finetune,eval,deploy,monitor,orchestrator,finops} | deploy/05_harnesses.py | full ids in SSM `/llmops/harness/*`; shared Memory attached; obs + online evals wired; currently on Opus 5 (Fable 5 fallback policy, AGENTS.md) |
+| SNS topic | llmops-escalations | deploy/03_storage.py | EscalatedToHuman notifications; 1 email subscriber since 2026-08-02 (was ZERO, so every `escalate_human` published into the void). A subscription is PendingConfirmation until the recipient clicks the link, and ensure_topic reports pending separately because unconfirmed is the same silence in a new place |
+| Macie | classification job `llmops-customer-data-pii` | deploy/03_storage.py --enable-pii-scan | SCHEDULED daily, 100% sampling, scoped `OBJECT_KEY STARTS_WITH customer-data/`; per-GB billed. The runtime role got read-only `macie2` the same day — a scan whose findings the auditing agent cannot read changes nothing a customer can see |
+| Harnesses ×7 | llmops_{data_prep,finetune,eval,deploy,monitor,orchestrator,finops} | deploy/05_harnesses.py | full ids in SSM `/llmops/harness/*`; shared Memory attached; obs + online evals wired; all 7 on `global.anthropic.claude-fable-5` as deployed (GetHarness, 2026-08-02); driver auto-failover covers quota bursts |
 | AgentCore Memory | llmops_shared_memory (SEMANTIC + EPISODIC) | deploy/04_wire_memory.py | shared across all 7 harnesses |
 | Lambdas ×6 | llmops-{harness-driver,start-pipeline,resume-pipeline,webhook,finops-reconcile,monitor-sweep} | deploy/07_lambdas.py | driver: turn-continuation + auto model failover; monitor-sweep: own least-privilege role |
 | Step Functions | llmops-pipeline (STANDARD) | deploy/07_lambdas.py | 25 states; 11 harness tasks on the happy path incl. EvalGenerate and MonitorHealth/MonitorReport, plus the remediation loop |
@@ -47,8 +48,17 @@ that have never existed._
 
 ## Standing cost posture
 
-Zero standing billable resources: no SageMaker endpoints, pipeline scheduler DISABLED,
-serverless spine idles free. Total v1 build cost ≈ $12–15.
+Zero standing billable resources CREATED BY THIS PROJECT: no llmops-* SageMaker
+endpoint, pipeline scheduler DISABLED, serverless spine idles free. Total v1 build cost
+≈ $12–15. That scoping is load-bearing and used to be missing: the account also carries
+`jumpstart-dft-hf-asr-whisper-large-v2`, InService since 2024-04-11 with 0 invocations
+over 30 days, which Cost Explorer bills at **$36.36/day** (ml.g5.2xlarge ×1 —
+confirmed by describe_endpoint_config, not the JumpStart-default guess the first run of
+the schedule below had to make). It was found by that schedule, which scans the whole
+account precisely because one restricted to `llmops-*` cannot find an unclaimed resource.
+It is not ours to delete; reported, and awaiting the account owner. A PII scan
+(`llmops-customer-data-pii`, Macie, SCHEDULED daily over `customer-data/`) went live
+2026-08-02 and bills per GB — at 0.87 MiB that is under $0.01/scan.
 
 Two recurring costs, both agent-turn cost only — every AWS API either of them calls is $0:
 
@@ -83,9 +93,12 @@ live (torn down after eval per cost rule).
 
 ## Known issues / open items
 
-- Fable 5 vendor-quota 5xx bursts → all harnesses on Opus 5; switch back when
-  stable (UpdateHarness hot-swap, ~15s each; driver auto-failover now handles
-  future bursts).
+- Fable 5 vendor-quota 5xx bursts: this file claimed "all harnesses on Opus 5" until
+  2026-08-02, when GetHarness on all 8 returned `global.anthropic.claude-fable-5`. The
+  hot-swap was evidently never applied, or was reverted by a later deploy from config
+  that still names Fable 5 — every `agents/*/harness.json` does. The mitigation that IS
+  live is the driver's auto-failover; the model line is not. Asserted by
+  tests/test_docs_claims.py rather than restated.
 - GitHub Actions trigger requires one-time OIDC role setup + `AWS_OIDC_ROLE_ARN`
   repo secret (docs/TRIGGERS.md).
 - v2 experiments queued: code-as-reasoning + augmentation; Kimi K3 teacher A/B;

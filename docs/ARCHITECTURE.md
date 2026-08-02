@@ -153,12 +153,16 @@ Two spine details that are policy, not plumbing:
   so a failed publish took all three of the others with it — including the settle, leaving a
   live task token on a run that had already escalated, freed only by the stage's own timeout
   (7200s for data_prep, 21600s for finetune). That is the worst possible thing to gate on
-  *this* call: **`llmops-escalations` has zero subscribers**, so SNS is the one channel
-  already known to deliver to no one. `ensure_topic` in `deploy/03_storage.py` reports it as
+  *this* call: **`llmops-escalations` had zero subscribers** when this was found, so SNS was
+  the one channel already known to deliver to no one. `ensure_topic` in
+  `deploy/03_storage.py` reports it as
   `NO SUBSCRIBERS — every escalate_human call publishes into the void` rather than calling
   the topic healthy, because a deploy cannot invent an address; the fix is
-  `--escalation-email <addr>`, and until someone supplies one the runtime has to assume that
-  channel is dead. Each notification is now wrapped and logged on its own, in ascending
+  `--escalation-email <addr>`, supplied 2026-08-02. Note what that fix does NOT settle: an
+  email subscription is `PendingConfirmation` until the recipient clicks the link, and
+  `ensure_topic` reports pending separately for exactly that reason — unconfirmed is the
+  same silence one step further along. The ordering below is therefore still required, not
+  superseded: a channel's audience can go back to zero without any code changing. Each notification is now wrapped and logged on its own, in ascending
   order of what it costs to lose: SNS, then the timeline row, then the bus event, and the
   token settle last so it happens even when every notification failed.
 - **A readiness checklist must be derived from the prompt, not copied from it.** The console's

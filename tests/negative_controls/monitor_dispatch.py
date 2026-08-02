@@ -895,6 +895,28 @@ case("docs: the two happy-path derivations collide under one name and one shadow
      ["tests/test_docs_claims.py::test_the_documented_spine_matches_the_state_machine"])
 
 
+def m68(t):
+    """Put the falsified $18/day figure back into cost_model.py.
+
+    Every prose mention of the Whisper orphan said $18/day, in six files, for as long as
+    the finding existed. The number was the FIRST SWEEP'S GUESS -- that sweep could not
+    call DescribeEndpoint and said so in its own report -- and it was half the truth:
+    describe_endpoint_config returns ml.g5.2xlarge x1, and Cost Explorer billed $36.36 on
+    seven consecutive days. A cost control that understates by 2x is one an owner can
+    dismiss on the merits, so the arithmetic is now asserted against the hourly rate this
+    module documents rather than restated as a string. This mutation restores the stale
+    figure; the guard must notice.
+    """
+    old = "endpoint ($36.36/day) that have nothing to do"
+    assert old in t, "the corrected daily figure has moved; re-anchor this mutation"
+    return t.replace(old, "endpoint ($18/day) that have nothing to do", 1)
+
+
+case("finops: the Whisper orphan's daily cost is restated from the sweep's guess, not derived",
+     "pipeline/contracts/cost_model.py", m68,
+     ["tests/test_cost_model.py::test_the_whisper_orphans_daily_figure_matches_its_instance_and_hourly_rate"])
+
+
 failed = []
 for name, rel, mutate, tests in CASES:
     p = REPO / rel

@@ -441,17 +441,51 @@ def test_only_approved_estimates_can_launch():
 # ── attribution: the contamination hazard ─────────────────────────────────────
 def test_foreign_resources_are_excluded_from_the_project_rollup():
     """Measured on this account: SageMaker Canvas ($296) and a JumpStart Whisper
-    endpoint ($18/day) share the account. A service-level rollup would bill both to
+    endpoint ($36.36/day) share the account. A service-level rollup would bill both to
     this project."""
     groups = [
         {"resource_id": "training-job/llmops-qlora-run-phase2-main-0001-r3", "cost_usd": 10.77},
-        {"resource_id": "endpoint/jumpstart-dft-hf-asr-whisper-large-v2", "cost_usd": 18.18},
+        {"resource_id": "endpoint/jumpstart-dft-hf-asr-whisper-large-v2", "cost_usd": 36.36},
         {"resource_id": "Canvas:Session-Hrs", "cost_usd": 296.0},
     ]
     out = attribute_actuals(groups, "llmops-agentic-system", "2026-07-30")
     assert out["total_usd"] == pytest.approx(10.77)
-    assert out["excluded_usd"] == pytest.approx(314.18)
+    assert out["excluded_usd"] == pytest.approx(332.36)
     assert len(out["excluded"]) == 2
+
+
+def test_the_whisper_orphans_daily_figure_matches_its_instance_and_hourly_rate():
+    """The orphan's daily cost is DERIVED here, not restated.
+
+    Every prose mention of this endpoint said $18/day for as long as it existed. That
+    number came from the first monitor sweep, which had to guess: the sweep's own report
+    said "sagemaker:DescribeEndpoint denied ... cost figures are estimates based on
+    JumpStart defaults". describe_endpoint_config later returned ml.g5.2xlarge x1, and
+    Cost Explorer billed $36.36 on each of seven consecutive days -- exactly 24 x the
+    $1.515/hr this module already documents for that instance. So the figure that six
+    files repeated was half the real one, and a cost control whose headline number is
+    an underestimate is one an owner can correctly dismiss.
+
+    Asserting the arithmetic rather than the string is what makes this a guard: if
+    someone re-copies a stale figure, or the documented hourly rate moves, the two sides
+    stop agreeing. The FinOps rule is the same one the sweep broke -- an assumed number
+    must be labelled as one, and a measured number must match what it is derived from.
+    """
+    hourly = 1.515          # ml.g5.2xlarge, Price List us-east-1; see this module's header
+    daily = hourly * 24
+    assert daily == pytest.approx(36.36), (
+        f"ml.g5.2xlarge at ${hourly}/hr is ${daily:.2f}/day")
+
+    src = (pathlib.Path(__file__).resolve().parent.parent
+           / "pipeline" / "contracts" / "cost_model.py").read_text()
+    assert f"${daily:.2f}/day" in src, (
+        "cost_model.py states a daily figure for the Whisper orphan that its own "
+        "documented hourly rate does not produce")
+    assert "$18/day" not in src, "the falsified $18/day figure is back in cost_model.py"
+
+    for doc in ("docs/COST.md", "CHANGELOG.md"):
+        text = (pathlib.Path(__file__).resolve().parent.parent / doc).read_text()
+        assert "$18/day" not in text, f"{doc} still carries the falsified $18/day figure"
 
 
 def test_attribution_is_an_allowlist_so_unknown_shapes_are_excluded():
