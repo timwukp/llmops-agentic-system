@@ -5,6 +5,31 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
 ## [Unreleased]
 
+### A limit without its mode is the more misleading half
+
+- **`GET /api/cost-overview` reported the two dollar limits and not whether either is
+  enforced.** `limits` carried `single_usd`, `cumulative_usd` and `approver_group`;
+  `budget_mode` existed on the `gate` object but not here — so the one surface a human reads
+  was the surface missing it. Found while verifying the $2000 → $20,000 raise live: the
+  overview came back with the new number and `budget_mode: None`. `limits` now carries
+  `budget_mode` and a derived `enforced`, computed with the same predicate the gate itself
+  uses (`BUDGET_MODE == "blocking"`), so the label cannot disagree with the branch.
+- **The Cost KPI card read as a stop sign.** Its own words were *"limit $20,000 per run /
+  $20,000 cumulative"*, with nothing saying that in `advisory` — the deployed default — an
+  over-budget run is named, priced, and then launched anyway. It now renders
+  *"reference … · ADVISORY — an over-budget run is reported, then launched anyway"* in amber,
+  or *"ENFORCED — an over-budget run is held for an approver"* in green. Verified live at the
+  new reference: n=260,000 straddles it ($19,775 expected, $21,056 worst case) and returns
+  `over_budget_usd=1056.30` with `status=approved` — the run launched.
+- **Guarded in both directions, and against behaviour rather than against itself.** A field
+  hardcoded `False` satisfies an advisory-only test forever and mislabels every blocking
+  deployment; one hardcoded `True` is the original defect with extra steps. So `enforced` is
+  asserted equal to what an over-budget launch *does* — held with 409, or invoked — once per
+  mode. The two modes are checked by two single-fixture tests calling one helper, not by one
+  test requesting both fixtures: the `blocking` fixture monkeypatches `BUDGET_MODE` on the
+  same module object `wired` hands out, so a test asking for both gets blocking twice and
+  passes while comparing nothing. That version was green in the wrong direction first.
+
 ### Stage timeouts: a day for real work, an hour for anything holding a GPU
 
 - **The six states that wait on real agent work now carry `TimeoutSeconds: 86400`** — a full

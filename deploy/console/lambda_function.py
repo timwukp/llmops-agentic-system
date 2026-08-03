@@ -1729,9 +1729,16 @@ def cost_estimates(limit=50):
     out.sort(key=lambda x: str(x.get("created_at") or ""), reverse=True)
     return {"estimates": out,
             "pending": [e for e in out if e["status"] == "pending_approval"],
+            # budget_mode travels WITH the limits, because a limit without its mode is
+            # the more misleading of the two halves. Two numbers labelled "limit" read as
+            # enforced; in advisory -- the deployed default -- an over-budget run is named,
+            # priced, and then launched anyway. A reader who trusts the number to stop
+            # something is wrong about the only thing they wanted to know.
             "limits": {"single_usd": APPROVAL_LIMIT_USD,
                        "cumulative_usd": CUMULATIVE_LIMIT_USD,
-                       "approver_group": APPROVER_GROUP}}
+                       "approver_group": APPROVER_GROUP,
+                       "budget_mode": BUDGET_MODE,
+                       "enforced": BUDGET_MODE == "blocking"}}
 
 
 def cost_overview(period_days=30):

@@ -903,6 +903,91 @@ def test_estimates_exposes_the_limits_and_the_approver_group(wired):
     assert out["limits"]["approver_group"] == wired.m.APPROVER_GROUP
 
 
+# ── a limit without its mode ──────────────────────────────────────────────────
+# The Cost tab rendered "limit $20,000 per run / $20,000 cumulative" and said nothing
+# about whether either is enforced. Both readings of that card are available and only one
+# is true: in advisory -- the deployed default -- an over-budget run is named, priced, and
+# then launched. The number is real; its authority is not. Found on 2026-08-03 while
+# verifying the raise to $20,000 live: `gate` carries budget_mode, `limits` did not, so
+# the surface a human reads was the one surface missing it.
+#
+# This is the same shape this repo has now paid for three times -- a display that reads as
+# a control (the hover card's "heartbeat 18000s" with no sender; the diagram's git skill
+# sources after the S3 migration). Asserted rather than corrected, because a correction
+# holds until the next person adds a limits consumer.
+
+def test_the_limits_say_whether_they_are_enforced(wired):
+    """Advisory: the numbers ship with the fact that nothing stops a run."""
+    lim = wired.m.cost_estimates()["limits"]
+    assert lim["budget_mode"] == wired.m.BUDGET_MODE
+    assert lim["enforced"] is False, \
+        "advisory mode must not report its reference as enforced"
+
+
+def test_the_limits_report_enforcement_when_the_gate_really_blocks(blocking):
+    """Blocking: the same field flips, so it tracks the mode rather than being a constant.
+
+    Both directions are needed. A field hardcoded to False would satisfy the advisory test
+    above forever and mislabel every blocking deployment -- and a field hardcoded to True
+    is the original defect with extra steps.
+    """
+    lim = blocking.m.cost_estimates()["limits"]
+    assert lim["budget_mode"] == "blocking"
+    assert lim["enforced"] is True
+
+
+def _enforced_matches_behaviour(w):
+    """Compare the label against what an over-budget launch actually does.
+
+    `enforced` is a claim; whether the run is held is the behaviour. Both are derived from
+    BUDGET_MODE in two different places, which is precisely how they drift apart, so the
+    label is pinned to the observed outcome rather than to the constant it came from.
+
+    Taken as ONE helper called by two single-fixture tests, not one test requesting both:
+    the `blocking` fixture monkeypatches BUDGET_MODE on the same module object `wired`
+    hands out, so a test that asks for both gets blocking twice and passes while comparing
+    nothing. That mistake made this test green in the wrong direction before it was caught.
+    """
+    eid = _over_limit(w)
+    r = w.m.start_run({"estimate_id": eid})
+    held = r.get("status_code") == 409
+    assert w.m.cost_estimates()["limits"]["enforced"] is held, (
+        f"limits.enforced disagrees with behaviour: an over-budget run was "
+        f"{'held' if held else 'launched'} in {w.m.BUDGET_MODE} mode")
+    return held
+
+
+def test_enforced_is_false_and_the_run_really_launches(wired):
+    assert _enforced_matches_behaviour(wired) is False
+    assert wired.invokes, "advisory must actually launch the over-budget run"
+
+
+def test_enforced_is_true_and_the_run_really_is_held(blocking):
+    assert _enforced_matches_behaviour(blocking) is True
+    assert not blocking.invokes, "blocking must not invoke start-pipeline"
+
+
+def test_the_cost_card_renders_the_mode_next_to_the_numbers():
+    """The API can be honest while the page still reads as a stop sign.
+
+    Anchored on the element that shows the limits, not on the whole 124 KB file: an
+    unanchored substring search for "advisory" hits the word anywhere in a 124 KB page and
+    passes while the card itself says nothing (the m69 lesson).
+
+    The window reaches BEHIND the anchor as well as ahead of it, because the flag is read
+    into a local on the line above the element. A forward-only window failed this on the
+    correct implementation -- and a guard that fails on correct code is one somebody
+    deletes, taking the real check with it.
+    """
+    html = (REPO / "deploy/console/frontend.html").read_text()
+    i = html.index('$("kpiCostPendingSub").innerHTML')
+    block = html[max(0, i - 400):i + 700]
+    assert "lim.enforced" in block, \
+        "the limits card must read the enforcement flag, not just the two numbers"
+    for word in ("ADVISORY", "ENFORCED"):
+        assert word in block, f"the card never tells the reader it is {word.lower()}"
+
+
 # ── rate card health ──────────────────────────────────────────────────────────
 def test_rate_card_health_reports_required_but_missing_skus(wired):
     """Health is measured against what a plan NEEDS. A card with plenty of irrelevant

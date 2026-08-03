@@ -1577,6 +1577,65 @@ case("docs: a shadowed duplicate test name is not reported",
      ["tests/test_docs_claims.py::test_a_test_name_defined_twice_in_one_module_is_reported"])
 
 
+def m100(t):
+    """Ship the limits without the mode, exactly as they shipped until 2026-08-03.
+
+    Two numbers labelled as limits and no word on whether either is enforced. The route
+    keeps working, the page keeps rendering, and the reader concludes the platform stops an
+    over-budget run -- which in the deployed advisory default it does not.
+    """
+    old = ('                       "budget_mode": BUDGET_MODE,\n'
+           '                       "enforced": BUDGET_MODE == "blocking"}}')
+    assert t.count(old) == 1, f"the limits payload has moved; found {t.count(old)}"
+    return t.replace(old, '                       }}', 1)
+
+
+case("console: the limits ship without saying whether they are enforced",
+     "deploy/console/lambda_function.py", m100,
+     ["tests/test_console_cost.py::test_the_limits_say_whether_they_are_enforced"])
+
+
+def m101(t):
+    """Hardcode enforcement to False -- the shape that keeps the advisory test green forever.
+
+    This is the mutation the first version of this guard would NOT have caught: a test that
+    only checks the advisory default is satisfied by a constant, and every blocking
+    deployment then reports its real gate as advisory. Aimed at the blocking tests, because
+    their subject is the flag TRACKING the mode rather than matching today's value.
+    """
+    old = '                       "enforced": BUDGET_MODE == "blocking"}}'
+    assert t.count(old) == 1, f"the enforced flag has moved; found {t.count(old)}"
+    return t.replace(old, '                       "enforced": False}}', 1)
+
+
+case("console: enforcement is hardcoded rather than derived from the mode",
+     "deploy/console/lambda_function.py", m101,
+     ["tests/test_console_cost.py::"
+      "test_the_limits_report_enforcement_when_the_gate_really_blocks",
+      "tests/test_console_cost.py::test_enforced_is_true_and_the_run_really_is_held"])
+
+
+def m102(t):
+    """Put the numbers back on the card with the mode stripped off.
+
+    The API stays honest and the page still reads as a stop sign -- which is the actual
+    user-visible defect, and the reason the card is asserted separately from the payload.
+    """
+    old = 'const enf = lim.enforced === true;'
+    assert t.count(old) == 1, f"the card's mode read has moved; found {t.count(old)}"
+    t = t.replace(old, 'const enf = false;', 1)
+    old2 = ('      +(enf ? "ENFORCED &mdash; an over-budget run is held for an approver"\n'
+            '            : "ADVISORY &mdash; an over-budget run is reported, then launched '
+            'anyway")+"</span>";')
+    assert t.count(old2) == 1, f"the card's mode text has moved; found {t.count(old2)}"
+    return t.replace(old2, '      +""+"</span>";', 1)
+
+
+case("console: the cost card shows the limits with no word on enforcement",
+     "deploy/console/frontend.html", m102,
+     ["tests/test_console_cost.py::test_the_cost_card_renders_the_mode_next_to_the_numbers"])
+
+
 #: Where the pristine text of the file currently mutated is parked, so a kill -9 -- which
 #: no handler can intercept -- still leaves the original recoverable. Under the repo root
 #: rather than /tmp because it must be obvious to whoever finds the tree dirty, and
