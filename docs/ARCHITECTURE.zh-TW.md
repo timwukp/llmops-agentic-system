@@ -72,10 +72,12 @@ manifest —— 更早寫的報告會漏掉它本來要確認的 teardown ——
 第三個 monitor 任務 **`sweep`** 刻意留在狀態機*之外*，跑在 08:00 UTC 的排程上
 （`llmops-monitor-sweep-daily` → `llmops-monitor-sweep`）。它獵捕的是*其他* run 留下的端點，
 包括那些崩潰、因此從未走到任何能檢查的狀態的 run —— 一個綁定單一 run 的 agent 無法替其他
-run 回答。這個帳號本身就是證據：唯一還站著的端點
-`jumpstart-dft-hf-asr-whisper-large-v2` 從 2024-04-11 起 InService，完全沒有 `project`
-標籤，所以永遠不會有哪個 run 對它負責；也因此它的 `ListTags` 權限必須是帳號層級的
-（`Resource: "*"`）。這條邊界是**讀取放到帳號層級、寫入只限 `llmops-*`** ——
+run 回答。這個帳號本身就是證據：它唯一站過的那個端點
+`jumpstart-dft-hf-asr-whisper-large-v2` 從 2024-04-11 起 InService，直到 2026-08-02 被刪除，
+期間完全沒有 `project` 標籤，所以從來不會有哪個 run 對它負責；也因此它的 `ListTags` 權限
+必須是帳號層級的（`Resource: "*"`）。端點刪掉之後這個權限仍然保持寬的，理由和一開始放寬它
+的理由完全一樣：sweep 存在的目的是找出*下一個*沒有人認領的資源，而把範圍限縮成「我們已經
+認領的東西」，正是這一個能在它 843 天的生命裡無聲計費到底的原因。這條邊界是**讀取放到帳號層級、寫入只限 `llmops-*`** ——
 `ListEndpoints`/`ListTags`/`DescribeEndpoint`/`DescribeEndpointConfig` 都在 `"*"` 上，
 所有的變更操作仍然窄範圍：sweep 能把一個它動不了的孤兒端點**完整刻畫出來**。這條線之所以
 畫在「讀 vs 寫」而不是畫在 `Describe`，是第一次實測 sweep 逼出來的。它找到了那個端點，
@@ -434,7 +436,8 @@ eval agent 發出 `gate_passed: null` + `needs_human: true`，而舊的 default-
 ## 9. 模型 failover 是設計層，不是應急手段
 
 實測確立（Phase 5）：供應商模型配額是硬約束 —— 即使 AWS 內部帳號也受模型供應商限流，
-而多 agent 平台本身就是 token 洪流製造機（6 個 harness × agent 迴圈 × 長串流）。單日
+而多 agent 平台本身就是 token 洪流製造機（當時 6 個 harness，加入 `llmops_finops` 後為 7 個，
+× agent 迴圈 × 長串流）。單日
 內 Fable 5 的 5xx 爆發重現約 12 次。設計規則（全文見 [AGENTS.md](../AGENTS.md)）：
 
 1. 每個 harness 都有後備鏈：`global.anthropic.claude-fable-5` →

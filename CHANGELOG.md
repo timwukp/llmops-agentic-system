@@ -3,6 +3,123 @@
 All notable changes to this project are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
+## [1.2.0] — 2026-08-02
+
+Twenty-one merged PRs (#17–#38; #24 closed unmerged). The pattern across almost all of them
+is one kind of defect: **a component that existed, was deployed, was tested, and was never
+reached.** A dispatch that no state ever called, a bus rule set that was empty, a success path
+that had never executed, a reply channel with nothing listening. Each looked healthy from
+every dashboard, because the half that was written was the half that worked.
+
+### A consultation the customer can actually finish
+
+Before this release a customer could not hand us a dataset. The Tasks tab could show a run
+but had no way to start one from a goal, and there was no upload path at all.
+
+- **Goal-driven consult entry** (#17) — a natural-language goal enters the orchestrator in
+  consult mode and comes back as a costed plan; acceptance is **KMS-signed**, and
+  `service_launch_run` verifies the signature and the plan hash before `start-pipeline` sees
+  anything. An approval that cannot be verified is not an approval.
+- **Presigned dataset upload** (#22) — plus bucket CORS, the console's `PutObject` IAM, and an
+  **httpOnly refresh cookie**, because the old refresh path signed the customer out in the
+  middle of the upload they were signed in to perform.
+- **One thread, not a form** (#23, #31) — the tab became a single Claude-Code-style
+  conversation with a drop zone. Parked directive rows had been pushing the newest real events
+  off the timeline, so the customer watched a stale run.
+- **The identity in the hover card is resolved, not guessed** (#18), and the teacher-token
+  estimate was recalibrated — the old figure made the plan's own caps arithmetically
+  infeasible, so every plan it produced was unexecutable.
+- **The audit copy stops erasing, truncating, and gating itself** (#36's branch) — a failed
+  transcript read was treated as "no file yet" and wiped the history; a failed audit write
+  stranded a signed acceptance it had no authority to gate.
+
+### The pipeline dispatches every stage it claims to dispatch
+
+Three stages were configured, documented, and never dispatched. All three were found by
+asking what actually calls the thing, not by reading what declares it.
+
+- **The eval gate read a report nothing wrote** (#33) — `evaluate` was never dispatched, so the
+  gate consumed a file that did not exist.
+- **The `llmops-pipeline` bus carried ZERO rules** (#35) — `EscalatedToHuman` was published to a
+  bus with no subscribers, so every escalation was emitted into nothing. Now routed to the
+  conductor for triage, with `page_human` serviced on the driver path as triage's only
+  above-authority exit.
+- **`llmops_monitor` had no task dispatched anywhere** (#36) — a runtime deployed and wired into
+  the state machine that nothing ever asked to do work.
+- **The SUCCESS path had never run** (#19's window) — nothing wrote `status=completed`, so every
+  successful run was a zombie record. A happy path that has never executed is not a path.
+- **Per-run report keys** (#19) — one shared key meant each run overwrote the last one's report.
+
+### FinOps and governance
+
+- **The orphan endpoint costs $36.36/day, not the $18 six files claimed** (#37). The $18 was the
+  first sweep's *guess* — that sweep could not call `DescribeEndpoint` and said so in its own
+  report — and it understated by 2×, which is the magnitude an owner can dismiss on the merits.
+  Now derived from `describe_endpoint_config` (ml.g5.2xlarge ×1) against the documented hourly
+  rate. The endpoint had been InService for 843 days (2024-04-11 → 2026-08-02) with 0
+  invocations and 0.0% GPU utilization; deleted 2026-08-02 under explicit authorization.
+- **`bedrock-monthly-dev` is stated in both directions** (#37) — its `Service: ["Amazon Bedrock"]`
+  filter is simultaneously what kept the $1000 guardrail meaningful and what made it blind. No
+  account-level control would ever have flagged that endpoint; the whole-account monitor sweep
+  is what found it. `describe_budget_actions_for_budget` returns **0 actions**: it notifies, it
+  does not enforce.
+- **The budget became advisory but stayed spoken aloud** (#21) — `BUDGET_MODE=advisory` reports
+  the overage in `start_run`'s response rather than blocking. Removing the number entirely would
+  have deleted the only line that says a run is more expensive than its plan.
+- **A real PII scan, or an honest absence** (#36) — Macie `llmops-customer-data-pii`, daily
+  SCHEDULED over `customer-data/`. Until it existed the audit's answer to "did anything scan
+  this data" was silence, which reads as yes.
+- **`budgets:ViewBudget`** (#25) — the action `DescribeBudgets` actually authorizes against, not
+  the one its name suggests.
+- **The rate card is priced from the file callers are told to read** (#20) — the document shape
+  the fetcher produced and the shape the pricer expected were different, so a card that
+  refreshed successfully priced nothing.
+
+### Latency: 2–5 uncached round-trips per turn, whole turn buffered
+
+- **Inject the rate card instead of making the agent fetch it** (#26) — a tool call per turn for
+  data that fits in the prompt.
+- **Stream the reply** (#27) — the whole turn had been buffered before the first character
+  reached the browser, so a correct answer looked like a hang.
+- **READY does not mean warm** (#28) — a harness reports READY before its first session pays
+  the cold-start cost, so deploy now warms it. The effort knob was never the lever.
+- **Log the round-trips a turn really made** (#29) — the previous log line was structurally
+  incapable of showing the real count, so the latency work had no measurement to stand on.
+
+### Release engineering: the push tool, and a PR that shipped to nowhere
+
+Direct `git push` is hook-blocked here, so `tools/push_via_api.py` is the only path to the
+remote — and it was silently corrupting history in four distinct ways, each found by comparing
+the pushed tree to the local one rather than by trusting a green push.
+
+- **Squashed commits** (#29), **commits replayed on every subsequent push** (#30), **an
+  eventually-consistent ref read** (#19), and **merges flattened in two places at once** (#34).
+- **`deploy/07_lambdas.py --only` now means only** (#36's branch) — it both over-deployed past
+  its argument and blocked the narrow deploy it was added to enable.
+- **All 19 skill mounts moved git → s3, resolved at deploy time** (#36's branch) — a git skill
+  source has no branch field, so every deployed harness read the skills repo's default branch
+  and a push there silently changed production. `ensure_skills()` landed in
+  `deploy/03_storage.py` **before** any source was switched, because a bad skill source is
+  accepted by `UpdateHarness`, reports READY, and then fails every session at start.
+- **The capacity race guard finally reached main** (#38) — #10 merged it into a non-main base,
+  so its 10 shell assertions sat outside CI for days while every badge was green. Reading the
+  `validate` log, not the badge, is what found it.
+- **Diagrams and docs corrected against the running system** (#30, #32) — including the audit
+  plane, the escalation path, and the skill-source language.
+
+### Tests
+
+**779 pytest** (from 274 at v1.0.0), **87/87 negative controls** (76 mutations, 87
+(guard, mutation) pairs), **10/10 shell assertions**, three SVGs geometrically CLEAN against
+six checks. Offline by construction: `tests/conftest.py` strips AWS credentials and refuses
+non-loopback sockets, so a credentialed laptop cannot turn a test that hits production into a
+passing test.
+
+Four of this release's guards were **fixed by their own negative controls** — including one
+that certified as clean the exact defect it was written to forbid, and one that was wrong for
+its own reasons and would have had the docs corrected to a false number. A control that cannot
+fail has tested nothing.
+
 ## [1.1.0] — 2026-07-31
 
 ### FinOps — cost estimation, a $2000 approval gate, and a 7th runtime

@@ -12,7 +12,9 @@ Run: .venv/bin/python -m pytest tests/test_cost_model.py -q
 from __future__ import annotations
 
 import datetime
+import json
 import pathlib
+import re
 import sys
 
 import pytest
@@ -483,9 +485,19 @@ def test_the_whisper_orphans_daily_figure_matches_its_instance_and_hourly_rate()
         "documented hourly rate does not produce")
     assert "$18/day" not in src, "the falsified $18/day figure is back in cost_model.py"
 
-    for doc in ("docs/COST.md", "CHANGELOG.md"):
-        text = (pathlib.Path(__file__).resolve().parent.parent / doc).read_text()
-        assert "$18/day" not in text, f"{doc} still carries the falsified $18/day figure"
+    # Every markdown file, in both unit spellings. The first version of this guard listed
+    # two English files, so the zh-TW twin kept the falsified figure for as long as the
+    # guard existed: `$18/天` is not `$18/day`, and a per-file allowlist is satisfied by
+    # the files it happens to name. A falsified figure is falsified in every language.
+    repo = pathlib.Path(__file__).resolve().parent.parent
+    for doc in sorted(repo.rglob("*.md")):
+        if ".venv" in doc.parts or "node_modules" in doc.parts:
+            continue
+        text = doc.read_text()
+        for stale in ("$18/day", "$18/天"):
+            assert stale not in text, (
+                f"{doc.relative_to(repo)} still carries the falsified {stale} figure; the "
+                f"orphan billed ${daily:.2f}/day")
 
 
 def test_the_orphans_monthly_figure_is_derived_and_the_budget_filter_is_stated_both_ways():
@@ -533,6 +545,48 @@ def test_the_orphans_monthly_figure_is_derived_and_the_budget_filter_is_stated_b
         assert "sweep" in para, (
             f"{doc} states the budget filter without saying which control DOES cover "
             f"non-Bedrock spend -- a reader is left thinking nothing does")
+
+
+def test_the_orphans_idle_lifetime_is_derived_from_its_own_two_dates():
+    """How long it idled is arithmetic on two recorded dates, not a number to retype.
+
+    It was retyped, and it was wrong: the snapshot and the CHANGELOG both said "838 days"
+    while the IAM comment said 842, and the truth is 843 -- 2024-04-11 creation to
+    2026-08-02 deletion. Three files, three numbers, no disagreement any of them could
+    surface, because each was a standalone digit with nothing to check it against.
+
+    That is the same shape as the $18/day figure two tests above: a measurement copied
+    into prose stops being a measurement. The difference here is that the endpoint is now
+    deleted, so the interval is FIXED forever -- which makes a wrong value permanent
+    rather than merely stale, and makes deriving it strictly better than restating it.
+    """
+    snap = json.loads(
+        (REPO / "deploy" / "evidence" / "whisper_endpoint_snapshot.json").read_text())
+    created = datetime.date.fromisoformat(snap["created"][:10])
+    assert created == datetime.date(2024, 4, 11), (
+        f"the snapshot's creation date moved to {created}; every day count below is "
+        "measured from it")
+
+    # The deletion date is stated in prose, in the field that records the deletion.
+    deleted_at = re.search(r"DELETED (\d{4}-\d{2}-\d{2})", snap["status"])
+    assert deleted_at, "the snapshot's status no longer states the deletion date"
+    deleted = datetime.date.fromisoformat(deleted_at.group(1))
+    days = (deleted - created).days
+    assert days == 843, f"2024-04-11 to {deleted} is {days} days"
+
+    # Every place that states a day count for THIS endpoint must state the derived one.
+    # A bare "NNN days" near the endpoint's name is the claim; anchor on the name so an
+    # unrelated day count elsewhere in a long file cannot satisfy or break this.
+    for rel in ("CHANGELOG.md", "docs/ARCHITECTURE.md", "docs/ARCHITECTURE.zh-TW.md",
+                "deploy/evidence/whisper_endpoint_snapshot.json"):
+        text = (REPO / rel).read_text()
+        for m in re.finditer(r"(\d{3})[ -](?:days|day|天)", text):
+            stated = int(m.group(1))
+            if not 700 <= stated <= 999:
+                continue                      # not a lifetime for this endpoint
+            assert stated == days, (
+                f"{rel} states {stated} days for the orphan's InService life; "
+                f"{created} to {deleted} is {days}")
 
 
 def test_attribution_is_an_allowlist_so_unknown_shapes_are_excluded():

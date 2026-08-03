@@ -5,8 +5,18 @@ created/deleted or a phase gate passes. Never record account IDs or full ARNs.
 
 ## Current phase
 
+**v1.2.0 — reachability** (2026-08-02): 21 merged PRs (#17–#38), almost all of one shape —
+a component that was deployed, tested, and never reached. The eval gate read a report nothing
+wrote; the `llmops-pipeline` bus carried ZERO rules so every escalation published into nothing;
+`llmops_monitor` had no task dispatched anywhere; the SUCCESS path had never executed, so every
+successful run was a zombie record. Also: a consultation the customer can finish end to end
+(KMS-signed plan acceptance, presigned upload, one thread), streaming replies, and the orphan
+endpoint re-costed from measured hardware at $36.36/day — 2× the $18 six files claimed — then
+deleted.
+
 **v1.1.0 — FinOps** (2026-07-31): cost estimation, the $2000 dual approval gate, and the
 7th runtime `llmops_finops`. v1 complete before it (all six phases 2026-07-28 → 2026-07-29).
+
 Next: v2 experiments — code-as-reasoning distillation + augmentation; Kimi K3 teacher A/B
 (see docs/CASE_STUDY.md).
 
@@ -51,12 +61,37 @@ that have never existed._
 Zero standing billable resources CREATED BY THIS PROJECT: no llmops-* SageMaker
 endpoint, pipeline scheduler DISABLED, serverless spine idles free. Total v1 build cost
 ≈ $12–15. That scoping is load-bearing and used to be missing: the account also carries
-`jumpstart-dft-hf-asr-whisper-large-v2`, InService since 2024-04-11 with 0 invocations
-over 30 days, which Cost Explorer bills at **$36.36/day** (ml.g5.2xlarge ×1 —
-confirmed by describe_endpoint_config, not the JumpStart-default guess the first run of
-the schedule below had to make). It was found by that schedule, which scans the whole
-account precisely because one restricted to `llmops-*` cannot find an unclaimed resource.
-It is not ours to delete; reported, and awaiting the account owner. A PII scan
+`jumpstart-dft-hf-asr-whisper-large-v2`, InService since 2024-04-11 with **0 invocations
+and 0.0% GPU utilization over 90 days**, which Cost Explorer bills at **$36.36/day**
+(ml.g5.2xlarge ×1 — confirmed by describe_endpoint_config, not the JumpStart-default
+guess the first run of the schedule below had to make). It was found by that schedule,
+which scans the whole account precisely because one restricted to `llmops-*` cannot find
+an unclaimed resource — and this one carried **no owner, cost-centre or project tag at
+all**, only JumpStart's automatic model-id tags, so there was nothing on it to claim. It
+was a one-click Studio JumpStart deploy of public Whisper large-v2 weights, traced to a
+Studio domain created 2021-01-14 and a user profile created 2021-12-17; every identity
+involved predates this project by four years.
+
+**DELETED 2026-08-02** on the owner's explicit authorization — `list_endpoints` in
+us-east-1 now returns zero endpoints, so ~$1106/month stopped. Two things about how that
+happened are worth keeping, because both are the general rule and not a detail of this
+endpoint:
+
+- **"Pause" was checked, not assumed.** `list_inference_components` returns 0 (a legacy
+  ProductionVariant endpoint, not the Inference-Component architecture that supports
+  scale-to-zero) and no `ManagedInstanceScaling` is configured, so neither scale-to-zero
+  nor a desired count of 0 was available. Only then was deleting the only way to stop the
+  bill.
+- **Technical necessity is not authorization.** The instruction said "pause". Discovering
+  that pause is impossible does not convert it into consent to delete permanently, least
+  of all for a resource belonging to someone else, so the deletion waited for the owner to
+  say so in as many words. The reverse — an agent reasoning "the only available action
+  must be what they meant" — is how irreversible operations get self-authorized.
+
+The restore path was verified **after** the delete, not before: `describe_endpoint_config`
+and `describe_model` both still succeed, and the weights live in AWS's public JumpStart
+cache, so recreating it is one `create-endpoint` call. Full capture in
+`deploy/evidence/whisper_endpoint_snapshot.json`. A PII scan
 (`llmops-customer-data-pii`, Macie, SCHEDULED daily over `customer-data/`) went live
 2026-08-02 and bills per GB — at 0.87 MiB that is under $0.01/scan.
 

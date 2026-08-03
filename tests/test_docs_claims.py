@@ -21,6 +21,7 @@ reader happens to open.
 """
 from __future__ import annotations
 
+import ast
 import json
 import pathlib
 import re
@@ -167,6 +168,78 @@ def test_the_skill_source_claims_match_the_harness_configs():
         "migration means some harnesses read a pinned snapshot and others float on the "
         "skill repo's default branch, which is the drift the migration exists to stop. "
         "Update the docs and this guard together.")
+
+
+def test_the_diagram_text_states_the_real_skill_source_kind():
+    """The high-level SVG's STATE band names the mount count and kind. Derive both.
+
+    This guard exists because the drawing outlived two corrections of the same sentence.
+    It first claimed "git in dev, S3 mirror in prod"; corrected to "all 19 mounts are
+    `git`, the mirror exists but nothing is switched to it" -- true when written -- and
+    then the migration it described made that false too, so the band went on asserting
+    `git` with the correction's own prose vouching for it.
+
+    Two independent evasions let that happen, and both are closed here:
+      * test_the_skill_source_claims_match_the_harness_configs scans .md files only, and
+        the band lives in an .svg;
+      * it looks for "N sources", and the band says "N mounts".
+    A sentence one token away from a checked sentence is unchecked.
+
+    The claim is located by parsing the band's own <text> element, not by searching the
+    60 KB file. An unanchored substring search over a document that repeats every label
+    passes on any incidental hit -- the lesson from the negative control whose "sweep"
+    anchor matched prose it was not aiming at.
+    """
+    svg = (REPO / "docs" / "architecture-high-level.svg").read_text()
+    lines = [l for l in svg.splitlines()
+             if re.match(r'\s*<text class="sub"', l) and "skills mounted from" in l]
+    assert len(lines) == 1, (
+        f"expected exactly one skill-mount line in the STATE band, found {len(lines)}. "
+        "Regenerate with docs/gen_architecture_svg.py; the band is generated, never "
+        "hand-edited.")
+    band = lines[0]
+
+    counts = _skill_sources()
+    git_n = sum(k.get("git", 0) for k in counts.values())
+    s3_n = sum(k.get("s3", 0) for k in counts.values())
+    total = git_n + s3_n
+    assert total, f"no skill sources found in any harness config: {counts}"
+
+    m = re.search(r"all (\d+) mounts across all (\d+) harnesses are ([a-z0-9+ ]+?):", band)
+    assert m, (
+        "the STATE band no longer states its mount count, harness count and source kind "
+        f"in the form the generator emits: {band.strip()!r}. Dropping the claim removes "
+        "this check rather than passing it.")
+    claimed_mounts, claimed_harnesses, claimed_kind = int(m.group(1)), int(m.group(2)), m.group(3)
+
+    assert claimed_mounts == total, (
+        f"the diagram says {claimed_mounts} skill mounts, the configs have {total}: {counts}")
+    n_harnesses = len(list((REPO / "agents").glob("*/harness.json")))
+    assert claimed_harnesses == n_harnesses, (
+        f"the diagram says {claimed_harnesses} harnesses, agents/ has {n_harnesses}")
+
+    # The kind is asserted separately from the count for the reason the .md guard gives:
+    # a band right about 19 and wrong about `git` tells the reader the migration never
+    # happened, and the count check cannot see it.
+    want_kind = "s3" if s3_n and not git_n else "git" if git_n and not s3_n else None
+    assert want_kind is not None, (
+        f"skill sources are MIXED ({git_n} git, {s3_n} s3): {counts}. The generator emits "
+        "a '3 git+16 s3' description for this case rather than a majority kind; update "
+        "this guard deliberately if a mixed fleet becomes the intended steady state.")
+    assert claimed_kind == want_kind, (
+        f"the diagram calls the {total} mounts {claimed_kind!r}, but the configs have "
+        f"{git_n} git and {s3_n} s3. This is the exact sentence that decayed twice.")
+
+    # And the operational clause has to move with the kind. "are s3" followed by prose
+    # about reading GitHub at session start is a sentence that contradicts its own
+    # subject, which is how a half-updated correction reads as a whole one.
+    reaches_github = "reads GitHub at session start" in band or "read from GitHub" in band
+    if want_kind == "s3":
+        assert "pinned snapshot" in band and "no harness reads GitHub" in band, (
+            f"the band names s3 but does not say what that means operationally: {band.strip()!r}")
+    else:
+        assert reaches_github, (
+            f"the band names git but does not say the harnesses read GitHub: {band.strip()!r}")
 
 
 #: Docs whose §2 states how many harness-task states the happy path has, and names them.
@@ -412,6 +485,18 @@ def test_the_documented_happy_path_state_count_matches_the_state_machine():
             assert int(c) == n, f"{name} claims {c} happy-path harness states, the ASL has {n}"
 
 
+#: How each doc states the Lambda count. PROJECT_STATE writes it in an infrastructure
+#: table cell, the READMEs in a repo-map line -- so no single regex covers all three, and
+#: a guard that only knows the table form is exactly the guard that let both READMEs say
+#: 5 for 21 merged PRs while passing. The file it watches is also the one file that gets
+#: fixed, because it is the one the failure names.
+LAMBDA_COUNT_PATTERNS = {
+    "PROJECT_STATE.md": r"\| Lambdas ×(\d+)",
+    "README.md": r"state machine \+ (\d+) Lambdas",
+    "README.zh-TW.md": r"狀態機 \+ (\d+) 個 Lambda",
+}
+
+
 def test_the_documented_state_and_lambda_counts_match_the_deployers():
     """PROJECT_STATE's infrastructure table is the one-screen answer to "what is running".
 
@@ -435,6 +520,34 @@ def test_the_documented_state_and_lambda_counts_match_the_deployers():
     for c in claimed_fns:
         assert int(c) == n_fns, f"PROJECT_STATE claims ×{c} Lambdas, LAMBDAS has {n_fns}"
 
+    # The same number, everywhere it is stated -- and each doc's own phrasing, because a
+    # regex that matches none of them would pass every file vacuously.
+    for name, pattern in LAMBDA_COUNT_PATTERNS.items():
+        doc = (REPO / name).read_text()
+        stated = re.findall(pattern, doc)
+        assert stated, f"{name} no longer states a Lambda count as /{pattern}/"
+        for c in stated:
+            assert int(c) == n_fns, (
+                f"{name} claims {c} Lambdas, deploy/07_lambdas.py deploys {n_fns}")
+
+    # The digit alone is a claim a reader cannot check, and the list beside it is what
+    # actually went stale: the READMEs named four functions and omitted monitor-sweep.
+    fn_names = re.findall(r'^\s{8}"fn": "llmops-([a-z-]+)"', lambdas, re.M)
+    for name in ("README.md", "README.zh-TW.md"):
+        line = next(l for l in (REPO / name).read_text().splitlines()
+                    if re.search(LAMBDA_COUNT_PATTERNS[name], l))
+        listed = re.search(r"[(（]([^)）]*)[)）]", line)
+        assert listed, f"{name}'s Lambda line names no functions at all"
+        items = [i.strip() for i in listed.group(1).split("/")]
+        assert len(items) == n_fns, (
+            f"{name} lists {len(items)} Lambda names {items} beside the digit {n_fns}")
+        # Match on segments, not full names: the list is deliberately abbreviated
+        # (harness-driver -> driver), so demanding the deployed name verbatim would fail
+        # on a correct line and teach the next reader to delete the check.
+        for fn in fn_names:
+            assert any(seg in items for seg in fn.split("-")) or fn in items, (
+                f"{name}'s Lambda list {items} names nothing for deployed llmops-{fn}")
+
 
 def test_every_schedule_the_deployer_creates_is_named_in_the_cost_posture():
     """The cost posture called the finops reconcile "one recurring cost" and "the only
@@ -457,3 +570,146 @@ def test_every_schedule_the_deployer_creates_is_named_in_the_cost_posture():
             f"{name} is ENABLED by default and the standing cost posture never mentions "
             f"it; the paragraph a reader uses to decide what this platform costs to leave "
             "running has to name every schedule that runs on its own")
+
+
+def test_the_documented_negative_control_count_matches_the_runner():
+    """"Mutation-checked" is an adjective, and an adjective cannot go stale.
+
+    TEST_RESULTS said "every guard added in this work was mutation-checked" and stated no
+    number, so a control silently deleted -- or a guard added with no control at all --
+    left the sentence still reading true. The claim only becomes checkable once it carries
+    the count, and the count only stays true once something derives it.
+
+    Two numbers are derived, because they answer different questions and have drifted
+    apart before: how many mutations exist (``case(...)`` registrations) and how many
+    (guard, mutation) pairs they assert (the test ids listed inside them). The runner
+    prints one PASS line per pair, so the pair count is what a reader comparing the doc to
+    the runner's output actually sees.
+    """
+    src = (REPO / "tests/negative_controls/monitor_dispatch.py").read_text()
+    tree = ast.parse(src)
+    calls = [n for n in ast.walk(tree)
+             if isinstance(n, ast.Call) and getattr(n.func, "id", None) == "case"]
+    assert calls, "no case(...) registrations found -- did the runner's shape change?"
+    n_cases = len(calls)
+    # args[3] is the list of pytest node ids this mutation must break. A case that lists
+    # none is a mutation nothing verifies, which is the defect this guard exists to name.
+    n_pairs = 0
+    for c in calls:
+        listed = c.args[3]
+        assert isinstance(listed, ast.List) and listed.elts, (
+            f"a case(...) at line {c.lineno} names no test to break; a mutation with no "
+            "guard listed is a control that cannot fail")
+        n_pairs += len(listed.elts)
+
+    count = re.compile(r"\*\*(\d+)/(\d+)\s*(?:negative controls|反向控制)\*\*")
+    for doc in DOCS:
+        text = doc.read_text()
+        stated = count.findall(text)
+        assert stated, (
+            f"{doc.name} states no negative-control count; 'mutation-checked' with no "
+            "number is a claim that stays true while controls disappear")
+        # The count has to be IN the mutation-check sentence, not merely somewhere in the
+        # file. Anchoring on the whole document was not enough: this guard's own negative
+        # control stripped the number out of that sentence -- restoring the bare adjective
+        # this test exists to forbid -- and the check still passed on the summary table's
+        # row further up. The sentence a reader takes the claim from is the sentence that
+        # has to carry the number.
+        claim = next((para for para in text.split("\n\n")
+                      if "mutation-check" in para or "mutation check" in para), None)
+        assert claim, f"{doc.name} no longer says the guards were mutation-checked at all"
+        assert count.search(claim), (
+            f"{doc.name}'s mutation-check claim states no count:\n{claim}\nAn adjective "
+            "cannot go stale, which is exactly why it is not evidence.")
+        for passed, total in stated:
+            assert int(total) == n_pairs, (
+                f"{doc.name} claims {total} negative controls, the runner registers "
+                f"{n_cases} mutations asserting {n_pairs} (guard, mutation) pairs")
+            assert passed == total, (
+                f"{doc.name} claims {passed}/{total} controls passing; a documented "
+                "result with a failing control in it is not evidence of anything")
+
+
+def test_the_shell_suite_is_documented_with_its_assertion_count():
+    """CI runs ``tests/*.sh``; the pytest-derived count guard cannot see a single one.
+
+    ``test_capacity_race_guard.sh`` landed with 10 assertions and CI has run them on every
+    push since, while both TEST_RESULTS variants reported only the pytest total -- so the
+    documented evidence understated what was actually verified. The count guard could not
+    have caught it: it derives from ``pytest --collect-only``, and a shell suite is not a
+    pytest test. A second suite therefore needs a second derivation.
+
+    The derivation runs the suite and reads the total it prints, rather than counting
+    ``check`` invocations in its source. Counting the source gave 9 for a suite that
+    asserts 10: the most expensive case -- "the winner is never among the stopped" -- is
+    written inline with its own PASS/FAIL branch instead of through the helper. A guard
+    that is wrong for its own reasons would have had the docs corrected to a false number.
+    The suite is offline by construction (a mock ``guard.sh`` over files in a temp dir),
+    so running it here costs nothing the rest of the suite does not already assume.
+    """
+    suites = sorted((REPO / "tests").glob("*.sh"))
+    assert suites, "no shell suites found -- has CI's tests/*.sh loop got nothing to run?"
+    for suite in suites:
+        proc = subprocess.run(["bash", str(suite)], capture_output=True, text=True,
+                              cwd=REPO, timeout=300)
+        m = re.search(r"=== (\d+) passed, (\d+) failed ===", proc.stdout)
+        assert m, (f"{suite.name} printed no '=== N passed, N failed ===' total; "
+                   f"rc={proc.returncode}\nstdout tail:\n{proc.stdout[-2000:]}")
+        n, failed = int(m.group(1)), int(m.group(2))
+        assert failed == 0 and proc.returncode == 0, (
+            f"{suite.name}: {failed} assertions failed\n{proc.stdout[-2000:]}")
+        for doc in DOCS:
+            text = doc.read_text()
+            assert suite.name in text, (
+                f"{doc.name} never names {suite.name}, which CI runs on every push; "
+                "a suite absent from the evidence file reads as a suite that does not exist")
+            # Deliberately NOT "N/N passed": that is _CLAIM's form, and _CLAIM asserts
+            # every match equals the pytest collection total. A shell suite's 10 written
+            # in pytest's phrasing would be read as a stale pytest count and "fixed" to
+            # match the suite it is not part of.
+            m = re.search(re.escape(suite.name) + r"[^|\n]*\|[^|\n]*?\*\*(\d+)/(\d+)"
+                          r"\s*(?:assertions|斷言)\*\*", text)
+            assert m, (f"{doc.name} names {suite.name} but states no N/N assertion "
+                       "count in the same table row")
+            assert int(m.group(2)) == n, (
+                f"{doc.name} claims {m.group(2)} assertions for {suite.name}, it makes {n}")
+            assert m.group(1) == m.group(2), (
+                f"{doc.name} claims {m.group(1)}/{m.group(2)} for {suite.name}")
+
+
+def test_the_version_file_and_the_changelog_agree_on_the_current_release():
+    """VERSION and the CHANGELOG's newest entry are two statements of one fact.
+
+    They drifted at 1.1.0: 21 PRs merged after that entry was written, and both the file and
+    the changelog went on naming a release that had stopped describing the tree. Nothing
+    failed, because a version string is only checkable against another version string --
+    which is exactly why the two have to be checked against each other.
+
+    PROJECT_STATE's current-phase paragraph is included: it is the file agents read first,
+    so a stale version there misroutes the next session's work rather than merely misleading
+    a reader.
+    """
+    version = (REPO / "VERSION").read_text().strip()
+    assert re.fullmatch(r"\d+\.\d+\.\d+", version), f"VERSION is not a SemVer: {version!r}"
+
+    changelog = (REPO / "CHANGELOG.md").read_text()
+    entries = re.findall(r"^## \[(\d+\.\d+\.\d+)\] — (\d{4}-\d{2}-\d{2})$", changelog, re.M)
+    assert entries, "CHANGELOG.md has no '## [x.y.z] — YYYY-MM-DD' entries to read"
+    newest, _ = entries[0]
+    assert newest == version, (
+        f"VERSION says {version} and the CHANGELOG's newest entry is {newest}; a release "
+        "is not cut until both say so")
+
+    # Newest first, and no version entered twice: a duplicate heading means one of the two
+    # entries is unreachable to a reader scanning for the release they are running.
+    versions = [v for v, _ in entries]
+    assert len(set(versions)) == len(versions), f"CHANGELOG lists a version twice: {versions}"
+    keyed = [tuple(int(n) for n in v.split(".")) for v in versions]
+    assert keyed == sorted(keyed, reverse=True), (
+        f"CHANGELOG entries are not newest-first: {versions}")
+
+    phase = (REPO / "PROJECT_STATE.md").read_text().split("## Current phase")[1] \
+        .split("\n## ")[0]
+    assert f"v{version}" in phase, (
+        f"PROJECT_STATE's current phase never names v{version}; it is the first file an "
+        f"agent reads, and it currently claims: {phase.strip().splitlines()[0]}")

@@ -82,10 +82,13 @@ The third monitor task, **`sweep`**, is deliberately *outside* the state machine
 08:00 UTC schedule (`llmops-monitor-sweep-daily` → `llmops-monitor-sweep`). It hunts
 endpoints left running by *other* runs, including runs that crashed and so never reached
 any state that could have looked — a run-scoped agent cannot answer for other runs. The
-account proves the point: its only standing endpoint,
-`jumpstart-dft-hf-asr-whisper-large-v2`, has been InService since 2024-04-11 with no
-`project` tag at all, so no run will ever be responsible for it and its `ListTags` grant
-must be account-wide (`Resource: "*"`). The boundary is **read account-wide, mutate
+account proves the point: the one standing endpoint it carried,
+`jumpstart-dft-hf-asr-whisper-large-v2`, was InService from 2024-04-11 until its deletion on
+2026-08-02, with no `project` tag at all, so no run was ever going to be responsible for it
+and its `ListTags` grant must be account-wide (`Resource: "*"`). The grant stays wide now
+that the endpoint is gone, for the reason it was widened in the first place: the sweep
+exists to find the *next* unclaimed resource, and a scope restricted to what we already call
+ours is what let this one bill for its whole 843-day life unnoticed. The boundary is **read account-wide, mutate
 `llmops-*` only** — `ListEndpoints`/`ListTags`/`DescribeEndpoint`/`DescribeEndpointConfig`
 on `"*"`, every mutation still scoped: the sweep can fully characterise an orphan it cannot
 touch. The first live sweep is why the line falls at read-vs-mutate rather than at
@@ -508,7 +511,8 @@ and the loop's exit for it is `escalate_human`.
 
 Live-established (Phase 5): vendor model quotas are a HARD constraint — even AWS-internal
 accounts are rate-limited by the model provider, and a multi-agent platform is its own
-token-flood generator (6 harnesses × agent loops × long streams). ~12 Fable 5 5xx bursts
+token-flood generator (6 harnesses then, 7 since `llmops_finops`, × agent loops × long
+streams). ~12 Fable 5 5xx bursts
 recurred across a single day. Design rules (full text in [AGENTS.md](../AGENTS.md)):
 
 1. Every harness has a fallback chain: `global.anthropic.claude-fable-5` →

@@ -77,7 +77,7 @@
     <g>
       <rect class="card cOps" x="660" y="150" width="220" height="56" rx="12"/>
       <text class="title" x="770.0" y="174" text-anchor="middle">🧩 inline functions</text>
-      <text class="sub" x="770.0" y="192" text-anchor="middle">stage_complete · job_launched · finops audit tools …</text>
+      <text class="sub" x="770.0" y="192" text-anchor="middle">stage_complete · job_launched · audit …</text>
     </g>
   </a>
 
@@ -102,7 +102,7 @@
   <path class="wireR" d="M286,280.0 L214,280.0" marker-end="url(#ahR)"/>
 
   <text class="sub" x="245" y="250.0" text-anchor="middle">invoke</text>
-  <text class="sub" x="250" y="322" text-anchor="middle">pause: stopReason=tool_use</text>
+  <text class="sub" x="230" y="322" text-anchor="middle">pause: stopReason=tool_use</text>
   <path class="wire" d="M406.0,206 L406.0,256" marker-end="url(#ahB)"/>
 
   <path class="wire" d="M406.0,316 L406.0,366" marker-end="url(#ahB)"/>

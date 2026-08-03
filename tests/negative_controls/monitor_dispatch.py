@@ -925,12 +925,17 @@ def m69(t):
     the filter protects our $1000 headroom is true and reassuring and leaves the reader
     believing the account has a spend guardrail over it. It does not: a budget scoped to
     one service is blind to waste in another, which is exactly why nothing at the account
-    level ever flagged a $1106/month endpoint sitting InService for 838 days. The whole-
+    level ever flagged a $1106/month endpoint sitting InService for 843 days. The whole-
     account monitor sweep is what found it. Drop the second half and the paragraph
     misleads by omission -- the failure mode that is hardest to catch by reading, because
     every sentence left on the page is still true.
     """
-    start = t.index("- It ALSO means")
+    anchor = "- It ALSO meant"
+    assert anchor in t, (
+        "the second half of the budget-filter sentence has moved or been reworded; "
+        "re-anchor this mutation rather than letting it crash -- a control that raises "
+        "is a control that never tested its guard")
+    start = t.index(anchor)
     end = t.index("\n\n", start)
     return t[:start] + t[end:]
 
@@ -938,6 +943,145 @@ def m69(t):
 case("finops: COST.md states the budget's Bedrock filter without saying what it is blind to",
      "docs/COST.md", m69,
      ["tests/test_cost_model.py::test_the_orphans_monthly_figure_is_derived_and_the_budget_filter_is_stated_both_ways"])
+
+
+def m70(t):
+    """Put the stale Lambda count back in the English README.
+
+    The count guard existed and passed for 21 merged PRs while both READMEs said 5 and the
+    deployer deployed 6, because the guard read PROJECT_STATE.md only. That is the shape of
+    the drift: the one file a count guard watches is the one file that gets corrected, since
+    it is the only file the failure names. This mutation restores the stale digit in a file
+    the guard did not used to read.
+    """
+    old = "state machine + 6 Lambdas"
+    assert old in t, "the README's Lambda line has moved; re-anchor this mutation"
+    return t.replace(old, "state machine + 5 Lambdas", 1)
+
+
+case("docs: the English README states 5 Lambdas again while the deployer deploys 6",
+     "README.md", m70,
+     ["tests/test_docs_claims.py::test_the_documented_state_and_lambda_counts_match_the_deployers"])
+
+
+def m71(t):
+    """Drop monitor-sweep from the README's Lambda list but leave the digit at 6.
+
+    This is the more interesting half, and the half a digit-only guard cannot see: the
+    stale README did not just miscount, it named four functions for a fleet of six. A
+    reader who trusts the list goes looking for the sweep's code and concludes it does not
+    exist. So the names beside the number are asserted too, and this mutation breaks only
+    the names.
+    """
+    old = "(driver / start / resume / webhook / finops / monitor-sweep)"
+    assert old in t, "the README's Lambda name list has moved; re-anchor this mutation"
+    return t.replace(old, "(driver / start / resume / webhook / finops)", 1)
+
+
+case("docs: the README's Lambda list omits monitor-sweep while the count still reads 6",
+     "README.md", m71,
+     ["tests/test_docs_claims.py::test_the_documented_state_and_lambda_counts_match_the_deployers"])
+
+
+def m72(t):
+    """Turn the negative-control claim back into an adjective with no number in it.
+
+    "Every guard was mutation-checked" is the exact sentence that stood while nothing
+    counted the controls: a control deleted, or a guard added with no control at all, left
+    it reading true. An adjective cannot go stale, which is why it is worthless as evidence.
+    This mutation removes the count and the guard must refuse the sentence that remains.
+    """
+    start = t.index("reverted one at a time and the test confirmed to fail")
+    end = t.index("\n", start)
+    line = t[start:end]
+    assert "negative controls" in line, "the count has moved out of this sentence"
+    return t[:start] + "reverted one at a time and the test confirmed to fail. A test that" + t[end:]
+
+
+case("docs: TEST_RESULTS' mutation-check claim loses its count and becomes an adjective",
+     "docs/TEST_RESULTS.md", m72,
+     ["tests/test_docs_claims.py::test_the_documented_negative_control_count_matches_the_runner"])
+
+
+def m73(t):
+    """Delete the shell suite's row from the evidence file.
+
+    This is not hypothetical: `test_capacity_race_guard.sh` ran in CI on every push for
+    days while both TEST_RESULTS variants reported the pytest total alone, so the evidence
+    understated what was verified. The pytest-derived count guard is structurally unable to
+    notice -- a shell suite is not a pytest test -- so a second suite needs a second
+    derivation, and this mutation removes what that derivation checks.
+    """
+    start = t.index("| Shell suite")
+    end = t.index("\n", start) + 1
+    return t[:start] + t[end:]
+
+
+case("docs: the shell suite CI runs on every push vanishes from the evidence file",
+     "docs/TEST_RESULTS.md", m73,
+     ["tests/test_docs_claims.py::test_the_shell_suite_is_documented_with_its_assertion_count"])
+
+
+def m74(t):
+    """Leave VERSION at the release the CHANGELOG has moved past.
+
+    This is what actually happened: the 1.1.0 entry was written, 21 PRs merged after it, and
+    both VERSION and PROJECT_STATE's current phase went on naming 1.1.0 for two days. Nothing
+    failed, because a version string is only checkable against another version string. The
+    mutation reverts VERSION alone -- the CHANGELOG's newest entry and PROJECT_STATE stay at
+    the new release -- so the guard has to catch a disagreement, not just an old number.
+    """
+    assert t.strip() != "1.1.0", "VERSION is already 1.1.0; this mutation would be a no-op"
+    return "1.1.0\n"
+
+
+case("release: VERSION names the release the CHANGELOG has already moved past",
+     "VERSION", m74,
+     ["tests/test_docs_claims.py::test_the_version_file_and_the_changelog_agree_on_the_current_release"])
+
+
+def m75(t):
+    """Put the falsified figure back in the zh-TW twin, in the zh unit spelling.
+
+    This is a real escape, not a hypothetical. When m68's guard was written it checked two
+    files by name -- docs/COST.md and CHANGELOG.md -- so the correction landed in English
+    and `docs/COST.zh-TW.md` kept saying `$18/天` with the guard green for as long as it
+    existed. Two independent evasions in one: a per-file allowlist is satisfied by the
+    files it happens to name, and `$18/天` is not the string `$18/day`. The guard now walks
+    every *.md in both unit spellings, which is the only shape that cannot be escaped by
+    adding a file or translating a unit.
+    """
+    old = "Whisper endpoint（約 $36.36/天）"
+    assert old in t, (
+        "the corrected zh-TW daily figure has moved or been reworded; re-anchor this "
+        "mutation rather than letting it no-op")
+    return t.replace(old, "Whisper endpoint（約 $18/天）", 1)
+
+
+case("finops: the falsified $18 figure survives in the zh-TW twin, in the zh unit",
+     "docs/COST.zh-TW.md", m75,
+     ["tests/test_cost_model.py::test_the_whisper_orphans_daily_figure_matches_its_instance_and_hourly_rate"])
+
+
+def m76(t):
+    """Restate the orphan's idle lifetime as one of the three wrong numbers it had.
+
+    838 in the snapshot and the CHANGELOG, 842 in the IAM comment, 843 in fact. Three
+    files, three digits, and nothing that could disagree with anything -- a standalone
+    number has nothing to be checked against. The endpoint is deleted, so the interval is
+    fixed forever: a wrong value here is permanent, not merely stale. The guard derives it
+    from the snapshot's own creation and deletion dates.
+    """
+    old = "InService for 843 days"
+    assert old in t, (
+        "the CHANGELOG's derived day count has moved or been reworded; re-anchor this "
+        "mutation rather than letting it no-op")
+    return t.replace(old, "InService for 838 days", 1)
+
+
+case("finops: the orphan's idle lifetime is restated as one of its three wrong values",
+     "CHANGELOG.md", m76,
+     ["tests/test_cost_model.py::test_the_orphans_idle_lifetime_is_derived_from_its_own_two_dates"])
 
 
 failed = []
