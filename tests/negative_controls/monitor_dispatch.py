@@ -1171,6 +1171,44 @@ case("budget: the straddling fixture stops straddling and tests nothing",
       "tests/test_console_cost.py::test_lowering_the_limit_re_gates_an_already_clean_estimate"])
 
 
+def m81(t):
+    """Put the falsified $18/day back into the auditor's own system prompt.
+
+    m68 covers `cost_model.py`; the sweep that corrected the figure edited three files and
+    the guard was anchored to exactly those three, so the finops prompt kept stating the
+    stale rate inside the very rule about not publishing assumed numbers as measured ones.
+    A prompt is the worst place for it: the agent re-reads it on every invocation, and
+    nothing in the repo compared it to the arithmetic. This mutation restores that state.
+    """
+    old = "carried a JumpStart Whisper endpoint at $36.36/day"
+    assert old in t, "the corrected prompt sentence has moved; re-anchor this mutation"
+    return t.replace(old, "carried a JumpStart Whisper endpoint at ~$18/day", 1)
+
+
+case("finops: the auditor's prompt states the orphan rate the sweep guessed, not the one measured",
+     "agents/finops/harness.json", m81,
+     ["tests/test_cost_model.py::test_no_harness_prompt_states_the_falsified_orphan_rate"])
+
+
+def m82(t):
+    """Delete the measured rate from the prompt rather than falsifying it.
+
+    An absence-only guard passes on an empty page. Removing the excluded-spend example
+    leaves the attribute-by-resource rule abstract -- and that rule exists because a
+    service-level rollup billed hundreds of dollars of somebody else's Canvas and Whisper
+    spend to this project. The guard has to require the correction to be PRESENT, not
+    merely require the wrong number to be gone.
+    """
+    old = " at $36.36/day -- ml.g5.2xlarge x1 at $1.515/hr x 24 h"
+    assert old in t, "the measured-rate clause has moved; re-anchor this mutation"
+    return t.replace(old, "", 1)
+
+
+case("finops: the prompt drops the orphan's measured rate instead of correcting it",
+     "agents/finops/harness.json", m82,
+     ["tests/test_cost_model.py::test_no_harness_prompt_states_the_falsified_orphan_rate"])
+
+
 failed = []
 for name, rel, mutate, tests in CASES:
     p = REPO / rel

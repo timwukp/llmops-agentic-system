@@ -58,6 +58,15 @@ asking what actually calls the thing, not by reading what declares it.
   Now derived from `describe_endpoint_config` (ml.g5.2xlarge ×1) against the documented hourly
   rate. The endpoint had been InService for 843 days (2024-04-11 → 2026-08-02) with 0
   invocations and 0.0% GPU utilization; deleted 2026-08-02 under explicit authorization.
+  **The sweep that corrected it missed the one file that matters most**: the guard was anchored
+  to the three files that sweep edited, so `agents/finops/harness.json` kept telling the auditor
+  the orphan cost half that rate — inside the very rule about never publishing an assumed number as a
+  measured one. A prompt is the worst place for a falsified figure: nobody opens a doc mid-audit,
+  and the agent re-reads its prompt on every invocation. The guard now scans **every**
+  `agents/*/harness.json` rather than naming the file that was wrong, since naming the file is how
+  the hole got there, and it requires the measured rate to be **present** — an absence-only check
+  passes on a deleted sentence, which would have left the attribute-by-resource rule with no
+  concrete example.
 - **`bedrock-monthly-dev` is stated in both directions** (#37) — its `Service: ["Amazon Bedrock"]`
   filter is simultaneously what kept the $1000 guardrail meaningful and what made it blind. No
   account-level control would ever have flagged that endpoint; the whole-account monitor sweep
@@ -125,7 +134,7 @@ the pushed tree to the local one rather than by trusting a green push.
 
 ### Tests
 
-**781 pytest** (from 274 at v1.0.0), **94/94 negative controls** (80 mutations, 94
+**782 pytest** (from 274 at v1.0.0), **96/96 negative controls** (82 mutations, 96
 (guard, mutation) pairs), **10/10 shell assertions**, three SVGs geometrically CLEAN against
 six checks. Offline by construction: `tests/conftest.py` strips AWS credentials and refuses
 non-loopback sockets, so a credentialed laptop cannot turn a test that hits production into a
