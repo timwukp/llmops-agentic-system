@@ -13,6 +13,7 @@ Run: .venv/bin/python -m pytest tests/test_console_cost.py -q
 """
 from __future__ import annotations
 
+import ast
 import importlib.util
 import json
 import pathlib
@@ -986,6 +987,54 @@ def test_the_cost_card_renders_the_mode_next_to_the_numbers():
         "the limits card must read the enforcement flag, not just the two numbers"
     for word in ("ADVISORY", "ENFORCED"):
         assert word in block, f"the card never tells the reader it is {word.lower()}"
+
+
+def test_the_overview_limits_also_say_whether_they_are_enforced(wired):
+    """The second `limits` payload, and the reason the first fix was incomplete.
+
+    `cost_estimates` and `cost_overview` BOTH publish a dict named `limits`, and the fix
+    above gave the mode to only one of them. It shipped, and the live read-back is what
+    found it: /api/cost-estimates answered with budget_mode, while /api/cost-overview --
+    the endpoint whose name says overview -- still answered with two bare numbers. The
+    comment three screens up said a correction "holds until the next person adds a limits
+    consumer"; the second consumer already existed, in the same module.
+    """
+    lim = wired.m.cost_overview()["limits"]
+    assert lim["budget_mode"] == wired.m.BUDGET_MODE
+    assert lim["enforced"] is False
+
+
+def test_no_limits_payload_anywhere_omits_the_mode():
+    """Derived from the source, so a THIRD consumer cannot repeat this.
+
+    Both tests above name their endpoint, which is exactly the shape that let the defect
+    ship: a guard anchored to the payload someone remembered. This one finds every dict
+    literal assigned to a "limits" key in the console module and requires each to carry
+    both fields -- so the failure arrives when the payload is written, not after a deploy.
+
+    Parsed with ast rather than grepped: `"limits"` appears in prose and in the frontend,
+    and a substring search over this module would pass on a comment mentioning it.
+    """
+    src = (REPO / "deploy/console/lambda_function.py").read_text()
+    found = []
+    for node in ast.walk(ast.parse(src)):
+        if not isinstance(node, ast.Dict):
+            continue
+        for k, v in zip(node.keys, node.values):
+            if (isinstance(k, ast.Constant) and k.value == "limits"
+                    and isinstance(v, ast.Dict)):
+                keys = {n.value for n in v.keys
+                        if isinstance(n, ast.Constant) and isinstance(n.value, str)}
+                found.append((v.lineno, keys))
+    assert len(found) >= 2, (
+        f"expected at least the two known limits payloads, found {len(found)} -- has the "
+        "shape changed? A guard that finds nothing passes.")
+    for lineno, keys in found:
+        missing = {"budget_mode", "enforced"} - keys
+        assert not missing, (
+            f"the limits payload at lambda_function.py:{lineno} omits {sorted(missing)}. "
+            "Two numbers labelled limit read as enforced; in advisory nothing is stopped. "
+            "Every limits payload states its mode, not just the one that was fixed first.")
 
 
 # ── rate card health ──────────────────────────────────────────────────────────
