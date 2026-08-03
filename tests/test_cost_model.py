@@ -203,10 +203,15 @@ def test_gate_reads_worst_case_not_expected(rates):
     it survives advisory mode: what changed is whether we BLOCK, not which number we
     compare. Reported against the expected total this run reads as under budget."""
     est = estimate_run(PLAN, rates)
-    est["total_usd"], est["worst_case_usd"] = 1500.0, 4500.0
+    # Straddle the reference: expected under it, worst case over. Derived, because a
+    # pair of literals stops straddling the moment the reference moves -- and then this
+    # test passes while comparing two numbers that are both on the same side.
+    under = DEFAULT_SINGLE_RUN_LIMIT_USD * 0.75
+    est["total_usd"], est["worst_case_usd"] = under, under * 3
+    assert est["total_usd"] < DEFAULT_SINGLE_RUN_LIMIT_USD < est["worst_case_usd"]
     d = approval_decision(est)
     assert d["gating_basis"] == "worst_case_usd"
-    assert d["gating_usd"] == 4500.0
+    assert d["gating_usd"] == under * 3
     assert d["over_budget"], "the worst case is over the limit and must be reported"
     assert approval_decision(est, budget_mode="blocking")["approval_required"] is True
 
@@ -301,14 +306,19 @@ def test_teardown_off_is_stated_as_an_assumption(rates):
 # "blocking". A single-mode assertion would let a regression that hard-codes one mode
 # pass, which is how a budget silently stops being either enforced or mentioned.
 def test_single_run_over_limit_is_reported_and_blocks_only_in_blocking_mode():
-    d = approval_decision({"worst_case_usd": 2500.0}, project_to_date_usd=0.0)
+    over = DEFAULT_SINGLE_RUN_LIMIT_USD + 500.0
+    d = approval_decision({"worst_case_usd": over}, project_to_date_usd=0.0)
     assert d["approval_required"] is False       # advisory: the run is not stopped
     assert d["status"] == "approved"
     assert any("single-run" in r for r in d["over_budget"])
-    assert d["over_budget_usd"] == 500.0         # 2500 - the 2000 limit, named
+    # Derived from the constant, not retyped: at $2,000 this line read `== 500.0` with
+    # a `# 2500 - the 2000 limit` comment beside it, i.e. three copies of one number in
+    # one assertion. Raising the limit would have left the comment lying and the assert
+    # passing for the wrong reason.
+    assert d["over_budget_usd"] == 500.0
     assert d["notes"], "advisory must still SAY it is over; silence is not a reference"
 
-    b = approval_decision({"worst_case_usd": 2500.0}, project_to_date_usd=0.0,
+    b = approval_decision({"worst_case_usd": over}, project_to_date_usd=0.0,
                           budget_mode="blocking")
     assert b["approval_required"] is True
     assert b["status"] == "pending_approval"
@@ -334,27 +344,45 @@ def test_cumulative_only_trip_is_still_detected():
     project quietly passes $2000. A single-threshold check never sees it -- and the
     cumulative arm is the one advisory mode could most easily have dropped, since
     per-run it always looks fine."""
-    d = approval_decision({"worst_case_usd": 150.0}, project_to_date_usd=1950.0)
+    # Just under the single-run reference on its own, over it once added to to-date:
+    # that gap is the whole point of the second arm, so it is derived from the limit
+    # rather than being two literals that happen to sit either side of it.
+    to_date = DEFAULT_PROJECT_CUMULATIVE_LIMIT_USD - 50.0
+    d = approval_decision({"worst_case_usd": 150.0}, project_to_date_usd=to_date)
     assert len(d["over_budget"]) == 1
     assert "project to-date" in d["over_budget"][0]
     # Under the single-run limit, so there is no single-run overage to name...
     assert d["over_budget_usd"] == 0.0
     # ...but the run is still over budget, and must not read as clean.
     assert d["notes"]
-    assert approval_decision({"worst_case_usd": 150.0}, project_to_date_usd=1950.0,
+    assert approval_decision({"worst_case_usd": 150.0}, project_to_date_usd=to_date,
                              budget_mode="blocking")["approval_required"] is True
 
 
 def test_both_thresholds_can_trip_together():
-    d = approval_decision({"worst_case_usd": 5000.0}, project_to_date_usd=9000.0)
+    over = DEFAULT_SINGLE_RUN_LIMIT_USD * 2.5      # over on its own...
+    to_date = DEFAULT_PROJECT_CUMULATIVE_LIMIT_USD * 4.5   # ...and over cumulatively
+    d = approval_decision({"worst_case_usd": over}, project_to_date_usd=to_date)
     assert len(d["over_budget"]) == 2
-    assert len(approval_decision({"worst_case_usd": 5000.0}, project_to_date_usd=9000.0,
+    assert len(approval_decision({"worst_case_usd": over}, project_to_date_usd=to_date,
                                  budget_mode="blocking")["reasons"]) == 2
 
 
-def test_default_limits_are_the_2000_dollars_asked_for():
-    assert DEFAULT_SINGLE_RUN_LIMIT_USD == 2000.0
-    assert DEFAULT_PROJECT_CUMULATIVE_LIMIT_USD == 2000.0
+def test_default_limits_are_the_20000_dollars_asked_for():
+    """Raised from $2,000 on 2026-08-02: this is the project's own design-and-test
+    platform, not a customer's production account, and a reference low enough to be
+    crossed by ordinary work is a reference that gets ignored.
+
+    Asserted on the constants with the number in the test NAME as well as the body,
+    because that is what makes a silent change impossible to land: a diff that edits the
+    constant and the assert together still leaves a test called
+    `..._are_the_20000_dollars_asked_for` checking 5,000, which does not read as fine.
+    """
+    assert DEFAULT_SINGLE_RUN_LIMIT_USD == 20_000.0
+    assert DEFAULT_PROJECT_CUMULATIVE_LIMIT_USD == 20_000.0
+    # Both arms move together or the dual reference stops being dual: a low cumulative
+    # against a high single-run one turns every second run into an overage report.
+    assert DEFAULT_SINGLE_RUN_LIMIT_USD == DEFAULT_PROJECT_CUMULATIVE_LIMIT_USD
 
 
 def test_the_budget_is_a_reference_by_default_not_a_ceiling():
@@ -372,12 +400,17 @@ def test_an_unrecognised_budget_mode_falls_back_to_advisory_not_to_blocking():
     """A typo'd env var must not silently become enforcement. The failure mode of
     guessing 'blocking' is every run stopping on a value nobody can approve; the
     failure mode of guessing 'advisory' is the documented default."""
-    d = approval_decision({"worst_case_usd": 2500.0}, budget_mode="Blocking!")
+    # Over the reference, derived. As a literal 2500.0 this cleared a $2,000 reference
+    # and stopped clearing a $20,000 one -- so raising the limit turned the second half
+    # of this test ("the overage is still reported") into an assertion about a run that
+    # was never over budget at all. The straddle IS the test; it cannot be a constant.
+    over = DEFAULT_SINGLE_RUN_LIMIT_USD + 500.0
+    d = approval_decision({"worst_case_usd": over}, budget_mode="Blocking!")
     assert d["budget_mode"] == "advisory"
     assert d["approval_required"] is False
     assert d["over_budget"], "the overage is still reported under a bad mode"
     for bogus in (None, "", "off", "enforce", "yes"):
-        assert approval_decision({"worst_case_usd": 2500.0},
+        assert approval_decision({"worst_case_usd": over},
                                  budget_mode=bogus)["approval_required"] is False
 
 
@@ -393,10 +426,11 @@ def test_limits_are_configurable():
 
 
 def test_approval_falls_back_to_total_when_worst_case_absent():
-    d = approval_decision({"total_usd": 2500.0})
-    assert d["gating_usd"] == 2500.0
+    over = DEFAULT_SINGLE_RUN_LIMIT_USD + 500.0
+    d = approval_decision({"total_usd": over})
+    assert d["gating_usd"] == over
     assert d["over_budget"]
-    assert approval_decision({"total_usd": 2500.0},
+    assert approval_decision({"total_usd": over},
                              budget_mode="blocking")["approval_required"] is True
 
 

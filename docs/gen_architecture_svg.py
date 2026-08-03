@@ -79,7 +79,26 @@ def skill_mounts():
     return total, next(iter(kinds))
 
 
+def single_run_limit():
+    """The console's single-run budget reference, read out of the module that owns it.
+
+    Same reason as `skill_mounts()`: the band used to state `$2000 gate` as prose, and on
+    2026-08-02 the reference became $20,000 -- a diagram label that quotes a number nothing
+    derives is a claim that ages into a false one, which is the failure this whole generator
+    docstring is about. Parsed rather than imported because this script must stay runnable
+    from a temp dir with no repo on sys.path (see `_repo_root`).
+    """
+    src = os.path.join(_repo_root(), "pipeline", "contracts", "cost_model.py")
+    with open(src) as fh:
+        for line in fh:
+            if line.startswith("DEFAULT_SINGLE_RUN_LIMIT_USD"):
+                # float() accepts the `20_000.0` underscore form directly; no stripping.
+                return float(line.split("=", 1)[1].split("#")[0].strip())
+    raise SystemExit(f"DEFAULT_SINGLE_RUN_LIMIT_USD not found in {src}")
+
+
 SKILL_N, SKILL_KIND = skill_mounts()
+LIMIT_USD = single_run_limit()
 HARNESS_N = len(sorted(_glob.glob(os.path.join(_repo_root(), "agents", "*", "harness.json"))))
 
 STYLE = """
@@ -551,7 +570,7 @@ for i in range(3):
 svg.append(f'  <text class="sub" x="{286 + 2*(WW+24) + WW/2}" y="{wy+CH+20}" text-anchor="middle">async → finops-reconcile λ → harness-driver λ → llmops_finops</text>')
 # Left-anchored on the card's left edge rather than centred under it: centred, this
 # label began at x~253 and the consult drop down x=254 struck through it.
-svg.append(f'  <text class="sub" x="286" y="{wy+CH+20}">$2000 gate, server-side not in the UI: advisory now, blocking by env</text>')
+svg.append(f'  <text class="sub" x="286" y="{wy+CH+20}">${LIMIT_USD:,.0f} reference, server-side not in the UI: advisory now, blocking by env</text>')
 
 # ---- CONSULT PLANE (bottom): the Tasks tab -- the only plane that talks to an agent ----
 #

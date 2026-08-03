@@ -306,6 +306,17 @@ def _transcript_lines(w, tid):
     return out
 
 
+#: A priced plan 50% over w's single-run reference, derived rather than typed.
+#:
+#: As the literal "3000" this was over a $2,000 reference and became UNDER a $20,000 one on
+#: 2026-08-02 -- which does not fail, it silently turns "the overage is signed into the
+#: record" into an assertion about a plan that was never over budget. Three tests here read
+#: as passing while checking nothing. 1.5x keeps the "50% over" the docstrings describe, and
+#: keeps it 50% over whatever the reference becomes next.
+def _over_limit_cost(w):
+    return str(w.console.APPROVAL_LIMIT_USD * 1.5)
+
+
 def _mk_task(w, status="plan_proposed", cost="50", plan_body=b'{"goal":"x"}'):
     tid = "task-abc123"
     uri = f"s3://test-bucket/tasks/{tid}/plan.json"
@@ -366,13 +377,13 @@ def test_accept_under_limit_dispatches_and_writes_shadow_estimate(wired):
 def test_accept_over_budget_dispatches_but_signs_the_overage(wired):
     """Advisory mode at the acceptance boundary.
 
-    The $3000 plan dispatches — the owner is the only approver, so a queue here could
-    only ask them to approve their own run. What must NOT happen is the overage
+    A plan 50% over the reference dispatches — the owner is the only approver, so a queue
+    here could only ask them to approve their own run. What must NOT happen is the overage
     disappearing: it goes into the KMS-signed approval record, which is the artifact a
     third party audits later. A signed record that reads as within-budget when the plan
     was 50% over is a false attestation, not a relaxed policy.
     """
-    tid = _mk_task(wired, cost="3000")
+    tid = _mk_task(wired, cost=_over_limit_cost(wired))
     r = wired.console.accept_task(tid, DS_USER)
     assert r["ok"] and r["status"] == "accepting"
     signed = wired.tasks.items[tid]["approvals"][-1]
@@ -395,7 +406,7 @@ def test_accept_over_budget_dispatches_but_signs_the_overage(wired):
 
 def test_accept_over_limit_goes_to_the_cost_queue(blocking):
     wired = blocking
-    tid = _mk_task(wired, cost="3000")
+    tid = _mk_task(wired, cost=_over_limit_cost(wired))
     r = wired.console.accept_task(tid, DS_USER)
     assert r["ok"] and r["status"] == "pending_approval"
     pend = [p for p in wired.est.puts if p.get("status") == "pending_approval"]
@@ -408,7 +419,7 @@ def test_accept_over_limit_goes_to_the_cost_queue(blocking):
 def test_accept_requires_a_console_group_even_over_limit(wired):
     """Over-limit acceptance is 'submit to the queue' — but a user in NO group must
     not be able to enqueue spend requests at all."""
-    tid = _mk_task(wired, cost="3000")
+    tid = _mk_task(wired, cost=_over_limit_cost(wired))
     r = wired.console.accept_task(tid, NOBODY)
     assert r["status_code"] == 403
     assert not [p for p in wired.est.puts if p.get("task_id") == tid]
@@ -419,7 +430,7 @@ def test_over_limit_self_approval_is_blocked_at_the_cost_queue(blocking):
     cost_model.check_approval (requester != approver) — exactly the same rule the
     form-based estimates enforce. Alice created and submitted; Alice may not decide."""
     wired = blocking
-    tid = _mk_task(wired, cost="3000")
+    tid = _mk_task(wired, cost=_over_limit_cost(wired))
     wired.console.accept_task(tid, DS_USER)
     eid = [p for p in wired.est.puts if p.get("task_id") == tid][-1]["id"]
     wired.est.items[eid] = [p for p in wired.est.puts if p.get("id") == eid][-1]
@@ -464,7 +475,7 @@ def test_tampered_approval_record_fails_verification(wired):
 
 
 def test_hash_chain_links_successive_records(wired, monkeypatch):
-    tid = _mk_task(wired, cost="3000")
+    tid = _mk_task(wired, cost=_over_limit_cost(wired))
     wired.console.accept_task(tid, DS_USER)          # record 1: submitted
     first = wired.tasks.items[tid]["approvals"][-1]
     # approver decides on the Cost tab
@@ -484,7 +495,7 @@ def test_hash_chain_links_successive_records(wired, monkeypatch):
 # ── the Cost-tab decision routes back through the orchestrator ────────────────
 
 def test_budget_approval_enqueues_the_accept_turn_not_start_run(wired, monkeypatch):
-    tid = _mk_task(wired, cost="3000")
+    tid = _mk_task(wired, cost=_over_limit_cost(wired))
     wired.console.accept_task(tid, DS_USER)
     eid = [p for p in wired.est.puts if p.get("task_id") == tid][-1]["id"]
     wired.est.items[eid] = [p for p in wired.est.puts if p.get("id") == eid][-1]
@@ -502,7 +513,7 @@ def test_budget_approval_enqueues_the_accept_turn_not_start_run(wired, monkeypat
 
 
 def test_budget_rejection_feeds_the_reason_back_to_the_orchestrator(wired, monkeypatch):
-    tid = _mk_task(wired, cost="3000")
+    tid = _mk_task(wired, cost=_over_limit_cost(wired))
     wired.console.accept_task(tid, DS_USER)
     eid = [p for p in wired.est.puts if p.get("task_id") == tid][-1]["id"]
     wired.est.items[eid] = [p for p in wired.est.puts if p.get("id") == eid][-1]

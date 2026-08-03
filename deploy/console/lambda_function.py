@@ -44,9 +44,19 @@ FINOPS_FN = os.environ.get("FINOPS_FN", "llmops-finops-reconcile")
 PROJECT = os.environ.get("PROJECT", "llmops-agentic-system")
 #: Budget references, compared two independent ways: this run's worst case against the
 #: single-run figure, and project-to-date actual + this estimate against the cumulative
-#: one, because a stream of $500 runs is the same $2000 exposure as one $2000 run.
-APPROVAL_LIMIT_USD = float(os.environ.get("APPROVAL_LIMIT_USD", "2000"))
-CUMULATIVE_LIMIT_USD = float(os.environ.get("CUMULATIVE_LIMIT_USD", "2000"))
+#: one, because a stream of $5,000 runs is the same $20,000 exposure as one $20,000 run.
+#:
+#: These literals must equal cost_model's DEFAULT_*_LIMIT_USD, and they cannot be imported
+#: from it here: cost_model is loaded lazily by `_cost_model()` (the zip may be built
+#: without it) and that needs `_HERE`, defined further down. So the agreement is pinned by
+#: a test instead -- test_console_cost.py::
+#: test_the_consoles_fallback_limits_equal_the_canonical_ones. Two copies of a number with
+#: nothing comparing them is exactly how one falsified figure survived in four files; the
+#: fix is not to trust the copy, it is to make a disagreement fail loudly. deploy.sh now
+#: also SETS both env vars, read out of cost_model, so on a deployed function these
+#: fallbacks are never what is in force.
+APPROVAL_LIMIT_USD = float(os.environ.get("APPROVAL_LIMIT_USD", "20000"))
+CUMULATIVE_LIMIT_USD = float(os.environ.get("CUMULATIVE_LIMIT_USD", "20000"))
 #: advisory (default) = report the overage, launch anyway. blocking = the old gate.
 #: The platform owner is the only approver here, so a gate could only ever ask them to
 #: approve their own run; the budget is a reference instead. Overages are still named

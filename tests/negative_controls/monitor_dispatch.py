@@ -1084,6 +1084,93 @@ case("finops: the orphan's idle lifetime is restated as one of its three wrong v
      ["tests/test_cost_model.py::test_the_orphans_idle_lifetime_is_derived_from_its_own_two_dates"])
 
 
+def m77(t):
+    """Lower the console's fallback limit and leave cost_model's alone.
+
+    This is the exact shape of the defect the pairing test was written for: two copies of
+    one number in two files, and until 2026-08-02 nothing compared them. The console's copy
+    is the one that decides what an undeployed or env-var-less invocation enforces, so a
+    silent disagreement means the tests all check $20,000 while the running code checks
+    something else.
+    """
+    old = 'os.environ.get("APPROVAL_LIMIT_USD", "20000")'
+    assert old in t, (
+        "the console's fallback limit literal has moved or been reworded; re-anchor this "
+        "mutation rather than letting it no-op")
+    return t.replace(old, 'os.environ.get("APPROVAL_LIMIT_USD", "2000")', 1)
+
+
+case("budget: the console's fallback limit disagrees with cost_model",
+     "deploy/console/lambda_function.py", m77,
+     ["tests/test_console_cost.py::test_the_consoles_fallback_limits_equal_the_canonical_ones"])
+
+
+def m78(t):
+    """Retype the limits in deploy.sh instead of reading them out of cost_model.
+
+    The pre-2026-08-02 state was worse than this -- the script set NEITHER var, so the live
+    function reported `APPROVAL_LIMIT_USD: null` and fell back to the console literal, which
+    happened to agree. Nothing was wrong and nothing could have told us when it stopped
+    agreeing. Hardcoding is that hazard with an extra copy: the deploy would keep shipping
+    2000 while every test in the repo asserted 20000.
+    """
+    old = 'LIMITS=$("$PY_FOR_BUILD" -c "import sys; sys.path.insert(0,\'$BUILD\'); import cost_model as c; \\\n  print(f\'{c.DEFAULT_SINGLE_RUN_LIMIT_USD:.0f} {c.DEFAULT_PROJECT_CUMULATIVE_LIMIT_USD:.0f}\')")'
+    assert old in t, (
+        "the deploy script's limit derivation has moved or been reworded; re-anchor this "
+        "mutation rather than letting it no-op")
+    return t.replace(old, 'LIMITS="2000 2000"', 1)
+
+
+case("budget: deploy.sh hardcodes the limits instead of deriving them",
+     "deploy/console/deploy.sh", m78,
+     ["tests/test_console_cost.py::test_the_deploy_script_sets_both_limits_and_reads_them_from_cost_model"])
+
+
+def m79(t):
+    """Put the old $2,000 reference back in the module that owns the arithmetic.
+
+    The number was raised by the platform owner's instruction, and the test carries it in
+    its NAME as well as its body for this reason: a diff that edits the constant and the
+    assert together still leaves a test called `..._are_the_20000_dollars_asked_for`
+    checking something else, which does not read as fine to anyone reviewing it.
+    """
+    old = "DEFAULT_SINGLE_RUN_LIMIT_USD = 20_000.0"
+    assert old in t, (
+        "the canonical single-run reference has moved or been reworded; re-anchor this "
+        "mutation rather than letting it no-op")
+    return t.replace(old, "DEFAULT_SINGLE_RUN_LIMIT_USD = 2_000.0", 1)
+
+
+case("budget: the canonical single-run reference silently reverts to $2,000",
+     "pipeline/contracts/cost_model.py", m79,
+     ["tests/test_cost_model.py::test_default_limits_are_the_20000_dollars_asked_for",
+      "tests/test_console_cost.py::test_the_consoles_fallback_limits_equal_the_canonical_ones"])
+
+
+def m80(t):
+    """Freeze the straddling plan back to the literal 2,000,000 rows it used at $2,000.
+
+    Not a hypothetical: this IS what raising the reference did, and it is the reason the
+    plan is derived now. 2M rows price at $1,268 expected / $3,804 worst case -- both under
+    $20,000 -- so every budget test downstream would stop engaging the budget check at all
+    and pass while testing nothing. A fixture that no longer triggers the check it exists to
+    trigger is the failure mode its own docstring names, so the straddle relation is
+    asserted on every use rather than assumed.
+    """
+    old = 'return {"sample_count": int(0.5 * limit / per_sample), "max_iterations": 3}'
+    assert old in t, (
+        "the straddling plan's derivation has moved or been reworded; re-anchor this "
+        "mutation rather than letting it no-op")
+    return t.replace(old, 'return {"sample_count": 2_000_000, "max_iterations": 3}', 1)
+
+
+case("budget: the straddling fixture stops straddling and tests nothing",
+     "tests/test_console_cost.py", m80,
+     ["tests/test_console_cost.py::test_the_budget_check_reads_worst_case_not_expected",
+      "tests/test_console_cost.py::test_an_over_budget_launch_says_so_in_its_own_response",
+      "tests/test_console_cost.py::test_lowering_the_limit_re_gates_an_already_clean_estimate"])
+
+
 failed = []
 for name, rel, mutate, tests in CASES:
     p = REPO / rel

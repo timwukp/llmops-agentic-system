@@ -177,7 +177,19 @@ cp "$(dirname "$0")/../../orchestration/conductor_tools.py" "$BUILD/conductor_to
 # deploy script and switchable without a code change.
 BUDGET_MODE="${BUDGET_MODE:-advisory}"
 
-ENV_VARS="Variables={CONSOLE_TABLE=$TABLE,RUNS_TABLE=llmops-pipeline-runs,EVENTS_TABLE=llmops-stage-events,TASKS_TABLE=llmops-tasks,STATE_MACHINE=llmops-pipeline,START_FN=llmops-start-pipeline,DATA_BUCKET=$DATA_BUCKET,COGNITO_POOL_ID=$POOL_ID,COGNITO_CLIENT_ID=$CLIENT_ID,JUDGE_MODEL=$JUDGE_MODEL,SPANS_SINCE=$SPANS_SINCE,OPTIMIZE_HARNESS=$OPTIMIZE_HARNESS,LLMOPS_SNS_TOPIC=arn:aws:sns:$REGION:$ACCOUNT_ID:llmops-escalations,APPROVAL_KEY=alias/llmops-approval,DS_GROUP=llmops-datascience,BUDGET_MODE=$BUDGET_MODE}"
+# The two budget references, READ OUT OF the module that owns the arithmetic rather than
+# retyped here. Until now this script set neither, so the live function reported
+# `APPROVAL_LIMIT_USD: null` and fell back to the code default -- which happened to
+# agree, so nothing was wrong and nothing could have told us when it stopped agreeing.
+# Deriving them means raising the constant raises the deployment; typing them means a
+# deploy can disagree with the module every test checks.
+LIMITS=$("$PY_FOR_BUILD" -c "import sys; sys.path.insert(0,'$BUILD'); import cost_model as c; \
+  print(f'{c.DEFAULT_SINGLE_RUN_LIMIT_USD:.0f} {c.DEFAULT_PROJECT_CUMULATIVE_LIMIT_USD:.0f}')")
+APPROVAL_LIMIT_USD="${APPROVAL_LIMIT_USD:-${LIMITS%% *}}"
+CUMULATIVE_LIMIT_USD="${CUMULATIVE_LIMIT_USD:-${LIMITS##* }}"
+echo "budget references: single-run \$$APPROVAL_LIMIT_USD, cumulative \$$CUMULATIVE_LIMIT_USD, mode $BUDGET_MODE"
+
+ENV_VARS="Variables={CONSOLE_TABLE=$TABLE,RUNS_TABLE=llmops-pipeline-runs,EVENTS_TABLE=llmops-stage-events,TASKS_TABLE=llmops-tasks,STATE_MACHINE=llmops-pipeline,START_FN=llmops-start-pipeline,DATA_BUCKET=$DATA_BUCKET,COGNITO_POOL_ID=$POOL_ID,COGNITO_CLIENT_ID=$CLIENT_ID,JUDGE_MODEL=$JUDGE_MODEL,SPANS_SINCE=$SPANS_SINCE,OPTIMIZE_HARNESS=$OPTIMIZE_HARNESS,LLMOPS_SNS_TOPIC=arn:aws:sns:$REGION:$ACCOUNT_ID:llmops-escalations,APPROVAL_KEY=alias/llmops-approval,DS_GROUP=llmops-datascience,BUDGET_MODE=$BUDGET_MODE,APPROVAL_LIMIT_USD=$APPROVAL_LIMIT_USD,CUMULATIVE_LIMIT_USD=$CUMULATIVE_LIMIT_USD}"
 
 # timeout 900: one orchestrator consultation turn can stream for up to 840s; the
 # old 300 killed the worker mid-turn and left the task stuck in 'thinking'.

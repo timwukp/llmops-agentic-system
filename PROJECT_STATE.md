@@ -14,7 +14,8 @@ successful run was a zombie record. Also: a consultation the customer can finish
 endpoint re-costed from measured hardware at $36.36/day — 2× the $18 six files claimed — then
 deleted.
 
-**v1.1.0 — FinOps** (2026-07-31): cost estimation, the $2000 dual approval gate, and the
+**v1.1.0 — FinOps** (2026-07-31): cost estimation, the dual approval gate (then $2,000, raised
+to $20,000 on 2026-08-02), and the
 7th runtime `llmops_finops`. v1 complete before it (all six phases 2026-07-28 → 2026-07-29).
 
 Next: v2 experiments — code-as-reasoning distillation + augmentation; Kimi K3 teacher A/B
@@ -110,9 +111,21 @@ invocation — `sweep#…` in `llmops-stage-events`, `#audit#` in `llmops-cost-a
 schedule that silently *stopped* is visible; a cost control nobody can tell has stopped is not a
 control either.
 
-Guardrails, in order of who acts first: the console's **$2000 dual gate** (single-run worst
-case, or project-to-date + this estimate), then the pre-existing account-level AWS Budget
+Guardrails, in order of who acts first: the console's **$20,000 dual reference** (single-run
+worst case, or project-to-date + this estimate), then the pre-existing account-level AWS Budget
 `bedrock-monthly-dev` at **$1000/month**. See docs/COST.md.
+
+Neither one stops anything today, and that is worth stating plainly rather than leaving to be
+inferred from two separate facts. `BUDGET_MODE=advisory` means the console's reference reports
+an over-estimate run and launches it; `describe_budget_actions_for_budget` on
+`bedrock-monthly-dev` returns **0 actions**, so the AWS Budget notifies and does not enforce.
+Nothing in this account halts spend on its own. The references exist to make an overage get
+named — which is why the number was raised rather than deleted.
+
+The $20,000 figure is the platform owner's instruction of 2026-08-02: this is the project's own
+design-and-test platform, not a customer's production account, and the whole test-proven record
+to date cost **~$12–15**. A reference low enough to be crossed by ordinary work is a reference
+that gets ignored.
 
 ## Harness versions & endpoint pins
 

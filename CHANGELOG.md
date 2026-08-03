@@ -66,6 +66,22 @@ asking what actually calls the thing, not by reading what declares it.
 - **The budget became advisory but stayed spoken aloud** (#21) — `BUDGET_MODE=advisory` reports
   the overage in `start_run`'s response rather than blocking. Removing the number entirely would
   have deleted the only line that says a run is more expensive than its plan.
+- **The reference is $20,000, raised from $2,000, and the deploy now sets it** — the platform
+  owner's instruction: this is the project's own design-and-test platform, not a customer's
+  production account, and the entire test-proven record cost ~$12–15. A reference low enough to
+  be crossed by ordinary work gets clicked past. Two things the raise exposed, both worse than
+  the number being low:
+  - `deploy.sh` set **neither** limit, so the live function reported `APPROVAL_LIMIT_USD: null`
+    and fell back to the console's own literal — which happened to agree. Nothing was wrong and
+    nothing could have told us when it stopped agreeing. Both are now derived from
+    `cost_model.DEFAULT_*_LIMIT_USD`, and the console's fallback copy is pinned equal to the
+    canonical one by a test, because two copies of a number with nothing comparing them is
+    exactly how one falsified figure survived in four files at once.
+  - **The straddle fixtures stopped straddling.** Nine budget tests were built on a literal
+    2,000,000 rows priced at $1,268 expected / $3,804 worst case — both under $20,000, so the
+    tests would have gone green while never engaging the budget check at all. Their own
+    docstrings named this hazard; a limit change is that hazard arriving on purpose. The plan is
+    now derived from the reference and the straddle is asserted on every use.
 - **A real PII scan, or an honest absence** (#36) — Macie `llmops-customer-data-pii`, daily
   SCHEDULED over `customer-data/`. Until it existed the audit's answer to "did anything scan
   this data" was silence, which reads as yes.
@@ -109,7 +125,7 @@ the pushed tree to the local one rather than by trusting a green push.
 
 ### Tests
 
-**779 pytest** (from 274 at v1.0.0), **87/87 negative controls** (76 mutations, 87
+**781 pytest** (from 274 at v1.0.0), **94/94 negative controls** (80 mutations, 94
 (guard, mutation) pairs), **10/10 shell assertions**, three SVGs geometrically CLEAN against
 six checks. Offline by construction: `tests/conftest.py` strips AWS credentials and refuses
 non-loopback sockets, so a credentialed laptop cannot turn a test that hits production into a

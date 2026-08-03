@@ -25,7 +25,7 @@ next added tab fails the suite rather than quietly making this list wrong again.
 | Observability | Per-harness AgentCore service metrics, daily bar chart, token tile, SageMaker training jobs + student endpoints |
 | Evaluations | Online eval configs with score gauges, batch evaluations, insights reports |
 | Optimizations | AWS-native system-prompt recommendations + Bedrock-drafted prompts (human-review-then-apply via UpdateHarness) |
-| Cost | Estimates vs reconciled actuals, the $2000 gate, approval queue (approver group, never self-approve), `finops-run` dispatch |
+| Cost | Estimates vs reconciled actuals, the $20,000 reference, approval queue (approver group, never self-approve), `finops-run` dispatch |
 
 Route shape: **30 handlers** — 13 public GETs, 3 session POSTs, 14 authenticated POSTs.
 See [ARCHITECTURE.md §13](../../docs/ARCHITECTURE.md#13-the-admin-console--one-lambda-three-planes-with-different-rules)
@@ -86,8 +86,8 @@ existing `agent-cicd-admin` stack):
 | `ACTUALS_TABLE` | `llmops-cost-actuals` | Reconciled actuals (PK `project`, SK `sk`) |
 | `FINOPS_FN` | `llmops-finops-reconcile` | Auditor dispatch target |
 | `PROJECT` | `llmops-agentic-system` | Cost attribution key |
-| `APPROVAL_LIMIT_USD` | `2000` | Single-run gate — **server-side**; a gate the client enforces is a gate the client can skip |
-| `CUMULATIVE_LIMIT_USD` | `2000` | Period gate, checked alongside the single-run one |
+| `APPROVAL_LIMIT_USD` | `20000` | Single-run reference — **server-side**; a gate the client enforces is a gate the client can skip. `deploy.sh` sets it from `cost_model.DEFAULT_SINGLE_RUN_LIMIT_USD`; it set neither limit until 2026-08-02, so the live function read `null` and fell back to the code default |
+| `CUMULATIVE_LIMIT_USD` | `20000` | Period reference, checked alongside the single-run one |
 | `BUDGET_MODE` | `advisory` | `advisory` names an over-budget dispatch and records the estimate; `blocking` refuses it |
 | `APPROVER_GROUP` | `llmops-approver` | Cognito group that may decide approvals (never the requester) |
 | `DS_GROUP` | `llmops-datascience` | Cognito group that may create/chat tasks and mint upload URLs |
