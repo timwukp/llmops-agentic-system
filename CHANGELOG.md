@@ -3,6 +3,51 @@
 All notable changes to this project are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
+## [Unreleased]
+
+### Stage timeouts: a day for real work, an hour for anything holding a GPU
+
+- **The six states that wait on real agent work now carry `TimeoutSeconds: 86400`** — a full
+  day, raised from 7200/21600 on the platform owner's instruction. `TimeoutSeconds` is the
+  only real ceiling on a stage: the driver Lambda's 900 s does **not** bound it, because the
+  driver self-reinvokes across invocations via `_continuation` — but the `.waitForTaskToken`
+  token it holds only lives for `TimeoutSeconds`. A 480-teacher-call generation run does not
+  fit in two hours, and the 2026-08-01 run was cut off by exactly that, mid-work, with the
+  work already paid for.
+- **The seven bookkeeping states deliberately did *not* move.** `Teardown` is what deletes the
+  endpoint and `MonitorHealth`/`MonitorReport` sit on the only path to it: a wedged `Teardown`
+  at 86400 s holds an `ml.g5.2xlarge` InService for a day at $1.515/hr — the exact shape of
+  the 843-day, 0-invocation orphan this project already paid for and deleted on 2026-08-02.
+  Raising every state with one `sed` would have been a cost regression dressed as a
+  reliability fix. The split is now asserted, and the guard **fails on an unclassified new
+  state** rather than defaulting it into either bucket, because defaulting is how a cleanup
+  stage would silently inherit a 24-hour ceiling.
+- **`HeartbeatSeconds: 18000` on `FinetuneLaunch` and `RemediateFinetune` was a shorter
+  deadline wearing a liveness signal's name, and it was live for weeks.** Step Functions
+  fails a state with `States.Timeout` if the heartbeat interval elapses without a
+  `SendTaskHeartbeat` — and **nothing in this platform has ever called it**, though the IAM
+  role grants `states:SendTaskHeartbeat`. So the first heartbeat never arrived and both
+  states really died at **18000 s while their ASL said 21600**. Every surface agreed with the
+  ASL: the console's hover card rendered a `heartbeat 18000s` row, which reads as *we monitor
+  liveness*, not as *this stage has a 5-hour cap you cannot see anywhere*. It surfaced only
+  because the raise to 86400 would have left those two dying at 5 hours while all six
+  siblings ran a day. Both fields removed, along with the console reader and hover row that
+  displayed them — and the existing
+  `test_every_field_the_hover_card_renders_is_supplied_by_the_api` is what caught the
+  now-unproducible field, so the dead UI could not linger. A heartbeat may come back, but
+  only **with** a sender: that is what the new guard permits and what it refuses.
+- Two hover-card tests pinned the literal `7200` while being about something else entirely
+  (that a failed AgentCore lookup must not drop the ASL half of the card). Both now derive
+  the value from the ASL: a literal in a test whose subject is not that literal is a tripwire
+  on the wrong wire, and rewriting it to `86400` would just re-arm it for next time. The
+  card's timeout row also renders hours above an hour — "1440 min" is not a duration anyone
+  reads as a day.
+
+**785 pytest**, **103/103 negative controls** (89 mutations). Four new controls: `Teardown`
+inheriting the day, `DataPrepGenerate` reverting to 7200 (the shape a merge conflict resolves
+wrongly by default), a new timed state shipping unclassified, and a heartbeat interval
+returning without a sender.
+
 ## [1.2.0] — 2026-08-02
 
 Twenty-one merged PRs (#17–#38; #24 closed unmerged). The pattern across almost all of them
@@ -148,7 +193,7 @@ the pushed tree to the local one rather than by trusting a green push.
   in both directions: SIGTERM restored the file, SIGKILL leaked it, and the next start printed
   `RECOVERED` and undid it.
 
-**783 pytest** (from 274 at v1.0.0), **99/99 negative controls** (85 mutations, 99
+**785 pytest** (from 274 at v1.0.0), **103/103 negative controls** (89 mutations, 103
 (guard, mutation) pairs), **10/10 shell assertions**, three SVGs geometrically CLEAN against
 six checks. Offline by construction: `tests/conftest.py` strips AWS credentials and refuses
 non-loopback sockets, so a credentialed laptop cannot turn a test that hits production into a

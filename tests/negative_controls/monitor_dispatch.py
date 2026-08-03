@@ -1288,6 +1288,104 @@ case("controls: the runner journals the original but never restores from it",
      ["tests/test_docs_claims.py::test_the_control_runner_restores_its_mutation_even_when_signalled"])
 
 
+def m86(t):
+    """Give Teardown the same 24-hour ceiling the long-work states were raised to.
+
+    The plausible mistake, and the reason the raise was scoped to six states rather than
+    applied with sed: Teardown is what DELETES the endpoint. A wedged Teardown at 86400
+    holds an ml.g5.2xlarge InService for a full day at $1.515/hr -- the shape of the
+    843-day orphan this project already paid for once. Nothing about the state's own
+    definition objects: 86400 is a legal TimeoutSeconds and the machine deploys fine.
+    """
+    old = '"ResultPath": "$.teardown",\n      "TimeoutSeconds": 3600,'
+    assert t.count(old) == 1, f"Teardown's timeout has moved; found {t.count(old)}"
+    return t.replace(old, '"ResultPath": "$.teardown",\n      "TimeoutSeconds": 86400,', 1)
+
+
+case("ASL: Teardown inherits the 24-hour ceiling meant for long-work states",
+     "orchestration/state_machine.asl.json", m86,
+     ["tests/test_orchestration.py::TestStateMachine::test_a_stage_that_deletes_the_endpoint_keeps_a_short_timeout"])
+
+
+def m87(t):
+    """Leave DataPrepGenerate at the 7200 that cut the generation run off mid-work.
+
+    The reverse direction, and the one a merge conflict resolves wrongly by default: an
+    older branch's 7200 wins and every surface still reads healthy, because 7200 is a
+    perfectly valid timeout. The only thing that says it is wrong is the owner's decision,
+    so the guard has to hold that decision rather than trust the file.
+    """
+    old = '"ResultPath": "$.data_prep_generate",\n      "TimeoutSeconds": 86400,'
+    assert t.count(old) == 1, f"DataPrepGenerate's timeout has moved; found {t.count(old)}"
+    return t.replace(
+        old, '"ResultPath": "$.data_prep_generate",\n      "TimeoutSeconds": 7200,', 1)
+
+
+case("ASL: DataPrepGenerate reverts to the 7200s that cut a run off mid-work",
+     "orchestration/state_machine.asl.json", m87,
+     ["tests/test_orchestration.py::TestStateMachine::test_a_stage_that_deletes_the_endpoint_keeps_a_short_timeout"])
+
+
+def m88(t):
+    """Add a new timed state without classifying it into either timeout bucket.
+
+    The hole a two-list guard has if it only checks the states it names: a state added
+    later is in neither list, so neither loop examines it and the guard passes while an
+    unreviewed ceiling ships. Modelled on the real hazard -- this clones MonitorReport
+    under a new name with a 24-hour timeout, which is exactly how a cleanup-adjacent
+    state would acquire one.
+    """
+    old = '    "MonitorReport": {'
+    assert t.count(old) == 1, "MonitorReport's key has moved; re-anchor this mutation"
+    clone = ('    "ArchiveArtifacts": {\n'
+             '      "Type": "Task",\n'
+             '      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",\n'
+             '      "Parameters": {\n'
+             '        "FunctionName": "${HarnessDriverArn}",\n'
+             '        "Payload": {\n'
+             '          "run_id.$": "$.run_id",\n'
+             '          "manifest_uri.$": "$.manifest_uri",\n'
+             '          "stage": "monitor",\n'
+             '          "task": "report",\n'
+             '          "harness_id": "llmops_monitor",\n'
+             '          "task_token.$": "$$.Task.Token",\n'
+             '          "iteration.$": "$.iteration"\n'
+             '        }\n'
+             '      },\n'
+             '      "ResultPath": "$.archive",\n'
+             '      "TimeoutSeconds": 86400,\n'
+             '      "Next": "Complete"\n'
+             '    },\n')
+    return t.replace(old, clone + old, 1)
+
+
+case("ASL: a new timed state ships unclassified by the timeout policy",
+     "orchestration/state_machine.asl.json", m88,
+     ["tests/test_orchestration.py::TestStateMachine::test_a_stage_that_deletes_the_endpoint_keeps_a_short_timeout"])
+
+
+def m89(t):
+    """Put HeartbeatSeconds back on FinetuneLaunch with nothing sending heartbeats.
+
+    The state this shipped in for weeks, and it read as MORE careful than a bare timeout:
+    a liveness interval alongside a ceiling. Nothing calls SendTaskHeartbeat, so the first
+    heartbeat never arrives and the state dies at 18000s while its TimeoutSeconds says
+    86400 -- a deadline no surface reports, hidden behind a field whose name promises
+    monitoring. The console even rendered it as a "heartbeat" row.
+    """
+    old = '"ResultPath": "$.training",\n      "TimeoutSeconds": 86400,'
+    assert t.count(old) == 1, f"FinetuneLaunch's timeout has moved; found {t.count(old)}"
+    return t.replace(
+        old,
+        '"ResultPath": "$.training",\n      "TimeoutSeconds": 86400,'
+        '\n      "HeartbeatSeconds": 18000,', 1)
+
+
+case("ASL: a heartbeat interval returns with nothing to send heartbeats",
+     "orchestration/state_machine.asl.json", m89,
+     ["tests/test_orchestration.py::TestStateMachine::test_a_heartbeat_interval_requires_something_to_send_heartbeats"])
+
+
 #: Where the pristine text of the file currently mutated is parked, so a kill -9 -- which
 #: no handler can intercept -- still leaves the original recoverable. Under the repo root
 #: rather than /tmp because it must be obvious to whoever finds the tree dirty, and

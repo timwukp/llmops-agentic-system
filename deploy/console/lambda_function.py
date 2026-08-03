@@ -435,8 +435,6 @@ def stage_config():
                 cfg.setdefault(dst, pay[src])
         if st.get("TimeoutSeconds"):
             cfg.setdefault("timeoutSeconds", st["TimeoutSeconds"])
-        if st.get("HeartbeatSeconds"):
-            cfg.setdefault("heartbeatSeconds", st["HeartbeatSeconds"])
         fn = (st.get("Parameters") or {}).get("FunctionName") or ""
         if fn:
             cfg.setdefault("lambda", fn.rsplit(":", 1)[-1])

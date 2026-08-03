@@ -641,9 +641,10 @@ def handle_escalate(c, event, args) -> dict:
     except Exception as exc:  # noqa: BLE001 — see below: the token must still settle
         # The settle is what releases the state machine. Letting a failed PutEvents skip
         # it would park a live task token on a run that has already escalated, and the
-        # only thing that ever frees it is the stage's own timeout (7200s for data_prep,
-        # 21600s for finetune) -- the zombie that MarkRunDone/MarkRunFailed and #52 all
-        # exist to prevent, re-entered through the notification path.
+        # only thing that ever frees it is the stage's own timeout (86400s on every
+        # long-work state since 2026-08-03, so a DAY) -- the zombie that MarkRunDone,
+        # MarkRunFailed and #52 all exist to prevent, re-entered through the notification
+        # path. The raise makes this except clause more load-bearing, not less.
         print(f"[driver] could not emit {ev.ESCALATED_TO_HUMAN} for {run_id}: {exc}")
     if event.get("task_token"):
         c["sfn"].send_task_failure(taskToken=event["task_token"],
@@ -839,8 +840,9 @@ def handler(event, context=None, clients=None):
     A SYNCHRONOUS stage invocation that raises is reported to Step Functions by the
     Lambda integration itself. An ASYNCHRONOUS continuation is not: the state machine
     waits on the task token, not on this invocation, so an exception here goes to
-    CloudWatch and to nobody else. The token then parks until TimeoutSeconds -- 7200s
-    for data-prep, 21600s for finetune -- with the run record still saying 'running'.
+    CloudWatch and to nobody else. The token then parks until TimeoutSeconds -- 86400s
+    on every long-work state since the 2026-08-03 raise, so a full DAY -- with the run
+    record still saying 'running'.
 
     Live: the driver's missing s3:PutObject grant crashed the final stage_complete of
     run-...-8b864805 twice in the same silence, and the run held its token for 90

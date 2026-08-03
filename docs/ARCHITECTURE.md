@@ -155,7 +155,8 @@ Two spine details that are policy, not plumbing:
   to release the state machine. The SNS publish was the **first** statement and unwrapped,
   so a failed publish took all three of the others with it — including the settle, leaving a
   live task token on a run that had already escalated, freed only by the stage's own timeout
-  (7200s for data_prep, 21600s for finetune). That is the worst possible thing to gate on
+  (86400s — a full day — on every long-work state since 2026-08-03). That is the worst
+  possible thing to gate on
   *this* call: **`llmops-escalations` had zero subscribers** when this was found, so SNS was
   the one channel already known to deliver to no one. `ensure_topic` in
   `deploy/03_storage.py` reports it as
@@ -553,6 +554,42 @@ where it stopped. Other production patterns baked into the same loop, each from 
 failure: `read_timeout=870, retries=0` on the AgentCore client (default 60 s kills long
 streams; auto-retry would silently re-run a whole agent turn), and a one-shot same-session
 salvage retry when a stream dies mid-turn.
+
+### The only deadline that actually bounds a stage
+
+Three timeouts are stacked here and only one of them is a ceiling on the *work*:
+
+| Layer | Value | What it bounds |
+|---|---|---|
+| Harness turn budget | 840 s | one agent turn |
+| Driver Lambda `Timeout` | 900 s | one **invocation** — not the stage, because the driver self-reinvokes via `_continuation` |
+| State machine `TimeoutSeconds` | **86400 s** on long-work states, 3600–7200 s on the rest | the **stage**: how long the `.waitForTaskToken` token stays alive |
+
+Because the driver hands itself the conversation across invocations, the Lambda's 900 s is
+not a limit on how long a stage may run — the **task token's** lifetime is, and that is
+`TimeoutSeconds`. The six states that wait on real agent work (`DataPrepGenerate`,
+`DataPrepCurate`, `FinetuneLaunch`, `EvalGenerate`, `EvalGate`, `RemediateFinetune`) carry
+**86400 s — a full day**, raised from 7200/21600 on 2026-08-03 on the platform owner's
+instruction after a 480-teacher-call generation run was cut off at 7200 s mid-work.
+
+The seven bookkeeping states keep an hour or two on purpose. `Teardown` is what deletes the
+endpoint, and `MonitorHealth`/`MonitorReport` sit on the only path to it: a wedged
+`Teardown` at 86400 s would hold an `ml.g5.2xlarge` InService for a day at $1.515/hr, which
+is the precise shape of the 843-day, 0-invocation orphan this project already paid for. The
+split is asserted by
+`tests/test_orchestration.py::TestStateMachine::test_a_stage_that_deletes_the_endpoint_keeps_a_short_timeout`,
+which also **fails on an unclassified new state** rather than defaulting it into either
+bucket.
+
+`FinetuneLaunch` and `RemediateFinetune` also carried `HeartbeatSeconds: 18000` until the
+same change. That field is a liveness signal only if something sends heartbeats — and
+nothing in this platform ever called `SendTaskHeartbeat`, though the IAM role grants it. So
+the first heartbeat never arrived and both states really died at **18000 s while their ASL
+said 21600**, with the console's hover card rendering a reassuring "heartbeat 18000s" row.
+Both fields were removed, and
+`test_a_heartbeat_interval_requires_something_to_send_heartbeats` now refuses the field
+without a sender: a heartbeat interval with nobody sending is not monitoring, it is a
+shorter deadline that no surface reports.
 
 ## 11. VPC posture for production
 

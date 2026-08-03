@@ -598,10 +598,17 @@ function stageTipRows(st){
   add("stage · task", c.stage && c.task ? c.stage+" · "+c.task : null);
   add("SFN state", (c.states||[]).join(" | "));
   add("driver λ", c.lambda);
-  // Seconds are what the ASL says; minutes are what a human reasons in. A 7200 that
+  // Seconds are what the ASL says; hours are what a human reasons in. An 86400 that
   // the operator has to divide is a number they will misread once and never trust.
-  if (c.timeoutSeconds) add("timeout", c.timeoutSeconds+"s ("+Math.round(c.timeoutSeconds/60)+" min)");
-  if (c.heartbeatSeconds) add("heartbeat", c.heartbeatSeconds+"s");
+  // Minutes were the old unit and stopped scaling at a 24-hour stage: "1440 min" is
+  // not a duration anyone reads as a day.
+  if (c.timeoutSeconds) add("timeout", c.timeoutSeconds >= 3600
+      ? c.timeoutSeconds+"s ("+(c.timeoutSeconds/3600).toFixed(1).replace(/\.0$/,"")+" h)"
+      : c.timeoutSeconds+"s ("+Math.round(c.timeoutSeconds/60)+" min)");
+  // No heartbeat row: the ASL carries no HeartbeatSeconds on any state, because nothing
+  // in the platform calls SendTaskHeartbeat -- see the FinetuneLaunch Comment. A row
+  // reading "heartbeat 18000s" told the operator a liveness signal existed, when what
+  // the field really did was kill the state 3600s EARLIER than the timeout beside it.
   if (c.maxAttempts) add("retries", c.maxAttempts+" (service errors only)");
   add("on error", (c.catch||[]).join(" -> "));
   add("attempts this run", st.attempts>1 ? st.attempts+" (remediation loop)" : st.attempts);
