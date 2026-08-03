@@ -48,6 +48,46 @@ inheriting the day, `DataPrepGenerate` reverting to 7200 (the shape a merge conf
 wrongly by default), a new timed state shipping unclassified, and a heartbeat interval
 returning without a sender.
 
+### The ASL deploy has to prove it landed, not report that it was sent
+
+- **`deploy_state_machine` now reads the definition back and refuses to call the deploy done
+  until the live machine matches the ASL in this tree.** It used to return
+  `action: "updated"` on the strength of `update_state_machine` returning 200 — which says
+  the call was accepted, and nothing about what the machine will run. On 2026-08-03 the live
+  definition turned out to be **a state behind**: `EvalGenerate` was entirely absent, though
+  it merged on 2026-08-02 in `7940af8` as the whole point of #57, along with six stale
+  timeouts, both senderless heartbeats, and `FinetuneAnalyze` still pointing at `EvalGate`.
+  A human found that by reading the live definition by hand. Nothing in the repo compared
+  the two, so nothing could have found it.
+- **This repo had already paid for that belief once.** `update_function_configuration` was
+  called without `Role` for months while every run reported "updated" and each function kept
+  its birth role — the defect
+  `test_a_role_change_reaches_an_existing_function_not_only_a_new_one` exists for. The same
+  file's `live_bus_translator_gap` even argues the point in its own docstring, and **blocks**
+  the deploy on it, for bus rules. The state machine definition never got the same treatment.
+- **The comparison is semantic and it names states, not bytes.** Step Functions happens to
+  return the definition verbatim today (measured: 26742 bytes both sides, parsed-identical),
+  but a formatting-only difference is not a deploy failure, and a check that calls it one gets
+  switched off by the third person it wakes. So the drift walk parses both sides and reports
+  "`EvalGenerate` is absent live" rather than a 26 KB diff — and when equality fails and
+  neither walk can localise it, it says **that**, because reporting clean on the one case it
+  cannot explain is the exact failure it exists to prevent.
+- **It polls rather than reading once.** AWS documents `UpdateStateMachine` as eventually
+  consistent — executions started immediately afterwards may still use the previous
+  definition. Five reads, backing off 1/2/4/8 s. A guard that cries wolf gets deleted, which
+  is the same eventual consistency that bit the push tool's ref read in #35.
+- A read-back that cannot run reports `definition_confirmed: false` with the reason, never a
+  confirmation. Not being able to check is not the same as having checked.
+
+**795 pytest**, **107/107 negative controls** (93 mutations). Eleven new tests and four new
+controls: the read-back deleted from the deploy path, the "cannot localise" backstop returning
+clean, the eventual-consistency wait removed so a lagging read reads as drift, and an
+unreachable read claiming confirmed. The backstop's control went **uncaught** on the first
+run — the test fed it a difference the top-level walk does localise. Its real input is a key
+present-with-`null` on one side and absent on the other: unequal dicts, and every `.get()`
+comparison agreeing, which is the one shape both walks are blind to. A control that goes
+uncaught means the test named the wrong subject, not that the control needs weakening.
+
 ## [1.2.0] — 2026-08-02
 
 Twenty-one merged PRs (#17–#38; #24 closed unmerged). The pattern across almost all of them
