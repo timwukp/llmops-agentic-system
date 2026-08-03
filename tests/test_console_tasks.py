@@ -1593,6 +1593,22 @@ def _fake_sfn_history(events, exec_status, run_id="run-x", definition=None):
     return _Sfn()
 
 
+def _asl_timeout(state):
+    """The state's TimeoutSeconds, read from the ASL rather than written as a literal.
+
+    Two tests below assert that a PARTIAL identity resolution still returns the ASL
+    half of the hover card, and both pinned the literal 7200. That made them fail for
+    the wrong reason the day DataPrepGenerate was raised to 86400: neither test is
+    about the number, they are about the console not dropping the ASL config when the
+    AgentCore lookup is what failed. A literal in a test whose subject is not that
+    literal is a tripwire on the wrong wire -- and rewriting it to 86400 would just
+    re-arm it for the next change.
+    """
+    return json.loads(
+        (REPO / "orchestration/state_machine.asl.json").read_text()
+    )["States"][state]["TimeoutSeconds"]
+
+
 #: The live history of run-20260731T183103Z-8b864805, event for event (verified against
 #: GetExecutionHistory: 16 events). The .waitForTaskToken task TIMED OUT after 7200s
 #: with States.Timeout, the Catch ran EscalateFail, and MarkRunFailed then died on
@@ -1810,7 +1826,8 @@ def test_the_hover_card_says_unresolved_rather_than_inventing_a_runtime(console,
     assert "runtimeId" not in cfg, "no id may be reported for a runtime we did not find"
     # still useful: the facts that DID resolve are all present
     assert cfg["harnessFullId"].startswith("llmops_data_prep-")
-    assert cfg["timeoutSeconds"] == 7200 and cfg["harnessStatus"] == "READY"
+    assert cfg["timeoutSeconds"] == _asl_timeout("DataPrepGenerate") \
+        and cfg["harnessStatus"] == "READY"
 
 
 def test_a_cached_harness_status_expires_instead_of_being_served_forever(console, monkeypatch):
@@ -1922,7 +1939,8 @@ def test_a_hover_card_never_breaks_the_flow_diagram(console, monkeypatch):
         cfg = console.stage_config()["data-prep-generate"]
         assert note in cfg, f"{kw}: the card must say why, not omit silently"
         # a denial on one lookup must not blank the others
-        assert cfg["timeoutSeconds"] == 7200, f"{kw}: lost the ASL config too"
+        assert cfg["timeoutSeconds"] == _asl_timeout("DataPrepGenerate"), \
+            f"{kw}: lost the ASL config too"
 
 
 def test_every_field_the_hover_card_renders_is_supplied_by_the_api(console, monkeypatch):
@@ -1943,9 +1961,13 @@ def test_every_field_the_hover_card_renders_is_supplied_by_the_api(console, monk
     missing = sorted(f for f in stage_fields if f not in gen)
     assert not missing, f"the card renders st.{missing} but pipeline_detail never sends it"
 
-    # Union across stages, not one stage: heartbeatSeconds exists only on the two
-    # long-running SageMaker states, so requiring every field on data-prep would force
-    # a fake key onto stages that genuinely do not have one.
+    # Union across stages, not one stage: a config key set from the ASL exists only on
+    # the states whose ASL entry carries that field (retryPolicy, catchTargets), so
+    # requiring every field on data-prep would force a fake key onto stages that
+    # genuinely do not have one. `heartbeatSeconds` used to be the example here, and it
+    # is the reason this union matters: the field was removed from the ASL on
+    # 2026-08-03 and THIS test is what caught the card still reading `c.heartbeatSeconds`
+    # with nothing left to produce it.
     every_cfg = set()
     for s in out["stages"]:
         every_cfg |= set(s["config"])

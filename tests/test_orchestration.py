@@ -644,8 +644,10 @@ class TestDriver:
         the Lambda integration itself, which is why the NameError above surfaced in
         seconds. An ASYNCHRONOUS continuation has no such reporter: the state machine
         is waiting on the task token, not on this invocation, so an exception here is
-        written to CloudWatch and to nobody else. The token parks until TimeoutSeconds
-        -- 7200s for DataPrepGenerate, six hours for FinetuneLaunch.
+        written to CloudWatch and to nobody else. The token parks until TimeoutSeconds --
+        86400s, a full DAY, on every state that waits on real work. The 2026-08-03 raise
+        from 7200 made this test's subject strictly more valuable: a stranded token used
+        to cost two hours, and now costs a day.
 
         Live: the driver's missing s3:PutObject grant crashed the final
         stage_complete of run-...-8b864805. The work was done and the report written
@@ -696,8 +698,8 @@ class TestDriver:
         failures = c["sfn"].failures
         assert failures, (
             "the driver crashed while holding a task token and told Step Functions "
-            "nothing -- the token parks until TimeoutSeconds (7200s for data-prep, "
-            "21600s for finetune) while the run record still says 'running'")
+            "nothing -- the token parks until TimeoutSeconds (86400s on every "
+            "long-work state since 2026-08-03) while the run record still says 'running'")
         assert failures[0]["taskToken"] == "tok-parked"
         cause = json.dumps(failures[0])
         assert "AccessDenied" in cause or "PitItem" in cause or "PutItem" in cause, (
@@ -857,9 +859,11 @@ class TestDriver:
     def test_a_failed_bus_emit_still_settles_the_task_token(self):
         """The expensive half. The settle is what releases the state machine; skipping it
         because a PutEvents failed parks a live token on a run that has already escalated,
-        and the only thing that frees it is the stage's own timeout -- 7200s for data_prep,
-        21600s for finetune. That is the zombie #52 and MarkRunFailed exist to prevent,
-        re-entered through the notification path."""
+        and the only thing that frees it is the stage's own timeout -- 86400s on every
+        long-work state since the 2026-08-03 raise, so a full day rather than the two
+        hours it used to be. That is the zombie #52 and MarkRunFailed exist to prevent,
+        re-entered through the notification path, and the raise makes the settle path
+        more load-bearing rather than less."""
         c = clients()
 
         def boom(**kw):
@@ -1803,6 +1807,93 @@ class TestStateMachine:
                 for i, v in enumerate(node):
                     walk(v, f"{path}[{i}]")
         walk(asl, "")
+
+    def test_a_stage_that_deletes_the_endpoint_keeps_a_short_timeout(self, asl):
+        """The asymmetry is deliberate and it is the whole safety argument for 86400.
+
+        TimeoutSeconds is the only real ceiling on a stage: the driver Lambda's 900s
+        limit does not bound it (it self-reinvokes via _continuation), so the task token
+        surviving for TimeoutSeconds is what keeps a long stage alive. Raising the six
+        states that wait on real work to a day is therefore correct -- a 480-teacher-call
+        generation run does not fit in 7200s and was cut off mid-work by it.
+
+        Applying the same day to the CLEANUP states would not be. Teardown is what
+        deletes the endpoint; MonitorHealth and MonitorReport sit on the only path to it.
+        A wedged Teardown at 86400 leaves an ml.g5.2xlarge InService for a full day at
+        $1.515/hr -- the exact shape of the 843-day, 0-invocation orphan this project
+        already paid for and deleted on 2026-08-02. So the cost-bearing states keep an
+        hour, and a raise that reached them would be a cost regression disguised as a
+        reliability improvement.
+
+        Asserted as an upper bound rather than an equality: tightening a cleanup timeout
+        is always safe and should not need this test edited.
+        """
+        CLEANUP = {"Teardown", "MonitorHealth", "MonitorReport", "SmokeTest",
+                   "Deploy", "DataAudit", "FinetuneAnalyze"}
+        LONG_WORK = {"DataPrepGenerate", "DataPrepCurate", "FinetuneLaunch",
+                     "EvalGenerate", "EvalGate", "RemediateFinetune"}
+        timed = {n for n, st in asl["States"].items() if "TimeoutSeconds" in st}
+        assert timed == CLEANUP | LONG_WORK, (
+            f"the timeout policy names {sorted(CLEANUP | LONG_WORK)} but the ASL times "
+            f"{sorted(timed)}; a new timed state must be classified, not defaulted -- "
+            "an unclassified state is how a cleanup stage inherits a 24-hour ceiling")
+        for n in sorted(CLEANUP):
+            assert asl["States"][n]["TimeoutSeconds"] <= 7200, (
+                f"{n} is on the endpoint-lifecycle path with TimeoutSeconds "
+                f"{asl['States'][n]['TimeoutSeconds']}; a wedged cleanup stage holding a "
+                "GPU endpoint for that long is the orphan-endpoint cost this project "
+                "already paid once")
+        for n in sorted(LONG_WORK):
+            assert asl["States"][n]["TimeoutSeconds"] == 86400, (
+                f"{n} waits on real agent work and has TimeoutSeconds "
+                f"{asl['States'][n]['TimeoutSeconds']}, not the 86400 the owner set; "
+                "the 7200 it was cut off at is what this change exists to remove")
+
+    def test_a_heartbeat_interval_requires_something_to_send_heartbeats(self, asl):
+        """HeartbeatSeconds without a sender is not a liveness signal -- it is a second,
+        SHORTER deadline, and one nobody reads as a deadline.
+
+        FinetuneLaunch and RemediateFinetune carried `HeartbeatSeconds: 18000` beside
+        `TimeoutSeconds: 21600` from the day they were written. Step Functions resets the
+        heartbeat clock on SendTaskHeartbeat and fails the state with States.Timeout if
+        the interval elapses without one. Nothing in this platform has ever called it:
+        the driver settles a token with SendTaskSuccess/SendTaskFailure and nothing else,
+        even though the IAM role grants states:SendTaskHeartbeat. So the first heartbeat
+        never arrived and both states really died at 18000s while their ASL said 21600 --
+        the console's hover card even rendered a "heartbeat 18000s" row, which reads as
+        *we monitor liveness* rather than *this stage has a 5-hour cap you cannot see*.
+
+        It surfaced when the six long-work states were raised to 86400 on the platform
+        owner's instruction: those two would have kept dying at 5 hours while every
+        surface reported a day. The number in the ASL not being the number that fires is
+        precisely the defect class this suite exists for.
+
+        So the field is allowed back ONLY together with a sender. This test is what will
+        let it in -- it does not forbid heartbeats, it forbids the half of the pair that
+        looks reassuring on its own.
+        """
+        with_hb = sorted(n for n, st in asl["States"].items()
+                         if "HeartbeatSeconds" in st)
+        if not with_hb:
+            return
+        senders = []
+        for rel in ("orchestration/harness_driver/handler.py",
+                    "orchestration/resume_pipeline/handler.py",
+                    "orchestration/start_pipeline/handler.py"):
+            p = REPO / rel
+            if p.exists() and "send_task_heartbeat" in p.read_text():
+                senders.append(rel)
+        assert senders, (
+            f"{with_hb} declare a heartbeat interval but no Lambda calls "
+            "send_task_heartbeat, so the first heartbeat never arrives and the interval "
+            "is a shorter timeout wearing a liveness signal's name")
+        # And the pair must be consistent: an interval at or above the timeout can never
+        # fire, which is a different way of writing a field that does nothing.
+        for n in with_hb:
+            st = asl["States"][n]
+            assert st["HeartbeatSeconds"] < st.get("TimeoutSeconds", float("inf")), (
+                f"{n}: HeartbeatSeconds {st['HeartbeatSeconds']} is not below its "
+                f"TimeoutSeconds {st.get('TimeoutSeconds')}, so it can never fire")
 
     def test_the_state_machine_role_can_write_the_status_it_is_now_asked_to_write(self):
         """The grant and the ASL change are one fix: shipping the state without the

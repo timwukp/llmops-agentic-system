@@ -1,5 +1,5 @@
 {
-  "Comment": "llmops-pipeline — stage DAG with waitForTaskToken per harness task and the self-iteration remediation loop (eval gate fail -> remediate finetune, <=3 iterations, then escalate).",
+  "Comment": "llmops-pipeline — stage DAG with waitForTaskToken per harness task and the self-iteration remediation loop (eval gate fail -> remediate finetune, <=3 iterations, then escalate). TimeoutSeconds is the ONLY real ceiling on a stage: the driver Lambda's own 900s limit does not bound the stage, because it self-reinvokes across invocations via _continuation, but the task token it holds only lives for TimeoutSeconds. The six states that wait on real work (generate, curate, finetune launch, eval generate, eval gate, remediate) carry 86400 — a full day, on the platform owner's instruction, after a 480-teacher-call generation run was cut off at 7200s mid-work. The seven that do bookkeeping keep their hour: a wedged Teardown at 86400 would leave an ml.g5.2xlarge endpoint InService for a day at $1.515/hr, which is the exact shape of the 843-day orphan this project already paid for.",
   "StartAt": "PipelineModeChoice",
   "States": {
     "PipelineModeChoice": {
@@ -78,7 +78,7 @@
         }
       },
       "ResultPath": "$.data_prep_generate",
-      "TimeoutSeconds": 7200,
+      "TimeoutSeconds": 86400,
       "Retry": [
         {
           "ErrorEquals": [
@@ -118,7 +118,7 @@
         }
       },
       "ResultPath": "$.data_prep_curate",
-      "TimeoutSeconds": 7200,
+      "TimeoutSeconds": 86400,
       "Catch": [
         {
           "ErrorEquals": [
@@ -132,6 +132,7 @@
     },
     "FinetuneLaunch": {
       "Type": "Task",
+      "Comment": "Carried HeartbeatSeconds: 18000 until 2026-08-03, and it was a second, SHORTER deadline rather than the liveness signal it looks like: nothing in this platform ever calls SendTaskHeartbeat (grep the repo -- zero sites; the only reader of the field is the console's hover card, which merely displays it). So the first heartbeat never arrived and this state actually died at 18000s while its TimeoutSeconds said 21600. Removed rather than kept, because a heartbeat interval with no sender is a deadline nobody can see: the number in the ASL was not the number that fired. If a real heartbeat is ever implemented in the driver's continuation loop, this field comes back WITH it, and test_a_heartbeat_interval_requires_something_to_send_heartbeats is what will let it back in.",
       "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
       "Parameters": {
         "FunctionName": "${HarnessDriverArn}",
@@ -146,8 +147,7 @@
         }
       },
       "ResultPath": "$.training",
-      "TimeoutSeconds": 21600,
-      "HeartbeatSeconds": 18000,
+      "TimeoutSeconds": 86400,
       "Catch": [
         {
           "ErrorEquals": [
@@ -211,7 +211,7 @@
         }
       },
       "ResultPath": "$.evaluation_run",
-      "TimeoutSeconds": 21600,
+      "TimeoutSeconds": 86400,
       "Catch": [
         {
           "ErrorEquals": [
@@ -239,7 +239,7 @@
         }
       },
       "ResultPath": "$.evaluation",
-      "TimeoutSeconds": 7200,
+      "TimeoutSeconds": 86400,
       "Catch": [
         {
           "ErrorEquals": [
@@ -299,8 +299,7 @@
         }
       },
       "ResultPath": "$.remediation",
-      "TimeoutSeconds": 21600,
-      "HeartbeatSeconds": 18000,
+      "TimeoutSeconds": 86400,
       "Catch": [
         {
           "ErrorEquals": [

@@ -135,7 +135,8 @@ prompt 明文禁止它刪東西的 agent。
   `EscalatedToHuman` 給 conductor、以及 `send_task_failure` 放掉狀態機。而 SNS publish 原本是
   **第一個** 敘述且沒有包起來，所以一次 publish 失敗會把其他三個一起帶走 —— 包括那個 settle，
   於是一個已經升級的 run 上還掛著活的 task token，只能等該 stage 自己的 timeout
-  （data_prep 7200s、finetune 21600s）才被釋放。而這在**這個**呼叫上是最糟的閘門選擇：
+  （自 2026-08-03 起，每個做長工作的 state 都是 86400s，也就是整整一天）才被釋放。
+  而這在**這個**呼叫上是最糟的閘門選擇：
   發現當時**`llmops-escalations` 的訂閱者是零**，SNS 正是那條已知送不到任何人的通道。
   `deploy/03_storage.py` 的 `ensure_topic` 會把它報成
   `NO SUBSCRIBERS — every escalate_human call publishes into the void`，而不是把 topic
@@ -472,6 +473,37 @@ Lambda 硬上限 **900 秒**，而 harness 回合預算（`timeoutSeconds`）是
 與 task token 跨調用存活，對話從中斷處精確恢復。同一迴圈裡還烙著其他源自真實故障的
 生產模式：AgentCore 客戶端 `read_timeout=870, retries=0`（默認 60 秒會殺死長串流；
 自動重試會靜默重跑整輪 agent 回合），以及串流中途死亡時同 session 的一次性搶救重試。
+
+### 真正框住一個 stage 的只有一個死線
+
+這裡疊了三層 timeout，而只有一層是**工作**的上限：
+
+| 層 | 值 | 它框住什麼 |
+|---|---|---|
+| Harness 回合預算 | 840 秒 | 一輪 agent 回合 |
+| Driver Lambda `Timeout` | 900 秒 | 一次**調用** —— 不是 stage，因為 driver 會經 `_continuation` 自我重調 |
+| 狀態機 `TimeoutSeconds` | 做長工作的 state **86400 秒**，其餘 3600–7200 秒 | **stage** 本身：`.waitForTaskToken` 的 token 能活多久 |
+
+因為 driver 會把對話跨調用交給自己，Lambda 的 900 秒並不是「一個 stage 能跑多久」的限制
+—— **task token 的壽命**才是，而那就是 `TimeoutSeconds`。六個等待真實 agent 工作的 state
+（`DataPrepGenerate`、`DataPrepCurate`、`FinetuneLaunch`、`EvalGenerate`、`EvalGate`、
+`RemediateFinetune`）帶著 **86400 秒 —— 整整一天**，於 2026-08-03 依平台所有者的指示
+自 7200／21600 調高，起因是一個 480 次 teacher 呼叫的生成 run 在 7200 秒被工作中途切斷。
+
+其餘七個記帳 state 刻意保留一到兩小時。`Teardown` 是刪除 endpoint 的那一個，而
+`MonitorHealth`／`MonitorReport` 就坐在通往它的唯一路徑上：一個卡死的 `Teardown` 若是
+86400 秒，會讓一台 `ml.g5.2xlarge` 以 $1.515/hr 的價格 InService 整整一天 —— 那正是這個
+專案已經付過一次的、843 天零調用孤兒 endpoint 的形狀。這個切分由
+`tests/test_orchestration.py::TestStateMachine::test_a_stage_that_deletes_the_endpoint_keeps_a_short_timeout`
+斷言，而它對一個**未分類的新 state 會失敗**，而不是把它默默歸進任一邊。
+
+`FinetuneLaunch` 與 `RemediateFinetune` 在同一次改動之前還帶著 `HeartbeatSeconds: 18000`。
+那個欄位要成為活性訊號，前提是有東西在送心跳 —— 而這個平台從來沒有任何地方呼叫
+`SendTaskHeartbeat`，儘管 IAM role 是有授權的。於是第一次心跳永遠不會到，兩個 state 實際上
+**死在 18000 秒，而它們的 ASL 寫著 21600**，同時 console 的 hover card 還渲染出一列讓人安心的
+「heartbeat 18000s」。兩個欄位都被移除，而
+`test_a_heartbeat_interval_requires_something_to_send_heartbeats` 現在會拒絕「沒有送出方的
+欄位」：沒有人在送的心跳間隔不是監控，而是一條沒有任何介面會報出來的、更短的死線。
 
 ## 11. 生產環境的 VPC 態勢
 
