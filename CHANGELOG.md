@@ -88,6 +88,62 @@ present-with-`null` on one side and absent on the other: unequal dicts, and ever
 comparison agreeing, which is the one shape both walks are blind to. A control that goes
 uncaught means the test named the wrong subject, not that the control needs weakening.
 
+### A harness deploy has to prove it landed too — READY is not "serving what you sent"
+
+- **`05_harnesses.py` now reads each harness config back and refuses to call the deploy done
+  until the live config matches this tree.** It returned `action: "updated"`, `status:
+  "READY"` on the strength of `update_harness` returning 200 and `wait_ready` seeing READY.
+  Neither says anything about *what the harness answers with*, and READY is the more
+  dangerous of the two, because a harness serving a stale prompt is READY the entire time
+  it is wrong.
+- **Two harnesses were live-drifted when the guard was first run, and only one was known.**
+  `llmops_finops` still quoted the falsified orphan rate — the $18 daily figure that was half
+  the real one — although #41 had put `$36.36/day` on main two days earlier. The one nobody knew about: **`llmops_data_prep` was
+  932 characters behind main**, missing the entire Macie paragraph from #63 — so the
+  data-prep agent was still being told it had no way to report a real classification result,
+  months of that work deployed to S3 and never to the harness. The other five reported clean.
+- **The comparison is containment, and that is a measurement rather than a preference.** On a
+  perfectly synced harness `environment` still differs: the deploy sends
+  `networkConfiguration` + `lifecycleConfiguration`, and the service returns those *plus* the
+  `agentRuntimeArn`/`Name`/`Id` it assigned. Strict equality would report drift on every
+  correct deploy of all seven harnesses, forever — and a check that fails a correct deploy is
+  one the third person it wakes switches off, taking the real check with it. So the question
+  asked is: is every value we sent present and equal live? Keys the service added are its own
+  business. Verified against all seven live harnesses before shipping.
+- Drift is reported by **dotted field path** (`environment.agentCoreRuntimeEnvironment.
+  lifecycleConfiguration: sent, but ABSENT live`), and a long value by length plus first
+  divergence rather than pasted twice — the finops prompt is 6539 characters, and dumping
+  both sides is how the one line that mattered scrolls off the screen. "Sent but absent" is
+  kept distinct from "differs": different causes, different fixes.
+- **The read-back runs before `warm()`.** Warming first spends up to six real model turns
+  making a harness that serves the *wrong* prompt fast to reach, and prints a reassuring
+  "warmed" line above the failure.
+- The update payload and the read-back's field list are now one name (`UPDATED_FIELDS`). Two
+  lists that agree today drift later, and a field added to the send but not the check can
+  fail to land silently — this defect reintroduced one field at a time. `memory` is
+  deliberately excluded: it belongs to `04_wire_memory.py`, and reporting another owner's
+  field would make every run look broken.
+
+### A duplicate test name deletes the earlier test, and no count notices
+
+- **`test_no_test_function_name_is_defined_twice_in_a_file`.** Python keeps the later `def`,
+  so the first is never collected and never runs. Nothing in this repo noticed: the
+  collection total still goes *up*, so the count guard is satisfied, and the suite stays
+  green because the surviving test passes. Found by writing the harness guards above — a new
+  test reused the exact name of the ASL read-back test from #80, in the same file. That test
+  silently left the suite, and the negative control verifying it (`m93`) named the shadowed
+  node id: it would have gone on printing PASS while measuring a different test's failure.
+- Its own first control went **UNCAUGHT**, which is the same lesson in the same commit: the
+  guard asserted only "this repo has no duplicates", and that passes whether the detection
+  works or not while the tree is clean. Split into a detector checkable against input that
+  *has* the defect, plus a separate repo-wide sweep. A control that goes uncaught means the
+  test named the wrong subject — never that the mutation needs weakening.
+
+**808 pytest**, **113/113 negative controls** (99 mutations). Six new controls: the harness
+read-back deleted, equality demanded where the service adds keys, warming before confirming,
+the field list allowed to drift from the payload, an unreachable read claiming confirmed, and
+a shadowed duplicate going unreported.
+
 ## [1.2.0] — 2026-08-02
 
 Twenty-one merged PRs (#17–#38; #24 closed unmerged). The pattern across almost all of them
