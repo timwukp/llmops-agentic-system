@@ -202,7 +202,7 @@ def deploy_lambda(lam, ssm, region, account, key, cfg, dry, events=None):
     return {"lambda": cfg["fn"], "action": action}
 
 
-def deploy_state_machine(sfn, ssm, region, account, dry):
+def deploy_state_machine(sfn, ssm, region, account, dry, sleep=time.sleep):
     asl = (REPO / "orchestration" / "state_machine.asl.json").read_text()
     driver_arn = f"arn:aws:lambda:{region}:{account}:function:llmops-harness-driver"
     asl = asl.replace("${HarnessDriverArn}", driver_arn)
@@ -249,7 +249,94 @@ def deploy_state_machine(sfn, ssm, region, account, dry):
                                  roleArn=role_arn, type="STANDARD",
                                  tags=[{"key": "project", "value": "llmops-agentic-system"}])
         action = "created"
-    return {"state_machine": STATE_MACHINE_NAME, "action": action}
+    landed = confirm_state_machine_landed(sfn, sm_arn, asl, sleep=sleep)
+    return {"state_machine": STATE_MACHINE_NAME, "action": action, **landed}
+
+
+def state_machine_drift(sent: str, live: str) -> list:
+    """How the LIVE definition differs from the one just sent, state by state.
+
+    Semantic, not byte-wise: Step Functions happens to return the definition verbatim
+    today (measured), but a formatting-only difference is not a deploy failure, and a
+    check that calls it one gets switched off by the third person it wakes. What matters
+    is whether the machine will DO what the ASL says -- so the comparison is on parsed
+    JSON, and it names the states rather than dumping a 26 KB diff, because the useful
+    sentence is "EvalGenerate is absent live", not "definitions differ".
+    """
+    try:
+        want, got = json.loads(sent), json.loads(live)
+    except json.JSONDecodeError as exc:
+        return [{"problem": f"live definition is not JSON: {exc}"}]
+    if want == got:
+        return []
+    drift = []
+    ws, gs = want.get("States", {}), got.get("States", {})
+    for name in sorted(set(ws) - set(gs)):
+        drift.append({"state": name, "problem": "in the ASL being deployed, ABSENT live"})
+    for name in sorted(set(gs) - set(ws)):
+        drift.append({"state": name, "problem": "live, but absent from the ASL deployed"})
+    for name in sorted(set(ws) & set(gs)):
+        if ws[name] == gs[name]:
+            continue
+        fields = sorted(k for k in set(ws[name]) | set(gs[name])
+                        if ws[name].get(k) != gs[name].get(k))
+        drift.append({"state": name, "problem": f"differs on {fields}"})
+    for key in sorted((set(want) | set(got)) - {"States"}):
+        if want.get(key) != got.get(key):
+            drift.append({"top_level": key, "problem": "differs"})
+    if not drift:
+        # Equality failed and nothing above localised it. Reporting clean here would turn
+        # an unexplained difference into a pass, which is the failure this whole function
+        # exists to prevent -- so say that instead.
+        drift.append({"problem": "definitions differ in a way this check cannot localise"})
+    return drift
+
+
+def confirm_state_machine_landed(sfn, sm_arn: str, asl: str, attempts: int = 5,
+                                 sleep=time.sleep) -> dict:
+    """Read the definition back, and refuse to call the deploy done until it matches.
+
+    `update_state_machine` returning 200 is not evidence that the machine changed, and
+    this project has already paid for believing otherwise: `update_function_configuration`
+    was called without `Role`, so every run reported "updated" while the live function
+    kept the role it was born with -- silent in both directions. The state machine had the
+    same gap. On 2026-08-03 the live definition turned out to be missing `EvalGenerate`
+    ENTIRELY: merged 2026-08-02 as the whole point of #57 (the quality gate read
+    `evaluation/report.json` and nothing wrote it), suite green, ASL simply never
+    deployed. What caught it was a human reading the live definition by hand, a day later
+    and only because an unrelated timeout change sent them looking.
+
+    This is the argument `live_bus_translator_gap` already makes for rules -- a tree
+    cannot know what is live, only the live resource knows -- applied to the definition.
+
+    Polled rather than read once, because UpdateStateMachine is eventually consistent:
+    AWS documents that executions started immediately afterwards may still use the
+    PREVIOUS definition. A single read would fail on deploys that were in fact fine, and
+    a check that cries wolf is a check that gets deleted -- the same eventual consistency
+    that bit the push tool's ref read. It converges on the first attempt in practice; the
+    retries are what make a drift report trustworthy when one does come out.
+    """
+    last = [{"problem": "never read"}]
+    for i in range(attempts):
+        try:
+            live = sfn.describe_state_machine(stateMachineArn=sm_arn)
+        except Exception as exc:  # noqa: BLE001 — cannot confirm; must not claim confirmed
+            return {"definition_confirmed": False,
+                    "read_back_unreachable": f"{type(exc).__name__}: {exc}"}
+        last = state_machine_drift(asl, live["definition"])
+        if not last:
+            return {"definition_confirmed": True,
+                    "revision_id": live.get("revisionId"),
+                    "states_live": len(json.loads(live["definition"]).get("States", {}))}
+        if i < attempts - 1:
+            sleep(2 ** i)  # 1,2,4,8s — for eventual consistency, not a cure for drift
+    raise SystemExit(
+        f"{STATE_MACHINE_NAME}: the deploy call succeeded but the LIVE definition still "
+        f"disagrees with this tree's ASL after {attempts} reads — "
+        f"{json.dumps(last, indent=2)}\n"
+        "Every execution will run the live definition, not the one in this tree. Do not "
+        "record this deploy as done: nothing else in this repo compares the two, so this "
+        "message is the only place the disagreement is visible.")
 
 
 def live_bus_translator_gap(events, src: str, fn: str, bus: str) -> list:

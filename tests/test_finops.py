@@ -456,6 +456,206 @@ def test_the_documented_spine_lambda_count_matches_LAMBDAS():
             assert got == n, f"{doc} claims {c!r} spine Lambdas, LAMBDAS has {n}"
 
 
+# ---------------------------------------------------------------------------
+# The ASL deploy has to prove it landed (#80)
+# ---------------------------------------------------------------------------
+def _lambdas():
+    return _load("deploy_lambdas_readback", "deploy/07_lambdas.py")
+
+
+_ASL = json.dumps({
+    "StartAt": "A",
+    "States": {"A": {"Type": "Task", "TimeoutSeconds": 86400, "Next": "B"},
+               "B": {"Type": "Pass", "End": True}},
+})
+
+
+def _asl_without(state):
+    """The same ASL with one state removed — the shape the live machine was actually in."""
+    d = json.loads(_ASL)
+    d["States"].pop(state)
+    return json.dumps(d)
+
+
+class _SfnReads:
+    """describe_state_machine returns each queued definition in turn, last one repeating."""
+
+    exceptions = type("E", (), {"StateMachineDoesNotExist": Exception})
+
+    def __init__(self, *definitions):
+        self.queue, self.reads, self.updated = list(definitions), 0, []
+
+    def describe_state_machine(self, **kw):
+        i = min(self.reads, len(self.queue) - 1)
+        self.reads += 1
+        return {"definition": self.queue[i], "revisionId": f"rev-{i}"}
+
+    def update_state_machine(self, **kw):
+        self.updated.append(kw)
+        return {}
+
+
+def test_a_state_the_asl_declares_but_the_live_machine_lacks_is_named():
+    """The exact defect, reduced. On 2026-08-03 the live definition was missing
+    EvalGenerate entirely: merged 2026-08-02 as the whole point of #57 (the quality gate
+    read evaluation/report.json and nothing wrote it), the suite green, the ASL never
+    deployed. `action: "updated"` was the only thing the deployer had ever said about it.
+
+    The assertion is on the state NAME, not on "something differs": a report that says
+    "definitions differ" sends the reader to a 26 KB diff, and the whole value here is
+    the one-line answer.
+    """
+    mod = _lambdas()
+    drift = mod.state_machine_drift(_ASL, _asl_without("B"))
+    assert drift, "a live machine missing a state was reported as matching"
+    assert any(d.get("state") == "B" and "ABSENT live" in d["problem"] for d in drift), \
+        f"the drift report does not name the missing state: {drift}"
+
+
+def test_drift_reports_a_live_state_the_asl_no_longer_has():
+    """The other direction, and it is not symmetric noise: a state left behind live is
+    reachable by any execution whose path still names it, so a rename deployed as
+    add-plus-remove can leave the old one running forever."""
+    mod = _lambdas()
+    drift = mod.state_machine_drift(_asl_without("B"), _ASL)
+    assert any(d.get("state") == "B" and "absent from the ASL" in d["problem"]
+               for d in drift), drift
+
+
+def test_drift_names_the_fields_that_differ_on_a_shared_state():
+    """A timeout that never landed is the case that started this: the field has to be
+    named, because "A differs" does not tell you whether it was the timeout, the retry
+    policy or the next state."""
+    mod = _lambdas()
+    stale = json.loads(_ASL)
+    stale["States"]["A"]["TimeoutSeconds"] = 7200
+    drift = mod.state_machine_drift(_ASL, json.dumps(stale))
+    assert any(d.get("state") == "A" and "TimeoutSeconds" in d["problem"]
+               for d in drift), drift
+
+
+def test_identical_definitions_are_not_reported_as_drift():
+    """The check has to be silent when things are fine, or it gets switched off — and
+    then the next undeployed state is invisible again. Byte-for-byte equal, and also
+    equal-but-reformatted: Step Functions returns the definition verbatim today
+    (measured), but a whitespace difference is not a deploy failure."""
+    mod = _lambdas()
+    assert mod.state_machine_drift(_ASL, _ASL) == []
+    reformatted = json.dumps(json.loads(_ASL), indent=4, sort_keys=True)
+    assert mod.state_machine_drift(_ASL, reformatted) == [], \
+        "a formatting-only difference was reported as drift; this check cries wolf"
+
+
+def test_an_unexplained_difference_is_never_reported_as_clean():
+    """If equality fails and neither walk localises it, the honest answer is "differs,
+    cannot localise" -- not []. Returning clean would turn the one case this function
+    cannot explain into a pass, which is the failure it exists to prevent.
+
+    The input is the reachable version of that, not a contrived one: a key PRESENT with a
+    null value on one side and ABSENT on the other. The dicts are unequal (different key
+    sets) while every `.get()` comparison agrees, because both sides yield None. Both
+    walks are built on `.get`, so both are blind to exactly this shape.
+    """
+    mod = _lambdas()
+    with_null = json.dumps({**json.loads(_ASL), "Comment": None})
+    drift = mod.state_machine_drift(with_null, _ASL)
+    assert drift, "an unexplained difference was reported as no drift"
+    assert "cannot localise" in json.dumps(drift), \
+        f"the difference was localised after all -- this test's subject is wrong: {drift}"
+
+
+def test_a_deploy_whose_definition_never_lands_fails_loudly():
+    """The point of the task. update_state_machine returning 200 is not evidence the
+    machine changed — the sibling defect (update_function_configuration called without
+    Role) reported "updated" for months while the live function kept its birth role. So
+    a definition that never matches must stop the deploy, not annotate it.
+    """
+    mod = _lambdas()
+    sfn = _SfnReads(_asl_without("B"))
+    with pytest.raises(SystemExit) as exc:
+        mod.confirm_state_machine_landed(sfn, "arn:sm", _ASL, attempts=2,
+                                        sleep=lambda s: None)
+    msg = str(exc.value)
+    assert "B" in msg and "ABSENT live" in msg, f"the failure does not say what drifted: {msg}"
+    assert "not the one in this tree" in msg, \
+        "the failure does not say the live definition is what will execute"
+
+
+def test_a_confirmed_deploy_reports_the_revision_it_verified():
+    """"updated" is the deployer's own claim; the revision id and the live state count are
+    read back from the resource. That difference is the entire task."""
+    mod = _lambdas()
+    sfn = _SfnReads(_ASL)
+    out = mod.confirm_state_machine_landed(sfn, "arn:sm", _ASL, sleep=lambda s: None)
+    assert out["definition_confirmed"] is True
+    assert out["revision_id"] == "rev-0"
+    assert out["states_live"] == 2
+    assert sfn.reads == 1, "a matching definition should be confirmed on the first read"
+
+
+def test_eventual_consistency_is_waited_out_rather_than_reported_as_drift():
+    """UpdateStateMachine is eventually consistent — AWS documents that executions
+    started immediately after may still use the PREVIOUS definition. A single read would
+    fail on deploys that were in fact fine, and a check that cries wolf is a check that
+    gets deleted. Same eventual consistency that bit the push tool's ref read.
+    """
+    mod = _lambdas()
+    sfn = _SfnReads(_asl_without("B"), _ASL)   # stale first, correct on the retry
+    slept = []
+    out = mod.confirm_state_machine_landed(sfn, "arn:sm", _ASL, sleep=slept.append)
+    assert out["definition_confirmed"] is True, \
+        "a stale first read was reported as drift instead of being retried"
+    assert sfn.reads == 2 and slept == [1], f"reads={sfn.reads} slept={slept}"
+
+
+def test_a_read_back_that_cannot_run_says_so_instead_of_claiming_confirmed():
+    """No credentials, throttling, a deleted machine: all of them mean "unknown". The one
+    answer that must never come out of an unreachable read is "confirmed" -- the same
+    rule the dry-run's ASL validation already follows when the validator is unreachable.
+    """
+    mod = _lambdas()
+
+    class _Denied:
+        exceptions = type("E", (), {"StateMachineDoesNotExist": Exception})
+
+        def describe_state_machine(self, **kw):
+            raise RuntimeError("AccessDeniedException")
+
+    out = mod.confirm_state_machine_landed(_Denied(), "arn:sm", _ASL, sleep=lambda s: None)
+    assert out["definition_confirmed"] is False
+    assert "AccessDenied" in out["read_back_unreachable"]
+
+
+def test_the_asl_deploy_path_actually_calls_the_read_back():
+    """A verifier nothing invokes is the same defect one level up. Runs the real
+    deploy_state_machine against a live machine stuck on a stale definition and requires
+    the deploy to fail -- which is only possible if it read the definition back.
+    """
+    mod = _lambdas()
+    # Substituted exactly as the deployer will substitute it, so the ONLY drift in the
+    # report is the missing state. A fixture that also differs on every Parameters block
+    # would pass this test while proving nothing about which difference was detected.
+    asl = (REPO / "orchestration/state_machine.asl.json").read_text() \
+        .replace("${HarnessDriverArn}",
+                 "arn:aws:lambda:us-east-1:123456789012:function:llmops-harness-driver") \
+        .replace("${EventBusName}", "llmops-pipeline")
+    stale = json.loads(asl)
+    stale["States"].pop("EvalGenerate")   # the real state that was really missing
+
+    class _Ssm:
+        exceptions = type("E", (), {"ParameterNotFound": Exception})
+
+        def get_parameter(self, Name):
+            return {"Parameter": {"Value": "arn:aws:iam::123456789012:role/sfn"}}
+
+    sfn = _SfnReads(json.dumps(stale))
+    with pytest.raises(SystemExit) as exc:
+        mod.deploy_state_machine(sfn, _Ssm(), "us-east-1", "123456789012", False,
+                                 sleep=lambda s: None)
+    assert "EvalGenerate" in str(exc.value)
+    assert sfn.updated, "the deploy never even called update_state_machine"
+
+
 def _harness_s3(sid):
     doc = json.loads((REPO / "deploy/iam/harness_execution_role.json").read_text())
     for st in doc["permissionsPolicy"]["Statement"]:

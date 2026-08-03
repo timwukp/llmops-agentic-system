@@ -1386,6 +1386,80 @@ case("ASL: a heartbeat interval returns with nothing to send heartbeats",
      ["tests/test_orchestration.py::TestStateMachine::test_a_heartbeat_interval_requires_something_to_send_heartbeats"])
 
 
+def m90(t):
+    """Go back to trusting update_state_machine's 200 -- the state the deployer shipped in.
+
+    This is the whole defect, restored: the call succeeds, the deployer reports
+    action="updated", and nobody ever compares the live definition to the ASL. It ran that
+    way while the live machine was missing EvalGenerate for a day.
+    """
+    old = "    landed = confirm_state_machine_landed(sfn, sm_arn, asl, sleep=sleep)\n"
+    assert t.count(old) == 1, f"the read-back call has moved; found {t.count(old)}"
+    return t.replace(old, "    landed = {}\n", 1)
+
+
+case("deploy: the ASL deploy stops reading the definition back",
+     "deploy/07_lambdas.py", m90,
+     ["tests/test_finops.py::test_the_asl_deploy_path_actually_calls_the_read_back"])
+
+
+def m91(t):
+    """Report clean when the definitions differ but the walk localises nothing.
+
+    The tempting simplification -- if the per-state loop found nothing to say, there is
+    nothing wrong. It turns the one case this function cannot explain into a pass, and it
+    passes every test that feeds it a difference the walk CAN localise.
+    """
+    old = ('        drift.append({"problem": "definitions differ in a way this check '
+           'cannot localise"})')
+    assert t.count(old) == 1, f"the unexplained-difference branch has moved; {t.count(old)}"
+    return t.replace(old, "        pass", 1)
+
+
+case("deploy: an unexplained definition difference is reported as clean",
+     "deploy/07_lambdas.py", m91,
+     ["tests/test_finops.py::test_an_unexplained_difference_is_never_reported_as_clean"])
+
+
+def m92(t):
+    """Read the definition back exactly once, with no allowance for eventual consistency.
+
+    The opposite failure, and the reason the retry loop exists: UpdateStateMachine is
+    eventually consistent, so a single read fails on deploys that were fine. A check that
+    cries wolf is a check that gets deleted -- and then the next undeployed state is
+    invisible again.
+    """
+    old = "        if i < attempts - 1:\n            sleep(2 ** i)"
+    assert t.count(old) == 1, f"the retry backoff has moved; found {t.count(old)}"
+    return t.replace(old, "        if False:\n            sleep(2 ** i)", 1)
+
+
+case("deploy: the definition read-back gives up before eventual consistency settles",
+     "deploy/07_lambdas.py", m92,
+     ["tests/test_finops.py::test_eventual_consistency_is_waited_out_rather_than_reported_as_drift"])
+
+
+def m93(t):
+    """Claim confirmed when the read-back could not run at all.
+
+    No credentials, throttling, a deleted machine: all mean "unknown", and the one answer
+    that must never come out is "confirmed". The dry-run path already follows this rule for
+    an unreachable ASL validator; this is the same rule on the verify path.
+    """
+    old = ('            return {"definition_confirmed": False,\n'
+           '                    "read_back_unreachable": f"{type(exc).__name__}: {exc}"}')
+    assert t.count(old) == 1, f"the unreachable-read branch has moved; found {t.count(old)}"
+    return t.replace(
+        old,
+        '            return {"definition_confirmed": True,\n'
+        '                    "read_back_unreachable": f"{type(exc).__name__}: {exc}"}', 1)
+
+
+case("deploy: an unreachable read-back is reported as a confirmed deploy",
+     "deploy/07_lambdas.py", m93,
+     ["tests/test_finops.py::test_a_read_back_that_cannot_run_says_so_instead_of_claiming_confirmed"])
+
+
 #: Where the pristine text of the file currently mutated is parked, so a kill -9 -- which
 #: no handler can intercept -- still leaves the original recoverable. Under the repo root
 #: rather than /tmp because it must be obvious to whoever finds the tree dirty, and
