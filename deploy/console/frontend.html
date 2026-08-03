@@ -1240,7 +1240,16 @@ async function loadCost(){
     const pend = (es.pending||[]).length;
     $("kpiCostPending").textContent = String(pend);
     const lim = es.limits||{};
-    $("kpiCostPendingSub").textContent = "limit "+usd(lim.single_usd)+" per run / "+usd(lim.cumulative_usd)+" cumulative";
+    // The mode renders WITH the numbers, not beside them and not below the fold. In
+    // advisory -- the deployed default -- the reference is a report, not a gate: it names
+    // an over-budget run and launches it anyway. "limit $20,000 per run" on its own reads
+    // as a stop sign, which is the one thing it is not.
+    const enf = lim.enforced === true;
+    $("kpiCostPendingSub").innerHTML = "reference "+esc(usd(lim.single_usd))+" per run / "
+      +esc(usd(lim.cumulative_usd))+" cumulative &middot; <span style=\"color:"
+      +(enf?"var(--green)":"var(--amber)")+"\">"
+      +(enf ? "ENFORCED &mdash; an over-budget run is held for an approver"
+            : "ADVISORY &mdash; an over-budget run is reported, then launched anyway")+"</span>";
     const rc = ov.rate_card||{};
     $("kpiRateCard").textContent = rc.present ? String(rc.n_rates||0) : "—";
     $("kpiRateCardSub").textContent = !rc.present ? "no rate card — estimates unusable"
