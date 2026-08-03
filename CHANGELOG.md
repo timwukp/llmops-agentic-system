@@ -134,7 +134,21 @@ the pushed tree to the local one rather than by trusting a green push.
 
 ### Tests
 
-**782 pytest** (from 274 at v1.0.0), **96/96 negative controls** (82 mutations, 96
+- **The control runner leaked its mutation when signalled, and a `try/finally` was why nobody
+  noticed.** The restore has always been inside a `finally`, so the runner read as safe.
+  SIGTERM's default disposition terminates the process without unwinding — no `finally`, no
+  `atexit` — so killing it at a tool timeout left `m52`'s edit to `deploy/03_storage.py` in the
+  working tree, found afterwards by `git status` and nothing else. A full run takes ~3 minutes,
+  which makes being killed partway the ordinary case, not the exceptional one. The damage is
+  not the dirty file: it is the **next** run, which mutates an already-mutated file and then
+  reports PASS about code nobody wrote. Two defences, because neither covers the other's gap —
+  handlers that raise so the existing `finally` fires, and a journal written **before** the
+  mutation so `SIGKILL`, which no handler may intercept, still leaves the original recoverable
+  and the next start repairs the tree before trusting it. Verified against a real reproduction
+  in both directions: SIGTERM restored the file, SIGKILL leaked it, and the next start printed
+  `RECOVERED` and undid it.
+
+**783 pytest** (from 274 at v1.0.0), **99/99 negative controls** (85 mutations, 99
 (guard, mutation) pairs), **10/10 shell assertions**, three SVGs geometrically CLEAN against
 six checks. Offline by construction: `tests/conftest.py` strips AWS credentials and refuses
 non-loopback sockets, so a credentialed laptop cannot turn a test that hits production into a
