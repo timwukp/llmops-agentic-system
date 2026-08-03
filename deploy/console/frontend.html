@@ -277,7 +277,7 @@
   <div data-tab-panel="architecture" class="card col-12"><h2>This console &middot; how the dashboard itself is wired</h2>
     <div id="archOps"><span class="sub">loading diagram&hellip;</span></div>
     <div class="sub" style="margin-top:8px">One Lambda serves this page and its API. GETs are public, read-only aggregations;
-      every POST requires a Cognito token, and the $2,000 cost-approval gate is enforced server-side &mdash; the requester can
+      every POST requires a Cognito token, and the $20,000 cost-approval reference is enforced server-side &mdash; the requester can
       never approve their own estimate.</div>
   </div>
 
@@ -1404,7 +1404,7 @@ const PLAN_STATUSES = ["plan_proposed","pending_approval","accepting","dispatche
 function planArtifactHtml(t){
   if (!t || !PLAN_STATUSES.includes(String(t.status))) return "";
   const gateNote = t.status==="plan_proposed"
-    ? '<div class="sub" style="margin-top:8px">signing means: you approve this exact plan (its hash is signed with the project KMS key). Under $2,000 it dispatches immediately; over, it goes to the Cost approval queue.</div>' : "";
+    ? '<div class="sub" style="margin-top:8px">signing means: you approve this exact plan (its hash is signed with the project KMS key). Under $20,000 it dispatches immediately; over, it goes to the Cost approval queue.</div>' : "";
   const signBtn = t.status==="plan_proposed"
     ? '<div class="flex" style="margin-top:10px"><button class="primary" onclick="acceptTask()">&#9997;&#65039; Accept &amp; sign</button></div>' : "";
   return `<div class="msg m-artifact"><div class="arth">Proposed plan &middot; requires your signature</div>`+

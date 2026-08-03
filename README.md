@@ -10,7 +10,7 @@ lifecycle without human intervention: a **teacher LLM (DeepSeek-R1 on Bedrock)**
 training data, a **student model (Qwen3-1.7B)** is QLoRA-fine-tuned as a SageMaker training
 job, evaluated against quality gates, deployed to a SageMaker endpoint, and monitored —
 with a human pulled in only when an agent calls `escalate_human`, or when a run's estimated
-cost crosses the **$2000 approval gate**.
+cost crosses the **$20,000 reporting reference**.
 
 > **TEST-PROVEN**: every phase gate below is a real invocation on a real AWS account,
 > with evidence files in `deploy/evidence/` and results in `docs/TEST_RESULTS.md`.
@@ -124,7 +124,7 @@ script is idempotent, so re-running it updates in place.
 | **Observability** | Per-harness AgentCore metrics, daily volume, token spend, SageMaker training jobs and student endpoints |
 | **Evaluations** | Online eval configs with score gauges, plus batch evaluations |
 | **Optimizations** | Insights findings, then AWS-native prompt recommendations and Bedrock-drafted prompts — reviewed by a human, then applied via `UpdateHarness` |
-| **Cost** | Estimate a run line by line, approve or reject anything over $2000, then read actual spend by project/service/run against the estimate — see [docs/COST.md](docs/COST.md) |
+| **Cost** | Estimate a run line by line, approve or reject anything over the $20,000 reference, then read actual spend by project/service/run against the estimate — see [docs/COST.md](docs/COST.md) |
 
 Two things it is deliberately strict about:
 

@@ -58,6 +58,15 @@ asking what actually calls the thing, not by reading what declares it.
   Now derived from `describe_endpoint_config` (ml.g5.2xlarge ×1) against the documented hourly
   rate. The endpoint had been InService for 843 days (2024-04-11 → 2026-08-02) with 0
   invocations and 0.0% GPU utilization; deleted 2026-08-02 under explicit authorization.
+  **The sweep that corrected it missed the one file that matters most**: the guard was anchored
+  to the three files that sweep edited, so `agents/finops/harness.json` kept telling the auditor
+  the orphan cost half that rate — inside the very rule about never publishing an assumed number as a
+  measured one. A prompt is the worst place for a falsified figure: nobody opens a doc mid-audit,
+  and the agent re-reads its prompt on every invocation. The guard now scans **every**
+  `agents/*/harness.json` rather than naming the file that was wrong, since naming the file is how
+  the hole got there, and it requires the measured rate to be **present** — an absence-only check
+  passes on a deleted sentence, which would have left the attribute-by-resource rule with no
+  concrete example.
 - **`bedrock-monthly-dev` is stated in both directions** (#37) — its `Service: ["Amazon Bedrock"]`
   filter is simultaneously what kept the $1000 guardrail meaningful and what made it blind. No
   account-level control would ever have flagged that endpoint; the whole-account monitor sweep
@@ -66,6 +75,22 @@ asking what actually calls the thing, not by reading what declares it.
 - **The budget became advisory but stayed spoken aloud** (#21) — `BUDGET_MODE=advisory` reports
   the overage in `start_run`'s response rather than blocking. Removing the number entirely would
   have deleted the only line that says a run is more expensive than its plan.
+- **The reference is $20,000, raised from $2,000, and the deploy now sets it** — the platform
+  owner's instruction: this is the project's own design-and-test platform, not a customer's
+  production account, and the entire test-proven record cost ~$12–15. A reference low enough to
+  be crossed by ordinary work gets clicked past. Two things the raise exposed, both worse than
+  the number being low:
+  - `deploy.sh` set **neither** limit, so the live function reported `APPROVAL_LIMIT_USD: null`
+    and fell back to the console's own literal — which happened to agree. Nothing was wrong and
+    nothing could have told us when it stopped agreeing. Both are now derived from
+    `cost_model.DEFAULT_*_LIMIT_USD`, and the console's fallback copy is pinned equal to the
+    canonical one by a test, because two copies of a number with nothing comparing them is
+    exactly how one falsified figure survived in four files at once.
+  - **The straddle fixtures stopped straddling.** Nine budget tests were built on a literal
+    2,000,000 rows priced at $1,268 expected / $3,804 worst case — both under $20,000, so the
+    tests would have gone green while never engaging the budget check at all. Their own
+    docstrings named this hazard; a limit change is that hazard arriving on purpose. The plan is
+    now derived from the reference and the straddle is asserted on every use.
 - **A real PII scan, or an honest absence** (#36) — Macie `llmops-customer-data-pii`, daily
   SCHEDULED over `customer-data/`. Until it existed the audit's answer to "did anything scan
   this data" was silence, which reads as yes.
@@ -109,7 +134,21 @@ the pushed tree to the local one rather than by trusting a green push.
 
 ### Tests
 
-**779 pytest** (from 274 at v1.0.0), **87/87 negative controls** (76 mutations, 87
+- **The control runner leaked its mutation when signalled, and a `try/finally` was why nobody
+  noticed.** The restore has always been inside a `finally`, so the runner read as safe.
+  SIGTERM's default disposition terminates the process without unwinding — no `finally`, no
+  `atexit` — so killing it at a tool timeout left `m52`'s edit to `deploy/03_storage.py` in the
+  working tree, found afterwards by `git status` and nothing else. A full run takes ~3 minutes,
+  which makes being killed partway the ordinary case, not the exceptional one. The damage is
+  not the dirty file: it is the **next** run, which mutates an already-mutated file and then
+  reports PASS about code nobody wrote. Two defences, because neither covers the other's gap —
+  handlers that raise so the existing `finally` fires, and a journal written **before** the
+  mutation so `SIGKILL`, which no handler may intercept, still leaves the original recoverable
+  and the next start repairs the tree before trusting it. Verified against a real reproduction
+  in both directions: SIGTERM restored the file, SIGKILL leaked it, and the next start printed
+  `RECOVERED` and undid it.
+
+**783 pytest** (from 274 at v1.0.0), **99/99 negative controls** (85 mutations, 99
 (guard, mutation) pairs), **10/10 shell assertions**, three SVGs geometrically CLEAN against
 six checks. Offline by construction: `tests/conftest.py` strips AWS credentials and refuses
 non-loopback sockets, so a credentialed laptop cannot turn a test that hits production into a

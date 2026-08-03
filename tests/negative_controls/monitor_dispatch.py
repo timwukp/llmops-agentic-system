@@ -11,7 +11,7 @@ It is deliberately NOT a pytest module. Each case edits a tracked source file in
 restores it in a ``finally``; collecting that alongside the suite it mutates would let a
 crash mid-case leave the working tree broken and the next run's results meaningless.
 
-Two lessons are baked in, both learned by this harness reporting a false result:
+Three lessons are baked in, all learned by this harness reporting a false result:
 
   * **Assert the mutation applied.** A ``str.replace`` whose pattern has drifted is a no-op,
     and a no-op case prints "the guard caught nothing" -- which reads identically to a guard
@@ -25,8 +25,19 @@ Two lessons are baked in, both learned by this harness reporting a false result:
     as an uncaught break for a full debugging round while being perfectly sound. Verifying
     the patch applied is necessary and not sufficient: the interpreter has its own opinion
     about what the source is.
+  * **A ``finally`` does not run when the process is signalled.** The restore has always been
+    inside a ``finally``, and a mutation still leaked to disk: killing this runner at a
+    two-minute tool timeout left ``m52``'s edit to ``deploy/03_storage.py`` (``NO JOB SCANS``
+    -> ``no llmops job for``) in the working tree, noticed afterwards only by ``git status``.
+    SIGTERM's default disposition terminates the process outright -- no unwinding, no
+    ``finally``, no ``atexit``. A full run takes ~3 minutes, so being killed partway is the
+    ordinary case rather than the exceptional one, and the leak is silent in the worst way:
+    the next run mutates an already-mutated file, so every result after it is meaningless
+    while still printing PASS. Hence the two defences below -- handlers that turn a signal
+    into an ordinary exception so the existing ``finally`` fires, and a journal on disk that
+    survives even ``SIGKILL``, which no handler is allowed to intercept.
 """
-import json, os, pathlib, shutil, subprocess, sys
+import json, os, pathlib, shutil, signal, subprocess, sys
 
 REPO = pathlib.Path(__file__).resolve().parents[2]
 
@@ -1084,6 +1095,244 @@ case("finops: the orphan's idle lifetime is restated as one of its three wrong v
      ["tests/test_cost_model.py::test_the_orphans_idle_lifetime_is_derived_from_its_own_two_dates"])
 
 
+def m77(t):
+    """Lower the console's fallback limit and leave cost_model's alone.
+
+    This is the exact shape of the defect the pairing test was written for: two copies of
+    one number in two files, and until 2026-08-02 nothing compared them. The console's copy
+    is the one that decides what an undeployed or env-var-less invocation enforces, so a
+    silent disagreement means the tests all check $20,000 while the running code checks
+    something else.
+    """
+    old = 'os.environ.get("APPROVAL_LIMIT_USD", "20000")'
+    assert old in t, (
+        "the console's fallback limit literal has moved or been reworded; re-anchor this "
+        "mutation rather than letting it no-op")
+    return t.replace(old, 'os.environ.get("APPROVAL_LIMIT_USD", "2000")', 1)
+
+
+case("budget: the console's fallback limit disagrees with cost_model",
+     "deploy/console/lambda_function.py", m77,
+     ["tests/test_console_cost.py::test_the_consoles_fallback_limits_equal_the_canonical_ones"])
+
+
+def m78(t):
+    """Retype the limits in deploy.sh instead of reading them out of cost_model.
+
+    The pre-2026-08-02 state was worse than this -- the script set NEITHER var, so the live
+    function reported `APPROVAL_LIMIT_USD: null` and fell back to the console literal, which
+    happened to agree. Nothing was wrong and nothing could have told us when it stopped
+    agreeing. Hardcoding is that hazard with an extra copy: the deploy would keep shipping
+    2000 while every test in the repo asserted 20000.
+    """
+    old = 'LIMITS=$("$PY_FOR_BUILD" -c "import sys; sys.path.insert(0,\'$BUILD\'); import cost_model as c; \\\n  print(f\'{c.DEFAULT_SINGLE_RUN_LIMIT_USD:.0f} {c.DEFAULT_PROJECT_CUMULATIVE_LIMIT_USD:.0f}\')")'
+    assert old in t, (
+        "the deploy script's limit derivation has moved or been reworded; re-anchor this "
+        "mutation rather than letting it no-op")
+    return t.replace(old, 'LIMITS="2000 2000"', 1)
+
+
+case("budget: deploy.sh hardcodes the limits instead of deriving them",
+     "deploy/console/deploy.sh", m78,
+     ["tests/test_console_cost.py::test_the_deploy_script_sets_both_limits_and_reads_them_from_cost_model"])
+
+
+def m79(t):
+    """Put the old $2,000 reference back in the module that owns the arithmetic.
+
+    The number was raised by the platform owner's instruction, and the test carries it in
+    its NAME as well as its body for this reason: a diff that edits the constant and the
+    assert together still leaves a test called `..._are_the_20000_dollars_asked_for`
+    checking something else, which does not read as fine to anyone reviewing it.
+    """
+    old = "DEFAULT_SINGLE_RUN_LIMIT_USD = 20_000.0"
+    assert old in t, (
+        "the canonical single-run reference has moved or been reworded; re-anchor this "
+        "mutation rather than letting it no-op")
+    return t.replace(old, "DEFAULT_SINGLE_RUN_LIMIT_USD = 2_000.0", 1)
+
+
+case("budget: the canonical single-run reference silently reverts to $2,000",
+     "pipeline/contracts/cost_model.py", m79,
+     ["tests/test_cost_model.py::test_default_limits_are_the_20000_dollars_asked_for",
+      "tests/test_console_cost.py::test_the_consoles_fallback_limits_equal_the_canonical_ones"])
+
+
+def m80(t):
+    """Freeze the straddling plan back to the literal 2,000,000 rows it used at $2,000.
+
+    Not a hypothetical: this IS what raising the reference did, and it is the reason the
+    plan is derived now. 2M rows price at $1,268 expected / $3,804 worst case -- both under
+    $20,000 -- so every budget test downstream would stop engaging the budget check at all
+    and pass while testing nothing. A fixture that no longer triggers the check it exists to
+    trigger is the failure mode its own docstring names, so the straddle relation is
+    asserted on every use rather than assumed.
+    """
+    old = 'return {"sample_count": int(0.5 * limit / per_sample), "max_iterations": 3}'
+    assert old in t, (
+        "the straddling plan's derivation has moved or been reworded; re-anchor this "
+        "mutation rather than letting it no-op")
+    return t.replace(old, 'return {"sample_count": 2_000_000, "max_iterations": 3}', 1)
+
+
+case("budget: the straddling fixture stops straddling and tests nothing",
+     "tests/test_console_cost.py", m80,
+     ["tests/test_console_cost.py::test_the_budget_check_reads_worst_case_not_expected",
+      "tests/test_console_cost.py::test_an_over_budget_launch_says_so_in_its_own_response",
+      "tests/test_console_cost.py::test_lowering_the_limit_re_gates_an_already_clean_estimate"])
+
+
+def m81(t):
+    """Put the falsified $18/day back into the auditor's own system prompt.
+
+    m68 covers `cost_model.py`; the sweep that corrected the figure edited three files and
+    the guard was anchored to exactly those three, so the finops prompt kept stating the
+    stale rate inside the very rule about not publishing assumed numbers as measured ones.
+    A prompt is the worst place for it: the agent re-reads it on every invocation, and
+    nothing in the repo compared it to the arithmetic. This mutation restores that state.
+    """
+    old = "carried a JumpStart Whisper endpoint at $36.36/day"
+    assert old in t, "the corrected prompt sentence has moved; re-anchor this mutation"
+    return t.replace(old, "carried a JumpStart Whisper endpoint at ~$18/day", 1)
+
+
+case("finops: the auditor's prompt states the orphan rate the sweep guessed, not the one measured",
+     "agents/finops/harness.json", m81,
+     ["tests/test_cost_model.py::test_no_harness_prompt_states_the_falsified_orphan_rate"])
+
+
+def m82(t):
+    """Delete the measured rate from the prompt rather than falsifying it.
+
+    An absence-only guard passes on an empty page. Removing the excluded-spend example
+    leaves the attribute-by-resource rule abstract -- and that rule exists because a
+    service-level rollup billed hundreds of dollars of somebody else's Canvas and Whisper
+    spend to this project. The guard has to require the correction to be PRESENT, not
+    merely require the wrong number to be gone.
+    """
+    old = " at $36.36/day -- ml.g5.2xlarge x1 at $1.515/hr x 24 h"
+    assert old in t, "the measured-rate clause has moved; re-anchor this mutation"
+    return t.replace(old, "", 1)
+
+
+case("finops: the prompt drops the orphan's measured rate instead of correcting it",
+     "agents/finops/harness.json", m82,
+     ["tests/test_cost_model.py::test_no_harness_prompt_states_the_falsified_orphan_rate"])
+
+
+def m83(t):
+    """Take the signal handlers back off, leaving only the ``finally``.
+
+    This is the state the runner shipped in, and it read as safe: the restore WAS in a
+    ``finally``. SIGTERM's default disposition terminates without unwinding, so the mutation
+    survived on disk -- ``m52``'s edit to `deploy/03_storage.py` was found afterwards by
+    `git status`. Note this mutation edits the runner's own source: harmless, because the
+    running process already holds its bytecode and the pytest subprocess reads from disk.
+    """
+    # Assembled from fragments rather than written whole: this case mutates the file it
+    # lives IN, so a verbatim anchor would occur twice -- here and in the code it targets --
+    # and `replace(..., 1)` would rewrite this literal while leaving the handlers installed.
+    # It did exactly that, and the run scored the guard as having a hole it did not have.
+    old = "for _sig in (signal.SIG" + "TERM, signal.SIGINT, signal.SIGHUP):"
+    assert t.count(old) == 1, (
+        f"expected exactly one handler-installation loop, found {t.count(old)}; a "
+        "self-mutating case that matches its own anchor tests nothing")
+    return t.replace(old, "for _sig in ():", 1)
+
+
+case("controls: the runner drops its signal handlers and leaks the mutation on SIGTERM",
+     "tests/negative_controls/monitor_dispatch.py", m83,
+     ["tests/test_docs_claims.py::test_the_control_runner_restores_its_mutation_even_when_signalled"])
+
+
+def m84(t):
+    """Journal AFTER mutating instead of before.
+
+    An ordering bug that no test of the happy path can see: both writes happen, the restore
+    works, and every run passes. It only bites in the window between them -- crash there and
+    the file is mutated with nothing on disk that knows what it held. The guard compares
+    line numbers rather than trusting that the code reads in the order it executes.
+    """
+    journal = '    JOURNAL.write_text(json.dumps({"path": rel, "text": orig, "case": name}))\n'
+    mutate_line = "    p.write_text(new)\n"
+    assert journal + mutate_line in t, (
+        "the journal/mutate ordering has moved; re-anchor this mutation")
+    return t.replace(journal + mutate_line, mutate_line + journal, 1)
+
+
+case("controls: the recovery journal is written after the mutation, not before",
+     "tests/negative_controls/monitor_dispatch.py", m84,
+     ["tests/test_docs_claims.py::test_the_control_runner_restores_its_mutation_even_when_signalled"])
+
+
+def m85(t):
+    """Keep the journal but never read it -- a record with no repair.
+
+    The subtler half of the fix. Writing the pristine text is worthless on its own: SIGKILL
+    cannot be handled, so the ONLY thing that undoes that leak is the next run reading the
+    journal before it trusts the tree. Delete the call and the file still gets written, still
+    gets cleaned up on the normal path, and still looks like a recovery mechanism.
+    """
+    # Anchored on the call at column 0, which is the invocation; the def and the reference
+    # inside this docstring are both indented or quoted. Same self-mutation hazard as m83:
+    # an unanchored "_restore_from_journal()" matches three places in this file.
+    old = "\n_restore_from_journal()\n"
+    assert t.count(old) == 1, (
+        f"expected exactly one top-level recovery call, found {t.count(old)}; this case "
+        "mutates its own file, so an anchor that matches itself would test nothing")
+    return t.replace(old, "\n", 1)
+
+
+case("controls: the runner journals the original but never restores from it",
+     "tests/negative_controls/monitor_dispatch.py", m85,
+     ["tests/test_docs_claims.py::test_the_control_runner_restores_its_mutation_even_when_signalled"])
+
+
+#: Where the pristine text of the file currently mutated is parked, so a kill -9 -- which
+#: no handler can intercept -- still leaves the original recoverable. Under the repo root
+#: rather than /tmp because it must be obvious to whoever finds the tree dirty, and
+#: .gitignore'd so it can never be committed. The `finally` deletes it on the normal path,
+#: so its mere existence IS the "a run died mid-case" signal.
+JOURNAL = REPO / ".negative_control_journal"
+
+
+def _restore_from_journal():
+    """Undo a mutation left behind by a run that died before its ``finally``.
+
+    Runs at import, before any case executes, because the damage a leak does is not to the
+    run that leaked -- it is to the NEXT run, which mutates an already-mutated file and then
+    reports on code nobody wrote. Restoring first makes the harness self-healing instead of
+    compounding, and it prints what it did: a silent repair would hide that a previous run
+    was killed, which is itself worth knowing.
+    """
+    if not JOURNAL.exists():
+        return
+    saved = json.loads(JOURNAL.read_text())
+    target = REPO / saved["path"]
+    if target.read_text() != saved["text"]:
+        target.write_text(saved["text"])
+        print(f"RECOVERED  a previous run died mid-case and left {saved['path']} mutated; "
+              "restored it from the journal before starting")
+    JOURNAL.unlink()
+
+
+def _die_on_signal(signum, _frame):
+    """Turn a terminating signal into an exception so the restore ``finally`` actually runs.
+
+    Raising from the handler is the point: the default disposition for SIGTERM/SIGINT/SIGHUP
+    terminates the process without unwinding the stack, so `finally` never executes and the
+    mutation stays on disk. ``KeyboardInterrupt`` is deliberate rather than a custom class --
+    it propagates through the loop exactly like a Ctrl-C already does, a path this runner has
+    always handled correctly, so signalled and interrupted become one code path instead of
+    two. SIGKILL cannot be caught at all, which is what the journal is for.
+    """
+    raise KeyboardInterrupt(f"terminated by signal {signum}")
+
+
+for _sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+    signal.signal(_sig, _die_on_signal)
+_restore_from_journal()
+
 failed = []
 for name, rel, mutate, tests in CASES:
     p = REPO / rel
@@ -1093,6 +1342,9 @@ for name, rel, mutate, tests in CASES:
         print(f"SKIP-BROKEN  {name}: patch was a no-op (guard NOT verified)")
         failed.append(name)
         continue
+    # Journal BEFORE mutating, never after: a crash in the window between the two would
+    # otherwise leave a mutated file with no record of what it used to be.
+    JOURNAL.write_text(json.dumps({"path": rel, "text": orig, "case": name}))
     p.write_text(new)
     for cache in REPO.glob("**/__pycache__"):
         if ".venv" not in str(cache):
@@ -1101,6 +1353,7 @@ for name, rel, mutate, tests in CASES:
         results = [(t, *run(t)) for t in tests]
     finally:
         p.write_text(orig)
+        JOURNAL.unlink(missing_ok=True)
     for t, rc, last in results:
         ok = rc == PYTEST_TESTS_FAILED
         why = "" if ok else f"  [pytest exit {rc}, wanted {PYTEST_TESTS_FAILED}]"

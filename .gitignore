@@ -4,3 +4,7 @@ __pycache__/
 .DS_Store
 deploy/evidence/*.local.*
 pipeline/v2/out/
+# Written by tests/negative_controls/monitor_dispatch.py while one file is mutated, so a
+# run killed mid-case can restore it on the next start. Never committed: it holds the
+# pristine copy of a tracked source file, and committing it would be committing a duplicate.
+.negative_control_journal

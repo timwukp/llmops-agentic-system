@@ -3,7 +3,7 @@
 This is the single place cost arithmetic lives, mirroring ``report.py``'s role as the
 one canonical report writer. Nothing here touches AWS: the caller fetches rates and
 realized usage, this module decides what they mean. That split is what makes the
-$2000 approval gate testable without a bill.
+$20,000 approval reference testable without a bill.
 
 The design rule, from which most of the odd-looking details below follow:
 
@@ -14,7 +14,7 @@ item carries the formula that produced it (``basis``); a SKU with no rate is *li
 in ``unpriced`` rather than silently contributing $0; and a Cost Explorer period still
 marked ``Estimated`` settles as ``provisional``, never as ``settled``. A confidently
 wrong cost figure is worse than an admitted unknown, because a human approves a
-$2000 run on the strength of it.
+$20,000 run on the strength of it.
 
 Measured facts this module is calibrated against (all verified on the live account
 2026-07-31, see docs/COST.md):
@@ -107,8 +107,23 @@ CATEGORIES = ("sagemaker_training", "sagemaker_inference", "bedrock_teacher",
 
 #: Default budget references (USD). Dual reference: a single expensive run passes the
 #: first, a drip of cheap runs against the same project passes the second.
-DEFAULT_SINGLE_RUN_LIMIT_USD = 2000.0
-DEFAULT_PROJECT_CUMULATIVE_LIMIT_USD = 2000.0
+#:
+#: $20,000, raised from $2,000 on 2026-08-02 by the platform owner's instruction: this is
+#: the project's own design-and-test platform, not a customer's production account, and a
+#: reference set low enough to be crossed by ordinary work is a reference that gets
+#: ignored. Every real run to date has cost single-digit dollars (the whole test-proven
+#: record, six agents through five e2e iterations, was ~$12-15), so nothing legitimate
+#: comes near this.
+#:
+#: Why raise it rather than remove it, which is what "money is not a problem" might
+#: suggest: with BUDGET_MODE=advisory the number does not stop anything, so its ONLY
+#: remaining job is to be the line that makes an over-estimate run get named in
+#: `budget_notice`. Delete the number and that line goes too -- there would be nothing
+#: left that could say "this run cost far more than it was estimated at", which is the
+#: failure this whole module exists to catch. A high reference still reports; no
+#: reference reports nothing.
+DEFAULT_SINGLE_RUN_LIMIT_USD = 20_000.0
+DEFAULT_PROJECT_CUMULATIVE_LIMIT_USD = 20_000.0
 
 #: How the budget behaves when a run exceeds it.
 #:
@@ -295,7 +310,7 @@ def estimate_run(plan: dict, rates: RateCard | dict) -> dict:
 
     Returns line items, per-category subtotals, ``total_usd`` (expected) AND
     ``worst_case_usd`` (every remediation iteration taken). The approval gate reads
-    the worst case: approving $2000 that can silently become $6000 because the
+    the worst case: reporting $2,000 for something that can silently become $6,000 because the
     self-remediation loop ran three times is not a gate.
     """
     if isinstance(rates, dict):
@@ -552,7 +567,7 @@ def check_approval(record: dict, approver: str, approver_groups: Iterable[str],
 
     1. the actor must hold ``required_group``;
     2. the actor must not be the requester — self-approval is REJECTED outright, not
-       merely annotated, so a $2000 gate cannot be cleared by the person who opened it.
+       merely annotated, so the gate cannot be cleared by the person who opened it.
     """
     groups = {str(g) for g in (approver_groups or [])}
     if required_group not in groups:

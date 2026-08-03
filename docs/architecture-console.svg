@@ -151,7 +151,7 @@
   <path class="wireR" d="M396,252 L396,384 L974.0,384 L974.0,440" marker-end="url(#ahR)"/>
 
   <text class="sub" x="974.0" y="520" text-anchor="middle">async → finops-reconcile λ → harness-driver λ → llmops_finops</text>
-  <text class="sub" x="286" y="520">$2000 gate, server-side not in the UI: advisory now, blocking by env</text>
+  <text class="sub" x="286" y="520">$20,000 reference, server-side not in the UI: advisory now, blocking by env</text>
   <text class="bandT" x="286" y="570">CONSULT PLANE — Tasks tab: one thread per engagement · the only console path that invokes an agent</text>
   <a href="https://github.com/timwukp/llmops-agentic-system/blob/main/deploy/console/lambda_function.py" target="_top">
     <g>

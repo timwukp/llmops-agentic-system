@@ -7,7 +7,7 @@
 七個 AI agent —— 指揮家（orchestrator）、數據準備、微調、評估、部署、監控五位階段專家，加上一位 FinOps 審計員 —— 無人干預地執行完整 LLMOps 生命週期：
 **teacher 大模型（Bedrock 上的 DeepSeek-R1）**生成訓練數據，**student 小模型（Qwen3-1.7B）**
 以 SageMaker 訓練作業做 QLoRA 微調，通過質量門檻評估後部署到 SageMaker endpoint 並持續監控 ——
-只有 agent 呼叫 `escalate_human`、或某次 run 的估算費用跨過 **$2000 審批閘門**時，才需要人類介入。
+只有 agent 呼叫 `escalate_human`、或某次 run 的估算費用跨過 **$20,000 通報基準**時，才需要人類介入。
 
 > **TEST-PROVEN（以測試為證）**：下方每個階段門檻都是在真實 AWS 帳號上的真實調用，
 > 證據文件在 `deploy/evidence/`，結果彙總在 `docs/TEST_RESULTS.md`。
@@ -107,7 +107,7 @@ Gateway，搭配 Cognito 認證：讀取公開，所有寫入都必須帶 Bearer
 | **Observability** | 各 harness 的 AgentCore 指標、每日用量、token 花費、SageMaker 訓練作業與 student endpoint |
 | **Evaluations** | 線上評估配置與分數儀表，以及批次評估 |
 | **Optimizations** | 先看 Insights 發現，再看 AWS 原生 prompt 建議與 Bedrock 起草的 prompt —— 經人工審核後才透過 `UpdateHarness` 套用 |
-| **Cost** | 逐列估算一個 run 的費用、批准或駁回超過 $2000 的請求，再依專案／服務／run 對照估算讀取實際支出 —— 見 [docs/COST.zh-TW.md](docs/COST.zh-TW.md) |
+| **Cost** | 逐列估算一個 run 的費用、批准或駁回超過 $20,000 基準的請求，再依專案／服務／run 對照估算讀取實際支出 —— 見 [docs/COST.zh-TW.md](docs/COST.zh-TW.md) |
 
 有兩點是刻意做嚴的：
 

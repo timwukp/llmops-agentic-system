@@ -67,7 +67,7 @@ replace `rate_card_latest.json` until regenerated through the module — because
 
 **This is the whole point.** The failure mode that would have mattered is a
 confident-looking 37-SKU card that nobody could regenerate next month. Someone approves
-a $2000 run on these figures. Fail-closed held under conditions nobody designed for.
+a five-figure run on these figures. Fail-closed held under conditions nobody designed for.
 
 ## Rate card contents (derived, provisional, not yet published)
 

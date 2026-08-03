@@ -630,6 +630,97 @@ def test_the_documented_negative_control_count_matches_the_runner():
                 "result with a failing control in it is not evidence of anything")
 
 
+def test_the_control_runner_restores_its_mutation_even_when_signalled():
+    """A ``finally`` does not run when the process is signalled, and this one didn't.
+
+    The restore was already inside a ``try/finally``, so the runner read as safe. It is not:
+    the default disposition for SIGTERM terminates the process without unwinding, so killing
+    this runner at a tool timeout left ``m52``'s edit to ``deploy/03_storage.py`` sitting in
+    the working tree -- found later by ``git status``, not by anything in the repo. A full
+    run takes ~3 minutes, which makes being killed partway the ordinary case.
+
+    What makes the leak dangerous is not the dirty file, it is the NEXT run: it mutates an
+    already-mutated file, and every result after that describes code nobody wrote while
+    still printing PASS. So two things are asserted, because each covers what the other
+    cannot:
+
+      * a handler for each catchable terminating signal, so the existing ``finally`` fires;
+      * a journal written BEFORE the mutation, so ``SIGKILL`` -- which no handler is allowed
+        to intercept -- still leaves the pristine text recoverable, and a later run repairs
+        the tree before it trusts it.
+
+    Asserting on the source rather than by signalling a subprocess is deliberate: this suite
+    is offline and must not spawn a 3-minute run, and both mechanisms were verified live
+    against a real reproduction (SIGTERM restored the file; SIGKILL leaked it; the next start
+    printed ``RECOVERED`` and repaired it) before this guard was written.
+
+    Every assertion below is scoped to statements at MODULE LEVEL, and that is the whole
+    lesson of this guard's own negative controls. The controls that break this fix are the
+    only ones in the runner that mutate the file they live in, so the strings they contain
+    are in the same file as the code they target -- a plain ``in src`` check was satisfied by
+    a mutation's own body while the mechanism it names was disabled, and two controls came
+    back UNCAUGHT against a guard that looked thorough. Function bodies and docstrings do not
+    install signal handlers; only module-level statements do.
+    """
+    src = (REPO / "tests/negative_controls/monitor_dispatch.py").read_text()
+    tree = ast.parse(src)
+    #: Statements that actually execute when the runner starts -- not the contents of a
+    #: ``def``, and not a string that merely mentions the right identifier.
+    toplevel = [n for stmt in tree.body for n in ast.walk(stmt)
+                if not isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))]
+
+    installs = [n for n in toplevel
+                if isinstance(n, ast.Call)
+                and getattr(n.func, "attr", None) == "signal"
+                and getattr(n.func.value, "id", None) == "signal"]
+    assert installs, (
+        "the control runner installs no signal handler at module level; its restore lives "
+        "in a finally, and a finally does not run when the process is signalled -- the "
+        "mutation stays on disk and the next run reports on code nobody wrote")
+    handled = {n.attr for n in toplevel
+               if isinstance(n, ast.Attribute) and n.attr.startswith("SIG")}
+    for sig in ("SIGTERM", "SIGINT", "SIGHUP"):
+        assert sig in handled, (
+            f"the control runner installs no handler for {sig}; a terminating signal it "
+            "does not catch skips the restore entirely and leaks the mutation to disk")
+
+    # The journal must be written before the mutation, not after: a crash in the window
+    # between them would leave a mutated file with no record of what it replaced. Compare
+    # line numbers rather than trusting the reading order of the file.
+    journal_write = [n.lineno for n in ast.walk(tree)
+                     if isinstance(n, ast.Call)
+                     and getattr(n.func, "attr", None) == "write_text"
+                     and getattr(n.func.value, "id", None) == "JOURNAL"]
+    assert journal_write, (
+        "nothing writes the recovery journal; without it a SIGKILL leaves a mutated "
+        "tracked file with nothing on disk that knows what it used to contain")
+    mutation_write = [n.lineno for n in ast.walk(tree)
+                      if isinstance(n, ast.Call)
+                      and getattr(n.func, "attr", None) == "write_text"
+                      and getattr(n.func.value, "id", None) == "p"]
+    assert mutation_write and min(journal_write) < min(mutation_write), (
+        "the journal is written after the file is mutated; a crash in between leaves the "
+        "mutation on disk with no record of the original")
+
+    # Module level again, for the same reason: this identifier appears three times in the
+    # file -- the def, this control's own anchor string, and the one call that matters.
+    recovers = [n for n in toplevel
+                if isinstance(n, ast.Call)
+                and getattr(n.func, "id", None) == "_restore_from_journal"]
+    assert recovers, (
+        "the runner never calls its own recovery at module level; a journal nothing reads "
+        "is a file, not a repair. SIGKILL cannot be handled, so reading the journal on the "
+        "next start is the ONLY thing that undoes that leak")
+    assert min(r.lineno for r in recovers) < min(journal_write), (
+        "recovery runs after the first case has already mutated a file; the repair has to "
+        "happen before the runner trusts the tree, or it mutates an already-mutated file")
+
+    ignored = (REPO / ".gitignore").read_text()
+    assert ".negative_control_journal" in ignored, (
+        "the recovery journal is not gitignored; it holds a pristine copy of a tracked "
+        "source file, so an untracked-file sweep would commit the duplicate")
+
+
 def test_the_shell_suite_is_documented_with_its_assertion_count():
     """CI runs ``tests/*.sh``; the pytest-derived count guard cannot see a single one.
 

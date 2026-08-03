@@ -533,7 +533,7 @@ harness 角色對 `skills/*` 只有 `GetObject` 與 `ListBucket`，沒有寫入�
   元件，會把支出控制的權限放錯位置 —— 而一個能對自己的發現直接動手的審計員，那些發現就
   再也沒有獨立的檢查了。
 
-$2000 審批閘門住在 console 與 `cost_model.py`，不在審計員身上，理由相同：**衡量支出的東西，
+$20,000 審批基準住在 console 與 `cost_model.py`，不在審計員身上，理由相同：**衡量支出的東西，
 不是授權支出的東西。** 見 [COST.zh-TW.md](COST.zh-TW.md)。
 
 全程最小權限 IAM（無 `*FullAccess`），所有資源限定 `llmops-*` 範圍；本 repo 公開：
