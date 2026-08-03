@@ -1460,6 +1460,123 @@ case("deploy: an unreachable read-back is reported as a confirmed deploy",
      ["tests/test_finops.py::test_a_read_back_that_cannot_run_says_so_instead_of_claiming_confirmed"])
 
 
+def m94(t):
+    """Stop reading the harness config back after the update (#81).
+
+    The state this restores is the one that let the live llmops_finops prompt quote a
+    falsified $18/day for two days while status read READY -- and llmops_data_prep sit 932
+    characters behind main, with the Macie paragraph from #63 never deployed.
+    """
+    old = "    out.update(confirm_harness_landed(ctl, harness_id, sent))"
+    assert t.count(old) == 1, f"the harness read-back call has moved; found {t.count(old)}"
+    return t.replace(old, "    out.update({})", 1)
+
+
+case("deploy: the harness deploy stops reading its config back",
+     "deploy/05_harnesses.py", m94,
+     ["tests/test_finops.py::test_the_harness_deploy_path_actually_calls_the_read_back"])
+
+
+def m95(t):
+    """Compare by equality instead of containment.
+
+    This is the plausible-looking version of the check, and it is exactly why the guard
+    needs a control: it reports drift on EVERY correct deploy, because the service adds
+    agentRuntimeArn/Name/Id to the environment it returns. A check that fails a correct
+    deploy is one somebody switches off, taking the real check with it.
+    """
+    old = """        if isinstance(want, dict) and isinstance(got, dict):
+            inner = _dict_drift(want, got, f)
+            if inner:
+                drift.extend(inner)
+                continue
+            # Every key we sent matched; the difference is keys the service added.
+            continue"""
+    assert t.count(old) == 1, f"the containment branch has moved; found {t.count(old)}"
+    return t.replace(old, "        pass", 1)
+
+
+case("deploy: the config read-back demands equality the service never returns",
+     "deploy/05_harnesses.py", m95,
+     ["tests/test_finops.py::test_the_service_adding_its_own_keys_is_not_reported_as_drift"])
+
+
+def m96(t):
+    """Warm the harness before confirming what it serves.
+
+    Six model turns spent making a stale prompt fast to reach, and a reassuring "warmed"
+    line printed above the failure.
+    """
+    old = "    out.update(confirm_harness_landed(ctl, harness_id, sent))\n"
+    assert t.count(old) == 1, f"the read-back call has moved; found {t.count(old)}"
+    t = t.replace(old, "", 1)
+    tail = '        out.update(warm(dat, h["arn"], harness_id))\n'
+    assert t.count(tail) == 1, f"the warm call has moved; found {t.count(tail)}"
+    return t.replace(tail, tail + old, 1)
+
+
+case("deploy: the harness is warmed before its config is confirmed",
+     "deploy/05_harnesses.py", m96,
+     ["tests/test_finops.py::test_the_config_is_confirmed_before_any_turn_is_spent_warming_it"])
+
+
+def m97(t):
+    """Let the update payload name its own field list again.
+
+    Two lists that agree today and drift later: a field added to the update call but not to
+    the read-back can fail to land silently, which is this defect reintroduced one field at
+    a time.
+    """
+    old = "if k in UPDATED_FIELDS}"
+    assert t.count(old) == 1, f"the shared field list has moved; found {t.count(old)}"
+    return t.replace(
+        old,
+        'if k in ("model", "systemPrompt", "tools", "skills", "allowedTools",\n'
+        '                           "maxIterations", "maxTokens", "timeoutSeconds",\n'
+        '                           "truncation", "environment", "environmentVariables")}', 1)
+
+
+case("deploy: the update payload stops deriving from the checked field list",
+     "deploy/05_harnesses.py", m97,
+     ["tests/test_finops.py::test_the_read_back_checks_exactly_the_fields_the_update_sends"])
+
+
+def m98(t):
+    """Claim confirmed when the harness read-back could not run at all."""
+    old = ('            return {"config_confirmed": False,\n'
+           '                    "read_back_unreachable": f"{type(exc).__name__}: {exc}"}')
+    assert t.count(old) == 1, f"the unreachable-read branch has moved; found {t.count(old)}"
+    return t.replace(
+        old,
+        '            return {"config_confirmed": True,\n'
+        '                    "read_back_unreachable": f"{type(exc).__name__}: {exc}"}', 1)
+
+
+case("deploy: an unreachable harness read-back is reported as confirmed",
+     "deploy/05_harnesses.py", m98,
+     ["tests/test_finops.py::"
+      "test_a_harness_read_back_that_cannot_run_says_so_instead_of_claiming_confirmed"])
+
+
+def m99(t):
+    """Stop reporting a name seen a second time.
+
+    The detector goes silent while still returning a list, so both its claims read true on a
+    clean tree. Its first version aimed this control at the repo-wide sweep, which passes
+    whether the detection works or not -- the tree had no duplicates -- and the control went
+    UNCAUGHT. That is the signal that the test named the wrong subject: the fix was to make
+    the detection checkable on input that has the defect, not to weaken the mutation.
+    """
+    old = '                dupes.append(f"{node.name} (line {node.lineno})")'
+    assert t.count(old) == 1, f"the duplicate report has moved; found {t.count(old)}"
+    return t.replace(old, "                pass", 1)
+
+
+case("docs: a shadowed duplicate test name is not reported",
+     "tests/test_docs_claims.py", m99,
+     ["tests/test_docs_claims.py::test_a_test_name_defined_twice_in_one_module_is_reported"])
+
+
 #: Where the pristine text of the file currently mutated is parked, so a kill -9 -- which
 #: no handler can intercept -- still leaves the original recoverable. Under the repo root
 #: rather than /tmp because it must be obvious to whoever finds the tree dirty, and

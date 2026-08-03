@@ -376,6 +376,227 @@ def test_the_auditor_lambda_runs_under_its_own_role_not_the_drivers():
     assert "/llmops/iam/lambda_driver_arn" not in finops
 
 
+# The harness deploy has to prove it landed too (#81). Same defect as the Role above and
+# as the ASL read-back in #80, one resource over: a call that returned is not a change that
+# landed, and for a harness READY is the reassuring surface that hides it.
+
+def _h5():
+    return _load("deploy_harnesses_readback", "deploy/05_harnesses.py")
+
+
+def _sent(prompt="new", **over):
+    """A config in the shape create_or_update sends: only UPDATED_FIELDS, resolved."""
+    cfg = {"systemPrompt": [{"text": prompt}],
+           "model": {"bedrockModelConfig": {"modelId": "global.anthropic.claude-fable-5"}},
+           "maxTokens": 65536, "timeoutSeconds": 840,
+           "environment": {"agentCoreRuntimeEnvironment": {
+               "networkConfiguration": {"networkMode": "PUBLIC"}}}}
+    cfg.update(over)
+    return cfg
+
+
+class _CtlReads:
+    """get_harness returns each queued config in turn, the last one repeating."""
+    def __init__(self, *harnesses):
+        self.queue, self.reads = list(harnesses), 0
+
+    def get_harness(self, **kw):
+        i = min(self.reads, len(self.queue) - 1)
+        self.reads += 1
+        return {"harness": self.queue[i]}
+
+
+def test_the_service_adding_its_own_keys_is_not_reported_as_drift():
+    """Containment, not equality -- and this is the measurement that forced it.
+
+    On a harness that is perfectly in sync, ``environment`` still differs: the deploy sends
+    networkConfiguration + lifecycleConfiguration and the service returns those plus the
+    agentRuntimeArn/Name/Id it assigned. Strict equality would therefore report drift on
+    every correct deploy of all seven harnesses, forever -- and a check that cries wolf on a
+    correct deploy is a check the third person it wakes switches off. Verified live against
+    all seven harnesses: five reported CLEAN under containment.
+    """
+    m = _h5()
+    sent = _sent()
+    live = {"systemPrompt": [{"text": "new"}],
+            "model": {"bedrockModelConfig": {"modelId": "global.anthropic.claude-fable-5"}},
+            "maxTokens": 65536, "timeoutSeconds": 840,
+            "environment": {"agentCoreRuntimeEnvironment": {
+                "networkConfiguration": {"networkMode": "PUBLIC"},
+                "agentRuntimeArn": "arn:aws:bedrock-agentcore:us-east-1:123456789012:"
+                                   "runtime/harness_x-abc",
+                "agentRuntimeId": "harness_x-abc"}},
+            "harnessVersion": "6", "status": "READY", "createdAt": "whenever"}
+    assert m.harness_config_drift(sent, live) == []
+
+
+def test_a_prompt_that_did_not_land_is_named_as_drift():
+    """The live #77 shape: main says one thing, the harness serves another, status READY."""
+    m = _h5()
+    drift = m.harness_config_drift(_sent(prompt="the $36.36/day figure"),
+                                   {"systemPrompt": [{"text": "the ~$18/day figure"}],
+                                    "status": "READY"})
+    assert any(d["field"] == "systemPrompt" for d in drift), \
+        f"a stale prompt was not reported: {drift}"
+
+
+def test_a_field_absent_live_is_distinguished_from_one_that_differs():
+    """"sent, but ABSENT live" and "differs" have different causes and different fixes.
+
+    A field the service dropped means the update did not carry it; a field with another
+    value means something else deployed. Collapsing both into "differs" makes the log ask
+    the reader to guess which.
+    """
+    m = _h5()
+    sent = _sent(environment={"agentCoreRuntimeEnvironment": {
+        "lifecycleConfiguration": {"maxLifetime": 28800}}})
+    drift = m.harness_config_drift(sent, {"systemPrompt": [{"text": "new"}],
+                                          "model": sent["model"],
+                                          "maxTokens": 65536, "timeoutSeconds": 840,
+                                          "environment": {"agentCoreRuntimeEnvironment": {}}})
+    paths = {d["field"]: d["problem"] for d in drift}
+    assert "environment.agentCoreRuntimeEnvironment.lifecycleConfiguration" in paths, \
+        f"the absent nested field was not named by its path: {drift}"
+    assert "ABSENT live" in \
+        paths["environment.agentCoreRuntimeEnvironment.lifecycleConfiguration"]
+
+
+def test_a_field_the_deployer_never_sends_is_not_its_drift_to_report():
+    """``memory`` belongs to 04_wire_memory.py. Reporting it here would make every run of
+    this script look broken over a field it deliberately does not touch -- and a report full
+    of another owner's differences is one nobody finishes reading."""
+    m = _h5()
+    assert "memory" not in m.UPDATED_FIELDS
+    drift = m.harness_config_drift(_sent(), {"systemPrompt": [{"text": "new"}],
+                                             "model": _sent()["model"],
+                                             "maxTokens": 65536, "timeoutSeconds": 840,
+                                             "environment": _sent()["environment"],
+                                             "memory": {"whatever": "the wirer set"}})
+    assert drift == [], f"a field this script never sends was reported as its drift: {drift}"
+
+
+def test_the_read_back_checks_exactly_the_fields_the_update_sends():
+    """Two lists that must not drift apart. If the update call sends a field the read-back
+    does not check, that field can fail to land silently -- which is this whole defect,
+    reintroduced one field at a time. So the deployer builds both from one name."""
+    m = _h5()
+    src = (REPO / "deploy/05_harnesses.py").read_text()
+    assert "if k in UPDATED_FIELDS}" in src, \
+        "the update payload no longer derives from UPDATED_FIELDS; the two lists can drift"
+    assert "systemPrompt" in m.UPDATED_FIELDS
+
+
+def test_a_long_prompt_is_reported_by_length_and_divergence_not_pasted_twice():
+    """The finops prompt is 6539 characters. Dumping both sides scrolls the one line that
+    mattered off the screen, so the report gives lengths and the first divergence."""
+    m = _h5()
+    a, b = "x" * 3000 + "OLD" + "y" * 500, "x" * 3000 + "NEW" + "y" * 500
+    problem = m.harness_config_drift({"systemPrompt": [{"text": b}]},
+                                     {"systemPrompt": [{"text": a}]})[0]["problem"]
+    assert "chars" in problem and "first differ at" in problem
+    assert len(problem) < 400, f"the drift report pasted the whole prompt: {len(problem)}"
+
+
+def test_a_config_that_never_lands_fails_the_deploy_loudly():
+    """A warning is read by nobody: the deploy prints a success report either way, and the
+    next person reads "updated"/READY. Same reason a blocking bus gap raises in 07."""
+    m = _h5()
+    ctl = _CtlReads({"systemPrompt": [{"text": "stale"}], "status": "READY",
+                     "harnessVersion": "5"})
+    with pytest.raises(SystemExit) as exc:
+        m.confirm_harness_landed(ctl, "llmops_finops-abc", _sent(prompt="fresh"),
+                                 sleep=lambda s: None)
+    assert "llmops_finops-abc" in str(exc.value)
+    assert "READY" in str(exc.value), \
+        "the message does not tell the reader why READY was not evidence"
+
+
+def test_a_version_still_publishing_is_waited_out_rather_than_called_drift():
+    """A version publish is not instantaneous. A read-back that gives up on the first look
+    turns a settling deploy into a failed one, and a guard that fails correct deploys gets
+    deleted -- the lesson from the ASL read-back and from warm()'s two-fast-turns rule."""
+    m = _h5()
+    ctl = _CtlReads({"systemPrompt": [{"text": "stale"}], "harnessVersion": "5"},
+                    {"systemPrompt": [{"text": "fresh"}],
+                     "model": _sent()["model"], "maxTokens": 65536,
+                     "timeoutSeconds": 840, "environment": _sent()["environment"],
+                     "harnessVersion": "6"})
+    slept = []
+    out = m.confirm_harness_landed(ctl, "h-abc", _sent(prompt="fresh"),
+                                   sleep=slept.append)
+    assert out["config_confirmed"] is True
+    assert out["harness_version"] == "6"
+    assert ctl.reads == 2 and slept == [1], \
+        f"did not wait out a settling publish: reads={ctl.reads} slept={slept}"
+
+
+def test_a_harness_read_back_that_cannot_run_says_so_instead_of_claiming_confirmed():
+    """Not being able to check is not the same as having checked. A throttled or denied
+    get_harness must not resolve to a confirmation.
+
+    Named for the harness deliberately: the ASL version of this test (#80) already exists in
+    this file, and the first draft of this one reused its exact name. Python keeps the later
+    definition, so the ASL test silently vanished from the suite and m93's control would
+    have been verified by the wrong test entirely -- a collision no count noticed, because
+    the total still went up.
+    """
+    m = _h5()
+
+    class _Denied:
+        def get_harness(self, **kw):
+            raise RuntimeError("AccessDeniedException: bedrock-agentcore:GetHarness")
+
+    out = m.confirm_harness_landed(_Denied(), "h-abc", _sent(), sleep=lambda s: None)
+    assert out["config_confirmed"] is False
+    assert "AccessDenied" in out["read_back_unreachable"]
+
+
+def test_the_harness_deploy_path_actually_calls_the_read_back():
+    """A verifier nothing invokes is the same defect one level up.
+
+    Drives the real create_or_update against a fake control plane whose live config is the
+    stale one, and asserts it both fails and had really called update_harness -- so the test
+    cannot pass by never reaching the deploy at all.
+    """
+    m = _h5()
+
+    class _Ctl:
+        def __init__(self):
+            self.updated = []
+
+        def list_harnesses(self):
+            return {"harnesses": [{"harnessId": "llmops_finops-abc",
+                                   "harnessName": "llmops_finops"}]}
+
+        def get_harness(self, **kw):
+            return {"harness": {"harnessId": "llmops_finops-abc", "status": "READY",
+                                "arn": "arn:aws:bedrock-agentcore:us-east-1:123456789012:"
+                                       "harness/llmops_finops",
+                                "systemPrompt": [{"text": "the stale ~$18/day prompt"}],
+                                "harnessVersion": "5"}}
+
+        def update_harness(self, **kw):
+            self.updated.append(kw)
+            return {}
+
+    ctl = _Ctl()
+    cfg = dict(_sent(prompt="the $36.36/day prompt"), harnessName="llmops_finops")
+    with pytest.raises(SystemExit) as exc:
+        m.create_or_update(ctl, cfg, "arn:aws:iam::123456789012:role/x", dry=False)
+    assert ctl.updated, "the deploy never even called update_harness"
+    assert "systemPrompt" in str(exc.value)
+
+
+def test_the_config_is_confirmed_before_any_turn_is_spent_warming_it():
+    """Order matters, and not only for tidiness: warm() spends up to six real model turns.
+    Warming first means paying to make a harness that serves the WRONG prompt fast to
+    reach, and it puts the reassuring "warmed" line above the failure in the log."""
+    src = (REPO / "deploy/05_harnesses.py").read_text()
+    body = src.split("def create_or_update(", 1)[1]
+    assert body.index("confirm_harness_landed(") < body.index("out.update(warm("), \
+        "the harness is warmed before its config is confirmed"
+
+
 def _run_deployer_dry(monkeypatch, capsys, only):
     """Run 07_lambdas.py's main() with --dry-run and stub clients, and return the
     parsed report. Dry-run reaches every target-selection decision -- which is the

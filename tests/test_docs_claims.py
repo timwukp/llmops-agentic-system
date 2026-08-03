@@ -55,6 +55,64 @@ def _collected_test_count() -> int:
     return int(m.group(1))
 
 
+def shadowed_test_names(source: str) -> list:
+    """Test names defined more than once in ONE module, so the earlier one never runs.
+
+    A separate function rather than a loop inside the assertion, because the guard has to be
+    checkable on input that actually contains a duplicate. A test that only asserts "this
+    repo has none" passes whether the detection works or not — which is exactly what its
+    first negative control proved: suppressing the report changed nothing, since the tree was
+    clean at the time. The subject is the DETECTION; the repo-wide sweep is a second,
+    separate claim.
+
+    Per-module scope is the mechanism, not an implementation detail: the same name in two
+    different files is legitimate, twice in one file is always a loss.
+    """
+    seen, dupes = set(), []
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) \
+                and node.name.startswith("test_"):
+            if node.name in seen:
+                dupes.append(f"{node.name} (line {node.lineno})")
+            else:
+                seen.add(node.name)
+    return dupes
+
+
+def test_a_test_name_defined_twice_in_one_module_is_reported():
+    """The detection itself, on input that has the defect.
+
+    Python keeps the later definition, so the earlier test is never collected and never runs.
+    Nothing already here notices: the collection total still goes UP, so the count guard
+    above is satisfied, and the suite stays green because the surviving test passes.
+
+    Not hypothetical. Writing the harness read-back guards (#81) reused the exact name of the
+    ASL read-back test added in #80 — same file. That test vanished from the suite, and worse,
+    the negative control verifying it (``m93``) named the shadowed node id: it would have gone
+    on printing PASS while measuring a different test's failure entirely. A control aimed at
+    a shadowed name proves nothing about the guard it claims to check.
+    """
+    dupe = ("def test_alpha():\n    pass\n"
+            "def test_beta():\n    pass\n"
+            "def test_alpha():\n    pass\n")
+    found = shadowed_test_names(dupe)
+    assert found and "test_alpha" in found[0], \
+        f"a shadowed duplicate was not detected: {found}"
+    assert not any("test_beta" in f for f in found), "a unique name was reported as shadowed"
+    # Two modules may legitimately share a name; only within one module is it a loss.
+    assert shadowed_test_names("def test_alpha():\n    pass\n") == []
+
+
+def test_no_test_function_name_is_defined_twice_in_a_file():
+    """The repo-wide sweep, over every test module."""
+    dupes = {p.name: d for p in sorted((REPO / "tests").rglob("test_*.py"))
+             if (d := shadowed_test_names(p.read_text()))}
+    assert not dupes, (
+        f"a test name is defined twice; the earlier definition never runs: {dupes}. "
+        "Rename one. Any negative control naming the shadowed node id is measuring the "
+        "wrong test while still printing PASS.")
+
+
 def test_documented_test_counts_match_the_real_suite():
     """Every **N passed** claim in TEST_RESULTS must equal what pytest collects.
 

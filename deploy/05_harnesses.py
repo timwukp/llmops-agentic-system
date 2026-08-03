@@ -83,6 +83,119 @@ def existing_harness(ctl, name):
     return None
 
 
+#: The fields create_or_update actually sends on an update. Named once, here, because the
+#: read-back must check exactly what was sent -- a list that drifts from the update call
+#: would confirm fields nobody deployed and stay silent about one that was.
+UPDATED_FIELDS = ("model", "systemPrompt", "tools", "skills", "allowedTools",
+                  "maxIterations", "maxTokens", "timeoutSeconds", "truncation",
+                  "environment", "environmentVariables")
+
+
+def harness_config_drift(sent: dict, live: dict, fields=UPDATED_FIELDS) -> list:
+    """Which of the fields we just sent did NOT land, field by field.
+
+    CONTAINMENT, not equality, and that is a measurement rather than a preference. On a
+    harness that is perfectly in sync, `environment` still differs: we send
+    networkConfiguration + lifecycleConfiguration, and the service returns those plus
+    agentRuntimeArn/agentRuntimeName/agentRuntimeId that it assigned. Strict equality would
+    report drift on every single deploy forever, and a check that cries wolf on a correct
+    deploy is a check somebody deletes. So the question asked is the one that matters: is
+    every value we sent present and equal live? Keys the service added are its business.
+
+    Only `fields` are checked, because only those are sent. Reporting on a field this script
+    never deploys would blame this deploy for something another owns -- `memory` is
+    04_wire_memory.py's, and naming it here would make every run of this script look broken.
+    """
+    drift = []
+    for f in fields:
+        if f not in sent:
+            continue
+        want, got = sent[f], live.get(f)
+        if want == got:
+            continue
+        if isinstance(want, dict) and isinstance(got, dict):
+            inner = _dict_drift(want, got, f)
+            if inner:
+                drift.extend(inner)
+                continue
+            # Every key we sent matched; the difference is keys the service added.
+            continue
+        drift.append({"field": f, "problem": _describe(want, got)})
+    return drift
+
+
+def _dict_drift(want: dict, got: dict, path: str) -> list:
+    """Recursive containment check, reporting the dotted path of each key that disagrees."""
+    out = []
+    for k, wv in want.items():
+        if k not in got:
+            out.append({"field": f"{path}.{k}", "problem": "sent, but ABSENT live"})
+        elif isinstance(wv, dict) and isinstance(got[k], dict):
+            out.extend(_dict_drift(wv, got[k], f"{path}.{k}"))
+        elif wv != got[k]:
+            out.append({"field": f"{path}.{k}", "problem": _describe(wv, got[k])})
+    return out
+
+
+def _describe(want, got) -> str:
+    """Say what differs without pasting a 6.5 KB prompt into a terminal.
+
+    The finops prompt is 6539 characters. Dumping both sides is how a deploy log becomes
+    unreadable and the one line that mattered scrolls away, so long values are reported by
+    length and by the first place they diverge -- enough to tell "the new prompt did not
+    land" apart from "a different prompt landed".
+    """
+    ws, gs = json.dumps(want, default=str), json.dumps(got, default=str)
+    if len(ws) > 160 or len(gs) > 160:
+        at = next((i for i in range(min(len(ws), len(gs))) if ws[i] != gs[i]),
+                  min(len(ws), len(gs)))
+        return (f"sent {len(ws)} chars, live {len(gs)} chars, first differ at {at}: "
+                f"sent {ws[at:at + 60]!r} vs live {gs[at:at + 60]!r}")
+    return f"sent {ws} != live {gs}"
+
+
+def confirm_harness_landed(ctl, harness_id: str, sent: dict, attempts: int = 4,
+                           sleep=time.sleep) -> dict:
+    """Read the config back, and refuse to call the deploy done until it matches.
+
+    `update_harness` returning 200 says the call was accepted. `wait_ready` then says the
+    harness is READY. Neither says the live config is the one in this tree, and READY is the
+    more dangerous of the two, because a harness serving a stale prompt is READY the whole
+    time -- which is exactly what happened: on 2026-08-03 the live llmops_finops prompt still
+    quoted the orphan endpoint at `~$18/day` while main had said `$36.36/day` since #41
+    merged. Every surface reported healthy: status READY, version 5, `list_harnesses` clean.
+    The falsified number was found by a human dumping the live prompt and grepping it.
+
+    This is the same defect deploy/07_lambdas.py had for the state machine definition (#80),
+    and the same one `update_function_configuration` had for `Role` before that: three
+    resources, one belief, that a call which returned is a change that landed.
+
+    Polls, because a version publish is not instantaneous and a guard that cries wolf gets
+    deleted -- the same reasoning as the ASL read-back, and the same reason `warm()` below
+    needs two consecutive fast turns instead of one.
+    """
+    last = [{"problem": "never read"}]
+    for i in range(attempts):
+        try:
+            live = ctl.get_harness(harnessId=harness_id)["harness"]
+        except Exception as exc:  # noqa: BLE001 — cannot confirm; must not claim confirmed
+            return {"config_confirmed": False,
+                    "read_back_unreachable": f"{type(exc).__name__}: {exc}"}
+        last = harness_config_drift(sent, live)
+        if not last:
+            return {"config_confirmed": True,
+                    "harness_version": live.get("harnessVersion")}
+        if i < attempts - 1:
+            sleep(2 ** i)  # 1,2,4s — for a version publish settling, not a cure for drift
+    raise SystemExit(
+        f"{harness_id}: update_harness succeeded and the harness is READY, but the LIVE "
+        f"config still disagrees with this tree after {attempts} reads — "
+        f"{json.dumps(last, indent=2)}\n"
+        "Every session runs the live config, not the one in this tree. Do not record this "
+        "deploy as done: READY is not 'serving what you sent', and a stale prompt is READY "
+        "the entire time it is wrong.")
+
+
 def wait_ready(ctl, harness_id, timeout=300):
     for _ in range(timeout // 5):
         h = ctl.get_harness(harnessId=harness_id)["harness"]
@@ -222,16 +335,14 @@ def create_or_update(ctl, cfg, role_arn, dry, dat=None):
         # (04_wire_memory.py owns it).
         harness_id = exists["harnessId"]
         wait_ready(ctl, harness_id)  # can't update while CREATING/UPDATING
-        update = {k: v for k, v in cfg.items()
-                  if k in ("model", "systemPrompt", "tools", "skills", "allowedTools",
-                           "maxIterations", "maxTokens", "timeoutSeconds", "truncation",
-                           "environment", "environmentVariables")}
-        ctl.update_harness(harnessId=harness_id, clientToken=secrets.token_hex(20), **update)
+        sent = {k: v for k, v in cfg.items() if k in UPDATED_FIELDS}
+        ctl.update_harness(harnessId=harness_id, clientToken=secrets.token_hex(20), **sent)
         action = "updated"
     else:
         resp = ctl.create_harness(harnessName=name, executionRoleArn=role_arn,
                                   clientToken=secrets.token_hex(20), **cfg)
         harness_id = resp["harness"]["harnessId"]
+        sent = cfg
         action = "created"
 
     h = wait_ready(ctl, harness_id)
@@ -239,6 +350,10 @@ def create_or_update(ctl, cfg, role_arn, dry, dat=None):
         ctl.tag_resource(resourceArn=h["arn"], tags=tags)
     out = {"harness": name, "harness_id": harness_id, "action": action,
            "status": h["status"]}
+    # READY says the harness answers; it does not say what it answers WITH. Confirmed before
+    # warming, because warming a harness that is serving a stale prompt spends real turns
+    # making the wrong config fast to reach.
+    out.update(confirm_harness_landed(ctl, harness_id, sent))
     # READY is not warm. See warm() for the measurement; without this the first real
     # turn after any deploy pays ~35s, and the person who pays it is a customer.
     if dat is not None:
