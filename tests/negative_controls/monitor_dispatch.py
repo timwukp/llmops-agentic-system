@@ -1636,6 +1636,33 @@ case("console: the cost card shows the limits with no word on enforcement",
      ["tests/test_console_cost.py::test_the_cost_card_renders_the_mode_next_to_the_numbers"])
 
 
+def m103(t):
+    """Strip the mode from the OVERVIEW limits only -- the state that actually shipped.
+
+    m100 breaks the estimates payload, which the first three guards all read. This breaks
+    the second payload and leaves the first intact, so it reproduces the live defect
+    exactly: /api/cost-estimates answered with budget_mode while /api/cost-overview
+    answered with two bare numbers, and every test named after the estimates endpoint
+    stayed green through the deploy. It is aimed at the source-derived guard as well as
+    the endpoint-named one, because the source-derived guard is the only one that would
+    have caught this before it shipped.
+    """
+    old = ('        "limits": {"single_usd": APPROVAL_LIMIT_USD,\n'
+           '                   "cumulative_usd": CUMULATIVE_LIMIT_USD,\n'
+           '                   "budget_mode": BUDGET_MODE,\n'
+           '                   "enforced": BUDGET_MODE == "blocking"},')
+    assert t.count(old) == 1, f"the overview limits payload has moved; found {t.count(old)}"
+    return t.replace(old, '        "limits": {"single_usd": APPROVAL_LIMIT_USD,\n'
+                          '                   "cumulative_usd": CUMULATIVE_LIMIT_USD},', 1)
+
+
+case("console: one limits payload states its mode and the other does not",
+     "deploy/console/lambda_function.py", m103,
+     ["tests/test_console_cost.py::"
+      "test_the_overview_limits_also_say_whether_they_are_enforced",
+      "tests/test_console_cost.py::test_no_limits_payload_anywhere_omits_the_mode"])
+
+
 #: Where the pristine text of the file currently mutated is parked, so a kill -9 -- which
 #: no handler can intercept -- still leaves the original recoverable. Under the repo root
 #: rather than /tmp because it must be obvious to whoever finds the tree dirty, and

@@ -1819,8 +1819,18 @@ def cost_overview(period_days=30):
         "line_items": rows[:400],
         "audit_rows": audit[:50],
         "budgets": budgets,
+        # The SECOND limits payload, and the reason the first fix was incomplete.
+        # `cost_estimates` and `cost_overview` both publish a dict named `limits`, and
+        # only one of them was given the mode. The live read-back after deploying that
+        # fix is what found it: /api/cost-estimates answered with budget_mode, and
+        # /api/cost-overview -- the endpoint whose name says overview -- still answered
+        # with two bare numbers. A second surface carrying the same key with less in it
+        # is worse than none, because a caller who found the mode once will not check
+        # again. Derived identically, from the same predicate the gate uses.
         "limits": {"single_usd": APPROVAL_LIMIT_USD,
-                   "cumulative_usd": CUMULATIVE_LIMIT_USD},
+                   "cumulative_usd": CUMULATIVE_LIMIT_USD,
+                   "budget_mode": BUDGET_MODE,
+                   "enforced": BUDGET_MODE == "blocking"},
         "note": ("Attribution is by explicit resource match (training-job/llmops-*, "
                  "manifest endpoints, spans by session id) — never by service, because "
                  "this account also carries unrelated SageMaker spend. Cost Explorer "

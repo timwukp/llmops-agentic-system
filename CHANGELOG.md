@@ -14,6 +14,16 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
   overview came back with the new number and `budget_mode: None`. `limits` now carries
   `budget_mode` and a derived `enforced`, computed with the same predicate the gate itself
   uses (`BUDGET_MODE == "blocking"`), so the label cannot disagree with the branch.
+- **That fix went in on one of the two `limits` payloads, and shipped that way.** The
+  console publishes a dict named `limits` from both `cost_estimates` and `cost_overview`;
+  only the first got the mode. Reading the deployed API back is what found it —
+  `/api/cost-estimates` answered with `budget_mode`, `/api/cost-overview` answered with two
+  bare numbers, and every test above stayed green because each names the estimates endpoint.
+  The entry above even said a correction "holds until the next person adds a limits
+  consumer"; the second consumer already existed. Both payloads now carry it, and the guard
+  that would have caught it **derives the list from the source** — every dict literal
+  assigned to a `limits` key must state its mode — rather than naming the payload somebody
+  remembered. m103 reproduces the shipped state: first payload honest, second one bare.
 - **The Cost KPI card read as a stop sign.** Its own words were *"limit $20,000 per run /
   $20,000 cumulative"*, with nothing saying that in `advisory` — the deployed default — an
   over-budget run is named, priced, and then launched anyway. It now renders
