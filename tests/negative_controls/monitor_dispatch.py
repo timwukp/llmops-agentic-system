@@ -2063,49 +2063,61 @@ case("redaction: the blocking byte run is quoted instead of reconstructed",
 #: Recorded here because the next person to widen this runner should know these directions are
 #: covered, and by what.
 def m120(t):
-    """Delete the video reference from the EN README, leaving 10 MB nobody can reach.
+    """Drop the poster image and leave a text link in its place, in the EN README.
 
-    The direction that actually happens: someone rewrites the top of the README months from
-    now and the embed goes with it. Nothing breaks, no link 404s, the file just stops being
-    reachable and keeps costing every clone.
+    The direction that will actually happen now that the section is three lines: someone decides
+    a 200 KB poster png above a working player is redundant weight and turns it into a text link.
+    The path still resolves, so nothing 404s and the section still reaches the file -- but the
+    reader who scrolls past sees no sign the committed original exists at all, which is the whole
+    job the poster does now that the "Download the as-recorded walkthrough" line is gone.
 
-    Retargeted once: the anchor was the "Play the five-minute walkthrough" link, which the
-    inline-player rewrite renamed to "Download the as-recorded walkthrough" (the section now
-    plays the upload and offers the committed file as the download). The `count(old) == 1`
-    assertion is what made that loud instead of silently mutating nothing.
+    Deliberately NOT the whole-deletion direction: that is m121, on the other language. This
+    mutation keeps the path present so the guard's FIRST assertion passes and the poster-link
+    assertion is the one that has to fire. Driving the whole-deletion version on both parameters
+    left the poster assertion -- the only route from either README to the committed file --
+    never once seen failing.
+
+    Retargeted twice, and the `count(old) == 1` assertion is what made both retargets loud
+    instead of silently mutating nothing: the anchor was the "Play the five-minute walkthrough"
+    link, renamed by the inline-player rewrite to "Download the as-recorded walkthrough", and
+    then that whole line was cut as verbose.
     """
-    old = "**[▶ Download the as-recorded walkthrough](docs/media/intro-en.mp4)**"
-    assert t.count(old) == 1, f"the EN download link has moved; found {t.count(old)}"
-    return t.replace(old, "**Download the as-recorded walkthrough**", 1)
+    old = "[![Watch the five-minute walkthrough](docs/media/intro-poster.png)]" \
+          "(docs/media/intro-en.mp4)"
+    assert t.count(old) == 1, f"the EN poster link has moved; found {t.count(old)}"
+    return t.replace(old, "[Watch the five-minute walkthrough](docs/media/intro-en.mp4)", 1)
 
 
-case("readme: the embedded walkthrough stops being reachable from the EN README",
+case("readme: the EN walkthrough poster is downgraded to a text link",
      "README.md", m120,
-     ["tests/test_intro_video.py::test_both_readmes_reach_the_video_and_the_live_page"])
+     ["tests/test_intro_video.py::test_both_readmes_reach_the_committed_video"])
 
 
 def m121(t):
-    """Strip the five-language pointer from the zh-TW README, leaving only the English mp4.
+    """Delete the zh-TW README's only path to the committed mp4 outright.
 
-    This is the case that makes the guard's last assertion earn its place. The mp4 is English
-    only; `deploy/console/intro/` is where the other four narrations are. Drop that pointer and
-    a Cantonese or Korean reader is left with an English video and no hint the rest exists.
+    The whole-deletion direction, on the zh-TW side because the guard is parametrized and the two
+    files are not: m120 proves only that the EN parameter can fail. Someone trims the section to
+    just the player -- the upload plays, the page looks complete, and the as-recorded 10 MB in
+    this repo becomes reachable from nothing, still costing every clone.
 
-    It also pins a real defect this control found: the assertion was first written
-    `"/intro" in text`, which the video's own path `docs/media/intro-en.mp4` satisfies -- so
-    this exact mutation PASSED. (The pointer was then an absolute URL to the live console; that
-    address was removed from the repo entirely, because publishing the front door of a page that
-    launches runs and approves budgets is not something a README should do. The assertion moved
-    to the in-repo path, which is where the narrations actually are.)
+    This control used to break the five-language narration pointer, and that pointer no longer
+    exists: the section was cut back to a player and a poster link, so the sentence naming
+    `deploy/console/intro/` went with it and the assertion requiring it was deleted. What the old
+    version pinned is worth keeping written down anyway, since the guard it tested is gone: that
+    assertion was first `"/intro" in text`, which the video's own path `docs/media/intro-en.mp4`
+    satisfies, so the mutation PASSED; it was later satisfied by a second, unrelated mention of
+    the same directory (`record_video.py`) and went from caught to UNCAUGHT, which is how that
+    defect was found. Substring-anywhere is not a claim.
     """
-    old = "`deploy/console/intro/`"
-    assert t.count(old) == 1, f"the zh-TW narration pointer has moved; found {t.count(old)}"
-    return t.replace(old, "那個動畫頁面", 1)
+    old = "\n[![觀看五分鐘導覽](docs/media/intro-poster.png)](docs/media/intro-en.mp4)\n"
+    assert t.count(old) == 1, f"the zh-TW poster link has moved; found {t.count(old)}"
+    return t.replace(old, "", 1)
 
 
-case("readme: the zh-TW walkthrough section loses the five-language narration pointer",
+case("readme: the embedded walkthrough stops being reachable from the zh-TW README",
      "README.zh-TW.md", m121,
-     ["tests/test_intro_video.py::test_both_readmes_reach_the_video_and_the_live_page"])
+     ["tests/test_intro_video.py::test_both_readmes_reach_the_committed_video"])
 
 
 def m121b(t):
@@ -2116,6 +2128,10 @@ def m121b(t):
     deletes the tag, so the section renders with a blank gap where the player was meant to be
     and the reader is told nothing. Measured against GitHub's own POST /markdown, not assumed --
     six embed forms, all erased.
+
+    More likely now than when this control was written, not less: the section used to explain in
+    prose that `<video>` is stripped, and that explanation was cut as verbose. The next person to
+    look at a poster-image link has nothing telling them why it is not a player.
     """
     old = "[![Watch the five-minute walkthrough](docs/media/intro-poster.png)]" \
           "(docs/media/intro-en.mp4)"
@@ -2125,7 +2141,7 @@ def m121b(t):
 
 case("readme: a <video> tag GitHub silently deletes is added back to the EN README",
      "README.md", m121b,
-     ["tests/test_intro_video.py::test_both_readmes_reach_the_video_and_the_live_page"])
+     ["tests/test_intro_video.py::test_both_readmes_reach_the_committed_video"])
 
 
 def m122(t):
@@ -2138,10 +2154,16 @@ def m122(t):
 
     zh-TW rather than EN on purpose -- a `$`-shaped pattern would miss 兩萬 entirely, so the
     half of the guard that has to understand Chinese numerals is the half worth breaking.
+
+    Retargeted: the anchor was the section's scene summary ("沒人看著的閒置 endpoint"), which was
+    cut when the section was trimmed to a player and a poster link. It now mutates the heading,
+    which is the shortest-lived thing that is still guaranteed to be inside the section -- and a
+    caption bolted onto the heading is a realistic place for a figure to reappear now that there
+    is no prose left to put one in.
     """
-    old = "沒人看著的閒置 endpoint"
-    assert t.count(old) == 1, f"the zh-TW scene summary has moved; found {t.count(old)}"
-    return t.replace(old, "超過兩萬美元基準的 run、沒人看著的閒置 endpoint", 1)
+    old = "## 看五分鐘導覽（有旁白）"
+    assert t.count(old) == 1, f"the zh-TW walkthrough heading has moved; found {t.count(old)}"
+    return t.replace(old, old + "：包含超過兩萬美元基準的 run 如何被指名", 1)
 
 
 case("readme: a budget amount reappears next to the player (zh-TW)",
@@ -2375,47 +2397,55 @@ case("readme: the zh-TW README points at a different upload from the EN one",
 
 
 def m131(t):
-    """Restate the committed file's size as the re-encode's, next to the download link.
+    """Add a helpful file size back to the EN download link.
 
-    The plausible version of this defect, not a typo: the section names TWO files now -- the
-    8.9 MB upload that plays inline and the 10.7 MB original that is committed -- so copying the
-    wrong one of the two numbers onto the download link is a one-character edit that reads as
-    consistent. A reader then expects 8.9 MB and pulls 10.7.
+    Retargeted from the other side of the same defect. This control used to relabel the download
+    link's "10.7 MB" as the re-encode's 8.9 MB, and both the label and the link were cut when the
+    section was trimmed. What is left is the rule that replaced them: the section states no size
+    it does not derive. This mutation is the way that rule gets broken -- not by a typo, but by
+    someone adding the size because a reader deciding whether to click obviously wants it. It is
+    correct on the day it is typed, and it stays put through the next re-encode.
 
-    This control is also why the guard checks the download link's own PARAGRAPH rather than the
-    section: the section-wide version of the assertion passed this exact mutation, because the
-    paragraph above still explains the as-recorded file is 10.7 MB. Presence anywhere in the
-    section is satisfied by the sentence ABOUT the discrepancy, which is not the sentence a
-    reader reads as they click.
+    Worth keeping the finding the old version pinned, because the guard it tested is gone: the
+    assertion was first scoped to the whole `##` section, and this exact mutation PASSED it,
+    because the paragraph above still mentioned 10.7 MB. Presence anywhere in a section is
+    satisfied by the sentence ABOUT a number, which is not the sentence a reader acts on.
     """
-    old = "**[▶ Download the as-recorded walkthrough](docs/media/intro-en.mp4)** — 10.7 MB"
-    assert t.count(old) == 1, f"the EN download link's size claim has moved; found {t.count(old)}"
-    return t.replace(old, old.replace("10.7 MB", "8.9 MB"), 1)
+    old = "[![Watch the five-minute walkthrough](docs/media/intro-poster.png)]" \
+          "(docs/media/intro-en.mp4)"
+    assert t.count(old) == 1, f"the EN poster link has moved; found {t.count(old)}"
+    return t.replace(old, old + " — 10.7 MB", 1)
 
 
-case("readme: the download link is labelled with the inline re-encode's size, not the file's",
+case("readme: a retyped file size is added back beside the EN walkthrough link",
      "README.md", m131,
      ["tests/test_intro_video.py"
-      "::test_the_readmes_state_the_committed_size_and_encoder_settings_correctly"])
+      "::test_the_walkthrough_section_states_no_number_it_does_not_derive"])
 
 
 def m132(t):
-    """Change the recorder's CRF without touching the READMEs that quote it.
+    """Add the encoder setting back to the zh-TW section, in the other half of the pattern.
 
-    Mutates the SOURCE, not the prose -- the direction a hardcoded guard cannot catch. Someone
-    tunes the encoder for a smaller file; both READMEs go on saying CRF 26 and go on looking
-    measured. Same shape as the fleet-count control: derive the number from the file that owns
-    it, or the guard only ever catches the prose half.
+    Retargeted, and the retarget is itself the record of a real loss. This control used to mutate
+    `"-crf", "26"` in record_video.py, and it caught a guard that DERIVED that number and compared
+    it to what both READMEs said -- the direction a hardcoded guard cannot see, where the source
+    changes and the prose keeps looking measured. Both READMEs stopped quoting the CRF, so nothing
+    derives it any more and that direction is no longer guarded by anything. Retuning the recorder
+    now breaks no test, correctly: there is no claim left to falsify.
+
+    What remains guardable is the prose half, so that is what this mutates. zh-TW rather than EN
+    on purpose: m131 covers the MB half in English, and the two files are only equal while
+    something checks both.
     """
-    old = '"-crf", "26"'
-    assert t.count(old) == 1, f"the recorder's crf setting has moved; found {t.count(old)}"
-    return t.replace(old, '"-crf", "30"', 1)
+    old = "[![觀看五分鐘導覽](docs/media/intro-poster.png)](docs/media/intro-en.mp4)"
+    assert t.count(old) == 1, f"the zh-TW poster link has moved; found {t.count(old)}"
+    return t.replace(old, old + "（CRF 26 錄製）", 1)
 
 
-case("readme: the recorder's CRF is retuned and both READMEs keep quoting the old one",
-     "deploy/console/intro/record_video.py", m132,
+case("readme: an encoder setting is added back beside the zh-TW walkthrough link",
+     "README.zh-TW.md", m132,
      ["tests/test_intro_video.py"
-      "::test_the_readmes_state_the_committed_size_and_encoder_settings_correctly"])
+      "::test_the_walkthrough_section_states_no_number_it_does_not_derive"])
 
 
 #: Where the pristine text of the file currently mutated is parked, so a kill -9 -- which

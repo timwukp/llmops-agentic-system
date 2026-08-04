@@ -25,29 +25,7 @@ run，讓超支被指名，而不是在帳單上才被發現。整套生命週�
 
 https://github.com/user-attachments/assets/f189afb1-c326-49b6-b023-785da5ed3e6a
 
-**直接按上面的播放鍵** —— 英文旁白，**5:04**。七個場景：沒人看著的閒置 endpoint、六輪失敗的
-訓練、架構、這次建置實際花了多少，以及那道把本專案自己的模型判成 0/16、而且沒有被談過去的
-品質門檻。片中念出的每個數字都與本 README 引用的數字相同；聲音是 repo 裡已提交的旁白檔，
-不是另外重錄的。
-
-*那個播放器不是 `<video>` 標籤，而且它不可能是。* GitHub 的 markdown sanitizer 會把
-`<video>` 整段清掉：用 GitHub 自己的渲染 API 測過 repo 相對路徑、
-`raw.githubusercontent.com` URL、`<source>` 子標籤與 release 資產共六種寫法，每一種渲染出來
-都是空的。唯一會生成播放器的寫法是一個裸的 `user-attachments/assets/…` URL，而這種 URL 只會
-為「從網頁 UI 上傳的檔案」而存在。**所以內嵌播放的是一份上傳檔，它跟 repo 裡的檔案不是同一批
-位元組：** GitHub 的附件上限是 10 MB，原始錄製檔是 10.7 MB，所以內嵌那一份是它的 CRF 27
-重新編碼版 —— 8.9 MB，逐位元組驗證過同樣是 304.72 秒、1180×664、h264 + aac、同一份旁白。
-
-repo 裡提交的是原始錄製檔。點劇照、或點它下面那一行：
-
 [![觀看五分鐘導覽](docs/media/intro-poster.png)](docs/media/intro-en.mp4)
-
-**[▶ 下載原始錄製的導覽影片](docs/media/intro-en.mp4)** —— 10.7 MB，CRF 26，
-就是 `deploy/console/intro/record_video.py` 產出的那一份。
-
-這支 mp4 只有英文。同樣七個場景的**五種語言**旁白（English、普通话、粵語、日本語、한국어）
-在 `deploy/console/intro/`：動畫頁面與全部 35 段旁白音檔都在這個 repo 裡，部署 console 之後
-由它在 `/intro` 提供。
 
 ## 這是什麼
 
