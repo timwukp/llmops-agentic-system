@@ -23,22 +23,23 @@ run，讓超支被指名，而不是在帳單上才被發現。整套生命週�
 
 ## 看五分鐘導覽（有旁白）
 
-<video src="docs/media/intro-en.mp4" poster="docs/media/intro-poster.png" controls width="720" preload="none">
-  你的瀏覽器不會內嵌播放 —— <a href="docs/media/intro-en.mp4">下載這段導覽</a>。
-</video>
+[![觀看五分鐘導覽](docs/media/intro-poster.png)](docs/media/intro-en.mp4)
 
 **[▶ 播放五分鐘導覽](docs/media/intro-en.mp4)** —— 英文旁白，**5:04**，10.7 MB。七個場景：
 沒人看著的閒置 endpoint、六輪失敗的訓練、架構、這次建置實際花了多少，以及那道把本專案自己的
 模型判成 0/16、而且沒有被談過去的品質門檻。
 
-*那個播放連結是刻意留的備援。* GitHub 會不會把 repo 相對路徑的 `<video>` 標籤渲染成內嵌播放器、
-還是把它壓成一個連結，我在推上去之前無法驗證，所以兩個都放：看到播放器就直接播，看到連結就點
-一下下載 —— 兩種情況下檔案都在同一個地方。片中念出的每個數字都與本 README 引用的數字相同；
-聲音是 repo 裡已提交的旁白檔，不是另外重錄的。
+*它不會在這一頁內嵌播放 —— 這是量過的，不是猜的。* GitHub 的 markdown sanitizer 會把
+`<video>` 標籤整段清掉：用 GitHub 自己的渲染 API 測過 repo 相對路徑、
+`raw.githubusercontent.com` URL、`<source>` 子標籤與 release 資產共六種寫法，每一種渲染
+出來都是空的。GitHub 只會為「從網頁 UI 上傳的檔案」生成播放器，而一個提交進 repo 的檔案永遠
+不屬於那一類。所以上面那張劇照就是一個連結：點它、或點它下面那一行，mp4 會下載下來、由你自己
+的播放器打開。片中念出的每個數字都與本 README 引用的數字相同；聲音是 repo 裡已提交的旁白檔，
+不是另外重錄的。
 
-線上頁面才是正本 —— 同樣七個場景、**五種語言**旁白（English、普通话、粵語、日本語、한국어）
-並附語言切換，因為這支 mp4 只有英文：
-**[▶ /intro](https://deovqcv4m7.execute-api.us-east-1.amazonaws.com/intro)**。
+這支 mp4 只有英文。同樣七個場景的**五種語言**旁白（English、普通话、粵語、日本語、한국어）
+在 `deploy/console/intro/`：動畫頁面與全部 35 段旁白音檔都在這個 repo 裡，部署 console 之後
+由它在 `/intro` 提供。
 
 ## 這是什麼
 

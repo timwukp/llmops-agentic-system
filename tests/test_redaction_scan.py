@@ -209,6 +209,71 @@ def test_a_longer_digit_run_is_not_an_account_id():
     assert not rs.scan_blob("docs/COST.md", _text(b"at 1753699200000 ms"))
 
 
+def test_a_live_api_gateway_hostname_is_a_finding():
+    """The rule that was missing while the leak it describes was already merged.
+
+    Every other rule here is about identity -- an access key, an account id, an ARN. A URL is
+    none of those, which is why nothing objected when the address of this account's live admin
+    console shipped in a rendered README, in both ARCHITECTURE files, and hard-coded into two
+    test files. Reaching that page still needs a Cognito login; publishing its address in a
+    public repo invites everyone who reads it to try, and that page launches runs and approves
+    budgets.
+
+    The id here is synthesised from a shape, not copied from the real one -- writing the real id
+    into the file that proves it is caught is the self-report this module already avoids for
+    account ids.
+    """
+    host = b"a1b2c3d4e5.execute-api.us-east-1.amazonaws.com"
+    findings = rs.scan_blob("README.md", _text(b"the dashboard is at https://" + host + b"/"))
+    assert findings, "a live API Gateway hostname was not reported"
+    assert any("hostname" in f[1] for f in findings), findings
+    # And on a binary too: the rule is structural, so an mp3 or a zip carrying the same
+    # hostname is the same leak. It is deliberately NOT text-only like the 12-digit heuristic.
+    assert rs.scan_blob("deploy/console/intro/audio/en/s1.mp3", b"\x00\x00" + host)
+
+
+@pytest.mark.parametrize("example", rs.EXAMPLE_API_IDS, ids=lambda e: e.decode())
+def test_an_example_api_id_is_not_a_finding(example):
+    """`deploy/03_storage.py` prints a sample origin in its own help text, and this repo's own
+    tests need a stand-in id. Those must not be findings, or the rule gets deleted the first
+    time it blocks a legitimate example.
+
+    Parametrized off the module's own tuple for the same reason the ALLOWED test is: a
+    hand-copied second list lets an entry be dropped from the scanner with these still green.
+    """
+    blob = _text(b"https://" + example + b".execute-api.us-east-1.amazonaws.com")
+    assert not [f for f in rs.scan_blob("deploy/03_storage.py", blob) if "hostname" in f[1]]
+
+
+def test_the_examples_do_not_excuse_the_real_shape():
+    """An excuse list is only safe if it cannot be satisfied by accident.
+
+    Two ways this rule could be written to excuse a real leak, both checked:
+
+    1. matching the example ids as SUBSTRINGS of the hostname -- then an id that merely
+       *contains* an excused one walks straight through. The id is compared for equality
+       against the captured group for this reason.
+    2. folding them into `_excused`, which is substring-based and shared by every rule above --
+       then the word "example" anywhere in an ARN hit silences the ARN rule.
+
+    The first version of this rule had defect 1. It was found by writing this test, not by
+    reading the regex.
+
+    The sneaky id is BUILT FROM the module's own tuple rather than spelled out. The first
+    version of this test hard-coded `exampleandthenrealbits99`, which contains no entry of that
+    tuple at all -- so a substring-matching scanner excused nothing, the assertion passed
+    against the very defect it names, and the negative control for it passed too. That is how
+    the weakness was found: by watching the control fail to fail.
+    """
+    sneaky = rs.EXAMPLE_API_IDS[0] + b"andthenrealbits99.execute-api.us-east-1.amazonaws.com"
+    assert [f for f in rs.scan_blob("README.md", _text(b"https://" + sneaky))
+            if "hostname" in f[1]], (
+        f"an id merely CONTAINING the excused {rs.EXAMPLE_API_IDS[0]!r} was excused")
+    arn = rs.scan_blob("deploy/iam.json",
+                       _text(b"example arn:aws:iam::" + SYNTHETIC_ACCOUNT + b":role/x"))
+    assert arn, "the word 'example' silenced the ARN rule"
+
+
 def test_an_account_bearing_arn_is_caught_even_when_the_digits_run_long():
     """The length excuse must not extend to a structured ARN match.
 

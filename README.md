@@ -27,24 +27,25 @@ discovered on a bill. The whole lifecycle, proven end to end, cost **≈ $12–1
 
 ## Watch it — five minutes, narrated
 
-<video src="docs/media/intro-en.mp4" poster="docs/media/intro-poster.png" controls width="720" preload="none">
-  Your browser will not play this inline — <a href="docs/media/intro-en.mp4">download the walkthrough</a>.
-</video>
+[![Watch the five-minute walkthrough](docs/media/intro-poster.png)](docs/media/intro-en.mp4)
 
 **[▶ Play the five-minute walkthrough](docs/media/intro-en.mp4)** — English narration,
 **5:04**, 10.7 MB. Seven scenes: the idle endpoint nobody was watching, the six failed
 training rounds, the architecture, what the build actually cost, and the quality gate that
 scored this project's own model 0/16 and was not talked past.
 
-*The play link is deliberate redundancy.* Whether GitHub renders a repo-relative `<video>`
-tag as an inline player or flattens it to a link is not something I could verify before
-pushing, so both are here: if you see a player, use it; if you see a link, the file is one
-click away either way. Every figure spoken in it is the same figure this README cites — the
-audio is the committed narration, not a re-recording.
+*It will not play inline on this page, and that is measured rather than assumed.* GitHub's
+markdown sanitizer strips a `<video>` tag to nothing — checked against GitHub's own rendering
+API for a repo-relative path, a `raw.githubusercontent.com` URL, a `<source>` child and a
+release asset, six forms in all, every one of them erased. GitHub builds a player only for
+files uploaded through its web UI, which a file committed to a repo can never be. So the
+poster above is a link: click it, or click the line under it, and the mp4 downloads for your
+own player. Every figure spoken in it is a figure this README cites — the audio is the
+committed narration, not a re-recording.
 
-The live page is the canonical version: the same seven scenes narrated in **five languages**
-(English, 普通话, 粵語, 日本語, 한국어) with a picker, since this mp4 is English only —
-**[▶ /intro](https://deovqcv4m7.execute-api.us-east-1.amazonaws.com/intro)**.
+This mp4 is English only. The same seven scenes are narrated in **five languages** (English,
+普通话, 粵語, 日本語, 한국어) by `deploy/console/intro/` — the animated page and all 35
+narration clips are in this repo, and the console serves them at `/intro` once deployed.
 
 ## What it is
 

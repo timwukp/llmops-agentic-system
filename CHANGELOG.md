@@ -5,6 +5,45 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
 ## [Unreleased]
 
+### The live console's address was in the README, and the video embed never worked
+
+Two defects on merged `main`, both reported by a reader looking at the repo page.
+
+- **The front door of the live admin console shipped in a public README.** The rendered
+  README, both `ARCHITECTURE` files, and two test files carried this account's API Gateway
+  hostname — six sites. Reaching that page still needs a Cognito login, but it is where runs
+  are launched and budgets are approved, and publishing its address invites the whole internet
+  to knock. **Root cause: the redaction scanner had no rule for a URL.** Every rule it had was
+  about identity — an access key, an account id, an ARN — so a hostname was not a leak any gate
+  had an opinion about, and the only thing standing between it and the public was somebody
+  noticing. `LIVE_ENDPOINT` now refuses any `*.execute-api.*.amazonaws.com` in text *or*
+  binary, verified to flag five of the six sites and to excuse the sample origin
+  `deploy/03_storage.py` prints in its own help text.
+  - Its excuse list compares the **whole** captured id for equality. The first version searched
+    for the example words as substrings, so an id merely *containing* an excused one walked
+    through — found by writing the test, not by re-reading the regex.
+  - That test then had the same class of defect one level up. It spelled out a sneaky id
+    (`exampleandthenrealbits99`) that contains **no** entry of the excuse list at all, so a
+    substring-matching scanner excused nothing and the assertion passed against the very defect
+    it named — and so did the negative control written to break it. It now builds the id from
+    the module's own tuple. Found by watching the control fail to fail.
+  - The one test that hard-coded the real id now uses a stand-in. The resolver's behaviour never
+    depended on which id came back, so nothing was ever bought by using the live one.
+- **`<video>` in a README renders as nothing, and this was checkable all along.** The previous
+  entry says the tag's fate "cannot be verified before pushing". It can:
+  `POST /markdown` with `mode=gfm` returns exactly what the repo page will show. Measured
+  there and against this repo's own rendered homepage — **zero `<video>` elements** — for a
+  repo-relative path, a `raw.githubusercontent.com` URL, a `<source>` child and a release
+  asset alike. GitHub builds a player only for files uploaded through its web UI, which a
+  committed file can never be. So the guard was **requiring** a tag that provably does nothing,
+  with a message claiming the reader could play it inline. The READMEs now lead with a clickable
+  poster frame, and the guard asserts the tag is **absent** and that two independent links
+  reach the mp4.
+  - The `blob/…/*.mp4` page's *"can't show files that are this big"* is unrelated to size: a
+    5.5 MB mp4 in an unrelated repo draws the identical refusal.
+  - The guard strips code spans before matching, because both READMEs now explain in prose that
+    `<video>` does not work — the naive version failed on its own documentation.
+
 ### The redaction gate: one rule set, and binaries are actually scanned
 
 Found by staging the narration below — the first commit in this repo's history to add binary
@@ -156,7 +195,7 @@ the mp4 is English only, so both READMEs link it right beside the player.
   and this suite is offline by construction, so `tests/test_intro_video.py` (11 tests) verifies
   the artifact instead of re-running the recorder: length against the summed narration clips,
   an audio track as long as the video, the authored stage size, `yuv420p`, `moov` before `mdat`,
-  and that both READMEs carry **both** a `<video>` tag and a plain link.
+  and that both READMEs reach the file two independent ways.
 - **Four guard defects found by breaking it, not by reading it.** Deliberately broken mp4s were
   built and driven past the guard, each one **with `ffprobe` removed from `PATH`**, because CI
   has no ffmpeg and a guard that only fails on a laptop gates nothing.

@@ -100,6 +100,26 @@ HIGH_SIGNAL = (
     ("account-bearing ARN", re.compile(rb"arn:aws[a-z-]*:[a-z0-9-]+:[a-z0-9-]*:[0-9]{12}")),
 )
 
+#: Live front-door hostnames. An API Gateway id is not a credential, and every rule above is
+#: about identity -- which is exactly why this one was missing: nothing here described a URL,
+#: so the address of this account's admin console shipped in a rendered README and no gate
+#: objected. Reaching it still needs a Cognito login, but publishing the door in a public repo
+#: invites everyone who reads it to knock, and the console is where runs are launched and
+#: budgets approved. Structurally improbable on any byte stream, so it runs on binaries too.
+#:
+#: The id is captured so the excuse below can be applied to the WHOLE id rather than to the
+#: match: an id that merely starts with `example` is not an example.
+LIVE_ENDPOINT = re.compile(
+    rb"([a-z0-9<>_-]{4,})\.execute-api\.[a-z0-9-]+\.amazonaws\.com")
+
+#: Ids that stand in for a real one by design -- the sample origin `deploy/03_storage.py`
+#: prints in its own help text, the stand-in this repo's tests need, and the substitution
+#: token. Compared for EQUALITY against the captured id, not searched for inside the match:
+#: folding these into `_excused` (which is substring-based) would let any rule above be
+#: silenced by the word "example" turning up somewhere in its hit, and would excuse a real
+#: hostname whose id happened to begin with one of these words.
+EXAMPLE_API_IDS = (b"abc123", b"<api_id>", b"exampleapi1", b"apiid")
+
 #: The entropy-prone heuristic: any bare 12-digit run. High value on text (it catches an
 #: account id nobody thought to look for), no value on binaries. Text-only for that reason.
 GENERIC_ACCOUNT_ID = re.compile(rb"(?:^|[^0-9.])([0-9]{12})(?:[^0-9.]|$)")
@@ -160,6 +180,12 @@ def scan_blob(path: str, blob: bytes):
                 continue
             findings.append((None if binary else blob.count(b"\n", 0, m.start()) + 1,
                              rule, m.group(0)[:80]))
+
+    for m in LIVE_ENDPOINT.finditer(blob):
+        if m.group(1).lower() in EXAMPLE_API_IDS:
+            continue
+        findings.append((None if binary else blob.count(b"\n", 0, m.start()) + 1,
+                         "live API Gateway hostname", m.group(0)[:80]))
 
     for pat_name, pat in ((("this repo's own account id"), re.compile(
             rb"|".join(re.escape(a) for a in REAL_ACCOUNT_IDS))),):
