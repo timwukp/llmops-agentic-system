@@ -5,6 +5,50 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
 ## [Unreleased]
 
+### Two guards from the previous change could pass having checked nothing
+
+Follow-up to the change below, from reviewing it after it merged. Both holes are the same shape
+and it is the shape this repo keeps finding: a guard that reads correctly, ran green, and was
+satisfiable without examining its subject. Neither was reasoned about — each was driven to red
+first, and the wording here says which mutation did it.
+
+- **The ffprobe cross-check could compare zero clips.** The previous change moved this check off
+  a duplicate walker in a deleted test file and onto `synth.mp3_duration`, the function that
+  actually writes `durations.json` — the right move, and it left the loop's `if not p.exists():
+  continue` in place with nothing counting how often it fired. `assert not bad` is satisfied by
+  an empty `bad`, and `bad` is empty when nothing was compared, so a renamed audio directory or
+  a changed language key turns "agrees with an independent decoder" into a green report over 0 of
+  35 files. Measured, not feared: pointing `INTRO` at an empty directory passed the whole test.
+  It now asserts `compared == len(LANGS) * len(SCENES)`. Worth naming why the missing-clip guard
+  above it did not already cover this — it happens to fail first today, which is a property of
+  *that* test, and a guard whose coverage depends on another guard's existence is one refactor
+  from checking nothing.
+- **"Re-measured" was left as prose.** The same change re-measured `161 tracked files, 35 binary`
+  when the mp4 and poster were deleted, wrote the numbers into four comments across
+  `tests/redaction_scan.py` and `tests/test_redaction_scan.py`, and derived none of them. Those
+  numbers are load-bearing: they are the evidence for dropping the generic 12-digit heuristic on
+  binaries, and for the empty-tree diff base covering the whole index. Re-measuring describes how
+  a number was *produced*; it says nothing about whether it stays true. Committing one tracked
+  file falsified all four sites with the full suite green — measured, not argued.
+  `test_the_scanners_own_coverage_claims_match_the_repo` now derives both counts from
+  `git ls-files` and `rs.is_binary`, one anchored pattern per site, and **asserts each pattern
+  hit** so a reworded comment fails instead of silently retiring its own guard.
+- **The past-tense carve-out, and why it is not a hole.** `"163 files became 161"` records that
+  the file count moved while the 12-digit run statistics did not — which is the evidence that two
+  numbers drifting together are not one number, so the line must be allowed to state a former
+  count. It follows `HISTORICAL_FLEET_PATTERNS` in `tests/test_docs_claims.py`: the *current* half
+  of such a phrase is still held to today's number, so the line recording the change cannot
+  itself go stale, and a stale count cannot be legalised by writing "X became Y" around it.
+- **Five negative controls (m133–m137), one per assertion.** Each hand-driven to red on its
+  *named* assertion with the full failure body read: zero clips compared (0 of 35), a stale
+  tracked count, a stale binary count, a reworded claim matching nothing, and the past-tense
+  line's current half. The binary one is separate from the tracked one because of a finding
+  worth keeping: driving it by adding a tracked binary file tripped the `tracked` assertion
+  first and never reached `binary`, so a control written that way would have looked correct
+  while proving only what another control already proved. A control that dies on an earlier
+  assertion than the one it is meant to prove is indistinguishable from a working one from the
+  outside.
+
 ### The film was in the repo twice, and the second copy cost every clone 10 MB
 
 `docs/media/intro-en.mp4` is deleted, with its poster. The walkthrough plays from the

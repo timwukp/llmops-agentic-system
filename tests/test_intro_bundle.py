@@ -281,6 +281,7 @@ def test_the_duration_measurement_agrees_with_ffprobe():
     spec.loader.exec_module(synth)
 
     bad = []
+    compared = 0
     for lang in LANGS:
         for scene in SCENES:
             p = INTRO / "audio" / lang / f"{scene}.mp3"
@@ -291,6 +292,7 @@ def test_the_duration_measurement_agrees_with_ffprobe():
                  "-of", "default=nokey=1:noprint_wrappers=1", str(p)],
                 capture_output=True, text=True, check=True).stdout
             truth, mine = float(out.strip()), synth.mp3_duration(p.read_bytes())
+            compared += 1
             # 0.05s per ~40s clip: room for the encoder's own frame rounding and for
             # mp3_duration's round(_, 2), nowhere near enough for a version-table mistake --
             # that is off by a factor, not a fraction.
@@ -300,6 +302,17 @@ def test_the_duration_measurement_agrees_with_ffprobe():
         "mp3_duration disagrees with ffprobe:\n  " + "\n  ".join(bad)
         + "\nEvery beat on the page is timed off this function, and durations.json cannot "
           "catch it being wrong — the file is written by the same code.")
+    # `assert not bad` alone is satisfied by comparing NOTHING: the `continue` above skips a
+    # clip whose path does not resolve, so a renamed audio directory or a changed lang/scene
+    # key made this report green having examined zero of 35 files. Measured, not feared --
+    # pointing INTRO at an empty directory passed. That the missing-clip guard above happens
+    # to fail first is a property of THAT test, not of this one, and a guard whose coverage
+    # depends on another guard's existence is one refactor from checking nothing.
+    expected = len(LANGS) * len(SCENES)
+    assert compared == expected, (
+        f"compared only {compared} of {expected} clips against ffprobe — this test's whole "
+        "purpose IS the comparison against an independent decoder, so a run that skipped "
+        "clips has not checked the thing its name promises")
 
 
 def test_the_english_narration_lands_near_five_minutes():

@@ -632,3 +632,86 @@ def test_neither_caller_kept_its_own_copy_of_the_rules():
             assert frag not in code, (
                 f"{path} has re-inlined the redaction regexes ({frag!r}); keep the rules in "
                 "tests/redaction_scan.py")
+
+
+#: Every place the scanner's own comments state how much of the repo it covers, anchored on the
+#: surrounding phrase rather than on a bare number. Same reason LAMBDA_COUNT_PATTERNS in
+#: tests/test_docs_claims.py is per-site: each says it differently, and one loose `\d+` would
+#: match the KDF round count, the iteration timings and the byte offsets in the same comments.
+#:
+#: Nothing here states what the counts ARE -- they are derived below from `git ls-files` and
+#: `rs.is_binary`, which is the whole point. A guard hardcoding 161 would catch a comment
+#: drifting while the repo sits still, and sail past the repo growing while the comment sits
+#: still. Every count in this repo that has ever gone stale went stale by ADDITION.
+_COVERAGE_CLAIM_PATTERNS = {
+    "tests/redaction_scan.py": (
+        (r"measured across all (\d+)\s*\n#:\s*tracked files", "tracked"),
+    ),
+    "tests/test_redaction_scan.py": (
+        (r"the whole index -- (\d+) files, (\d+) of\s*\n\s*them binary", "tracked+binary"),
+        (r"checking a single file out of (\d+)", "tracked"),
+    ),
+}
+
+#: What marks a count as describing a PAST state of the repo rather than today's. Same carve-out
+#: as HISTORICAL_FLEET_PATTERNS in test_docs_claims.py, and for the same reason: the comment at
+#: redaction_scan.py:113 says "163 files became 161" to record that the file count moved while
+#: the 12-digit run counts did not, which is the evidence that two numbers drifting together are
+#: not one number. A guard forcing every number to today's value would demand that line lie
+#: about what was measured.
+_PAST_COUNT_PHRASINGS = (r"(\d+) files became (\d+)",)
+
+
+def test_the_scanners_own_coverage_claims_match_the_repo():
+    """The "161 files, 35 binary" in these comments, derived rather than trusted.
+
+    These numbers are load-bearing in a way a reader cannot check: they are the evidence for
+    dropping the generic 12-digit rule on binaries ("measured across all N tracked files there
+    are 52 such runs") and for the empty-tree diff base covering everything. They were carefully
+    re-measured when the walkthrough mp4 and its poster were deleted -- and then left as prose,
+    with nothing deriving them, which is the same defect three earlier commits in this repo
+    fixed elsewhere. Re-measuring describes how a number was PRODUCED; it says nothing about
+    whether it stays true. Committing one tracked file falsified all four sites while the full
+    suite stayed green, measured.
+
+    The past-tense carve-out is narrow and follows test_docs_claims.py's: a comment may state a
+    former count where its own phrasing says that is what it is doing ("163 files became 161").
+    The CURRENT half of such a phrase is still held to the real number, so the line that records
+    the change cannot itself go stale.
+    """
+    tracked = subprocess.run(["git", "ls-files"], capture_output=True, text=True,
+                             cwd=REPO, check=True).stdout.split()
+    assert tracked, "git reported no tracked files -- this guard verified nothing"
+    n_binary = sum(1 for p in tracked
+                   if rs.is_binary((REPO / p).read_bytes()))
+    real = {"tracked": len(tracked), "binary": n_binary}
+
+    for path, claims in _COVERAGE_CLAIM_PATTERNS.items():
+        src = (REPO / path).read_text()
+        for pattern, kind in claims:
+            m = re.search(pattern, src)
+            # A reworded comment must FAIL rather than pass silently -- an anchored pattern that
+            # matches nothing is indistinguishable from a correct claim otherwise, and that is
+            # how a guard like this becomes decoration.
+            assert m, (
+                f"{path}: no coverage claim matching /{pattern}/ -- if the wording changed, "
+                "update the pattern in _COVERAGE_CLAIM_PATTERNS; if the claim was deleted, "
+                "delete its entry. Do not leave a guard matching nothing")
+            for got, want in zip(m.groups(), kind.split("+")):
+                assert int(got) == real[want], (
+                    f"{path} claims {got} {want} files, the repo has {real[want]} "
+                    f"(matched {m.group(0)!r})")
+
+    # The past-tense form, held to its current half only.
+    src = (REPO / "tests/redaction_scan.py").read_text()
+    for pattern in _PAST_COUNT_PHRASINGS:
+        m = re.search(pattern, src)
+        assert m, (
+            f"tests/redaction_scan.py: no past-count phrase matching /{pattern}/ -- that comment "
+            "records that the file count moved while the 12-digit run counts did not, which is "
+            "why the run counts are believable. Update the pattern rather than dropping it")
+        was, now = int(m.group(1)), int(m.group(2))
+        assert now == real["tracked"], (
+            f"the comment says the count became {now}, the repo has {real['tracked']} files")
+        assert was != now, (
+            f"the comment records {was} -> {now}, which is not a change at all")
