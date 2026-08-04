@@ -2457,6 +2457,125 @@ case("readme: an encoder setting is added back to the zh-TW walkthrough section"
       "::test_the_walkthrough_section_states_no_number_it_does_not_derive"])
 
 
+def m133(t):
+    """Make the ffprobe cross-check skip every clip, by moving where it looks for them.
+
+    The direction the coverage assertion exists for, and the reason it exists at all: the
+    `if not p.exists(): continue` above it means a wrong audio path is not an error, it is
+    silence. `assert not bad` is then satisfied by comparing NOTHING, and the test reports
+    green having measured zero of 35 files against the decoder it exists to consult.
+
+    Measured before this control was written, not feared: pointing INTRO at an empty directory
+    passed the whole test. The reason it does not ALSO trip the missing-clip guard above is that
+    this mutation changes only THIS test's path expression, which is the honest shape of the
+    failure -- a guard whose coverage depends on a different guard's existence is one refactor
+    from checking nothing, and the refactor is what this simulates.
+    """
+    old = """            p = INTRO / "audio" / lang / f"{scene}.mp3"
+            if not p.exists():
+                continue
+            out = subprocess.run("""
+    assert t.count(old) == 1, f"the ffprobe clip loop has moved; found {t.count(old)}"
+    return t.replace(old, old.replace('"audio" / lang', '"audio" / "no-such-lang" / lang'), 1)
+
+
+case("intro: the ffprobe cross-check compares zero clips and still reports green",
+     "tests/test_intro_bundle.py", m133,
+     ["tests/test_intro_bundle.py::test_the_duration_measurement_agrees_with_ffprobe"])
+
+
+def m134(t):
+    """Let the scanner's own coverage comment keep a count the repo has moved past.
+
+    The direction that actually happened, twice. These numbers were carefully RE-MEASURED when
+    the walkthrough mp4 was deleted -- and "re-measured" describes how a number was produced, not
+    whether it stays true. The next commit that adds one tracked file falsifies all four sites and
+    the whole suite stays green, which is exactly what happened: 161 was correct on the day it was
+    typed and wrong on the day after.
+
+    Mutating the comment rather than adding a file because the guard derives the real count from
+    `git ls-files`: a control that added a file would trip the tracked assertion for both sites at
+    once and prove nothing about which one is watched.
+    """
+    old = "measured across all 161\n#: tracked files"
+    assert t.count(old) == 1, f"the tracked-file coverage claim has moved; found {t.count(old)}"
+    return t.replace(old, "measured across all 160\n#: tracked files", 1)
+
+
+case("redaction: the scanner's comment claims a tracked-file count the repo has grown past",
+     "tests/redaction_scan.py", m134,
+     ["tests/test_redaction_scan.py"
+      "::test_the_scanners_own_coverage_claims_match_the_repo"])
+
+
+def m135(t):
+    """Drift the BINARY half of the same claim, which the tracked half cannot cover for it.
+
+    Two counts in one sentence are two claims. The binary number is the one that says why
+    dropping the generic 12-digit heuristic on binaries is defensible -- if 35 becomes 40 without
+    anyone re-reading that argument, the argument is about a repo that no longer exists.
+
+    Separate from m134 on purpose, and the separation is the finding: when this was first driven
+    by adding a tracked BINARY file, the `tracked` assertion fired first and the `binary` half was
+    never reached, so a control written that way would have looked correct while proving only what
+    m134 already proves. Driven instead by editing the binary number alone.
+    """
+    old = "the whole index -- 161 files, 35 of"
+    assert t.count(old) == 1, f"the binary coverage claim has moved; found {t.count(old)}"
+    return t.replace(old, "the whole index -- 161 files, 34 of", 1)
+
+
+case("redaction: the scanner's comment claims a binary-file count the repo has moved past",
+     "tests/test_redaction_scan.py", m135,
+     ["tests/test_redaction_scan.py"
+      "::test_the_scanners_own_coverage_claims_match_the_repo"])
+
+
+def m136(t):
+    """Reword one coverage claim so the anchored pattern matches nothing at all.
+
+    The failure mode that turns a derived guard back into decoration: an anchored regex that hits
+    nothing is indistinguishable from a claim that is correct, so a comment reworded in good faith
+    silently retires its own guard. Same reason LAMBDA_COUNT_PATTERNS in test_docs_claims.py
+    asserts its match rather than iterating whatever it happened to find.
+
+    Rewording rather than deleting because deletion is the honest case the guard's message tells
+    you how to handle (drop the entry); a rewrite is the one that looks like nothing happened.
+    """
+    old = "checking a single file out of 161"
+    assert t.count(old) == 1, f"the single-file phrasing has moved; found {t.count(old)}"
+    return t.replace(old, "checking just one of the 161 files", 1)
+
+
+case("redaction: a coverage claim is reworded so its anchored pattern matches nothing",
+     "tests/test_redaction_scan.py", m136,
+     ["tests/test_redaction_scan.py"
+      "::test_the_scanners_own_coverage_claims_match_the_repo"])
+
+
+def m137(t):
+    """Let the CURRENT half of the past-tense count line go stale.
+
+    The carve-out that makes the past-tense phrasing legal is narrow, and this is what keeps it
+    narrow. "163 files became 161" is allowed to state a former number because it says so; the
+    number it says the repo BECAME is a claim about today and is held to today. Without this the
+    carve-out would be a hole the size of every count in the comment -- any stale number could be
+    made legal by writing "X became Y" around it.
+
+    The historical half is deliberately NOT mutated here: 163 must stay allowed, which the guard's
+    own passing run proves and which no control should contradict.
+    """
+    old = "163 files became 161"
+    assert t.count(old) == 1, f"the past-count phrase has moved; found {t.count(old)}"
+    return t.replace(old, "163 files became 160", 1)
+
+
+case("redaction: the past-tense count line says the repo became a size it is not",
+     "tests/redaction_scan.py", m137,
+     ["tests/test_redaction_scan.py"
+      "::test_the_scanners_own_coverage_claims_match_the_repo"])
+
+
 #: Where the pristine text of the file currently mutated is parked, so a kill -9 -- which
 #: no handler can intercept -- still leaves the original recoverable. Under the repo root
 #: rather than /tmp because it must be obvious to whoever finds the tree dirty, and
