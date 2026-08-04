@@ -2031,117 +2031,123 @@ case("redaction: the blocking byte run is quoted instead of reconstructed",
       "::test_no_credential_shaped_literal_survives_in_either_file"])
 
 
-#: The README's embedded walkthrough video. Three cases, all on the TEXT side of the guard,
-#: because this runner mutates the text of one existing tracked file and journals that path for
-#: recovery -- it cannot swap a 10 MB binary.
+#: The README's walkthrough player. The film is no longer committed to this repo -- it is served
+#: by the `user-attachments` upload GitHub renders as a real <video> element -- so what these
+#: cases break is the PRESENTATION, and that is now the whole of the promise: if the URL stops
+#: being promoted to a player, the walkthrough is unreachable from the repo page and there is no
+#: second path behind it.
 #:
-#: The binary directions were verified BY HAND instead, by building deliberately broken mp4s
-#: with ffmpeg and driving each one past tests/test_intro_video.py. EVERY row below was re-run
-#: with ffprobe removed from PATH, because that is the configuration CI runs in and a guard that
-#: only fails on a laptop does not gate anything:
-#:   4 KB truncation           -> "video is only 4000 bytes" (plus the moov/mdat check)
-#:   -an, 4 KB                 -> "video is only ... bytes"
-#:   -an, FULL LENGTH          -> "video has NO audio track — the narration was not muxed in"
-#:   audio track only 3s       -> "video track is 304.68s but the audio track is 3.07s"
-#:   scale=640:360             -> "recorded at 640x360, but the stage is authored at 1180x664"
-#:   scale=640:360 setsar=59/32-> same; the coded size is read from the sample entry, not tkhd
-#:   setsar=2/1 (coded intact) -> "coded 1180x664 but displayed as 2360x664"
-#:   no +faststart             -> "moov comes after mdat"
-#:   -t 240 (cut short)        -> "video is 240.08s but the narration plus tail is 304.72s"
+#: A block of history used to sit here listing nine deliberately-broken mp4s (4 KB truncation,
+#: `-an` at full length, a 3-second audio track, scale=640:360, setsar=59/32, no +faststart,
+#: -t 240) built with ffmpeg and driven past the container reader BY HAND -- by hand because this
+#: runner mutates the text of one tracked file and journals that path for recovery, so it cannot
+#: swap a 10 MB binary. Those directions are gone with the artifact: there is no committed mp4
+#: left to damage. Two of the four defects they found are kept, because they are about how a
+#: guard is written rather than about mp4s:
+#:   - the audio-stream and frame-size assertions sat behind skipif(ffprobe), and CI has no
+#:     ffmpeg, so a FULL-LENGTH SILENT film passed the whole module (7 passed, 3 skipped) on the
+#:     one machine that gates merges. A guard that can only fail on a laptop gates nothing.
+#:   - presence anywhere in a section is not a claim. m131's ancestor PASSED its guard because a
+#:     paragraph ABOVE the link happened to mention the same number, and the sentence ABOUT a
+#:     number is not the sentence a reader acts on. Hence the section slice, and hence the anchor.
 #:
-#: Four real guard defects were found that way rather than reasoned about:
-#:   1. the moov check raised ValueError instead of asserting, on a truncated file;
-#:   2. the mp3 fallback assumed MPEG-1 while Polly emits MPEG-2, so it reported 11.7s for
-#:      303.8s of audio -- a wrong answer in the right units, the kind that survives review;
-#:   3. the audio-stream and frame-size assertions sat behind skipif(ffprobe), and CI has no
-#:      ffmpeg, so a FULL-LENGTH SILENT film passed the entire module (7 passed, 3 skipped) on
-#:      the machine that gates merges. Both now read the container directly;
-#:   4. the frame-size check read tkhd, which is DISPLAY geometry: a 640x360 frame tagged
-#:      SAR 59:32 reports width 1180 -- the authored width exactly -- so a video with a third
-#:      of the pixels would have passed. Measured, not hypothesised. It now reads the coded size
-#:      from the sample entry and separately asserts the pixels are square.
-#: Recorded here because the next person to widen this runner should know these directions are
-#: covered, and by what.
+#: One direction here CANNOT be driven by this runner, and was driven by hand instead:
+#: test_no_video_file_is_committed_to_this_repo reads `git ls-files`, so no edit to the text of an
+#: already-tracked file can trip it -- this runner cannot add an index entry. Verified manually:
+#: `git add`ing an empty docs/media/intro-en.mp4 turned it red on its named assertion
+#: ("video file(s) committed to the repo: ['docs/media/intro-en.mp4']"), and `git rm --cached`
+#: restored it. Written down because a reader counting the cases here would otherwise conclude
+#: that guard has never been seen failing.
+#:
+#: And one real loss, named so nobody has to rediscover it: m123's direction used to be driven
+#: from `.stage` in page.template.html against the recording's CODED frame size, read out of the
+#: mp4's sample entry. With no recording it now compares page.template.html against
+#: record_video.py's own STAGE_W/STAGE_H copy -- two places the number is WRITTEN, not a place it
+#: was measured. Changing both together passes, and no test can see it.
 def m120(t):
-    """Drop the poster image and leave a text link in its place, in the EN README.
+    """Give the EN player URL a caption line, so it stops being alone in its paragraph.
 
-    The direction that will actually happen now that the section is three lines: someone decides
-    a 200 KB poster png above a working player is redundant weight and turns it into a text link.
-    The path still resolves, so nothing 404s and the section still reaches the file -- but the
-    reader who scrolls past sees no sign the committed original exists at all, which is the whole
-    job the poster does now that the "Download the as-recorded walkthrough" line is gone.
+    Retargeted: this control used to downgrade a poster image to a text link, and both the poster
+    and the mp4 it pointed at are deleted. The rule that replaced them is that the URL must stand
+    ALONE in its paragraph -- and this is the way that gets broken, because a bare unexplained URL
+    reads like an accident and captioning it looks like tidying up. GitHub then renders the
+    caption and the URL as one paragraph of text: a live link, no player, nothing 404ing, and
+    every other guard green.
 
-    Deliberately NOT the whole-deletion direction: that is m121, on the other language. This
-    mutation keeps the path present so the guard's FIRST assertion passes and the poster-link
-    assertion is the one that has to fire. Driving the whole-deletion version on both parameters
-    left the poster assertion -- the only route from either README to the committed file --
-    never once seen failing.
-
-    Retargeted twice, and the `count(old) == 1` assertion is what made both retargets loud
-    instead of silently mutating nothing: the anchor was the "Play the five-minute walkthrough"
-    link, renamed by the inline-player rewrite to "Download the as-recorded walkthrough", and
-    then that whole line was cut as verbose.
+    Drives the `before.endswith("\\n\\n")` assertion specifically, which is why the caption goes
+    on the line ABOVE rather than in front of the URL on the same line: prefixing the same line
+    would stop `^…$` matching at all and the guard would die on its FIRST assertion instead,
+    leaving the paragraph rule unproven. That is the exact hole the last pass left -- two controls
+    both dying on the same early assertion -- so the two halves of the paragraph rule are now
+    split across m120 (text before, EN) and m121 (text after, zh-TW).
     """
-    old = "[![Watch the five-minute walkthrough](docs/media/intro-poster.png)]" \
-          "(docs/media/intro-en.mp4)"
-    assert t.count(old) == 1, f"the EN poster link has moved; found {t.count(old)}"
-    return t.replace(old, "[Watch the five-minute walkthrough](docs/media/intro-en.mp4)", 1)
+    old = "\nhttps://github.com/user-attachments/assets/"
+    assert t.count(old) == 1, f"the EN player URL has moved; found {t.count(old)}"
+    i = t.index(old) + 1
+    return t[:i] + "Five minutes, narrated:\n" + t[i:]
 
 
-case("readme: the EN walkthrough poster is downgraded to a text link",
+case("readme: the EN player URL is captioned, so it is no longer alone in its paragraph",
      "README.md", m120,
-     ["tests/test_intro_video.py::test_both_readmes_reach_the_committed_video"])
+     ["tests/test_intro_video.py::test_both_readmes_carry_the_inline_player_url"])
 
 
 def m121(t):
-    """Delete the zh-TW README's only path to the committed mp4 outright.
+    """Put a note under the zh-TW player, in the same paragraph as the URL.
 
-    The whole-deletion direction, on the zh-TW side because the guard is parametrized and the two
-    files are not: m120 proves only that the EN parameter can fail. Someone trims the section to
-    just the player -- the upload plays, the page looks complete, and the as-recorded 10 MB in
-    this repo becomes reachable from nothing, still costing every clone.
+    The other half of the paragraph rule -- text AFTER the URL with no blank line between -- and
+    on the zh-TW side because the guard reads both files and the two are not the same file. A note
+    directly under the player is the likeliest thing anyone adds ("執行時間 5:04"), it looks like
+    it belongs to the video, and markdown makes it one paragraph with the URL. The player stops
+    rendering and the page still looks finished.
 
-    This control used to break the five-language narration pointer, and that pointer no longer
-    exists: the section was cut back to a player and a poster link, so the sentence naming
-    `deploy/console/intro/` went with it and the assertion requiring it was deleted. What the old
-    version pinned is worth keeping written down anyway, since the guard it tested is gone: that
-    assertion was first `"/intro" in text`, which the video's own path `docs/media/intro-en.mp4`
-    satisfies, so the mutation PASSED; it was later satisfied by a second, unrelated mention of
-    the same directory (`record_video.py`) and went from caught to UNCAUGHT, which is how that
-    defect was found. Substring-anywhere is not a claim.
+    Retargeted from deleting the README's path to the committed mp4, which no longer exists. What
+    the old version pinned is worth keeping written down, because the guard it tested is gone:
+    that assertion was first `"/intro" in text`, which the video's own path
+    `docs/media/intro-en.mp4` satisfied, so the mutation PASSED; it was later satisfied by a
+    second, unrelated mention of the same directory (`record_video.py`) and went from caught to
+    UNCAUGHT, which is how that defect was found. Substring-anywhere is not a claim.
     """
-    old = "\n[![觀看五分鐘導覽](docs/media/intro-poster.png)](docs/media/intro-en.mp4)\n"
-    assert t.count(old) == 1, f"the zh-TW poster link has moved; found {t.count(old)}"
-    return t.replace(old, "", 1)
+    old = "\nhttps://github.com/user-attachments/assets/"
+    assert t.count(old) == 1, f"the zh-TW player URL has moved; found {t.count(old)}"
+    end = t.index("\n", t.index(old) + 1)
+    return t[:end] + "\n執行時間 5:04。" + t[end:]
 
 
-case("readme: the embedded walkthrough stops being reachable from the zh-TW README",
+case("readme: a note is added under the zh-TW player, inside the URL's own paragraph",
      "README.zh-TW.md", m121,
-     ["tests/test_intro_video.py::test_both_readmes_reach_the_committed_video"])
+     ["tests/test_intro_video.py::test_both_readmes_carry_the_inline_player_url"])
 
 
 def m121b(t):
-    """Put a <video> tag back into the EN README.
+    """Write a <video> tag into the EN README.
 
-    The direction that will actually happen: someone sees a poster-image link, assumes an
-    inline player is possible, and "improves" it into `<video src=...>`. GitHub's sanitizer
-    deletes the tag, so the section renders with a blank gap where the player was meant to be
-    and the reader is told nothing. Measured against GitHub's own POST /markdown, not assumed --
-    six embed forms, all erased.
+    The direction that will actually happen, and it is likelier now than when this control was
+    written: the section is a heading and a bare URL with no prose left to explain why it is not
+    a tag, so anyone who wants "a real player" reaches for the obvious markup and points it at
+    the URL that is already sitting there. GitHub's sanitizer deletes the element, so it renders
+    as an empty gap. Measured against GitHub's own POST /markdown, not assumed -- six embed
+    forms, all erased.
 
-    More likely now than when this control was written, not less: the section used to explain in
-    prose that `<video>` is stripped, and that explanation was cut as verbose. The next person to
-    look at a poster-image link has nothing telling them why it is not a player.
+    Retargeted onto the heading, and pointed at the guard that outlived the split: the <video>
+    assertion used to ride inside the test that also required a committed mp4, so it died with
+    that premise. It is `test_neither_readme_hand_writes_a_video_tag` now, parametrized over both
+    READMEs, and unaffected by where the bytes live.
+
+    Deliberately leaves the bare URL in place below the tag: the mutation must fail on the
+    video-tag guard, not incidentally break the player guard as well and make it ambiguous which
+    assertion caught it.
     """
-    old = "[![Watch the five-minute walkthrough](docs/media/intro-poster.png)]" \
-          "(docs/media/intro-en.mp4)"
-    assert t.count(old) == 1, f"the EN poster link has moved; found {t.count(old)}"
-    return t.replace(old, '<video src="docs/media/intro-en.mp4" controls></video>', 1)
+    old = "## Watch it — five minutes, narrated\n"
+    assert t.count(old) == 1, f"the EN walkthrough heading has moved; found {t.count(old)}"
+    tag = ('\n<video src="https://github.com/user-attachments/assets/'
+           'f189afb1-c326-49b6-b023-785da5ed3e6a" controls></video>\n')
+    return t.replace(old, old + tag, 1)
 
 
-case("readme: a <video> tag GitHub silently deletes is added back to the EN README",
+case("readme: a <video> tag GitHub silently deletes is written into the EN README",
      "README.md", m121b,
-     ["tests/test_intro_video.py::test_both_readmes_reach_the_committed_video"])
+     ["tests/test_intro_video.py::test_neither_readme_hand_writes_a_video_tag"])
 
 
 def m122(t):
@@ -2172,24 +2178,29 @@ case("readme: a budget amount reappears next to the player (zh-TW)",
 
 
 def m123(t):
-    """Re-author the stage at a different size and leave the committed recording behind.
+    """Re-author the stage larger and leave the recorder pointed at the old size.
 
-    The one binary-adjacent direction this runner CAN drive, because the mutation is in text:
-    the guard derives the authored size from `.stage` in page.template.html rather than
-    retyping it, so widening the stage without re-recording must fail. That derivation is the
-    point -- record_video.py keeps its own STAGE_W/STAGE_H copy, and a guard that compared the
-    video against the RECORDER's number would stay green while both drifted away from the page
-    the scenes are actually laid out in.
+    A stage the recorder does not match means fit() scales it, and every diagram in the next
+    recording ships resampled. Nobody notices that by watching the film once, which is why it was
+    measured rather than eyeballed.
+
+    Retargeted, and the retarget is a genuine weakening worth stating rather than glossing. The
+    guard this used to trip compared `.stage` against the CODED frame size read out of the
+    committed mp4's sample entry -- a real measurement of a real artifact. With the mp4 deleted,
+    the surviving guard compares `.stage` against record_video.py's own STAGE_W/STAGE_H copy: two
+    places the number is WRITTEN. This mutation still fires, because it changes one of the two.
+    What no longer fires -- and no test can see -- is someone changing BOTH together while a
+    recording made at the old size is what people watch.
     """
     old = "width:1180px; height:664px"
     assert t.count(old) == 1, f"the .stage size declaration has moved; found {t.count(old)}"
     return t.replace(old, "width:1280px; height:720px", 1)
 
 
-case("intro: the stage is re-authored larger and the committed video is not re-recorded",
+case("intro: the stage is re-authored larger and the recorder is not updated",
      "deploy/console/intro/page.template.html", m123,
      ["tests/test_intro_video.py"
-      "::test_the_video_carries_an_audio_stream_and_the_authored_frame_size"])
+      "::test_the_recorder_records_at_the_size_the_page_is_authored_at"])
 
 
 def m124(t):
@@ -2397,27 +2408,25 @@ case("readme: the zh-TW README points at a different upload from the EN one",
 
 
 def m131(t):
-    """Add a helpful file size back to the EN download link.
+    """Add a helpful download size to the EN walkthrough heading.
 
-    Retargeted from the other side of the same defect. This control used to relabel the download
-    link's "10.7 MB" as the re-encode's 8.9 MB, and both the label and the link were cut when the
-    section was trimmed. What is left is the rule that replaced them: the section states no size
-    it does not derive. This mutation is the way that rule gets broken -- not by a typo, but by
-    someone adding the size because a reader deciding whether to click obviously wants it. It is
-    correct on the day it is typed, and it stays put through the next re-encode.
+    "How big is it" is the obvious thing to tell a reader deciding whether to press play, and it
+    is correct on the day it is typed. Retargeted onto the heading because the link it used to
+    annotate is deleted -- and the deletion makes the rule STRONGER rather than weaker: the bytes
+    a reader now downloads are GitHub's own re-encode of the upload, so a size written here cannot
+    be right even on the day it is typed, and nothing in this repo can measure it.
 
-    Worth keeping the finding the old version pinned, because the guard it tested is gone: the
-    assertion was first scoped to the whole `##` section, and this exact mutation PASSED it,
-    because the paragraph above still mentioned 10.7 MB. Presence anywhere in a section is
-    satisfied by the sentence ABOUT a number, which is not the sentence a reader acts on.
+    Worth keeping the finding the old version pinned, because the guard it tested has changed
+    shape: this same mutation once PASSED, because the assertion was scoped to the whole `##`
+    section and a paragraph above the link still mentioned 10.7 MB. Presence anywhere in a section
+    is satisfied by the sentence ABOUT a number, which is not the sentence a reader acts on.
     """
-    old = "[![Watch the five-minute walkthrough](docs/media/intro-poster.png)]" \
-          "(docs/media/intro-en.mp4)"
-    assert t.count(old) == 1, f"the EN poster link has moved; found {t.count(old)}"
-    return t.replace(old, old + " — 10.7 MB", 1)
+    old = "## Watch it — five minutes, narrated"
+    assert t.count(old) == 1, f"the EN walkthrough heading has moved; found {t.count(old)}"
+    return t.replace(old, old + " (10.7 MB)", 1)
 
 
-case("readme: a retyped file size is added back beside the EN walkthrough link",
+case("readme: a retyped file size is added back to the EN walkthrough section",
      "README.md", m131,
      ["tests/test_intro_video.py"
       "::test_the_walkthrough_section_states_no_number_it_does_not_derive"])
@@ -2426,23 +2435,23 @@ case("readme: a retyped file size is added back beside the EN walkthrough link",
 def m132(t):
     """Add the encoder setting back to the zh-TW section, in the other half of the pattern.
 
-    Retargeted, and the retarget is itself the record of a real loss. This control used to mutate
-    `"-crf", "26"` in record_video.py, and it caught a guard that DERIVED that number and compared
-    it to what both READMEs said -- the direction a hardcoded guard cannot see, where the source
-    changes and the prose keeps looking measured. Both READMEs stopped quoting the CRF, so nothing
-    derives it any more and that direction is no longer guarded by anything. Retuning the recorder
-    now breaks no test, correctly: there is no claim left to falsify.
+    Retargeted twice, and each retarget records a real loss. It first mutated `"-crf", "26"` in
+    record_video.py, and it caught a guard that DERIVED that number and compared it to what both
+    READMEs said -- the direction a hardcoded guard cannot see, where the source changes and the
+    prose keeps looking measured. Both READMEs stopped quoting the CRF, so nothing derives it and
+    retuning the recorder now breaks no test, correctly: there is no claim left to falsify. It
+    then mutated the poster link, which is deleted too.
 
     What remains guardable is the prose half, so that is what this mutates. zh-TW rather than EN
-    on purpose: m131 covers the MB half in English, and the two files are only equal while
-    something checks both.
+    on purpose: m131 covers the MB half in English, the pattern's two branches are different code
+    paths, and the two READMEs are only equal while something checks both.
     """
-    old = "[![觀看五分鐘導覽](docs/media/intro-poster.png)](docs/media/intro-en.mp4)"
-    assert t.count(old) == 1, f"the zh-TW poster link has moved; found {t.count(old)}"
-    return t.replace(old, old + "（CRF 26 錄製）", 1)
+    old = "## 看五分鐘導覽（有旁白）"
+    assert t.count(old) == 1, f"the zh-TW walkthrough heading has moved; found {t.count(old)}"
+    return t.replace(old, old + "，CRF 26 錄製", 1)
 
 
-case("readme: an encoder setting is added back beside the zh-TW walkthrough link",
+case("readme: an encoder setting is added back to the zh-TW walkthrough section",
      "README.zh-TW.md", m132,
      ["tests/test_intro_video.py"
       "::test_the_walkthrough_section_states_no_number_it_does_not_derive"])

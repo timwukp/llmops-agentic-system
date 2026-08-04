@@ -211,11 +211,15 @@ def test_binary_classification_matches_git_for_every_tracked_file():
     only what differs from HEAD, so on a clean checkout it returns nothing and this test used to
     `pytest.skip("nothing staged")` -- which is exactly what CI is: a fresh clone with an
     untouched index. Measured in the CI log for the commit that added this note: `910 passed,
-    4 skipped`, one skip more than the three ffprobe cross-checks, and this was it. A guard
-    whose name says "for every tracked file" was checking zero of them on the only machine that
-    gates the merge, and reported green for it. Against `4b825dc…` the diff is the whole index
-    -- 163 files, 37 of them binary -- so it can never be empty and there is nothing left to
-    skip on.
+    4 skipped`, one skip more than the three ffprobe cross-checks THAT EXISTED THEN, and this
+    was it. (Two of those three read the committed walkthrough mp4 and were deleted with it when
+    the film moved to a hosted upload; one ffprobe-gated test is left, so the same arithmetic on
+    a current CI log reads against `1 skipped`. Both counts are pinned to their commit on
+    purpose -- the finding is that a skip count nobody reads is where a guard goes to hide, and
+    that finding does not expire when the arithmetic changes.) A guard whose name says "for every
+    tracked file" was checking zero of them on the only machine that gates the merge, and
+    reported green for it. Against `4b825dc…` the diff is the whole index -- 161 files, 35 of
+    them binary -- so it can never be empty and there is nothing left to skip on.
     """
     out = subprocess.run(["git", "diff", "--cached", "--numstat", _EMPTY_TREE],
                          capture_output=True, text=True, cwd=REPO).stdout
@@ -233,7 +237,7 @@ def test_binary_classification_matches_git_for_every_tracked_file():
             f"{path}: git says binary={git_says_binary}, is_binary() disagrees")
         checked += 1
     # EVERY tracked file, which is what the name promises -- not "at least one". `assert checked`
-    # was the old floor, and it is satisfied by checking a single file out of 163: a diff against
+    # was the old floor, and it is satisfied by checking a single file out of 161: a diff against
     # HEAD covers only what this branch happens to touch, so the coverage of this guard silently
     # tracked the size of the working change. Comparing against `git ls-files` makes the promise
     # in the name falsifiable, and is what fails if the diff base is ever narrowed again.

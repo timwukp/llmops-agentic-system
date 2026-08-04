@@ -29,8 +29,6 @@ discovered on a bill. The whole lifecycle, proven end to end, cost **≈ $12–1
 
 https://github.com/user-attachments/assets/f189afb1-c326-49b6-b023-785da5ed3e6a
 
-[![Watch the five-minute walkthrough](docs/media/intro-poster.png)](docs/media/intro-en.mp4)
-
 ## What it is
 
 Seven AI agents — a conductor (orchestrator), five stage specialists (data-prep, finetune,

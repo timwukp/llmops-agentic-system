@@ -107,9 +107,11 @@ ALLOWED = (b"6833" + b"13688378", b"7631" + b"04351884", b"1234" + b"56789012")
 #: this laptop, single-threaded CPython does 3.1M sha256/s, so the whole 1e12 space falls in
 #: about 4 days -- and a GPU does it in roughly 100 seconds. So the KDF is iterated. At 200k
 #: iterations a candidate costs ~16 ms, which makes the same sweep ~500 GPU-years, while the
-#: scan stays cheap because only 12-digit runs are ever hashed: measured across all 163
-#: tracked files there are 52 such runs, 9 distinct, and hashing the distinct set takes 0.14 s
-#: for the entire repo.
+#: scan stays cheap because only 12-digit runs are ever hashed: measured across all 161
+#: tracked files there are 52 such runs, 9 distinct, and hashing the distinct set takes 0.15 s
+#: for the entire repo. (Re-measured when the committed walkthrough mp4 and its poster were
+#: deleted: 163 files became 161, and the run counts did not move at all -- neither binary
+#: contained a 12-digit run. Two numbers that drift together are not one number.)
 #:
 #: The salt is a constant in this file on purpose -- it is not a secret and pretending
 #: otherwise would be theatre. Its job is to stop this digest being looked up in a rainbow
