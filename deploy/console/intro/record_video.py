@@ -1,15 +1,26 @@
 #!/usr/bin/env python3
-"""Record the /intro walkthrough as a narrated mp4, for embedding in the README.
+"""Record the /intro walkthrough as a narrated mp4, to upload as the README's player.
 
 Why this exists. The live page is the canonical artifact -- five languages, real Polly
 voices, a language picker. But a reader on GitHub sees a README, not a browser tab, and a
 link is something you have to decide to click. This produces one file they can press play
 on without leaving the page they are already on.
 
+The output does NOT belong in this repo. It is ~10 MB, it was committed once, and it had to
+be removed: a bare `https://github.com/user-attachments/assets/<uuid>` URL alone in its own
+paragraph is the form GitHub promotes into a real <video> element, and GitHub hosts those
+bytes. So upload what comes out of here and put the URL in both READMEs -- leave the tree
+clean. tests/test_intro_video.py fails on any tracked .mp4/.mov/.webm/.mkv/.avi.
+
 Why it is a BUILD step and not a test. It drives a real headless browser and shells out to
-ffmpeg; it is the same category as synth_narration.py (which calls Polly). Tests in this
-repo are offline by construction and must stay that way, so the guard that ships alongside
-this checks the RESULT (tests/test_intro_video.py) rather than re-running the recorder.
+ffmpeg; it is the same category as synth_narration.py (which calls Polly). Tests in this repo
+are offline by construction and must stay that way. Which leaves this script as very nearly
+the only thing that checks its own output, so the drift check below is not belt-and-braces:
+the container reader that used to re-verify the committed mp4 -- faststart, the audio mux, the
+pixel format, recorded length against the narration -- was deleted with the file it read. Do
+not widen --tolerance to make a run pass. What survives on the test side is one comparison of
+STAGE_W/STAGE_H against the page's own `.stage` box, so a stage re-authored without updating
+this file still fails.
 
 How the picture and the sound are kept in sync -- this is the whole design:
 
@@ -33,8 +44,8 @@ How the picture and the sound are kept in sync -- this is the whole design:
 The audio is not re-encoded from a fresh Polly call: it is the committed mp3s, so the video
 cannot say something different from the page.
 
-Usage:
-    python3 deploy/console/intro/record_video.py --out docs/media/intro-en.mp4
+Usage (note the destination is OUTSIDE the repo -- see above):
+    python3 deploy/console/intro/record_video.py --out /tmp/intro-en.mp4
     python3 deploy/console/intro/record_video.py --out /tmp/smoke.mp4 --scenes 1   # fast check
 """
 

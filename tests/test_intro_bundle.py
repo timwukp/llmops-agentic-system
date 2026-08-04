@@ -245,6 +245,63 @@ def test_durations_are_measured_from_the_clips_on_disk():
                      + "\nRun synth_narration.py --remeasure (no Polly call, no cost).")
 
 
+def _have(tool: str) -> bool:
+    return shutil.which(tool) is not None
+
+
+@pytest.mark.skipif(not _have("ffprobe"),
+                    reason="needs ffprobe to have something to agree with")
+def test_the_duration_measurement_agrees_with_ffprobe():
+    """The frame walker that writes durations.json, pinned against a real decoder.
+
+    The guard above proves durations.json matches what `synth.mp3_duration` says. It does not
+    prove either is TRUE -- both sides come from the same function, so a walker that is wrong by
+    a factor produces a file that agrees with it perfectly. That is not hypothetical: this walker
+    was wrong exactly that way once, applying the MPEG-1 bytes-per-frame coefficient to Polly's
+    MPEG-2 stream and recording every clip at half its length. A wrong answer in the right units
+    is the kind that survives review.
+
+    This cross-check existed before, in tests/test_intro_video.py, and it pointed at a SECOND
+    copy of the walker that lived in that test file for the no-ffprobe path -- so the
+    implementation that actually writes the timings has never been compared to a decoder, while
+    the duplicate that no production code called was. That file was deleted with the committed
+    mp4 it guarded; the check moves here and onto the real function.
+
+    Every clip in every language, not just English: the walker's failure mode was version-
+    dependent, and one language re-synthesised at a different sample rate is the way it comes
+    back. Per-clip rather than on a total, so two errors cannot cancel into a passing sum.
+
+    Skipped without ffprobe rather than reimplemented, and that is honest here in a way it was
+    not for the deleted length check: this test's whole purpose IS the comparison against an
+    independent decoder. There is nothing left to check without one.
+    """
+    spec = importlib.util.spec_from_file_location(
+        "synth_narration", CONSOLE / "synth_narration.py")
+    synth = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(synth)
+
+    bad = []
+    for lang in LANGS:
+        for scene in SCENES:
+            p = INTRO / "audio" / lang / f"{scene}.mp3"
+            if not p.exists():
+                continue
+            out = subprocess.run(
+                ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                 "-of", "default=nokey=1:noprint_wrappers=1", str(p)],
+                capture_output=True, text=True, check=True).stdout
+            truth, mine = float(out.strip()), synth.mp3_duration(p.read_bytes())
+            # 0.05s per ~40s clip: room for the encoder's own frame rounding and for
+            # mp3_duration's round(_, 2), nowhere near enough for a version-table mistake --
+            # that is off by a factor, not a fraction.
+            if abs(mine - truth) >= 0.05:
+                bad.append(f"{lang}/{scene}: walker {mine:.3f}s, ffprobe {truth:.3f}s")
+    assert not bad, (
+        "mp3_duration disagrees with ffprobe:\n  " + "\n  ".join(bad)
+        + "\nEvery beat on the page is timed off this function, and durations.json cannot "
+          "catch it being wrong — the file is written by the same code.")
+
+
 def test_the_english_narration_lands_near_five_minutes():
     """The user asked for five minutes; a script only a guard can measure will drift.
 

@@ -5,6 +5,91 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
 ## [Unreleased]
 
+### The film was in the repo twice, and the second copy cost every clone 10 MB
+
+`docs/media/intro-en.mp4` is deleted, with its poster. The walkthrough plays from the
+`user-attachments` upload GitHub hosts and renders as a real `<video>` element — the committed
+copy was a *second* path to the same five minutes, 10,666,327 bytes of it, fetched by everyone
+who clones this repo whether they ever watch it or not. The poster (`intro-poster.png`,
+148,817 B) went with it: its only job was to be the clickable image whose target was the mp4,
+so with the target gone it is a thumbnail linking to nothing. That second file was not named in
+the request, and the reasoning for taking it is written here rather than left implicit.
+
+**What this does not do: the blob is still in history.** It entered at `cdeea2d` and every
+clone still fetches it out of the pack. Deleting a path from the tree removes it from the
+*checkout*, not from the object store. Making the repo genuinely smaller means rewriting
+history, which changes every commit id after `cdeea2d` and breaks every existing clone and
+fork — a separate decision, deliberately not taken here. What this change buys is that the
+next 10 MB does not arrive the same way.
+
+- **Two single-language pull requests were opened first, and CI was right to fail both.** Each
+  edited one README, and `hooks/pre-commit` §2 — which forces the EN/zh-TW pair into one commit
+  — does not run in the web UI. But the pair was not the interesting failure. Both PRs showed
+  `3 failed`, and only *one* of the three was the guard whose subject was the change: the other
+  two were `test_the_walkthrough_section_states_no_number_it_does_not_derive` and
+  `test_the_video_section_names_no_budget_amount`, which have nothing to do with a committed
+  mp4. They failed because their **locator** was the thing being deleted:
+  `_section_containing(text, "docs/media/intro-en.mp4")` asserts the needle is present in order
+  to find the section around it, so deleting the file broke every guard anchored on it whatever
+  its subject. The anchor is now `SECTION_ANCHOR = "user-attachments/assets/"` — the one string
+  in the section whose presence is separately guaranteed, by the player guard. A heading would
+  also work and was rejected: headings differ per language and get reworded by translation
+  polish, which would fail these guards for a reason that is not their subject.
+- **What was genuinely lost, stated rather than left for someone to find.** Six tests read the
+  mp4's container: `moov` before `mdat` (faststart), an audio track as long as the video track
+  (the narration actually muxed in), the coded frame size from the sample entry, square pixels,
+  `yuv420p`, and the recorded length against the summed narration plus tail. None of those can
+  be checked any more, because they were properties of an artifact this repo no longer has. The
+  nine hand-built broken mp4s that drove them (4 KB truncation, `-an` at full length, a
+  3-second audio track, `scale=640:360`, `setsar=59/32`, no `+faststart`, `-t 240`) are gone
+  with them. `record_video.py` still measures its own output against the narration and fails the
+  build past `--tolerance`, and that is now very nearly the only check on it — its docstring says
+  so, and says not to widen the tolerance to make a run pass.
+- **The frame-size guard was kept one step weaker, and the weakening is named.** It compared
+  `.stage` in `page.template.html` against the recording's *coded* size — a real measurement of
+  a real artifact, and the version that caught reading `tkhd` (display geometry) instead, where
+  a 640×360 frame tagged SAR 59:32 reports width 1180 and a video with a third of the pixels
+  would have passed. What survives compares `page.template.html` against `record_video.py`'s own
+  `STAGE_W/STAGE_H` copy: two places the number is *written*. Changing one still fails (`m123`
+  drives it). Changing both together passes, and no test can see it. Kept anyway, because a
+  recorder pointed at a stage it does not match ships every diagram resampled, and nobody
+  notices that by watching the film once.
+- **The deleted ffprobe cross-check was pinning the wrong implementation, and its replacement is
+  on the production code.** `test_the_mp3_fallback_agrees_with_ffprobe` compared ffprobe against
+  `_mp3_seconds` — a *second copy* of the frame walker that lived only in the test file. The
+  function that actually writes `durations.json`, `synth_narration.mp3_duration`, had never been
+  compared to a decoder. It is now, over all 35 clips
+  (`test_the_duration_measurement_agrees_with_ffprobe`), and why that matters is concrete: its
+  sibling guard compares `durations.json` against `mp3_duration` — **both sides from the same
+  function** — so a walker wrong by a constant factor writes a file that agrees with it
+  perfectly. That walker *was* wrong exactly that way once, applying the MPEG-1
+  samples-per-frame coefficient to Polly's MPEG-2 stream and reporting 11.7 s for 303.8 s of
+  audio. Proven non-vacuous by halving the production walker: red, `walker 21.240s, ffprobe
+  42.480s`. Worst real delta across the 35 clips: 0.004 s.
+- **One guard exists only because of this deletion:** no `.mp4`/`.mov`/`.webm`/`.mkv`/`.avi` may
+  be tracked, derived from `git ls-files` rather than a directory walk so the untracked recording
+  `record_video.py` produces does not fail it. The negative-control runner cannot drive it — it
+  mutates the text of one already-tracked file and cannot add an index entry — so it was driven
+  by hand: `git add`ing an empty `docs/media/intro-en.mp4` turned it red on its named assertion,
+  and `git rm --cached` restored the index. That is written into the control file, because a
+  reader counting registered cases would otherwise conclude it has never been seen failing.
+- **Seven controls retargeted, and the previous pass's own hole is closed.** PR #54 recorded that
+  `m120` and `m121` both died on the guard's *first* assertion, leaving the assertion they were
+  meant to prove never once observed failing. The four assertions of the player guard are now
+  each driven individually: `m120` captions the line above the URL (fails
+  `before.endswith("\n\n")`), `m121` adds a note on the line below (fails `after.startswith`),
+  `m129` wraps it as a markdown link (fails the URL-exists assertion), `m130` points zh-TW at a
+  different upload (fails the single-uuid assertion). `m121b` moved to
+  `test_neither_readme_hand_writes_a_video_tag`, a test of its own now instead of an assertion
+  riding inside one that required a committed file. `m131`/`m132` re-anchored on the headings.
+  Each was hand-driven to red with the full failure body read, not the pass/fail count — a
+  control that dies early is indistinguishable from a correct one if you only read the counts.
+  152/152 pairs still pass; retargeting changed no count.
+- Counts re-measured rather than adjusted: 163 tracked files → **161**, 37 binaries → **35**.
+  The 12-digit-run statistics in the same comment (52 runs, 9 distinct, 0.15 s) were re-measured
+  with the scanner's own regex and **did not move** — neither deleted binary contained one. Two
+  numbers that had drifted together would not have been one number.
+
 ### The walkthrough section explained itself at more length than the film it introduced
 
 Twenty-six of the section's thirty lines were about the section. A player, a poster, and
@@ -15,6 +100,10 @@ none of it what someone arriving at this repo is trying to find out, and a READM
 agents as often as by people now — both of them pay for prose that answers a question nobody
 asked. The section is a heading, the player, and the poster link; **the film is unchanged and
 so is every byte in `docs/media/`.**
+[Falsified by the entry above, one PR later: `docs/media/` no longer exists. Left standing
+rather than edited, because what it recorded was true when written and rewriting it would hide
+how short-lived "and nothing else changed" turned out to be. Read every claim below about the
+poster link and the committed mp4 as describing a state that lasted one pull request.]
 
 - **A guard that demands deleted prose is a guard someone deletes, so three were rewritten
   rather than left to fail.** They asserted the section stated "10.7 MB, CRF 26" beside the
@@ -298,6 +387,11 @@ they have to decide to click. `docs/media/intro-en.mp4` (10.7 MB, 5:04) is commi
 embedded in both READMEs so the five-minute walkthrough plays without leaving the page. The
 live `/intro` page stays the canonical artifact — it is the one with all five narrations, and
 the mp4 is English only, so both READMEs link it right beside the player.
+[Superseded twice within this same unreleased block, and both times by something this entry did
+not anticipate: the `<video>` markup GitHub strips never played at all, and the committed file
+was then deleted as a second copy of a film GitHub was already hosting. The link to the live
+page went earlier still — it was the address of the live admin console. Kept as written; the
+top entry of this section is the current state.]
 
 - **One clock, not two recordings.** `deploy/console/intro/record_video.py` plays the real page
   in a headless browser *in real time* and muxes the **same committed mp3s** the page just
@@ -320,7 +414,8 @@ the mp4 is English only, so both READMEs link it right beside the player.
   and this suite is offline by construction, so `tests/test_intro_video.py` (11 tests) verifies
   the artifact instead of re-running the recorder: length against the summed narration clips,
   an audio track as long as the video, the authored stage size, `yuv420p`, `moov` before `mdat`,
-  and that both READMEs reach the file two independent ways.
+  and that both READMEs reach the file two independent ways. [All six container checks were
+  deleted with the file; the module is 7 tests and guards the presentation. See the top entry.]
 - **Four guard defects found by breaking it, not by reading it.** Deliberately broken mp4s were
   built and driven past the guard, each one **with `ffprobe` removed from `PATH`**, because CI
   has no ffmpeg and a guard that only fails on a laptop gates nothing.
