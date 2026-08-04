@@ -43,6 +43,40 @@ Two defects on merged `main`, both reported by a reader looking at the repo page
     5.5 MB mp4 in an unrelated repo draws the identical refusal.
   - The guard strips code spans before matching, because both READMEs now explain in prose that
     `<video>` does not work — the naive version failed on its own documentation.
+- **The walkthrough now does play inline, and the paragraph saying it never could is gone.**
+  The entry above stops one measurement short. "GitHub strips `<video>`" is true; "so nothing
+  plays inline on this page" does not follow, and both READMEs asserted it *as measured* — the
+  same shape as every falsified doc claim this repo has had to sweep, written by the commit that
+  was fixing one. There is exactly one form GitHub does promote: **a bare
+  `user-attachments/assets/<uuid>` URL alone in its paragraph**, which is not a tag at all —
+  the renderer recognises the link and builds the `<video controls>` itself. Verified through
+  `POST /markdown` `mode=gfm` on the final section text: **one `<video>` element**, wrapped in
+  `<details open>` with the upload's filename.
+  - **The inline copy is not the committed bytes, and both READMEs now say so.** That URL only
+    exists for a web-UI upload, and GitHub caps an attachment at 10 MB — the as-recorded file is
+    **10,666,327 B (10.17 MiB)**, over by ~175 KB. So the upload is a CRF-27 re-encode,
+    **8,864,103 B**, and the repo keeps the CRF-26 original. Not inferred from the rendered
+    filename: the asset was downloaded whole and hashed — `e537416b…` matches the re-encode byte
+    for byte and does **not** match the committed file — and it probes identical in every
+    respect that matters (304.72 s, 1180×664, h264 + aac). Two files, one page, stated rather
+    than glossed.
+  - **The size in the prose is derived and the CRF is read from the recorder.** Both are numbers
+    that outlive what they describe: "10.7 MB" was true when written, and a re-encode would
+    leave it still reading as measured.
+    `test_the_readmes_state_the_committed_size_and_encoder_settings_correctly` computes the size
+    from the file and greps `-crf` out of `record_video.py`. It also asserts the committed file
+    is still **over** 10 MB, because the READMEs' whole explanation of why there are two copies
+    rests on that cap.
+  - The size check reads the download link's own **paragraph**, not the section. The
+    section-wide version passed a control that relabelled the download link with the re-encode's
+    8.9 MB, because the paragraph above still mentions 10.7 MB — presence anywhere in a section
+    is satisfied by the sentence *about* the discrepancy, which is not the sentence a reader
+    reads as they click. Found by driving the control, not by review.
+  - Four controls, hand-driven to red first: the URL "tidied" into `[text](url)`, the two
+    READMEs pointing at different uploads, the download link relabelled with the wrong size, and
+    the recorder's CRF retuned while both READMEs keep quoting the old one. `m120`'s anchor also
+    had to be retargeted — the link it mutated was renamed from *Play* to *Download* — which its
+    `count(old) == 1` assertion reported instead of silently mutating nothing.
 - **A guard named "for every tracked file" was checking zero of them in CI.** Found in the CI
   log of the commit above, not by reading:
   `910 passed, 4 skipped` — one skip more than the three ffprobe cross-checks.

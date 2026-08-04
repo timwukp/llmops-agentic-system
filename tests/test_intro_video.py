@@ -482,6 +482,12 @@ def test_both_readmes_reach_the_video_and_the_live_page(readme):
     # guard was requiring a tag that provably does nothing while its message claimed the reader
     # could play it inline.
     #
+    # What this does NOT mean, and what the message below used to imply: that nothing plays
+    # inline. A bare user-attachments URL does, and both READMEs now carry one -- see
+    # test_both_readmes_carry_the_inline_player_url. The two facts are compatible because that
+    # URL is not a tag: GitHub's renderer recognises the LINK and builds the <video> element
+    # itself. Writing the tag by hand is still erased, which is why this half of the guard stays.
+    #
     # Code spans are stripped before matching, because both READMEs now EXPLAIN in prose that
     # `<video>` does not work -- and a guard that fires on the sentence documenting the defect
     # would force the explanation out of the README. Found by writing the naive version first
@@ -506,9 +512,107 @@ def test_both_readmes_reach_the_video_and_the_live_page(readme):
     # are launched and budgets approved, and publishing it in a README invited the whole
     # internet to knock. `tests/redaction_scan.py` now refuses any live execute-api hostname, so
     # this asserts the in-repo pointer that replaced it.
-    assert "deploy/console/intro" in text, (
-        f"{readme} does not point at deploy/console/intro — the mp4 is English only, so a reader "
-        "who needs one of the other four narrations must be told where they are")
+    #
+    # Scoped to the PARAGRAPH that raises the other languages, not the whole README, and that is
+    # not tidiness. It was `"deploy/console/intro" in text`, and the inline-player rewrite added a
+    # second mention of that directory in a different paragraph
+    # (`deploy/console/intro/record_video.py`, naming what encoded the file). From then on the
+    # assertion was satisfied by a path about the RECORDER while the narration pointer could be
+    # deleted outright -- m121, the control for exactly that deletion, went from caught to
+    # UNCAUGHT, which is how this was found. A substring anywhere is not the claim; the claim is
+    # that the reader who needs 粵語 is told where it is, where the subject comes up.
+    para = [p for p in text.split("\n\n") if "한국어" in p]
+    assert para, (
+        f"{readme} no longer lists the other narration languages at all — the mp4 is English "
+        "only, and a reader who needs one of the other four is told nothing")
+    for p in para:
+        assert "deploy/console/intro" in p, (
+            f"{readme} names the other four narrations but not deploy/console/intro, where they "
+            f"actually live. Paragraph was: {' '.join(p.split())[:200]!r}")
+
+
+ASSET_URL = re.compile(
+    r"^https://github\.com/user-attachments/assets/"
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.M)
+
+
+def test_both_readmes_carry_the_inline_player_url():
+    """The one form of link GitHub turns into a player, in both languages, identical.
+
+    This is the guard the sibling test above could not be. That one forbids a hand-written
+    <video> tag; forbidding the thing that does not work says nothing about keeping the thing
+    that does. A rewrite that deletes this URL leaves both guards green and the repo page with
+    no player -- which is exactly the state the READMEs were in until it was added.
+
+    Measured, not assumed, via POST /markdown mode=gfm: a bare user-attachments URL ALONE IN
+    ITS PARAGRAPH renders <details open> + <video controls>. Hence `^...$` with re.M and the
+    blank-line check -- the same URL wrapped in `[text](url)` or trailing prose in the same
+    paragraph is a different input, and this repo does not get to guess which ones GitHub
+    promotes. It also cannot be verified offline (the asset is behind a signed JWT), so the
+    check is on the FORM that was verified online, held to the letter.
+    """
+    urls = set()
+    for readme in ("README.md", "README.zh-TW.md"):
+        text = (REPO / readme).read_text()
+        found = ASSET_URL.findall(text)
+        assert found, (
+            f"{readme} has no bare https://github.com/user-attachments/assets/<uuid> line — "
+            "that URL alone in a paragraph is the ONLY form GitHub renders as a player, so "
+            "without it this page shows a poster and two download links and nothing plays")
+        for url in found:
+            i = text.index(url)
+            before, after = text[:i], text[i + len(url):]
+            assert before.endswith("\n\n"), (
+                f"{readme}: the player URL is not alone in its paragraph (text precedes it on "
+                "the same block) — GitHub only promotes a URL that stands by itself")
+            assert after.startswith("\n\n") or after.strip() == "", (
+                f"{readme}: prose follows the player URL inside the same paragraph — GitHub "
+                "only promotes a URL that stands by itself")
+        urls.update(found)
+    assert len(urls) == 1, (
+        f"the two READMEs point at different uploads ({sorted(urls)}) — a reader of one would "
+        "watch a different film from a reader of the other")
+
+
+def test_the_readmes_state_the_committed_size_and_encoder_settings_correctly():
+    """The two numbers a reader uses to decide whether to click, derived not retyped.
+
+    Both are the kind that survive the thing they describe. "10.7 MB" was written when the
+    committed file was 10,666,327 bytes; a re-encode that halves it leaves the sentence looking
+    measured. And the size is now load-bearing prose, not decoration: the READMEs explain that
+    the inline player serves a SMALLER re-encode because GitHub caps attachments at 10 MB, an
+    argument that only holds while the committed file is actually over that cap.
+    """
+    mb = f"{VIDEO.stat().st_size / 1e6:.1f} MB"
+    # The cap the READMEs' explanation rests on. If a future re-encode drops the committed file
+    # under 10 MB, the prose about needing a separate upload becomes false and must be rewritten
+    # -- so fail here rather than let it read as measured.
+    assert VIDEO.stat().st_size > 10_000_000, (
+        f"the committed video is {mb}, under GitHub's 10 MB attachment cap — both READMEs "
+        "explain the inline player as a re-encode forced by that cap, which is no longer true; "
+        "upload this file itself and delete that paragraph")
+    crf = re.search(r'"-crf",\s*"(\d+)"', (INTRO / "record_video.py").read_text())
+    assert crf, "could not find the -crf setting in record_video.py"
+    for readme in ("README.md", "README.zh-TW.md"):
+        section = _section_containing((REPO / readme).read_text(), "intro-en.mp4")
+        # The PARAGRAPH holding the download link, not the whole section. Found by driving the
+        # section-wide version: swapping the size next to the download link to the re-encode's
+        # 8.9 MB left it GREEN, because the paragraph two above still explains that the
+        # as-recorded file is 10.7 MB. Section-wide presence is satisfied by a mention anywhere,
+        # and the mention that has to be right is the one a reader reads as they click.
+        para = [p for p in section.split("\n\n") if re.search(
+            rf"\[(?!!)[^\]]*\]\({re.escape(str(VIDEO.relative_to(REPO)))}\)", p)]
+        assert para, (
+            f"{readme}: no paragraph contains the plain download link, so the size and encoder "
+            "claims cannot be located next to the promise they qualify")
+        for p in para:
+            assert mb in p, (
+                f"{readme}: the download link's own paragraph does not state the committed "
+                f"file's real size ({mb}) — a stale size reads as measured and misprices the "
+                f"click. Paragraph was: {' '.join(p.split())[:160]!r}")
+            assert f"CRF {crf.group(1)}" in p, (
+                f"{readme}: that paragraph does not say CRF {crf.group(1)}, which is what "
+                "record_video.py actually encodes at — the number was retyped and has drifted")
 
 
 def _section_containing(text: str, needle: str) -> str:

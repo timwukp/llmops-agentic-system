@@ -2068,10 +2068,15 @@ def m120(t):
     The direction that actually happens: someone rewrites the top of the README months from
     now and the embed goes with it. Nothing breaks, no link 404s, the file just stops being
     reachable and keeps costing every clone.
+
+    Retargeted once: the anchor was the "Play the five-minute walkthrough" link, which the
+    inline-player rewrite renamed to "Download the as-recorded walkthrough" (the section now
+    plays the upload and offers the committed file as the download). The `count(old) == 1`
+    assertion is what made that loud instead of silently mutating nothing.
     """
-    old = "**[▶ Play the five-minute walkthrough](docs/media/intro-en.mp4)**"
-    assert t.count(old) == 1, f"the EN play link has moved; found {t.count(old)}"
-    return t.replace(old, "**Play the five-minute walkthrough**", 1)
+    old = "**[▶ Download the as-recorded walkthrough](docs/media/intro-en.mp4)**"
+    assert t.count(old) == 1, f"the EN download link has moved; found {t.count(old)}"
+    return t.replace(old, "**Download the as-recorded walkthrough**", 1)
 
 
 case("readme: the embedded walkthrough stops being reachable from the EN README",
@@ -2325,6 +2330,92 @@ case("redaction: the account-id KDF is 'simplified' to a bare sha256 a GPU sweep
      "tests/redaction_scan.py", m128,
      ["tests/test_redaction_scan.py"
       "::test_the_watched_account_is_stored_as_an_iterated_digest"])
+
+
+def m129(t):
+    """Turn the bare player URL into a tidy markdown link.
+
+    The direction that will actually happen, and the one that looks like an improvement: a bare
+    URL on its own line reads like an accident, so someone wraps it as `[Watch the walkthrough]
+    (…)`. Measured through GitHub's own POST /markdown mode=gfm: the bare form renders
+    <details open> + <video controls>, and this repo does not get to assume the wrapped form
+    does too. If GitHub stops promoting it, the page silently loses its only player while every
+    link still resolves and every other guard stays green -- which is the state both READMEs
+    were in before this URL existed.
+    """
+    old = "\nhttps://github.com/user-attachments/assets/"
+    assert t.count(old) == 1, f"the EN player URL has moved; found {t.count(old)}"
+    i = t.index(old) + 1
+    end = t.index("\n", i)
+    return t[:i] + f"[Watch the five-minute walkthrough]({t[i:end]})" + t[end:]
+
+
+case("readme: the inline player URL is 'tidied' into a markdown link that renders no player",
+     "README.md", m129,
+     ["tests/test_intro_video.py::test_both_readmes_carry_the_inline_player_url"])
+
+
+def m130(t):
+    """Point the zh-TW README at a different upload from the EN one.
+
+    Two READMEs, two uploads, and nothing that compares them: a reader of one watches a
+    different film from a reader of the other, and both pages look correct in isolation. This is
+    the same class as every bilingual drift this repo has had to fix -- the pair is only equal
+    while something asserts it -- except that here neither copy can be diffed, because both
+    URLs resolve to opaque uploads behind a signed JWT.
+    """
+    old = "user-attachments/assets/f189afb1"
+    assert t.count(old) == 1, f"the zh-TW player URL has moved; found {t.count(old)}"
+    return t.replace(old, "user-attachments/assets/0badf00d", 1)
+
+
+case("readme: the zh-TW README points at a different upload from the EN one",
+     "README.zh-TW.md", m130,
+     ["tests/test_intro_video.py::test_both_readmes_carry_the_inline_player_url"])
+
+
+def m131(t):
+    """Restate the committed file's size as the re-encode's, next to the download link.
+
+    The plausible version of this defect, not a typo: the section names TWO files now -- the
+    8.9 MB upload that plays inline and the 10.7 MB original that is committed -- so copying the
+    wrong one of the two numbers onto the download link is a one-character edit that reads as
+    consistent. A reader then expects 8.9 MB and pulls 10.7.
+
+    This control is also why the guard checks the download link's own PARAGRAPH rather than the
+    section: the section-wide version of the assertion passed this exact mutation, because the
+    paragraph above still explains the as-recorded file is 10.7 MB. Presence anywhere in the
+    section is satisfied by the sentence ABOUT the discrepancy, which is not the sentence a
+    reader reads as they click.
+    """
+    old = "**[▶ Download the as-recorded walkthrough](docs/media/intro-en.mp4)** — 10.7 MB"
+    assert t.count(old) == 1, f"the EN download link's size claim has moved; found {t.count(old)}"
+    return t.replace(old, old.replace("10.7 MB", "8.9 MB"), 1)
+
+
+case("readme: the download link is labelled with the inline re-encode's size, not the file's",
+     "README.md", m131,
+     ["tests/test_intro_video.py"
+      "::test_the_readmes_state_the_committed_size_and_encoder_settings_correctly"])
+
+
+def m132(t):
+    """Change the recorder's CRF without touching the READMEs that quote it.
+
+    Mutates the SOURCE, not the prose -- the direction a hardcoded guard cannot catch. Someone
+    tunes the encoder for a smaller file; both READMEs go on saying CRF 26 and go on looking
+    measured. Same shape as the fleet-count control: derive the number from the file that owns
+    it, or the guard only ever catches the prose half.
+    """
+    old = '"-crf", "26"'
+    assert t.count(old) == 1, f"the recorder's crf setting has moved; found {t.count(old)}"
+    return t.replace(old, '"-crf", "30"', 1)
+
+
+case("readme: the recorder's CRF is retuned and both READMEs keep quoting the old one",
+     "deploy/console/intro/record_video.py", m132,
+     ["tests/test_intro_video.py"
+      "::test_the_readmes_state_the_committed_size_and_encoder_settings_correctly"])
 
 
 #: Where the pristine text of the file currently mutated is parked, so a kill -9 -- which
