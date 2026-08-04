@@ -37,7 +37,7 @@ Three lessons are baked in, all learned by this harness reporting a false result
     into an ordinary exception so the existing ``finally`` fires, and a journal on disk that
     survives even ``SIGKILL``, which no handler is allowed to intercept.
 """
-import importlib.util, json, os, pathlib, shutil, signal, subprocess, sys
+import importlib.util, json, os, pathlib, re, shutil, signal, subprocess, sys
 
 REPO = pathlib.Path(__file__).resolve().parents[2]
 
@@ -1899,15 +1899,20 @@ case("redaction: binaries are skipped entirely, not just the entropy rule",
 
 
 def m115(t):
-    """Drop the real-account-id rule, keeping only the structural patterns.
+    """Drop the own-account rule, keeping only the structural patterns.
 
     The subtle half of m114. `AKIA…` and `arn:aws:…` are structural and would still fire, so
     a reviewer skimming for "do the high-signal rules run on binaries?" sees yes. But the
-    generic 12-digit rule is text-only, so REAL_ACCOUNT_IDS is the ONLY thing catching this
+    generic 12-digit rule is text-only, so the digest check is the ONLY thing catching this
     account's bare id in a binary -- delete it and the single most important string in the
     repo's threat model is unguarded in exactly the files nobody reads.
+
+    Retargeted when REAL_ACCOUNT_IDS became REAL_ACCOUNT_DIGESTS: the loop this deletes used to
+    iterate literal ids and now hashes candidates. A control whose anchor has moved does not
+    fail quietly -- the `count(old) == 1` assertion below turns it into a loud error -- which is
+    the reason the anchor is asserted rather than assumed.
     """
-    old = '    for pat_name, pat in ((("this repo\'s own account id"), re.compile(\n'
+    old = "    own_account = []\n"
     assert t.count(old) == 1, f"the account-id loop has moved; found {t.count(old)}"
     i = t.index(old)
     end = t.index("    # The generic heuristic is text-only", i)
@@ -2205,6 +2210,121 @@ def m125(t):
 case("redaction: the live API Gateway hostname rule is removed entirely",
      "tests/redaction_scan.py", m125,
      ["tests/test_redaction_scan.py::test_a_live_api_gateway_hostname_is_a_finding"])
+
+
+def m126(t):
+    """Narrow the binary-classification guard's diff base from the empty tree back to HEAD.
+
+    The direction that actually happened, and it was found in a CI log rather than by reading:
+    `git diff --cached --numstat` with no base lists only what differs from HEAD, so on a clean
+    checkout it returns nothing and the guard did `pytest.skip("nothing staged")`. CI *is* a
+    clean checkout -- the run for the previous commit printed `910 passed, 4 skipped`, one more
+    skip than the three ffprobe cross-checks, and this was the fourth. A guard named "for every
+    tracked file" was checking ZERO of them on the only machine that gates the merge.
+
+    The mutation restores the narrow base. It does not need to fabricate an empty index: run from
+    a dirty worktree the diff still lists something, which is why the guard now also asserts it
+    covered `len(git ls-files)` files rather than merely "at least one". That count assertion is
+    what this control trips.
+    """
+    old = 'subprocess.run(["git", "diff", "--cached", "--numstat", _EMPTY_TREE],'
+    assert t.count(old) == 1, f"the binary-classification diff has moved; found {t.count(old)}"
+    return t.replace(old, 'subprocess.run(["git", "diff", "--cached", "--numstat"],', 1)
+
+
+case("redaction: the binary-classification guard only sees the current change, not every file",
+     "tests/test_redaction_scan.py", m126,
+     ["tests/test_redaction_scan.py"
+      "::test_binary_classification_matches_git_for_every_tracked_file"])
+
+
+def m127(t):
+    """Put the account id back into the scanner as two adjacent halves.
+
+    THE defect this whole change exists to close, restored in the exact form it shipped in. The
+    theory behind it was "a value no scanner's regex matches is a value the repo does not
+    contain", and it was wrong in the only way that matters: the halves sit next to each other,
+    in source order, in a file GitHub renders. A reader recombines them by eye in about a second.
+    Every automated scanner missed it -- including this repo's own, which reported its own source
+    CLEAN -- so the splitting hid the id from the machines that look for it and from no human at
+    all. GitHub secret scanning never flagged it either, because an account id is not a
+    credential and has no detector.
+
+    The mutation cannot spell the id -- and interestingly, it cannot LOOK IT UP either. The first
+    version of this control tried to recover it from git history (`git grep -oE '[0-9]{12}'` over
+    the commits that touched `arn:aws:iam::`) and found nothing, which is the defect restating
+    itself: the id was never in history as twelve consecutive digits, only ever as two halves. So
+    the recovery has to do what a human reader does -- join adjacent literals FIRST, then look --
+    exactly the step the fixed guard added. It reuses the guard's own `_with_literals_joined` for
+    that, which means this control also fails if that helper is gutted.
+
+    The reconstructed split then has to be a REAL match. A guard that merely counted split
+    literals would flag half the scanner (ALLOWED is split on purpose and legitimately so -- those
+    three ids are published by AWS). The property under test is specifically "no split that
+    reconstructs a WATCHED id survives", which is why the guard joins and then asks the digest.
+    """
+    import sys as _sys
+    _sys.path.insert(0, str(REPO / "tests"))
+    import redaction_scan as _rs
+    _sys.path.insert(0, str(REPO))
+    from tests.test_redaction_scan import _with_literals_joined
+
+    # `-S` narrows to commits that changed the number of occurrences, so this is a handful of
+    # blobs rather than a history walk.
+    revs = subprocess.run(["git", "log", "--all", "-S", "arn:aws:iam::", "--format=%H"],
+                          capture_output=True, text=True, cwd=REPO).stdout.split()
+    found = None
+    for sha in revs:
+        blob = subprocess.run(["git", "grep", "-h", "-oE",
+                               r"([0-9\"'b +]|arn:aws)[0-9\"'b +]{10,60}", sha],
+                              capture_output=True, text=True, cwd=REPO).stdout
+        for cand in dict.fromkeys(re.findall(r"(?<![0-9])[0-9]{12}(?![0-9])",
+                                             _with_literals_joined(blob))):
+            if _rs._digest_matches(cand.encode()):
+                found = cand
+                break
+        if found:
+            break
+    assert found, (
+        "could not reconstruct a watched account id from git history, so this control would "
+        "mutate nothing and pass vacuously. If the id is genuinely gone from every historical "
+        "blob, delete this control and say so -- do not leave it green")
+
+    anchor = "REAL_ACCOUNT_DIGESTS = (\n"
+    assert t.count(anchor) == 1, f"the digest tuple has moved; found {t.count(anchor)}"
+    split = f'\n_split_id = b"{found[:6]}" + b"{found[6:]}"\n'
+    return t.replace(anchor, split + anchor, 1)
+
+
+case("redaction: this account's id goes back into the scanner as two adjacent halves",
+     "tests/redaction_scan.py", m127,
+     ["tests/test_redaction_scan.py"
+      "::test_the_real_account_id_is_never_recoverable_from_either_file"])
+
+
+def m128(t):
+    """Replace the iterated KDF with a bare sha256 of the same input.
+
+    The plausible "simplification", and the one nobody would question in review: the digests
+    still look like digests, every scan still produces identical findings, and the whole suite
+    stays green. What changes is only that the stored digest becomes a lookup. Twelve digits is
+    ~40 bits; measured on this laptop single-threaded CPython does 3.1M sha256/s, so the entire
+    1e12 space falls in about four days here and roughly 100 seconds on a GPU. At that point
+    publishing the digest publishes the id -- i.e. the fix would have moved the exposure rather
+    than closed it, while reading as strictly more careful than before.
+
+    Tripped by the round-count assertion, which exists precisely because this property is
+    invisible in a passing scan.
+    """
+    old = 'return hashlib.pbkdf2_hmac("sha256", candidate, _KDF_SALT, _KDF_ROUNDS).hex()'
+    assert t.count(old) == 1, f"account_digest has moved; found {t.count(old)}"
+    return t.replace(old, "return hashlib.sha256(_KDF_SALT + candidate).hexdigest()", 1)
+
+
+case("redaction: the account-id KDF is 'simplified' to a bare sha256 a GPU sweeps in 100 seconds",
+     "tests/redaction_scan.py", m128,
+     ["tests/test_redaction_scan.py"
+      "::test_the_watched_account_is_stored_as_an_iterated_digest"])
 
 
 #: Where the pristine text of the file currently mutated is parked, so a kill -9 -- which
