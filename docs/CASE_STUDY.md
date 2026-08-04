@@ -15,6 +15,13 @@ an endpoint, smoke-tested, and torn down — **with a human pulled in only when
 an agent calls `escalate_human`**. Not "an assistant that suggests commands":
 six agents that hold the pager.
 
+**Six, throughout this document, is the v1 fleet.** The FinOps auditor
+(`llmops_finops`) was added after Phase 6, making seven today — so the READMEs
+say seven and this record says six, and each is right about its own moment.
+Renumbering it would put this document in conflict with the evidence it cites
+(`VERIFICATION_phase5.md`: "All six harnesses currently run Opus 5") and would
+claim the auditor took part in a build it was not present for.
+
 The total bill for proving it — six agents, a trained model, a deployed and
 torn-down endpoint, five end-to-end iterations — was **≈ $12–15**, about one
 hour of a human engineer.

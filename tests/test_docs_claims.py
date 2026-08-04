@@ -607,6 +607,120 @@ def test_the_documented_state_and_lambda_counts_match_the_deployers():
                 f"{name}'s Lambda list {items} names nothing for deployed llmops-{fn}")
 
 
+#: Number words a fleet count may be spelled with, per language. Derivation from the files
+#: is the whole point of the guard below, so this map exists only to turn the derived
+#: INTEGER into the tokens to demand -- nothing here states what the fleet size is.
+_FLEET_WORDS = {5: ("five", "五"), 6: ("six", "六"), 7: ("seven", "七"),
+                8: ("eight", "八"), 9: ("nine", "九"), 10: ("ten", "十")}
+
+#: Every place a doc states the fleet size, anchored on the surrounding phrase. Same reason
+#: LAMBDA_COUNT_PATTERNS is per-doc one guard above: the number is worded differently in each
+#: place, so one loose regex would either miss most of them or match prose that is not a
+#: count at all (`[A-Za-z]+ agents` happily matches "the agents" and "for agents", and
+#: `[一二三四五六七八九十]+個` matches "一個實測缺陷（agent"). Anchoring costs a guard update when
+#: the sentence is reworded -- and that is the cheap direction to fail, because the
+#: assert-it-hit check below turns a reworded claim into a loud failure rather than silence.
+FLEET_COUNT_PATTERNS = {
+    "README.md": (
+        r"\*\*(\d+|[A-Za-z]+) agents that hold the pager\*\*",
+        r"(\d+|[A-Za-z]+) AI agents —",
+    ),
+    "README.zh-TW.md": (
+        r"\*\*(\d+|[一二三四五六七八九十]+) ?個 agent 自己揣著 pager\*\*",
+        r"(\d+|[一二三四五六七八九十]+)個 AI agent ——",
+    ),
+}
+
+#: Docs that narrate a past build and may therefore state a SMALLER count -- but only in a
+#: section that says so. Split out from FLEET_COUNT_PATTERNS because the rule differs, not
+#: because the files matter less.
+HISTORICAL_FLEET_PATTERNS = {
+    "docs/CASE_STUDY.md": (
+        r"(\d+|[A-Za-z]+) agents that hold the pager",
+        r"(\d+|[A-Za-z]+) agents, a trained model",
+    ),
+    "docs/CASE_STUDY.zh-TW.md": (
+        r"而是(\d+|[一二三四五六七八九十]+)個\s*真正值班",
+        r"(\d+|[一二三四五六七八九十]+)個 agent、一個訓練完成",
+    ),
+}
+
+#: What marks a count as belonging to a past fleet rather than today's, both languages.
+_ERA_MARKERS = ("v1 fleet", "v1 當時", "was added after", "之後才加入")
+
+
+def _md_sections(text):
+    """Split a markdown doc at `## ` headings -- the unit a reader takes in at once."""
+    return re.split(r"\n(?=## )", text)
+
+
+def test_the_agent_count_readers_see_first_matches_the_fleet():
+    """The fleet size a newcomer reads first, derived from agents/ rather than restated.
+
+    This is the most-quoted number in the repo and, until this guard, the least checked:
+    it sits above the fold in both READMEs with nothing verifying it. What that costs is
+    already on the record -- both CASE_STUDY variants say "six agents", true when written
+    and false from the moment `llmops_finops` landed, and a fully green suite noticed
+    nothing for the entire life of the seventh harness. A number that was once measured
+    looks measured forever.
+
+    Derived from `agents/*/harness.json`. A guard hardcoding 7 would catch prose drifting
+    while the fleet sits still, and sail straight past the fleet growing while the prose
+    sits still -- and the second is the direction this repo actually drifts: the Lambda
+    count, the ASL state count and this one all broke by ADDITION.
+
+    The carve-out for CASE_STUDY is deliberate and narrow. A document may state a smaller
+    PAST count where it says that is what it is doing, which is why that record still reads
+    "six" -- renumbering it would contradict the evidence file it cites
+    (`VERIFICATION_phase5.md`: "All six harnesses currently run Opus 5") and claim the
+    auditor took part in a build it was absent from. Same principle as `absent_markers` in
+    test_no_doc_claims_a_file_that_does_not_exist: a doc that names the gap is doing the
+    right thing, and a guard forbidding it forces the doc to lie about its own history.
+
+    Two conditions keep that carve-out from becoming a hole. The marker must sit in the same
+    `##` SECTION as the count -- a section is what a reader consumes as a unit, so a
+    scoping sentence three sections away never reaches whoever read the number. And the
+    exempt section must ALSO state today's count, so the note that says "seven today" fails
+    the day an eighth harness lands instead of quietly becoming the next stale number.
+    """
+    n = len(list((REPO / "agents").glob("*/harness.json")))
+    assert n in _FLEET_WORDS, f"{n} harness configs: extend _FLEET_WORDS in this guard"
+    ok = {str(n), *_FLEET_WORDS[n]}
+
+    for name, patterns in FLEET_COUNT_PATTERNS.items():
+        text = (REPO / name).read_text()
+        for pattern in patterns:
+            stated = re.findall(pattern, text)
+            # "No claim found" is a failure, not a pass: deleting or rewording the sentence
+            # would otherwise silence the guard, and that sentence is why it exists.
+            assert stated, (
+                f"{name} no longer states an agent count as /{pattern}/ — the count a "
+                "first-time reader sees is the claim this guard exists to check")
+            for c in stated:
+                assert c.lower() in ok, (
+                    f"{name} tells its first-time reader {c!r} agents; agents/ holds {n} "
+                    f"harness configs. Expected one of {sorted(ok)}.")
+
+    for name, patterns in HISTORICAL_FLEET_PATTERNS.items():
+        sections = _md_sections((REPO / name).read_text())
+        for pattern in patterns:
+            found = 0
+            for section in sections:
+                for c in re.findall(pattern, section):
+                    found += 1
+                    if c.lower() in ok:
+                        continue
+                    assert any(m in section for m in _ERA_MARKERS), (
+                        f"{name} states {c!r} agents where the fleet is {n}, and its "
+                        f"section does not mark that as a past fleet size. Either scope it "
+                        f"to the era it describes (one of {_ERA_MARKERS}) or correct it.")
+                    assert any(w in section for w in ok), (
+                        f"{name} scopes {c!r} agents to a past fleet but never says what "
+                        f"the count is now ({n}); a reader is left with the stale number "
+                        "and the note itself cannot go stale visibly.")
+            assert found, f"{name} no longer states an agent count as /{pattern}/"
+
+
 def test_every_schedule_the_deployer_creates_is_named_in_the_cost_posture():
     """The cost posture called the finops reconcile "one recurring cost" and "the only
     schedule enabled by default". The sweep schedule made both false the moment it landed.

@@ -4,6 +4,25 @@
 
 [English](README.md) · [架構](docs/ARCHITECTURE.zh-TW.md) · [費用](docs/COST.zh-TW.md) · [安全](SECURITY.md) · [Agent 指引](AGENTS.md)
 
+## 這個專案解決什麼問題
+
+LLM 生命週期的大部分工作不是研究，是膠水勞動與待命。在這個 repo 裡，讓一個 QLoRA 作業跑到
+`Completed` 用掉了 **6 輪**依賴版本與 CUDA OOM 失敗：每一輪都是一個人在讀 log、改一個 pin、
+重新送出。同時，沒人看著的支出會一直流 —— 這個帳戶上有一個 endpoint **每天計費 $36.36，
+90 天內 0 次調用、GPU 使用率 0.0%**，而且身上沒有任何 owner tag。沒有人做錯什麼，只是沒有人在看。
+
+一個「會建議命令」的助手補不上這個洞：命令仍然要有人去執行，而且要有人**被授權**去執行。
+診斷正確但沒有手，結局還是等人。
+
+所以改成 —— **7 個 agent 自己揣著 pager**，各自在明訂的自我修復預算內診斷與重試，到邊界才升級；
+一條確定性主幹負責排序階段，因為 DAG 不需要 LLM 判斷；品質門檻硬到把本專案自己的模型判成
+**0/16** 而沒有被談過去；還有一個唯讀的審計員，對照**每個團隊自己設定**的通報基準去估算每一次
+run，讓超支被指名，而不是在帳單上才被發現。整套生命週期端到端驗證完成，花費 **約 $12–15**。
+
+→ 完整記錄（失敗全部保留）：[docs/CASE_STUDY.zh-TW.md](docs/CASE_STUDY.zh-TW.md)
+
+## 這是什麼
+
 七個 AI agent —— 指揮家（orchestrator）、數據準備、微調、評估、部署、監控五位階段專家，加上一位 FinOps 審計員 —— 無人干預地執行完整 LLMOps 生命週期：
 **teacher 大模型（Bedrock 上的 DeepSeek-R1）**生成訓練數據，**student 小模型（Qwen3-1.7B）**
 以 SageMaker 訓練作業做 QLoRA 微調，通過質量門檻評估後部署到 SageMaker endpoint 並持續監控 ——

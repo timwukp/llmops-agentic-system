@@ -4,6 +4,29 @@
 
 [繁體中文](README.zh-TW.md) · [Architecture](docs/ARCHITECTURE.md) · [Cost](docs/COST.md) · [Security](SECURITY.md) · [Agent orientation](AGENTS.md)
 
+## The problem this solves
+
+Most of an LLM's lifecycle is not research — it is glue toil and being on call. In this
+repo, getting one QLoRA job to `Completed` took **6 rounds** of dependency-version and
+CUDA-OOM failures: each round a human reading a log, changing one pin, resubmitting.
+Meanwhile unwatched spend keeps running — this account carried an endpoint billing
+**$36.36/day with 0 invocations and 0.0% GPU utilization over 90 days**, with no owner tag
+at all. Nobody did anything wrong; nobody was looking.
+
+An assistant that suggests commands does not close that gap: someone still has to run the
+command, and be **allowed** to. Correct diagnosis with no hands still waits for a human.
+
+So instead — **7 agents that hold the pager**, each diagnosing and retrying inside a stated
+self-repair budget and escalating at its edge; a deterministic spine that orders the stages,
+because a DAG needs no LLM judgment; quality gates hard enough to score this project's own
+model **0/16** and not be talked past; and a read-only auditor that prices every run against
+a reporting reference **each team sets for itself**, so overspend is named rather than
+discovered on a bill. The whole lifecycle, proven end to end, cost **≈ $12–15**.
+
+→ The full record, failures kept in: [docs/CASE_STUDY.md](docs/CASE_STUDY.md)
+
+## What it is
+
 Seven AI agents — a conductor (orchestrator), five stage specialists (data-prep, finetune,
 eval, deploy, monitor), and a FinOps auditor — execute the full LLMOps
 lifecycle without human intervention: a **teacher LLM (DeepSeek-R1 on Bedrock)** generates
