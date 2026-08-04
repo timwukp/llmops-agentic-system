@@ -21,6 +21,25 @@ run，讓超支被指名，而不是在帳單上才被發現。整套生命週�
 
 → 完整記錄（失敗全部保留）：[docs/CASE_STUDY.zh-TW.md](docs/CASE_STUDY.zh-TW.md)
 
+## 看五分鐘導覽（有旁白）
+
+<video src="docs/media/intro-en.mp4" poster="docs/media/intro-poster.png" controls width="720" preload="none">
+  你的瀏覽器不會內嵌播放 —— <a href="docs/media/intro-en.mp4">下載這段導覽</a>。
+</video>
+
+**[▶ 播放五分鐘導覽](docs/media/intro-en.mp4)** —— 英文旁白，**5:04**，10.7 MB。七個場景：
+沒人看著的閒置 endpoint、六輪失敗的訓練、架構、這次建置實際花了多少，以及那道把本專案自己的
+模型判成 0/16、而且沒有被談過去的品質門檻。
+
+*那個播放連結是刻意留的備援。* GitHub 會不會把 repo 相對路徑的 `<video>` 標籤渲染成內嵌播放器、
+還是把它壓成一個連結，我在推上去之前無法驗證，所以兩個都放：看到播放器就直接播，看到連結就點
+一下下載 —— 兩種情況下檔案都在同一個地方。片中念出的每個數字都與本 README 引用的數字相同；
+聲音是 repo 裡已提交的旁白檔，不是另外重錄的。
+
+線上頁面才是正本 —— 同樣七個場景、**五種語言**旁白（English、普通话、粵語、日本語、한국어）
+並附語言切換，因為這支 mp4 只有英文：
+**[▶ /intro](https://deovqcv4m7.execute-api.us-east-1.amazonaws.com/intro)**。
+
 ## 這是什麼
 
 七個 AI agent —— 指揮家（orchestrator）、數據準備、微調、評估、部署、監控五位階段專家，加上一位 FinOps 審計員 —— 無人干預地執行完整 LLMOps 生命週期：

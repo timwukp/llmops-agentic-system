@@ -2026,6 +2026,117 @@ case("redaction: the blocking byte run is quoted instead of reconstructed",
       "::test_no_credential_shaped_literal_survives_in_either_file"])
 
 
+#: The README's embedded walkthrough video. Three cases, all on the TEXT side of the guard,
+#: because this runner mutates the text of one existing tracked file and journals that path for
+#: recovery -- it cannot swap a 10 MB binary.
+#:
+#: The binary directions were verified BY HAND instead, by building deliberately broken mp4s
+#: with ffmpeg and driving each one past tests/test_intro_video.py. EVERY row below was re-run
+#: with ffprobe removed from PATH, because that is the configuration CI runs in and a guard that
+#: only fails on a laptop does not gate anything:
+#:   4 KB truncation           -> "video is only 4000 bytes" (plus the moov/mdat check)
+#:   -an, 4 KB                 -> "video is only ... bytes"
+#:   -an, FULL LENGTH          -> "video has NO audio track — the narration was not muxed in"
+#:   audio track only 3s       -> "video track is 304.68s but the audio track is 3.07s"
+#:   scale=640:360             -> "recorded at 640x360, but the stage is authored at 1180x664"
+#:   scale=640:360 setsar=59/32-> same; the coded size is read from the sample entry, not tkhd
+#:   setsar=2/1 (coded intact) -> "coded 1180x664 but displayed as 2360x664"
+#:   no +faststart             -> "moov comes after mdat"
+#:   -t 240 (cut short)        -> "video is 240.08s but the narration plus tail is 304.72s"
+#:
+#: Four real guard defects were found that way rather than reasoned about:
+#:   1. the moov check raised ValueError instead of asserting, on a truncated file;
+#:   2. the mp3 fallback assumed MPEG-1 while Polly emits MPEG-2, so it reported 11.7s for
+#:      303.8s of audio -- a wrong answer in the right units, the kind that survives review;
+#:   3. the audio-stream and frame-size assertions sat behind skipif(ffprobe), and CI has no
+#:      ffmpeg, so a FULL-LENGTH SILENT film passed the entire module (7 passed, 3 skipped) on
+#:      the machine that gates merges. Both now read the container directly;
+#:   4. the frame-size check read tkhd, which is DISPLAY geometry: a 640x360 frame tagged
+#:      SAR 59:32 reports width 1180 -- the authored width exactly -- so a video with a third
+#:      of the pixels would have passed. Measured, not hypothesised. It now reads the coded size
+#:      from the sample entry and separately asserts the pixels are square.
+#: Recorded here because the next person to widen this runner should know these directions are
+#: covered, and by what.
+def m120(t):
+    """Delete the video reference from the EN README, leaving 10 MB nobody can reach.
+
+    The direction that actually happens: someone rewrites the top of the README months from
+    now and the embed goes with it. Nothing breaks, no link 404s, the file just stops being
+    reachable and keeps costing every clone.
+    """
+    old = "**[▶ Play the five-minute walkthrough](docs/media/intro-en.mp4)**"
+    assert t.count(old) == 1, f"the EN play link has moved; found {t.count(old)}"
+    return t.replace(old, "**Play the five-minute walkthrough**", 1)
+
+
+case("readme: the embedded walkthrough stops being reachable from the EN README",
+     "README.md", m120,
+     ["tests/test_intro_video.py::test_both_readmes_reach_the_video_and_the_live_page"])
+
+
+def m121(t):
+    """Strip the live-page link from the zh-TW README, leaving only the English-only mp4.
+
+    This is the case that makes the guard's second assertion earn its place. The mp4 is English
+    only; the live page is where the other four narrations are. Drop that link and a Cantonese
+    or Korean reader is left with an English video and no hint the rest exists.
+
+    It also pins a real defect this control found: the assertion was first written
+    `"/intro" in text`, which the video's own path `docs/media/intro-en.mp4` satisfies -- so
+    this exact mutation PASSED. It now matches an absolute URL ending in /intro.
+    """
+    old = "**[▶ /intro](https://deovqcv4m7.execute-api.us-east-1.amazonaws.com/intro)**"
+    assert t.count(old) == 1, f"the zh-TW live-page link has moved; found {t.count(old)}"
+    return t.replace(old, "**/intro**", 1)
+
+
+case("readme: the zh-TW walkthrough section loses the five-language live page",
+     "README.zh-TW.md", m121,
+     ["tests/test_intro_video.py::test_both_readmes_reach_the_video_and_the_live_page"])
+
+
+def m122(t):
+    """Reintroduce a budget figure beside the player, in Chinese.
+
+    The reporting reference is whatever each team sets, so no amount belongs in material that
+    describes the product. The walkthrough section is the likeliest place for one to come back:
+    it is the part that summarises what the video shows, and "it flags runs over $X" reads like
+    a helpful specific rather than like this platform's own test setting.
+
+    zh-TW rather than EN on purpose -- a `$`-shaped pattern would miss 兩萬 entirely, so the
+    half of the guard that has to understand Chinese numerals is the half worth breaking.
+    """
+    old = "沒人看著的閒置 endpoint"
+    assert t.count(old) == 1, f"the zh-TW scene summary has moved; found {t.count(old)}"
+    return t.replace(old, "超過兩萬美元基準的 run、沒人看著的閒置 endpoint", 1)
+
+
+case("readme: a budget amount reappears next to the player (zh-TW)",
+     "README.zh-TW.md", m122,
+     ["tests/test_intro_video.py::test_the_video_section_names_no_budget_amount"])
+
+
+def m123(t):
+    """Re-author the stage at a different size and leave the committed recording behind.
+
+    The one binary-adjacent direction this runner CAN drive, because the mutation is in text:
+    the guard derives the authored size from `.stage` in page.template.html rather than
+    retyping it, so widening the stage without re-recording must fail. That derivation is the
+    point -- record_video.py keeps its own STAGE_W/STAGE_H copy, and a guard that compared the
+    video against the RECORDER's number would stay green while both drifted away from the page
+    the scenes are actually laid out in.
+    """
+    old = "width:1180px; height:664px"
+    assert t.count(old) == 1, f"the .stage size declaration has moved; found {t.count(old)}"
+    return t.replace(old, "width:1280px; height:720px", 1)
+
+
+case("intro: the stage is re-authored larger and the committed video is not re-recorded",
+     "deploy/console/intro/page.template.html", m123,
+     ["tests/test_intro_video.py"
+      "::test_the_video_carries_an_audio_stream_and_the_authored_frame_size"])
+
+
 #: Where the pristine text of the file currently mutated is parked, so a kill -9 -- which
 #: no handler can intercept -- still leaves the original recoverable. Under the repo root
 #: rather than /tmp because it must be obvious to whoever finds the tree dirty, and

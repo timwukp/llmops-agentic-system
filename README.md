@@ -25,6 +25,27 @@ discovered on a bill. The whole lifecycle, proven end to end, cost **≈ $12–1
 
 → The full record, failures kept in: [docs/CASE_STUDY.md](docs/CASE_STUDY.md)
 
+## Watch it — five minutes, narrated
+
+<video src="docs/media/intro-en.mp4" poster="docs/media/intro-poster.png" controls width="720" preload="none">
+  Your browser will not play this inline — <a href="docs/media/intro-en.mp4">download the walkthrough</a>.
+</video>
+
+**[▶ Play the five-minute walkthrough](docs/media/intro-en.mp4)** — English narration,
+**5:04**, 10.7 MB. Seven scenes: the idle endpoint nobody was watching, the six failed
+training rounds, the architecture, what the build actually cost, and the quality gate that
+scored this project's own model 0/16 and was not talked past.
+
+*The play link is deliberate redundancy.* Whether GitHub renders a repo-relative `<video>`
+tag as an inline player or flattens it to a link is not something I could verify before
+pushing, so both are here: if you see a player, use it; if you see a link, the file is one
+click away either way. Every figure spoken in it is the same figure this README cites — the
+audio is the committed narration, not a re-recording.
+
+The live page is the canonical version: the same seven scenes narrated in **five languages**
+(English, 普通话, 粵語, 日本語, 한국어) with a picker, since this mp4 is English only —
+**[▶ /intro](https://deovqcv4m7.execute-api.us-east-1.amazonaws.com/intro)**.
+
 ## What it is
 
 Seven AI agents — a conductor (orchestrator), five stage specialists (data-prep, finetune,

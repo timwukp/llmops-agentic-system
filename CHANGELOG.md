@@ -127,6 +127,71 @@ to describe the patterns instead.
   generator to restore the wrong number on its next run. It now counts the nav buttons in
   `frontend.html`, like `HARNESS_N` and `LIMIT_USD` already did.
 
+### The same walkthrough, playable from the README
+
+A reader on GitHub sees a README, not a browser tab, and a link to a live console is something
+they have to decide to click. `docs/media/intro-en.mp4` (10.7 MB, 5:04) is committed and
+embedded in both READMEs so the five-minute walkthrough plays without leaving the page. The
+live `/intro` page stays the canonical artifact — it is the one with all five narrations, and
+the mp4 is English only, so both READMEs link it right beside the player.
+
+- **One clock, not two recordings.** `deploy/console/intro/record_video.py` plays the real page
+  in a headless browser *in real time* and muxes the **same committed mp3s** the page just
+  played. The page's clock **is** the audio element (`curTime()` returns `audio.currentTime`),
+  so a 300 ms stall stalls the animation with the sound instead of sliding it ahead: sync is a
+  property of using one clock, not of aligning two recordings afterwards. Rendering frame N at
+  `t = N/fps` was rejected in writing — CSS transitions and SVG `@keyframes` animate on the
+  document timeline, which does not advance during a screenshot, so every beat would pop
+  instead of fade and the diagrams would be static.
+- **Three separate offsets, measured, not absorbed into a tolerance.** Drift started at
+  **+2.00s** and each cause was found rather than tuned away: an opening **lead-in** (recording
+  begins at context creation, narration after load+click) trimmed with `-ss` after measuring to
+  the first nonzero `currentTime`; a **deliberate 900 ms tail** (`TAIL_S`) held so the closing
+  beat's `.5s` fade completes, named as a constant and *added to the expected length* rather
+  than charged to drift; and a **trailing flush** as the browser finalises the file on context
+  close, cut with `-t`. Final drift: **+0.00s**. Widening the tolerance twice would have been
+  quicker, and a tolerance wide enough to hide a deliberate second is wide enough to hide an
+  accidental one.
+- **The recorder is a build step; the guard checks the result.** It needs Chromium and ffmpeg,
+  and this suite is offline by construction, so `tests/test_intro_video.py` (11 tests) verifies
+  the artifact instead of re-running the recorder: length against the summed narration clips,
+  an audio track as long as the video, the authored stage size, `yuv420p`, `moov` before `mdat`,
+  and that both READMEs carry **both** a `<video>` tag and a plain link.
+- **Four guard defects found by breaking it, not by reading it.** Deliberately broken mp4s were
+  built and driven past the guard, each one **with `ffprobe` removed from `PATH`**, because CI
+  has no ffmpeg and a guard that only fails on a laptop gates nothing.
+  - The truncated file made the faststart check raise `ValueError: b'mdat' is not in list` —
+    red, but reporting a Python bug rather than the state of the file.
+  - The no-ffprobe mp3 fallback assumed **MPEG-1** while Polly emits **MPEG-2** (24 kHz mono),
+    so it returned **11.7s for 303.8s of audio**: a wrong answer in the right units, on the
+    exact branch that runs in CI.
+  - **A full-length silent film passed the entire module** — `7 passed, 3 skipped` — on the
+    machine that gates merges. The audio-track and frame-size assertions sat behind
+    `skipif(ffprobe)`, the same defect as the length check one test along. Both now read
+    `hdlr` / `stsd` / `mdhd` out of `moov` directly, and a 3-second audio track against a
+    304-second video fails on **duration** rather than passing on presence.
+  - **The frame-size check read `tkhd`, which is *display* geometry.** A 640×360 frame tagged
+    `SAR 59:32` reports width **1180** — the authored width exactly — so a video carrying a
+    third of the pixels would have passed. It now reads the coded size from the sample entry and
+    separately asserts the pixels are square, which also catches the reverse: right pixel count,
+    stretched rendering.
+
+  Each is cross-checked against ffprobe where ffprobe exists, and the length check reads `mvhd`
+  from the container so it *runs* without ffmpeg rather than skipping into a green tick.
+- **The authored stage size is derived from the page's own CSS**, not retyped and not read from
+  `record_video.py` — the recorder keeps its own `STAGE_W`/`STAGE_H`, and a guard comparing the
+  video against the *recorder's* number stays green while both drift away from the page the
+  scenes are actually laid out in. **m123** re-authors `.stage` larger without re-recording, and
+  the guard fails.
+- **`"/intro" in text` was satisfied by `docs/media/intro-en.mp4`.** So the assertion that the
+  READMEs still link the five-language live page could not fail while the video link existed.
+  Found by **m121** deleting the live link and watching the test stay green; it now matches an
+  absolute URL. **m120** and **m122** cover the video becoming unreachable and a budget figure
+  reappearing beside the player.
+- **No amount, in either language.** The walkthrough section says the reporting reference is
+  set by each team and names no figure — checked by section boundary rather than a character
+  window, so the guard does not police the pre-existing prose in the next section.
+
 ### The README never said what problem it solves
 
 - **Both READMEs opened with an implementation, not a problem.** The first sentence was "An
