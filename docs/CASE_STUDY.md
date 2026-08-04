@@ -8,12 +8,13 @@ failures are kept in because they are the point.
 
 ## The goal
 
-Replace the human LLMOps engineer for one complete lifecycle: a teacher LLM
-(DeepSeek-R1 on Bedrock) generates training data, a student model (Qwen3-1.7B)
-is QLoRA-fine-tuned on SageMaker, evaluated against quality gates, deployed to
-an endpoint, smoke-tested, and torn down — **with a human pulled in only when
-an agent calls `escalate_human`**. Not "an assistant that suggests commands":
-six agents that hold the pager.
+Carry one complete lifecycle end to end without anyone having to stand by: a
+teacher LLM (DeepSeek-R1 on Bedrock) generates training data, a student model
+(Qwen3-1.7B) is QLoRA-fine-tuned on SageMaker, evaluated against quality gates,
+deployed to an endpoint, smoke-tested, and torn down — **with a person brought in
+only when an agent calls `escalate_human`**. Not "an assistant that suggests
+commands": six agents that hold the pager for the routine rounds, so the
+engineers who own the system are called for the decisions rather than the toil.
 
 **Six, throughout this document, is the v1 fleet.** The FinOps auditor
 (`llmops_finops`) was added after Phase 6, making seven today — so the READMEs
@@ -23,20 +24,22 @@ Renumbering it would put this document in conflict with the evidence it cites
 claim the auditor took part in a build it was not present for.
 
 The total bill for proving it — six agents, a trained model, a deployed and
-torn-down endpoint, five end-to-end iterations — was **≈ $12–15**, about one
-hour of a human engineer.
+torn-down endpoint, five end-to-end iterations — was **≈ $12–15**, less than
+this account spent in a single day on one idle endpoint nobody was watching
+($36.36/day, §4 of [COST.md](COST.md)).
 
 ## The thesis: three layers, not one model
 
 The clearest single incident is from Phase 3. The finetune agent was asked to
 launch a QLoRA training job; its S3 download of the training script failed with
-a 403. With zero human intervention it: probed two prefixes and *induced* that
+a 403. Without anyone stepping in it: probed two prefixes and *induced* that
 its IAM role was prefix-scoped (`runs/*` readable, `code/*` not) rather than
 blindly retrying; searched fallbacks in priority order (local workspace → skill
 directories → historical jobs' sourcedirs); found the sandbox had no `tar` and
 rebuilt `sourcedir.tar.gz` with Python's `tarfile`; uploaded it to a prefix it
 *could* write; submitted the job; verified `InProgress`; and released the
-session with `job_launched`. Training started on the first human-free attempt.
+session with `job_launched`. Training started on the first attempt, with nobody
+paged.
 
 That behavior is not a property of any one component. It is three layers
 multiplied:
@@ -51,7 +54,7 @@ multiplied:
    self-repair budget ("diagnose, fix, retry — max 3; then `escalate_human`"),
    and the mounted skills supply the domain shape of a correct fix. A
    conservatively-aligned model without that grant stops at the first 403 to
-   ask a human.
+   ask for help.
 
 Remove any layer and the same incident ends as `escalate_human: S3 403`
 instead of a running training job.

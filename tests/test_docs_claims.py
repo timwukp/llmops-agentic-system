@@ -640,13 +640,33 @@ HISTORICAL_FLEET_PATTERNS = {
         r"(\d+|[A-Za-z]+) agents, a trained model",
     ),
     "docs/CASE_STUDY.zh-TW.md": (
-        r"而是(\d+|[一二三四五六七八九十]+)個\s*真正值班",
+        r"而是(\d+|[一二三四五六七八九十]+)個 agent\s*在例行巡檢",
         r"(\d+|[一二三四五六七八九十]+)個 agent、一個訓練完成",
     ),
 }
 
 #: What marks a count as belonging to a past fleet rather than today's, both languages.
 _ERA_MARKERS = ("v1 fleet", "v1 當時", "was added after", "之後才加入")
+
+#: The evidence file whose sentence fixes what the v1 fleet size WAS. CASE_STUDY cites this
+#: exact line as the reason it must keep saying "six", so the guard reads the count from
+#: there rather than restating it: if the record is ever corrected, the docs allowed to quote
+#: it move with it, and a former count nobody recorded is not allowed at all.
+_V1_FLEET_EVIDENCE = "deploy/evidence/VERIFICATION_phase5.md"
+
+
+def _v1_fleet_words():
+    """Accepted spellings of the v1 fleet size, read from the evidence file."""
+    text = (REPO / _V1_FLEET_EVIDENCE).read_text()
+    m = re.search(r"All (\w+) harnesses currently run", text)
+    assert m, (f"{_V1_FLEET_EVIDENCE} no longer states the v1 fleet size as "
+               '"All <n> harnesses currently run" — the historical carve-out below has no '
+               "record to check the past count against, so re-anchor it before trusting it")
+    word = m.group(1).lower()
+    for k, words in _FLEET_WORDS.items():
+        if word == str(k) or word in words:
+            return {str(k), *words}
+    raise AssertionError(f"{_V1_FLEET_EVIDENCE} says {word!r} harnesses: extend _FLEET_WORDS")
 
 
 def _md_sections(text):
@@ -718,6 +738,16 @@ def test_the_agent_count_readers_see_first_matches_the_fleet():
                         f"{name} scopes {c!r} agents to a past fleet but never says what "
                         f"the count is now ({n}); a reader is left with the stale number "
                         "and the note itself cannot go stale visibly.")
+                    # ...and the past count must be the count that era actually had. Without
+                    # this, the carve-out accepts ANY number in a marked section: "five agents,
+                    # the v1 fleet, seven today" satisfied both checks above. Derived from the
+                    # evidence file the doc cites for it, so the exemption is anchored to a
+                    # record rather than to a literal in this guard.
+                    assert c.lower() in _v1_fleet_words(), (
+                        f"{name} states {c!r} agents as the past fleet; the evidence it cites "
+                        f"({_V1_FLEET_EVIDENCE}) records {sorted(_v1_fleet_words())}. A "
+                        "section may state a former count, but not a former count that never "
+                        "existed.")
             assert found, f"{name} no longer states an agent count as /{pattern}/"
 
 

@@ -32,8 +32,8 @@ https://github.com/user-attachments/assets/f189afb1-c326-49b6-b023-785da5ed3e6a
 ## What it is
 
 Seven AI agents — a conductor (orchestrator), five stage specialists (data-prep, finetune,
-eval, deploy, monitor), and a FinOps auditor — execute the full LLMOps
-lifecycle without human intervention: a **teacher LLM (DeepSeek-R1 on Bedrock)** generates
+eval, deploy, monitor), and a FinOps auditor — carry the full LLMOps
+lifecycle end to end, unattended on the routine path: a **teacher LLM (DeepSeek-R1 on Bedrock)** generates
 training data, a **student model (Qwen3-1.7B)** is QLoRA-fine-tuned as a SageMaker training
 job, evaluated against quality gates, deployed to a SageMaker endpoint, and monitored —
 with a human pulled in only when an agent calls `escalate_human`, or when a run's estimated
@@ -94,18 +94,18 @@ Key design decisions (full rationale in [docs/ARCHITECTURE.md](docs/ARCHITECTURE
   harness cannot resolve a `git` skill source, so the mirror is a prerequisite, not a
   refinement.
 
-## Why the agents can replace an LLMOps engineer: three layers, not one model
+## Why the agents can carry the routine work themselves: three layers, not one model
 
 A real incident from Phase 3 (verbatim in
 [`deploy/evidence/VERIFICATION_phase3.md`](deploy/evidence/VERIFICATION_phase3.md)):
 the finetune agent was asked to launch a QLoRA training job. Its S3 download of the
-training script failed with a 403. **With zero human intervention** it: probed two
+training script failed with a 403. **Without anyone stepping in** it: probed two
 prefixes and induced that its IAM role was prefix-scoped (`runs/*` readable, `code/*`
 not) rather than blindly retrying; searched fallbacks in priority order (local
 workspace → skill directories → historical jobs' sourcedirs); found the sandbox had
 no `tar` and rebuilt `sourcedir.tar.gz` with Python's `tarfile` instead; uploaded it
 to a prefix it *could* write; submitted the job; verified `InProgress`; and released
-with `job_launched`. Training started on the first human-free attempt.
+with `job_launched`. Training started on the first attempt, with nobody paged.
 
 That behavior is not a property of any single component — it is three layers multiplied:
 
@@ -113,12 +113,18 @@ That behavior is not a property of any single component — it is three layers m
 |---|---|---|
 | **Model quality** (Claude Fable 5 as the harness loop) | *Reasoning per recovery hop* — each failure produces a designed hypothesis (a 2-point permission probe → "role is prefix-scoped"), a prioritized search order, an instant tool substitution. Weaker models retry the same 403 or give up. | Diagnosis loops or premature escalation |
 | **Harness runtime** (AgentCore microVM: shell, filesystem, code interpreter) | *Ability to act* — probing S3 permissions, building tarballs, calling SageMaker are real actions in a real environment, not suggestions in a chat window. | Correct diagnosis, no hands |
-| **Engineering the authorization** (task prompts + mounted skills) | *Permission to act, with boundaries* — every task prompt grants an explicit self-repair budget ("diagnose, fix, retry — max 3; then `escalate_human`"), and mounted skills supply the domain shape of a correct fix (what a script-mode sourcedir looks like). | A conservatively-aligned model stops at the first 403 to ask a human |
+| **Engineering the authorization** (task prompts + mounted skills) | *Permission to act, with boundaries* — every task prompt grants an explicit self-repair budget ("diagnose, fix, retry — max 3; then `escalate_human`"), and mounted skills supply the domain shape of a correct fix (what a script-mode sourcedir looks like). | A conservatively-aligned model stops at the first 403 to ask for help |
 
-The thesis this repo demonstrates: **what replaces a human LLMOps engineer is not a
-model — it is a strong model × a real execution environment × explicitly engineered
+The thesis this repo demonstrates: **what lets an agent finish this kind of work unattended
+is not a model — it is a strong model × a real execution environment × explicitly engineered
 authorization boundaries.** Remove any factor and the same incident ends as
 `escalate_human: S3 403` instead of a running training job.
+
+To be clear about what this is and is not: the aim is to take the 3 a.m. log-reading and the
+sixth resubmission off an engineer's plate, not the engineer. Every judgment that matters —
+what to build, which trade-off is acceptable, whether a gate's verdict should stand — stays
+with the people who own the system, which is why the escalation path is a first-class feature
+rather than a fallback.
 
 The same three layers produced, unprompted: per-task S3 checkpointing after a microVM
 recycle destroyed local state (the agent adopted it and recorded it in the manifest as

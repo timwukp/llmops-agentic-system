@@ -5,6 +5,51 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
 ## [Unreleased]
 
+### The docs framed the agents as replacing engineers; they do not
+
+Reader-facing wording only — no behavior, no numbers, no guard. The README's own section
+heading read "Why the agents can **replace** an LLMOps engineer", `docs/CASE_STUDY.md`'s goal
+statement opened with "Replace the human LLMOps engineer", and both the case study and the test
+results priced the whole proof as "about one hour of a human engineer". That framing is both
+off-putting and inaccurate about what this system actually does: it takes the 3 a.m. log-reading
+and the sixth resubmission, and every judgment that matters still sits with the people who own
+the system — which is why `escalate_human` is a first-class path rather than a fallback. Both
+languages, swept together:
+
+- The section heading is now "Why the agents can carry the routine work themselves", and both
+  READMEs say so explicitly in a new closing paragraph: the aim is the toil, not the engineer.
+- `docs/CASE_STUDY.md` / `.zh-TW.md` open with carrying one lifecycle end to end "without anyone
+  having to stand by", and name the engineers as the ones called for the decisions.
+- The cost comparison changed subject. "About one hour of a human engineer" became "less than
+  this account spent in a single day on one idle endpoint nobody was watching ($36.36/day)" — in
+  `docs/CASE_STUDY.md`, `docs/TEST_RESULTS.md`, both Chinese twins, and the intro page's cost
+  card. It is the same order of magnitude and a better comparison: it measures the waste this
+  repo exists to catch, against a number this repo already documents and guards
+  (`tests/test_cost_model.py`), instead of measuring a person.
+- Softer throughout where the meaning is unchanged: "human-free attempt" → "with nobody paged",
+  "stops at the first 403 to ask a human" → "to ask for help", 升級人類 → 升級求助.
+
+Left deliberately alone: `deploy/evidence/` and the phase table's "zero human intervention",
+which are records of what a specific run did; `str.replace()` and prompt/event replacement in
+code; and "no human user in the loop", which justifies a memory-strategy choice.
+
+One guard did fire, and finding out why closed a hole in it.
+`test_the_agent_count_readers_see_first_matches_the_fleet` anchors its zh-TW pattern on the
+sentence I reworded, so it failed loudly instead of silently retiring — the assert-it-hit design
+working as intended. Re-anchoring it exposed the other half: the era carve-out that lets
+`docs/CASE_STUDY*.md` keep saying "six agents" accepted **any** number in a marked section.
+Measured on merged main before touching it, `六 → 五` was green there — a section reading "five
+agents … the v1 fleet … seven today" satisfied both existing checks, because neither asked whether
+five was ever the fleet size. The accepted past count is now read from the sentence in
+`deploy/evidence/VERIFICATION_phase5.md` that the section already cites as its reason, so a
+former count nobody recorded fails, and a reworded evidence line fails loudly rather than
+reverting the carve-out to accepting anything. Three negative controls (m138–m140), each
+hand-driven to red on its own assertion: the past count drifting in each language, and the
+evidence sentence being reworded out from under the derivation.
+
+Counts refilled from the guards' own failure messages, not computed: negative controls
+157 → 160 pairs over 141 mutations, both languages.
+
 ### Two guards from the previous change could pass having checked nothing
 
 Follow-up to the change below, from reviewing it after it merged. Both holes are the same shape
