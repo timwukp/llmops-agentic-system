@@ -153,18 +153,36 @@ the mp4 is English only, so both READMEs link it right beside the player.
   quicker, and a tolerance wide enough to hide a deliberate second is wide enough to hide an
   accidental one.
 - **The recorder is a build step; the guard checks the result.** It needs Chromium and ffmpeg,
-  and this suite is offline by construction, so `tests/test_intro_video.py` (10 tests) verifies
+  and this suite is offline by construction, so `tests/test_intro_video.py` (11 tests) verifies
   the artifact instead of re-running the recorder: length against the summed narration clips,
-  an audio stream at all, the authored 1180×664 stage, `yuv420p`, `moov` before `mdat`, and
-  that both READMEs carry **both** a `<video>` tag and a plain link.
-- **Two guard defects found by breaking it, not by reading it.** Five deliberately broken mp4s
-  were built and driven past the guard. The truncated one made the faststart check raise
-  `ValueError: b'mdat' is not in list` — red, but reporting a Python bug rather than the state
-  of the file. And the no-ffprobe mp3 fallback assumed **MPEG-1** while Polly emits **MPEG-2**
-  (24 kHz mono), so it returned **11.7s for 303.8s of audio**: a wrong answer in the right
-  units, on the exact branch that runs in CI. Both fixed, both now cross-checked against
-  ffprobe clip by clip, and the length check reads `mvhd` from the container so it *runs*
-  without ffmpeg rather than skipping into a green tick.
+  an audio track as long as the video, the authored stage size, `yuv420p`, `moov` before `mdat`,
+  and that both READMEs carry **both** a `<video>` tag and a plain link.
+- **Four guard defects found by breaking it, not by reading it.** Deliberately broken mp4s were
+  built and driven past the guard, each one **with `ffprobe` removed from `PATH`**, because CI
+  has no ffmpeg and a guard that only fails on a laptop gates nothing.
+  - The truncated file made the faststart check raise `ValueError: b'mdat' is not in list` —
+    red, but reporting a Python bug rather than the state of the file.
+  - The no-ffprobe mp3 fallback assumed **MPEG-1** while Polly emits **MPEG-2** (24 kHz mono),
+    so it returned **11.7s for 303.8s of audio**: a wrong answer in the right units, on the
+    exact branch that runs in CI.
+  - **A full-length silent film passed the entire module** — `7 passed, 3 skipped` — on the
+    machine that gates merges. The audio-track and frame-size assertions sat behind
+    `skipif(ffprobe)`, the same defect as the length check one test along. Both now read
+    `hdlr` / `stsd` / `mdhd` out of `moov` directly, and a 3-second audio track against a
+    304-second video fails on **duration** rather than passing on presence.
+  - **The frame-size check read `tkhd`, which is *display* geometry.** A 640×360 frame tagged
+    `SAR 59:32` reports width **1180** — the authored width exactly — so a video carrying a
+    third of the pixels would have passed. It now reads the coded size from the sample entry and
+    separately asserts the pixels are square, which also catches the reverse: right pixel count,
+    stretched rendering.
+
+  Each is cross-checked against ffprobe where ffprobe exists, and the length check reads `mvhd`
+  from the container so it *runs* without ffmpeg rather than skipping into a green tick.
+- **The authored stage size is derived from the page's own CSS**, not retyped and not read from
+  `record_video.py` — the recorder keeps its own `STAGE_W`/`STAGE_H`, and a guard comparing the
+  video against the *recorder's* number stays green while both drift away from the page the
+  scenes are actually laid out in. **m123** re-authors `.stage` larger without re-recording, and
+  the guard fails.
 - **`"/intro" in text` was satisfied by `docs/media/intro-en.mp4`.** So the assertion that the
   READMEs still link the five-language live page could not fail while the video link existed.
   Found by **m121** deleting the live link and watching the test stay green; it now matches an

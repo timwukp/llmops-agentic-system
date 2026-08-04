@@ -2030,20 +2030,33 @@ case("redaction: the blocking byte run is quoted instead of reconstructed",
 #: because this runner mutates the text of one existing tracked file and journals that path for
 #: recovery -- it cannot swap a 10 MB binary.
 #:
-#: The binary directions were verified BY HAND instead, by building five deliberately broken
-#: mp4s with ffmpeg and driving each one past tests/test_intro_video.py:
-#:   4 KB truncation     -> "video is only 4000 bytes" (plus the moov/mdat check)
-#:   -an (silent)        -> "video has NO audio stream — the narration was not muxed in"
-#:   scale=640:360       -> "recorded at 640x360, but the stage is authored at 1180x664"
-#:   no +faststart       -> "moov comes after mdat"
-#:   -t 240 (cut short)  -> "video is 240.08s but the narration plus tail is 304.72s"
-#: The length one was re-run with ffprobe removed from PATH, because that is the configuration
-#: CI runs in, and it still fails there. Two real guard defects were found that way rather than
-#: reasoned about: the moov check raised ValueError instead of asserting on a truncated file,
-#: and the mp3 fallback assumed MPEG-1 while Polly emits MPEG-2, so it reported 11.7s for
-#: 303.8s of audio -- a wrong answer in the right units, which is the kind that survives
-#: review. Recorded here because the next person to widen this runner should know these
-#: directions are covered, and by what.
+#: The binary directions were verified BY HAND instead, by building deliberately broken mp4s
+#: with ffmpeg and driving each one past tests/test_intro_video.py. EVERY row below was re-run
+#: with ffprobe removed from PATH, because that is the configuration CI runs in and a guard that
+#: only fails on a laptop does not gate anything:
+#:   4 KB truncation           -> "video is only 4000 bytes" (plus the moov/mdat check)
+#:   -an, 4 KB                 -> "video is only ... bytes"
+#:   -an, FULL LENGTH          -> "video has NO audio track — the narration was not muxed in"
+#:   audio track only 3s       -> "video track is 304.68s but the audio track is 3.07s"
+#:   scale=640:360             -> "recorded at 640x360, but the stage is authored at 1180x664"
+#:   scale=640:360 setsar=59/32-> same; the coded size is read from the sample entry, not tkhd
+#:   setsar=2/1 (coded intact) -> "coded 1180x664 but displayed as 2360x664"
+#:   no +faststart             -> "moov comes after mdat"
+#:   -t 240 (cut short)        -> "video is 240.08s but the narration plus tail is 304.72s"
+#:
+#: Four real guard defects were found that way rather than reasoned about:
+#:   1. the moov check raised ValueError instead of asserting, on a truncated file;
+#:   2. the mp3 fallback assumed MPEG-1 while Polly emits MPEG-2, so it reported 11.7s for
+#:      303.8s of audio -- a wrong answer in the right units, the kind that survives review;
+#:   3. the audio-stream and frame-size assertions sat behind skipif(ffprobe), and CI has no
+#:      ffmpeg, so a FULL-LENGTH SILENT film passed the entire module (7 passed, 3 skipped) on
+#:      the machine that gates merges. Both now read the container directly;
+#:   4. the frame-size check read tkhd, which is DISPLAY geometry: a 640x360 frame tagged
+#:      SAR 59:32 reports width 1180 -- the authored width exactly -- so a video with a third
+#:      of the pixels would have passed. Measured, not hypothesised. It now reads the coded size
+#:      from the sample entry and separately asserts the pixels are square.
+#: Recorded here because the next person to widen this runner should know these directions are
+#: covered, and by what.
 def m120(t):
     """Delete the video reference from the EN README, leaving 10 MB nobody can reach.
 
@@ -2101,6 +2114,27 @@ def m122(t):
 case("readme: a budget amount reappears next to the player (zh-TW)",
      "README.zh-TW.md", m122,
      ["tests/test_intro_video.py::test_the_video_section_names_no_budget_amount"])
+
+
+def m123(t):
+    """Re-author the stage at a different size and leave the committed recording behind.
+
+    The one binary-adjacent direction this runner CAN drive, because the mutation is in text:
+    the guard derives the authored size from `.stage` in page.template.html rather than
+    retyping it, so widening the stage without re-recording must fail. That derivation is the
+    point -- record_video.py keeps its own STAGE_W/STAGE_H copy, and a guard that compared the
+    video against the RECORDER's number would stay green while both drifted away from the page
+    the scenes are actually laid out in.
+    """
+    old = "width:1180px; height:664px"
+    assert t.count(old) == 1, f"the .stage size declaration has moved; found {t.count(old)}"
+    return t.replace(old, "width:1280px; height:720px", 1)
+
+
+case("intro: the stage is re-authored larger and the committed video is not re-recorded",
+     "deploy/console/intro/page.template.html", m123,
+     ["tests/test_intro_video.py"
+      "::test_the_video_carries_an_audio_stream_and_the_authored_frame_size"])
 
 
 #: Where the pristine text of the file currently mutated is parked, so a kill -9 -- which

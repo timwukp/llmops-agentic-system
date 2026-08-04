@@ -46,9 +46,25 @@ POSTER = REPO / "docs" / "media" / "intro-poster.png"
 INTRO = REPO / "deploy" / "console" / "intro"
 LANG = "en"
 
-#: Authored stage size, from page.template.html. Recording at exactly this means fit()
-#: computes scale = 1 and nothing is resampled.
-STAGE_W, STAGE_H = 1180, 664
+def _stage_size() -> tuple[int, int]:
+    """The authored stage size, read from the page's own CSS.
+
+    Not retyped, and not read from record_video.py either -- the recorder has its own
+    STAGE_W/STAGE_H copy, and a guard that compares the video to the RECORDER's number would
+    stay green if both drifted away from what the page actually lays out. `.stage` is the box
+    every scene is positioned inside; fit() scales it, so this is the size at which scale == 1
+    and nothing is resampled.
+    """
+    css = (INTRO / "page.template.html").read_text()
+    m = re.search(r"\.stage\s*\{[^}]*?width:\s*(\d+)px;\s*height:\s*(\d+)px", css, re.S)
+    assert m, ("could not find the .stage width/height in page.template.html — the authored "
+               "size this guard compares the recording against is derived from there")
+    return int(m.group(1)), int(m.group(2))
+
+
+#: Recording at exactly the authored stage size means fit() computes scale = 1 and nothing is
+#: resampled.
+STAGE_W, STAGE_H = _stage_size()
 
 #: Must match record_video.TAIL_S. Imported rather than retyped below.
 def _tail_s() -> float:
@@ -214,22 +230,75 @@ def test_the_video_is_a_real_mp4_with_a_moov_atom_up_front():
         "+faststart, so a browser must download the whole file before showing frame one")
 
 
-@pytest.mark.skipif(not _have("ffprobe"), reason="ffprobe not installed")
 def test_the_video_carries_an_audio_stream_and_the_authored_frame_size():
-    streams = _ffprobe("-show_streams")["streams"]
-    video = [s for s in streams if s["codec_type"] == "video"]
-    audio = [s for s in streams if s["codec_type"] == "audio"]
-    assert len(video) == 1, f"expected one video stream, got {len(video)}"
+    """Track shape from the container, so this runs where merges are gated.
+
+    This assertion was behind `skipif(not _have("ffprobe"))` and CI has no ffmpeg. Measured
+    what that cost: a full-length copy remuxed with `-an` -- a perfectly playable SILENT film,
+    the exact failure the module docstring names -- passed the whole module under CI conditions
+    (7 passed, 3 skipped). Same defect as the skipped length check, one test along: an
+    assertion gated on a tool the gating machine does not have is not an assertion.
+
+    Handler type, codec fourcc and the tkhd frame size are all in `moov`, so none of this
+    needed ffprobe in the first place. test_the_track_reader_agrees_with_ffprobe pins it
+    against ffprobe where ffprobe exists.
+    """
+    video = [t for t in _tracks(VIDEO.read_bytes()) if t["handler"] == "vide"]
+    audio = [t for t in _tracks(VIDEO.read_bytes()) if t["handler"] == "soun"]
+    assert len(video) == 1, f"expected one video track, got {len(video)}"
     # The entire point of this artifact is that it is narrated. A silent mp4 plays fine and
     # is a different product.
-    assert audio, "video has NO audio stream — the narration was not muxed in"
-    assert video[0]["codec_name"] == "h264", f"unexpected video codec {video[0]['codec_name']}"
-    assert video[0]["pix_fmt"] == "yuv420p", (
-        f"pix_fmt is {video[0]['pix_fmt']}, not yuv420p — QuickTime and Safari show a black "
-        "frame for anything else")
-    assert (video[0]["width"], video[0]["height"]) == (STAGE_W, STAGE_H), (
-        f"recorded at {video[0]['width']}x{video[0]['height']}, but the stage is authored at "
+    assert audio, "video has NO audio track — the narration was not muxed in"
+    # fourcc as stored in the sample description, not ffprobe's friendly name: h264 is `avc1`
+    # and aac is `mp4a`.
+    assert video[0]["codec"] == "avc1", (
+        f"video track codec is {video[0]['codec']!r}, not avc1/h264")
+    assert audio[0]["codec"] == "mp4a", (
+        f"audio track codec is {audio[0]['codec']!r}, not mp4a/aac")
+    # CODED size, from the sample entry -- the pixels that actually exist in the file.
+    assert (video[0]["w"], video[0]["h"]) == (STAGE_W, STAGE_H), (
+        f"recorded at {video[0]['w']}x{video[0]['h']}, but the stage is authored at "
         f"{STAGE_W}x{STAGE_H} — anything else ships the diagrams resampled")
+    # And the display size must agree with it, i.e. square pixels. Without this, a video coded
+    # at 640x360 with SAR 59:32 reports the authored 1180 width in tkhd and passes while
+    # carrying a third of the pixels -- measured, not hypothesised.
+    assert (video[0]["disp_w"], video[0]["disp_h"]) == (video[0]["w"], video[0]["h"]), (
+        f"coded {video[0]['w']}x{video[0]['h']} but displayed as "
+        f"{video[0]['disp_w']}x{video[0]['disp_h']} — the pixel aspect is not square, so a "
+        "player rescales every frame and the diagrams arrive distorted")
+    # The audio track must be roughly as long as the video track. A 2-second beep satisfies
+    # "has an audio track" while being just as silent as no track at all for 99% of the run.
+    drift = video[0]["secs"] - audio[0]["secs"]
+    assert abs(drift) < 2.0, (
+        f"video track is {video[0]['secs']:.2f}s but the audio track is "
+        f"{audio[0]['secs']:.2f}s ({drift:+.2f}s) — most of this film is silent")
+
+
+@pytest.mark.skipif(not _have("ffprobe"), reason="needs ffprobe to have something to agree with")
+def test_the_track_reader_agrees_with_ffprobe():
+    """Same reasoning as the mp3 and mvhd cross-checks: pin the no-ffprobe reader where it can be."""
+    truth = {s["codec_type"]: s for s in _ffprobe("-show_streams")["streams"]}
+    mine = {t["handler"]: t for t in _tracks(VIDEO.read_bytes())}
+    assert set(mine) == {"vide", "soun"}, f"track reader found {sorted(mine)}"
+    # ffprobe's width/height IS the coded size, which is why the reader is pinned on the sample
+    # entry and not on tkhd -- the two disagree whenever the pixel aspect is not square.
+    assert (mine["vide"]["w"], mine["vide"]["h"]) == (truth["video"]["width"],
+                                                      truth["video"]["height"]), (
+        f"reader says coded {mine['vide']['w']}x{mine['vide']['h']}, ffprobe says "
+        f"{truth['video']['width']}x{truth['video']['height']}")
+    assert truth["video"].get("sample_aspect_ratio", "1:1") in ("1:1", "0:1"), (
+        f"SAR is {truth['video']['sample_aspect_ratio']} — non-square pixels; the coded-vs-"
+        "display assertion in the test above is what catches this")
+    for handler, kind in (("vide", "video"), ("soun", "audio")):
+        assert abs(mine[handler]["secs"] - float(truth[kind]["duration"])) < 0.05, (
+            f"{handler} track: reader says {mine[handler]['secs']:.3f}s, ffprobe says "
+            f"{truth[kind]['duration']}s")
+    # pix_fmt is NOT in the container in a form worth parsing (it is inside the avcC profile
+    # bytes), so this one property stays ffprobe-only and is asserted here rather than being
+    # silently dropped when the test above moved off ffprobe.
+    assert truth["video"]["pix_fmt"] == "yuv420p", (
+        f"pix_fmt is {truth['video']['pix_fmt']}, not yuv420p — QuickTime and Safari show a "
+        "black frame for anything else")
 
 
 def _boxes(data: bytes, start: int, end: int):
@@ -247,6 +316,83 @@ def _boxes(data: bytes, start: int, end: int):
             return
         yield kind, body, min(off + size, end)
         off += size
+
+
+def _tracks(data: bytes) -> list[dict]:
+    """Per-track handler, codec fourcc, frame size and duration, read from `moov`.
+
+    Exists because the audio/frame-size assertions used to require ffprobe, which this repo's
+    CI does not have -- so a silent film passed the gate. Every field here is a fixed offset in
+    a box the file must already contain to be playable at all:
+
+      tkhd  DISPLAY width/height as 16.16 fixed point, at +76 (version 0) or +88 (version 1)
+      hdlr  handler type fourcc at +8 -- `vide` / `soun`
+      mdhd  timescale + duration, at +12/+16 (v0) or +20/+24 (v1); PER TRACK, unlike mvhd
+      stsd  sample description; format fourcc at +12, and for a visual entry the CODED
+            width/height as two u16 at +40
+
+    Coded and display size are BOTH read because they are different numbers and only one of
+    them answers "were the diagrams resampled". Found by measuring: a control scaled to 640x360
+    reported `639x360` from tkhd, which is 640 x SAR 2655/2656 -- so tkhd is display geometry.
+    Feeding a `setsar=59/32` copy of the same 640-wide video made tkhd report **1180**, the
+    authored width exactly, and the frame-size assertion would have passed on a video carrying
+    a third of the authored pixels. The coded size is the one asserted against the stage;
+    display is compared to it so a non-square SAR cannot pass either.
+
+    Returns a list, not a dict keyed by handler: "how many video tracks" is one of the things
+    worth asserting, and a dict would silently collapse two of them into one.
+    """
+    out: list[dict] = []
+    for kind, s, e in _boxes(data, 0, len(data)):
+        if kind != b"moov":
+            continue
+        for k2, s2, e2 in _boxes(data, s, e):
+            if k2 != b"trak":
+                continue
+            t: dict = {"handler": None, "codec": None, "w": None, "h": None,
+                       "disp_w": None, "disp_h": None, "secs": None}
+            for k3, s3, e3 in _boxes(data, s2, e2):
+                if k3 == b"tkhd":
+                    off = s3 + (88 if data[s3] == 1 else 76)
+                    w, h = struct.unpack(">II", data[off:off + 8])
+                    # 16.16 fixed point, and DISPLAY geometry -- rounded, because a
+                    # non-square SAR makes it fractional (639.759 for a 640-wide frame).
+                    t["disp_w"], t["disp_h"] = round(w / 65536), round(h / 65536)
+                elif k3 == b"mdia":
+                    for k4, s4, e4 in _boxes(data, s3, e3):
+                        if k4 == b"hdlr":
+                            t["handler"] = data[s4 + 8:s4 + 12].decode("latin-1")
+                        elif k4 == b"mdhd":
+                            if data[s4] == 1:
+                                ts, dur = struct.unpack(">IQ", data[s4 + 20:s4 + 32])
+                            else:
+                                ts, dur = struct.unpack(">II", data[s4 + 12:s4 + 20])
+                            assert ts, "a track's mdhd timescale is zero — header unreadable"
+                            t["secs"] = dur / ts
+                        elif k4 == b"minf":
+                            for k5, s5, e5 in _boxes(data, s4, e4):
+                                if k5 != b"stbl":
+                                    continue
+                                for k6, s6, e6 in _boxes(data, s5, e5):
+                                    if k6 == b"stsd":
+                                        t["codec"] = data[s6 + 12:s6 + 16].decode("latin-1")
+                                        # NOT conditioned on t["handler"]: that would depend on
+                                        # hdlr having been walked before stsd, which is true of
+                                        # this file but is not required by the spec. The +40 u16
+                                        # pair is only meaningful for a VisualSampleEntry, so
+                                        # the caller reads it for the vide track and ignores it
+                                        # elsewhere (an audio entry yields the sample rate).
+                                        t["w"], t["h"] = struct.unpack(
+                                            ">HH", data[s6 + 40:s6 + 44])
+            # Assert rather than tolerate a None: a track whose handler or duration could not be
+            # read must fail here, not flow into a comparison that quietly skips it.
+            for field in ("handler", "codec", "secs"):
+                assert t[field] is not None, (
+                    f"could not read {field} for a track — the mp4's moov is not the shape "
+                    "this reader understands, so nothing below can be trusted")
+            out.append(t)
+    assert out, "no tracks found in moov — the file is not a readable mp4"
+    return out
 
 
 def _mvhd_seconds(data: bytes) -> float:
