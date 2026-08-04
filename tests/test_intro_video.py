@@ -464,11 +464,16 @@ def test_the_poster_exists_and_is_a_png():
 
 
 @pytest.mark.parametrize("readme", ["README.md", "README.zh-TW.md"])
-def test_both_readmes_reach_the_video_and_the_live_page(readme):
+def test_both_readmes_reach_the_committed_video(readme):
     """A committed video no README references is weight nobody can reach.
 
     Both language versions, because `hooks/pre-commit` already requires the pair to land
     together and a reader of one should not get less than a reader of the other.
+
+    Renamed from `..._and_the_live_page`: the live page it referred to was the console's
+    execute-api hostname, deleted from this repo months ago, and then the in-repo pointer that
+    replaced it was deleted too when the section was cut back to a player and a link. A guard
+    named after a thing it no longer checks is read as checking it.
     """
     text = (REPO / readme).read_text()
     rel = "docs/media/intro-en.mp4"
@@ -488,47 +493,24 @@ def test_both_readmes_reach_the_video_and_the_live_page(readme):
     # URL is not a tag: GitHub's renderer recognises the LINK and builds the <video> element
     # itself. Writing the tag by hand is still erased, which is why this half of the guard stays.
     #
-    # Code spans are stripped before matching, because both READMEs now EXPLAIN in prose that
-    # `<video>` does not work -- and a guard that fires on the sentence documenting the defect
-    # would force the explanation out of the README. Found by writing the naive version first
-    # and watching it fail on its own documentation.
+    # Code spans are stripped before matching. The READMEs no longer explain in prose that
+    # `<video>` is stripped -- that paragraph was cut -- but the strip stays, because the reason
+    # it went in is that the naive version of this assertion failed on its own documentation, and
+    # the next person who documents the defect should not have to rediscover that.
     prose = re.sub(r"`[^`]*`", "", text)
     assert not re.search(r"<video\b", prose), (
         f"{readme} has a <video> tag — GitHub's sanitizer deletes it, so it renders as an empty "
-        "gap. Link the mp4 (a poster image link and/or a plain markdown link) instead")
-    # TWO independent ways in, still. A single one means one careless rewrite makes 10 MB
-    # unreachable, and the earlier version of this guard passed a control that deleted the play
-    # link because the <video src=...> attribute still matched the substring it checked.
+        "gap. A bare user-attachments URL on its own line is the form that plays; link the "
+        "committed mp4 with a poster image")
+    # The poster link is now the ONLY path from either README to the committed file. It used to be
+    # one of two (a poster image link and a plain "Download …" link), and that redundancy was
+    # deliberate -- one careless rewrite could otherwise make 10 MB unreachable. The download line
+    # was cut as verbose, so this single assertion is now load-bearing on its own; it is not a
+    # weaker check than before, it is the same check with nothing behind it.
     poster = re.search(rf"\[!\[[^\]]*\]\([^)]*\)\]\({re.escape(rel)}\)", text)
-    plain = re.search(rf"\[(?!!)[^\]]*\]\({re.escape(rel)}\)", text)
     assert poster, (
-        f"{readme} has no clickable poster image for the walkthrough — the section renders as a "
-        "wall of text with no sign there is a video")
-    assert plain, (
-        f"{readme} has no plain markdown link to {rel} — a reader whose client does not load "
-        "the poster image is left with no way to reach the file")
-    # The five-language narration lives in the repo, not behind a URL. It used to be an absolute
-    # link to this account's live console; that address is the front door to a page where runs
-    # are launched and budgets approved, and publishing it in a README invited the whole
-    # internet to knock. `tests/redaction_scan.py` now refuses any live execute-api hostname, so
-    # this asserts the in-repo pointer that replaced it.
-    #
-    # Scoped to the PARAGRAPH that raises the other languages, not the whole README, and that is
-    # not tidiness. It was `"deploy/console/intro" in text`, and the inline-player rewrite added a
-    # second mention of that directory in a different paragraph
-    # (`deploy/console/intro/record_video.py`, naming what encoded the file). From then on the
-    # assertion was satisfied by a path about the RECORDER while the narration pointer could be
-    # deleted outright -- m121, the control for exactly that deletion, went from caught to
-    # UNCAUGHT, which is how this was found. A substring anywhere is not the claim; the claim is
-    # that the reader who needs 粵語 is told where it is, where the subject comes up.
-    para = [p for p in text.split("\n\n") if "한국어" in p]
-    assert para, (
-        f"{readme} no longer lists the other narration languages at all — the mp4 is English "
-        "only, and a reader who needs one of the other four is told nothing")
-    for p in para:
-        assert "deploy/console/intro" in p, (
-            f"{readme} names the other four narrations but not deploy/console/intro, where they "
-            f"actually live. Paragraph was: {' '.join(p.split())[:200]!r}")
+        f"{readme} has no clickable poster image for the walkthrough — nothing in the section "
+        f"reaches {rel}, and the inline player serves a different, smaller upload")
 
 
 ASSET_URL = re.compile(
@@ -574,45 +556,37 @@ def test_both_readmes_carry_the_inline_player_url():
         "watch a different film from a reader of the other")
 
 
-def test_the_readmes_state_the_committed_size_and_encoder_settings_correctly():
-    """The two numbers a reader uses to decide whether to click, derived not retyped.
+def test_the_walkthrough_section_states_no_number_it_does_not_derive():
+    """No retyped size or encoder setting anywhere in the walkthrough section, either language.
 
-    Both are the kind that survive the thing they describe. "10.7 MB" was written when the
-    committed file was 10,666,327 bytes; a re-encode that halves it leaves the sentence looking
-    measured. And the size is now load-bearing prose, not decoration: the READMEs explain that
-    the inline player serves a SMALLER re-encode because GitHub caps attachments at 10 MB, an
-    argument that only holds while the committed file is actually over that cap.
+    This replaces a guard that asserted the section DID state "10.7 MB, CRF 26" next to the
+    download link, and the replacement is not a weakening -- it is the same defect approached
+    from the other side. Those two numbers, and the paragraph explaining that the inline player
+    is a smaller re-encode of the committed file, were cut as verbose. The class of failure they
+    created has not gone anywhere: a size or a CRF written into a README is measured on the day
+    it is typed and looks measured forever, and this section is the likeliest place for one to
+    come back, because "how big is the download" is the obvious thing to want to add.
+
+    So the rule the section now lives by is: don't state either. Anyone who reintroduces one has
+    to make it derived, and this guard is where they find that out -- with a message that says
+    which number and why. The alternative, deleting the old guard outright, would leave the next
+    "helpful" 10.7 MB to rot silently, which is exactly how the first one got there.
+
+    Scoped to the walkthrough section, not the whole README: `docs/COST.md` and the cost prose
+    elsewhere legitimately carry figures, and a guard that fails on text it was never meant to
+    police is a guard someone deletes.
     """
-    mb = f"{VIDEO.stat().st_size / 1e6:.1f} MB"
-    # The cap the READMEs' explanation rests on. If a future re-encode drops the committed file
-    # under 10 MB, the prose about needing a separate upload becomes false and must be rewritten
-    # -- so fail here rather than let it read as measured.
-    assert VIDEO.stat().st_size > 10_000_000, (
-        f"the committed video is {mb}, under GitHub's 10 MB attachment cap — both READMEs "
-        "explain the inline player as a re-encode forced by that cap, which is no longer true; "
-        "upload this file itself and delete that paragraph")
-    crf = re.search(r'"-crf",\s*"(\d+)"', (INTRO / "record_video.py").read_text())
-    assert crf, "could not find the -crf setting in record_video.py"
+    # Both patterns are about a claim ABOUT THE FILE, so both are anchored on units, not on bare
+    # digits -- "5:04" and "0/16" are facts about the film and the gate, not retyped measurements.
+    bad = re.compile(r"\b\d+(?:\.\d+)?\s*[MK]B\b|\bCRF[\s-]*\d+", re.I)
     for readme in ("README.md", "README.zh-TW.md"):
         section = _section_containing((REPO / readme).read_text(), "intro-en.mp4")
-        # The PARAGRAPH holding the download link, not the whole section. Found by driving the
-        # section-wide version: swapping the size next to the download link to the re-encode's
-        # 8.9 MB left it GREEN, because the paragraph two above still explains that the
-        # as-recorded file is 10.7 MB. Section-wide presence is satisfied by a mention anywhere,
-        # and the mention that has to be right is the one a reader reads as they click.
-        para = [p for p in section.split("\n\n") if re.search(
-            rf"\[(?!!)[^\]]*\]\({re.escape(str(VIDEO.relative_to(REPO)))}\)", p)]
-        assert para, (
-            f"{readme}: no paragraph contains the plain download link, so the size and encoder "
-            "claims cannot be located next to the promise they qualify")
-        for p in para:
-            assert mb in p, (
-                f"{readme}: the download link's own paragraph does not state the committed "
-                f"file's real size ({mb}) — a stale size reads as measured and misprices the "
-                f"click. Paragraph was: {' '.join(p.split())[:160]!r}")
-            assert f"CRF {crf.group(1)}" in p, (
-                f"{readme}: that paragraph does not say CRF {crf.group(1)}, which is what "
-                "record_video.py actually encodes at — the number was retyped and has drifted")
+        hit = bad.search(section)
+        assert not hit, (
+            f"{readme}: the walkthrough section states {hit.group(0)!r} — a file size or encoder "
+            "setting typed into prose is measured once and reads as measured forever (the last "
+            "one said 10.7 MB and stayed while the file was re-encoded). Derive it from "
+            "docs/media/intro-en.mp4 or record_video.py, or leave it out")
 
 
 def _section_containing(text: str, needle: str) -> str:

@@ -5,6 +5,53 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
 ## [Unreleased]
 
+### The walkthrough section explained itself at more length than the film it introduced
+
+Twenty-six of the section's thirty lines were about the section. A player, a poster, and
+twenty-four lines arguing why the player is shaped the way it is: which of six embed forms
+GitHub erases, why the inline copy is 8.9 MB and the committed one 10.7, what CRF each was
+encoded at, what a reader whose language is not English should read instead. All of it true,
+none of it what someone arriving at this repo is trying to find out, and a README is read by
+agents as often as by people now — both of them pay for prose that answers a question nobody
+asked. The section is a heading, the player, and the poster link; **the film is unchanged and
+so is every byte in `docs/media/`.**
+
+- **A guard that demands deleted prose is a guard someone deletes, so three were rewritten
+  rather than left to fail.** They asserted the section stated "10.7 MB, CRF 26" beside the
+  download link, that the download link existed at all, and that the paragraph naming 한국어
+  pointed at `deploy/console/intro/`. Every one of those sentences is gone.
+  - `test_the_readmes_state_the_committed_size_and_encoder_settings_correctly` is now
+    `test_the_walkthrough_section_states_no_number_it_does_not_derive` — the same defect from
+    the other side. The reason those two numbers were guarded has not gone anywhere: a size or
+    a CRF typed into a README is measured on the day it is typed and reads as measured forever,
+    and "how big is the download" is the obvious thing for the next person to add back. So the
+    section's rule is now that it states neither, and anyone reintroducing one is told which
+    number and why. Deleting the guard outright would have let the next helpful `10.7 MB` rot
+    silently, which is exactly how the first one got there.
+  - **Retuning the recorder's CRF now breaks no test, correctly, and that is a real loss worth
+    naming.** `m132` used to mutate `"-crf", "26"` in `record_video.py` and catch a guard that
+    *derived* it — the direction a hardcoded guard cannot see. With no README quoting the
+    number, there is no claim left to falsify; the control was retargeted to the prose half it
+    can still reach.
+  - `test_both_readmes_reach_the_video_and_the_live_page` → `..._reach_the_committed_video`. The
+    live page in its name was deleted from this repo months ago and the in-repo pointer that
+    replaced it went with this trim; a guard named after something it no longer checks reads as
+    checking it.
+  - The poster link is now the **only** path from either README to the committed mp4. It used to
+    be one of two, deliberately, so one careless rewrite could not orphan 10 MB. That redundancy
+    is gone — the assertion is unchanged but nothing stands behind it.
+- **Driving the controls, not reading them, is what caught the hole in this PR's own work.**
+  `m120` and `m121` were both retargeted to delete a README's path to the file, and both then
+  failed on the guard's *first* assertion (`"docs/media/intro-en.mp4" in text`) — leaving the
+  poster-link assertion, the one now carrying the whole promise, never once observed failing.
+  `m120` now downgrades the poster to a text link so the path survives and the poster assertion
+  is the one that has to fire; `m121` keeps the outright deletion, on the other language,
+  because the guard is parametrized over both files and m120 proves only one parameter.
+- Eight controls retargeted in all (`m120` `m121` `m121b` `m122` `m129` `m130` `m131` `m132`),
+  each hand-driven to red on its named assertion before being registered. `m122`'s budget-figure
+  mutation moved to the section heading — the shortest-lived thing still guaranteed to be inside
+  the section, and with no prose left, a caption on the heading is where a figure would come back.
+
 ### The live console's address was in the README, and the video embed never worked
 
 Two defects on merged `main`, both reported by a reader looking at the repo page.
