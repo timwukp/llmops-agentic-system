@@ -11,13 +11,15 @@ once at cold start (no giant inline HTML string in the handler).
 
 ## Tabs
 
-Eight, in the order they appear in the nav. This table listed five and described "the 6
+Nine, in the order they appear in the nav. This table listed five and described "the 6
 `llmops_*` harnesses"; both had drifted (three tabs were added and the fleet is seven).
 `tests/test_console_routes.py` derives the tab count from `frontend.html` now, so the
-next added tab fails the suite rather than quietly making this list wrong again.
+next added tab fails the suite rather than quietly making this list wrong again — which
+is how the Introduction row below got written on the same commit as the tab itself.
 
 | Tab | What it shows |
 |---|---|
+| Introduction | A narrated five-minute walkthrough of the problem, the build and the measured cost, in an iframe (`GET /intro`) with narration in five languages (`GET /intro/audio/<lang>/<scene>.mp3`, 35 clips bundled in the zip). **The default landing tab** for a first-time visitor; a returning operator still lands on whatever tab they left |
 | Architecture | The generated diagrams (`docs/architecture-*.svg`), served from the same Lambda so the picture cannot lag the deployment |
 | Tasks | **The customer-facing plane** — one consultation thread per engagement with `llmops_orchestrator`: chat, presigned `customer-data/` upload, priced plan, KMS-signed acceptance, lifecycle strip |
 | Pipeline | Animated 9-stage flow (Step Functions `llmops-pipeline`) with remediation-loop arrow, execution picker, run detail (gates / metrics / evidence / training job), Start Run, and the verdicts panel (delivered / parked / never delivered) |

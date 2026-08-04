@@ -31,6 +31,7 @@ configured, so the next migration fails a test instead of ageing a comment.
 import glob as _glob
 import json as _json
 import os
+import re as _re
 
 OUT = os.path.dirname(os.path.abspath(__file__))
 REPO = "https://github.com/timwukp/llmops-agentic-system/blob/main/"
@@ -97,9 +98,31 @@ def single_run_limit():
     raise SystemExit(f"DEFAULT_SINGLE_RUN_LIMIT_USD not found in {src}")
 
 
+def console_tabs():
+    """Count the console's nav tabs by reading frontend.html.
+
+    Was the literal `8 tabs`, and adding the Introduction tab made it false — caught by
+    test_the_tabs_in_the_docs_match_the_frontend, which derives the same number from the
+    same file. Hand-editing the SVG would have satisfied that guard while leaving the
+    GENERATOR still emitting 8, so the next regeneration would quietly restore the wrong
+    label: a fix that survives until someone runs the tool is not a fix. Same reason
+    HARNESS_N and LIMIT_USD are derived rather than typed.
+
+    Counted from `data-tab="…"` on the nav buttons, deduplicated because each tab's label
+    also appears in the panel markers the guard cross-checks.
+    """
+    src = os.path.join(_repo_root(), "deploy", "console", "frontend.html")
+    with open(src, encoding="utf-8") as fh:
+        tabs = set(_re.findall(r'<button data-tab="([a-z-]+)"', fh.read()))
+    if not tabs:
+        raise SystemExit(f"no nav tabs found in {src} — the parse broke, not the console")
+    return len(tabs)
+
+
 SKILL_N, SKILL_KIND = skill_mounts()
 LIMIT_USD = single_run_limit()
 HARNESS_N = len(sorted(_glob.glob(os.path.join(_repo_root(), "agents", "*", "harness.json"))))
+TAB_N = console_tabs()
 
 STYLE = """
   <defs>
@@ -493,7 +516,7 @@ svg = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1240 {CH2}" font-f
 svg.append(STYLE)
 svg.append(f'  <rect class="bg" x="0" y="0" width="1240" height="{CH2}" rx="16"/>')
 svg.append('  <text class="title" x="30" y="40" font-size="18">LLMOps Admin console — one Lambda, read-mostly, server-enforced gates</text>')
-svg.append('  <text class="sub" x="30" y="60">deploy/console/ · 8 tabs · self-contained HTML from cold start · public GETs · Cognito on every POST except the 3 session routes that establish it</text>')
+svg.append(f'  <text class="sub" x="30" y="60">deploy/console/ · {TAB_N} tabs · self-contained HTML from cold start · public GETs · Cognito on every POST except the 3 session routes that establish it</text>')
 
 # ---- the operator path in (left column, top to bottom) ----
 svg.append(card(30, 96, CW, CH, "cOps", "🧑‍💻", "Operator browser", "one HTML file · no CDN · CSP self", "deploy/console/frontend.html"))

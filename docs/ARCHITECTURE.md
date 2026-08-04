@@ -675,7 +675,7 @@ and this being a public repo: no account IDs anywhere — deploy scripts substit
 ![Console architecture](architecture-console.svg)
 
 The dashboard ([live](https://deovqcv4m7.execute-api.us-east-1.amazonaws.com/)) is a single
-Lambda serving the HTML and all **30 route handlers** across **8 tabs**, with **no build step
+Lambda serving the HTML and all **30 route handlers** across **9 tabs**, with **no build step
 and no CDN**:
 `frontend.html` is embedded at cold start and the page ships with `CSP connect-src 'self'`
 plus the S3 origin the upload path needs. One artifact means the UI can never be a version

@@ -1,0 +1,208 @@
+{
+  "_comment": [
+    "Narration source for the console's Introduction tab (/intro). ONE file, read by two",
+    "consumers that must never drift: deploy/console/synth_narration.py (Polly -> 35 MP3s)",
+    "and deploy/console/intro/build_intro.py (the page's NARR/DUR/TITLES maps).",
+    "",
+    "Every number spoken here is derived from or cited to a file in this repo, and",
+    "tests/test_intro_narration.py re-derives each one. A voice-over is the most-quoted and",
+    "least-checkable surface a project has -- a reader cannot diff audio, so this is the one",
+    "place a stale number would live longest. Hence: no number is typed here that a guard",
+    "does not recompute from its source.",
+    "",
+    "Numbers and their sources:",
+    "  six rounds of training failure      docs/CASE_STUDY.md:61 ('took six iterations')",
+    "  $36.36/day, 0 invocations,          PROJECT_STATE.md:64-70",
+    "  0.0% GPU, 90 days, no owner tag",
+    "  ~$1106/month                        PROJECT_STATE.md:77",
+    "  seven agents                        len(agents/*/harness.json)",
+    "  eleven harness-task states          orchestration/state_machine.asl.json, happy path",
+    "  six Lambdas                         deploy/07_lambdas.py LAMBDAS",
+    "  nineteen skill sources, all s3      agents/*/harness.json skills[].sources",
+    "  ~twelve 5xx bursts in one day       docs/CASE_STUDY.md:138",
+    "  Fable 5 -> Opus 5, ~15 s            docs/ARCHITECTURE.md:519",
+    "  0/16 twice, 12 of 16 hit the limit  docs/CASE_STUDY.md:94-101",
+    "  ~$12-15 total                       deploy/evidence/VERIFICATION_phase6.md:61",
+    "",
+    "DELIBERATELY NOT SPOKEN: the test count, the negative-control count, the shell",
+    "assertion count. A first draft said 'eight hundred and seventeen tests, one hundred and",
+    "twenty-four negative controls and ten shell assertions'. Those three are the",
+    "fastest-churning numbers in the repo -- they move on nearly every pull request, and this",
+    "very change adds tests, so that sentence was already false before it was recorded. Every",
+    "other number above describes something that HAPPENED and is therefore fixed; a suite",
+    "size describes today. Baking a moving number into an MP3 is the worst case of the drift",
+    "this project keeps fixing: no guard can read audio, and correcting one word costs a",
+    "five-language Polly run. So the narration says 'the whole test suite, the negative",
+    "controls and the shell assertions' -- the part that stays true -- and the counts stay on",
+    "the Test results page, where tests/test_docs_claims.py already re-derives them.",
+    "",
+    "Numbers are SPELLED OUT in the narration text because Polly reads a numeral in the",
+    "voice's own locale convention, and the guard therefore matches spelled forms as well.",
+    "",
+    "NOT stated, on the owner's instruction: any figure for the reporting reference. The",
+    "$20,000 in this repo is this platform's own setting, not a recommendation -- every team",
+    "sets its own, so the narration describes the mechanism and names no amount.",
+    "",
+    "Length: English runs ~5:00, the longest translation ~6:00. Trimming is done by cutting",
+    "whole sentences in ALL FIVE languages at once, so the five stay one script rather than",
+    "five drifting essays."
+  ],
+
+  "version": 1,
+
+  "scenes": ["s1-problem", "s2-solution", "s3-architecture", "s4-build",
+             "s5-design", "s6-results", "s7-console"],
+
+  "_langs_comment": [
+    "`bcp47` is for the BROWSER: the <html lang> attribute and the voice hint given to",
+    "SpeechSynthesisUtterance in the TTS fallback. It is deliberately NOT passed to Polly.",
+    "",
+    "Polly identifies these voices by their own language codes, which are not the browser's",
+    "tags: Zhiyu is `cmn-CN` (not zh-CN) and Hiujin is `yue-CN` (not zh-HK). Sending a",
+    "browser tag as Polly's LanguageCode is a ValidationException, so synth_narration.py",
+    "omits LanguageCode entirely and lets each monolingual voice use its own default. That",
+    "parameter only exists for bilingual voices, and none of these five is one.",
+    "",
+    "`engine` is per-voice and not a free choice -- verified against DescribeVoices:",
+    "Matthew and Seoyeon support generative; Zhiyu and Takumi are neural at best; Hiujin",
+    "is neural ONLY. Asking for an engine a voice lacks fails the call."
+  ],
+
+  "langs": {
+    "en":  {"name": "English",  "voice": "Matthew", "engine": "generative", "bcp47": "en-US"},
+    "zh":  {"name": "普通话",   "voice": "Zhiyu",   "engine": "neural",     "bcp47": "zh-CN"},
+    "yue": {"name": "粵語",     "voice": "Hiujin",  "engine": "neural",     "bcp47": "zh-HK"},
+    "ja":  {"name": "日本語",   "voice": "Takumi",  "engine": "neural",     "bcp47": "ja-JP"},
+    "ko":  {"name": "한국어",   "voice": "Seoyeon", "engine": "generative", "bcp47": "ko-KR"}
+  },
+
+  "titles": {
+    "en": {
+      "s1-problem": "The problem",
+      "s2-solution": "Agents that hold the pager",
+      "s3-architecture": "Architecture",
+      "s4-build": "Built on AgentCore",
+      "s5-design": "Design decisions",
+      "s6-results": "What was proven",
+      "s7-console": "This console"
+    },
+    "zh": {
+      "s1-problem": "问题在哪",
+      "s2-solution": "自己揣着 pager 的 agent",
+      "s3-architecture": "架构",
+      "s4-build": "建在 AgentCore 上",
+      "s5-design": "设计决定",
+      "s6-results": "证明了什么",
+      "s7-console": "这个控制台"
+    },
+    "yue": {
+      "s1-problem": "問題在邊",
+      "s2-solution": "自己揣住 pager 嘅 agent",
+      "s3-architecture": "架構",
+      "s4-build": "建喺 AgentCore 上",
+      "s5-design": "設計決定",
+      "s6-results": "證明咗乜",
+      "s7-console": "呢個控制台"
+    },
+    "ja": {
+      "s1-problem": "課題",
+      "s2-solution": "ポケベルを持つエージェント",
+      "s3-architecture": "アーキテクチャ",
+      "s4-build": "AgentCore の上に",
+      "s5-design": "設計判断",
+      "s6-results": "証明できたこと",
+      "s7-console": "このコンソール"
+    },
+    "ko": {
+      "s1-problem": "문제",
+      "s2-solution": "호출기를 든 에이전트",
+      "s3-architecture": "아키텍처",
+      "s4-build": "AgentCore 위에",
+      "s5-design": "설계 결정",
+      "s6-results": "증명된 것",
+      "s7-console": "이 콘솔"
+    }
+  },
+
+  "text": {
+    "en": {
+      "s1-problem": "Most of a machine learning team's time is not research. It is glue work, and being on call. A real example from this repository: getting one fine-tuning job to complete took six rounds of failure — a dependency version, then a GPU out-of-memory, then another version conflict. Every round was a human reading a log, changing one pin, resubmitting. And while people are busy doing that, unwatched spending keeps running. This same AWS account carried an inference endpoint billing thirty-six dollars and thirty-six cents a day, with zero invocations and zero percent GPU utilization for ninety days, and no owner tag on it at all. About eleven hundred dollars a month, for nothing. Nobody did anything wrong. Nobody was looking.",
+
+      "s2-solution": "An assistant that suggests commands does not close that gap. Someone still has to run the command, and be allowed to run it. A correct diagnosis with no hands still waits for a human. So this platform does something different: seven agents hold the pager. A conductor plans and triages. Five stage specialists own data preparation, fine-tuning, evaluation, deployment and monitoring. And a seventh, a read-only auditor, prices every run. Each agent's task prompt grants it an explicit self-repair budget: diagnose, fix, retry, up to three times. At the edge of that budget it escalates to a human instead of guessing. That is the design in one sentence: real authority, a stated limit, and an honest exit.",
+
+      "s3-architecture": "Here is how it is wired. The order of the stages never changes from one run to the next, so that part needs no language model at all. A Step Functions state machine is the deterministic spine: eleven harness task states on the happy path, each one a wait-for-task-token call into a harness driver Lambda. Six Lambdas make up the serverless edge — the driver, pipeline start and resume, a webhook, a cost reconciler, and a scheduled sweep for orphaned resources. Intelligence lives inside each stage, never above it. A manifest in S3 is the single source of truth: every agent reads it first and only appends. And because the spine is deterministic, when a model provider had a bad hour and the agent could not be reached, the spine submitted the final training job itself.",
+
+      "s4-build": "None of the agent loops here are hand-written. Each agent is an Amazon Bedrock AgentCore Harness. You declare the model, the system prompt, the tools, the skills and the limits as configuration, and AWS runs the agent loop inside a per-session micro V M with its own shell and file system. That is what lets these agents act rather than advise. Nineteen skill sources across the seven harnesses mount at session start, all from a pinned S3 mirror, so a skill repository moving on its own cannot change what ran. Changing behaviour is a configuration change, not a redeploy. When one model provider threw about twelve bursts of server errors in a single day, every harness swapped from Fable 5 to Opus 5 in roughly fifteen seconds through one update call, with live sessions surviving.",
+
+      "s5-design": "Three design decisions carry this system. First, the quality gates are fail-closed: only a literal true passes. That was learned the hard way — an agent emitted an empty gate result, an old default promoted it to a pass, so the default was deleted and a regression test now stands in its place. Second, honesty is enforced structurally. Every number in this project's documentation is checked against the file that produces it: the agent count from the harness configs, the Lambda count from the deployer, the state count from the state machine. A number that was measured once looks measured forever, and that is exactly how documentation lies. Third, every guard has been watched to fail. A suite of negative controls breaks each guard in turn and requires it to catch the break.",
+
+      "s6-results": "So what was actually proven. The full loop ran hands-off: trigger, plan, generate, curate, train, evaluate, deploy, smoke test, tear down. The training job that took six rounds the first time launched first-try the next time, from a recipe the agent had written into shared memory. Six failures became one organizational learning. And the most important result is a failure. The quality gates ran twice over sixteen held-out tasks, and the distilled student model scored zero out of sixteen both times. The evaluation agent did not soften it. It ran its own controls and produced the diagnostic that explains everything: the model never once closed its reasoning block, and twelve of the sixteen answers ran into the context limit. It had learned to start reasoning and never to converge. Nothing was fixed into a pass. The whole lifecycle, proven end to end, cost about twelve to fifteen dollars.",
+
+      "s7-console": "And you can watch all of it. This console is the operator's view: live pipeline stages, the harness fleet, observability, evaluations, optimizations, and a cost tab, where the auditor prices every run against a reporting reference that each team sets for itself. So overspend is named while it is happening, instead of discovered on a bill. Escalations arrive as tasks you answer in a thread. A spend approval is signed and appended to a hash chain, so the record of who approved what cannot be quietly rewritten. The whole test suite, the negative controls and the shell assertions all run offline on every pull request. That is the takeaway: not an assistant that suggests commands, but a team of agents with real authority, stated limits, and gates hard enough to fail their own builders."
+    },
+
+    "zh": {
+      "s1-problem": "机器学习团队的时间，大部分并不花在研究上，而是花在胶水工作和随时待命上。这个仓库里有一个真实例子：让一个微调作业跑到完成，前后失败了六轮——先是依赖版本，然后是显存溢出，接着又是另一个版本冲突。每一轮都是一个人在读日志、改一个版本号、重新提交。而就在大家忙这些的时候，没人盯着的开销一直在跑。同一个 AWS 账号里有一个推理端点，每天计费三十六点三六美元，九十天里零次调用、GPU 利用率百分之零，而且连一个 owner 标签都没有。每个月大约一千一百美元，花在什么都没做上面。没有人做错任何事，只是没有人在看。",
+
+      "s2-solution": "一个只会建议命令的助手，补不上这个洞。命令还是要有人去执行，而且那个人必须被授权执行。诊断正确但没有手，结局仍然是等人。所以这个平台做的是另一件事：七个 agent 自己揣着 pager。一个指挥家负责计划和分诊；五个阶段专家分别负责数据准备、微调、评估、部署和监控；还有第七个，一个只读的审计员，为每一次运行定价。每个 agent 的任务提示里都写明了它的自我修复预算：诊断、修正、重试，最多三次。到了这个预算的边界，它会升级给人类，而不是继续猜。整个设计就一句话：给真实的权限，写清楚它的上限，并留一个诚实的出口。",
+
+      "s3-architecture": "再看它是怎么接起来的。阶段的顺序每一次运行都一样，所以这一部分根本不需要大模型。Step Functions 状态机就是这条确定性主干：正常路径上有十一个 harness 任务状态，每一个都是一次 wait for task token 的 harness driver Lambda 调用。无服务器边缘一共六个 Lambda——driver、启动、恢复、webhook、成本对账，以及一个定时的孤儿资源扫描。智能住在每个阶段的里面，从不在它们上面。S3 上的 manifest 是唯一的事实来源：每个 agent 先读它，而且只往里追加。也正因为主干是确定性的，当模型供应商出现故障、agent 联系不上的时候，主干自己提交了最后那个训练作业。",
+
+      "s4-build": "这里没有任何一个 agent 循环是手写的。每个 agent 都是一个 Amazon Bedrock AgentCore Harness：你把模型、系统提示、工具、skills 和各种上限声明成配置，AWS 就在一个每会话独立的 micro V M 里替你跑 agent 循环，里面有自己的 shell 和文件系统。这正是这些 agent 能动手、而不只是给建议的原因。七个 harness 一共十九个 skill 源在会话开始时挂载，全部来自一个钉住版本的 S3 镜像，所以 skill 仓库自己变动，不会改变已经跑过的东西。改行为是改配置，不是重新部署。当某个模型供应商在一天里抛出大约十二波服务端错误时，每个 harness 通过一次 update 调用，在大约十五秒内从 Fable 5 切到 Opus 5，正在跑的会话也没有断。",
+
+      "s5-design": "有三个设计决定支撑着整个系统。第一，质量门槛是 fail closed 的：只有字面上的 true 才算通过。这是吃过亏才学到的——一个 agent 发出了空的门槛结果，被一个旧的默认值晋升成通过，于是那个默认值被删掉，现在那个位置站着一条回归测试。第二，诚实是靠结构强制的：项目文档里的每一个数字，都要对回产生它的那个文件——agent 的数量从 harness 配置推导，Lambda 的数量从部署脚本推导，状态数从状态机推导。一个曾经被量过的数字，看起来永远都像被量过，而这正是文档说谎的方式。第三，每一个守卫都被亲眼看着失败过：一整套负向对照逐一破坏每个守卫，并要求它抓到这个破坏。",
+
+      "s6-results": "那么，到底证明了什么。完整的闭环真的在无人干预下跑完了：触发、计划、生成、整理、训练、评估、部署、冒烟测试、回收。那个第一次要六轮才成功的训练作业，第二次一次就起来了，用的是 agent 自己写进共享 Memory 的配方。六次失败变成了一条组织级的学习。而最重要的结果，是一个失败。质量门槛在十六个留出任务上跑了两次，蒸馏出来的 student 模型两次都是零比十六。评估 agent 没有粉饰它，而是自己跑了对照，并给出了能解释一切的诊断：这个模型从来没有闭合过它的推理块，十六条里有十二条撞上了上下文上限。它学会了开始推理，却从来没学会收敛。没有任何东西被修成通过。而证明这一切端到端跑通，总共花了大约十二到十五美元。",
+
+      "s7-console": "这一切你都能看着。这个控制台就是运维者的视角：实时的管线阶段、harness 机群、可观测性、评估、优化，还有一个成本页签——审计员在那里把每一次运行，对照一个由每个团队按自己情况设定的通报基准来定价，所以超支是在发生的时候被指名，而不是等到账单上才被发现。升级会以任务的形式送到你面前，你在一个对话线程里回答它；一笔支出批准会被签名并追加到一条哈希链上，所以谁批了什么这件记录，没办法被悄悄改写。整套测试、负向对照、shell 断言，在每一个 pull request 上离线跑完。这就是结论：这不是一个会建议命令的助手，而是一队有真实权限、有明确上限、连自己建造者的模型都拦得住的 agent。"
+    },
+
+    "yue": {
+      "s1-problem": "機器學習團隊嘅時間，大部分唔係用嚟做研究，而係用嚟做膠水工同候命。呢個 repo 有個真實例子：要令一個微調作業跑到完成，前後失敗咗六輪——先係依賴版本，跟住係顯存爆掉，再跟住又係另一個版本衝突。每一輪都係一個人喺度睇 log、改一個版本號、再重新提交。而就喺大家忙緊呢啲嘅時候，冇人盯住嘅開支一直喺度跑。同一個 AWS 帳號裏面有個推理端點，每日計費三十六點三六美元，九十日內零次調用、GPU 使用率百分之零，而且連一個 owner 標籤都冇。每個月大約一千一百美元，用嚟乜都冇做。冇人做錯任何事，只係冇人喺度睇。",
+
+      "s2-solution": "一個只會建議命令嘅助手，補唔到呢個洞。命令都仲係要有人去執行，而且嗰個人必須被授權執行。診斷正確但係冇手，結局都仲係等人。所以呢個平台做嘅係另一件事：七個 agent 自己揣住 pager。一個指揮家負責計劃同分診；五個階段專家分別負責數據準備、微調、評估、部署同監控；再有第七個，一個只讀嘅審計員，為每一次運行定價。每個 agent 嘅任務提示裏面都寫明咗佢嘅自我修復預算：診斷、修正、重試，最多三次。到咗呢個預算嘅邊界，佢會升級去人類，而唔係繼續猜。整個設計就一句話：畀真實嘅權限，寫清楚佢嘅上限，同留一個誠實嘅出口。",
+
+      "s3-architecture": "再睇佢係點樣接起嚟。階段嘅順序每一次運行都一樣，所以呢一部分根本唔需要大模型。Step Functions 狀態機就係呢條確定性主幹：正常路徑上有十一個 harness 任務狀態，每一個都係一次 wait for task token 嘅 harness driver Lambda 調用。無伺服器邊緣一共六個 Lambda——driver、啟動、恢復、webhook、成本對帳，同一個定時嘅孤兒資源掃描。智能住喺每個階段嘅裏面，從來唔係喺佢們上面。S3 上面嘅 manifest 係唯一嘅事實來源：每個 agent 先讀佢，而且只會往裏面追加。都正因為主幹係確定性嘅，當模型供應商出現故障、agent 聯絡唔到嘅時候，主幹自己提交咗最後嗰個訓練作業。",
+
+      "s4-build": "呢度冇任何一個 agent 循環係手寫嘅。每個 agent 都係一個 Amazon Bedrock AgentCore Harness：你將模型、系統提示、工具、skills 同各種上限聲明成配置，AWS 就喺一個每個 session 獨立嘅 micro V M 裏面幫你跑 agent 循環，裏面有自己嘅 shell 同檔案系統。呢個正係呢班 agent 可以動手、而唔係只係畀建議嘅原因。七個 harness 一共十九個 skill 源喺 session 開始時掛載，全部嚟自一個釘住版本嘅 S3 鏡像，所以 skill 倉庫自己變動，唔會改變已經跑過嘅嘢。改行為係改配置，唔係重新部署。當某個模型供應商喺一日裏面拋出大約十二波服務端錯誤嘅時候，每個 harness 透過一次 update 調用，喺大約十五秒內由 Fable 5 切到 Opus 5，跑住嘅 session 都冇斷。",
+
+      "s5-design": "有三個設計決定撐住整個系統。第一，質量門檻係 fail closed 嘅：只有字面上嘅 true 才算通過。呢個係食過虧才學到嘅——一個 agent 發出咗空嘅門檻結果，被一個舊嘅預設值晉升成通過，於是嗰個預設值被刪走，而家嗰個位置站住一條回歸測試。第二，誠實係靠結構強制嘅：項目文檔裏面每一個數字，都要對得返產生佢嘅嗰個檔案——agent 嘅數量由 harness 配置推導，Lambda 嘅數量由部署腳本推導，狀態數由狀態機推導。一個曾經被量過嘅數字，睇落去永遠都好似被量過，而呢個正係文檔講大話嘅方式。第三，每一個守衛都被親眼睇住失敗過：一整套負向對照逐一破壞每個守衛，並且要求佢捉到呢個破壞。",
+
+      "s6-results": "咁到底證明咗乜。完整嘅閉環真係喺無人干預之下跑完咗：觸發、計劃、生成、整理、訓練、評估、部署、冒煙測試、回收。嗰個第一次要六輪才成功嘅訓練作業，第二次一次就起得嚟，用嘅係 agent 自己寫入共享 Memory 嘅配方。六次失敗變成咗一條組織級嘅學習。而最重要嘅結果，係一個失敗。質量門檻喺十六個留出任務上跑咗兩次，蒸餾出嚟嘅 student 模型兩次都係零比十六。評估 agent 冇粉飾佢，而係自己跑咗對照，並且畀出咗能夠解釋一切嘅診斷：呢個模型從來冇閉合過佢嘅推理塊，十六條裏面有十二條撞到上下文上限。佢學會咗開始推理，但係從來冇學會收斂。冇任何嘢被修成通過。而證明呢一切端到端跑得通，總共用咗大約十二到十五美元。",
+
+      "s7-console": "呢一切你都睇得到。呢個控制台就係運維者嘅視角：實時嘅管線階段、harness 機群、可觀測性、評估、優化，仲有一個成本頁籤——審計員喺嗰度將每一次運行，對照一個由每個團隊按自己情況設定嘅通報基準嚟定價，所以超支係喺發生嗰時就被指名，而唔係等到帳單上才被發現。升級會以任務嘅形式送到你面前，你喺一個對話線程裏面回答佢；一筆支出批准會被簽名並追加到一條哈希鏈上，所以邊個批咗乜呢件記錄，冇辦法被靜靜雞改寫。整套測試、負向對照、shell 斷言，喺每一個 pull request 上離線跑完。呢個就係結論：唔係一個會建議命令嘅助手，而係一隊有真實權限、有明確上限、連自己建造者嘅模型都攔得住嘅 agent。"
+    },
+
+    "ja": {
+      "s1-problem": "機械学習チームの時間の大半は、研究ではありません。配管作業と、オンコール対応です。このリポジトリの実例です。ファインチューニングのジョブを一度完了させるまでに、六回の失敗を重ねました。依存関係のバージョン、次に GPU のメモリ不足、さらに別のバージョン衝突。毎回、人間がログを読み、ピンを一つ変え、再投入していました。そして皆がそれに追われている間、誰も見ていない支出は動き続けます。同じ AWS アカウントに、一日あたり三十六ドル三十六セントを課金し続ける推論エンドポイントがありました。九十日間で呼び出しはゼロ、GPU 使用率はゼロパーセント、しかも owner タグは一つも付いていません。月に約千百ドルを、何もしないために払っていたのです。誰も間違ったことはしていません。ただ、誰も見ていなかった。",
+
+      "s2-solution": "コマンドを提案するだけのアシスタントでは、この隙間は埋まりません。誰かがそのコマンドを実行しなければならず、その誰かに実行の権限が必要です。診断が正しくても手がなければ、結局は人間を待ちます。そこでこのプラットフォームは別のことをしています。七つのエージェントが、自らポケベルを持つのです。指揮者が計画とトリアージを担い、五つのステージ担当がデータ準備、ファインチューニング、評価、デプロイ、モニタリングを受け持ちます。七つ目は読み取り専用の監査役で、すべての実行に値段を付けます。各エージェントのタスクプロンプトには自己修復の予算が明示されています。診断し、直し、再試行する、最大三回まで。その端に達したら、推測を続けずに人間へエスカレーションします。設計はこの一文です。本物の権限、明示された上限、そして正直な出口。",
+
+      "s3-architecture": "配線を見ましょう。ステージの順序は実行ごとに変わりません。ですからこの部分に大規模言語モデルは不要です。Step Functions のステートマシンが決定的な背骨です。正常経路には十一のハーネスタスク状態があり、そのそれぞれがハーネスドライバー Lambda への wait for task token 呼び出しです。サーバーレスの縁を成すのは六つの Lambda。ドライバー、パイプラインの開始と再開、ウェブフック、コストの照合、そして孤立リソースを探す定期スイープ。知性は各ステージの内側に住み、その上には決して置きません。S3 のマニフェストが唯一の真実で、すべてのエージェントはまずそれを読み、追記するだけです。背骨が決定的だからこそ、モデルの提供側が不調でエージェントに届かなかったとき、背骨自身が最後の学習ジョブを投入しました。",
+
+      "s4-build": "ここにあるエージェントループは、どれも手書きではありません。各エージェントは Amazon Bedrock AgentCore のハーネスです。モデル、システムプロンプト、ツール、スキル、上限を設定として宣言すれば、AWS がセッションごとのマイクロ V M の中でエージェントループを走らせます。その中には専用のシェルとファイルシステムがあります。これが、このエージェントたちが助言ではなく実行できる理由です。七つのハーネスに渡る十九のスキルソースがセッション開始時にマウントされ、すべて版を固定した S3 のミラーから来ます。スキルのリポジトリが独自に動いても、走ったものは変わりません。振る舞いを変えるのは設定の変更で、再デプロイではありません。あるモデル提供側が一日に十二回ほどサーバーエラーの波を出したとき、すべてのハーネスは一度の更新呼び出しで、およそ十五秒で Fable 5 から Opus 5 へ切り替わり、進行中のセッションも生き残りました。",
+
+      "s5-design": "三つの設計判断がこのシステムを支えます。第一に、品質ゲートは fail closed です。文字どおりの true だけが通ります。これは痛い経験から学びました。あるエージェントが空のゲート結果を返し、古い既定値がそれを合格に昇格させたのです。その既定値は削除され、いまはその場所に回帰テストが立っています。第二に、正直さは構造で強制します。この文書に出てくる数はすべて、それを生み出すファイルと照合されます。エージェントの数はハーネス設定から、Lambda の数はデプロイスクリプトから、状態の数はステートマシンから導かれます。一度計測された数は、いつまでも計測済みに見える。それこそが文書が嘘をつく仕組みです。第三に、すべてのガードは失敗する姿を見られています。一連のネガティブコントロールが各ガードを順に壊し、その破壊を捕まえることを要求します。",
+
+      "s6-results": "では、何が証明できたのか。完全なループが人手なしで走りました。トリガー、計画、生成、整理、学習、評価、デプロイ、スモークテスト、撤収。最初は六回かかった学習ジョブが、次は一発で立ち上がりました。エージェント自身が共有メモリに書き残したレシピを使ったのです。六つの失敗が、一つの組織的な学びになりました。そして最も重要な結果は、失敗です。品質ゲートは十六の保留タスクに対して二度走り、蒸留された生徒モデルは二度ともゼロ点でした。評価エージェントはそれを和らげず、自ら対照実験を走らせ、すべてを説明する診断を出しました。このモデルは推論ブロックを一度も閉じておらず、十六件のうち十二件が文脈長の上限に当たっていた。推論を始めることは学んだが、収束することは学ばなかったのです。何ひとつ合格に作り替えられていません。この証明にかかった費用は、およそ十二から十五ドルでした。",
+
+      "s7-console": "そして、そのすべてを見ることができます。このコンソールは運用者の視点です。稼働中のパイプラインの各ステージ、ハーネスの一群、可観測性、評価、最適化、そしてコストのタブ。そこで監査役が、各チームが自分たちの事情に合わせて設定する報告基準に照らして、すべての実行に値段を付けます。だから使いすぎは、請求書で発見されるのではなく、起きているその時に名前を呼ばれます。エスカレーションはタスクとして届き、あなたはスレッドの中で答えます。支出の承認は署名され、ハッシュチェーンに追記されます。誰が何を承認したかという記録を、静かに書き換えることはできません。テスト一式、ネガティブコントロール、シェルアサーションが、すべてのプルリクエストでオフラインで走ります。結論はこうです。コマンドを提案するアシスタントではなく、本物の権限と明示された上限を持ち、作った本人たちのモデルさえ落とせるゲートを備えた、エージェントのチームです。"
+    },
+
+    "ko": {
+      "s1-problem": "머신러닝 팀의 시간은 대부분 연구에 쓰이지 않습니다. 접착 작업과 온콜 대기에 쓰입니다. 이 저장소의 실제 사례입니다. 파인튜닝 작업 하나를 완료 상태로 만들기까지 여섯 번의 실패가 필요했습니다. 처음은 의존성 버전, 다음은 GPU 메모리 부족, 그다음은 또 다른 버전 충돌이었습니다. 매번 사람이 로그를 읽고, 핀 하나를 바꾸고, 다시 제출했습니다. 그리고 모두가 그 일에 매여 있는 동안, 아무도 보지 않는 지출은 계속 흘러갑니다. 같은 AWS 계정에 하루 삼십육 달러 삼십육 센트를 청구하던 추론 엔드포인트가 있었습니다. 구십 일 동안 호출은 영, GPU 사용률은 영 퍼센트였고, owner 태그는 하나도 붙어 있지 않았습니다. 한 달에 약 천백 달러를, 아무것도 하지 않는 데 쓰고 있었던 것입니다. 누구도 잘못한 것은 없습니다. 다만 아무도 보고 있지 않았습니다.",
+
+      "s2-solution": "명령을 제안하는 도우미로는 이 간격이 메워지지 않습니다. 누군가는 그 명령을 실행해야 하고, 그에게 실행 권한이 있어야 합니다. 진단이 맞아도 손이 없으면 결국 사람을 기다립니다. 그래서 이 플랫폼은 다른 일을 합니다. 일곱 개의 에이전트가 직접 호출기를 듭니다. 지휘자가 계획과 분류를 맡고, 다섯 개의 단계 전문가가 데이터 준비, 파인튜닝, 평가, 배포, 모니터링을 담당합니다. 일곱 번째는 읽기 전용 감사자로, 모든 실행에 가격을 붙입니다. 각 에이전트의 작업 프롬프트에는 자기 수리 예산이 명시되어 있습니다. 진단하고, 고치고, 다시 시도한다, 최대 세 번까지. 그 경계에 닿으면 추측을 계속하는 대신 사람에게 에스컬레이션합니다. 설계는 한 문장입니다. 진짜 권한, 명시된 한계, 그리고 정직한 출구.",
+
+      "s3-architecture": "이제 어떻게 연결되어 있는지 보겠습니다. 단계의 순서는 실행마다 바뀌지 않습니다. 그래서 이 부분에는 언어 모델이 필요하지 않습니다. Step Functions 상태 기계가 결정적인 척추입니다. 정상 경로에는 열한 개의 하네스 작업 상태가 있고, 각각은 하네스 드라이버 Lambda 로 향하는 wait for task token 호출입니다. 서버리스 경계를 이루는 것은 여섯 개의 Lambda 입니다. 드라이버, 파이프라인 시작과 재개, 웹훅, 비용 정산, 그리고 고아 자원을 찾는 정기 스윕. 지능은 각 단계의 안쪽에 살고, 그 위에는 두지 않습니다. S3 의 매니페스트가 유일한 진실이고, 모든 에이전트는 먼저 그것을 읽고 덧붙이기만 합니다. 척추가 결정적이기 때문에, 모델 공급자가 흔들려 에이전트에 닿지 못했을 때 척추가 스스로 마지막 학습 작업을 제출했습니다.",
+
+      "s4-build": "여기 있는 에이전트 루프는 어느 것도 손으로 쓰지 않았습니다. 각 에이전트는 Amazon Bedrock AgentCore 하네스입니다. 모델, 시스템 프롬프트, 도구, 스킬, 한계를 설정으로 선언하면, AWS 가 세션마다 분리된 마이크로 V M 안에서 에이전트 루프를 돌립니다. 그 안에는 자체 셸과 파일 시스템이 있습니다. 이것이 이 에이전트들이 조언하는 대신 행동할 수 있는 이유입니다. 일곱 개의 하네스에 걸친 열아홉 개의 스킬 소스가 세션 시작 시점에 마운트되며, 모두 버전을 고정한 S3 미러에서 옵니다. 스킬 저장소가 혼자 움직여도 이미 실행된 것은 바뀌지 않습니다. 동작을 바꾸는 일은 설정 변경이고, 재배포가 아닙니다. 어떤 모델 공급자가 하루에 열두 번쯤 서버 오류의 물결을 보냈을 때, 모든 하네스는 한 번의 업데이트 호출로 약 십오 초 만에 Fable 5 에서 Opus 5 로 바뀌었고, 진행 중인 세션도 살아남았습니다.",
+
+      "s5-design": "세 가지 설계 결정이 이 시스템을 받칩니다. 첫째, 품질 게이트는 fail closed 입니다. 문자 그대로의 true 만 통과합니다. 이것은 아프게 배웠습니다. 어떤 에이전트가 빈 게이트 결과를 냈고, 오래된 기본값이 그것을 통과로 승격시켰습니다. 그래서 그 기본값은 삭제되었고, 지금 그 자리에는 회귀 테스트가 서 있습니다. 둘째, 정직함은 구조로 강제됩니다. 이 문서에 나오는 모든 숫자는 그것을 만들어내는 파일과 맞춰집니다. 에이전트 수는 하네스 설정에서, Lambda 수는 배포 스크립트에서, 상태 수는 상태 기계에서 도출됩니다. 한 번 측정된 숫자는 언제까지나 측정된 것처럼 보입니다. 문서가 거짓말하는 방식이 바로 그것입니다. 셋째, 모든 가드는 실패하는 모습을 확인했습니다. 네거티브 컨트롤 전체가 각 가드를 차례로 깨뜨리고, 그 파괴를 잡아내도록 요구합니다.",
+
+      "s6-results": "그래서 무엇이 증명되었나. 전체 루프가 사람 손 없이 돌았습니다. 트리거, 계획, 생성, 정리, 학습, 평가, 배포, 스모크 테스트, 철거. 처음에 여섯 번이 걸렸던 학습 작업이 다음번에는 한 번에 올라갔습니다. 에이전트가 공유 메모리에 직접 적어둔 조합을 사용한 것입니다. 여섯 번의 실패가 하나의 조직적 학습이 되었습니다. 그리고 가장 중요한 결과는 실패입니다. 품질 게이트가 열여섯 개의 보류 과제에 대해 두 번 돌았고, 증류된 학생 모델은 두 번 모두 영 점을 받았습니다. 평가 에이전트는 그것을 부드럽게 만들지 않았고, 스스로 대조 실험을 돌려 모든 것을 설명하는 진단을 내놓았습니다. 이 모델은 추론 블록을 한 번도 닫지 못했고, 열여섯 건 중 열두 건이 문맥 한계에 부딪혔습니다. 추론을 시작하는 것은 배웠지만, 수렴하는 것은 배우지 못했습니다. 어떤 것도 통과로 고쳐지지 않았습니다. 이 증명에 든 비용은 약 십이에서 십오 달러였습니다.",
+
+      "s7-console": "그리고 그 모든 것을 지켜볼 수 있습니다. 이 콘솔은 운영자의 시야입니다. 살아 있는 파이프라인 단계, 하네스 무리, 관측성, 평가, 최적화, 그리고 비용 탭. 거기서 감사자가 각 팀이 자기 사정에 맞게 정하는 보고 기준에 비추어 모든 실행에 가격을 붙입니다. 그래서 과지출은 청구서에서 발견되는 것이 아니라, 벌어지고 있는 그때 이름이 불립니다. 에스컬레이션은 과제로 도착하고, 당신은 하나의 스레드 안에서 답합니다. 지출 승인은 서명되어 해시 체인에 덧붙습니다. 누가 무엇을 승인했는지에 관한 기록을 조용히 다시 쓸 수 없습니다. 테스트 전체, 네거티브 컨트롤, 셸 어설션이 모든 풀 리퀘스트에서 오프라인으로 돌아갑니다. 결론은 이렇습니다. 명령을 제안하는 도우미가 아니라, 진짜 권한과 명시된 한계를 가지고, 만든 사람들 자신의 모델조차 막아낼 만큼 단단한 게이트를 갖춘 에이전트 팀입니다."
+    }
+  }
+}

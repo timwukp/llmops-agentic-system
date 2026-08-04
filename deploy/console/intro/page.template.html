@@ -1,0 +1,861 @@
+<!doctype html>
+<!--
+  Introduction page template for the LLMOps console. Built by build_intro.py, which
+  substitutes __SCENES__ / __LANGS__ / __TITLES__ / __NARR__ / __DUR__ and inlines two of
+  the repo's real architecture diagrams at __SVG_HIGH__ (scene 3) and __SVG_LOW__ (scene 4).
+
+  The third diagram, architecture-console.svg, is deliberately NOT inlined. Scene 7 is
+  about what an operator DOES here, so it draws the console's own surface instead; the
+  wiring diagram of the dashboard answers a different question and is one tab away, on
+  Architecture. build_intro.py requires exactly one occurrence of each placeholder it
+  knows about, so a placeholder mentioned only in this comment fails the build -- which
+  is how this was caught: __SVG_CONSOLE__ was listed here and rendered nowhere.
+
+  Everything on screen is drawn here in CSS and SVG. Nothing is a screenshot, on purpose:
+  a PNG of the console goes stale the first time a tab is renamed, and nobody notices,
+  because an image is the one surface no guard and no diff can read. Redrawing the UI
+  means the picture is markup a reviewer can read, it stays sharp at any size, and it can
+  animate in step with the voice-over. The three architecture diagrams ARE the repo's real
+  SVGs -- the same files the Architecture tab serves -- so they cannot disagree with it.
+
+  The audio is pre-synthesized (Amazon Polly, see synth_narration.py) and served from
+  /intro/audio/<lang>/<scene>.mp3 in the same Lambda zip. If a clip is missing or blocked,
+  the player falls back to the browser's own speech synthesis and keeps the timing, so the
+  page degrades to a robot voice rather than to silence.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>LLMOps — Introduction</title>
+<style>
+  :root {
+    --bg:#0b1020; --panel:#141b33; --panel2:#1b2444; --line:#26305a;
+    --text:#e7ecff; --muted:#8592c0; --accent:#5b8cff; --green:#3ecf8e;
+    --amber:#f5b342; --red:#ff6b6b; --crit:#ff4d6d; --purple:#9d5bff;
+  }
+  * { box-sizing:border-box; }
+  html,body { margin:0; height:100%; }
+  body { background:var(--bg); color:var(--text); overflow:hidden;
+         font:14px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; }
+  .page { height:100%; display:flex; flex-direction:column; align-items:center;
+          justify-content:center; gap:10px; padding:10px; }
+
+  /* ── stage ────────────────────────────────────────────────────────────────
+     Scenes are authored at a fixed 1180x664 and scaled to fit by JS. Authoring in
+     real pixels keeps every position readable in the markup; scaling by transform
+     keeps one layout at every size, so nothing reflows differently on a phone than
+     it did when the beat timings were written against it. */
+  .stagewrap { position:relative; width:min(1180px,98vw); aspect-ratio:1180/664;
+               background:var(--panel); border:1px solid var(--line); border-radius:14px;
+               overflow:hidden; }
+  .stage { position:absolute; top:0; left:0; width:1180px; height:664px;
+           transform-origin:top left; }
+  .scene { position:absolute; inset:0; padding:34px 40px; opacity:0;
+           transition:opacity .55s ease; pointer-events:none; }
+  .scene.on { opacity:1; }
+  .beat { opacity:0; transform:translateY(14px); transition:opacity .5s ease, transform .5s ease; }
+  .beat.in { opacity:1; transform:none; }
+  @media (prefers-reduced-motion:reduce) {
+    .scene, .beat { transition:none; }
+  }
+
+  .stitle { font-size:12px; text-transform:uppercase; letter-spacing:.14em;
+            color:var(--accent); font-weight:700; margin-bottom:6px; }
+  .lede { font-size:26px; line-height:1.28; font-weight:650; max-width:840px;
+          margin:0 0 18px; }
+  .lede.sm { font-size:21px; }
+  .sub { color:var(--muted); font-size:14px; }
+  .mono { font-family:ui-monospace,Menlo,Consolas,monospace; }
+  .cols { display:flex; gap:20px; align-items:flex-start; }
+  .card { background:var(--panel2); border:1px solid var(--line); border-radius:12px;
+          padding:14px 16px; }
+  .card h4 { margin:0 0 10px; font-size:11px; text-transform:uppercase;
+             letter-spacing:.07em; color:var(--muted); font-weight:700; }
+  .pill { font-size:11px; padding:2px 9px; border-radius:20px; font-weight:700;
+          display:inline-block; }
+  .ok   { background:rgba(62,207,142,.16); color:var(--green); }
+  .warn { background:rgba(245,179,66,.16); color:var(--amber); }
+  .err  { background:rgba(255,107,107,.16); color:var(--red); }
+  .idle { background:#131a30; color:var(--muted); }
+  .big  { font-size:44px; font-weight:750; line-height:1; }
+  .huge { font-size:66px; font-weight:750; line-height:1; }
+
+  /* remediation rounds (s1) */
+  .rounds { width:560px; }
+  .rd { display:flex; gap:10px; align-items:center; padding:6px 0;
+        border-bottom:1px solid var(--line); font-size:13px; }
+  .rd:last-child { border-bottom:0; }
+  .rd .n { width:20px; color:var(--muted); font-size:11px; }
+  .rd .why { flex:1; }
+  /* the idle-endpoint bill (s1) */
+  .kv { display:flex; justify-content:space-between; gap:14px; padding:5px 0;
+        border-bottom:1px solid var(--line); font-size:13px; }
+  .kv:last-child { border-bottom:0; }
+  .kv b { font-weight:650; }
+
+  /* fleet grid (s2) */
+  .fleet { display:grid; grid-template-columns:repeat(3,1fr); gap:10px; width:660px; }
+  .ag { background:var(--panel2); border:1px solid var(--line); border-radius:10px;
+        padding:9px 11px; }
+  .ag .an { font-size:13px; font-weight:650; }
+  .ag .ar { font-size:11px; color:var(--muted); }
+  .ag.cond { border-color:var(--accent); }
+  .ag.audit { border-color:var(--green); }
+  .strike { text-decoration:line-through; text-decoration-color:var(--red);
+            text-decoration-thickness:2px; color:var(--muted); }
+
+  /* diagram frames (s3, s4) */
+  .dia { background:#0e1428; border:1px solid var(--line); border-radius:10px;
+         padding:8px; overflow:hidden; }
+  /* object-fit:contain on the height, not width:100%+height:100%. The diagrams are 1240
+     wide and 1060 / 560 tall -- stretching either to fill a box of a different ratio
+     squashes the boxes and the arrowheads. Letterboxing inside .dia keeps the geometry
+     the SVG geometry test already checks. */
+  .dia svg { display:block; width:100%; height:100%; object-fit:contain; }
+  .callouts { width:330px; display:flex; flex-direction:column; gap:9px; }
+  .co { background:var(--panel2); border:1px solid var(--line); border-left:3px solid var(--accent);
+        border-radius:8px; padding:8px 11px; font-size:12.5px; }
+  .co b { display:block; font-size:11px; text-transform:uppercase; letter-spacing:.06em;
+          color:var(--muted); margin-bottom:2px; }
+
+  /* config panel (s4) */
+  .cfg { font-family:ui-monospace,Menlo,Consolas,monospace; font-size:12.5px;
+         line-height:1.85; }
+  .cfg .k { color:var(--accent); }
+  .cfg .s { color:var(--green); }
+  .cfg .c { color:var(--muted); }
+
+  /* derived-number table (s5) */
+  .der { width:100%; border-collapse:collapse; font-size:12.5px; }
+  .der td { padding:5px 4px; border-bottom:1px solid var(--line); }
+  .der td:last-child { color:var(--muted); font-family:ui-monospace,Menlo,monospace;
+                       font-size:11.5px; text-align:right; }
+
+  /* lifecycle chain (s6) */
+  .chain { display:flex; align-items:center; gap:6px; flex-wrap:wrap; }
+  .chain .st { font-size:11.5px; padding:4px 10px; border-radius:20px;
+               border:1px solid rgba(62,207,142,.4); color:var(--green);
+               background:rgba(62,207,142,.08); }
+  /* Also matched inside .flow in the s7 console mock, which draws the same
+     stage-to-stage arrows. Scoping this to .chain would leave those seven separators
+     rendering as unstyled full-size text, which reads as a layout bug. */
+  .chain .arw, .flow .arw { color:var(--line); font-size:11px; }
+
+  /* console mock (s7) */
+  .mock { width:100%; background:var(--bg); border:1px solid var(--line);
+          border-radius:11px; overflow:hidden; }
+  .mock .mh { display:flex; align-items:center; gap:9px; padding:9px 13px;
+              background:var(--panel); border-bottom:1px solid var(--line); }
+  .mock .mh .lg { width:18px; height:18px; border-radius:5px;
+                  background:linear-gradient(135deg,var(--accent),var(--purple)); }
+  .mock .mh .t { font-size:12.5px; font-weight:650; }
+  .mtabs { display:flex; gap:5px; padding:8px 13px; background:var(--panel);
+           border-bottom:1px solid var(--line); }
+  .mtabs span { font-size:11.5px; padding:4px 10px; border-radius:7px;
+                border:1px solid var(--line); background:var(--panel2); color:var(--muted); }
+  .mtabs span.act { border-color:var(--accent); color:var(--text); }
+  .mbody { display:flex; gap:12px; padding:12px 13px; }
+  .flow { display:flex; align-items:center; gap:5px; flex-wrap:wrap; }
+  .flow .fs { font-size:11px; padding:3px 9px; border-radius:20px;
+              border:1px solid var(--line); background:var(--panel2); color:var(--muted); }
+  .flow .fs.done { color:var(--green); border-color:rgba(62,207,142,.4); }
+  .flow .fs.act { color:var(--accent); border-color:var(--accent); }
+  .msg { max-width:82%; padding:7px 11px; border-radius:11px; font-size:12px;
+         background:var(--panel2); border:1px solid var(--line); margin-bottom:6px; }
+  .msg.me { border-color:var(--accent); margin-left:auto; }
+
+  /* ── controls ───────────────────────────────────────────────────────────── */
+  .bar { width:min(1180px,98vw); display:flex; align-items:center; gap:9px;
+         flex-wrap:wrap; }
+  .bar button, .bar select {
+    font:inherit; font-size:12.5px; cursor:pointer; color:var(--text);
+    background:var(--panel2); border:1px solid var(--line); border-radius:8px;
+    padding:6px 11px; }
+  .bar button:hover, .bar select:hover { border-color:var(--accent); }
+  .bar button.primary { background:var(--accent); border-color:var(--accent);
+                        color:#00102e; font-weight:700; }
+  .bar .grow { flex:1; }
+  .bar .clock { font-size:12px; color:var(--muted); font-family:ui-monospace,Menlo,monospace; }
+  .segs { width:min(1180px,98vw); display:flex; gap:4px; }
+  .segs .sg { height:5px; border-radius:3px; background:var(--panel2); flex-grow:1;
+              overflow:hidden; cursor:pointer; border:1px solid var(--line); }
+  .segs .sg i { display:block; height:100%; width:0; background:var(--accent); }
+  .segs .sg[data-done="1"] i { width:100%; }
+  .cap { width:min(1180px,98vw); min-height:44px; font-size:13.5px; line-height:1.5;
+         color:var(--muted); text-align:center; }
+  .cap b { color:var(--text); font-weight:600; }
+
+  /* The overlay is the page's first frame: a browser will not start audio without a
+     gesture, and an autoplay attempt that is silently blocked looks exactly like a
+     broken page. So the first frame ASKS. */
+  .gate { position:absolute; inset:0; display:flex; flex-direction:column; gap:14px;
+          align-items:center; justify-content:center; background:rgba(11,16,32,.92);
+          backdrop-filter:blur(2px); z-index:5; text-align:center; padding:24px; }
+  .gate.off { display:none; }
+  .gate h1 { font-size:27px; margin:0; font-weight:700; }
+  .gate p { margin:0; color:var(--muted); font-size:14px; max-width:620px; }
+  .gate .go { font-size:15px; font-weight:700; padding:11px 26px; border-radius:10px;
+              background:var(--accent); border:1px solid var(--accent); color:#00102e;
+              cursor:pointer; }
+  .gate .pickrow { display:flex; align-items:center; gap:8px; font-size:12.5px;
+                   color:var(--muted); }
+  .gate select { font:inherit; font-size:13px; background:var(--panel2); color:var(--text);
+                 border:1px solid var(--line); border-radius:8px; padding:6px 10px; }
+  .ttsnote { font-size:11.5px; color:var(--amber); }
+  .ttsnote.off { display:none; }
+</style>
+</head>
+<body>
+<div class="page">
+
+<div class="stagewrap" id="wrap">
+  <div class="stage" id="stage">
+
+  <!-- ── 1 · the problem ─────────────────────────────────────────────────── -->
+  <section class="scene" id="s1-problem">
+    <div class="stitle beat" data-t="0.3" data-title></div>
+    <div class="lede beat" data-t="1.5">Most of an ML team's time is not research.<br />
+      It is glue work — and being on call.</div>
+    <div class="cols">
+      <div class="card rounds beat" data-t="8.5">
+        <h4>One fine-tuning job → <span style="color:var(--red)">6 rounds of failure</span></h4>
+        <div class="rd beat" data-t="9.5"><span class="n">0</span>
+          <span class="why mono">ImportError: torch&gt;=2.1.1</span><span class="pill err">fail</span></div>
+        <div class="rd beat" data-t="11"><span class="n">1</span>
+          <span class="why mono">CUDA OOM · 7.31 GiB at step 0</span><span class="pill err">fail</span></div>
+        <div class="rd beat" data-t="12.5"><span class="n">2</span>
+          <span class="why mono">liger needs transformers ≥ 4.52</span><span class="pill err">fail</span></div>
+        <div class="rd beat" data-t="14"><span class="n">3</span>
+          <span class="why mono">NameError: torch <i>inside</i> transformers</span><span class="pill err">fail</span></div>
+        <div class="rd beat" data-t="15.5"><span class="n">4</span>
+          <span class="why mono">bitsandbytes ≥ 0.46.1 required</span><span class="pill err">fail</span></div>
+        <div class="rd beat" data-t="17"><span class="n">5</span>
+          <span class="why mono">431 s billable · train_loss 0.5013</span><span class="pill ok">Completed</span></div>
+        <div class="sub beat" data-t="18.5" style="margin-top:9px">Every round: a human reads a log,
+          changes one pin, resubmits.</div>
+      </div>
+      <div class="card beat" data-t="22.5" style="width:440px">
+        <h4>Meanwhile, on the same AWS account</h4>
+        <div class="beat" data-t="26" style="display:flex;align-items:baseline;gap:9px">
+          <span class="big" style="color:var(--red)">$36.36</span>
+          <span class="sub">/ day · one inference endpoint</span>
+        </div>
+        <div style="margin-top:11px">
+          <div class="kv beat" data-t="28.5"><span>Invocations</span><b>0</b></div>
+          <div class="kv beat" data-t="28.5"><span>GPU utilization</span><b>0.0%</b></div>
+          <div class="kv beat" data-t="30.5"><span>Running for</span><b>90 days</b></div>
+          <div class="kv beat" data-t="32"><span>Owner tag</span>
+            <b style="color:var(--red)">none</b></div>
+        </div>
+        <div class="beat" data-t="34.5" style="margin-top:11px">
+          <span class="pill err">≈ $1,100 / month, for nothing</span>
+        </div>
+      </div>
+    </div>
+    <div class="lede sm beat" data-t="39.5" style="margin-top:16px;color:var(--muted)">
+      Nobody did anything wrong. <b style="color:var(--text)">Nobody was looking.</b></div>
+  </section>
+
+  <!-- ── 2 · agents that hold the pager ──────────────────────────────────── -->
+  <section class="scene" id="s2-solution">
+    <div class="stitle beat" data-t="0.3" data-title></div>
+    <div class="cols" style="margin-bottom:16px">
+      <div class="card beat" data-t="1" style="width:250px">
+        <h4>An assistant</h4>
+        <div class="mono" style="font-size:12.5px;color:var(--muted)">
+          “Try:<br />&nbsp;&nbsp;aws sagemaker create-…”</div>
+        <div class="beat" data-t="7" style="margin-top:9px">
+          <span class="pill err strike" style="text-decoration-color:var(--red)">still needs hands</span></div>
+      </div>
+      <div class="beat" data-t="7" style="align-self:center;font-size:22px;color:var(--muted)">→</div>
+      <div class="card beat" data-t="7" style="width:250px;border-color:var(--accent)">
+        <h4>An agent</h4>
+        <div class="mono" style="font-size:12.5px;color:var(--green)">
+          probes IAM · rebuilds the tarball<br />submits the job · releases</div>
+        <div style="margin-top:9px"><span class="pill ok">acts</span></div>
+      </div>
+      <div class="lede sm beat" data-t="7" style="flex:1;margin:0;align-self:center">
+        A correct diagnosis with no hands still waits for a human.</div>
+    </div>
+    <div class="fleet beat" data-t="11" style="width:100%">
+      <div class="ag cond beat" data-t="14.8"><div class="an">llmops_orchestrator</div>
+        <div class="ar">conductor · plans, triages, pages</div></div>
+      <div class="ag beat" data-t="17"><div class="an">llmops_data_prep</div>
+        <div class="ar">teacher traces · curation</div></div>
+      <div class="ag beat" data-t="19"><div class="an">llmops_finetune</div>
+        <div class="ar">QLoRA on SageMaker</div></div>
+      <div class="ag beat" data-t="20"><div class="an">llmops_eval</div>
+        <div class="ar">quality gates · hold-out</div></div>
+      <div class="ag beat" data-t="21"><div class="an">llmops_deploy</div>
+        <div class="ar">endpoint · smoke · teardown</div></div>
+      <div class="ag beat" data-t="22"><div class="an">llmops_monitor</div>
+        <div class="ar">drift · orphan sweep</div></div>
+      <div class="ag audit beat" data-t="25"><div class="an">llmops_finops</div>
+        <div class="ar">read-only auditor · prices every run</div></div>
+      <div class="card beat" data-t="31" style="grid-column:span 2;padding:11px 13px">
+        <h4>Every task prompt grants an explicit budget</h4>
+        <div class="mono" style="font-size:12.5px">
+          diagnose → fix → retry &nbsp;<span style="color:var(--amber)">max 3</span>
+          &nbsp;→&nbsp;<span class="beat" data-t="35" style="color:var(--red)">escalate_human</span></div>
+        <div class="sub beat" data-t="35" style="margin-top:6px">At the edge of the budget it
+          escalates instead of guessing.</div>
+      </div>
+    </div>
+    <div class="lede sm beat" data-t="38.5" style="margin-top:14px">
+      Real authority · a stated limit · an honest exit.</div>
+  </section>
+
+  <!-- ── 3 · architecture (the repo's real high-level diagram) ───────────── -->
+  <section class="scene" id="s3-architecture">
+    <div class="stitle beat" data-t="0.3" data-title></div>
+    <div class="cols">
+      <div class="dia beat" data-t="1" style="width:730px;height:560px">__SVG_HIGH__</div>
+      <div class="callouts">
+        <div class="co beat" data-t="7"><b>The order never changes</b>
+          So the spine needs no language model at all.</div>
+        <div class="co beat" data-t="12"><b>Step Functions · the deterministic spine</b>
+          11 harness task states on the happy path.</div>
+        <div class="co beat" data-t="17"><b>wait-for-task-token</b>
+          Each state hands off to the harness-driver Lambda and blocks until the agent
+          reports back.</div>
+        <div class="co beat" data-t="21"><b>6 Lambdas · the serverless edge</b>
+          driver · start · resume · webhook · cost reconciler · scheduled sweep</div>
+        <div class="co beat" data-t="28" style="border-left-color:var(--amber)">
+          <b>Intelligence inside the stage, never above it</b>
+          The spine decides order. The agent decides how.</div>
+        <div class="co beat" data-t="31" style="border-left-color:var(--green)">
+          <b>Manifest in S3 · single source of truth</b>
+          Every agent reads it first and only appends.</div>
+        <div class="co beat" data-t="36" style="border-left-color:var(--red)">
+          <b>When the model provider had a bad hour</b>
+          The agent was unreachable, so the spine submitted the final training job itself.</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── 4 · built on AgentCore (the repo's real low-level diagram) ──────── -->
+  <section class="scene" id="s4-build">
+    <div class="stitle beat" data-t="0.3" data-title></div>
+    <div class="lede sm beat" data-t="1">None of these agent loops are hand-written.
+      Each agent is an <b>Amazon Bedrock AgentCore Harness</b>.</div>
+    <div class="cols">
+      <div class="card beat" data-t="1" style="width:400px">
+        <h4>harness.json — you declare, AWS runs the loop</h4>
+        <div class="cfg">
+          <div class="beat" data-t="6"><span class="k">"model"</span>: <span class="s">"global.anthropic.claude-opus-5"</span>,</div>
+          <div class="beat" data-t="7"><span class="k">"systemPrompt"</span>: <span class="s">"…stage contract…"</span>,</div>
+          <div class="beat" data-t="8"><span class="k">"tools"</span>: [ code_interpreter, browser, … ],</div>
+          <div class="beat" data-t="9"><span class="k">"skills"</span>: [ 19 sources, all <span class="s">s3</span> ],</div>
+          <div class="beat" data-t="10"><span class="k">"maxIterations"</span>, <span class="k">"timeout"</span>, <span class="k">"memory"</span></div>
+          <div class="beat" data-t="12" style="margin-top:9px"><span class="c">// per-session microVM:</span></div>
+          <div class="beat" data-t="12"><span class="c">// own shell + filesystem</span></div>
+        </div>
+        <div class="beat" data-t="18.5" style="margin-top:10px">
+          <span class="pill ok">acts, rather than advises</span></div>
+      </div>
+      <div style="flex:1">
+        <div class="dia beat" data-t="1" style="height:270px">__SVG_LOW__</div>
+        <div class="co beat" data-t="22" style="margin-top:11px;border-left-color:var(--green)">
+          <b>19 skill sources · pinned S3 mirror</b>
+          Mounted at session start. <span class="beat" data-t="25">A skill repository moving on
+          its own cannot change what ran.</span></div>
+        <div class="co beat" data-t="31" style="margin-top:9px">
+          <b>Changing behaviour is a config change, not a redeploy</b>
+          <span class="beat mono" data-t="34">Fable 5 → Opus 5 · ~15 s · one UpdateHarness
+          · live sessions survived</span></div>
+        <div class="sub beat" data-t="34" style="margin-top:7px">…after one provider threw ~12 bursts
+          of 5xx in a single day.</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── 5 · design decisions ────────────────────────────────────────────── -->
+  <section class="scene" id="s5-design">
+    <div class="stitle beat" data-t="0.3" data-title></div>
+    <div class="cols beat" data-t="2">
+      <div class="card beat" data-t="3" style="flex:1">
+        <h4>1 · Gates are fail-closed</h4>
+        <div class="cfg beat" data-t="6">
+          <div><span class="c"># only a literal true passes</span></div>
+          <div>if r.get(<span class="s">"gate_passed"</span>) <span class="k">is True</span>:</div>
+        </div>
+        <div class="beat" data-t="10" style="margin-top:10px">
+          <div class="cfg strike" style="font-size:12px">.get("gate_passed", True)</div>
+          <div class="sub" style="margin-top:4px">An agent emitted an empty result; an old
+            default promoted it to a pass.</div>
+        </div>
+        <div class="beat" data-t="14" style="margin-top:9px">
+          <span class="pill ok">default deleted · regression test in its place</span></div>
+      </div>
+      <div class="card beat" data-t="15.8" style="flex:1.25">
+        <h4>2 · Honesty is enforced structurally</h4>
+        <table class="der">
+          <tr class="beat" data-t="20"><td>agent count</td><td>agents/*/harness.json</td></tr>
+          <tr class="beat" data-t="23"><td>Lambda count</td><td>deploy/07_lambdas.py</td></tr>
+          <tr class="beat" data-t="25"><td>state count</td><td>state_machine.asl.json</td></tr>
+        </table>
+        <div class="sub beat" data-t="27.5" style="margin-top:8px">Every number in the docs is
+          re-derived from the file that produces it.</div>
+        <div class="beat" data-t="29.2" style="margin-top:10px">
+          <span class="pill warn">A number measured once looks measured forever —
+            that is how documentation lies.</span></div>
+      </div>
+      <div class="card beat" data-t="34.4" style="flex:1">
+        <h4>3 · Every guard has been watched to fail</h4>
+        <div class="sub">A guard nobody has seen fail is a guard nobody has tested.</div>
+        <div class="beat" data-t="36.8" style="margin-top:11px">
+          <div class="kv"><span class="mono">break the claim</span>
+            <span class="pill err">guard fires</span></div>
+          <div class="kv"><span class="mono">restore it</span>
+            <span class="pill ok">guard passes</span></div>
+        </div>
+        <div class="sub beat" data-t="36.8" style="margin-top:8px">Negative controls break each
+          guard in turn and require it to catch the break.</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── 6 · what was proven ─────────────────────────────────────────────── -->
+  <section class="scene" id="s6-results">
+    <div class="stitle beat" data-t="0.3" data-title></div>
+    <div class="chain" style="margin-bottom:6px">
+      <span class="st beat" data-t="2.5">trigger</span><span class="arw beat" data-t="2.5">›</span>
+      <span class="st beat" data-t="3.1">plan</span><span class="arw beat" data-t="3.1">›</span>
+      <span class="st beat" data-t="3.7">generate</span><span class="arw beat" data-t="3.7">›</span>
+      <span class="st beat" data-t="4.3">curate</span><span class="arw beat" data-t="4.3">›</span>
+      <span class="st beat" data-t="4.9">train</span><span class="arw beat" data-t="4.9">›</span>
+      <span class="st beat" data-t="5.5">evaluate</span><span class="arw beat" data-t="5.5">›</span>
+      <span class="st beat" data-t="6.1">deploy</span><span class="arw beat" data-t="6.1">›</span>
+      <span class="st beat" data-t="6.7">smoke</span><span class="arw beat" data-t="6.7">›</span>
+      <span class="st beat" data-t="7.3">teardown</span>
+      <span class="pill ok beat" data-t="9" style="margin-left:8px">hands-off</span>
+    </div>
+    <div class="cols" style="margin-top:14px">
+      <div style="width:360px">
+        <div class="card beat" data-t="11">
+          <h4>The same training job, the next run</h4>
+          <div style="display:flex;align-items:baseline;gap:9px">
+            <span class="big" style="color:var(--green)">1</span>
+            <span class="sub">try — from a recipe the agent<br />wrote into shared memory</span></div>
+          <div class="sub beat" data-t="17.5" style="margin-top:10px">
+            6 failures became <b style="color:var(--text)">one organizational learning</b>.</div>
+        </div>
+        <div class="card beat" data-t="45.5" style="margin-top:12px">
+          <h4>Cost of proving the whole lifecycle</h4>
+          <div style="display:flex;align-items:baseline;gap:9px">
+            <span class="big">≈ $12–15</span>
+            <span class="sub">total · about one hour<br />of a human engineer</span></div>
+        </div>
+      </div>
+      <div class="card beat" data-t="20.5" style="flex:1;border-color:var(--red)">
+        <h4>And the most important result is a failure</h4>
+        <div style="display:flex;align-items:center;gap:20px">
+          <div class="beat" data-t="23">
+            <div class="huge" style="color:var(--red)">0/16</div>
+            <div class="sub beat" data-t="28">held-out tasks · <b style="color:var(--text)">twice</b></div>
+          </div>
+          <div style="flex:1">
+            <div class="kv beat" data-t="30"><span>Lenient re-scan</span><b>still 0</b></div>
+            <div class="kv beat" data-t="30"><span>Control prompts, same path</span>
+              <b style="color:var(--green)">well-formed</b></div>
+            <div class="kv beat" data-t="33"><span class="mono">closed_think_rate</span>
+              <b style="color:var(--red)">0%</b></div>
+            <div class="kv beat" data-t="36"><span>Hit the context limit</span><b>12 / 16</b></div>
+          </div>
+        </div>
+        <div class="lede sm beat" data-t="42" style="margin:14px 0 0">
+          It had learned to <b>start</b> reasoning and never to <b>converge</b>.</div>
+        <div class="beat" data-t="44" style="margin-top:10px">
+          <span class="pill err">Nothing was fixed into a pass. The verdict stood.</span></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── 7 · this console ────────────────────────────────────────────────── -->
+  <section class="scene" id="s7-console">
+    <div class="stitle beat" data-t="0.3" data-title></div>
+    <div class="mock beat" data-t="1">
+      <div class="mh"><span class="lg"></span><span class="t">LLMOps Admin</span>
+        <span class="sub" style="font-size:11px">the operator's view</span></div>
+      <div class="mtabs">
+        <span class="beat" data-t="3.5">Introduction</span>
+        <span class="beat" data-t="3.5">Architecture</span>
+        <span class="beat act" data-t="4.5">Pipeline</span>
+        <span class="beat" data-t="5.5">Fleet</span>
+        <span class="beat" data-t="5.5">Observability</span>
+        <span class="beat" data-t="6.5">Evaluations</span>
+        <span class="beat" data-t="6.5">Optimizations</span>
+        <span class="beat" data-t="7.5">Cost</span>
+      </div>
+      <div class="mbody" style="flex-direction:column;gap:12px">
+        <div class="flow beat" data-t="9.5">
+          <span class="fs done">data_prep</span><span class="arw">›</span>
+          <span class="fs done">curate</span><span class="arw">›</span>
+          <span class="fs act">finetune</span><span class="arw">›</span>
+          <span class="fs">evaluate</span><span class="arw">›</span>
+          <span class="fs">deploy</span><span class="arw">›</span>
+          <span class="fs">smoke</span><span class="arw">›</span>
+          <span class="fs">teardown</span>
+        </div>
+        <div style="display:flex;gap:12px">
+          <div class="card beat" data-t="12" style="flex:1;background:var(--panel)">
+            <h4>Cost · the auditor prices every run</h4>
+            <div class="kv"><span>Estimated, at approval</span><b>$41.80</b></div>
+            <div class="kv"><span>Actual, reconciled</span><b>$38.94</b></div>
+            <div class="kv"><span>Reporting reference</span>
+              <b class="sub">set by each team</b></div>
+            <div class="beat" data-t="16" style="margin-top:9px">
+              <span class="pill warn">named while it is happening — not discovered on a bill</span></div>
+          </div>
+          <div class="card beat" data-t="18.4" style="flex:1;background:var(--panel)">
+            <h4>Escalations arrive as a task you answer</h4>
+            <div class="msg">Budget for the 80-sample run exceeds the reference. Approve?</div>
+            <div class="msg me">Approved — proceed at 80 samples.</div>
+            <div class="beat" data-t="21.2">
+              <span class="pill ok mono">KMS-signed · appended to a hash chain</span>
+              <div class="sub" style="margin-top:5px">Who approved what cannot be quietly
+                rewritten.</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="cols beat" data-t="27.7" style="margin-top:13px;align-items:center">
+      <span class="pill ok">the whole test suite · negative controls · shell assertions —
+        offline, on every pull request</span>
+      <div class="lede sm beat" data-t="33.5" style="margin:0;flex:1">
+        Not an assistant that suggests commands — a team of agents with real authority,
+        stated limits, and <b>gates hard enough to fail their own builders</b>.</div>
+    </div>
+  </section>
+
+  </div><!-- /stage -->
+
+  <div class="gate" id="gate">
+    <h1>An autonomous LLMOps pipeline, run by agents</h1>
+    <p>Five minutes, narrated: what the problem is, how seven AgentCore agents were given
+       real authority and hard limits, and what that actually proved on a live AWS account.</p>
+    <div class="pickrow">
+      <label for="gateLang">Narration language</label>
+      <select id="gateLang"></select>
+    </div>
+    <button class="go" id="goBtn">▶ Play</button>
+    <div class="sub" style="font-size:11.5px">Space to pause · ← → to change scene</div>
+  </div>
+</div><!-- /stagewrap -->
+
+<div class="segs" id="segs"></div>
+
+<div class="bar">
+  <button class="primary" id="playBtn">▶ Play</button>
+  <button id="prevBtn">‹ Prev</button>
+  <button id="nextBtn">Next ›</button>
+  <button id="muteBtn">Mute</button>
+  <select id="langSel" aria-label="Narration language"></select>
+  <span class="grow"></span>
+  <span class="ttsnote off" id="ttsNote">voice file unavailable — using your browser's speech</span>
+  <span class="clock" id="clock">0:00 / 0:00</span>
+</div>
+
+<div class="cap" id="cap"></div>
+</div>
+
+<script>
+// ── generated data ───────────────────────────────────────────────────────────
+const SCENES = __SCENES__;
+const LANGS  = __LANGS__;
+const TITLES = __TITLES__;
+const NARR   = __NARR__;
+const DUR    = __DUR__;          // MEASURED mp3 seconds, per language, per scene
+const AUDIO_BASE = "/intro/audio/";
+
+// ── state ────────────────────────────────────────────────────────────────────
+let LANG = "en";
+let idx = -1, playing = false, audio = null, utter = null, raf = null;
+let muted = false, started = false;
+// The TTS fallback has no currentTime, so its clock is kept by hand. Both branches feed
+// curTime(), which is the ONLY thing the beat scheduler reads -- so a scene animates
+// identically whether it is driven by an mp3 or by the browser's voice.
+let ttsT0 = 0, ttsElapsed = 0;
+
+const $ = id => document.getElementById(id);
+const stage = $("stage"), wrap = $("wrap");
+
+try {
+  const saved = localStorage.getItem("introLang");
+  if (saved && LANGS[saved]) LANG = saved;
+} catch (e) { /* storage can be blocked; English is a fine default */ }
+
+// ── scale the fixed-size stage to whatever box it is in ──────────────────────
+function fit(){
+  const k = wrap.clientWidth / 1180;
+  stage.style.transform = "scale(" + k + ")";
+}
+if (window.ResizeObserver) new ResizeObserver(fit).observe(wrap);
+window.addEventListener("resize", fit);
+fit();
+
+// ── durations ────────────────────────────────────────────────────────────────
+// estDur is ONLY for the TTS fallback: no mp3 means no measured length. The rates are
+// the ones actually observed from the Polly clips of this script (English ~17 chars/s,
+// CJK ~6-8), not guesses -- a wrong estimate here makes every beat land at the wrong
+// moment, which reads as a broken page rather than as a missing file.
+const EST_RATE = { en: 17.2, zh: 6.0, yue: 6.2, ja: 6.1, ko: 7.7 };
+function estDur(lang, sid){
+  const txt = (NARR[lang] && NARR[lang][sid]) || "";
+  return Math.max(6, txt.length / (EST_RATE[lang] || 12));
+}
+function sceneDur(sid, lang){
+  lang = lang || LANG;
+  const d = DUR[lang] && DUR[lang][sid];
+  return d || estDur(lang, sid);
+}
+// Beats are authored once, in English seconds. Every other language scales them by the
+// ratio of its own clip length, so one set of timings serves five voices of very
+// different speeds -- and adding a language needs no re-timing of the markup.
+function beatScale(sid){
+  const en = DUR.en && DUR.en[sid];
+  return en ? sceneDur(sid) / en : 1;
+}
+const totalDur = () => SCENES.reduce((a, s) => a + sceneDur(s), 0);
+
+function fmt(s){
+  s = Math.max(0, Math.round(s));
+  return Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0");
+}
+
+// ── language pickers ─────────────────────────────────────────────────────────
+function fillLangSelects(){
+  for (const sel of [$("langSel"), $("gateLang")]) {
+    sel.innerHTML = "";
+    for (const code of Object.keys(LANGS)) {
+      const o = document.createElement("option");
+      o.value = code; o.textContent = LANGS[code].name;
+      if (code === LANG) o.selected = true;
+      sel.appendChild(o);
+    }
+  }
+}
+function setLang(code){
+  if (!LANGS[code] || code === LANG) return;
+  const resumeAt = idx, wasPlaying = playing;
+  hardStop();
+  LANG = code;
+  try { localStorage.setItem("introLang", code); } catch (e) {}
+  document.documentElement.lang = LANGS[code].bcp47;
+  fillLangSelects();
+  applyTitles();
+  buildSegs();
+  if (resumeAt >= 0) go(resumeAt, wasPlaying); else tick();
+}
+
+// Scene titles come from narration.json, so the on-screen heading and the spoken line
+// are the same source. A hard-coded English heading over a Japanese voice-over is the
+// kind of half-translated page that reads as an afterthought.
+function applyTitles(){
+  for (const sid of SCENES) {
+    const el = document.querySelector('#' + sid + ' [data-title]');
+    if (el) el.textContent = (TITLES[LANG] && TITLES[LANG][sid]) || (TITLES.en[sid] || "");
+  }
+}
+
+// ── progress segments, one per scene, width ∝ its duration ───────────────────
+function buildSegs(){
+  const box = $("segs");
+  box.innerHTML = "";
+  const total = totalDur();
+  SCENES.forEach((sid, i) => {
+    const sg = document.createElement("div");
+    sg.className = "sg";
+    sg.style.flexGrow = String(sceneDur(sid) / total);
+    sg.title = (TITLES[LANG] && TITLES[LANG][sid]) || sid;
+    sg.innerHTML = "<i></i>";
+    sg.onclick = () => go(i, true);
+    box.appendChild(sg);
+  });
+}
+
+// ── captions ────────────────────────────────────────────────────────────────
+// A sliding window rather than the whole paragraph: 800 characters of Korean under a
+// 664px stage pushes the stage off screen, and a caption that never moves gives no
+// signal that the audio is still advancing.
+function setCaption(sid, t){
+  const txt = (NARR[LANG] && NARR[LANG][sid]) || "";
+  if (!txt) { $("cap").textContent = ""; return; }
+  const frac = Math.min(1, Math.max(0, t / sceneDur(sid)));
+  const win = 150, mid = Math.round(txt.length * frac);
+  let a = Math.max(0, mid - Math.round(win / 2));
+  let b = Math.min(txt.length, a + win);
+  a = Math.max(0, b - win);
+  $("cap").innerHTML = (a > 0 ? "… " : "")
+    + txt.slice(a, b).replace(/[<>&]/g, c => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;" }[c]))
+    + (b < txt.length ? " …" : "");
+}
+
+// ── clock ────────────────────────────────────────────────────────────────────
+function curTime(){
+  if (audio) return audio.currentTime || 0;
+  return ttsElapsed + (playing ? (performance.now() - ttsT0) / 1000 : 0);
+}
+
+function tick(){
+  raf = null;
+  if (idx < 0) { $("clock").textContent = "0:00 / " + fmt(totalDur()); return; }
+  const sid = SCENES[idx], t = curTime(), k = beatScale(sid);
+
+  document.querySelectorAll("#" + sid + " .beat").forEach(el => {
+    if (t >= parseFloat(el.dataset.t) * k) el.classList.add("in");
+  });
+
+  const segs = $("segs").children;
+  for (let i = 0; i < segs.length; i++) {
+    const bar = segs[i].firstChild;
+    if (i < idx) { bar.style.width = "100%"; }
+    else if (i === idx) { bar.style.width = Math.min(100, 100 * t / sceneDur(sid)) + "%"; }
+    else { bar.style.width = "0"; }
+  }
+
+  let before = 0;
+  for (let i = 0; i < idx; i++) before += sceneDur(SCENES[i]);
+  $("clock").textContent = fmt(before + t) + " / " + fmt(totalDur());
+  setCaption(sid, t);
+
+  // Safety net for the TTS branch. SpeechSynthesis has no reliable `onend` on every
+  // browser -- Safari has shipped versions that never fire it -- so without this the
+  // page would stop dead on scene 1 with no error anywhere. The mp3 branch does not
+  // need it: `audio.onended` is dependable.
+  if (!audio && playing && t >= sceneDur(sid) + 0.5) { go(idx + 1, true); return; }
+  if (playing) raf = requestAnimationFrame(tick);
+}
+
+// ── transport ────────────────────────────────────────────────────────────────
+// onended is cleared BEFORE pause(). Otherwise stopping scene 3 to jump to scene 5
+// fires the handler that advances to scene 4, and the page ends up somewhere the click
+// never asked for.
+function hardStop(){
+  playing = false;
+  if (raf) { cancelAnimationFrame(raf); raf = null; }
+  if (audio) { audio.onended = null; audio.onerror = null; try { audio.pause(); } catch (e) {} audio = null; }
+  if (utter) { utter.onend = null; utter = null; }
+  try { window.speechSynthesis && window.speechSynthesis.cancel(); } catch (e) {}
+  ttsElapsed = 0;
+  $("playBtn").textContent = "▶ Play";
+}
+
+function speakTts(sid){
+  $("ttsNote").classList.remove("off");
+  ttsElapsed = 0; ttsT0 = performance.now();
+  if (!window.speechSynthesis) { playing = true; raf = requestAnimationFrame(tick); return; }
+  utter = new SpeechSynthesisUtterance((NARR[LANG] && NARR[LANG][sid]) || "");
+  utter.lang = LANGS[LANG].bcp47;
+  utter.volume = muted ? 0 : 1;
+  utter.onend = () => { if (playing) go(idx + 1, true); };
+  try { window.speechSynthesis.speak(utter); } catch (e) {}
+  playing = true;
+  raf = requestAnimationFrame(tick);
+}
+
+function go(i, autoplay){
+  if (i >= SCENES.length) {                       // ran off the end: stop on the last scene
+    hardStop();
+    $("playBtn").textContent = "↻ Replay";
+    $("playBtn").onclick = () => go(0, true);
+    return;
+  }
+  if (i < 0) i = 0;
+  hardStop();
+  started = true;
+  $("gate").classList.add("off");
+  $("playBtn").onclick = toggle;
+
+  idx = i;
+  SCENES.forEach((sid, n) => {
+    const el = $(sid);
+    el.classList.toggle("on", n === i);
+    // Beats reset when a scene is LEFT, so replaying or jumping back actually replays
+    // the animation instead of showing an already-finished slide.
+    if (n !== i) el.querySelectorAll(".beat").forEach(b => b.classList.remove("in"));
+  });
+
+  const sid = SCENES[i];
+  $("ttsNote").classList.add("off");
+  audio = new Audio(AUDIO_BASE + LANG + "/" + sid + ".mp3");
+  audio.muted = muted;
+  audio.onended = () => go(idx + 1, true);
+  audio.onerror = () => { audio = null; if (autoplay !== false) speakTts(sid); else tick(); };
+
+  if (autoplay === false) { playing = false; tick(); return; }
+  playing = true;
+  $("playBtn").textContent = "❚❚ Pause";
+  audio.play().catch(() => { audio = null; speakTts(sid); });
+  raf = requestAnimationFrame(tick);
+}
+
+function toggle(){
+  if (!started) { go(0, true); return; }
+  if (playing) {
+    playing = false;
+    if (audio) { try { audio.pause(); } catch (e) {} }
+    else { ttsElapsed = curTime(); try { window.speechSynthesis.pause(); } catch (e) {} }
+    if (raf) { cancelAnimationFrame(raf); raf = null; }
+    $("playBtn").textContent = "▶ Play";
+  } else {
+    playing = true;
+    if (audio) { audio.play().catch(() => { audio = null; speakTts(SCENES[idx]); }); }
+    else { ttsT0 = performance.now(); try { window.speechSynthesis.resume(); } catch (e) {} }
+    $("playBtn").textContent = "❚❚ Pause";
+    raf = requestAnimationFrame(tick);
+  }
+}
+
+$("playBtn").onclick = toggle;
+$("goBtn").onclick = () => go(0, true);
+$("prevBtn").onclick = () => go(Math.max(0, idx - 1), playing || !started);
+$("nextBtn").onclick = () => go(idx + 1 >= SCENES.length ? SCENES.length - 1 : idx + 1,
+                                playing || !started);
+$("muteBtn").onclick = () => {
+  muted = !muted;
+  if (audio) audio.muted = muted;
+  if (utter) utter.volume = muted ? 0 : 1;
+  $("muteBtn").textContent = muted ? "Unmute" : "Mute";
+};
+$("langSel").onchange = e => setLang(e.target.value);
+$("gateLang").onchange = e => setLang(e.target.value);
+
+document.addEventListener("keydown", e => {
+  if (e.target.tagName === "SELECT") return;
+  if (e.code === "Space") { e.preventDefault(); toggle(); }
+  else if (e.code === "ArrowRight") { e.preventDefault(); $("nextBtn").onclick(); }
+  else if (e.code === "ArrowLeft") { e.preventDefault(); $("prevBtn").onclick(); }
+});
+
+/* The console embeds this page in an iframe and switches tabs by toggling
+ * `display:none` on the panel. That does NOT pause audio -- a hidden iframe keeps
+ * playing, so an operator who clicked away to the Cost tab would hear five minutes of
+ * narration over their work with no visible control to stop it. The parent posts
+ * {intro:"pause"} when the tab is left. The origin is checked because this message
+ * arrives from outside the document.
+ *
+ * Nothing here resumes on return, deliberately: finding the scene paused where it
+ * stopped is what a reader expects, and restarting audio the user did not just ask for
+ * is the behaviour every browser's autoplay policy exists to prevent. */
+window.addEventListener("message", e => {
+  if (e.origin !== location.origin) return;
+  if (e.data && e.data.intro === "pause" && playing) toggle();
+});
+
+// ── first paint ──────────────────────────────────────────────────────────────
+document.documentElement.lang = LANGS[LANG].bcp47;
+fillLangSelects();
+applyTitles();
+buildSegs();
+// Scene 1 is shown, silent, behind the gate: the page reads as content waiting to start
+// rather than as an empty frame with a button on it.
+$(SCENES[0]).classList.add("on");
+$(SCENES[0]).querySelectorAll('.beat[data-t="0.3"], .beat[data-t="1"], .beat[data-t="1.5"]')
+  .forEach(b => b.classList.add("in"));
+tick();
+</script>
+</body>
+</html>

@@ -8,3 +8,8 @@ pipeline/v2/out/
 # run killed mid-case can restore it on the next start. Never committed: it holds the
 # pristine copy of a tracked source file, and committing it would be committing a duplicate.
 .negative_control_journal
+
+# The intro page is GENERATED (deploy/console/intro/build_intro.py --out build/intro.html)
+# by deploy.sh and by tests/test_intro_player.js. Committing it would give the repo a second,
+# staler copy of a file whose inputs are already tracked.
+build/

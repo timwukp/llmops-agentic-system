@@ -10,21 +10,24 @@ STAGED=$(git diff --cached --name-only --diff-filter=ACM)
 fail=0
 
 # ---- 1. Redaction scan (staged content, not just filenames) ----------------
-# AWS account IDs (bare 12-digit), credentials, account-bearing ARNs.
-# Allowlist: AWS public ECR gallery accounts used in official image URIs.
-ALLOW='683313688378|763104351884|123456789012'
-for f in $STAGED; do
-  case "$f" in *.png|*.jpg|*.jpeg|*.gif|*.pdf|*.zip) continue;; esac
-  # the scanners contain their own patterns as literals — skip them
-  case "$f" in hooks/pre-commit|.github/workflows/redaction-check.yml) continue;; esac
-  hits=$(git show ":$f" | grep -nE 'AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}|aws_secret_access_key|arn:aws[a-z-]*:[a-z0-9-]+:[a-z0-9-]*:[0-9]{12}|(^|[^0-9.])[0-9]{12}([^0-9.]|$)' \
-        | grep -vE "$ALLOW" | grep -vE '<ACCOUNT_ID>|ACCOUNT_ID_PLACEHOLDER|[0-9]{13,}' || true)
-  if [ -n "$hits" ]; then
-    echo "✗ REDACTION: possible account ID / credential / account-bearing ARN in $f:"
-    echo "$hits" | head -5
-    fail=1
-  fi
-done
+# The rules live in tests/redaction_scan.py, which CI runs too. They used to live here AND
+# in .github/workflows/redaction-check.yml as two hand-copied regex lists with two different
+# file-selection schemes, and they had drifted: this hook skipped by extension DENYLIST
+# (which omitted .mp3, so it text-grepped audio and blocked on entropy) while CI skipped by
+# extension ALLOWLIST (which omitted .html/.js, so CI never opened them). One module now, so
+# a rule added for one scanner cannot be missing from the other.
+#
+# A missing scanner is a FAILURE, not a skip — same reasoning as the SVG block below. rc=2
+# means "could not look", which must never read as "looked and it is fine".
+if [ ! -f tests/redaction_scan.py ]; then
+  echo "✗ REDACTION: tests/redaction_scan.py is missing — staged content cannot be verified"
+  fail=1
+elif ! command -v python3 >/dev/null; then
+  echo "✗ REDACTION: python3 not found, cannot verify staged content"
+  fail=1
+else
+  python3 tests/redaction_scan.py --staged || fail=1
+fi
 
 # ---- 2. Bilingual pairing: staged EN doc with a zh-TW twin must stage both --
 for f in $STAGED; do
