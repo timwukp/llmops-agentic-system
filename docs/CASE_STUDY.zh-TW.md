@@ -14,6 +14,11 @@ DeepSeek-R1）生成訓練數據，student 小模型（Qwen3-1.7B）在 SageMake
 `escalate_human` 時才需要人類介入**。不是「一個會建議命令的助手」，而是六個
 真正值班背 pager 的 agent。
 
+**本文全篇的「六」指的是 v1 當時的 fleet。** FinOps 審計員（`llmops_finops`）在 Phase 6
+之後才加入，今天是七個 —— 所以 README 寫七、這份記錄寫六，各自對自己那個時間點都是對的。
+把它改成七會讓本文與它自己引用的證據互相矛盾（`VERIFICATION_phase5.md`：「All six
+harnesses currently run Opus 5」），並且會宣稱審計員參與了一個它其實不在場的建置。
+
 證明這一切的總帳單 —— 六個 agent、一個訓練完成的模型、一個部署又回收的
 endpoint、五輪端到端迭代 —— 約 **$12–15**，大約等於一位人類工程師一小時。
 

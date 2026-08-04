@@ -1701,6 +1701,75 @@ case("console: the readiness field list shrinks and the prose count does not fol
       "test_the_readiness_docstring_states_the_real_number_of_questions"])
 
 
+#: The fleet count a first-time reader meets on line 7 of both READMEs. Three cases, because
+#: this claim can rot in three ways and only the first is the one people think of.
+#:
+#: The fourth way -- the FLEET grows while the prose stands still, which is how the Lambda
+#: count, the ASL state count and CASE_STUDY's "six" all actually broke -- cannot be encoded
+#: here: it needs a NEW agents/*/harness.json, and this runner mutates the text of one
+#: existing file and journals that one path for recovery. Widening it to create files would
+#: mean widening the journal's restore contract, which is not a change to make from inside a
+#: docs PR. It was verified by hand instead: an 8th harness dropped into agents/ turned the
+#: guard red with "README.md tells its first-time reader '7' agents; agents/ holds 8 harness
+#: configs" -- the direction a guard hardcoding 7 would have sailed straight past.
+#:
+#: The node id is repeated verbatim in all three cases rather than hoisted into a shared
+#: constant: test_every_negative_control_case_names_a_guard reads these registrations with
+#: `ast`, so args[3] must be a list LITERAL -- a variable parses as ast.Name and the case
+#: scores as naming no test at all. That guard caught this exact shortcut here.
+def m106(t):
+    """Drift the EN README's spelled-out count. The plain prose-rot direction."""
+    old = "Seven AI agents — a conductor"
+    assert t.count(old) == 1, f"the EN fleet sentence has moved; found {t.count(old)}"
+    return t.replace(old, "Six AI agents — a conductor", 1)
+
+
+case("readme: the count a first-time reader sees drifts from the fleet (EN)",
+     "README.md", m106,
+     ["tests/test_docs_claims.py::"
+      "test_the_agent_count_readers_see_first_matches_the_fleet"])
+
+
+def m107(t):
+    """Drift the zh-TW twin. Both languages state the claim, so both must be guarded --
+    a bilingual repo where only the English half is checked has an unguarded half."""
+    old = "**7 個 agent 自己揣著 pager**"
+    assert t.count(old) == 1, f"the zh-TW fleet phrase has moved; found {t.count(old)}"
+    return t.replace(old, "**6 個 agent 自己揣著 pager**", 1)
+
+
+case("readme: the count a first-time reader sees drifts from the fleet (zh-TW)",
+     "README.zh-TW.md", m107,
+     ["tests/test_docs_claims.py::"
+      "test_the_agent_count_readers_see_first_matches_the_fleet"])
+
+
+def m108(t):
+    """Delete the paragraph that scopes CASE_STUDY's "six" to the v1 fleet.
+
+    This is the case that keeps the carve-out from being a hole. The guard lets a document
+    state a smaller PAST count -- but only where it says so. Strip the scoping paragraph and
+    the bare "six agents" must go red, otherwise the exemption would silently bless any
+    stale number that happens to sit in a file on the allowed list.
+    """
+    old = """**Six, throughout this document, is the v1 fleet.** The FinOps auditor
+(`llmops_finops`) was added after Phase 6, making seven today — so the READMEs
+say seven and this record says six, and each is right about its own moment.
+Renumbering it would put this document in conflict with the evidence it cites
+(`VERIFICATION_phase5.md`: "All six harnesses currently run Opus 5") and would
+claim the auditor took part in a build it was not present for.
+
+"""
+    assert t.count(old) == 1, f"the v1-scope paragraph has moved; found {t.count(old)}"
+    return t.replace(old, "", 1)
+
+
+case("case study: the v1 scoping vanishes and a stale count is left bare",
+     "docs/CASE_STUDY.md", m108,
+     ["tests/test_docs_claims.py::"
+      "test_the_agent_count_readers_see_first_matches_the_fleet"])
+
+
 #: Where the pristine text of the file currently mutated is parked, so a kill -9 -- which
 #: no handler can intercept -- still leaves the original recoverable. Under the repo root
 #: rather than /tmp because it must be obvious to whoever finds the tree dirty, and

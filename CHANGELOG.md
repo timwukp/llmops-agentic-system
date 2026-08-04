@@ -5,6 +5,46 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
 ## [Unreleased]
 
+### The README never said what problem it solves
+
+- **Both READMEs opened with an implementation, not a problem.** The first sentence was "An
+  end-to-end LLMOps platform, run autonomously by AWS Bedrock AgentCore Harnesses", and by
+  line 7 a newcomer was reading about conductors, DeepSeek-R1, QLoRA and SageMaker endpoints —
+  three unfamiliar words deep before learning whose pain any of it removes. Someone deciding
+  whether this repo is relevant to them got no answer above the fold.
+- **The evidence for the pain was already in the repo, filed under other headings.** Six
+  rounds of dependency and CUDA-OOM failures to get one QLoRA job to `Completed`
+  (`docs/CASE_STUDY.md`); an endpoint billing $36.36/day at 0 invocations and 0.0% GPU over
+  90 days with no owner tag (`PROJECT_STATE.md`); quality gates that scored this project's own
+  model 0/16 and were not talked past; ≈ $12–15 for the whole proven lifecycle. A new
+  `## The problem this solves` section in both languages states the pain, why an assistant
+  that only suggests commands does not close it, and what runs instead — every number cited to
+  the file that measured it, no new claims invented. Depth stays in the case study, linked.
+- **The section describes the reporting mechanism without naming an amount.** The configurable
+  reference that names overspend is a per-team setting, so quoting this platform's own figure
+  as though it were the design would misrepresent it.
+
+### "Six agents" outlived the six-agent fleet
+
+- **Both CASE_STUDY variants say "six agents"; `agents/*/harness.json` holds seven.** The
+  FinOps auditor was added after Phase 6, and nothing noticed for the entire life of the
+  seventh harness — the same drift-by-addition that already produced a stale Lambda count and
+  a stale ASL state count. A number that was once measured looks measured forever.
+- **Scoped rather than renumbered.** Changing it to seven would contradict the evidence file
+  the document cites (`VERIFICATION_phase5.md`: "All six harnesses currently run Opus 5") and
+  claim the auditor took part in a build it was absent from. Both variants now say six *and*
+  say it is the v1 fleet, naming today's count alongside.
+- **The count on the first screen had no guard at all** — which is precisely why "six" could
+  stand indefinitely. `test_the_agent_count_readers_see_first_matches_the_fleet` derives the
+  fleet size from `agents/*/harness.json`, requires each README's claim to match, and treats a
+  claim deleted or reworded away as a failure rather than a pass. A smaller historical count is
+  allowed only in a `##` section that marks it as past *and* names the current count, so the
+  scoping note cannot itself become the next stale number. **m106** (English prose drifts),
+  **m107** (the zh-TW twin drifts) and **m108** (the v1 scoping deleted, leaving a bare stale
+  count) each fail it. A guard hardcoding 7 would have missed the direction that matters — an
+  eighth harness landing while the prose stands still — verified by hand here, since this
+  runner mutates existing files and cannot create one.
+
 ### The readiness panel counted nine questions and said six
 
 - **`task_readiness`'s docstring described the panel as showing "which of the *six* data
