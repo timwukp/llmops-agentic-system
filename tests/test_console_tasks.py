@@ -3461,6 +3461,45 @@ def test_the_readiness_guard_is_derived_from_the_prompt(wired):
     assert keys <= paths, f"not measured against the full spec: {sorted(keys - paths)}"
 
 
+def test_the_readiness_docstring_states_the_real_number_of_questions(wired):
+    """The prose count must be the tuple's count. It was "six" against a nine-item tuple.
+
+    Both numbers describe DATA_READINESS_FIELDS, and only one of them was checked, so the
+    unchecked one drifted -- the commit that grew the list to nine to match the consult
+    prompt left the sentence at six. The panel was correct; the explanation of the panel
+    was not, and the explanation is what a reader believes.
+
+    Read out of the docstring by NUMBER WORD, not by substring anywhere in the module:
+    "nine" appears in `test_the_readiness_guard_is_derived_from_the_prompt`'s own prose,
+    so a module-wide search for the right word would pass on a comment. And the docstring
+    must contain exactly one count word -- an edit that adds a second sentence with a
+    different number is the same defect again, with both numbers present.
+    """
+    words = {1: "one", 2: "two", 3: "three", 4: "four", 5: "five", 6: "six",
+             7: "seven", 8: "eight", 9: "nine", 10: "ten", 11: "eleven", 12: "twelve"}
+    n = len(wired.console.DATA_READINESS_FIELDS)
+    assert n in words, f"{n} fields: extend the number-word map in this guard"
+    doc = wired.console.task_readiness.__doc__ or ""
+    assert doc, "task_readiness lost its docstring; this guard reads it"
+
+    # Only the sentence that counts the questions, so the retrospective paragraph naming
+    # the old numbers ("six", "seven") is not what gets asserted against.
+    claim = [ln for ln in doc.splitlines() if "data questions" in ln]
+    assert len(claim) == 1, (
+        f"expected exactly one 'data questions' sentence to check, found {len(claim)}")
+    sentence = claim[0].lower()
+
+    found = [w for k, w in words.items() if re.search(rf"\b{w}\b", sentence)]
+    assert found == [words[n]], (
+        f"the docstring's count sentence says {found or 'no number'} while "
+        f"DATA_READINESS_FIELDS holds {n} ({words[n]}): {claim[0].strip()!r}")
+
+    # A digit is as wrong as the wrong word, and would slip past the word search above.
+    digits = {int(d) for d in re.findall(r"\b(\d+)\b", sentence)}
+    assert digits <= {n}, (
+        f"the count sentence names {sorted(digits - {n})} but there are {n} fields")
+
+
 def test_an_unanswered_field_says_so_and_says_why(wired):
     """A blank row reads as "fine". Every unanswered field comes back answered=False
     WITH the reason it matters, because the customer is being asked to go find the

@@ -2536,7 +2536,15 @@ def task_readiness(task_id):
 
     Unanswered fields are returned EXPLICITLY as answered=False with the reason they
     matter, never as an empty string. A blank row reads as "fine"; the whole point of
-    this panel is showing which of the six data questions nobody has answered yet.
+    this panel is showing which of the nine data questions nobody has answered yet.
+
+    Nine, not six: this sentence read "six" while DATA_READINESS_FIELDS held nine, ever
+    since the commit that grew the list to match the consult prompt. The count in the
+    tuple was guarded and the count in the prose was not, so the prose is the copy that
+    drifted -- the same shape ARCHITECTURE.md already records for this panel's guard,
+    which once restated seven paths against a prompt specifying nine. The number in this
+    docstring is now derived from the tuple by
+    test_the_readiness_docstring_states_the_real_number_of_questions.
     """
     task = _task_get(task_id)
     if not task:
