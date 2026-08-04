@@ -27,7 +27,7 @@ https://github.com/user-attachments/assets/f189afb1-c326-49b6-b023-785da5ed3e6a
 
 ## 這是什麼
 
-七個 AI agent —— 指揮家（orchestrator）、數據準備、微調、評估、部署、監控五位階段專家，加上一位 FinOps 審計員 —— 無人干預地執行完整 LLMOps 生命週期：
+七個 AI agent —— 指揮家（orchestrator）、數據準備、微調、評估、部署、監控五位階段專家，加上一位 FinOps 審計員 —— 在例行路徑上端到端跑完完整 LLMOps 生命週期，不需要有人守著：
 **teacher 大模型（Bedrock 上的 DeepSeek-R1）**生成訓練數據，**student 小模型（Qwen3-1.7B）**
 以 SageMaker 訓練作業做 QLoRA 微調，通過質量門檻評估後部署到 SageMaker endpoint 並持續監控 ——
 只有 agent 呼叫 `escalate_human`、或某次 run 的估算費用跨過 **$20,000 通報基準**時，才需要人類介入。
@@ -80,27 +80,31 @@ Lambda + HTTP API + Cognito 獨立棧，從
   `deploy/02_network.py` 建立。VPC 模式的 harness 變體與其所需的 S3 技能鏡像**尚未實作**:
   VPC 模式的 harness 無法解析 `git` 技能來源,所以鏡像是前置條件,不是優化。
 
-## 為什麼這些 agent 能替代 LLMOps 工程師：三層疊加，而不是單一模型
+## 為什麼這些 agent 能自己承擔這些例行工作：三層疊加，而不是單一模型
 
 Phase 3 的真實事件（完整記錄見
 [`deploy/evidence/VERIFICATION_phase3.md`](deploy/evidence/VERIFICATION_phase3.md)）：
-finetune agent 被指派啟動 QLoRA 訓練作業，下載訓練腳本時遭遇 S3 403。**全程無人干預**，它：
+finetune agent 被指派啟動 QLoRA 訓練作業，下載訓練腳本時遭遇 S3 403。**全程沒有人插手**，它：
 探測了兩個 prefix 並歸納出自己的 IAM role 是 prefix 範圍限定（`runs/*` 可讀、`code/*` 不可讀），
 而不是無腦重試；按優先級搜索備選（本地 workspace → skill 目錄 → 歷史作業的 sourcedir）；
 發現 sandbox 沒有 `tar`，改用 Python `tarfile` 重建 `sourcedir.tar.gz`；上傳到自己**有**寫權限
-的 prefix；提交作業；確認 `InProgress`；然後調 `job_launched` 釋放。訓練首次嘗試即啟動，零人力。
+的 prefix；提交作業；確認 `InProgress`；然後調 `job_launched` 釋放。訓練首次嘗試即啟動，沒有驚動任何人。
 
 這種行為不屬於任何單一組件 —— 它是三層能力的乘積：
 
 | 層 | 提供什麼 | 缺了它會怎樣 |
 |---|---|---|
-| **模型能力**（harness 主迴圈用 Claude Fable 5） | *每一跳恢復的推理質量* —— 每次失敗都產出有設計的假設（兩點權限探測 →「role 是 prefix 限定」）、有先驗的搜索排序、零猶豫的工具替換。弱模型會重試同一個 403 或直接放棄 | 診斷繞圈或過早升級人類 |
+| **模型能力**（harness 主迴圈用 Claude Fable 5） | *每一跳恢復的推理質量* —— 每次失敗都產出有設計的假設（兩點權限探測 →「role 是 prefix 限定」）、有先驗的搜索排序、零猶豫的工具替換。弱模型會重試同一個 403 或直接放棄 | 診斷繞圈或過早升級求助 |
 | **Harness 運行時**（AgentCore microVM：shell、文件系統、code interpreter） | *行動能力* —— 探測 S3 權限、構建 tarball、調 SageMaker 都是真實環境裡的真實動作，不是聊天窗口裡的建議 | 診斷正確，但沒有手 |
-| **授權的工程設計**（任務 prompt + 掛載的 skills） | *有邊界的行動許可* —— 每個任務 prompt 都明確授予自我修復預算（「診斷、修正、重試 —— 最多 3 次；然後 `escalate_human`」），掛載的 skills 提供正確修復的領域形態（script-mode sourcedir 長什麼樣） | 保守對齊的模型在第一個 403 就停下來問人 |
+| **授權的工程設計**（任務 prompt + 掛載的 skills） | *有邊界的行動許可* —— 每個任務 prompt 都明確授予自我修復預算（「診斷、修正、重試 —— 最多 3 次；然後 `escalate_human`」），掛載的 skills 提供正確修復的領域形態（script-mode sourcedir 長什麼樣） | 保守對齊的模型在第一個 403 就停下來求助 |
 
-這個 repo 要證明的論點：**替代人類 LLMOps 工程師的不是某個模型，而是「強模型 × 真實執行環境 ×
-明確工程化的授權邊界」這個系統。** 拿掉任何一層，同一事件的結局就是 `escalate_human: S3 403`,
-而不是一個跑起來的訓練作業。
+這個 repo 要證明的論點：**能讓 agent 把這類工作獨立收尾的不是某個模型，而是「強模型 × 真實執行
+環境 × 明確工程化的授權邊界」這個系統。** 拿掉任何一層，同一事件的結局就是
+`escalate_human: S3 403`,而不是一個跑起來的訓練作業。
+
+也把話說清楚：我們想從工程師手上接走的是凌晨三點讀 log、第六次重送作業這些事，而不是工程師本人。
+真正重要的判斷 —— 要建什麼、哪個取捨可以接受、某個品質門檻的裁決該不該維持 —— 始終留給擁有這套
+系統的人。這也正是為什麼升級給人的通道是一等公民，而不是一條退路。
 
 同樣的三層還在無提示的情況下產出了：microVM 回收毀掉本地狀態後,agent 自行採用逐任務 S3
 checkpoint 並把它記入 manifest 作為標準實踐；發現 sandbox 禁用 `kill` 後改為冪等並行 worker；

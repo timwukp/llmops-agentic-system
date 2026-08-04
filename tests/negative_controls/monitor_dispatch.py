@@ -2576,6 +2576,63 @@ case("redaction: the past-tense count line says the repo became a size it is not
       "::test_the_scanners_own_coverage_claims_match_the_repo"])
 
 
+def m138(t):
+    """State a past fleet size the record does not have (zh-TW).
+
+    The era carve-out let a marked section say ANY number. Both existing checks passed on
+    "五個 agent ... v1 當時 ... 今天是七個": the section carries an era marker, and it states
+    today's count, so nothing looked at whether five was ever the fleet size. Measured on merged
+    main before the fix, not reasoned about -- 六 -> 五 was green there.
+
+    A doc may state a FORMER count. It may not state a former count that never existed, which is
+    why the accepted value is read from the evidence file the section cites rather than restated
+    in the guard.
+    """
+    old = "而是六個 agent\n在例行巡檢"
+    assert t.count(old) == 1, f"the zh-TW past-fleet phrase has moved; found {t.count(old)}"
+    return t.replace(old, "而是五個 agent\n在例行巡檢", 1)
+
+
+case("case study: the past fleet size is a number the cited evidence never records (zh-TW)",
+     "docs/CASE_STUDY.zh-TW.md", m138,
+     ["tests/test_docs_claims.py"
+      "::test_the_agent_count_readers_see_first_matches_the_fleet"])
+
+
+def m139(t):
+    """The same break in English. Separate case, not a second assertion in one: the two halves of
+    a bilingual claim are guarded by separate patterns, and a repo where only the English half is
+    driven to red has an unverified half."""
+    old = "six agents that hold the pager"
+    assert t.count(old) == 1, f"the EN past-fleet phrase has moved; found {t.count(old)}"
+    return t.replace(old, "five agents that hold the pager", 1)
+
+
+case("case study: the past fleet size is a number the cited evidence never records (EN)",
+     "docs/CASE_STUDY.md", m139,
+     ["tests/test_docs_claims.py"
+      "::test_the_agent_count_readers_see_first_matches_the_fleet"])
+
+
+def m140(t):
+    """Reword the evidence sentence the carve-out reads its accepted count FROM.
+
+    Deriving the past count from a record is only better than hardcoding it while the record still
+    states it. If that sentence is reworded, `re.search` returns None -- and a guard that treats
+    "no match" as "nothing to check" would silently accept any past count again, which is the
+    failure mode this whole file exists to catch. So the miss must be loud, and this proves it is.
+    """
+    old = "All six harnesses currently run"
+    assert t.count(old) == 1, f"the v1 fleet-size sentence has moved; found {t.count(old)}"
+    return t.replace(old, "Every harness currently runs", 1)
+
+
+case("evidence: the sentence the era carve-out derives the past fleet size from is reworded",
+     "deploy/evidence/VERIFICATION_phase5.md", m140,
+     ["tests/test_docs_claims.py"
+      "::test_the_agent_count_readers_see_first_matches_the_fleet"])
+
+
 #: Where the pristine text of the file currently mutated is parked, so a kill -9 -- which
 #: no handler can intercept -- still leaves the original recoverable. Under the repo root
 #: rather than /tmp because it must be obvious to whoever finds the tree dirty, and

@@ -8,11 +8,11 @@
 
 ## 目標
 
-在一個完整生命週期內替代人類 LLMOps 工程師：teacher 大模型（Bedrock 上的
+把一個完整生命週期端到端跑完，過程中不需要有人守著：teacher 大模型（Bedrock 上的
 DeepSeek-R1）生成訓練數據，student 小模型（Qwen3-1.7B）在 SageMaker 上做 QLoRA
 微調，對照質量門檻評估，部署到 endpoint，冒煙測試，再回收 —— **只有 agent 呼叫
-`escalate_human` 時才需要人類介入**。不是「一個會建議命令的助手」，而是六個
-真正值班背 pager 的 agent。
+`escalate_human` 時才需要人介入**。不是「一個會建議命令的助手」，而是六個 agent
+在例行巡檢時揣著 pager，讓擁有這套系統的工程師被叫醒是為了做決定，而不是為了做雜活。
 
 **本文全篇的「六」指的是 v1 當時的 fleet。** FinOps 審計員（`llmops_finops`）在 Phase 6
 之後才加入，今天是七個 —— 所以 README 寫七、這份記錄寫六，各自對自己那個時間點都是對的。
@@ -20,17 +20,18 @@ DeepSeek-R1）生成訓練數據，student 小模型（Qwen3-1.7B）在 SageMake
 harnesses currently run Opus 5」），並且會宣稱審計員參與了一個它其實不在場的建置。
 
 證明這一切的總帳單 —— 六個 agent、一個訓練完成的模型、一個部署又回收的
-endpoint、五輪端到端迭代 —— 約 **$12–15**，大約等於一位人類工程師一小時。
+endpoint、五輪端到端迭代 —— 約 **$12–15**，比這個帳戶單日花在一個沒人看著的閒置
+endpoint 上的錢還少（每天 $36.36，見 [COST.zh-TW.md](COST.zh-TW.md) §4）。
 
 ## 論點：三層疊加，而不是單一模型
 
 最清晰的單一事件來自 Phase 3。finetune agent 被指派啟動 QLoRA 訓練作業；下載訓練
-腳本時遭遇 S3 403。全程無人干預，它：探測兩個 prefix 並*歸納*出自己的 IAM role 是
+腳本時遭遇 S3 403。全程沒有人插手，它：探測兩個 prefix 並*歸納*出自己的 IAM role 是
 prefix 範圍限定（`runs/*` 可讀、`code/*` 不可讀），而不是無腦重試；按優先級搜索
 備選（本地 workspace → skill 目錄 → 歷史作業的 sourcedir）；發現 sandbox 沒有
 `tar`，改用 Python `tarfile` 重建 `sourcedir.tar.gz`；上傳到自己**有**寫權限的
 prefix；提交作業；確認 `InProgress`；然後呼叫 `job_launched` 釋放 session。
-訓練首次無人嘗試即啟動。
+訓練首次嘗試即啟動，沒有驚動任何人。
 
 這種行為不屬於任何單一組件。它是三層能力的乘積：
 
@@ -40,7 +41,7 @@ prefix；提交作業；確認 `InProgress`；然後呼叫 `job_launched` 釋放
    探測 S3、構建 tarball、調 SageMaker 成為真實動作，而不是聊天窗口裡的建議。
 3. **工程化的授權** —— 每個任務 prompt 都明確授予自我修復預算（「診斷、修正、
    重試 —— 最多 3 次；然後 `escalate_human`」），掛載的 skills 提供正確修復的
-   領域形態。沒有這個授權的保守對齊模型，在第一個 403 就會停下來問人。
+   領域形態。沒有這個授權的保守對齊模型，在第一個 403 就會停下來求助。
 
 拿掉任何一層，同一事件的結局就是 `escalate_human: S3 403`，而不是一個跑起來的
 訓練作業。
@@ -155,7 +156,7 @@ describe 失敗這幾種。它立刻證明了自己的價值：抓到一個 `${l
 **已證明：** 完整的自主閉環是真的。觸發 → 計劃 → 生成 → 整理 → 訓練
 （launch-and-release）→ 評估 → 部署 → 冒煙 → 回收，全程無人，誠實終態，經共享
 Memory 的跨運行學習，明確預算內的自我補救，以及在 —— 且僅在 —— 前提要求時的
-升級人類。每條鏈路皆經實測驗證，總計約 $12–15。
+升級求助。每條鏈路皆經實測驗證，總計約 $12–15。
 
 **誠實設計下未證明的：** 一個能*通過*門檻的蒸餾 student。6 條訓練軌跡教不會
 1.7B 模型在 ARC 級推理上收斂；Phase 4 證據說得明白，補救階梯的下一級是設計變更，
