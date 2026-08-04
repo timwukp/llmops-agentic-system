@@ -37,7 +37,7 @@ Three lessons are baked in, all learned by this harness reporting a false result
     into an ordinary exception so the existing ``finally`` fires, and a journal on disk that
     survives even ``SIGKILL``, which no handler is allowed to intercept.
 """
-import importlib.util, json, os, pathlib, shutil, signal, subprocess, sys
+import importlib.util, json, os, pathlib, re, shutil, signal, subprocess, sys
 
 REPO = pathlib.Path(__file__).resolve().parents[2]
 
@@ -1899,15 +1899,20 @@ case("redaction: binaries are skipped entirely, not just the entropy rule",
 
 
 def m115(t):
-    """Drop the real-account-id rule, keeping only the structural patterns.
+    """Drop the own-account rule, keeping only the structural patterns.
 
     The subtle half of m114. `AKIA…` and `arn:aws:…` are structural and would still fire, so
     a reviewer skimming for "do the high-signal rules run on binaries?" sees yes. But the
-    generic 12-digit rule is text-only, so REAL_ACCOUNT_IDS is the ONLY thing catching this
+    generic 12-digit rule is text-only, so the digest check is the ONLY thing catching this
     account's bare id in a binary -- delete it and the single most important string in the
     repo's threat model is unguarded in exactly the files nobody reads.
+
+    Retargeted when REAL_ACCOUNT_IDS became REAL_ACCOUNT_DIGESTS: the loop this deletes used to
+    iterate literal ids and now hashes candidates. A control whose anchor has moved does not
+    fail quietly -- the `count(old) == 1` assertion below turns it into a loud error -- which is
+    the reason the anchor is asserted rather than assumed.
     """
-    old = '    for pat_name, pat in ((("this repo\'s own account id"), re.compile(\n'
+    old = "    own_account = []\n"
     assert t.count(old) == 1, f"the account-id loop has moved; found {t.count(old)}"
     i = t.index(old)
     end = t.index("    # The generic heuristic is text-only", i)
@@ -2063,10 +2068,15 @@ def m120(t):
     The direction that actually happens: someone rewrites the top of the README months from
     now and the embed goes with it. Nothing breaks, no link 404s, the file just stops being
     reachable and keeps costing every clone.
+
+    Retargeted once: the anchor was the "Play the five-minute walkthrough" link, which the
+    inline-player rewrite renamed to "Download the as-recorded walkthrough" (the section now
+    plays the upload and offers the committed file as the download). The `count(old) == 1`
+    assertion is what made that loud instead of silently mutating nothing.
     """
-    old = "**[▶ Play the five-minute walkthrough](docs/media/intro-en.mp4)**"
-    assert t.count(old) == 1, f"the EN play link has moved; found {t.count(old)}"
-    return t.replace(old, "**Play the five-minute walkthrough**", 1)
+    old = "**[▶ Download the as-recorded walkthrough](docs/media/intro-en.mp4)**"
+    assert t.count(old) == 1, f"the EN download link has moved; found {t.count(old)}"
+    return t.replace(old, "**Download the as-recorded walkthrough**", 1)
 
 
 case("readme: the embedded walkthrough stops being reachable from the EN README",
@@ -2205,6 +2215,207 @@ def m125(t):
 case("redaction: the live API Gateway hostname rule is removed entirely",
      "tests/redaction_scan.py", m125,
      ["tests/test_redaction_scan.py::test_a_live_api_gateway_hostname_is_a_finding"])
+
+
+def m126(t):
+    """Narrow the binary-classification guard's diff base from the empty tree back to HEAD.
+
+    The direction that actually happened, and it was found in a CI log rather than by reading:
+    `git diff --cached --numstat` with no base lists only what differs from HEAD, so on a clean
+    checkout it returns nothing and the guard did `pytest.skip("nothing staged")`. CI *is* a
+    clean checkout -- the run for the previous commit printed `910 passed, 4 skipped`, one more
+    skip than the three ffprobe cross-checks, and this was the fourth. A guard named "for every
+    tracked file" was checking ZERO of them on the only machine that gates the merge.
+
+    The mutation restores the narrow base. It does not need to fabricate an empty index: run from
+    a dirty worktree the diff still lists something, which is why the guard now also asserts it
+    covered `len(git ls-files)` files rather than merely "at least one". That count assertion is
+    what this control trips.
+    """
+    old = 'subprocess.run(["git", "diff", "--cached", "--numstat", _EMPTY_TREE],'
+    assert t.count(old) == 1, f"the binary-classification diff has moved; found {t.count(old)}"
+    return t.replace(old, 'subprocess.run(["git", "diff", "--cached", "--numstat"],', 1)
+
+
+case("redaction: the binary-classification guard only sees the current change, not every file",
+     "tests/test_redaction_scan.py", m126,
+     ["tests/test_redaction_scan.py"
+      "::test_binary_classification_matches_git_for_every_tracked_file"])
+
+
+def m127(t):
+    """Put the account id back into the scanner as two adjacent halves.
+
+    THE defect this whole change exists to close, restored in the exact form it shipped in. The
+    theory behind it was "a value no scanner's regex matches is a value the repo does not
+    contain", and it was wrong in the only way that matters: the halves sit next to each other,
+    in source order, in a file GitHub renders. A reader recombines them by eye in about a second.
+    Every automated scanner missed it -- including this repo's own, which reported its own source
+    CLEAN -- so the splitting hid the id from the machines that look for it and from no human at
+    all. GitHub secret scanning never flagged it either, because an account id is not a
+    credential and has no detector.
+
+    The mutation cannot spell the id -- and interestingly, it cannot LOOK IT UP either. The first
+    version of this control tried to recover it from git history (`git grep -oE '[0-9]{12}'` over
+    the commits that touched `arn:aws:iam::`) and found nothing, which is the defect restating
+    itself: the id was never in history as twelve consecutive digits, only ever as two halves. So
+    the recovery has to do what a human reader does -- join adjacent literals FIRST, then look --
+    exactly the step the fixed guard added. It reuses the guard's own `_with_literals_joined` for
+    that, which means this control also fails if that helper is gutted.
+
+    The reconstructed split then has to be a REAL match. A guard that merely counted split
+    literals would flag half the scanner (ALLOWED is split on purpose and legitimately so -- those
+    three ids are published by AWS). The property under test is specifically "no split that
+    reconstructs a WATCHED id survives", which is why the guard joins and then asks the digest.
+    """
+    import sys as _sys
+    _sys.path.insert(0, str(REPO / "tests"))
+    import redaction_scan as _rs
+    _sys.path.insert(0, str(REPO))
+    from tests.test_redaction_scan import _with_literals_joined
+
+    # `-S` narrows to commits that changed the number of occurrences, so this is a handful of
+    # blobs rather than a history walk.
+    revs = subprocess.run(["git", "log", "--all", "-S", "arn:aws:iam::", "--format=%H"],
+                          capture_output=True, text=True, cwd=REPO).stdout.split()
+    found = None
+    for sha in revs:
+        blob = subprocess.run(["git", "grep", "-h", "-oE",
+                               r"([0-9\"'b +]|arn:aws)[0-9\"'b +]{10,60}", sha],
+                              capture_output=True, text=True, cwd=REPO).stdout
+        for cand in dict.fromkeys(re.findall(r"(?<![0-9])[0-9]{12}(?![0-9])",
+                                             _with_literals_joined(blob))):
+            if _rs._digest_matches(cand.encode()):
+                found = cand
+                break
+        if found:
+            break
+    assert found, (
+        "could not reconstruct a watched account id from git history, so this control would "
+        "mutate nothing and pass vacuously. If the id is genuinely gone from every historical "
+        "blob, delete this control and say so -- do not leave it green")
+
+    anchor = "REAL_ACCOUNT_DIGESTS = (\n"
+    assert t.count(anchor) == 1, f"the digest tuple has moved; found {t.count(anchor)}"
+    split = f'\n_split_id = b"{found[:6]}" + b"{found[6:]}"\n'
+    return t.replace(anchor, split + anchor, 1)
+
+
+case("redaction: this account's id goes back into the scanner as two adjacent halves",
+     "tests/redaction_scan.py", m127,
+     ["tests/test_redaction_scan.py"
+      "::test_the_real_account_id_is_never_recoverable_from_either_file"])
+
+
+def m128(t):
+    """Replace the iterated KDF with a bare sha256 of the same input.
+
+    The plausible "simplification", and the one nobody would question in review: the digests
+    still look like digests, every scan still produces identical findings, and the whole suite
+    stays green. What changes is only that the stored digest becomes a lookup. Twelve digits is
+    ~40 bits; measured on this laptop single-threaded CPython does 3.1M sha256/s, so the entire
+    1e12 space falls in about four days here and roughly 100 seconds on a GPU. At that point
+    publishing the digest publishes the id -- i.e. the fix would have moved the exposure rather
+    than closed it, while reading as strictly more careful than before.
+
+    Tripped by the round-count assertion, which exists precisely because this property is
+    invisible in a passing scan.
+    """
+    old = 'return hashlib.pbkdf2_hmac("sha256", candidate, _KDF_SALT, _KDF_ROUNDS).hex()'
+    assert t.count(old) == 1, f"account_digest has moved; found {t.count(old)}"
+    return t.replace(old, "return hashlib.sha256(_KDF_SALT + candidate).hexdigest()", 1)
+
+
+case("redaction: the account-id KDF is 'simplified' to a bare sha256 a GPU sweeps in 100 seconds",
+     "tests/redaction_scan.py", m128,
+     ["tests/test_redaction_scan.py"
+      "::test_the_watched_account_is_stored_as_an_iterated_digest"])
+
+
+def m129(t):
+    """Turn the bare player URL into a tidy markdown link.
+
+    The direction that will actually happen, and the one that looks like an improvement: a bare
+    URL on its own line reads like an accident, so someone wraps it as `[Watch the walkthrough]
+    (…)`. Measured through GitHub's own POST /markdown mode=gfm: the bare form renders
+    <details open> + <video controls>, and this repo does not get to assume the wrapped form
+    does too. If GitHub stops promoting it, the page silently loses its only player while every
+    link still resolves and every other guard stays green -- which is the state both READMEs
+    were in before this URL existed.
+    """
+    old = "\nhttps://github.com/user-attachments/assets/"
+    assert t.count(old) == 1, f"the EN player URL has moved; found {t.count(old)}"
+    i = t.index(old) + 1
+    end = t.index("\n", i)
+    return t[:i] + f"[Watch the five-minute walkthrough]({t[i:end]})" + t[end:]
+
+
+case("readme: the inline player URL is 'tidied' into a markdown link that renders no player",
+     "README.md", m129,
+     ["tests/test_intro_video.py::test_both_readmes_carry_the_inline_player_url"])
+
+
+def m130(t):
+    """Point the zh-TW README at a different upload from the EN one.
+
+    Two READMEs, two uploads, and nothing that compares them: a reader of one watches a
+    different film from a reader of the other, and both pages look correct in isolation. This is
+    the same class as every bilingual drift this repo has had to fix -- the pair is only equal
+    while something asserts it -- except that here neither copy can be diffed, because both
+    URLs resolve to opaque uploads behind a signed JWT.
+    """
+    old = "user-attachments/assets/f189afb1"
+    assert t.count(old) == 1, f"the zh-TW player URL has moved; found {t.count(old)}"
+    return t.replace(old, "user-attachments/assets/0badf00d", 1)
+
+
+case("readme: the zh-TW README points at a different upload from the EN one",
+     "README.zh-TW.md", m130,
+     ["tests/test_intro_video.py::test_both_readmes_carry_the_inline_player_url"])
+
+
+def m131(t):
+    """Restate the committed file's size as the re-encode's, next to the download link.
+
+    The plausible version of this defect, not a typo: the section names TWO files now -- the
+    8.9 MB upload that plays inline and the 10.7 MB original that is committed -- so copying the
+    wrong one of the two numbers onto the download link is a one-character edit that reads as
+    consistent. A reader then expects 8.9 MB and pulls 10.7.
+
+    This control is also why the guard checks the download link's own PARAGRAPH rather than the
+    section: the section-wide version of the assertion passed this exact mutation, because the
+    paragraph above still explains the as-recorded file is 10.7 MB. Presence anywhere in the
+    section is satisfied by the sentence ABOUT the discrepancy, which is not the sentence a
+    reader reads as they click.
+    """
+    old = "**[▶ Download the as-recorded walkthrough](docs/media/intro-en.mp4)** — 10.7 MB"
+    assert t.count(old) == 1, f"the EN download link's size claim has moved; found {t.count(old)}"
+    return t.replace(old, old.replace("10.7 MB", "8.9 MB"), 1)
+
+
+case("readme: the download link is labelled with the inline re-encode's size, not the file's",
+     "README.md", m131,
+     ["tests/test_intro_video.py"
+      "::test_the_readmes_state_the_committed_size_and_encoder_settings_correctly"])
+
+
+def m132(t):
+    """Change the recorder's CRF without touching the READMEs that quote it.
+
+    Mutates the SOURCE, not the prose -- the direction a hardcoded guard cannot catch. Someone
+    tunes the encoder for a smaller file; both READMEs go on saying CRF 26 and go on looking
+    measured. Same shape as the fleet-count control: derive the number from the file that owns
+    it, or the guard only ever catches the prose half.
+    """
+    old = '"-crf", "26"'
+    assert t.count(old) == 1, f"the recorder's crf setting has moved; found {t.count(old)}"
+    return t.replace(old, '"-crf", "30"', 1)
+
+
+case("readme: the recorder's CRF is retuned and both READMEs keep quoting the old one",
+     "deploy/console/intro/record_video.py", m132,
+     ["tests/test_intro_video.py"
+      "::test_the_readmes_state_the_committed_size_and_encoder_settings_correctly"])
 
 
 #: Where the pristine text of the file currently mutated is parked, so a kill -9 -- which

@@ -21,6 +21,7 @@ module on precisely these bytes. Teaching every future scanner a per-file exempt
 drift this module was written to end; writing no literal needs no coordination at all.
 """
 
+import hashlib
 import re
 import subprocess
 import sys
@@ -46,6 +47,12 @@ BLOCKING_RUN = bytes([0x33] * 10 + [0x31, 0x39])
 #: A synthetic account id, likewise assembled. Not this account's, not AWS's -- it exists only
 #: to be a 12-digit run inside an ARN.
 SYNTHETIC_ACCOUNT = b"9998" + b"88777666"
+
+#: git's well-known empty tree object -- the same sha in every git repository ever created, so
+#: hardcoding it is not a local assumption. Diffing the index against it lists the WHOLE index,
+#: which is how the binary-classification guard below covers every tracked file on a clean
+#: checkout instead of skipping.
+_EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 
 #: AWS's own published example access key id, split at the boundary between the structural
 #: `AKIA` prefix and its body so the 20-char literal never appears whole.
@@ -80,20 +87,45 @@ def _text(payload=b""):
 # The direction that would silently rot: real secrets must still be caught in a BINARY.
 # --------------------------------------------------------------------------------------
 
-#: One payload per high-signal rule, plus this repo's own account id bare. Every one of these
-#: must be found even though the containing file is binary — that is the whole claim that makes
-#: skipping the generic 12-digit rule on binaries defensible.
+#: A stand-in for this repo's own account id, and the whole point of the digest scheme: this
+#: file no longer needs the real digits to prove the real digits are caught.
+#:
+#: The previous version of this list carried this account's id as two adjacent halves, and an
+#: ARN built from them.
+#: Two adjacent halves in source order are not redaction -- a reader recombines them by eye --
+#: and it is what GitHub secret scanning alert #1 was pointing at. The scheme under test is
+#: "the scanner recognises whatever is in REAL_ACCOUNT_DIGESTS", so it is tested with a
+#: SYNTHETIC id whose digest is injected. What the real digest is stays in the scanner and
+#: appears in no test.
+STANDIN_ACCOUNT = b"4242" + b"42424242"
+
+
+@pytest.fixture
+def standin_is_the_watched_account(monkeypatch):
+    """Point the scanner at STANDIN_ACCOUNT instead of the real one, for this test only.
+
+    Injected rather than added permanently: a scanner that permanently watches a test fixture's
+    id would fire on the fixture and get exempted, and the exemption is the hole.
+    """
+    monkeypatch.setattr(rs, "REAL_ACCOUNT_DIGESTS",
+                        (rs.account_digest(STANDIN_ACCOUNT),))
+    monkeypatch.setattr(rs, "_digest_cache", {})
+
+
+#: One payload per high-signal rule, plus the stand-in account id bare and inside an ARN. Every
+#: one of these must be found even though the containing file is binary — that is the whole
+#: claim that makes skipping the generic 12-digit rule on binaries defensible.
 _REAL_LEAKS = [
     EXAMPLE_AKIA,
     EXAMPLE_ASIA,
     b"aws_secret_access_key" + b"=wJalrXUtnFEMI",
-    b"arn:aws:iam::" + b"677207" + b"132843" + b":role/LlmopsAdminLambdaRole",
-    b"677207" + b"132843",
+    b"arn:aws:iam::" + STANDIN_ACCOUNT + b":role/LlmopsAdminLambdaRole",
+    STANDIN_ACCOUNT,
 ]
 
 
 @pytest.mark.parametrize("payload", _REAL_LEAKS, ids=lambda p: p[:24].decode("latin-1"))
-def test_a_real_secret_is_caught_even_inside_a_binary(payload):
+def test_a_real_secret_is_caught_even_inside_a_binary(payload, standin_is_the_watched_account):
     """The load-bearing assertion. If this can pass with a stubbed-out binary path, the
     entropy fix has quietly become "binaries are not scanned"."""
     findings = rs.scan_blob("deploy/console/intro/audio/en/s1-problem.mp3", _bin(payload))
@@ -106,7 +138,7 @@ def test_a_real_secret_is_caught_even_inside_a_binary(payload):
 
 
 @pytest.mark.parametrize("payload", _REAL_LEAKS, ids=lambda p: p[:24].decode("latin-1"))
-def test_a_real_secret_is_caught_in_text_too(payload):
+def test_a_real_secret_is_caught_in_text_too(payload, standin_is_the_watched_account):
     """Same payloads through the text path, with a real line number."""
     findings = rs.scan_blob("deploy/console/frontend.html", _text(payload))
     assert findings, f"text carrying {payload!r} was reported clean"
@@ -174,12 +206,23 @@ def test_binary_classification_matches_git_for_every_tracked_file():
     A comment saying "same heuristic as git" is unfalsifiable; git's own numstat output is
     not. This is what lets the hook's message ("scanned as a binary") be cross-checked by an
     engineer with `git diff --numstat`.
+
+    Diffed against the EMPTY TREE, not against HEAD. `git diff --cached --numstat` alone lists
+    only what differs from HEAD, so on a clean checkout it returns nothing and this test used to
+    `pytest.skip("nothing staged")` -- which is exactly what CI is: a fresh clone with an
+    untouched index. Measured in the CI log for the commit that added this note: `910 passed,
+    4 skipped`, one skip more than the three ffprobe cross-checks, and this was it. A guard
+    whose name says "for every tracked file" was checking zero of them on the only machine that
+    gates the merge, and reported green for it. Against `4b825dc…` the diff is the whole index
+    -- 163 files, 37 of them binary -- so it can never be empty and there is nothing left to
+    skip on.
     """
-    out = subprocess.run(["git", "diff", "--cached", "--numstat"],
+    out = subprocess.run(["git", "diff", "--cached", "--numstat", _EMPTY_TREE],
                          capture_output=True, text=True, cwd=REPO).stdout
     rows = [ln.split("\t") for ln in out.splitlines() if ln.count("\t") >= 2]
-    if not rows:
-        pytest.skip("nothing staged to compare against")
+    assert rows, (
+        "git reported no indexed files at all against the empty tree — this guard verified "
+        "nothing, and its previous version would have skipped silently here")
     checked = 0
     for added, _removed, path in ((r[0], r[1], r[2]) for r in rows):
         blob = subprocess.run(["git", "show", f":{path}"], capture_output=True, cwd=REPO)
@@ -189,7 +232,17 @@ def test_binary_classification_matches_git_for_every_tracked_file():
         assert rs.is_binary(blob.stdout) == git_says_binary, (
             f"{path}: git says binary={git_says_binary}, is_binary() disagrees")
         checked += 1
-    assert checked, "no staged blobs could be read — this guard verified nothing"
+    # EVERY tracked file, which is what the name promises -- not "at least one". `assert checked`
+    # was the old floor, and it is satisfied by checking a single file out of 163: a diff against
+    # HEAD covers only what this branch happens to touch, so the coverage of this guard silently
+    # tracked the size of the working change. Comparing against `git ls-files` makes the promise
+    # in the name falsifiable, and is what fails if the diff base is ever narrowed again.
+    tracked = subprocess.run(["git", "ls-files"], capture_output=True, text=True,
+                             cwd=REPO).stdout.split()
+    assert checked == len(tracked), (
+        f"classified {checked} of {len(tracked)} tracked files — this guard's name says every "
+        "one of them. A narrower diff base (e.g. HEAD instead of the empty tree) checks only "
+        "the files the current branch touches, and reports green for the rest")
 
 
 @pytest.mark.parametrize("allowed", rs.ALLOWED, ids=lambda a: a.decode())
@@ -347,25 +400,97 @@ def test_the_scanner_does_not_report_itself():
         "SELF_REFERENTIAL must list exact files, never a directory or glob"
 
 
-def test_the_real_account_id_is_never_a_literal_in_this_repo():
-    """The scanner must know the account id without the repo containing it.
+#: Python's implicit/explicit literal concatenation, as source text: the closing quote of one
+#: string literal, a `+`, and the opening quote of the next (with an optional `b`/`r`/`f`
+#: prefix). Substituting it away turns a two-part `b"1234" + b"5678..."` back into the single
+#: literal a reader sees when they glance at the line.
+_LITERAL_GLUE = re.compile(r"""(["'])\s*\+\s*[bBrRfFuU]*(["'])""")
 
-    Both this file and the scanner assemble it from halves. If someone "simplifies" either to
-    a literal, the repo now contains the exact string it exists to keep out — and because both
-    files are in SELF_REFERENTIAL, no scanner would report it.
+
+def _with_literals_joined(src: str) -> str:
+    """Source text with adjacent string-literal concatenations collapsed.
+
+    This is the whole lesson of the account-id exposure in one function. The previous version
+    of the guard below searched for one hand-spelled needle, so the same digits written as two
+    adjacent halves passed it — and that split form is exactly what shipped, in a file GitHub
+    renders, where any reader recombines it by eye in a second. Splitting hid the id from every
+    machine and from no human at all.
+
+    Applied repeatedly because a value can be broken into more than two pieces; three parts
+    need two passes.
     """
-    # The needle is assembled here too. Spelling it out inside this very assertion is what
-    # the first version of this test did, and it failed on itself — correctly: the string
-    # would then be in the repo, in a file that no scanner inspects.
-    needle = "677207" + "132843"
+    for _ in range(16):
+        joined = _LITERAL_GLUE.sub("", src)
+        if joined == src:
+            return joined
+        src = joined
+    raise AssertionError("literal concatenation did not settle after 16 passes")
+
+
+def test_the_real_account_id_is_never_recoverable_from_either_file():
+    """The scanner must know the account id without either file containing it — in ANY form.
+
+    "Any form" is the part the earlier version got wrong. It asserted only that one spelled-out
+    needle was absent, which the halves satisfied while sitting adjacent in source order. So
+    the check is now done the way the scanner itself does it: take every 12-digit run in the
+    source, take every 12-digit run again after collapsing literal concatenation, and ask the
+    digest. No needle is spelled anywhere, and a split into any number of parts is caught.
+    """
+    # The joiner has to actually join, or the second pass below is identical to the first and
+    # this guard silently degrades to the one-needle version it replaced. Self-checked against a
+    # split this file is known to contain (STANDIN_ACCOUNT above) rather than a hand-written
+    # example, so the check cannot go stale against a form the file no longer uses.
+    assert STANDIN_ACCOUNT.decode() in _with_literals_joined(Path(__file__).read_text()), (
+        "_with_literals_joined did not collapse this file's own split literals, so the "
+        "'assembled from adjacent literals' pass below is checking the unmodified source twice")
+
     for path in ("tests/redaction_scan.py", "tests/test_redaction_scan.py"):
         src = (REPO / path).read_text()
-        assert needle not in src, (
-            f"{path} contains the real account id as a literal; keep it assembled from parts")
-    # And the assembled value is what we think it is: 12 digits, and the one the scanner uses.
-    assert rs.REAL_ACCOUNT_IDS == (b"677207" + b"132843",)
-    for acct in rs.REAL_ACCOUNT_IDS:
-        assert re.fullmatch(rb"[0-9]{12}", acct), acct
+        for label, text in (("as a literal", src),
+                            ("assembled from adjacent literals", _with_literals_joined(src))):
+            for run in re.findall(r"(?<![0-9])[0-9]{12}(?![0-9])", text):
+                assert not rs._digest_matches(run.encode()), (
+                    f"{path} contains this repo's own account id {label} — and both files are "
+                    "in SELF_REFERENTIAL, so no scanner would report it. Splitting the digits "
+                    "is not a fix: a reader recombines adjacent halves by eye. Remove them; "
+                    "the scanner only needs the digest.")
+
+
+def test_the_watched_account_is_stored_as_an_iterated_digest():
+    """The digest scheme's two load-bearing properties, since neither is visible in a passing scan.
+
+    A well-formed digest list, and a KDF that is actually iterated. Twelve digits is ~40 bits:
+    measured on this laptop, single-threaded CPython does 3.1M plain sha256/s, so the whole 1e12
+    space falls in ~4 days here and ~100 seconds on a GPU. Storing a BARE sha256 would therefore
+    publish the id to anyone who cares, while every test in this file still passed. The round
+    count is what makes the stored digest useless to a sweeper, so it is asserted, not assumed.
+    """
+    assert rs.REAL_ACCOUNT_DIGESTS, (
+        "REAL_ACCOUNT_DIGESTS is empty — the scanner now watches for no account at all, and "
+        "every binary in the repo is checked by four structural rules and nothing else")
+    for digest in rs.REAL_ACCOUNT_DIGESTS:
+        assert re.fullmatch(r"[0-9a-f]{64}", digest), (
+            f"{digest!r} is not a sha256 hex digest — an id or a truncated hash here matches "
+            "nothing, silently")
+    assert rs._KDF_ROUNDS >= 100_000, (
+        f"the KDF is down to {rs._KDF_ROUNDS} rounds; below ~100k a 12-digit space is sweepable "
+        "on one GPU in minutes, so the stored digests would leak the ids they stand in for")
+
+    # And the function actually RUNS those rounds. Asserting the constant alone is worthless:
+    # swapping the body for `sha256(salt + candidate)` leaves _KDF_ROUNDS = 200_000 sitting in
+    # the file, unused, while every scan produces identical findings and every other assertion
+    # here stays green. So the algorithm is pinned by recomputing it independently.
+    probe = b"1122" + b"33445566"
+    assert rs.account_digest(probe) == hashlib.pbkdf2_hmac(
+        "sha256", probe, rs._KDF_SALT, rs._KDF_ROUNDS).hex(), (
+        "account_digest is not PBKDF2-HMAC-SHA256 over _KDF_SALT for _KDF_ROUNDS rounds. A "
+        "single unsalted or un-iterated hash of a 12-digit number is a lookup, not a digest: "
+        "the whole 1e12 space is ~100 GPU-seconds, so the stored digest would publish the id")
+
+    # And the digest actually depends on its input. A stub that returned a constant would keep
+    # every assertion above green while making the scanner fire on every 12-digit run in the repo.
+    assert rs.account_digest(b"1357" + b"91357913") != rs.account_digest(SYNTHETIC_ACCOUNT), \
+        "account_digest returned the same digest for two different ids"
 
 
 #: The scanner's own patterns, applied to the two files that carry them as subject matter.
@@ -384,8 +509,8 @@ _LITERAL_SHAPES = (
 def test_no_credential_shaped_literal_survives_in_either_file(path):
     """Neither file may SPELL a credential-shaped string, even a public or synthetic one.
 
-    This generalises `test_the_real_account_id_is_never_a_literal_in_this_repo` from one value
-    to a shape, and it exists because of a concrete failure. This repo's scanner exempts both
+    This generalises `test_the_real_account_id_is_never_recoverable_from_either_file` from one
+    value to a shape, and it exists because of a concrete failure. This repo's scanner exempts both
     files via `SELF_REFERENTIAL` — necessarily, since their subject matter IS these patterns —
     but that exemption is local knowledge. A session-level pre-PR hook scanned the branch diff
     with its own pattern list and no such notion, and blocked the PR introducing this module on

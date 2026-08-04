@@ -27,21 +27,30 @@ discovered on a bill. The whole lifecycle, proven end to end, cost **≈ $12–1
 
 ## Watch it — five minutes, narrated
 
+https://github.com/user-attachments/assets/f189afb1-c326-49b6-b023-785da5ed3e6a
+
+**Press play above** — English narration, **5:04**. Seven scenes: the idle endpoint nobody was
+watching, the six failed training rounds, the architecture, what the build actually cost, and
+the quality gate that scored this project's own model 0/16 and was not talked past. Every
+figure spoken in it is a figure this README cites, and the audio is the committed narration
+rather than a re-recording.
+
+*That player is not a `<video>` tag, and it could not be.* GitHub's markdown sanitizer strips
+`<video>` to nothing — measured against GitHub's own rendering API for a repo-relative path, a
+`raw.githubusercontent.com` URL, a `<source>` child and a release asset, six forms in all,
+every one of them erased. The one form that does render a player is a bare
+`user-attachments/assets/…` URL, and that URL exists only for a file uploaded through GitHub's
+web UI. **So what plays inline is an upload, and it is not the same bytes as the file in this
+repo:** GitHub caps an attachment at 10 MB, the as-recorded mp4 is 10.7 MB, so the inline copy
+is a CRF-27 re-encode of it — 8.9 MB, byte-verified as the same 304.72 s, 1180×664, h264 + aac,
+same narration.
+
+The as-recorded file is the one committed here. Click the poster, or the line under it:
+
 [![Watch the five-minute walkthrough](docs/media/intro-poster.png)](docs/media/intro-en.mp4)
 
-**[▶ Play the five-minute walkthrough](docs/media/intro-en.mp4)** — English narration,
-**5:04**, 10.7 MB. Seven scenes: the idle endpoint nobody was watching, the six failed
-training rounds, the architecture, what the build actually cost, and the quality gate that
-scored this project's own model 0/16 and was not talked past.
-
-*It will not play inline on this page, and that is measured rather than assumed.* GitHub's
-markdown sanitizer strips a `<video>` tag to nothing — checked against GitHub's own rendering
-API for a repo-relative path, a `raw.githubusercontent.com` URL, a `<source>` child and a
-release asset, six forms in all, every one of them erased. GitHub builds a player only for
-files uploaded through its web UI, which a file committed to a repo can never be. So the
-poster above is a link: click it, or click the line under it, and the mp4 downloads for your
-own player. Every figure spoken in it is a figure this README cites — the audio is the
-committed narration, not a re-recording.
+**[▶ Download the as-recorded walkthrough](docs/media/intro-en.mp4)** — 10.7 MB, CRF 26,
+exactly what `deploy/console/intro/record_video.py` produced.
 
 This mp4 is English only. The same seven scenes are narrated in **five languages** (English,
 普通话, 粵語, 日本語, 한국어) by `deploy/console/intro/` — the animated page and all 35

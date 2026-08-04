@@ -1,5 +1,10 @@
 __pycache__/
 *.pyc
+# Both spellings on purpose. `.venv/` alone matches a DIRECTORY; in a throwaway worktree
+# .venv is often a SYMLINK to a shared one, which the trailing slash does not match -- so
+# `git add -A` staged it as a mode-120000 entry pointing at a path on one laptop. The
+# redaction gate passed it, correctly: a dangling symlink is not a credential.
+.venv
 .venv/
 .DS_Store
 deploy/evidence/*.local.*

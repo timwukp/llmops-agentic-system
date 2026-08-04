@@ -43,6 +43,84 @@ Two defects on merged `main`, both reported by a reader looking at the repo page
     5.5 MB mp4 in an unrelated repo draws the identical refusal.
   - The guard strips code spans before matching, because both READMEs now explain in prose that
     `<video>` does not work — the naive version failed on its own documentation.
+- **The walkthrough now does play inline, and the paragraph saying it never could is gone.**
+  The entry above stops one measurement short. "GitHub strips `<video>`" is true; "so nothing
+  plays inline on this page" does not follow, and both READMEs asserted it *as measured* — the
+  same shape as every falsified doc claim this repo has had to sweep, written by the commit that
+  was fixing one. There is exactly one form GitHub does promote: **a bare
+  `user-attachments/assets/<uuid>` URL alone in its paragraph**, which is not a tag at all —
+  the renderer recognises the link and builds the `<video controls>` itself. Verified through
+  `POST /markdown` `mode=gfm` on the final section text: **one `<video>` element**, wrapped in
+  `<details open>` with the upload's filename.
+  - **The inline copy is not the committed bytes, and both READMEs now say so.** That URL only
+    exists for a web-UI upload, and GitHub caps an attachment at 10 MB — the as-recorded file is
+    **10,666,327 B (10.17 MiB)**, over by ~175 KB. So the upload is a CRF-27 re-encode,
+    **8,864,103 B**, and the repo keeps the CRF-26 original. Not inferred from the rendered
+    filename: the asset was downloaded whole and hashed — `e537416b…` matches the re-encode byte
+    for byte and does **not** match the committed file — and it probes identical in every
+    respect that matters (304.72 s, 1180×664, h264 + aac). Two files, one page, stated rather
+    than glossed.
+  - **The size in the prose is derived and the CRF is read from the recorder.** Both are numbers
+    that outlive what they describe: "10.7 MB" was true when written, and a re-encode would
+    leave it still reading as measured.
+    `test_the_readmes_state_the_committed_size_and_encoder_settings_correctly` computes the size
+    from the file and greps `-crf` out of `record_video.py`. It also asserts the committed file
+    is still **over** 10 MB, because the READMEs' whole explanation of why there are two copies
+    rests on that cap.
+  - The size check reads the download link's own **paragraph**, not the section. The
+    section-wide version passed a control that relabelled the download link with the re-encode's
+    8.9 MB, because the paragraph above still mentions 10.7 MB — presence anywhere in a section
+    is satisfied by the sentence *about* the discrepancy, which is not the sentence a reader
+    reads as they click. Found by driving the control, not by review.
+  - Four controls, hand-driven to red first: the URL "tidied" into `[text](url)`, the two
+    READMEs pointing at different uploads, the download link relabelled with the wrong size, and
+    the recorder's CRF retuned while both READMEs keep quoting the old one. `m120`'s anchor also
+    had to be retargeted — the link it mutated was renamed from *Play* to *Download* — which its
+    `count(old) == 1` assertion reported instead of silently mutating nothing.
+- **A guard named "for every tracked file" was checking zero of them in CI.** Found in the CI
+  log of the commit above, not by reading:
+  `910 passed, 4 skipped` — one skip more than the three ffprobe cross-checks.
+  `test_binary_classification_matches_git_for_every_tracked_file` diffed the index against
+  **HEAD**, which on a clean checkout lists nothing, so it hit `pytest.skip("nothing staged")`.
+  CI *is* a clean checkout, so the one machine that gates the merge never ran it — and its floor
+  assertion (`assert checked`) was satisfied by a single file out of 163 anywhere else. It now
+  diffs against git's empty tree (**163 files, 37 binary**, never empty) and asserts it covered
+  `len(git ls-files)`, so the promise in its name is falsifiable.
+- **This account's id was in the repo the whole time, as two adjacent halves — and our own
+  scanner reported its own source clean.** Prompted by GitHub secret-scanning alert #1, which
+  turned out to be about something else entirely (see below). The scanner and its test carried
+  the twelve digits split across a `+`, on the theory that a value no regex matches is a value
+  the repo does not contain. That theory is wrong in the only direction that matters: **the
+  halves sat next to each other, in source order, in files GitHub renders.** A reader
+  recombines them by eye in about a second, and so does one line of Python. What the splitting
+  defeated was every automated scanner — this repo's included, which called
+  `tests/redaction_scan.py` CLEAN. It hid the id from the machines that look for it and from no
+  human at all, which is precisely backwards. GitHub raised no alert either: an account id is
+  not a credential and has no detector.
+  - **Fix: the scanner stores a salted, iterated digest and no digits.** Every 12-digit run in
+    a blob is hashed and compared against `REAL_ACCOUNT_DIGESTS`, so the id is recognised —
+    in binaries too — while no file contains it in any form. A *bare* sha256 would have moved
+    the exposure rather than closed it: twelve digits is ~40 bits, and measured here CPython
+    does **3.1M sha256/s**, putting the whole 1e12 space at ~4 days on this laptop and
+    **~100 seconds on a GPU**. At 200k PBKDF2 rounds the same sweep is ~500 GPU-years, while
+    scanning stays cheap because only digit runs are hashed: **52 runs, 9 distinct, 0.14 s for
+    all 163 tracked files.**
+  - **The guard was rewritten to look the way a human does.** The old one searched for one
+    hand-spelled needle, which the split satisfied. It now collapses adjacent string literals
+    *first* and then asks the digest, so a split into any number of pieces is caught, and it
+    self-checks that the collapsing actually happens. The negative control for it could not
+    find the id in git history by grepping for twelve digits — the defect restating itself —
+    and had to join literals too.
+  - **The round count is asserted, and the algorithm with it.** Pinning `_KDF_ROUNDS >= 100_000`
+    alone is worthless: swapping the body for `sha256(salt + candidate)` leaves the constant
+    sitting unused, produces identical findings, and keeps every other test green.
+- **Alert #1 itself was a false positive, and is closed as one.** It flagged AWS's own published
+  example access key — the `AKIA` + `IOSFODNN7EXAMPLE` body printed in the Signature V4 and CLI
+  docs, not a credential — on commit `973d5c5c`, which is diverged from `main` and from every
+  live branch (an ancestor of none of them). `main` already carries it split at the `AKIA`
+  boundary. The real finding was the one no scanner reported. (Spelled here in two parts for the
+  same reason the tests do: writing it whole makes this file trip the gate it is describing —
+  which is exactly what the first draft of this entry did, and the scanner caught it.)
 
 ### The redaction gate: one rule set, and binaries are actually scanned
 
