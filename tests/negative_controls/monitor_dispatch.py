@@ -37,7 +37,7 @@ Three lessons are baked in, all learned by this harness reporting a false result
     into an ordinary exception so the existing ``finally`` fires, and a journal on disk that
     survives even ``SIGKILL``, which no handler is allowed to intercept.
 """
-import json, os, pathlib, shutil, signal, subprocess, sys
+import importlib.util, json, os, pathlib, shutil, signal, subprocess, sys
 
 REPO = pathlib.Path(__file__).resolve().parents[2]
 
@@ -1768,6 +1768,262 @@ case("case study: the v1 scoping vanishes and a stale count is left bare",
      "docs/CASE_STUDY.md", m108,
      ["tests/test_docs_claims.py::"
       "test_the_agent_count_readers_see_first_matches_the_fleet"])
+
+
+#: The Introduction tab. Four cases, one per failure DIRECTION, because every one of them
+#: produces a page that loads -- which is why none of them would be found by looking.
+def m109(t):
+    """Make the audio route serve raw bytes instead of base64.
+
+    The single most consequential line in the feature and the one with no visible symptom:
+    API Gateway payload format 2.0 sends `body` as UTF-8 unless `isBase64Encoded` is set,
+    so every clip arrives corrupted under a 200 status. The page's own degradation then
+    hides it -- audio.onerror falls through to browser speech, so the narration still
+    plays, in a robot voice, in all five languages, with nothing logged anywhere.
+    """
+    old = ('return {"statusCode": 200, "headers": headers,\n'
+           '            "body": base64.b64encode(data).decode("ascii"), "isBase64Encoded": True}')
+    assert t.count(old) == 1, f"the audio envelope has moved; found {t.count(old)}"
+    return t.replace(old, 'return {"statusCode": 200, "headers": headers,\n'
+                          '            "body": data.decode("latin-1")}', 1)
+
+
+case("intro: the audio route drops isBase64Encoded and serves corrupted MP3s",
+     "deploy/console/lambda_function.py", m109,
+     ["tests/test_intro_bundle.py::test_every_clip_the_page_will_request_is_served"])
+
+
+def m110(t):
+    """Replace the allowlist membership test with a path-shaped check.
+
+    This is the traversal the route is built to be immune to, written the way it is
+    tempting to write it: validate the SHAPE of the segments, then join them. It looks
+    careful. `%2F` is already decoded by API Gateway by the time the handler sees the
+    path, so `en%2F..%2F..%2Flambda_function.py.mp3` arrives as real separators and the
+    scene segment carries a `..` that this check has no opinion about.
+    """
+    old = "    if (lang, scene) not in INTRO_CLIPS:"
+    assert t.count(old) == 1, f"the allowlist test has moved; found {t.count(old)}"
+    return t.replace(old, "    if not lang or not scene:", 1)
+
+
+case("intro: the audio route validates the path instead of allowlisting the clip",
+     "deploy/console/lambda_function.py", m110,
+     ["tests/test_intro_bundle.py::"
+      "test_the_audio_route_cannot_be_walked_out_of_its_directory"])
+
+
+def m111(t):
+    """Drop the `csp_upload=False` on the intro page route.
+
+    The direction that costs money rather than correctness: `_csp()` resolves the S3
+    upload origin through `data_bucket()`, which does NOT cache a failed resolve -- so the
+    default landing tab would hit Parameter Store on every request for an origin the page
+    never fetches, and would break when SSM is throttled.
+    """
+    old = 'return _resp(200, INTRO_HTML, "text/html; charset=utf-8", csp_upload=False)'
+    assert t.count(old) == 1, f"the intro page route has moved; found {t.count(old)}"
+    return t.replace(old, 'return _resp(200, INTRO_HTML, "text/html; charset=utf-8")', 1)
+
+
+case("intro: the default landing tab reaches for SSM on every request",
+     "deploy/console/lambda_function.py", m111,
+     ["tests/test_intro_bundle.py::test_the_intro_routes_touch_no_aws_service",
+      "tests/test_intro_bundle.py::"
+      "test_dropping_the_upload_origin_is_scoped_to_the_intro_routes"])
+
+
+def m112(t):
+    """Make `csp_upload=False` the default for every response.
+
+    The opposite direction, and the one a fix-in-the-wrong-place produces: satisfying the
+    intro's no-SSM requirement by changing the DEFAULT strips the S3 origin from
+    `connect-src` on all 30 other routes, so the dataset upload is blocked by our own
+    header. That failure reads as a broken S3 permission -- it cost hours the first time,
+    which is why the guard pins both directions rather than just the intro's.
+    """
+    old = 'def _resp(code, body, ctype="application/json", cookies=None, csp_upload=True):'
+    assert t.count(old) == 1, f"the _resp signature has moved; found {t.count(old)}"
+    return t.replace(old, 'def _resp(code, body, ctype="application/json", '
+                          'cookies=None, csp_upload=False):', 1)
+
+
+case("intro: the CSP opt-out leaks to every other route and blocks the upload",
+     "deploy/console/lambda_function.py", m112,
+     ["tests/test_intro_bundle.py::"
+      "test_dropping_the_upload_origin_is_scoped_to_the_intro_routes"])
+
+
+def m113(t):
+    """Delete deploy.sh's audio copy: the page ships, the narration does not.
+
+    The bundle is where this feature is most likely to break, because nothing about the
+    RUNNING system notices. The handler's cold-start walk finds no clips, `INTRO_CLIPS` is
+    empty -- a state the code treats as legitimate, by design, so the tab loads, the
+    scenes advance, and every language falls back to browser speech. The deploy log says
+    nothing. A viewer is the detector.
+    """
+    old = 'cp -R "$SCRIPT_DIR/intro/audio/." "$BUILD/intro_audio/"\n'
+    assert t.count(old) == 1, f"the audio copy line has moved; found {t.count(old)}"
+    return t.replace(old, "", 1)
+
+
+case("intro: deploy.sh stops bundling the narration and nothing errors",
+     "deploy/console/deploy.sh", m113,
+     ["tests/test_intro_bundle.py::test_deploy_sh_bundles_what_the_handler_reads"])
+
+
+def m114(t):
+    """Stop scanning binaries at all, instead of only dropping the entropy-prone rule.
+
+    This is the mutation that matters most, because it is the shape a well-meaning
+    "simplification" of the real fix takes. The commit hook was blocking on an MP3, the
+    diagnosis was "binaries are not text", and the one-line version of that conclusion is an
+    early `return []`. Every clip then scans clean, the hook goes green, the suite goes green
+    -- and this repo's own account id could ship inside a bundled asset with nothing looking.
+
+    The distinction the fix rests on: binaries skip ONLY the generic any-12-digits heuristic
+    (measured 0 signal, 1 false hit across 11.4 MB) and keep every high-signal rule plus the
+    literal account id.
+    """
+    old = "    findings = []\n    binary = is_binary(blob)\n"
+    assert t.count(old) == 1, f"scan_blob's preamble has moved; found {t.count(old)}"
+    return t.replace(old, "    findings = []\n    binary = is_binary(blob)\n"
+                          "    if binary:\n        return findings\n", 1)
+
+
+case("redaction: binaries are skipped entirely, not just the entropy rule",
+     "tests/redaction_scan.py", m114,
+     ["tests/test_redaction_scan.py::"
+      "test_a_real_secret_is_caught_even_inside_a_binary"])
+
+
+def m115(t):
+    """Drop the real-account-id rule, keeping only the structural patterns.
+
+    The subtle half of m114. `AKIA…` and `arn:aws:…` are structural and would still fire, so
+    a reviewer skimming for "do the high-signal rules run on binaries?" sees yes. But the
+    generic 12-digit rule is text-only, so REAL_ACCOUNT_IDS is the ONLY thing catching this
+    account's bare id in a binary -- delete it and the single most important string in the
+    repo's threat model is unguarded in exactly the files nobody reads.
+    """
+    old = '    for pat_name, pat in ((("this repo\'s own account id"), re.compile(\n'
+    assert t.count(old) == 1, f"the account-id loop has moved; found {t.count(old)}"
+    i = t.index(old)
+    end = t.index("    # The generic heuristic is text-only", i)
+    return t[:i] + t[end:]
+
+
+case("redaction: a bare real account id in a binary stops being a finding",
+     "tests/redaction_scan.py", m115,
+     ["tests/test_redaction_scan.py::"
+      "test_a_real_secret_is_caught_even_inside_a_binary"])
+
+
+def m116(t):
+    """Apply the entropy-prone generic rule to binaries too -- the pre-fix behaviour.
+
+    Restores the defect exactly: `if not binary` becomes unconditional, so 1 of 35 narration
+    clips blocks the commit again. Worth a control of its own because the failure is
+    intermittent by nature -- re-synthesise the audio and a different subset trips -- and an
+    intermittent gate is the kind people route around with --no-verify, at which point it
+    guards nothing.
+    """
+    old = "    if not binary:\n        for m in GENERIC_ACCOUNT_ID.finditer(blob):\n"
+    assert t.count(old) == 1, f"the text-only guard has moved; found {t.count(old)}"
+    return t.replace(old, "    if True:\n        for m in GENERIC_ACCOUNT_ID.finditer(blob):\n", 1)
+
+
+case("redaction: compressed-audio entropy blocks the commit again",
+     "tests/redaction_scan.py", m116,
+     ["tests/test_redaction_scan.py::"
+      "test_the_byte_run_that_blocked_the_commit_is_not_a_finding",
+      "tests/test_redaction_scan.py::test_every_committed_narration_clip_scans_clean"])
+
+
+def m117(t):
+    """Put CI back on an extension allowlist, leaving 44 tracked files unscanned.
+
+    The half of the defect that was never visible: an allowlist of `*.py *.json *.md *.yml
+    *.yaml *.sh *.svg` opened 113 of 157 tracked files and never looked at frontend.html,
+    page.template.html, test_intro_player.js or any extensionless file. Those are TEXT -- a
+    real account id in one of them passes CI green. The mutation reverts the workflow to a
+    self-contained grep so the two scanners can drift apart again.
+    """
+    old = "        run: python3 tests/redaction_scan.py --tracked\n"
+    assert t.count(old) == 1, f"the CI scan step has moved; found {t.count(old)}"
+    return t.replace(old, "        run: grep -rn AKIA --include='*.py' . || true\n", 1)
+
+
+case("redaction: CI drifts back to its own rule list and its own blind spot",
+     ".github/workflows/redaction-check.yml", m117,
+     ["tests/test_redaction_scan.py::test_both_callers_fail_on_the_scanner_being_absent",
+      "tests/test_redaction_scan.py::test_neither_caller_kept_its_own_copy_of_the_rules"])
+
+
+def m118(t):
+    """"Simplify" the allowlist back into bare 12-digit literals.
+
+    These three accounts are published by AWS, so the instinct is that spelling them out is
+    harmless -- and for THIS repo's scanner it is, since redaction_scan.py is in
+    SELF_REFERENTIAL. The cost lands somewhere else entirely: a session-level pre-PR hook
+    scans the branch diff with its own pattern list and no such exemption, and it blocked the
+    PR that introduced this module on exactly these bytes. Every further scanner that ever
+    reads this file would need the same per-file exemption taught to it, one at a time -- which
+    is the drift the module exists to end.
+
+    So "no credential-shaped literal in either file" has to be enforced, not left as a
+    convention the next editor has no way to see.
+
+    The mutation is derived from `rs.ALLOWED` rather than typed out, for two reasons. This file
+    obeys the same rule -- a quoted tuple here would make the control's own module a finding,
+    which the gate caught on the first draft, and a guard that cannot be committed guards
+    nothing. It also means the mutation cannot go stale: add a fourth allowlisted account and
+    this still respells all of them.
+    """
+    spec = importlib.util.spec_from_file_location(
+        "redaction_scan", REPO / "tests" / "redaction_scan.py")
+    rs = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(rs)
+    literal = ", ".join(f'b"{a.decode()}"' for a in rs.ALLOWED)
+    old = 'ALLOWED = (b"6833" + b"13688378", b"7631" + b"04351884", b"1234" + b"56789012")'
+    assert t.count(old) == 1, f"the ALLOWED tuple has moved; found {t.count(old)}"
+    return t.replace(old, f"ALLOWED = ({literal})", 1)
+
+
+case("redaction: the allowlist is respelled as bare 12-digit literals",
+     "tests/redaction_scan.py", m118,
+     ["tests/test_redaction_scan.py"
+      "::test_no_credential_shaped_literal_survives_in_either_file"])
+
+
+def m119(t):
+    """Quote the blocking byte run as a literal instead of rebuilding it from bytes([...]).
+
+    The other direction of the same property, in the test file rather than the scanner. This
+    one matters because the literal is genuinely tempting: quoting the twelve digits directly
+    reads far better than a `bytes([0x33] * 10 + ...)` constant, and the value is not a secret
+    at all -- it is a coincidental run of digits inside an MPEG frame.
+
+    It still must not be written down. `BLOCKING_RUN` is asserted to be the identical twelve
+    bytes, so nothing is lost by constructing it, and the file stops needing an exemption from
+    every scanner that reads it.
+
+    Note that THIS file obeys the same rule, which is why the replacement text below is built
+    rather than quoted. The mutation is byte-for-byte what it would be if spelled out; writing
+    it as a literal would have made this control's own module a finding, and the gate caught
+    exactly that on the first draft. A guard that cannot be committed guards nothing.
+    """
+    run = bytes([0x33] * 10 + [0x31, 0x39]).decode()
+    old = "BLOCKING_RUN = bytes([0x33] * 10 + [0x31, 0x39])"
+    assert t.count(old) == 1, f"BLOCKING_RUN has moved; found {t.count(old)}"
+    return t.replace(old, f'BLOCKING_RUN = b"{run}"', 1)
+
+
+case("redaction: the blocking byte run is quoted instead of reconstructed",
+     "tests/test_redaction_scan.py", m119,
+     ["tests/test_redaction_scan.py"
+      "::test_no_credential_shaped_literal_survives_in_either_file"])
 
 
 #: Where the pristine text of the file currently mutated is parked, so a kill -9 -- which

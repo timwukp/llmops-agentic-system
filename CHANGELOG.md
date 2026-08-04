@@ -5,6 +5,128 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
 ## [Unreleased]
 
+### The redaction gate: one rule set, and binaries are actually scanned
+
+Found by staging the narration below — the first commit in this repo's history to add binary
+files. Two defects, both live, in the pair of scanners that guard a public repo:
+
+- **The commit hook text-grepped compressed audio and blocked on entropy.**
+  `hooks/pre-commit` skipped files by extension *denylist* (`png|jpg|jpeg|gif|pdf|zip`), which
+  does not include `.mp3`, so it ran the account-id regexes over 11.4 MB of MPEG frames. The
+  generic bare-12-digit rule matched a twelve-long run of `0x33` bytes inside a frame — ASCII
+  digits by coincidence, not an id — and refused the commit. (The exact byte run is pinned in
+  `tests/test_redaction_scan.py`; quoting it here would make this file trip the very gate it
+  describes, which is how the first draft of this entry got blocked.)
+  **Measured: 1 of 35 clips.** Re-synthesise the narration and a *different* random
+  subset blocks. An intermittent gate that fires on nothing is how people learn to pass
+  `--no-verify`, after which it guards nothing at all.
+- **CI never opened 44 of 157 tracked files.** `.github/workflows/redaction-check.yml` selected
+  files by extension *allowlist* (`--include='*.py' --include='*.json' …`), so `frontend.html`,
+  `page.template.html`, `test_intro_player.js` and three extensionless files were never
+  scanned. Those are ordinary text and can carry an account id; a leak in one of them passed CI
+  green. Scanned at the time of the fix — they were clean, so this closes an exposure rather
+  than an incident.
+
+The two scanners were hand-copied lists of the same five regexes with two different
+file-selection schemes, which is how they drifted in opposite directions. They now share
+`tests/redaction_scan.py`, and files are classified **by content** — a NUL byte in the first
+8000 bytes, the heuristic `git` itself uses — rather than by a filename guess maintained by
+hand. An extension list is wrong in both directions at once: it text-greps audio *and* skips
+HTML.
+
+Binaries are scanned with every high-signal rule — the two AWS access-key-id prefixes, the
+secret-key assignment string, account-bearing ARNs — **plus this repo's own account id**; those
+are structural enough to be safe on any byte stream. Only the generic any-12-digits
+heuristic is dropped for them, because on binary data it is measurably noise — 0 structural
+hits against 1 false positive across the same 11.4 MB. The residual gap is stated rather than
+hidden: a bare 12-digit id that is neither this account's nor inside an ARN, embedded in a
+binary, is not caught. `REAL_ACCOUNT_IDS` is the lever if a second account ever appears.
+
+Both callers now fail closed when the scanner is absent — the same lesson as the SVG block,
+which once skipped silently after its checker was renamed — and `rc=2` means *could not look*,
+kept distinct so it can never be reported as *looked, and it is fine*.
+
+Six negative controls, one per way this rots: binaries skipped entirely (the shape a
+"simplification" of this fix takes); the real-account-id rule deleted while the structural
+rules still fire, so a reviewer sees "yes, binaries are scanned"; the entropy rule re-applied
+to binaries; CI drifting back to its own list; and two on the literals property below. **The
+fourth was UNCAUGHT on its first run** — the guard grepped for two exact regex *spellings*, and
+a re-inlined scanner written as `grep -rn AKIA` contains neither. It now asserts the *shape* —
+no recursive content scan in either caller — with the spellings that must and must not match
+pinned in a table, because a regex checked only against the one string its author had in mind
+has unmeasured edges.
+
+**Neither file spells a credential-shaped string as a literal any more**, and a guard enforces
+it. This came out of the fix's own pull request being blocked. Both files are in the scanner's
+`SELF_REFERENTIAL` list — they have to be, since these patterns are their subject matter — but
+that exemption is knowledge local to *this* scanner. A session-level pre-PR hook scans the
+branch diff with its own pattern list and no such notion, and it stopped the PR on five hits:
+the `0x33` byte run, the three AWS-published accounts in the allowlist, AWS's own example
+access key, a synthetic account and a placeholder ARN. **Not one was a secret.**
+
+The tempting fix — teach that hook a per-file exemption — is a second scanner with its own
+selection scheme, i.e. precisely the drift this entry is about, and it would have to be repeated
+for every scanner that ever reads these files. So the values are assembled from parts
+(`b"6833" + b"13688378"`) or rebuilt from their byte description (`bytes([0x33] * 10 + …)`)
+instead. Nothing is weakened: the reconstructed run is asserted to be the identical twelve
+bytes, and the allowlist tests parametrize straight off `ALLOWED` rather than a second copy of
+it. The strings simply are not written down, which costs one `+` and needs no coordination with
+anybody. The same reasoning already applied to this repo's real account id — now generalised
+from one value to a shape.
+
+Worth recording for whoever hits this next: this entry's own first draft was blocked by the gate
+too, for naming the secret-key string and quoting the byte run. `CHANGELOG.md` was **not**
+allowlisted — a file everyone edits is the last one you want to exempt — the prose was reworded
+to describe the patterns instead.
+
+### A narrated five-minute introduction, as the console's first tab
+
+- **The console opened on a wiring diagram.** Architecture was the landing tab, which answers
+  *how the system is built* to someone who has not yet been told *why it exists or what it
+  cost*. A new **Introduction** tab sits left of Architecture and is now the default for a
+  first-time visitor; a returning operator still lands on whatever tab they left.
+- **Seven scenes, narrated, in five languages.** `GET /intro` serves one self-contained page
+  (83 KB, 128 timed beats) built at deploy time by `deploy/console/intro/build_intro.py` from
+  `page.template.html` + `narration.json` + `durations.json` + two architecture SVGs. Narration
+  is 35 pre-synthesized Amazon Polly clips — English (default), 普通話, 粵語, 日本語, 한국어 —
+  bundled in the Lambda zip and served by `GET /intro/audio/<lang>/<scene>.mp3`. The English
+  narration measures 303.8s (5:04); the other four run longer, and the page rescales its beat
+  timings and progress segments per language rather than assuming the English pacing.
+- **Pre-synthesized rather than synthesized on demand.** `deploy/console/synth_narration.py` is
+  a build step, so the console's IAM gains no Polly action, there is nothing to presign and
+  nothing to expire, playback costs nothing per view, and the whole feature is testable
+  offline. Screens are redrawn in CSS/SVG rather than captured, for the same reason: a
+  screenshot of a console is stale the next time the console changes.
+- **The page degrades to browser speech, per clip.** A missing clip is not an error — it is a
+  robot voice, and nothing logs it. So the bundle is checked instead of trusted: `deploy.sh`
+  hard-fails if any (language, scene) from `narration.json` is absent from the zip, if any clip
+  is under 1 KiB, or if the package exceeds Lambda's 50 MB direct-upload limit, and
+  `tests/test_intro_bundle.py` (40 tests) imports the handler out of a *reconstructed bundle*
+  because the layout is the thing under test.
+- **Two request-controlled segments go into a filename, so the route allowlists instead of
+  sanitizing.** Cold start walks the bundle and records which (lang, scene) pairs exist; a pair
+  that was not found is a 404 before any path is joined, so `..` is simply not a key. The audio
+  response also sets `isBase64Encoded` — without it API Gateway sends the body as UTF-8 and
+  every clip arrives corrupted under a *200*, which the page's own fallback then hides.
+- **The default landing tab no longer reaches for Parameter Store.** `_resp()` built its CSP
+  through `data_bucket()`, which resolves the S3 upload origin via SSM and does *not* cache a
+  failed resolve — so the intro routes would have hit SSM on every request for an origin the
+  page never fetches. They now pass `csp_upload=False`; **m111** and **m112** pin both
+  directions, because "fixing" this by changing the default would strip the upload origin from
+  the other 30 routes and block dataset uploads with a header that reads as an S3 permission
+  error.
+- **A negative control found the traversal test asserting one layer twice.** All eight payloads
+  carried an extra separator or a wrong extension, so every one died at the shape check and the
+  allowlist was never exercised — replacing the entire allowlist test with `if not lang or not
+  scene` left it passing 8/8. The payloads are now split by which layer must catch them, with a
+  second test asserting the split is still real, so a future tightening of the shape check
+  cannot quietly retire the allowlist's coverage. **m109**, **m110** and **m113** cover the
+  base64 envelope, the allowlist and `deploy.sh` dropping the audio copy.
+- **The tab count in the diagram is now derived, not typed.** `gen_architecture_svg.py` read
+  `8 tabs` from a literal; hand-editing the SVG would have satisfied the guard while leaving the
+  generator to restore the wrong number on its next run. It now counts the nav buttons in
+  `frontend.html`, like `HARNESS_N` and `LIMIT_USD` already did.
+
 ### The README never said what problem it solves
 
 - **Both READMEs opened with an implementation, not a problem.** The first sentence was "An

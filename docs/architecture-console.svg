@@ -38,7 +38,7 @@
 
   <rect class="bg" x="0" y="0" width="1240" height="760" rx="16"/>
   <text class="title" x="30" y="40" font-size="18">LLMOps Admin console — one Lambda, read-mostly, server-enforced gates</text>
-  <text class="sub" x="30" y="60">deploy/console/ · 8 tabs · self-contained HTML from cold start · public GETs · Cognito on every POST except the 3 session routes that establish it</text>
+  <text class="sub" x="30" y="60">deploy/console/ · 9 tabs · self-contained HTML from cold start · public GETs · Cognito on every POST except the 3 session routes that establish it</text>
   <a href="https://github.com/timwukp/llmops-agentic-system/blob/main/deploy/console/frontend.html" target="_top">
     <g>
       <rect class="card cOps" x="30" y="96" width="180" height="56" rx="12"/>

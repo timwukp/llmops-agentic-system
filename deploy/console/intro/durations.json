@@ -1,0 +1,47 @@
+{
+  "en": {
+    "s1-problem": 42.48,
+    "s2-solution": 40.94,
+    "s3-architecture": 43.13,
+    "s4-build": 43.61,
+    "s5-design": 41.59,
+    "s6-results": 49.39,
+    "s7-console": 42.67
+  },
+  "zh": {
+    "s1-problem": 48.94,
+    "s2-solution": 49.85,
+    "s3-architecture": 47.74,
+    "s4-build": 53.18,
+    "s5-design": 50.06,
+    "s6-results": 59.3,
+    "s7-console": 53.23
+  },
+  "yue": {
+    "s1-problem": 51.72,
+    "s2-solution": 55.27,
+    "s3-architecture": 51.58,
+    "s4-build": 57.58,
+    "s5-design": 55.42,
+    "s6-results": 65.71,
+    "s7-console": 58.1
+  },
+  "ja": {
+    "s1-problem": 61.42,
+    "s2-solution": 62.59,
+    "s3-architecture": 58.61,
+    "s4-build": 64.18,
+    "s5-design": 63.14,
+    "s6-results": 68.42,
+    "s7-console": 68.74
+  },
+  "ko": {
+    "s1-problem": 54.36,
+    "s2-solution": 53.64,
+    "s3-architecture": 52.73,
+    "s4-build": 59.74,
+    "s5-design": 56.35,
+    "s6-results": 63.0,
+    "s7-console": 58.73
+  }
+}

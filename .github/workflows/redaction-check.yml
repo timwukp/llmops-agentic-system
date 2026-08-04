@@ -9,17 +9,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # The rules live in tests/redaction_scan.py, shared with hooks/pre-commit. This job used
+      # to carry a hand-copied duplicate of that hook's regex list with a DIFFERENT file
+      # selection scheme, and the two had drifted:
+      #
+      #   * here, an extension ALLOWLIST (--include='*.py' --include='*.json' …) meant 113 of
+      #     157 tracked files were opened. frontend.html, page.template.html,
+      #     test_intro_player.js and every extensionless file were never scanned — ordinary
+      #     text that can carry an account id, passing green because nobody looked.
+      #   * in the hook, an extension DENYLIST that omitted .mp3 meant it text-grepped 11.4 MB
+      #     of compressed audio and blocked a commit on a chance run of digits.
+      #
+      # One module now, so a rule added for one scanner cannot be absent from the other.
+      # --tracked scans every tracked file and classifies binary the way git does, so a new
+      # file type never needs an edit here. The scanner exits 2 for "could not run", which
+      # fails the step rather than reporting a scan that never happened as clean.
       - name: Scan for account IDs, credentials, account-bearing ARNs
-        run: |
-          set -e
-          ALLOW='683313688378|763104351884|123456789012'
-          hits=$(grep -rnE 'AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}|aws_secret_access_key|arn:aws[a-z-]*:[a-z0-9-]+:[a-z0-9-]*:[0-9]{12}|(^|[^0-9.])[0-9]{12}([^0-9.]|$)' \
-            --include='*.py' --include='*.json' --include='*.md' --include='*.yml' --include='*.yaml' --include='*.sh' --include='*.svg' . \
-            | grep -vE '^\./(\.github/workflows/redaction-check\.yml|hooks/pre-commit):' \
-            | grep -vE "$ALLOW" | grep -vE '<ACCOUNT_ID>|[0-9]{13,}' || true)
-          if [ -n "$hits" ]; then
-            echo "::error::Possible account ID / credential / account-bearing ARN found:"
-            echo "$hits" | head -20
-            exit 1
-          fi
-          echo "Redaction scan clean."
+        run: python3 tests/redaction_scan.py --tracked

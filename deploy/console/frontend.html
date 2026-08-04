@@ -186,6 +186,7 @@
 </header>
 
 <nav class="tabs">
+  <button data-tab="intro" onclick="showTab('intro')">Introduction</button>
   <button data-tab="architecture" onclick="showTab('architecture')">Architecture</button>
   <button data-tab="tasks" onclick="showTab('tasks')">Tasks</button>
   <button data-tab="pipeline" class="active" onclick="showTab('pipeline')">Pipeline</button>
@@ -241,6 +242,33 @@
     </div>
     <div id="taskChatMsg" class="sub" style="margin-top:6px"></div>
     <div id="taskActions" class="flex" style="margin-top:10px;flex-wrap:wrap"></div>
+  </div>
+
+  <!-- Introduction: a narrated five-minute walkthrough, before any of the operator
+       surfaces. It is a separate document served at /intro rather than markup in this
+       file: it carries ~700 lines of its own CSS animation and a media player, and
+       inlining that here would put a 5-minute demo's stylesheet in front of every
+       operator who opens the Cost tab. The iframe is same-origin, so `frame-src 'self'`
+       and `x-frame-options: SAMEORIGIN` both permit it.
+
+       The src is set LAZILY in showTab(), not here: the page is ~85 KB with two inlined
+       SVGs, and an operator who never opens this tab should never pay for it. -->
+  <div data-tab-panel="intro" class="card col-12"><h2>Introduction &middot; a five-minute walkthrough</h2>
+    <div class="sub" style="max-width:920px;margin-bottom:10px">What the problem is, what was built, and what it
+      actually cost &mdash; narrated, with a language picker (English, 普通話, 粵語, 日本語, 한국어). Every number
+      spoken is one this repository recorded, not an estimate. Press play; use the segment bar to jump.</div>
+    <!-- aspect-ratio, not a fixed height: the page inside scales its 1180x664 stage to
+         whatever width it gets, so a hard height would letterbox or clip it. -->
+    <div style="aspect-ratio:16/10;width:100%;border:1px solid var(--line);border-radius:10px;overflow:hidden;background:#0b0f17">
+      <!-- allow="autoplay" so the player's own gesture-gated play() is not blocked a
+           second time by the iframe's permission policy. The page still asks for a
+           click first: a blocked autoplay looks exactly like a broken page. -->
+      <iframe id="introFrame" title="LLMOps agentic system — five-minute introduction"
+              allow="autoplay" style="width:100%;height:100%;border:0;display:block"></iframe>
+    </div>
+    <div class="sub" style="margin-top:8px">Prefer to read? The same ground is covered in
+      <a href="https://github.com/timwukp/llmops-agentic-system/blob/main/docs/CASE_STUDY.md" target="_blank" rel="noopener">docs/CASE_STUDY.md</a>,
+      which is where each number in the narration is sourced from.</div>
   </div>
 
   <!-- Architecture: what this system is and how it is wired -->
@@ -2017,6 +2045,20 @@ function showTab(t){
   document.querySelectorAll("nav.tabs button").forEach(b=>b.classList.toggle("active", b.dataset.tab===t));
   localStorage.setItem("adminTab", t);
   pipePoll(t==="pipeline");
+  // The intro page is loaded lazily and only once: it is ~85 KB with two inlined SVGs,
+  // and an operator who never opens the tab should never fetch it. Setting .src on every
+  // visit would also restart the narration from scene 1, discarding where they were.
+  if (t==="intro") {
+    const f = document.getElementById("introFrame");
+    if (f && !f.src) f.src = API + "/intro";
+  } else {
+    // Leaving the tab only hides the panel; a hidden iframe keeps playing audio. Ask the
+    // page to pause so the narration does not talk over the tab the operator moved to.
+    const f = document.getElementById("introFrame");
+    if (f && f.src && f.contentWindow) {
+      try { f.contentWindow.postMessage({intro:"pause"}, location.origin); } catch(e) {}
+    }
+  }
   if (t==="architecture") loadArch();
   tasksPoll(t==="tasks");
   if (t==="tasks") loadTasks();
@@ -2027,13 +2069,16 @@ function showTab(t){
   if (t==="cost") loadCost();
 }
 
-// tab on load: ?tab= URL param > localStorage > architecture for first-time
-// visitors (the tab exists to explain the system), remembered tab afterwards
-const KNOWN_TABS = ["architecture","tasks","pipeline","fleet","obs","evals","opts","cost"];
+// tab on load: ?tab= URL param > localStorage > intro for first-time visitors. The
+// default moved from architecture to intro because the two answer different questions:
+// the diagrams show a reader HOW the system is wired, the narration tells them WHY it
+// exists and what it cost. Someone arriving for the first time needs the second one
+// first. A returning operator still lands on whatever tab they left.
+const KNOWN_TABS = ["intro","architecture","tasks","pipeline","fleet","obs","evals","opts","cost"];
 const _urlTab = new URLSearchParams(location.search).get("tab");
 const _memTab = localStorage.getItem("adminTab");
 showTab(KNOWN_TABS.includes(_urlTab) ? _urlTab
-      : KNOWN_TABS.includes(_memTab) ? _memTab : "architecture");
+      : KNOWN_TABS.includes(_memTab) ? _memTab : "intro");
 setAuthUi();
 // Restore the signed-in session from the httpOnly refresh cookie. Fire-and-forget, and
 // deliberately NOT awaited: every GET route is public, so the page must render its data

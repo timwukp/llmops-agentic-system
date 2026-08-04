@@ -169,7 +169,49 @@ cp "$(dirname "$0")/../../orchestration/conductor_tools.py" "$BUILD/conductor_to
 "$PY_FOR_BUILD" -c "import sys; sys.path.insert(0,'$BUILD'); import conductor_tools; \
   assert hasattr(conductor_tools,'service_launch_run'), 'conductor_tools missing service_launch_run'; \
   print('bundled conductor_tools OK')"
+
+# ── the Introduction tab: build the page, bundle the narration audio ──────────
+# The page is GENERATED here rather than committed. Its inputs are committed
+# (page.template.html + narration.json + durations.json + the architecture SVGs); a
+# generated 85 KB artifact in git is a file that can disagree with its own inputs while
+# looking authoritative, which is the exact class of drift this repo keeps writing guards
+# against. build_intro.py hard-fails on a beat that can never fire, a scene the narration
+# does not know about, and a placeholder that was not substituted — so a broken page
+# fails the DEPLOY instead of shipping and being noticed by a viewer.
+"$PY_FOR_BUILD" "$SCRIPT_DIR/intro/build_intro.py" --out "$BUILD/intro.html"
+# The 35 MP3s ARE committed: regenerating them costs a Polly run, and the page is their
+# only consumer. Copied to `intro_audio/` and not `intro/audio/` because `intro/` would
+# also drag the template and the builder into the Lambda; the handler's allowlist walk is
+# keyed on this exact directory name.
+mkdir -p "$BUILD/intro_audio"
+cp -R "$SCRIPT_DIR/intro/audio/." "$BUILD/intro_audio/"
+rm -f "$BUILD/intro_audio/_synth_stamps.json"   # a build record, not a runtime asset
+# Prove the audio actually landed and that the page and the bundle agree on the clip set.
+# Without this the zip can ship a page that falls back to robot speech for every scene —
+# which is the DESIGNED degradation, so nothing errors and nobody finds out until they
+# play it. Derived from narration.json, never a hard-coded 35.
+"$PY_FOR_BUILD" - "$SCRIPT_DIR" "$BUILD" <<'PYCHECK'
+import json, pathlib, sys
+here, build = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
+spec = json.loads((here / "intro" / "narration.json").read_text())
+want = {f"{l}/{s}" for l in spec["langs"] for s in spec["scenes"]}
+have = {f"{p.parent.name}/{p.stem}" for p in (build / "intro_audio").rglob("*.mp3")}
+if want - have:
+    sys.exit(f"FATAL: {len(want - have)} narration clip(s) missing from the bundle: "
+             + ", ".join(sorted(want - have)))
+small = sorted(str(p.relative_to(build)) for p in (build / "intro_audio").rglob("*.mp3")
+               if p.stat().st_size < 1024)
+if small:
+    sys.exit("FATAL: narration clip(s) under 1 KiB — truncated, not audio: " + ", ".join(small))
+print(f"bundled intro: {len(have)} narration clips in {len(spec['langs'])} languages OK")
+PYCHECK
 (cd "$BUILD" && zip -rq /tmp/llmops-admin-dashboard.zip .)
+# Lambda refuses a direct zip upload over 50 MB, and the failure arrives from
+# update-function-code as a validation error at the END of a multi-minute build. Say it
+# here, with the number, while the operator is still watching the build.
+ZIP_MB=$(( $(wc -c < /tmp/llmops-admin-dashboard.zip) / 1000000 ))
+echo "deployment package: ${ZIP_MB} MB (Lambda direct-upload limit is 50 MB)"
+[ "$ZIP_MB" -lt 50 ] || { echo "FATAL: package is ${ZIP_MB} MB — over Lambda's 50 MB direct-upload limit. Move the narration audio to S3 or drop a language."; exit 1; }
 
 # BUDGET_MODE=advisory: an over-budget run is REPORTED (named and numbered on the Cost
 # tab) and launches anyway. Set blocking to restore the approval gate. Stated explicitly

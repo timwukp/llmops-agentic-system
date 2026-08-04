@@ -22,6 +22,7 @@ Env: CONSOLE_TABLE, RUNS_TABLE, EVENTS_TABLE, DATA_BUCKET (optional — falls ba
      START_FN (default llmops-start-pipeline), COGNITO_POOL_ID, COGNITO_CLIENT_ID,
      JUDGE_MODEL, SPANS_SINCE, OPTIMIZE_HARNESS (default llmops_orchestrator).
 """
+import base64
 import hashlib
 import json
 import os
@@ -144,6 +145,38 @@ for _name in ("architecture-high-level.svg", "architecture-low-level.svg",
             ARCH_SVGS[f"/docs/{_name}"] = _f.read()
     except Exception as _e:  # missing from the bundle — 404 with the reason, not a blank panel
         ARCH_SVGS[f"/docs/{_name}"] = None
+
+# ── the Introduction tab's page and its narration audio ──────────────────────
+# The page is small, so it is read once like frontend.html. The 35 MP3s total ~11 MB, so
+# they are NOT held in memory: cold start only enumerates which (lang, scene) pairs the
+# bundle actually contains, and each clip is read from the local filesystem on request.
+#
+# That enumeration is also the security boundary. `/intro/audio/<lang>/<scene>.mp3` puts
+# two request-controlled segments into a filename, which is a directory traversal waiting
+# to happen — and one that a regex over the path is easy to get subtly wrong. An
+# allowlist built from what is on disk cannot be traversed: a pair the walk below did not
+# find is a 404 before any path is joined.
+try:
+    with open(os.path.join(_HERE, "intro.html"), encoding="utf-8") as _f:
+        INTRO_HTML = _f.read()
+except Exception as _e:
+    INTRO_HTML = None
+    INTRO_ERR = str(_e)
+
+INTRO_AUDIO_DIR = os.path.join(_HERE, "intro_audio")
+#: {(lang, scene)} present in the deployed zip. Empty is a legitimate state, not a
+#: failure: the page falls back to browser speech synthesis per missing clip, so a bundle
+#: built without the audio speaks in a robot voice rather than showing a silent page.
+INTRO_CLIPS = set()
+try:
+    for _lang in sorted(os.listdir(INTRO_AUDIO_DIR)):
+        if not os.path.isdir(os.path.join(INTRO_AUDIO_DIR, _lang)):
+            continue
+        for _mp3 in sorted(os.listdir(os.path.join(INTRO_AUDIO_DIR, _lang))):
+            if _mp3.endswith(".mp3"):
+                INTRO_CLIPS.add((_lang, _mp3[:-4]))
+except Exception:
+    pass
 
 _BUCKET_CACHE = None
 
@@ -3145,7 +3178,7 @@ def _upload_origin():
         return ""
 
 
-def _csp():
+def _csp(upload=True):
     """Built per response, not once at import.
 
     The upload origin needs data_bucket(), which may resolve through SSM. Freezing this
@@ -3154,8 +3187,17 @@ def _csp():
     browser upload blocked by a header, which reads as an S3 permission problem and
     would cost hours. data_bucket() caches on success, so this stays a dict lookup after
     the first resolve.
+
+    `upload=False` omits that origin -- and with it the SSM lookup. It exists for the
+    Introduction routes: that page is the default landing tab and issues no fetch of any
+    kind (its audio is same-origin, covered by default-src), so naming an S3 upload
+    target in its CSP authorises a request it will never make. Worse, data_bucket()
+    swallows a failed resolve and does NOT cache it, so every intro response would retry
+    Parameter Store -- making the first thing a first-time visitor sees depend on the
+    health of a service it has no reason to touch. Omitting an origin is also strictly
+    the tighter header, so this is not a security trade.
     """
-    origin = _upload_origin()
+    origin = _upload_origin() if upload else ""
     connect = f"connect-src 'self' {origin}".rstrip() if origin else "connect-src 'self'"
     return ("default-src 'self'; script-src 'self' 'unsafe-inline'; "
             "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
@@ -3170,10 +3212,12 @@ _SEC_HEADERS = {
 }
 
 
-def _resp(code, body, ctype="application/json", cookies=None):
+def _resp(code, body, ctype="application/json", cookies=None, csp_upload=True):
+    # csp_upload=False: see _csp(). Only the Introduction routes pass it -- every other
+    # response is for a page that does fetch S3, and defaults must serve the many.
     headers = {"content-type": ctype}
     headers.update(_SEC_HEADERS)
-    headers["content-security-policy"] = _csp()
+    headers["content-security-policy"] = _csp(csp_upload)
     if ctype.startswith("application/json"):
         headers["cache-control"] = "no-store"
     if ALLOWED_ORIGIN:
@@ -3362,6 +3406,51 @@ def _authed(headers):
     return _authed_user(headers) is not None
 
 
+def intro_audio(path):
+    """Serve one bundled narration clip: GET /intro/audio/<lang>/<scene>.mp3.
+
+    Two things here are deliberate.
+
+    **The clip is looked up in INTRO_CLIPS before any filesystem path is built.** Both
+    path segments come from the request, so joining them onto a directory first and
+    validating afterwards is the traversal bug; a membership test against what cold start
+    found on disk has no traversal to defend against. `..` is simply not a key.
+
+    **The body is base64 with `isBase64Encoded`.** API Gateway payload format 2.0 sends
+    the `body` string as UTF-8 unless this flag is set, and MP3 bytes are not valid
+    UTF-8 — without the flag the audio arrives corrupted with a 200 status, which the
+    browser reports only as a decode error. `_resp` cannot express this, which is why
+    this route builds its own envelope rather than reusing it; the security headers are
+    still applied, so the response is not a hole in them.
+    """
+    parts = path.split("/")            # ['', 'intro', 'audio', lang, '<scene>.mp3']
+    if len(parts) != 5 or not parts[4].endswith(".mp3"):
+        return _resp(404, {"error": "expected /intro/audio/<lang>/<scene>.mp3"},
+                     csp_upload=False)
+    lang, scene = parts[3], parts[4][:-4]
+    if (lang, scene) not in INTRO_CLIPS:
+        # A 404 here is not an error state for the page: it falls back to browser speech
+        # for this clip. Say what IS bundled so a missing language is diagnosable from
+        # one request instead of a deploy-log hunt.
+        return _resp(404, {
+            "error": f"no narration clip for {lang}/{scene} in this bundle",
+            "languages": sorted({l for l, _ in INTRO_CLIPS}),
+            "clips": len(INTRO_CLIPS),
+        }, csp_upload=False)
+    with open(os.path.join(INTRO_AUDIO_DIR, lang, f"{scene}.mp3"), "rb") as f:
+        data = f.read()
+    headers = {"content-type": "audio/mpeg"}
+    headers.update(_SEC_HEADERS)
+    headers["content-security-policy"] = _csp(upload=False)
+    # The clips are immutable for the life of a deployment — the filename does not change
+    # when the text does, so the cache is keyed on the deployment, not the content. A day
+    # is short enough that a redeploy is picked up by the next visitor rather than being
+    # served stale for a week, and long enough that replaying a scene is free.
+    headers["cache-control"] = "public, max-age=86400"
+    return {"statusCode": 200, "headers": headers,
+            "body": base64.b64encode(data).decode("ascii"), "isBase64Encoded": True}
+
+
 def handler(event, context):
     # Async self-invocation path (task-chat worker)
     if isinstance(event, dict) and event.get("mode") == "task-chat":
@@ -3402,6 +3491,21 @@ def handler(event, context):
         if svg is None:
             return _resp(404, {"error": f"{path} missing from the deployed bundle"})
         return _resp(200, svg, "image/svg+xml; charset=utf-8")
+
+    if method == "GET" and path == "/intro":
+        if INTRO_HTML is None:
+            # Named, not blank. The Introduction tab loads this in an iframe, and an empty
+            # frame is indistinguishable from a broken one — this says which build step
+            # did not run.
+            return _resp(404, f"<h1>intro.html missing from bundle: {INTRO_ERR}</h1>"
+                              "<p>deploy/console/deploy.sh runs "
+                              "deploy/console/intro/build_intro.py to produce it.</p>",
+                         "text/html; charset=utf-8", csp_upload=False)
+        # csp_upload=False: this page fetches nothing. See _csp().
+        return _resp(200, INTRO_HTML, "text/html; charset=utf-8", csp_upload=False)
+
+    if method == "GET" and path.startswith("/intro/audio/"):
+        return intro_audio(path)
 
     try:
         if method == "GET" and path == "/api/overview":
@@ -3447,7 +3551,6 @@ def handler(event, context):
 
         raw = event.get("body") or "{}"
         if event.get("isBase64Encoded"):
-            import base64
             raw = base64.b64decode(raw).decode("utf-8", "replace")
         try:
             body = json.loads(raw)
