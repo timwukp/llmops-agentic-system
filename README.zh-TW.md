@@ -25,7 +25,7 @@ run，讓超支被指名，而不是在帳單上才被發現。整套生命週�
 
 https://github.com/user-attachments/assets/f189afb1-c326-49b6-b023-785da5ed3e6a
 
-[![觀看五分鐘導覽](docs/media/intro-poster.png)](docs/media/intro-en.mp4)
+
 
 ## 這是什麼
 
