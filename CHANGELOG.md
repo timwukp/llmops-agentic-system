@@ -5,6 +5,33 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
 ## [Unreleased]
 
+### The readiness panel counted nine questions and said six
+
+- **`task_readiness`'s docstring described the panel as showing "which of the *six* data
+  questions nobody has answered yet"; `DATA_READINESS_FIELDS` holds *nine*.** The list grew to
+  nine in the commit that derived it from the orchestrator's consult prompt — the fix for a
+  panel that was missing `datasheet.provenance` and `readiness_report_uri` — and the sentence
+  explaining the panel stayed at six. Nothing was functionally wrong: every readiness test
+  measures the tuple, so all nine questions were asked, answered and counted correctly in the
+  API response. What was wrong is the explanation, which is what a reader believes when
+  deciding whether the panel covers what they care about.
+- **Found while writing an operator runbook, and it had already spread.** The count was copied
+  out of this docstring into two operator-facing documents before anyone checked it against
+  the tuple — a false claim in a docstring propagates at the speed people quote it.
+- **The guard derives the number rather than restating it, and fails from both sides.** The
+  count in the tuple was guarded (`test_readiness_names_every_field_the_consult_protocol_asks_for`);
+  the count in the prose was not, so the prose is the copy that drifted. The new guard reads
+  `len(DATA_READINESS_FIELDS)`, maps it to its number word, and requires the docstring's count
+  sentence to name exactly that one — so **m104** (prose back to "six") and **m105** (tuple
+  shrinks to eight, prose left at nine) both fail it. A guard that hardcoded "nine" would
+  catch m104 and sail past m105, which is the difference between checking a claim and
+  restating it. It anchors on the single line containing "data questions" rather than
+  searching the module, because "nine" appears in another test's own prose; and it rejects
+  digits as well as words, since `6` would slip past a word search.
+- **Same shape as this panel's earlier defect.** ARCHITECTURE.md already records the version
+  where the *guard* restated seven paths against a prompt specifying nine. Derive-don't-restate
+  now covers the prose as well as the list.
+
 ### A limit without its mode is the more misleading half
 
 - **`GET /api/cost-overview` reported the two dollar limits and not whether either is

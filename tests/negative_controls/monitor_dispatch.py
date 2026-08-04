@@ -1663,6 +1663,44 @@ case("console: one limits payload states its mode and the other does not",
       "tests/test_console_cost.py::test_no_limits_payload_anywhere_omits_the_mode"])
 
 
+def m104(t):
+    """Put the readiness docstring's count back to "six" -- the state that was on main.
+
+    Not a hypothetical: DATA_READINESS_FIELDS grew to nine to match the consult prompt and
+    this sentence stayed at six, and every readiness test passed either way because they
+    all measure the tuple. The count in the tuple was guarded; the count in the prose was
+    not, so the prose is what drifted.
+    """
+    old = "which of the nine data questions"
+    assert t.count(old) == 1, f"the readiness count sentence has moved; found {t.count(old)}"
+    return t.replace(old, "which of the six data questions", 1)
+
+
+case("console: the readiness docstring miscounts the data questions",
+     "deploy/console/lambda_function.py", m104,
+     ["tests/test_console_tasks.py::"
+      "test_the_readiness_docstring_states_the_real_number_of_questions"])
+
+
+def m105(t):
+    """Shrink the field tuple and leave the prose at nine -- drift from the other side.
+
+    m104 breaks the sentence; this breaks the list. A guard that hardcoded "nine" instead
+    of deriving it from DATA_READINESS_FIELDS would catch m104 and sail past this one,
+    which is the difference between checking the claim and restating it.
+    """
+    old = ('    ("decontamination", "Decontamination",\n'
+           '     "training on the held-out set inflates every score that follows"),\n')
+    assert t.count(old) == 1, f"the decontamination field has moved; found {t.count(old)}"
+    return t.replace(old, "", 1)
+
+
+case("console: the readiness field list shrinks and the prose count does not follow",
+     "deploy/console/lambda_function.py", m105,
+     ["tests/test_console_tasks.py::"
+      "test_the_readiness_docstring_states_the_real_number_of_questions"])
+
+
 #: Where the pristine text of the file currently mutated is parked, so a kill -9 -- which
 #: no handler can intercept -- still leaves the original recoverable. Under the repo root
 #: rather than /tmp because it must be obvious to whoever finds the tree dirty, and
