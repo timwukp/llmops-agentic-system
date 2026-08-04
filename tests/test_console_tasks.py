@@ -2395,13 +2395,17 @@ def test_console_origin_is_empty_rather_than_wrong_when_the_api_is_absent(storag
 
 
 def test_console_origin_resolves_the_real_api(storage, monkeypatch):
+    # The id is deliberately a made-up one that reads as made up. This test used to hard-code
+    # the account's actual API id, which is how the address of the live admin console became a
+    # string this repo contains in six places -- the resolver's behaviour does not depend on
+    # which id comes back, so nothing was bought by using the real one.
     class _Api:
         def get_apis(self):
             return {"Items": [{"Name": "unrelated", "ApiId": "aaa"},
-                              {"Name": f"{storage.CONSOLE_FN}-api", "ApiId": "deovqcv4m7"}]}
+                              {"Name": f"{storage.CONSOLE_FN}-api", "ApiId": "exampleapi1"}]}
     monkeypatch.setattr(storage.boto3, "client", lambda *a, **k: _Api())
     assert storage.console_origin("us-east-1", dry=False) == \
-        "https://deovqcv4m7.execute-api.us-east-1.amazonaws.com"
+        "https://exampleapi1.execute-api.us-east-1.amazonaws.com"
 
 
 def test_the_deploy_reports_cors_on_its_own_line(storage):

@@ -2075,23 +2075,46 @@ case("readme: the embedded walkthrough stops being reachable from the EN README"
 
 
 def m121(t):
-    """Strip the live-page link from the zh-TW README, leaving only the English-only mp4.
+    """Strip the five-language pointer from the zh-TW README, leaving only the English mp4.
 
-    This is the case that makes the guard's second assertion earn its place. The mp4 is English
-    only; the live page is where the other four narrations are. Drop that link and a Cantonese
-    or Korean reader is left with an English video and no hint the rest exists.
+    This is the case that makes the guard's last assertion earn its place. The mp4 is English
+    only; `deploy/console/intro/` is where the other four narrations are. Drop that pointer and
+    a Cantonese or Korean reader is left with an English video and no hint the rest exists.
 
     It also pins a real defect this control found: the assertion was first written
     `"/intro" in text`, which the video's own path `docs/media/intro-en.mp4` satisfies -- so
-    this exact mutation PASSED. It now matches an absolute URL ending in /intro.
+    this exact mutation PASSED. (The pointer was then an absolute URL to the live console; that
+    address was removed from the repo entirely, because publishing the front door of a page that
+    launches runs and approves budgets is not something a README should do. The assertion moved
+    to the in-repo path, which is where the narrations actually are.)
     """
-    old = "**[▶ /intro](https://deovqcv4m7.execute-api.us-east-1.amazonaws.com/intro)**"
-    assert t.count(old) == 1, f"the zh-TW live-page link has moved; found {t.count(old)}"
-    return t.replace(old, "**/intro**", 1)
+    old = "`deploy/console/intro/`"
+    assert t.count(old) == 1, f"the zh-TW narration pointer has moved; found {t.count(old)}"
+    return t.replace(old, "那個動畫頁面", 1)
 
 
-case("readme: the zh-TW walkthrough section loses the five-language live page",
+case("readme: the zh-TW walkthrough section loses the five-language narration pointer",
      "README.zh-TW.md", m121,
+     ["tests/test_intro_video.py::test_both_readmes_reach_the_video_and_the_live_page"])
+
+
+def m121b(t):
+    """Put a <video> tag back into the EN README.
+
+    The direction that will actually happen: someone sees a poster-image link, assumes an
+    inline player is possible, and "improves" it into `<video src=...>`. GitHub's sanitizer
+    deletes the tag, so the section renders with a blank gap where the player was meant to be
+    and the reader is told nothing. Measured against GitHub's own POST /markdown, not assumed --
+    six embed forms, all erased.
+    """
+    old = "[![Watch the five-minute walkthrough](docs/media/intro-poster.png)]" \
+          "(docs/media/intro-en.mp4)"
+    assert t.count(old) == 1, f"the EN poster link has moved; found {t.count(old)}"
+    return t.replace(old, '<video src="docs/media/intro-en.mp4" controls></video>', 1)
+
+
+case("readme: a <video> tag GitHub silently deletes is added back to the EN README",
+     "README.md", m121b,
      ["tests/test_intro_video.py::test_both_readmes_reach_the_video_and_the_live_page"])
 
 
@@ -2135,6 +2158,53 @@ case("intro: the stage is re-authored larger and the committed video is not re-r
      "deploy/console/intro/page.template.html", m123,
      ["tests/test_intro_video.py"
       "::test_the_video_carries_an_audio_stream_and_the_authored_frame_size"])
+
+
+def m124(t):
+    """Widen the API-Gateway-hostname excuse from whole-id equality back to a substring search.
+
+    This is the direction the rule was FIRST written in, and it is the reason the rule needed a
+    control rather than a reading. With `any(e in match ...)`, a hostname whose id merely
+    *contains* an example word walks straight through -- so any real id containing `apiid` is
+    excused. The excuse list exists so a legitimate sample origin is not a finding; a substring
+    version of it silences the rule it is attached to.
+
+    This control earned its keep on its first run: it PASSED -- i.e. it did NOT trip its guard.
+    The guard's sneaky hostname was a hand-spelled `exampleandthenrealbits99`, which contains no
+    entry of the excuse tuple at all, so the substring version excused nothing and the assertion
+    held against the very defect it named. The guard now builds the id from
+    `rs.EXAMPLE_API_IDS[0]`. A control that passes is not a formality: it is the only reason that
+    weakness was found.
+
+    The mutation is on the scanner, and the guard it must trip lives in test_redaction_scan.py.
+    Note it does NOT quote a real hostname: this file is scanned by the same gate.
+    """
+    old = "        if m.group(1).lower() in EXAMPLE_API_IDS:"
+    assert t.count(old) == 1, f"the hostname excuse check has moved; found {t.count(old)}"
+    return t.replace(old, "        if any(e in m.group(0).lower() for e in EXAMPLE_API_IDS):", 1)
+
+
+case("redaction: the live-hostname excuse is loosened to a substring match",
+     "tests/redaction_scan.py", m124,
+     ["tests/test_redaction_scan.py::test_the_examples_do_not_excuse_the_real_shape"])
+
+
+def m125(t):
+    """Delete the live-endpoint rule from the scanner altogether.
+
+    The direction that actually happened: the rule did not exist, so this repo shipped the
+    address of its own admin console in a rendered README, in both ARCHITECTURE files and in two
+    test files, and every gate stayed green through the merge. A control that only checks the
+    excuse logic would not have caught its total absence.
+    """
+    old = "    for m in LIVE_ENDPOINT.finditer(blob):"
+    assert t.count(old) == 1, f"the hostname scan loop has moved; found {t.count(old)}"
+    return t.replace(old, "    for m in ():", 1)
+
+
+case("redaction: the live API Gateway hostname rule is removed entirely",
+     "tests/redaction_scan.py", m125,
+     ["tests/test_redaction_scan.py::test_a_live_api_gateway_hostname_is_a_finding"])
 
 
 #: Where the pristine text of the file currently mutated is parked, so a kill -9 -- which

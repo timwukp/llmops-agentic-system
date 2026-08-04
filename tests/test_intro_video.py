@@ -473,26 +473,42 @@ def test_both_readmes_reach_the_video_and_the_live_page(readme):
     text = (REPO / readme).read_text()
     rel = "docs/media/intro-en.mp4"
     assert rel in text, f"{readme} does not reference {rel}"
-    # BOTH forms, not either. The README argues in prose that the plain link is deliberate
-    # redundancy because whether GitHub renders a repo-relative <video> as a player cannot be
-    # verified before pushing -- so if the tag is flattened to nothing AND the link is gone, the
-    # reader has no way to the file. Requiring only one mention let a control that deleted the
-    # play link pass, because the <video src=...> attribute still matched the substring.
-    assert re.search(rf"<video[^>]*src=\"{re.escape(rel)}\"", text), (
-        f"{readme} has no <video> tag for the walkthrough — nothing will play inline")
-    assert re.search(rf"\[[^\]]*\]\({re.escape(rel)}\)", text), (
-        f"{readme} has no plain markdown link to {rel} — if GitHub does not render the "
-        "<video> tag as a player, the reader is left with no way to reach the file")
-    # The live page is the canonical five-language artifact; the mp4 is English only, so the
-    # README must not leave a non-English reader without the pointer.
+    # A <video> tag is NOT required, and asserting one was wrong. This guard used to demand
+    # `<video src="docs/media/intro-en.mp4">` on the grounds that whether GitHub renders it as a
+    # player "cannot be verified before pushing". It can: POST /markdown with mode=gfm returns
+    # exactly what the repo page will show, and it strips <video> to nothing -- for the
+    # repo-relative path, a raw.githubusercontent.com URL, a <source> child and a release asset
+    # alike. The rendered homepage HTML of this repo confirmed it: zero <video> elements. So the
+    # guard was requiring a tag that provably does nothing while its message claimed the reader
+    # could play it inline.
     #
-    # Matched as an absolute URL ending in /intro, NOT as the bare substring "/intro". The
-    # first version asserted `"/intro" in text` -- which the video's own path
-    # (docs/media/intro-en.mp4) satisfies, so deleting the live link entirely still passed.
-    # Found by mutating the link away and watching the test stay green on that assertion.
-    assert re.search(r"https?://\S+/intro\b", text), (
-        f"{readme} does not link the live /intro page — the mp4 is English only, so a reader "
-        "who needs one of the other four languages would have nowhere to go")
+    # Code spans are stripped before matching, because both READMEs now EXPLAIN in prose that
+    # `<video>` does not work -- and a guard that fires on the sentence documenting the defect
+    # would force the explanation out of the README. Found by writing the naive version first
+    # and watching it fail on its own documentation.
+    prose = re.sub(r"`[^`]*`", "", text)
+    assert not re.search(r"<video\b", prose), (
+        f"{readme} has a <video> tag — GitHub's sanitizer deletes it, so it renders as an empty "
+        "gap. Link the mp4 (a poster image link and/or a plain markdown link) instead")
+    # TWO independent ways in, still. A single one means one careless rewrite makes 10 MB
+    # unreachable, and the earlier version of this guard passed a control that deleted the play
+    # link because the <video src=...> attribute still matched the substring it checked.
+    poster = re.search(rf"\[!\[[^\]]*\]\([^)]*\)\]\({re.escape(rel)}\)", text)
+    plain = re.search(rf"\[(?!!)[^\]]*\]\({re.escape(rel)}\)", text)
+    assert poster, (
+        f"{readme} has no clickable poster image for the walkthrough — the section renders as a "
+        "wall of text with no sign there is a video")
+    assert plain, (
+        f"{readme} has no plain markdown link to {rel} — a reader whose client does not load "
+        "the poster image is left with no way to reach the file")
+    # The five-language narration lives in the repo, not behind a URL. It used to be an absolute
+    # link to this account's live console; that address is the front door to a page where runs
+    # are launched and budgets approved, and publishing it in a README invited the whole
+    # internet to knock. `tests/redaction_scan.py` now refuses any live execute-api hostname, so
+    # this asserts the in-repo pointer that replaced it.
+    assert "deploy/console/intro" in text, (
+        f"{readme} does not point at deploy/console/intro — the mp4 is English only, so a reader "
+        "who needs one of the other four narrations must be told where they are")
 
 
 def _section_containing(text: str, needle: str) -> str:

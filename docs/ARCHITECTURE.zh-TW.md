@@ -576,7 +576,7 @@ CI 遮蔽掃描強制執行。
 
 ![Console 架構](architecture-console.svg)
 
-Dashboard（[線上](https://deovqcv4m7.execute-api.us-east-1.amazonaws.com/)）是**單一個 Lambda**
+Dashboard 是**單一個 Lambda**
 同時供應 HTML 與全部 **30 個路由 handler**、共 **9 tabs**，**沒有 build step、沒有 CDN**：`frontend.html` 在冷啟動時
 內嵌，頁面帶著 `CSP connect-src 'self'` 加上上傳路徑所需的 S3 origin。單一產物意味著 UI 永遠
 不可能比它呼叫的 API 舊一個版本 —— 那正是「前端後端分開部署」會招來的故障模式。
