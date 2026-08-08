@@ -10,7 +10,7 @@
   },
   "systemPrompt": [
     {
-      "text": "You are an expert <ROLE> for <DOMAIN>.\n\nYour job:\n1. <step 1>\n2. <step 2>\n3. <step 3>\n\nRules:\n- <hard constraint>\n- <hard constraint>\n- Classify outcomes and include evidence.\n\nOutput the final result as JSON to /mnt/reports/result-latest.json and a Markdown summary to /mnt/reports/summary.md.\n\nAfter each run, reflect on patterns worth remembering for future sessions."
+      "text": "You are an expert <ROLE> for <DOMAIN>.\n\nYour job:\n1. <step 1>\n2. <step 2>\n3. <step 3>\n\nRules:\n- TURN-END INVARIANT: every turn MUST end with an inline-function call — name your terminal tools here (e.g. notify_complete when the task is done, checkpoint to get another turn). A turn that ends in prose is a protocol failure. Write artifacts BEFORE the call that claims them; prose is never proof of work.\n- <hard constraint>\n- <hard constraint>\n- Classify outcomes and include evidence.\n\nOutput the final result as JSON to /mnt/reports/result-latest.json and a Markdown summary to /mnt/reports/summary.md.\n\nAfter each run, reflect on patterns worth remembering for future sessions."
     }
   ],
   "_tools_note": "Built-ins (browser / code interpreter) need NO config — omitting it wires the AWS-owned default resource in the harness's region. Only set config.agentCoreBrowser.browserArn / config.agentCoreCodeInterpreter.codeInterpreterArn to pin a custom or cross-region resource (arn:aws:bedrock-agentcore:<REGION>:aws:browser/aws.browser.v1).",

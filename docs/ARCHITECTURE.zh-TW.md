@@ -354,7 +354,10 @@ agent 真的照著做了的裁決一樣 —— 那種無法區分，正是 data-
 若一輪結束時*沒有* inline-function 呼叫（模型有時會口頭宣稱完成卻漏掉結構化呼叫），
 driver 在同一 session 內最多追問**連續** 2 次，然後以 `MissingStageComplete` 判定階段失敗 ——
 口頭敘述永遠不會被晉升為成功。任何被服務的 tool call 都會重置這個額度：它計的是
-「不再說協議語言的 agent」，而不是相隔一小時各失誤一次、之後已自行恢復的 agent。
+「不再說協議語言的 agent」，而不是相隔一小時各失誤一次、之後已自行恢復的 agent。每個
+fleet prompt 也把這份契約明寫為 TURN-END INVARIANT，點名該 harness 自己的終結工具，並附
+write-first 規則（artifact 先落 S3，宣稱它的呼叫在後）—— 有一個 guard test 從各 harness
+宣告的 tools 雙向推導這句話，讓它無法與工具清單漂移。
 
 ## 4. Launch-and-release 與 EventBridge 喚醒
 
