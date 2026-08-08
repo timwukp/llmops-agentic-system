@@ -1515,6 +1515,51 @@ class TestResumePipeline:
                        for e in c["events"].entries), (
             "a student-inference completion was announced as MODEL_TRAINED")
 
+    def test_a_zero_billed_stop_relaunches_without_spending_an_iteration(self):
+        """Stopped with $0 billed is capacity, not code: the job never ran (Pending
+        time is unbilled) and proved nothing. Before this branch existed, a capacity
+        race loser fired TrainingJobFailed and spent a remediation iteration on
+        weather — with only 3 in the budget, two starved instance types and one real
+        bug exhausted a run that did nothing wrong."""
+        c = self._clients({"run_id": "run-1", "task_token": "tok-9"})
+        out = resume_pipeline.handler(
+            sm_event("Stopped", BillingSecondsUsed=0), clients=c)
+        assert out["outcome"] == "capacity-relaunch"
+        assert c["sfn"].failures[0]["error"] == "CapacityStopped", (
+            "the launch state's Catch routes on this exact error name")
+        assert any(e["DetailType"] == ev.CAPACITY_STOPPED
+                   for e in c["events"].entries)
+        assert not any(e["DetailType"] == ev.PIPELINE_FAILED
+                       for e in c["events"].entries), (
+            "a free relaunch announced itself as a pipeline failure")
+        # the retry counter rides the token-clear write: a crash between two separate
+        # writes would hand out an uncounted free relaunch
+        upd = c["ddb"].Table(ENV["RUNS_TABLE"]).updates[0]
+        assert "capacity_retries" in upd["UpdateExpression"]
+        assert upd["ExpressionAttributeValues"][":n"] == 1
+
+    def test_a_billed_stop_is_a_real_failure(self):
+        """A stop that billed seconds was a judgment call on a RUNNING job — an
+        operator or guard stopped real work. That keeps the TrainingJobFailed path
+        and its remediation-iteration cost; only never-ran stops are free."""
+        c = self._clients({"run_id": "run-1", "task_token": "tok-9"})
+        out = resume_pipeline.handler(
+            sm_event("Stopped", BillingSecondsUsed=1200), clients=c)
+        assert out["outcome"] == "failed"
+        assert c["sfn"].failures[0]["error"] == "TrainingJobFailed"
+
+    def test_the_fourth_capacity_stop_stops_being_free(self):
+        """The CapacityStopped Catch re-enters the launch state without
+        IncrementIteration, so the ASL has no loop guard of its own — this cap is
+        it. A permanently starved instance type must eventually become a real
+        failure someone gets paged about, not an infinite quiet relaunch loop."""
+        c = self._clients({"run_id": "run-1", "task_token": "tok-9",
+                           "capacity_retries": 3})
+        out = resume_pipeline.handler(
+            sm_event("Stopped", BillingSecondsUsed=0), clients=c)
+        assert out["outcome"] == "failed"
+        assert c["sfn"].failures[0]["error"] == "TrainingJobFailed"
+
     def test_unknown_job_is_skipped(self):
         c = self._clients(run=None)
         out = resume_pipeline.handler(sm_event("Completed", job="someone-elses-job"),
@@ -2132,6 +2177,30 @@ class TestStateMachine:
                 assert rp not in ("__absent__", "$"), (
                     f"{name}'s catch to {cat['Next']} replaces the state with the error "
                     "object, discarding $.run_id and $.iteration")
+
+    def test_a_capacity_stop_relaunches_the_same_state_without_incrementing_iteration(self, asl):
+        """A CapacityStopped Catch must re-enter the state that launched the job,
+        with $.iteration untouched: capacity is weather, and the remediation budget
+        (iteration < 3) exists for code failures. If the Catch ever routes through
+        IncrementIteration — or anywhere other than straight back — a starved
+        instance type starts eating the budget again, which is how a run that did
+        nothing wrong got executed. Derived over every state that has the Catch, so
+        a launch state added later inherits the assertion."""
+        found = []
+        for name, st in asl["States"].items():
+            for cat in st.get("Catch", []):
+                if "CapacityStopped" not in cat.get("ErrorEquals", []):
+                    continue
+                found.append(name)
+                assert cat["Next"] == name, (
+                    f"{name}'s CapacityStopped catch goes to {cat['Next']}; a free "
+                    "relaunch means re-entering the SAME state")
+                assert cat.get("ResultPath") == "$.error", (
+                    f"{name}'s capacity catch must file the error under $.error and "
+                    "keep $.iteration — replacing the state resets the run's context")
+        assert set(found) >= {"FinetuneLaunch", "EvalGenerate"}, (
+            f"the capacity exemption covers {found}; both launch-and-release states "
+            "park tracked jobs and both race capacity")
 
     def test_a_conductor_dispatched_task_is_closed_out_when_its_run_ends(self, asl):
         """The zombie-run bug, one level up: the TASK stays 'dispatched' forever.
