@@ -1332,6 +1332,44 @@ class TestDriver:
         assert c["sfn"].failures[0]["error"] == "MissingStageComplete"
         assert any(e["DetailType"] == ev.PIPELINE_FAILED for e in c["events"].entries)
 
+    def test_a_serviced_tool_call_resets_the_re_ask_budget(self):
+        """The re-ask budget must count CONSECUTIVE prose turns, not lifetime ones.
+
+        Live failure this pins: run b56281da's eval agent ended two early turns in
+        prose (burning both re-asks), then worked correctly through checkpoints for
+        an hour -- and the moment one more turn ended in prose, the driver failed the
+        stage with MissingStageComplete while the agent's third SageMaker relaunch
+        was healthy and mid-flight. A lifetime budget punishes an agent for sins it
+        already recovered from; the reset makes any serviced tool call re-arm it."""
+        uri = "s3://llmops-data-test/runs/run-test-1/raw/data.jsonl"
+        ac = FakeAgentCore([
+            text_stream("narrating instead of calling"),        # re_ask 1
+            text_stream("still narrating"),                     # re_ask 2 (exhausted)
+            tool_use_stream("checkpoint", {"next_action": "resume work"}),  # re-arms
+            text_stream("prose again after the checkpoint"),    # re_ask 1 (fresh)
+            text_stream("and once more"),                       # re_ask 2 (fresh)
+            tool_use_stream("stage_complete", {"outputs": [uri]}),
+            text_stream("ack")])
+        c = clients(ac, FakeS3(existing=[uri]))
+        out = driver.handler(driver_event(), clients=c)
+        assert out["status"] == "completed", (
+            "four prose turns split 2+2 around a healthy checkpoint killed the stage "
+            "-- the budget is still lifetime, not consecutive")
+        assert not c["sfn"].failures, "MissingStageComplete fired despite the reset"
+
+    def test_re_ask_budget_survives_a_self_reinvoke(self):
+        """'Consecutive' is counted across Lambda invocations: two prose turns split
+        by a self-reinvoke are still consecutive. The counter rides the continuation
+        payload as _re_asks -- if a refactor drops it from the handoff, every
+        reinvoke silently refills the budget and MissingStageComplete can never fire
+        on long stages, exactly where the protocol violations happen."""
+        src = (REPO / "orchestration/harness_driver/handler.py").read_text()
+        body = src[src.index("def _run_stage"):]
+        assert '"_re_asks": re_asks' in body, \
+            "_self_reinvoke stopped carrying the re-ask counter"
+        assert 'int(event.get("_re_asks", 0))' in body, \
+            "the continuation branch stopped restoring the re-ask counter"
+
     def test_stream_death_salvaged_same_session(self):
         uri = "s3://llmops-data-test/runs/run-test-1/raw/data.jsonl"
         ac = FakeAgentCore([

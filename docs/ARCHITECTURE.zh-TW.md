@@ -352,8 +352,9 @@ agent 真的照著做了的裁決一樣 —— 那種無法區分，正是 data-
 讀起來像已被回答的原因。
 
 若一輪結束時*沒有* inline-function 呼叫（模型有時會口頭宣稱完成卻漏掉結構化呼叫），
-driver 在同一 session 內最多追問 2 次，然後以 `MissingStageComplete` 判定階段失敗 ——
-口頭敘述永遠不會被晉升為成功。
+driver 在同一 session 內最多追問**連續** 2 次，然後以 `MissingStageComplete` 判定階段失敗 ——
+口頭敘述永遠不會被晉升為成功。任何被服務的 tool call 都會重置這個額度：它計的是
+「不再說協議語言的 agent」，而不是相隔一小時各失誤一次、之後已自行恢復的 agent。
 
 ## 4. Launch-and-release 與 EventBridge 喚醒
 
