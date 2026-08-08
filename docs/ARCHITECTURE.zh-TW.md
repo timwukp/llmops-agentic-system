@@ -363,7 +363,11 @@ write-first 規則（artifact 先落 S3，宣稱它的呼叫在後）—— 有�
 
 Harness 一輪有界（約 14 分鐘）；訓練作業跑數小時。規則：**harness 絕不空等作業**。
 finetune agent 發起 SageMaker 訓練作業 —— eval agent 的學生推論作業也走同一條訓練作業
-軌道 —— 呼叫 `job_launched`、session 隨即釋放。（eval 是付了學費才拿到這條路：沒有
+軌道 —— 呼叫 `job_launched`、session 隨即釋放。被追蹤的作業若以 **Stopped 且 $0 計費**
+收場，那是容量問題而不是程式問題 —— 搶容量落敗或放棄等待配額的作業從未真正跑起來，
+什麼也沒證明 —— 所以 resume Lambda 以 `CapacityStopped` 結算 token，launch 狀態原地
+重入且不消耗 remediation iteration，每個 run 最多 3 次免費重發；第 4 次就按
+`TrainingJobFailed` 計，跟真失敗一樣。（eval 是付了學費才拿到這條路：沒有
 `job_launched` 時，它跨越長推論作業的唯一辦法是在輪內輪詢，而那正是散文結尾發生的地方；
 狀態機的 `EvalScore` 狀態現在會在作業完成後以全新 session 接手評分。）恢復管線的
 鏈路：

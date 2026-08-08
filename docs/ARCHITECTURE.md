@@ -430,7 +430,11 @@ declared tools, so the sentence cannot drift from the tool list.
 A harness turn is bounded (~14 min); a training job runs for hours. The rule: **a harness
 never waits on a job**. The finetune agent launches the SageMaker training job — and the
 eval agent its student-inference job, which rides the same training-job rail — calls
-`job_launched`, and its session is released. (Eval earned this path the hard way: with no
+`job_launched`, and its session is released. A tracked job that ends **Stopped with $0
+billed** is capacity, not code — a race loser or an abandoned quota wait never ran and
+proved nothing — so the resume Lambda settles the token as `CapacityStopped` and the
+launch state re-enters itself with the remediation iteration unspent, up to 3 free
+relaunches per run; the 4th counts as `TrainingJobFailed` like any real failure. (Eval earned this path the hard way: with no
 `job_launched`, its only way to span a long inference job was polling in-turn, which is
 where prose turn-ends happen; the machine's `EvalScore` state now picks up scoring in a
 fresh session after the job completes.) The chain that resumes the pipeline:

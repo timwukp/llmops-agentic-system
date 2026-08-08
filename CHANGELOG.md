@@ -5,6 +5,33 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
 ## [Unreleased]
 
+### A $0 capacity stop no longer spends the remediation budget
+
+`resume_pipeline` treated `Stopped` and `Failed` identically (`TERMINAL_BAD`): a tracked
+job stopped while Pending — a capacity race loser, or a quota wait given up on — fired
+`TrainingJobFailed` and consumed one of the run's 3 remediation iterations, exactly as if
+the code had crashed. But a job that never left Pending billed $0 and proved nothing;
+spending remediation budget on it is spending budget on weather. The conductor's own
+triage learnings called this out after the b56281da lineage: "capacity-stops ($0 billed)
+should not consume the same remediation budget as code failures."
+
+- `orchestration/resume_pipeline/handler.py`: `_is_capacity_stop` — Stopped AND
+  `BillingSecondsUsed == 0` (the same economics the capacity-race guard runs on: Pending
+  time is unbilled, so a stop that billed seconds was a judgment call on a *running* job
+  and keeps the failure path). Up to 3 free relaunches per run (`capacity_retries`,
+  incremented in the same DynamoDB write that clears the token — a separate write would
+  open a crash window handing out uncounted relaunches); the 4th falls through to
+  `TrainingJobFailed`.
+- `orchestration/state_machine.asl.json`: `FinetuneLaunch` and `EvalGenerate` each gain a
+  `CapacityStopped` Catch that re-enters the same state with `$.iteration` unchanged —
+  no `IncrementIteration` on the path, pinned by a derived ASL test that covers any
+  future launch state carrying the Catch.
+- `pipeline/contracts/events.py`: `CAPACITY_STOPPED`, informational like
+  `MODEL_FAILED_OVER` — the timeline's answer to "why did this state run twice".
+- Tests (all red-first verified): zero-billed stop relaunches free with the counter
+  riding the token-clear write; a billed stop stays a real failure; the 4th capacity
+  stop stops being free; the Catch re-enters the same state.
+
 ### The eval stage gets launch-and-release; polling in-turn is what killed it
 
 The eval agent's prompt said "there are no training jobs at your stage" — written when

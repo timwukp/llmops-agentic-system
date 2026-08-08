@@ -151,6 +151,14 @@
       "Catch": [
         {
           "ErrorEquals": [
+            "CapacityStopped"
+          ],
+          "ResultPath": "$.error",
+          "Comment": "A tracked job stopped with $0 billed (capacity race loser / quota wait) re-enters this state with $.iteration UNCHANGED -- capacity is weather, not a code failure, so it spends no remediation iteration. The loop guard is resume_pipeline's capacity_retries cap: the 4th stop arrives as TrainingJobFailed.",
+          "Next": "FinetuneLaunch"
+        },
+        {
+          "ErrorEquals": [
             "TrainingJobFailed"
           ],
           "ResultPath": "$.error",
@@ -213,6 +221,14 @@
       "ResultPath": "$.evaluation_run",
       "TimeoutSeconds": 86400,
       "Catch": [
+        {
+          "ErrorEquals": [
+            "CapacityStopped"
+          ],
+          "ResultPath": "$.error",
+          "Comment": "A tracked job stopped with $0 billed (capacity race loser / quota wait) re-enters this state with $.iteration UNCHANGED -- capacity is weather, not a code failure, so it spends no remediation iteration. The loop guard is resume_pipeline's capacity_retries cap: the 4th stop arrives as TrainingJobFailed.",
+          "Next": "EvalGenerate"
+        },
         {
           "ErrorEquals": [
             "States.ALL"

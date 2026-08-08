@@ -45,6 +45,11 @@ MODEL_FAILED_OVER = "ModelFailedOver"
 #: detail-type made the triage rule feed itself -- escalate -> triage -> page ->
 #: triage -- with each lap costing a real harness invocation.
 OWNER_PAGED = "OwnerPaged"
+#: A tracked SageMaker job was stopped with $0 billed — a capacity race loser or a
+#: give-up on a Pending quota wait, not a code failure. Informational, like
+#: MODEL_FAILED_OVER: the pipeline relaunches the stage without spending a remediation
+#: iteration, and this event is how the timeline says why the same state ran twice.
+CAPACITY_STOPPED = "CapacityStopped"
 PIPELINE_COMPLETED = "PipelineCompleted"
 PIPELINE_FAILED = "PipelineFailed"
 
@@ -66,6 +71,7 @@ ALL_EVENTS: tuple = (
     ESCALATED_TO_HUMAN,
     MODEL_FAILED_OVER,
     OWNER_PAGED,
+    CAPACITY_STOPPED,
     PIPELINE_COMPLETED,
     PIPELINE_FAILED,
 )
