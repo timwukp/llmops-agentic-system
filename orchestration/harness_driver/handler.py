@@ -896,7 +896,7 @@ def _run_stage(event, context=None, c=None):
     else:
         messages = _user_text(json.dumps(payload, default=str))
         stream_retried = False
-        re_asks = 0  # up to 2: continue-and-finish nudge, then final demand
+        re_asks = 0  # up to 2 CONSECUTIVE: nudge, final demand; any serviced tool call re-arms it
 
     def _out_of_time() -> bool:
         return bool(context) and context.get_remaining_time_in_millis() < 850_000
@@ -935,6 +935,14 @@ def _run_stage(event, context=None, c=None):
         # "toolResult blocks ... exceeds the number of toolUse blocks of previous
         # turn" (found live on the console's dispatch path, same shape here).
         if tu and out["stop_reason"] == "tool_use":
+            # A structured call proves the agent still speaks protocol, so the
+            # consecutive-prose budget re-arms — even for a rejected stage_complete
+            # or an unknown tool name; what the budget counts is PROSE turn-ends.
+            # Before this reset the counter was a lifetime one: run b56281da died
+            # with MissingStageComplete while its (healthy) third SageMaker relaunch
+            # was mid-flight, because two prose turns much earlier had used up the
+            # allowance and nothing ever gave it back.
+            re_asks = 0
             name, args = tu["name"], tu.get("input") or {}
             if name == "stage_complete":
                 result = handle_stage_complete(c, event, args)

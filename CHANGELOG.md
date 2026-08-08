@@ -5,6 +5,33 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
 ## [Unreleased]
 
+### The re-ask budget was a lifetime count; it is now consecutive
+
+One counter, three dead runs. When a turn ends in prose instead of an inline-function
+call, the driver re-asks up to 2 times, then fails the stage as `MissingStageComplete`.
+That allowance was counted over the driver invocation's whole life and nothing ever gave
+it back: an agent that slipped twice early, then worked correctly through checkpoints for
+an hour, was executed for its third slip regardless of everything in between. Live:
+run-20260808T024809Z-b56281da's eval agent burned both re-asks navigating a GPU capacity
+race (stopping a $0 Pending job, relaunching on a fallback instance type — the right
+calls, wrongly reported), recovered, and was then killed at 04:10Z by one more prose turn
+while its third, healthy SageMaker job was mid-flight with nobody left to hear it finish.
+Its two predecessors in the lineage (fb41420e, c8b13faa) died the same way.
+
+- `orchestration/harness_driver/handler.py`: any serviced tool call — including a
+  rejected `stage_complete` and an unknown tool name — resets `re_asks` to 0. What the
+  budget counts is an agent that has stopped speaking protocol, not one that recovered.
+  Two prose turns split by a self-reinvoke are still consecutive: the counter keeps
+  riding the `_re_asks` continuation key.
+- `tests/test_orchestration.py`: `test_a_serviced_tool_call_resets_the_re_ask_budget`
+  (red against the old driver — verified by stashing the fix) and
+  `test_re_ask_budget_survives_a_self_reinvoke` (pins the continuation carry, so a
+  refactor cannot silently turn "consecutive" into "per-invocation"). The existing
+  `test_missing_stage_complete_reasks_then_fails` passes unchanged — three consecutive
+  prose turns still fail the stage.
+- `docs/ARCHITECTURE.md` + zh-TW twin: the re-ask paragraph now says "consecutive" and
+  why.
+
 ### The docs framed the agents as replacing engineers; they do not
 
 Reader-facing wording only — no behavior, no numbers, no guard. The README's own section

@@ -416,8 +416,10 @@ acted on — the indistinguishability that let the data-prep escalation read as 
 three days.
 
 If a turn ends *without* an inline-function call (models sometimes narrate completion but
-skip the structured call), the driver re-asks up to 2 times in the same session, then
-fails the stage as `MissingStageComplete` — narration is never promoted to success.
+skip the structured call), the driver re-asks up to 2 **consecutive** times in the same
+session, then fails the stage as `MissingStageComplete` — narration is never promoted to
+success. Any serviced tool call re-arms the budget: what it counts is an agent that has
+stopped speaking protocol, not one that slipped twice an hour apart and recovered.
 
 ## 4. Launch-and-release with EventBridge wake
 
