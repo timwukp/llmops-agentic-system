@@ -2918,16 +2918,32 @@ def run_task_turn(task_id, accept=False):
                 messages = _chat_tool_result(tu, {"status": "paged"})
                 continue
             if name == "launch_run":
-                already = _task_get(task_id).get("run_id")
-                if already:
-                    # "exactly once" cannot be left to the prompt: a second call
-                    # would start a second GPU run against one signed approval.
-                    # Answer with the run it already has, so the agent reports that
-                    # run rather than trying again.
+                # "exactly once" cannot be left to the prompt: a second call would
+                # start a second GPU run against one signed approval. But the unit
+                # of idempotency is the ACCEPTANCE RECORD, not the task: a
+                # consultation thread whose earlier run died gets a fresh signature
+                # for its continuation, and that new acceptance has never been
+                # honored. The first version of this guard keyed on run_id alone,
+                # which made every continuation signed in an existing thread
+                # undispatchable forever — found live when continuation #5's
+                # acceptance (record 17fd4218…) was refused because the dead
+                # continuation #4's run_id still sat on the task row.
+                task_now = _task_get(task_id)
+                already = str(task_now.get("run_id") or "")
+                latest_rec = str(((task_now.get("approvals") or [{}])[-1]
+                                  or {}).get("record_sha256", ""))
+                honored = str(task_now.get("dispatched_record") or "")
+                # Block when this exact acceptance already produced a run — and,
+                # conservatively, for pre-fix rows that carry a run_id but never
+                # recorded which acceptance it honored (dispatched_record absent):
+                # those cannot prove the new signature is new, so an operator
+                # clears them deliberately rather than this guard guessing.
+                if already and (not honored or honored == latest_rec):
                     messages = _chat_tool_result(tu, {
-                        "status": "already_dispatched", "run_id": str(already),
-                        "reason": "this plan was already dispatched; one acceptance "
-                                  "authorizes exactly one run. Report this run_id."})
+                        "status": "already_dispatched", "run_id": already,
+                        "reason": "this acceptance was already dispatched; one "
+                                  "acceptance authorizes exactly one run. Report "
+                                  "this run_id."})
                     continue
                 if not accept:
                     messages = _chat_tool_result(tu, {
@@ -2949,11 +2965,15 @@ def run_task_turn(task_id, accept=False):
                     continue
                 tasks_tbl.update_item(
                     Key={"id": task_id},
-                    UpdateExpression="SET #s = :s, run_id = :r, execution_arn = :x, updated_at = :t",
+                    UpdateExpression="SET #s = :s, run_id = :r, execution_arn = :x, "
+                                     "updated_at = :t, dispatched_record = :rec",
                     ExpressionAttributeNames={"#s": "status"},
                     ExpressionAttributeValues={":s": "dispatched", ":r": result["run_id"],
                                                ":x": result.get("execution_arn", ""),
-                                               ":t": _now_iso()})
+                                               ":t": _now_iso(),
+                                               # which acceptance this run honors —
+                                               # the idempotency guard's key
+                                               ":rec": latest_rec})
                 _task_event(task_id, "RunDispatched", "orchestrator",
                             {"run_id": result["run_id"]})
                 messages = _chat_tool_result(tu, {
