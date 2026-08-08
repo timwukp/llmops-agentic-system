@@ -2399,6 +2399,54 @@ class TestConductorDispatch:
         assert not missing, (f"harness declares tools nobody services: {missing} — "
                              "they would all return 'unsupported' at runtime")
 
+    def test_every_harness_prompt_carries_the_turn_end_invariant_naming_its_own_terminal_tools(self):
+        """The driver only recognizes tool calls; a stage that finishes in prose is a
+        stage that failed (MissingStageComplete). Four runs in one week died this way —
+        the same specialist fault each time, and re-stating the rule louder in per-plan
+        params fixed exactly the stages whose plans carried it (run b56281da: data-prep,
+        curate and finetune closed correctly; eval, mid-polling, did not). So the rule
+        lives in every fleet prompt now, and this guard derives it BOTH directions from
+        each harness's own tools[] list: every declared inline function must be named in
+        the invariant sentence (an unnamed escape hatch is one the model won't use under
+        pressure), and no tool may be named that is not declared (a stale name after a
+        tool is removed points the model at a function that returns 'unsupported')."""
+        for cfg in sorted((REPO / "agents").glob("*/harness.json")):
+            h = json.loads(cfg.read_text())
+            prompt = h["systemPrompt"][0]["text"]
+            declared = {t["name"] for t in h.get("tools", [])
+                        if t.get("type") == "inline_function"}
+            assert prompt.count("TURN-END INVARIANT") == 1, (
+                f"{cfg.parent.name}: the invariant must appear exactly once, "
+                f"found {prompt.count('TURN-END INVARIANT')}")
+            sentence = prompt.split("TURN-END INVARIANT")[1].split("\n- ")[0]
+            missing = {n for n in declared if n not in sentence}
+            assert not missing, (
+                f"{cfg.parent.name}: declared tools {missing} are not named in the "
+                "turn-end invariant — an exit the rule does not mention is an exit "
+                "the model will not take")
+            fleet_tools = {"stage_complete", "job_launched", "checkpoint",
+                           "escalate_human", "launch_run", "resolve_escalation",
+                           "page_human", "write_report", "publish_cost_report",
+                           "update_rate_card", "flag_variance"}
+            stale = {n for n in fleet_tools - declared if n in sentence}
+            assert not stale, (
+                f"{cfg.parent.name}: invariant names {stale} which this harness does "
+                "not declare — calling it returns 'unsupported' and burns the turn")
+            assert "BEFORE the call" in sentence, (
+                f"{cfg.parent.name}: the write-first clause is gone — prose is not "
+                "proof of work, and neither is a tool call claiming artifacts that "
+                "were never written")
+        # the orchestrator's consult mode legitimately ends turns in prose (a question
+        # to the customer IS the turn); its invariant must carve that out or the agent
+        # emits spurious checkpoints mid-conversation and breaks the choices/trailer
+        # protocol the console parses.
+        orch = json.loads((REPO / "agents/orchestrator/harness.json").read_text())
+        orch_sentence = orch["systemPrompt"][0]["text"].split(
+            "TURN-END INVARIANT")[1].split("\n- ")[0]
+        assert "consult" in orch_sentence, (
+            "the orchestrator's invariant lost its consult carve-out — consult turns "
+            "that properly end in prose would now read as protocol failures")
+
     def test_orchestrator_prompt_carries_the_consult_contract(self):
         h = json.loads((REPO / "agents/orchestrator/harness.json").read_text())
         prompt = h["systemPrompt"][0]["text"]

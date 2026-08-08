@@ -419,7 +419,11 @@ If a turn ends *without* an inline-function call (models sometimes narrate compl
 skip the structured call), the driver re-asks up to 2 **consecutive** times in the same
 session, then fails the stage as `MissingStageComplete` — narration is never promoted to
 success. Any serviced tool call re-arms the budget: what it counts is an agent that has
-stopped speaking protocol, not one that slipped twice an hour apart and recovered.
+stopped speaking protocol, not one that slipped twice an hour apart and recovered. Every
+fleet prompt also states this contract explicitly as a TURN-END INVARIANT naming that
+harness's own terminal tools, with a write-first rule (artifacts land in S3 before the
+call that claims them) — a guard test derives both directions from each harness's
+declared tools, so the sentence cannot drift from the tool list.
 
 ## 4. Launch-and-release with EventBridge wake
 

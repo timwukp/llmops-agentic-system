@@ -5,6 +5,32 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
 ## [Unreleased]
 
+### Every fleet prompt now states the turn-end invariant it was dying by
+
+The driver's contract has always been mechanical — only a tool call ends a stage; prose
+is `MissingStageComplete` — but the prompts only *suggested* it ("If work remains, call
+checkpoint…"). Four runs in one week died on that gap, all the same fault: the specialist
+did the work, then narrated instead of calling. The evidence that wording fixes it is a
+controlled pair: run b56281da's plan params carried a hard turn-end rule, and every stage
+whose agent read those params closed correctly; the eval stage, deep in SageMaker
+polling where the soft sentence gives no order, ended three turns in prose and killed
+the run.
+
+- All 7 `agents/*/harness.json` prompts: a `TURN-END INVARIANT` bullet at the top of
+  Rules, naming that harness's OWN terminal tools (finops has no stage_complete; its
+  exits are publish_cost_report / update_rate_card / flag_variance), plus the write-first
+  rule: artifacts land in S3 before the call that claims them. The orchestrator's
+  invariant carves out consult mode — a turn that asks the customer a question properly
+  ends in prose, and only a turn that owes a dispatch after "PLAN ACCEPTED" must end in
+  launch_run — mirroring the console's own owes-dispatch re-ask logic.
+- `tests/test_orchestration.py`: a derived guard
+  (`test_every_harness_prompt_carries_the_turn_end_invariant_naming_its_own_terminal_tools`)
+  reads each harness's tools[] and asserts both directions: every declared inline
+  function is named in the invariant sentence, and no undeclared tool is (a stale name
+  points the model at a function that returns 'unsupported'). Mutation-checked: deleting
+  one tool name from one prompt turns it red.
+- `agents/harness.json.template`: newly minted agents inherit the rule.
+
 ### The re-ask budget was a lifetime count; it is now consecutive
 
 One counter, three dead runs. When a turn ends in prose instead of an inline-function
