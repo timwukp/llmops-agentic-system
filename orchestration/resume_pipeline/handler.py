@@ -93,9 +93,14 @@ def handler(event, context=None, clients=None):
     try:
         if status in TERMINAL_OK:
             model_uri = (detail.get("ModelArtifacts", {}) or {}).get("S3ModelArtifacts", "")
-            ev.emit_event(os.environ["EVENT_BUS"], ev.MODEL_TRAINED,
-                          {"run_id": run_id, "job_name": job_name,
-                           "model_artifacts": model_uri}, client=c["events"])
+            # An eval-stage job is student INFERENCE riding the training-job rail;
+            # announcing MODEL_TRAINED for it would put a lie on the timeline. The
+            # eval score task emits MODEL_EVALUATED moments later, so eval jobs get
+            # no bus event here at all.
+            if run.get("current_stage") != "eval":
+                ev.emit_event(os.environ["EVENT_BUS"], ev.MODEL_TRAINED,
+                              {"run_id": run_id, "job_name": job_name,
+                               "model_artifacts": model_uri}, client=c["events"])
             c["sfn"].send_task_success(taskToken=token, output=json.dumps({
                 "run_id": run_id, "job_name": job_name, "status": "trained",
                 "model_artifacts": model_uri}))
