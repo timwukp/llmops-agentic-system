@@ -49,12 +49,12 @@ LLM 判斷。因此編排採用 **Step Functions Standard 狀態機**，智能�
 讓 LLM 決定「下一個階段是什麼」只會給系統中唯一不需要不確定性的部分添加不確定性、
 成本和故障模式。
 
-狀態機（`orchestration/state_machine.asl.json`）在正常路徑上有 **11 個 harness 任務狀態**
+狀態機（`orchestration/state_machine.asl.json`）在正常路徑上有 **12 個 harness 任務狀態**
 —— 每個都是帶 `waitForTaskToken` 的 harness driver Lambda 調用 —— 外加只在迴路中出現的
 `RemediateFinetune`，以及只在審計模式出現的 `DataAudit`：
 
 ```
-DataPrepGenerate → DataPrepCurate → FinetuneLaunch → FinetuneAnalyze → EvalGenerate → EvalGate
+DataPrepGenerate → DataPrepCurate → FinetuneLaunch → FinetuneAnalyze → EvalGenerate → EvalScore → EvalGate
                                                         │（門檻失敗）
                               RemediateFinetune ←───────┘   …門檻通過則：
              Deploy → SmokeTest → MonitorHealth → Teardown → MonitorReport
@@ -354,12 +354,22 @@ agent 真的照著做了的裁決一樣 —— 那種無法區分，正是 data-
 若一輪結束時*沒有* inline-function 呼叫（模型有時會口頭宣稱完成卻漏掉結構化呼叫），
 driver 在同一 session 內最多追問**連續** 2 次，然後以 `MissingStageComplete` 判定階段失敗 ——
 口頭敘述永遠不會被晉升為成功。任何被服務的 tool call 都會重置這個額度：它計的是
-「不再說協議語言的 agent」，而不是相隔一小時各失誤一次、之後已自行恢復的 agent。
+「不再說協議語言的 agent」，而不是相隔一小時各失誤一次、之後已自行恢復的 agent。每個
+fleet prompt 也把這份契約明寫為 TURN-END INVARIANT，點名該 harness 自己的終結工具，並附
+write-first 規則（artifact 先落 S3，宣稱它的呼叫在後）—— 有一個 guard test 從各 harness
+宣告的 tools 雙向推導這句話，讓它無法與工具清單漂移。
 
 ## 4. Launch-and-release 與 EventBridge 喚醒
 
 Harness 一輪有界（約 14 分鐘）；訓練作業跑數小時。規則：**harness 絕不空等作業**。
-finetune agent 發起 SageMaker 作業、呼叫 `job_launched`、session 隨即釋放。恢復管線的
+finetune agent 發起 SageMaker 訓練作業 —— eval agent 的學生推論作業也走同一條訓練作業
+軌道 —— 呼叫 `job_launched`、session 隨即釋放。被追蹤的作業若以 **Stopped 且 $0 計費**
+收場，那是容量問題而不是程式問題 —— 搶容量落敗或放棄等待配額的作業從未真正跑起來，
+什麼也沒證明 —— 所以 resume Lambda 以 `CapacityStopped` 結算 token，launch 狀態原地
+重入且不消耗 remediation iteration，每個 run 最多 3 次免費重發；第 4 次就按
+`TrainingJobFailed` 計，跟真失敗一樣。（eval 是付了學費才拿到這條路：沒有
+`job_launched` 時，它跨越長推論作業的唯一辦法是在輪內輪詢，而那正是散文結尾發生的地方；
+狀態機的 `EvalScore` 狀態現在會在作業完成後以全新 session 接手評分。）恢復管線的
 鏈路：
 
 1. Driver 把 Step Functions task token 按 job name 停放進 DynamoDB

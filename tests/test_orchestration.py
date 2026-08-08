@@ -763,6 +763,24 @@ class TestDriver:
         assert parked["ExpressionAttributeValues"][":t"] == "tok-123"
         assert any(e["DetailType"] == ev.TRAINING_STARTED for e in c["events"].entries)
 
+    def test_eval_job_launched_parks_token_and_releases(self):
+        """Launch-and-release is stage-generic: the eval agent parks its student
+        inference job on the same rail as finetune's training job, with
+        current_stage=eval so the resume Lambda knows whose completion it is
+        settling. Before eval had job_launched, its only way to span a long
+        inference job was polling in-turn — where prose turn-ends happen; run
+        b56281da died there with a healthy job mid-flight."""
+        ac = FakeAgentCore([
+            tool_use_stream("job_launched", {"job_name": "llmops-eval-infer-1"}),
+            text_stream("released")])
+        c = clients(ac)
+        out = driver.handler(driver_event(stage="eval", task="evaluate"), clients=c)
+        assert out["status"] == "released"
+        assert not c["sfn"].successes  # token NOT settled — resume λ owns it
+        parked = c["ddb"].Table(ENV["RUNS_TABLE"]).updates[0]
+        assert parked["ExpressionAttributeValues"][":j"] == "llmops-eval-infer-1"
+        assert parked["ExpressionAttributeValues"][":s"] == "eval"
+
     def test_escalate_human_notifies_and_fails_token(self):
         ac = FakeAgentCore([
             tool_use_stream("escalate_human", {"reason": "irrecoverable data drift"}),
@@ -1478,6 +1496,70 @@ class TestResumePipeline:
         assert out["outcome"] == "failed"
         assert c["sfn"].failures[0]["error"] == "TrainingJobFailed"
 
+    def test_a_completed_eval_inference_job_resumes_without_announcing_a_training(self):
+        """Eval-stage inference rides the SageMaker training-job rail (same EventBridge
+        rule, same parked token), but it is not a training: MODEL_TRAINED on the bus
+        for a batch-scoring job would be a lie on the timeline. The run row's
+        current_stage — written by handle_job_launched — is what tells them apart.
+        The token still settles identically; EvalScore's stage_complete emits
+        MODEL_EVALUATED moments later, so eval jobs get no bus event here at all."""
+        c = self._clients({"run_id": "run-1", "task_token": "tok-9",
+                           "current_stage": "eval"})
+        out = resume_pipeline.handler(
+            sm_event("Completed", job="llmops-eval-infer-1",
+                     ModelArtifacts={"S3ModelArtifacts": "s3://b/out.tar.gz"}),
+            clients=c)
+        assert out["outcome"] == "resumed"
+        assert c["sfn"].successes, "the eval token was never settled"
+        assert not any(e["DetailType"] == ev.MODEL_TRAINED
+                       for e in c["events"].entries), (
+            "a student-inference completion was announced as MODEL_TRAINED")
+
+    def test_a_zero_billed_stop_relaunches_without_spending_an_iteration(self):
+        """Stopped with $0 billed is capacity, not code: the job never ran (Pending
+        time is unbilled) and proved nothing. Before this branch existed, a capacity
+        race loser fired TrainingJobFailed and spent a remediation iteration on
+        weather — with only 3 in the budget, two starved instance types and one real
+        bug exhausted a run that did nothing wrong."""
+        c = self._clients({"run_id": "run-1", "task_token": "tok-9"})
+        out = resume_pipeline.handler(
+            sm_event("Stopped", BillingSecondsUsed=0), clients=c)
+        assert out["outcome"] == "capacity-relaunch"
+        assert c["sfn"].failures[0]["error"] == "CapacityStopped", (
+            "the launch state's Catch routes on this exact error name")
+        assert any(e["DetailType"] == ev.CAPACITY_STOPPED
+                   for e in c["events"].entries)
+        assert not any(e["DetailType"] == ev.PIPELINE_FAILED
+                       for e in c["events"].entries), (
+            "a free relaunch announced itself as a pipeline failure")
+        # the retry counter rides the token-clear write: a crash between two separate
+        # writes would hand out an uncounted free relaunch
+        upd = c["ddb"].Table(ENV["RUNS_TABLE"]).updates[0]
+        assert "capacity_retries" in upd["UpdateExpression"]
+        assert upd["ExpressionAttributeValues"][":n"] == 1
+
+    def test_a_billed_stop_is_a_real_failure(self):
+        """A stop that billed seconds was a judgment call on a RUNNING job — an
+        operator or guard stopped real work. That keeps the TrainingJobFailed path
+        and its remediation-iteration cost; only never-ran stops are free."""
+        c = self._clients({"run_id": "run-1", "task_token": "tok-9"})
+        out = resume_pipeline.handler(
+            sm_event("Stopped", BillingSecondsUsed=1200), clients=c)
+        assert out["outcome"] == "failed"
+        assert c["sfn"].failures[0]["error"] == "TrainingJobFailed"
+
+    def test_the_fourth_capacity_stop_stops_being_free(self):
+        """The CapacityStopped Catch re-enters the launch state without
+        IncrementIteration, so the ASL has no loop guard of its own — this cap is
+        it. A permanently starved instance type must eventually become a real
+        failure someone gets paged about, not an infinite quiet relaunch loop."""
+        c = self._clients({"run_id": "run-1", "task_token": "tok-9",
+                           "capacity_retries": 3})
+        out = resume_pipeline.handler(
+            sm_event("Stopped", BillingSecondsUsed=0), clients=c)
+        assert out["outcome"] == "failed"
+        assert c["sfn"].failures[0]["error"] == "TrainingJobFailed"
+
     def test_unknown_job_is_skipped(self):
         c = self._clients(run=None)
         out = resume_pipeline.handler(sm_event("Completed", job="someone-elses-job"),
@@ -1869,7 +1951,7 @@ class TestStateMachine:
         CLEANUP = {"Teardown", "MonitorHealth", "MonitorReport", "SmokeTest",
                    "Deploy", "DataAudit", "FinetuneAnalyze"}
         LONG_WORK = {"DataPrepGenerate", "DataPrepCurate", "FinetuneLaunch",
-                     "EvalGenerate", "EvalGate", "RemediateFinetune"}
+                     "EvalGenerate", "EvalScore", "EvalGate", "RemediateFinetune"}
         timed = {n for n, st in asl["States"].items() if "TimeoutSeconds" in st}
         assert timed == CLEANUP | LONG_WORK, (
             f"the timeout policy names {sorted(CLEANUP | LONG_WORK)} but the ASL times "
@@ -2095,6 +2177,30 @@ class TestStateMachine:
                 assert rp not in ("__absent__", "$"), (
                     f"{name}'s catch to {cat['Next']} replaces the state with the error "
                     "object, discarding $.run_id and $.iteration")
+
+    def test_a_capacity_stop_relaunches_the_same_state_without_incrementing_iteration(self, asl):
+        """A CapacityStopped Catch must re-enter the state that launched the job,
+        with $.iteration untouched: capacity is weather, and the remediation budget
+        (iteration < 3) exists for code failures. If the Catch ever routes through
+        IncrementIteration — or anywhere other than straight back — a starved
+        instance type starts eating the budget again, which is how a run that did
+        nothing wrong got executed. Derived over every state that has the Catch, so
+        a launch state added later inherits the assertion."""
+        found = []
+        for name, st in asl["States"].items():
+            for cat in st.get("Catch", []):
+                if "CapacityStopped" not in cat.get("ErrorEquals", []):
+                    continue
+                found.append(name)
+                assert cat["Next"] == name, (
+                    f"{name}'s CapacityStopped catch goes to {cat['Next']}; a free "
+                    "relaunch means re-entering the SAME state")
+                assert cat.get("ResultPath") == "$.error", (
+                    f"{name}'s capacity catch must file the error under $.error and "
+                    "keep $.iteration — replacing the state resets the run's context")
+        assert set(found) >= {"FinetuneLaunch", "EvalGenerate"}, (
+            f"the capacity exemption covers {found}; both launch-and-release states "
+            "park tracked jobs and both race capacity")
 
     def test_a_conductor_dispatched_task_is_closed_out_when_its_run_ends(self, asl):
         """The zombie-run bug, one level up: the TASK stays 'dispatched' forever.
@@ -2326,26 +2432,36 @@ class TestEveryDeclaredTaskIsReachable:
         """The producer of evaluation/report.json must precede its consumer.
 
         Asserted as reachability rather than a literal Next: the guarantee is ordering,
-        and it survives a state being inserted between them.
+        and it survives a state being inserted between them. Since the eval stage
+        became a launch/score pair, the report's producer is the SCORE task (evaluate
+        may end at job_launched with no report yet); score is also the only entry
+        into the gate, so no route arrives at EvalGate without the report written.
         """
         states = asl["States"]
-        gen = [n for n, st in states.items()
-               if ((st.get("Parameters") or {}).get("Payload") or {}).get("task")
-               == "evaluate"]
-        assert len(gen) == 1, f"expected exactly one evaluate state, found {gen}"
-        assert _reaches(states, gen[0], "EvalGate"), (
-            f"{gen[0]} produces evaluation/report.json but cannot reach EvalGate, "
+        producer = [n for n, st in states.items()
+                    if ((st.get("Parameters") or {}).get("Payload") or {}).get("task")
+                    == "score"]
+        assert len(producer) == 1, f"expected exactly one score state, found {producer}"
+        launcher = [n for n, st in states.items()
+                    if ((st.get("Parameters") or {}).get("Payload") or {}).get("task")
+                    == "evaluate"]
+        assert len(launcher) == 1, f"expected exactly one evaluate state, found {launcher}"
+        assert _reaches(states, launcher[0], producer[0]), (
+            f"{launcher[0]} launches the inference {producer[0]} scores, but cannot "
+            "reach it")
+        assert _reaches(states, producer[0], "EvalGate"), (
+            f"{producer[0]} produces evaluation/report.json but cannot reach EvalGate, "
             "which reads it")
         # Ordering is asserted on the ENTRY paths into the gate, not by demanding the
-        # gate cannot reach the generator: it can and must, because the remediation
+        # gate cannot reach the producer: it can and must, because the remediation
         # loop goes back around and re-evaluates (the next test pins that). What must
-        # hold is that no route ARRIVES at EvalGate without passing the generator
+        # hold is that no route ARRIVES at EvalGate without passing the producer
         # first -- that is the reading a stale report would need.
         entries = [n for n, st in states.items() if "EvalGate" in _exits(st)]
         assert entries, "nothing transitions into EvalGate"
-        assert entries == [gen[0]], (
-            f"EvalGate is entered from {entries}; only {gen[0]} may lead into it, or a "
-            "run can reach the gate without the report it reads having been written")
+        assert entries == [producer[0]], (
+            f"EvalGate is entered from {entries}; only {producer[0]} may lead into it, "
+            "or a run can reach the gate without the report it reads having been written")
 
     def test_the_remediation_loop_regenerates_the_report_it_regates(self, asl):
         """A second gate attempt must re-run evaluation, not re-read the stale report.
@@ -2398,6 +2514,54 @@ class TestConductorDispatch:
         missing = declared - serviced
         assert not missing, (f"harness declares tools nobody services: {missing} — "
                              "they would all return 'unsupported' at runtime")
+
+    def test_every_harness_prompt_carries_the_turn_end_invariant_naming_its_own_terminal_tools(self):
+        """The driver only recognizes tool calls; a stage that finishes in prose is a
+        stage that failed (MissingStageComplete). Four runs in one week died this way —
+        the same specialist fault each time, and re-stating the rule louder in per-plan
+        params fixed exactly the stages whose plans carried it (run b56281da: data-prep,
+        curate and finetune closed correctly; eval, mid-polling, did not). So the rule
+        lives in every fleet prompt now, and this guard derives it BOTH directions from
+        each harness's own tools[] list: every declared inline function must be named in
+        the invariant sentence (an unnamed escape hatch is one the model won't use under
+        pressure), and no tool may be named that is not declared (a stale name after a
+        tool is removed points the model at a function that returns 'unsupported')."""
+        for cfg in sorted((REPO / "agents").glob("*/harness.json")):
+            h = json.loads(cfg.read_text())
+            prompt = h["systemPrompt"][0]["text"]
+            declared = {t["name"] for t in h.get("tools", [])
+                        if t.get("type") == "inline_function"}
+            assert prompt.count("TURN-END INVARIANT") == 1, (
+                f"{cfg.parent.name}: the invariant must appear exactly once, "
+                f"found {prompt.count('TURN-END INVARIANT')}")
+            sentence = prompt.split("TURN-END INVARIANT")[1].split("\n- ")[0]
+            missing = {n for n in declared if n not in sentence}
+            assert not missing, (
+                f"{cfg.parent.name}: declared tools {missing} are not named in the "
+                "turn-end invariant — an exit the rule does not mention is an exit "
+                "the model will not take")
+            fleet_tools = {"stage_complete", "job_launched", "checkpoint",
+                           "escalate_human", "launch_run", "resolve_escalation",
+                           "page_human", "write_report", "publish_cost_report",
+                           "update_rate_card", "flag_variance"}
+            stale = {n for n in fleet_tools - declared if n in sentence}
+            assert not stale, (
+                f"{cfg.parent.name}: invariant names {stale} which this harness does "
+                "not declare — calling it returns 'unsupported' and burns the turn")
+            assert "BEFORE the call" in sentence, (
+                f"{cfg.parent.name}: the write-first clause is gone — prose is not "
+                "proof of work, and neither is a tool call claiming artifacts that "
+                "were never written")
+        # the orchestrator's consult mode legitimately ends turns in prose (a question
+        # to the customer IS the turn); its invariant must carve that out or the agent
+        # emits spurious checkpoints mid-conversation and breaks the choices/trailer
+        # protocol the console parses.
+        orch = json.loads((REPO / "agents/orchestrator/harness.json").read_text())
+        orch_sentence = orch["systemPrompt"][0]["text"].split(
+            "TURN-END INVARIANT")[1].split("\n- ")[0]
+        assert "consult" in orch_sentence, (
+            "the orchestrator's invariant lost its consult carve-out — consult turns "
+            "that properly end in prose would now read as protocol failures")
 
     def test_orchestrator_prompt_carries_the_consult_contract(self):
         h = json.loads((REPO / "agents/orchestrator/harness.json").read_text())

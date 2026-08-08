@@ -55,12 +55,12 @@ and intelligence lives *inside* each stage. An LLM deciding "what stage comes ne
 add nondeterminism, cost, and failure modes to the one part of the system that benefits
 from having none.
 
-The state machine (`orchestration/state_machine.asl.json`) has **11 harness-task states
+The state machine (`orchestration/state_machine.asl.json`) has **12 harness-task states
 on the happy path** — each a `waitForTaskToken` Lambda invocation of the harness driver
 — plus the loop-only `RemediateFinetune` and the audit-only `DataAudit`:
 
 ```
-DataPrepGenerate → DataPrepCurate → FinetuneLaunch → FinetuneAnalyze → EvalGenerate → EvalGate
+DataPrepGenerate → DataPrepCurate → FinetuneLaunch → FinetuneAnalyze → EvalGenerate → EvalScore → EvalGate
                                                         │ (gate fail)
                               RemediateFinetune ←───────┘   … then, on gate pass:
              Deploy → SmokeTest → MonitorHealth → Teardown → MonitorReport
@@ -419,13 +419,25 @@ If a turn ends *without* an inline-function call (models sometimes narrate compl
 skip the structured call), the driver re-asks up to 2 **consecutive** times in the same
 session, then fails the stage as `MissingStageComplete` — narration is never promoted to
 success. Any serviced tool call re-arms the budget: what it counts is an agent that has
-stopped speaking protocol, not one that slipped twice an hour apart and recovered.
+stopped speaking protocol, not one that slipped twice an hour apart and recovered. Every
+fleet prompt also states this contract explicitly as a TURN-END INVARIANT naming that
+harness's own terminal tools, with a write-first rule (artifacts land in S3 before the
+call that claims them) — a guard test derives both directions from each harness's
+declared tools, so the sentence cannot drift from the tool list.
 
 ## 4. Launch-and-release with EventBridge wake
 
 A harness turn is bounded (~14 min); a training job runs for hours. The rule: **a harness
-never waits on a job**. The finetune agent launches the SageMaker job, calls
-`job_launched`, and its session is released. The chain that resumes the pipeline:
+never waits on a job**. The finetune agent launches the SageMaker training job — and the
+eval agent its student-inference job, which rides the same training-job rail — calls
+`job_launched`, and its session is released. A tracked job that ends **Stopped with $0
+billed** is capacity, not code — a race loser or an abandoned quota wait never ran and
+proved nothing — so the resume Lambda settles the token as `CapacityStopped` and the
+launch state re-enters itself with the remediation iteration unspent, up to 3 free
+relaunches per run; the 4th counts as `TrainingJobFailed` like any real failure. (Eval earned this path the hard way: with no
+`job_launched`, its only way to span a long inference job was polling in-turn, which is
+where prose turn-ends happen; the machine's `EvalScore` state now picks up scoring in a
+fresh session after the job completes.) The chain that resumes the pipeline:
 
 1. Driver parks the Step Functions task token in DynamoDB (`llmops-pipeline-runs`,
    GSI `job_name-index`), keyed by job name.

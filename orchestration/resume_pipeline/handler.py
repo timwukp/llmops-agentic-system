@@ -28,6 +28,25 @@ except ImportError:  # Lambda bundle layout
 TERMINAL_OK = ("Completed",)
 TERMINAL_BAD = ("Failed", "Stopped")
 
+#: Free capacity relaunches per run before a stop counts as a real failure. The cap
+#: lives here (the only writer with the facts) rather than in a second ASL counter:
+#: the CapacityStopped Catch re-enters the same state without IncrementIteration, so
+#: without this cap a permanently-starved instance type would relaunch forever.
+CAPACITY_RETRY_CAP = 3
+
+
+def _is_capacity_stop(detail: dict) -> bool:
+    """Stopped with $0 billed is capacity, not code.
+
+    A job stopped while Pending (capacity race loser, quota wait given up on) never
+    ran and proved nothing about the code — treating it as TrainingJobFailed spends a
+    remediation iteration on weather. BillingSecondsUsed is the discriminator the
+    capacity-race guard itself uses: Pending time is unbilled, so a stop that billed
+    seconds was a judgment call on a RUNNING job and keeps the failure path.
+    """
+    return (detail.get("TrainingJobStatus") == "Stopped"
+            and int(detail.get("BillingSecondsUsed") or 0) == 0)
+
 # The two ways Step Functions says "this token is dead": TaskTimedOut carries the
 # message 'Provided task does not exist anymore', TaskDoesNotExist is the never-existed
 # case. Matched by botocore error CODE rather than by exception class, because the
@@ -93,13 +112,33 @@ def handler(event, context=None, clients=None):
     try:
         if status in TERMINAL_OK:
             model_uri = (detail.get("ModelArtifacts", {}) or {}).get("S3ModelArtifacts", "")
-            ev.emit_event(os.environ["EVENT_BUS"], ev.MODEL_TRAINED,
-                          {"run_id": run_id, "job_name": job_name,
-                           "model_artifacts": model_uri}, client=c["events"])
+            # An eval-stage job is student INFERENCE riding the training-job rail;
+            # announcing MODEL_TRAINED for it would put a lie on the timeline. The
+            # eval score task emits MODEL_EVALUATED moments later, so eval jobs get
+            # no bus event here at all.
+            if run.get("current_stage") != "eval":
+                ev.emit_event(os.environ["EVENT_BUS"], ev.MODEL_TRAINED,
+                              {"run_id": run_id, "job_name": job_name,
+                               "model_artifacts": model_uri}, client=c["events"])
             c["sfn"].send_task_success(taskToken=token, output=json.dumps({
                 "run_id": run_id, "job_name": job_name, "status": "trained",
                 "model_artifacts": model_uri}))
             outcome = "resumed"
+        elif (_is_capacity_stop(detail)
+              and int(run.get("capacity_retries") or 0) < CAPACITY_RETRY_CAP):
+            # The launch state Catches CapacityStopped back into itself with
+            # $.iteration unchanged — a free relaunch. The cap above is the loop
+            # guard; the (CAPACITY_RETRY_CAP+1)th stop falls through to the real
+            # failure branch and spends an iteration like any other failure.
+            n = int(run.get("capacity_retries") or 0) + 1
+            ev.emit_event(os.environ["EVENT_BUS"], ev.CAPACITY_STOPPED,
+                          {"run_id": run_id, "job_name": job_name,
+                           "capacity_retries": n}, client=c["events"])
+            c["sfn"].send_task_failure(
+                taskToken=token, error="CapacityStopped",
+                cause=f"job stopped with $0 billed (capacity), free relaunch "
+                      f"{n}/{CAPACITY_RETRY_CAP}")
+            outcome = "capacity-relaunch"
         else:
             reason = detail.get("FailureReason", status)
             ev.emit_event(os.environ["EVENT_BUS"], ev.PIPELINE_FAILED,
@@ -123,12 +162,20 @@ def handler(event, context=None, clients=None):
         print(f"[resume] token for {run_id} was already gone: {settle_error}")
 
     # Clear the token so a duplicate EventBridge delivery can't double-settle, and so a
-    # dead token does not sit in the row looking like work still in flight.
+    # dead token does not sit in the row looking like work still in flight. On the
+    # capacity path the retry counter rides the same write: incrementing it separately
+    # would open a window where a crash between the two writes hands out a free
+    # relaunch that was never counted.
     try:
+        update = "REMOVE task_token SET last_job_status = :s"
+        values = {":s": status}
+        if outcome == "capacity-relaunch":
+            update += ", capacity_retries = :n"
+            values[":n"] = int(run.get("capacity_retries") or 0) + 1
         c["ddb"].Table(os.environ["RUNS_TABLE"]).update_item(
             Key={"run_id": run_id},
-            UpdateExpression="REMOVE task_token SET last_job_status = :s",
-            ExpressionAttributeValues={":s": status})
+            UpdateExpression=update,
+            ExpressionAttributeValues=values)
     except Exception as exc:  # noqa: BLE001
         # Say so instead of dying silently: this exact failure (AccessDenied) is what
         # stranded the token in the first place, and it was invisible because the

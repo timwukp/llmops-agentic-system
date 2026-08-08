@@ -5,6 +5,92 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
 ## [Unreleased]
 
+### A $0 capacity stop no longer spends the remediation budget
+
+`resume_pipeline` treated `Stopped` and `Failed` identically (`TERMINAL_BAD`): a tracked
+job stopped while Pending — a capacity race loser, or a quota wait given up on — fired
+`TrainingJobFailed` and consumed one of the run's 3 remediation iterations, exactly as if
+the code had crashed. But a job that never left Pending billed $0 and proved nothing;
+spending remediation budget on it is spending budget on weather. The conductor's own
+triage learnings called this out after the b56281da lineage: "capacity-stops ($0 billed)
+should not consume the same remediation budget as code failures."
+
+- `orchestration/resume_pipeline/handler.py`: `_is_capacity_stop` — Stopped AND
+  `BillingSecondsUsed == 0` (the same economics the capacity-race guard runs on: Pending
+  time is unbilled, so a stop that billed seconds was a judgment call on a *running* job
+  and keeps the failure path). Up to 3 free relaunches per run (`capacity_retries`,
+  incremented in the same DynamoDB write that clears the token — a separate write would
+  open a crash window handing out uncounted relaunches); the 4th falls through to
+  `TrainingJobFailed`.
+- `orchestration/state_machine.asl.json`: `FinetuneLaunch` and `EvalGenerate` each gain a
+  `CapacityStopped` Catch that re-enters the same state with `$.iteration` unchanged —
+  no `IncrementIteration` on the path, pinned by a derived ASL test that covers any
+  future launch state carrying the Catch.
+- `pipeline/contracts/events.py`: `CAPACITY_STOPPED`, informational like
+  `MODEL_FAILED_OVER` — the timeline's answer to "why did this state run twice".
+- Tests (all red-first verified): zero-billed stop relaunches free with the counter
+  riding the token-clear write; a billed stop stays a real failure; the 4th capacity
+  stop stops being free; the Catch re-enters the same state.
+
+### The eval stage gets launch-and-release; polling in-turn is what killed it
+
+The eval agent's prompt said "there are no training jobs at your stage" — written when
+eval meant judging a few dozen answers against a live endpoint. Reality caught up: student
+inference for a 40-task holdout runs as a SageMaker training-type job that takes an hour,
+and the agent's only legal way to span it was polling in-turn under a 10-minute cap. Long
+polls are exactly where prose turn-ends happen; run b56281da died mid-poll with a healthy
+job in flight and nobody listening for it to finish. Meanwhile the finetune stage has
+never had this problem, because it has never been allowed to wait: `job_launched` parks
+the token, EventBridge wakes the resume Lambda, a fresh session picks up. Eval now rides
+the same rail.
+
+- `agents/eval/harness.json`: gains the `job_launched` tool; the "evaluate" task either
+  finishes small sets synchronously (stage_complete) or launches inference and releases
+  (job_launched); a new "score" task picks up in a fresh session after the job completes
+  — idempotent when evaluate already wrote the report. The stale no-training-jobs rule is
+  replaced with finetune's launch-and-release wording.
+- `orchestration/state_machine.asl.json`: new `EvalScore` state between `EvalGenerate`
+  and `EvalGate` (waitForTaskToken, 86400s, Catch → EscalateFail). The happy path is now
+  12 harness-task states; ARCHITECTURE (both languages) and PROJECT_STATE updated, and
+  the derived docs-count guards forced every one of those edits.
+- `orchestration/harness_driver/handler.py`: `handle_job_launched` documents that it is
+  stage-generic (TRAINING_STARTED describes the SageMaker job kind; the run row's
+  current_stage says whose it is); STAGE_EVENT_MAP maps ("eval","score") →
+  MODEL_EVALUATED.
+- `orchestration/resume_pipeline/handler.py`: a completed eval-stage job settles the
+  token but does NOT announce MODEL_TRAINED — a batch-scoring completion on the timeline
+  as a training would be a lie; EvalScore's stage_complete emits MODEL_EVALUATED moments
+  later. Red-first verified.
+- Tests: eval token parking (current_stage=eval), resume-without-MODEL_TRAINED, and the
+  report-before-gate reachability test now derives the producer as the "score" task and
+  additionally asserts evaluate reaches score.
+
+### Every fleet prompt now states the turn-end invariant it was dying by
+
+The driver's contract has always been mechanical — only a tool call ends a stage; prose
+is `MissingStageComplete` — but the prompts only *suggested* it ("If work remains, call
+checkpoint…"). Four runs in one week died on that gap, all the same fault: the specialist
+did the work, then narrated instead of calling. The evidence that wording fixes it is a
+controlled pair: run b56281da's plan params carried a hard turn-end rule, and every stage
+whose agent read those params closed correctly; the eval stage, deep in SageMaker
+polling where the soft sentence gives no order, ended three turns in prose and killed
+the run.
+
+- All 7 `agents/*/harness.json` prompts: a `TURN-END INVARIANT` bullet at the top of
+  Rules, naming that harness's OWN terminal tools (finops has no stage_complete; its
+  exits are publish_cost_report / update_rate_card / flag_variance), plus the write-first
+  rule: artifacts land in S3 before the call that claims them. The orchestrator's
+  invariant carves out consult mode — a turn that asks the customer a question properly
+  ends in prose, and only a turn that owes a dispatch after "PLAN ACCEPTED" must end in
+  launch_run — mirroring the console's own owes-dispatch re-ask logic.
+- `tests/test_orchestration.py`: a derived guard
+  (`test_every_harness_prompt_carries_the_turn_end_invariant_naming_its_own_terminal_tools`)
+  reads each harness's tools[] and asserts both directions: every declared inline
+  function is named in the invariant sentence, and no undeclared tool is (a stale name
+  points the model at a function that returns 'unsupported'). Mutation-checked: deleting
+  one tool name from one prompt turns it red.
+- `agents/harness.json.template`: newly minted agents inherit the rule.
+
 ### The re-ask budget was a lifetime count; it is now consecutive
 
 One counter, three dead runs. When a turn ends in prose instead of an inline-function
