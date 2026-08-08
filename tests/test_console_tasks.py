@@ -1061,6 +1061,70 @@ def test_a_second_launch_run_does_not_start_a_second_run(wired, monkeypatch):
     assert wired.tasks.items[tid]["status"] == "dispatched"
 
 
+def test_a_fresh_acceptance_dispatches_despite_a_dead_predecessor_run(wired, monkeypatch):
+    """The idempotency guard's unit is the ACCEPTANCE RECORD, not the task.
+
+    Found live: continuation #5's signature (a new approval record on the same
+    consultation thread) was refused with already_dispatched because the dead
+    continuation #4's run_id still sat on the task row. Keyed on run_id alone,
+    the guard made every continuation signed in an existing thread
+    undispatchable forever — the operator had to hand-clear the row in DynamoDB
+    to honor a signature the human had already given."""
+    tid = _mk_task(wired, status="accepting")
+    # a prior dispatch left its run and its honored record on the row
+    old = _signed_approval(wired.kms, b'{"goal":"old plan"}')
+    new = _signed_approval(wired.kms, b'{"goal":"x"}')
+    assert old["record_sha256"] != new["record_sha256"]
+    wired.tasks.items[tid]["run_id"] = "run-dead-0004"
+    wired.tasks.items[tid]["dispatched_record"] = old["record_sha256"]
+    wired.tasks.items[tid]["approvals"] = [old, new]
+
+    class _AC:
+        def invoke_harness(self, **kw):
+            if not wired.lam.invokes:
+                return _tool_call_stream("launch_run", {"plan_uri": _PLAN_URI})
+            return _text_stream("Dispatched.")
+
+    monkeypatch.setattr(wired.console, "agentcore_chat", _AC())
+    monkeypatch.setattr(wired.console, "_resolve_harness_id", lambda x: "llmops_orchestrator-x")
+    wired.console.run_task_turn(tid, accept=True)
+    starts = [i for i in wired.lam.invokes
+              if i.get("InvocationType") == "RequestResponse"]
+    assert len(starts) == 1, (
+        "a fresh acceptance was refused because a dead predecessor's run_id "
+        "still sat on the task row")
+    assert wired.tasks.items[tid]["status"] == "dispatched"
+    assert wired.tasks.items[tid]["dispatched_record"] == new["record_sha256"], (
+        "the dispatch must record WHICH acceptance it honored, or the next "
+        "continuation hits the same wall")
+
+
+def test_a_pre_fix_row_with_no_dispatched_record_stays_blocked(wired, monkeypatch):
+    """A row carrying a run_id but no dispatched_record predates the fix: it
+    cannot prove the latest signature was never honored, so the guard stays
+    conservative and an operator clears it deliberately. Guessing here is how a
+    duplicate GPU run happens."""
+    tid = _mk_task(wired, status="accepting")
+    wired.tasks.items[tid]["run_id"] = "run-prefix-0001"
+    wired.tasks.items[tid]["approvals"] = [
+        _signed_approval(wired.kms, b'{"goal":"x"}')]
+    replies = []
+
+    class _AC:
+        def invoke_harness(self, **kw):
+            if len(replies) == 0:
+                replies.append(1)
+                return _tool_call_stream("launch_run", {"plan_uri": _PLAN_URI})
+            return _text_stream("Understood.")
+
+    monkeypatch.setattr(wired.console, "agentcore_chat", _AC())
+    monkeypatch.setattr(wired.console, "_resolve_harness_id", lambda x: "llmops_orchestrator-x")
+    wired.console.run_task_turn(tid, accept=True)
+    starts = [i for i in wired.lam.invokes
+              if i.get("InvocationType") == "RequestResponse"]
+    assert not starts, "an ambiguous pre-fix row must not dispatch"
+
+
 def test_tool_results_go_back_as_text_not_json_blocks(wired, monkeypatch):
     """Live: the harness runtime rejected every tool result we sent —
     "runtimeClientError ... content_type=<json_> | unsupported type" — so the loop

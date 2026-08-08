@@ -5,6 +5,29 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
 ## [Unreleased]
 
+### The dispatch guard keyed on the task; the unit of idempotency is the acceptance
+
+"One acceptance authorizes exactly one run" was enforced as "one task ever dispatches
+once": the launch_run guard blocked whenever the task row carried ANY run_id. A
+consultation thread whose run died gets a fresh signature for its continuation — and
+that new acceptance, never honored, was refused with `already_dispatched` pointing at
+the corpse. Found live within hours of shipping the continuation workflow: continuation
+#5's acceptance (record `17fd4218…`) was refused because dead continuation #4's run_id
+still sat on `task-70a558ec8da031d1`; the operator had to hand-clear the row in DynamoDB
+to honor a signature the human had already given. The orchestrator's conduct on the
+refusal is worth recording: it verified no new run existed, identified the two distinct
+acceptance records, refused to blind-retry, and reported honestly.
+
+- `deploy/console/lambda_function.py`: the guard now compares the latest approval's
+  `record_sha256` against a new `dispatched_record` attribute written at dispatch time —
+  blocked only when THIS acceptance already produced a run. Pre-fix rows (run_id present,
+  `dispatched_record` absent) stay conservatively blocked: they cannot prove the new
+  signature is new, and guessing is how a duplicate GPU run happens; an operator clears
+  them deliberately.
+- Tests: a fresh acceptance dispatches despite a dead predecessor's run_id (red against
+  the old guard — verified by stashing the fix); an ambiguous pre-fix row stays blocked;
+  the original one-acceptance-one-run test passes unchanged.
+
 ### A $0 capacity stop no longer spends the remediation budget
 
 `resume_pipeline` treated `Stopped` and `Failed` identically (`TERMINAL_BAD`): a tracked
