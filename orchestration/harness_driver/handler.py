@@ -48,6 +48,10 @@ STAGE_EVENT_MAP = {
     # ModelEvaluated was declared in the event vocabulary and emitted by NOTHING --
     # the same absence as the evaluate task itself, from the other side.
     ("eval", "evaluate"): ev.MODEL_EVALUATED,
+    # score is the follow-on state after a launch-and-release inference job; when
+    # evaluate finishes synchronously instead, score just verifies the report, and
+    # a second ModelEvaluated for the same iteration is harmless bus noise.
+    ("eval", "score"): ev.MODEL_EVALUATED,
     ("deploy", "deploy"): ev.MODEL_DEPLOYED,
     ("deploy", "smoke"): ev.SMOKE_TEST_PASSED,
     ("deploy", "teardown"): ev.ENDPOINT_DELETED,
@@ -511,7 +515,13 @@ def handle_stage_complete(c, event, args) -> dict:
 
 
 def handle_job_launched(c, event, args) -> dict:
-    """Launch-and-release: park the token keyed by job name; resume λ settles it."""
+    """Launch-and-release: park the token keyed by job name; resume λ settles it.
+
+    Stage-generic: finetune parks its training job here and eval parks its student
+    inference job (which runs as a SageMaker training-type job, so the same
+    EventBridge rule wakes the same resume Lambda). TRAINING_STARTED is emitted for
+    both deliberately -- the event describes the SageMaker job kind, and the run row's
+    current_stage says whose it is."""
     run_id = event["run_id"]
     table = c["ddb"].Table(os.environ["RUNS_TABLE"])
     table.update_item(

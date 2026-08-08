@@ -5,6 +5,39 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
 ## [Unreleased]
 
+### The eval stage gets launch-and-release; polling in-turn is what killed it
+
+The eval agent's prompt said "there are no training jobs at your stage" — written when
+eval meant judging a few dozen answers against a live endpoint. Reality caught up: student
+inference for a 40-task holdout runs as a SageMaker training-type job that takes an hour,
+and the agent's only legal way to span it was polling in-turn under a 10-minute cap. Long
+polls are exactly where prose turn-ends happen; run b56281da died mid-poll with a healthy
+job in flight and nobody listening for it to finish. Meanwhile the finetune stage has
+never had this problem, because it has never been allowed to wait: `job_launched` parks
+the token, EventBridge wakes the resume Lambda, a fresh session picks up. Eval now rides
+the same rail.
+
+- `agents/eval/harness.json`: gains the `job_launched` tool; the "evaluate" task either
+  finishes small sets synchronously (stage_complete) or launches inference and releases
+  (job_launched); a new "score" task picks up in a fresh session after the job completes
+  — idempotent when evaluate already wrote the report. The stale no-training-jobs rule is
+  replaced with finetune's launch-and-release wording.
+- `orchestration/state_machine.asl.json`: new `EvalScore` state between `EvalGenerate`
+  and `EvalGate` (waitForTaskToken, 86400s, Catch → EscalateFail). The happy path is now
+  12 harness-task states; ARCHITECTURE (both languages) and PROJECT_STATE updated, and
+  the derived docs-count guards forced every one of those edits.
+- `orchestration/harness_driver/handler.py`: `handle_job_launched` documents that it is
+  stage-generic (TRAINING_STARTED describes the SageMaker job kind; the run row's
+  current_stage says whose it is); STAGE_EVENT_MAP maps ("eval","score") →
+  MODEL_EVALUATED.
+- `orchestration/resume_pipeline/handler.py`: a completed eval-stage job settles the
+  token but does NOT announce MODEL_TRAINED — a batch-scoring completion on the timeline
+  as a training would be a lie; EvalScore's stage_complete emits MODEL_EVALUATED moments
+  later. Red-first verified.
+- Tests: eval token parking (current_stage=eval), resume-without-MODEL_TRAINED, and the
+  report-before-gate reachability test now derives the producer as the "score" task and
+  additionally asserts evaluate reaches score.
+
 ### Every fleet prompt now states the turn-end invariant it was dying by
 
 The driver's contract has always been mechanical — only a tool call ends a stage; prose

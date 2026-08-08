@@ -196,7 +196,7 @@
     },
     "EvalGenerate": {
       "Type": "Task",
-      "Comment": "Produce evaluation/report.json. The gate below READS that report and applies thresholds to it; this state is what writes it. Both tasks are declared in the eval harness prompt, but only 'gate' was ever dispatched, so the only eval task the pipeline could run read an input no path produced. Fail-closed gate semantics hid it perfectly: a gate that failed because its report was never generated is indistinguishable from a gate that failed because the student was bad. Phase 4's verdict stood only because eval was run DIRECTLY, outside the machine.",
+      "Comment": "Prepare the eval and either finish synchronously or launch student inference as a SageMaker job via job_launched (launch-and-release, same shape as FinetuneLaunch). Before this was a launch/score pair, the eval agent had no legal way to span a long inference job except polling in-turn -- which is exactly where prose turn-ends happen; run-20260808T024809Z-b56281da died there with a healthy job mid-flight and nobody listening.",
       "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
       "Parameters": {
         "FunctionName": "${HarnessDriverArn}",
@@ -211,6 +211,35 @@
         }
       },
       "ResultPath": "$.evaluation_run",
+      "TimeoutSeconds": 86400,
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "EscalateFail"
+        }
+      ],
+      "Next": "EvalScore"
+    },
+    "EvalScore": {
+      "Type": "Task",
+      "Comment": "Fresh session after the inference job completed (or immediately, if evaluate finished synchronously -- the score task is idempotent when evaluation/report.json already exists). Produces the report EvalGate reads.",
+      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+      "Parameters": {
+        "FunctionName": "${HarnessDriverArn}",
+        "Payload": {
+          "run_id.$": "$.run_id",
+          "manifest_uri.$": "$.manifest_uri",
+          "stage": "eval",
+          "task": "score",
+          "harness_id": "llmops_eval",
+          "task_token.$": "$$.Task.Token",
+          "iteration.$": "$.iteration"
+        }
+      },
+      "ResultPath": "$.evaluation_scored",
       "TimeoutSeconds": 86400,
       "Catch": [
         {

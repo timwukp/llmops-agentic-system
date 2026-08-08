@@ -763,6 +763,24 @@ class TestDriver:
         assert parked["ExpressionAttributeValues"][":t"] == "tok-123"
         assert any(e["DetailType"] == ev.TRAINING_STARTED for e in c["events"].entries)
 
+    def test_eval_job_launched_parks_token_and_releases(self):
+        """Launch-and-release is stage-generic: the eval agent parks its student
+        inference job on the same rail as finetune's training job, with
+        current_stage=eval so the resume Lambda knows whose completion it is
+        settling. Before eval had job_launched, its only way to span a long
+        inference job was polling in-turn — where prose turn-ends happen; run
+        b56281da died there with a healthy job mid-flight."""
+        ac = FakeAgentCore([
+            tool_use_stream("job_launched", {"job_name": "llmops-eval-infer-1"}),
+            text_stream("released")])
+        c = clients(ac)
+        out = driver.handler(driver_event(stage="eval", task="evaluate"), clients=c)
+        assert out["status"] == "released"
+        assert not c["sfn"].successes  # token NOT settled — resume λ owns it
+        parked = c["ddb"].Table(ENV["RUNS_TABLE"]).updates[0]
+        assert parked["ExpressionAttributeValues"][":j"] == "llmops-eval-infer-1"
+        assert parked["ExpressionAttributeValues"][":s"] == "eval"
+
     def test_escalate_human_notifies_and_fails_token(self):
         ac = FakeAgentCore([
             tool_use_stream("escalate_human", {"reason": "irrecoverable data drift"}),
@@ -1478,6 +1496,25 @@ class TestResumePipeline:
         assert out["outcome"] == "failed"
         assert c["sfn"].failures[0]["error"] == "TrainingJobFailed"
 
+    def test_a_completed_eval_inference_job_resumes_without_announcing_a_training(self):
+        """Eval-stage inference rides the SageMaker training-job rail (same EventBridge
+        rule, same parked token), but it is not a training: MODEL_TRAINED on the bus
+        for a batch-scoring job would be a lie on the timeline. The run row's
+        current_stage — written by handle_job_launched — is what tells them apart.
+        The token still settles identically; EvalScore's stage_complete emits
+        MODEL_EVALUATED moments later, so eval jobs get no bus event here at all."""
+        c = self._clients({"run_id": "run-1", "task_token": "tok-9",
+                           "current_stage": "eval"})
+        out = resume_pipeline.handler(
+            sm_event("Completed", job="llmops-eval-infer-1",
+                     ModelArtifacts={"S3ModelArtifacts": "s3://b/out.tar.gz"}),
+            clients=c)
+        assert out["outcome"] == "resumed"
+        assert c["sfn"].successes, "the eval token was never settled"
+        assert not any(e["DetailType"] == ev.MODEL_TRAINED
+                       for e in c["events"].entries), (
+            "a student-inference completion was announced as MODEL_TRAINED")
+
     def test_unknown_job_is_skipped(self):
         c = self._clients(run=None)
         out = resume_pipeline.handler(sm_event("Completed", job="someone-elses-job"),
@@ -1869,7 +1906,7 @@ class TestStateMachine:
         CLEANUP = {"Teardown", "MonitorHealth", "MonitorReport", "SmokeTest",
                    "Deploy", "DataAudit", "FinetuneAnalyze"}
         LONG_WORK = {"DataPrepGenerate", "DataPrepCurate", "FinetuneLaunch",
-                     "EvalGenerate", "EvalGate", "RemediateFinetune"}
+                     "EvalGenerate", "EvalScore", "EvalGate", "RemediateFinetune"}
         timed = {n for n, st in asl["States"].items() if "TimeoutSeconds" in st}
         assert timed == CLEANUP | LONG_WORK, (
             f"the timeout policy names {sorted(CLEANUP | LONG_WORK)} but the ASL times "
@@ -2326,26 +2363,36 @@ class TestEveryDeclaredTaskIsReachable:
         """The producer of evaluation/report.json must precede its consumer.
 
         Asserted as reachability rather than a literal Next: the guarantee is ordering,
-        and it survives a state being inserted between them.
+        and it survives a state being inserted between them. Since the eval stage
+        became a launch/score pair, the report's producer is the SCORE task (evaluate
+        may end at job_launched with no report yet); score is also the only entry
+        into the gate, so no route arrives at EvalGate without the report written.
         """
         states = asl["States"]
-        gen = [n for n, st in states.items()
-               if ((st.get("Parameters") or {}).get("Payload") or {}).get("task")
-               == "evaluate"]
-        assert len(gen) == 1, f"expected exactly one evaluate state, found {gen}"
-        assert _reaches(states, gen[0], "EvalGate"), (
-            f"{gen[0]} produces evaluation/report.json but cannot reach EvalGate, "
+        producer = [n for n, st in states.items()
+                    if ((st.get("Parameters") or {}).get("Payload") or {}).get("task")
+                    == "score"]
+        assert len(producer) == 1, f"expected exactly one score state, found {producer}"
+        launcher = [n for n, st in states.items()
+                    if ((st.get("Parameters") or {}).get("Payload") or {}).get("task")
+                    == "evaluate"]
+        assert len(launcher) == 1, f"expected exactly one evaluate state, found {launcher}"
+        assert _reaches(states, launcher[0], producer[0]), (
+            f"{launcher[0]} launches the inference {producer[0]} scores, but cannot "
+            "reach it")
+        assert _reaches(states, producer[0], "EvalGate"), (
+            f"{producer[0]} produces evaluation/report.json but cannot reach EvalGate, "
             "which reads it")
         # Ordering is asserted on the ENTRY paths into the gate, not by demanding the
-        # gate cannot reach the generator: it can and must, because the remediation
+        # gate cannot reach the producer: it can and must, because the remediation
         # loop goes back around and re-evaluates (the next test pins that). What must
-        # hold is that no route ARRIVES at EvalGate without passing the generator
+        # hold is that no route ARRIVES at EvalGate without passing the producer
         # first -- that is the reading a stale report would need.
         entries = [n for n, st in states.items() if "EvalGate" in _exits(st)]
         assert entries, "nothing transitions into EvalGate"
-        assert entries == [gen[0]], (
-            f"EvalGate is entered from {entries}; only {gen[0]} may lead into it, or a "
-            "run can reach the gate without the report it reads having been written")
+        assert entries == [producer[0]], (
+            f"EvalGate is entered from {entries}; only {producer[0]} may lead into it, "
+            "or a run can reach the gate without the report it reads having been written")
 
     def test_the_remediation_loop_regenerates_the_report_it_regates(self, asl):
         """A second gate attempt must re-run evaluation, not re-read the stale report.

@@ -55,12 +55,12 @@ and intelligence lives *inside* each stage. An LLM deciding "what stage comes ne
 add nondeterminism, cost, and failure modes to the one part of the system that benefits
 from having none.
 
-The state machine (`orchestration/state_machine.asl.json`) has **11 harness-task states
+The state machine (`orchestration/state_machine.asl.json`) has **12 harness-task states
 on the happy path** — each a `waitForTaskToken` Lambda invocation of the harness driver
 — plus the loop-only `RemediateFinetune` and the audit-only `DataAudit`:
 
 ```
-DataPrepGenerate → DataPrepCurate → FinetuneLaunch → FinetuneAnalyze → EvalGenerate → EvalGate
+DataPrepGenerate → DataPrepCurate → FinetuneLaunch → FinetuneAnalyze → EvalGenerate → EvalScore → EvalGate
                                                         │ (gate fail)
                               RemediateFinetune ←───────┘   … then, on gate pass:
              Deploy → SmokeTest → MonitorHealth → Teardown → MonitorReport
@@ -428,8 +428,12 @@ declared tools, so the sentence cannot drift from the tool list.
 ## 4. Launch-and-release with EventBridge wake
 
 A harness turn is bounded (~14 min); a training job runs for hours. The rule: **a harness
-never waits on a job**. The finetune agent launches the SageMaker job, calls
-`job_launched`, and its session is released. The chain that resumes the pipeline:
+never waits on a job**. The finetune agent launches the SageMaker training job — and the
+eval agent its student-inference job, which rides the same training-job rail — calls
+`job_launched`, and its session is released. (Eval earned this path the hard way: with no
+`job_launched`, its only way to span a long inference job was polling in-turn, which is
+where prose turn-ends happen; the machine's `EvalScore` state now picks up scoring in a
+fresh session after the job completes.) The chain that resumes the pipeline:
 
 1. Driver parks the Step Functions task token in DynamoDB (`llmops-pipeline-runs`,
    GSI `job_name-index`), keyed by job name.
