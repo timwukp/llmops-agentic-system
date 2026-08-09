@@ -5,6 +5,30 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
 ## [Unreleased]
 
+### A stream can outlive the Lambda wall; the drain now watches the clock
+
+boto's `read_timeout` (870s) bounds the gap BETWEEN chunks, not the stream's total
+life. A reasoning model that trickles a chunk every few seconds can therefore stream
+past the Lambda's 900s wall entirely inside one `_drain` call — where the driver's
+between-turns `_out_of_time()` check can never look. Live: run 68cfa9c8's resumed
+generate turn hit the wall mid-stream (`REPORT … Duration: 900000.00 ms … Status:
+timeout`, 03:39:49Z); Lambda's async retry then replayed a continuation whose session
+state no longer matched, and the stage failed `MissingStageComplete` with 51 tasks
+still to run — the third failure class in this lineage, after the dropped reinvoke
+(#67) and the prose turn-ends (#61/#62).
+
+- `orchestration/harness_driver/handler.py`: `_drain` takes an `out_of_wall` check and
+  abandons the stream with a distinct `LambdaDeadlineApproaching` marker when less
+  than 45s of wall remains. The call site hands the turn to a fresh invocation via the
+  existing `_self_reinvoke` (whole 900s available again; the harness turn finishes
+  server-side meanwhile, and the salvage prompt asks the agent to restate its pending
+  call). Deliberately NOT treated as a stream death: burning the one same-session
+  salvage retry on a voluntary cut would leave a real death later in the stage
+  unprotected — pinned by its own test.
+- Tests: `TricklingStream` (never ends on its own) + the incident replay — red-first
+  verified the old driver HANGS on it; and the no-burned-retry pin. The existing
+  between-turns reinvoke test's fake clock moved from 10s to 500s remaining so it
+  keeps testing the between-turns path rather than tripping the new in-stream cut.
 ### A dead driver now gets found in minutes, not by an operator at 2 a.m.
 
 The driver hands each turn to its next invocation with an async self-invoke —

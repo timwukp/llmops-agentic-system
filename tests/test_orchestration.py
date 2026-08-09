@@ -291,6 +291,21 @@ class DyingStream:
         raise ConnectionError("reset by peer")
 
 
+class TricklingStream:
+    """A stream that never ends on its own — a reasoning model trickling chunks.
+
+    boto's read_timeout bounds the gap BETWEEN chunks, so a stream like this can
+    outlive the Lambda's 900s wall entirely inside one _drain call. That is what
+    killed run 68cfa9c8's resumed generate turn at 03:39:49Z: the runtime killed the
+    invocation mid-stream, the async retry replayed a stale continuation, and the
+    stage failed MissingStageComplete with 51 tasks left.
+    """
+
+    def __iter__(self):
+        while True:
+            yield {"contentBlockDelta": {"delta": {"text": "…"}}}
+
+
 def clients(agentcore=None, s3=None):
     return {
         "agentcore": agentcore or FakeAgentCore([]),
@@ -590,9 +605,14 @@ class TestDriver:
 
             def get_remaining_time_in_millis(self):
                 # turn 1 always runs (the loop only checks before LATER turns); by the
-                # time turn 2 would start there is not enough left for another 840s turn
+                # time turn 2 would start there is not enough left for another 840s
+                # turn. 500s, not 10s: comfortably above _drain's in-stream deadline
+                # margin (45s) so the first turn's stream is NOT deadline-cut, and
+                # comfortably below the 850s between-turns bar so turn 2 hands off --
+                # this test is about the BETWEEN-turns path, the in-stream cut has
+                # its own test.
                 self.calls += 1
-                return 10_000
+                return 500_000
 
         class _Lam:
             def __init__(self):
@@ -1394,6 +1414,80 @@ class TestDriver:
             "_self_reinvoke stopped carrying the re-ask counter"
         assert 'int(event.get("_re_asks", 0))' in body, \
             "the continuation branch stopped restoring the re-ask counter"
+
+    def test_a_stream_that_outlives_the_lambda_wall_hands_off_instead_of_dying(self):
+        """boto's read_timeout (870s) bounds the gap BETWEEN chunks, not the stream's
+        life: a reasoning model trickling a chunk every few seconds can stream past
+        the Lambda's 900s wall inside one _drain call, where the between-turns
+        _out_of_time() check can never look. Live: run 68cfa9c8's resumed generate
+        turn hit the wall mid-stream (REPORT ... Duration: 900000.00 ms Status:
+        timeout, 03:39:49Z); the async Lambda retry then replayed a continuation
+        whose session no longer matched and the stage died MissingStageComplete
+        with 51 tasks still to run. _drain now watches the clock between chunks and
+        hands the turn to a fresh invocation with the whole 900s available."""
+        class _Ctx:
+            function_name = "llmops-harness-driver"
+
+            def __init__(self):
+                self.reads = 0
+
+            def get_remaining_time_in_millis(self):
+                # plenty of wall at turn start; below the drain margin after the
+                # stream has trickled for a while
+                self.reads += 1
+                return 860_000 if self.reads < 10 else 30_000
+
+        class _Lam:
+            def __init__(self):
+                self.invocations = []
+
+            def invoke(self, **kw):
+                self.invocations.append(kw)
+                return {"StatusCode": 202}
+
+        ac = FakeAgentCore([TricklingStream()])
+        c = clients(ac)
+        c["lambda"] = _Lam()
+        out = driver.handler(driver_event(), clients=c, context=_Ctx())
+        assert out["status"] == "self_reinvoked_between_turns", (
+            "a stream that outlived the wall was not handed off — the runtime would "
+            "have killed this invocation mid-stream")
+        assert not c["sfn"].failures, "the deadline cut was treated as a failure"
+        payload = json.loads(c["lambda"].invocations[0]["Payload"])
+        assert payload.get("_continuation"), (
+            "the handoff lost the salvage continuation — the resumed invocation "
+            "would restart the stage from scratch")
+
+    def test_a_deadline_cut_does_not_burn_the_stream_salvage_retry(self):
+        """The one same-session salvage retry exists for involuntary stream deaths.
+        A deadline cut is voluntary — spending the retry on it leaves a REAL death
+        later in the same stage unprotected. The handoff must not set
+        _stream_retried."""
+        class _Ctx:
+            function_name = "llmops-harness-driver"
+
+            def __init__(self):
+                self.reads = 0
+
+            def get_remaining_time_in_millis(self):
+                self.reads += 1
+                return 860_000 if self.reads < 10 else 30_000
+
+        class _Lam:
+            def __init__(self):
+                self.invocations = []
+
+            def invoke(self, **kw):
+                self.invocations.append(kw)
+                return {"StatusCode": 202}
+
+        ac = FakeAgentCore([TricklingStream()])
+        c = clients(ac)
+        c["lambda"] = _Lam()
+        driver.handler(driver_event(), clients=c, context=_Ctx())
+        payload = json.loads(c["lambda"].invocations[0]["Payload"])
+        assert payload.get("_stream_retried") is False, (
+            "the deadline handoff spent the stream-salvage retry")
 
     def test_stream_death_salvaged_same_session(self):
         uri = "s3://llmops-data-test/runs/run-test-1/raw/data.jsonl"
