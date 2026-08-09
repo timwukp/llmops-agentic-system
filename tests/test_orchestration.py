@@ -187,6 +187,11 @@ class FakeTable:
                 return {"Item": item}
         return {}
 
+    def scan(self, **kw):
+        # The resurrector's discovery read: everything, one page. Pagination is the
+        # caller's problem and tens-of-rows is the documented scale.
+        return {"Items": list(self.items)}
+
 
 class FakeDDB:
     def __init__(self):
@@ -758,7 +763,8 @@ class TestDriver:
         out = driver.handler(driver_event(stage="finetune", task="launch"), clients=c)
         assert out["status"] == "released"
         assert not c["sfn"].successes  # token NOT settled — resume λ owns it
-        parked = c["ddb"].Table(ENV["RUNS_TABLE"]).updates[0]
+        parked = next(u for u in c["ddb"].Table(ENV["RUNS_TABLE"]).updates
+                      if ":j" in (u.get("ExpressionAttributeValues") or {}))
         assert parked["ExpressionAttributeValues"][":j"] == "llmops-qlora-1"
         assert parked["ExpressionAttributeValues"][":t"] == "tok-123"
         assert any(e["DetailType"] == ev.TRAINING_STARTED for e in c["events"].entries)
@@ -777,7 +783,8 @@ class TestDriver:
         out = driver.handler(driver_event(stage="eval", task="evaluate"), clients=c)
         assert out["status"] == "released"
         assert not c["sfn"].successes  # token NOT settled — resume λ owns it
-        parked = c["ddb"].Table(ENV["RUNS_TABLE"]).updates[0]
+        parked = next(u for u in c["ddb"].Table(ENV["RUNS_TABLE"]).updates
+                      if ":j" in (u.get("ExpressionAttributeValues") or {}))
         assert parked["ExpressionAttributeValues"][":j"] == "llmops-eval-infer-1"
         assert parked["ExpressionAttributeValues"][":s"] == "eval"
 
@@ -4570,3 +4577,160 @@ def test_a_call_site_without_a_definition_does_not_satisfy_the_check():
     gaps = mod.live_bus_translator_gap(_FakeEvents(_triage_rule_live()), src,
                                        DRIVER_FN, "llmops-pipeline")
     assert len(gaps) == 1 and "triage_event_from_bus" in gaps[0]["problem"], gaps
+
+
+# ── the dead-driver resurrector ────────────────────────────────────────────────
+
+resurrector = _load("resurrector", "orchestration/resurrector/handler.py")
+
+RES_ENV = {"RUNS_TABLE": "llmops-pipeline-runs", "EVENT_BUS": "llmops-pipeline",
+           "DRIVER_FN": "llmops-harness-driver", "AWS_REGION": "us-east-1"}
+
+
+class _ResLambda:
+    def __init__(self):
+        self.calls = []
+
+    def invoke(self, **kw):
+        self.calls.append(kw)
+        return {"StatusCode": 202}
+
+
+def _res_clients(rows):
+    ddb = FakeDDB()
+    ddb.Table(RES_ENV["RUNS_TABLE"]).items.extend(rows)
+    return {"ddb": ddb, "lambda": _ResLambda(), "events": FakeEvents()}
+
+
+def _beat_row(run_id="run-res-1", minutes_old=45, **over):
+    at = (datetime.datetime.now(datetime.timezone.utc)
+          - datetime.timedelta(minutes=minutes_old)).isoformat()
+    row = {"run_id": run_id, "status": "running",
+           "driver_beat_at": at,
+           "driver_beat_payload": json.dumps({
+               "run_id": run_id, "stage": "data-prep", "task": "generate",
+               "harness_id": "llmops_data_prep", "manifest_uri": "s3://b/m.json",
+               "task_token": "tok-parked-in-history", "iteration": 0})}
+    row.update(over)
+    return row
+
+
+class TestResurrector:
+    def _run(self, rows, env_over=None):
+        env = {**RES_ENV, **(env_over or {})}
+        for k, v in env.items():
+            os.environ[k] = v
+        c = _res_clients(rows)
+        out = resurrector.handler({}, clients=c)
+        return out, c
+
+    def test_a_stale_beat_on_a_running_run_is_resurrected_with_its_own_payload(self):
+        """The incident this whole Lambda exists for: run 68cfa9c8 sat dead nine hours
+        at 4/55 with Step Functions RUNNING and its token parked, because the async
+        self-reinvoke was dropped and nothing anywhere had the job of noticing. The
+        driver now stamps its re-invoke payload on every turn; a beat that stops while
+        the run is unfinished IS the signal, and the stamp is the resurrection."""
+        out, c = self._run([_beat_row()])
+        assert out["acted"] and out["acted"][0]["action"] == "resurrected"
+        assert len(c["lambda"].calls) == 1
+        sent = json.loads(c["lambda"].calls[0]["Payload"])
+        assert sent["run_id"] == "run-res-1" and sent["stage"] == "data-prep"
+        assert c["lambda"].calls[0]["InvocationType"] == "Event"
+        assert any(e["DetailType"] == ev.DRIVER_RESURRECTED
+                   for e in c["events"].entries)
+
+    def test_a_fresh_beat_is_left_alone(self):
+        out, c = self._run([_beat_row(minutes_old=5)])
+        assert not out["acted"] and not c["lambda"].calls
+
+    def test_a_parked_token_run_is_waiting_not_dead(self):
+        """A run row holding task_token is parked on a SageMaker job BY DESIGN —
+        resume_pipeline owns that wake. Resurrecting it would start a second agent
+        session next to a healthy launch-and-release wait; the silence the beat
+        measures is the driver's, and a released driver is silent on purpose."""
+        out, c = self._run([_beat_row(task_token="tok-parked-live")])
+        assert not out["acted"] and not c["lambda"].calls
+
+    def test_a_terminal_run_is_not_resurrected(self):
+        out, c = self._run([_beat_row(status="failed"),
+                            _beat_row(run_id="run-res-2", status="escalated")])
+        assert not out["acted"] and not c["lambda"].calls
+
+    def test_the_claim_is_conditional_on_the_beat_it_read(self):
+        """Two overlapping sweeps must not double-resurrect one silence. The claim
+        update is conditional on driver_beat_at still being the value this sweep
+        read; the loser of that race walks away without invoking anything."""
+        row = _beat_row()
+        seen_beat = row["driver_beat_at"]  # the fake mutates the row in place
+        out, c = self._run([row])
+        claim = c["ddb"].Table(RES_ENV["RUNS_TABLE"]).updates[0]
+        assert "driver_beat_at = :seen" in claim["ConditionExpression"]
+        assert claim["ExpressionAttributeValues"][":seen"] == seen_beat
+
+    def test_past_the_cap_it_escalates_instead_of_reviving_the_defect(self):
+        """A driver that dies every turn has a real defect; revival only re-runs it.
+        Past the cap the resurrector emits ESCALATED_TO_HUMAN — which routes to the
+        conductor's triage — and stops touching the run."""
+        out, c = self._run([_beat_row(resurrections=5)])
+        assert out["acted"][0]["action"] == "escalated"
+        assert not c["lambda"].calls
+        assert any(e["DetailType"] == ev.ESCALATED_TO_HUMAN
+                   for e in c["events"].entries)
+
+    def test_a_pre_heartbeat_run_is_skipped_not_guessed_at(self):
+        """A running row with no beat predates the heartbeat (or was not started by
+        the driver at all). There is no payload to resurrect it with; inventing one
+        would dispatch a stage the state machine never asked for."""
+        out, c = self._run([{"run_id": "run-old", "status": "running"}])
+        assert not out["acted"] and not c["lambda"].calls
+
+
+class TestDriverHeartbeat:
+    def test_every_turn_stamps_the_beat_with_the_reinvoke_payload(self):
+        """The heartbeat is the resurrector's entire input: no stamp, no wake. It must
+        carry the exact payload a re-invoke needs — task token included, because the
+        parked token in Step Functions history is what the manual resurrection of
+        68cfa9c8 was rebuilt from, by hand, at 2 a.m."""
+        uri = "s3://llmops-data-test/runs/run-test-1/raw/data.jsonl"
+        ac = FakeAgentCore([tool_use_stream("stage_complete", {"outputs": [uri]}),
+                            text_stream("ack")])
+        c = clients(ac, FakeS3(existing=[uri]))
+        # heartbeat's ConditionExpression(attribute_exists) needs the row to exist,
+        # exactly like production where start_pipeline creates it at dispatch
+        c["ddb"].Table(ENV["RUNS_TABLE"]).items.append({"run_id": "run-test-1"})
+        driver.handler(driver_event(), clients=c)
+        beats = [u for u in c["ddb"].Table(ENV["RUNS_TABLE"]).updates
+                 if "driver_beat_at" in u.get("UpdateExpression", "")]
+        assert beats, "no turn stamped a heartbeat — the resurrector is blind"
+        payload = json.loads(beats[0]["ExpressionAttributeValues"][":p"])
+        assert payload["run_id"] == "run-test-1"
+        assert payload["task_token"] == "tok-123", (
+            "the stamped payload lost the task token — a resurrection from it would "
+            "run the stage with no way to settle the machine")
+
+    def test_a_heartbeat_write_failure_does_not_kill_the_turn(self):
+        """The beat is telemetry about the work, not the work. A DynamoDB throttle on
+        the stamp must not fail a turn that was about to complete the stage."""
+        uri = "s3://llmops-data-test/runs/run-test-1/raw/data.jsonl"
+        ac = FakeAgentCore([tool_use_stream("stage_complete", {"outputs": [uri]}),
+                            text_stream("ack")])
+        c = clients(ac, FakeS3(existing=[uri]))
+
+        class _ThrottlingDDB(FakeDDB):
+            def Table(self, name):
+                t = super().Table(name)
+                if name == ENV["RUNS_TABLE"] and not getattr(t, "_wrapped", False):
+                    orig = t.update_item
+
+                    def flaky(**kw):
+                        if "driver_beat_at" in kw.get("UpdateExpression", ""):
+                            raise Exception("ProvisionedThroughputExceededException")
+                        return orig(**kw)
+                    t.update_item = flaky
+                    t._wrapped = True
+                return t
+
+        c["ddb"] = _ThrottlingDDB()
+        out = driver.handler(driver_event(), clients=c)
+        assert out["status"] == "completed", (
+            "a throttled heartbeat killed a turn that was completing the stage")

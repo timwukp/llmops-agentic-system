@@ -425,6 +425,19 @@ harness's own terminal tools, with a write-first rule (artifacts land in S3 befo
 call that claims them) — a guard test derives both directions from each harness's
 declared tools, so the sentence cannot drift from the tool list.
 
+The turn handoff itself is guarded by a **heartbeat + resurrector** pair. The driver's
+self-reinvoke is an async Lambda invoke — fire-and-forget, and Lambda dropped one live
+(run 68cfa9c8 sat dead nine hours with its token parked and Step Functions still
+RUNNING). The driver now stamps `driver_beat_at` and the exact re-invoke payload on the
+run row before every turn; a scheduled `llmops-resurrector` (every 15 min) re-invokes
+the driver for any running run whose beat is stale with **no parked task token** — a
+parked token means launch-and-release is waiting on a SageMaker job by design, and that
+wake belongs to resume_pipeline. The claim is conditional on the beat the sweep read
+(no double-resurrection), capped per run (past the cap it escalates: a driver that dies
+every turn has a defect revival only re-runs). This is also what makes AgentCore's
+8-hour session `maxLifetime` a non-event on 8–12h stages: sessions may die — state
+lives in S3, session ids are deterministic — because something now re-invokes.
+
 ## 4. Launch-and-release with EventBridge wake
 
 A harness turn is bounded (~14 min); a training job runs for hours. The rule: **a harness

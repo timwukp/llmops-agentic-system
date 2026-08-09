@@ -5,6 +5,42 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
 ## [Unreleased]
 
+### A dead driver now gets found in minutes, not by an operator at 2 a.m.
+
+The driver hands each turn to its next invocation with an async self-invoke —
+fire-and-forget by definition, and Lambda exercised the "forget": one dropped event
+(AsyncEventsDropped=1, 2026-08-08 17:00Z) left run 68cfa9c8 dead for NINE HOURS at 4/55
+tasks. Step Functions still RUNNING, token parked, money safe — and nothing anywhere
+whose job it was to notice. An operator resurrected it by hand from the execution
+history. The same silence swallows a driver that times out on its last turn, OOMs, or
+crashes after the token check — and it is the reason AgentCore's 8-hour session
+maxLifetime looked like a threat to 8–12h measurement stages: sessions may die (state
+lives in S3, session ids are deterministic); what was missing was anything that
+re-invokes afterward.
+
+- `orchestration/harness_driver/handler.py`: every turn stamps `driver_beat_at` + the
+  exact re-invoke payload (task token included) on the run row before doing anything.
+  Best-effort: a throttled stamp must not kill the turn it announces.
+- `orchestration/resurrector/handler.py` (new, 7th spine Lambda): every 15 minutes,
+  re-invokes the driver for any run that is running AND beat-stale (20 min) AND holds
+  no parked task token — a parked token is launch-and-release waiting on a SageMaker
+  job by design; that wake belongs to resume_pipeline. The claim is a conditional
+  update on the beat the sweep read, so two sweeps cannot double-resurrect one
+  silence; past RESURRECTIONS_MAX (5) it emits EscalatedToHuman instead — a driver
+  that dies every turn has a defect revival only re-runs. New informational event
+  `DriverResurrected`.
+- `deploy/07_lambdas.py`: the resurrector joins LAMBDAS; every function now gets an
+  explicit EventInvokeConfig (2 retries, max age 300s) — the account default of SIX
+  HOURS would redeliver a continuation long after the resurrector already acted.
+- `deploy/08_triggers.py`: `llmops-resurrector-15min` schedule (rate(15 minutes),
+  ENABLED by default); scheduler role may invoke it. `deploy/iam/lambda_roles.json`:
+  its own least-privilege role (Scan+UpdateItem on runs, invoke driver, PutEvents).
+- Tests (mutation-checked): the incident replay (stale beat → resurrection with the
+  stamped payload), fresh-beat/terminal/pre-heartbeat rows untouched, the parked-token
+  guard (deleting it turns the test red), conditional claim, cap escalation; driver
+  side: every turn stamps the beat with the token included, and a throttled heartbeat
+  does not kill a completing turn.
+
 ### The dispatch guard keyed on the task; the unit of idempotency is the acceptance
 
 "One acceptance authorizes exactly one run" was enforced as "one task ever dispatches

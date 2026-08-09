@@ -33,6 +33,7 @@ import boto3
 SCHEDULE_NAME = "llmops-nightly"
 FINOPS_SCHEDULE_NAME = "llmops-finops-daily"
 SWEEP_SCHEDULE_NAME = "llmops-monitor-sweep-daily"
+RESURRECTOR_SCHEDULE_NAME = "llmops-resurrector-15min"
 API_NAME = "llmops-triggers"
 SECRET_ID = "llmops/webhook"
 
@@ -153,6 +154,49 @@ def ensure_sweep_schedule(sched, lam_arn, role_arn, enable, dry):
     return {"schedule": SWEEP_SCHEDULE_NAME, "action": action, "state": state}
 
 
+def ensure_resurrector_schedule(sched, lam_arn, role_arn, enable, dry):
+    """Every-15-minutes dead-driver check — ENABLED by default.
+
+    This is the liveness half of the driver's heartbeat contract (PR #67): the driver
+    stamps driver_beat_at on the run row every turn, and this schedule is the only
+    thing that reads the stamp. It exists because the driver's turn handoff is an
+    ASYNC self-invoke that Lambda may drop (observed 2026-08-08, AsyncEventsDropped=1:
+    run 68cfa9c8 sat dead nine hours at 4/55 tasks with its token parked, Step
+    Functions RUNNING, and nothing anywhere whose job it was to notice). It is also
+    what makes AgentCore's 8-hour session maxLifetime a non-event on 8-12h stages:
+    sessions may die; the resurrector re-invokes; a fresh session resumes from S3.
+
+    15 minutes because the stale threshold is 20: a beat can be at most stale+15min
+    old before someone acts, bounding a dead driver's silence at ~35 minutes instead
+    of nine hours. Idle cost is one Scan over tens of rows, ~$0. FLEXIBLE window is
+    fine — unlike the date-keyed sweeps, nothing here derives identity from the clock.
+    """
+    state = "ENABLED" if enable else "DISABLED"
+    if dry:
+        return {"schedule": RESURRECTOR_SCHEDULE_NAME,
+                "would": f"create/update rate(15 minutes) {state}"}
+    body = dict(
+        Name=RESURRECTOR_SCHEDULE_NAME,
+        ScheduleExpression="rate(15 minutes)",
+        FlexibleTimeWindow={"Mode": "FLEXIBLE", "MaximumWindowInMinutes": 5},
+        Target={
+            "Arn": lam_arn,
+            "RoleArn": role_arn,
+            "Input": json.dumps({"trigger_source": "resurrector-schedule"}),
+            "RetryPolicy": {"MaximumRetryAttempts": 2,
+                            "MaximumEventAgeInSeconds": 600},
+        },
+        State=state,
+    )
+    try:
+        sched.create_schedule(**body)
+        action = "created"
+    except sched.exceptions.ConflictException:
+        sched.update_schedule(**body)
+        action = "updated"
+    return {"schedule": RESURRECTOR_SCHEDULE_NAME, "action": action, "state": state}
+
+
 def ensure_scheduler_role(iam, region, account, dry):
     """Role EventBridge Scheduler assumes to invoke the three scheduled functions.
 
@@ -174,6 +218,7 @@ def ensure_scheduler_role(iam, region, account, dry):
             f"arn:aws:lambda:{region}:{account}:function:llmops-start-pipeline",
             f"arn:aws:lambda:{region}:{account}:function:llmops-finops-reconcile",
             f"arn:aws:lambda:{region}:{account}:function:llmops-monitor-sweep",
+            f"arn:aws:lambda:{region}:{account}:function:llmops-resurrector",
         ]}]}
     try:
         iam.create_role(RoleName=name, AssumeRolePolicyDocument=json.dumps(trust),
@@ -247,6 +292,10 @@ def main():
     # remember it. --no-sweep-schedule turns it off.
     ap.add_argument("--no-sweep-schedule", action="store_true",
                     help="create the daily orphan-endpoint sweep schedule DISABLED")
+    # The dead-driver check costs one table Scan per 15 min and is the only thing that
+    # reads the driver's heartbeat; --no-resurrector-schedule turns it off.
+    ap.add_argument("--no-resurrector-schedule", action="store_true",
+                    help="create the 15-minute dead-driver resurrector schedule DISABLED")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
@@ -270,6 +319,10 @@ def main():
     sweep_arn = f"arn:aws:lambda:{region}:{account}:function:llmops-monitor-sweep"
     results.append(ensure_sweep_schedule(sched, sweep_arn, role_arn,
                                          not args.no_sweep_schedule, args.dry_run))
+    res_arn = f"arn:aws:lambda:{region}:{account}:function:llmops-resurrector"
+    results.append(ensure_resurrector_schedule(sched, res_arn, role_arn,
+                                               not args.no_resurrector_schedule,
+                                               args.dry_run))
     results.append(ensure_secret(sm, args.dry_run))
     api_res = ensure_api(apigw, lam, region, account, args.dry_run)
     results.append(api_res)

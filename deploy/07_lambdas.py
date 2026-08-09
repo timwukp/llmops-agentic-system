@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""07_lambdas.py — package and deploy the 6 spine Lambdas + the state machine.
+"""07_lambdas.py — package and deploy the 7 spine Lambdas + the state machine.
 
 Each Lambda bundle = its handler.py + the contracts (events.py, report.py,
 manifest.schema.json) vendored flat so the `except ImportError` fallback path
@@ -46,7 +46,7 @@ LAMBDAS = {
         "env_keys": ["RUNS_TABLE", "EVENTS_TABLE", "EVENT_BUS", "LLMOPS_SNS_TOPIC", "DATA_BUCKET",
                      "START_FN"],
         # This function is an EventBridge target, so its deploy is checked against the
-        # rules live on this bus (see live_bus_translator_gap). The other five are
+        # rules live on this bus (see live_bus_translator_gap). The other six are
         # invoked by Step Functions, the console or a schedule -- never by a bus rule --
         # so they have no envelope to translate.
         "bus_delivered": "llmops-pipeline",
@@ -64,6 +64,20 @@ LAMBDAS = {
         "role_param": "/llmops/iam/lambda_resume_arn",
         "timeout": 60, "memory": 256,
         "env_keys": ["RUNS_TABLE", "EVENT_BUS"],
+    },
+    # The dead-driver wake. The driver's turn handoff is an ASYNC self-invoke; Lambda
+    # dropped one on 2026-08-08 (AsyncEventsDropped=1) and run 68cfa9c8 sat dead nine
+    # hours with its token parked and nothing whose job it was to notice. The driver now
+    # heartbeats the run row every turn; this function re-invokes it from the stamped
+    # payload when a running run's beat goes stale — and it is also what makes
+    # AgentCore's 8-hour session maxLifetime survivable on 8-12h measurement stages.
+    "resurrector": {
+        "fn": "llmops-resurrector",
+        "src": REPO / "orchestration" / "resurrector" / "handler.py",
+        "role_param": "/llmops/iam/lambda_resurrector_arn",
+        # 120 s: one table scan over tens of rows + at most a handful of async invokes.
+        "timeout": 120, "memory": 256,
+        "env_keys": ["RUNS_TABLE", "EVENT_BUS", "DRIVER_FN"],
     },
     "webhook": {
         "fn": "llmops-webhook",
@@ -199,6 +213,16 @@ def deploy_lambda(lam, ssm, region, account, key, cfg, dry, events=None):
             Environment={"Variables": env},
             Tags={"project": "llmops-agentic-system"})
         action = "created"
+    # The driver's turn handoff is an async self-invoke, so its async delivery policy
+    # is part of the pipeline's correctness, not tuning. Defaults are 2 retries over up
+    # to 6 HOURS of event age -- a continuation redelivered hours later would resume a
+    # turn whose session and context are long gone, next to whatever the resurrector
+    # already restarted. Pin retries at 2 but bound the age at 5 minutes: past that,
+    # the heartbeat is stale and the resurrector (PR #67) owns the wake. Explicit for
+    # every function, so the policy is in code review rather than in whatever the
+    # account default happens to be.
+    lam.put_function_event_invoke_config(
+        FunctionName=cfg["fn"], MaximumRetryAttempts=2, MaximumEventAgeInSeconds=300)
     return {"lambda": cfg["fn"], "action": action}
 
 
