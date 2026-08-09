@@ -5,6 +5,47 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
 ## [Unreleased]
 
+### A task token Step Functions has already discarded is an answer, not a crash
+
+`resume_pipeline` has known this since 2026-07-29. The driver did not, and it cost four
+invocations. `TaskTimedOut: 'Provided task does not exist anymore'` came out of the
+re-asks-exhausted settle in `_run_stage`, the `handler()` wrapper re-raised it, Lambda
+marked the asynchronous invocation failed and **retried it twice** — 2026-08-09 at
+05:50:48Z, 05:52:03Z and 05:54:28Z are one incident, plus one earlier at
+2026-08-05T15:39:51Z. Every retry was a fresh **billed** AgentCore turn re-running an
+agent whose stage had already been decided, against a token none of them could settle. The
+stage's verdict, its `PipelineFailed` event and its S3 artifacts were all already correct;
+the only thing left to do was tell a state machine that had stopped listening.
+
+- `pipeline/contracts/task_tokens.py` (new): `TASK_GONE_CODES` + `is_task_gone()`, imported
+  by both Lambdas that settle tokens they did not park and defined by neither. The
+  constant existed in `resume_pipeline` alone; copying it a second time is the defect this
+  module exists to prevent — the driver's four settle sites and resume's one must agree
+  about what "gone" means, and two constants in two files agree only until someone edits
+  one of them. Matched by botocore error CODE, not exception class (the typed classes hang
+  off a live client, unusable under an injected double) and not bare `Exception` (which
+  would swallow the throttles and 5xx where the settle may yet succeed, stranding the token
+  for its full `TimeoutSeconds` — 86400s, a day).
+- `orchestration/harness_driver/handler.py`: one `settle_token()` funnel; all four settles
+  (`stage_complete`, `escalate`, the crash-path report, re-asks-exhausted) go through it.
+  Fixing only the one that crashed would have left three, and the next one hit would have
+  read as a new bug — so a derived test asserts no `send_task_*` call in the file bypasses
+  the funnel. `output=` picks success and its absence picks failure, so a caller cannot
+  report success on a failure path by passing a wrong value.
+- `orchestration/resume_pipeline/handler.py`: imports the shared definition, drops its own.
+- `deploy/07_lambdas.py`: the bundle's module list is now **derived** from what the handlers
+  import, read out of each `except ImportError:` branch with `ast` — that branch *is* the
+  flat bundle layout. The list was hand-maintained, so adding `task_tokens.py` and importing
+  it from two handlers would have deployed clean and killed the driver at cold start on
+  `ModuleNotFoundError: task_tokens` — on the code path added to stop it dying. Same failure
+  class as the hand-copied `env_keys` list, same cure. An unresolvable fallback import is
+  now a refusal at build time, because `update_function_code` returns 200 for a zip that
+  cannot import itself.
+- Tests: 17, mutation-verified six ways (no fix; bare-`except` swallow; one settle left
+  unguarded; bundle back to a hand-list; `flat_imports` back to the indentation regex —
+  which matched 22 names across the seven handlers, since indentation says *nested*, not
+  *nested in the fallback*; and each Lambda re-defining the constant locally).
+
 ### An unanswered triage now reaches the owner; the rejection stops naming a door that is painted on
 
 Three layers of one defect. Together they made the escalation answer channel a total

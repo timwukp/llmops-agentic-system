@@ -22,8 +22,10 @@ from boto3.dynamodb.conditions import Key
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))  # repo layout
 try:
     from pipeline.contracts import events as ev
+    from pipeline.contracts.task_tokens import is_task_gone
 except ImportError:  # Lambda bundle layout
     import events as ev  # type: ignore
+    from task_tokens import is_task_gone  # type: ignore
 
 TERMINAL_OK = ("Completed",)
 TERMINAL_BAD = ("Failed", "Stopped")
@@ -47,18 +49,9 @@ def _is_capacity_stop(detail: dict) -> bool:
     return (detail.get("TrainingJobStatus") == "Stopped"
             and int(detail.get("BillingSecondsUsed") or 0) == 0)
 
-# The two ways Step Functions says "this token is dead": TaskTimedOut carries the
-# message 'Provided task does not exist anymore', TaskDoesNotExist is the never-existed
-# case. Matched by botocore error CODE rather than by exception class, because the
-# classes hang off a live client instance -- referencing sfn.exceptions.TaskTimedOut
-# would make this module unimportable under an injected test double, and catching
-# Exception here would swallow the throttles and 5xx that genuinely must be retried.
-TASK_GONE_CODES = ("TaskTimedOut", "TaskDoesNotExist")
-
-
-def _is_task_gone(exc) -> bool:
-    code = getattr(exc, "response", {}).get("Error", {}).get("Code", "")
-    return code in TASK_GONE_CODES
+# "This token is dead" now lives in pipeline/contracts/task_tokens.py, shared with the
+# harness driver's four settle sites. It was defined here first and only here, which is
+# why the driver crashed on the same error four times -- see that module's docstring.
 
 
 def _clients():
@@ -148,7 +141,7 @@ def handler(event, context=None, clients=None):
                                        error="TrainingJobFailed", cause=str(reason)[:250])
             outcome = "failed"
     except Exception as exc:  # noqa: BLE001 — re-raised below unless the token is dead
-        if not _is_task_gone(exc):
+        if not is_task_gone(exc):
             # A throttle, a 5xx, a bad token: the settle may still be achievable, so let
             # EventBridge retry. The clear is deliberately skipped on this path -- the
             # token is still the pipeline's only way to learn this stage finished.

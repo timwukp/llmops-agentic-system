@@ -449,6 +449,17 @@ finetune agent 發起 SageMaker 訓練作業 —— eval agent 的學生推論�
 4. 之後 `FinetuneAnalyze` 在**全新 session** 中運行，從 AWS 狀態
    （describe-training-job + S3 + manifest）重建全部上下文。
 
+**已死的 token 是一個答案，不是一個錯誤 —— 兩個 Lambda 都是。** 上面這個判讀有十天
+只存在於 resume，driver 為此付了四次代價：`TaskTimedOut` 從「re-ask 用盡」那次結算拋出，
+被 `handler()` 外層重拋，於是 Lambda 把這次非同步調用標記為失敗並**重試兩次**
+（2026-08-09 的 05:50:48Z、05:52:03Z、05:54:28Z；此前 2026-08-05T15:39:51Z 還有一次）。
+每次重試都是一個全新的**計費** AgentCore turn，重跑一個階段早已定案的 agent，對著一個
+它們誰都結算不了的 token。現在 driver 的四個結算點全部走同一個 `settle_token()` 漏斗，
+而「gone」的定義住在 `pipeline/contracts/task_tokens.py` —— 兩個 Lambda 都 import、
+都不各自定義，因為兩份常數放在兩個檔案裡，只會一致到有人改動其中一份為止。
+那個區分本身沒變，而且正是重點所在：限流或 5xx 依然拋出，讓結算可以被重試，
+而不是把 token 擱置到它完整的 `TimeoutSeconds`。
+
 Phase 3 實測驗證（觀察到兩次 resume Lambda 調用：一次在早期失敗、一次在成功完成；
 時長 1.5 秒、0 錯誤），Phase 5 又兩次全程無人驗證。
 
