@@ -21,6 +21,7 @@ import argparse
 import io
 import json
 import pathlib
+import re
 import sys
 import time
 import zipfile
@@ -37,14 +38,22 @@ CONTRACTS = REPO / "pipeline" / "contracts"
 sys.path.insert(0, str(REPO))
 from pipeline.contracts import events as ev  # noqa: E402 — needs REPO on sys.path
 
+# `env_keys` here is ADDITIVE ONLY: values a handler reads through a defaulted
+# `os.environ.get(...)` that we nonetheless want pinned in this environment. Everything a
+# handler REQUIRES (`os.environ[...]`) is derived from its source by required_env_keys(),
+# because the hand-maintained list disagreed with the driver for eight days -- it omitted
+# ACTUALS_TABLE, and the daily cost audit's terminal tools died on KeyError inside an
+# agent turn where nothing was watching. Do not re-add required keys here; the guard test
+# fails if the two ever describe different sets.
 LAMBDAS = {
     "driver": {
         "fn": "llmops-harness-driver",
         "src": REPO / "orchestration" / "harness_driver" / "handler.py",
         "role_param": "/llmops/iam/lambda_driver_arn",
         "timeout": 900, "memory": 512,
-        "env_keys": ["RUNS_TABLE", "EVENTS_TABLE", "EVENT_BUS", "LLMOPS_SNS_TOPIC", "DATA_BUCKET",
-                     "START_FN"],
+        # Additive: START_FN is a defaulted read (launch_run's dispatch target), pinned
+        # here so the target is a deploy-time decision rather than a code default.
+        "env_keys": ["START_FN"],
         # This function is an EventBridge target, so its deploy is checked against the
         # rules live on this bus (see live_bus_translator_gap). The other six are
         # invoked by Step Functions, the console or a schedule -- never by a bus rule --
@@ -56,14 +65,14 @@ LAMBDAS = {
         "src": REPO / "orchestration" / "start_pipeline" / "handler.py",
         "role_param": "/llmops/iam/lambda_start_arn",
         "timeout": 60, "memory": 256,
-        "env_keys": ["RUNS_TABLE", "EVENT_BUS", "DATA_BUCKET", "STATE_MACHINE_ARN"],
+        "env_keys": [],
     },
     "resume": {
         "fn": "llmops-resume-pipeline",
         "src": REPO / "orchestration" / "resume_pipeline" / "handler.py",
         "role_param": "/llmops/iam/lambda_resume_arn",
         "timeout": 60, "memory": 256,
-        "env_keys": ["RUNS_TABLE", "EVENT_BUS"],
+        "env_keys": [],
     },
     # The dead-driver wake. The driver's turn handoff is an ASYNC self-invoke; Lambda
     # dropped one on 2026-08-08 (AsyncEventsDropped=1) and run 68cfa9c8 sat dead nine
@@ -77,14 +86,14 @@ LAMBDAS = {
         "role_param": "/llmops/iam/lambda_resurrector_arn",
         # 120 s: one table scan over tens of rows + at most a handful of async invokes.
         "timeout": 120, "memory": 256,
-        "env_keys": ["RUNS_TABLE", "EVENT_BUS", "DRIVER_FN"],
+        "env_keys": [],
     },
     "webhook": {
         "fn": "llmops-webhook",
         "src": REPO / "orchestration" / "webhook" / "handler.py",
         "role_param": "/llmops/iam/lambda_webhook_arn",
         "timeout": 30, "memory": 256,
-        "env_keys": ["WEBHOOK_SECRET_ID", "START_PIPELINE_FN"],
+        "env_keys": [],
     },
     # The auditor's trigger. 08_triggers.py already schedules llmops-finops-daily
     # against this function name, so omitting it here leaves a live EventBridge
@@ -102,8 +111,10 @@ LAMBDAS = {
         # 60 s is enough: it lists runs and hands off asynchronously. The auditor's
         # own multi-minute work happens in the harness, not here.
         "timeout": 60, "memory": 256,
-        "env_keys": ["RUNS_TABLE", "DATA_BUCKET", "DRIVER_FN",
-                     "ESTIMATES_TABLE", "ACTUALS_TABLE", "PROJECT"],
+        # Additive: PROJECT is a defaulted read, pinned so the ledger partition key is
+        # a deploy-time decision. RUNS_TABLE is NOT here -- the auditor reads estimates
+        # and actuals, never the runs table.
+        "env_keys": ["PROJECT"],
     },
     # The orphan hunter. Its trigger is created by 08_triggers.py, so the same rule the
     # finops entry above records applies verbatim: omit this and the deploy leaves a live
@@ -120,7 +131,8 @@ LAMBDAS = {
         # 60 s: it builds one payload and hands off asynchronously. The sweep's own
         # multi-minute CloudWatch work happens in the harness, not here.
         "timeout": 60, "memory": 256,
-        "env_keys": ["EVENTS_TABLE", "DATA_BUCKET", "DRIVER_FN", "PROJECT"],
+        # Additive: PROJECT is a defaulted read, pinned for the same reason as finops.
+        "env_keys": ["PROJECT"],
     },
 }
 
@@ -142,6 +154,49 @@ def bundle(src: pathlib.Path) -> bytes:
     return buf.getvalue()
 
 
+#: Env vars a handler reads through ``os.environ.get(...)`` WITH a default, so their
+#: absence is a documented choice rather than a crash. Everything else a handler reads
+#: must be passed at deploy time -- see required_env_keys.
+OPTIONAL_ENV = frozenset({
+    "AWS_REGION",        # Lambda sets this itself; never ours to pass
+    "STALE_MINUTES",     # resurrector tuning, defaulted in code
+    "RESURRECTIONS_MAX",
+    "IDLE_HOURS",        # monitor_sweep tuning, defaulted in code
+})
+
+#: os.environ["KEY"] -- a read with NO default, i.e. a hard requirement.
+_REQUIRED_ENV_RE = re.compile(r'os\.environ\[\s*"([A-Z][A-Z0-9_]*)"\s*\]')
+
+
+def required_env_keys(src: pathlib.Path) -> set[str]:
+    """Every env var `src` reads WITHOUT a default — derived, never hand-listed.
+
+    The bug this replaces: the driver's env_keys named six variables while
+    handler.py read seven. `handle_finops_tool` reads ACTUALS_TABLE with no default,
+    the driver role has granted PutItem on that table since the statement was written
+    FOR this call (`CostActualsWrite` in iam/lambda_roles.json), and the deploy simply
+    never passed the name. So the daily cost audit's terminal tools raised
+    `KeyError: 'ACTUALS_TABLE'` -- measured live on 2026-08-01 (3x) and again on
+    2026-08-09 (3x, once per Lambda async retry), each retry burning a fresh AgentCore
+    turn re-deciding the same period. `llmops-cost-actuals` holds ZERO `#finding#` rows
+    for the whole life of the system: not one variance the auditor found was ever
+    recorded.
+
+    Why derived rather than a longer hand-maintained list: a list is a second copy of a
+    fact the handler already states, and it was wrong for eight days without anything
+    noticing. It cannot be checked by eye either -- the crash needs a finops turn to
+    reach a terminal tool, which happens once a day inside an agent, so the failure
+    surfaces as a missing dashboard row and nothing else. Parsing the source makes the
+    handler the single source of truth, and the guard test fails the build the moment a
+    new `os.environ[...]` lands without a deploy-time value.
+
+    Deliberately a regex over the source, not an import: importing these handlers pulls
+    in boto3 clients at module scope, and a deploy script must not need the runtime's
+    dependencies to know what the runtime needs.
+    """
+    return set(_REQUIRED_ENV_RE.findall(src.read_text())) - OPTIONAL_ENV
+
+
 def env_values(ssm, region, account, keys, extra):
     bucket = ssm.get_parameter(Name="/llmops/storage/bucket")["Parameter"]["Value"]
     base = {
@@ -160,12 +215,33 @@ def env_values(ssm, region, account, keys, extra):
         "PROJECT": "llmops-agentic-system",
     }
     base.update(extra or {})
+    unknown = sorted(set(keys) - set(base))
+    if unknown:
+        # A key the handler requires that this function has no VALUE for. Refusing
+        # beats passing the rest: with the variable absent the handler crashes at the
+        # line that reads it, which for the finops tools is inside an agent turn a day
+        # after the deploy reported success.
+        raise KeyError(
+            f"{unknown} is read by a handler with os.environ[...] but env_values has no "
+            "value for it. Add it to `base` (and to the role in iam/lambda_roles.json "
+            "if it names a resource) -- do not drop it from the handler's requirements.")
     return {k: base[k] for k in keys}
 
 
+def env_keys_for(cfg) -> list[str]:
+    """The env this Lambda gets: what its handler requires, plus declared extras.
+
+    `env_keys` in LAMBDAS is now additive-only -- for values a handler reads through a
+    defaulted `.get()` but that we still want set explicitly in this environment. The
+    REQUIREMENTS come from the handler source, so the two can no longer disagree.
+    """
+    return sorted(required_env_keys(cfg["src"]) | set(cfg.get("env_keys") or []))
+
+
 def deploy_lambda(lam, ssm, region, account, key, cfg, dry, events=None):
+    keys = env_keys_for(cfg)
     if dry:
-        return {"lambda": cfg["fn"], "would": "create/update", "env_keys": cfg["env_keys"]}
+        return {"lambda": cfg["fn"], "would": "create/update", "env_keys": keys}
     # FIRST, before the role lookup and long before update_function_code: a driver that
     # cannot read a live rule's envelope is broken from the instant the code lands, and
     # the failure is invisible from here -- PutEvents succeeds, the rule matches, and the
@@ -188,7 +264,7 @@ def deploy_lambda(lam, ssm, region, account, key, cfg, dry, events=None):
             print(json.dumps({"warning": "bus/translator agreement NOT verified",
                               "detail": gaps}), file=sys.stderr)
     role_arn = ssm.get_parameter(Name=cfg["role_param"])["Parameter"]["Value"]
-    env = env_values(ssm, region, account, cfg["env_keys"], None)
+    env = env_values(ssm, region, account, keys, None)
     code = bundle(cfg["src"])
     try:
         lam.get_function(FunctionName=cfg["fn"])

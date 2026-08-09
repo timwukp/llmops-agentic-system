@@ -5,6 +5,36 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
 ## [Unreleased]
 
+### The env a Lambda needs is read from its handler, not copied by hand
+
+`LAMBDAS["driver"]["env_keys"]` named six variables; `harness_driver/handler.py` reads
+seven. The seventh is `ACTUALS_TABLE`, read by `handle_finops_tool` to record the cost
+audit's `#finding#` rows — and the driver role has granted `PutItem` on that table since
+the `CostActualsWrite` statement was written FOR this call. Permission present, code
+present, variable absent: every finops turn that reached a terminal tool died on
+`KeyError: 'ACTUALS_TABLE'`. Measured live 2026-08-01 (3x) and 2026-08-09 (3x — one per
+Lambda async retry, each retry a fresh billed AgentCore turn re-deciding the same
+period). `llmops-cost-actuals` holds **zero** `#finding#` rows for the entire life of the
+system: not one variance the auditor found was ever recorded anywhere.
+
+The gap survived eight days because nothing could see it. The crash needs a finops turn
+to reach a terminal tool — once a day, inside an agent — so it surfaces as a dashboard
+row that never appears, and the deploy reports success either way.
+
+- `deploy/07_lambdas.py`: new `required_env_keys(src)` derives every `os.environ["KEY"]`
+  read (no default = hard requirement) from the handler source; `env_keys_for(cfg)` unions
+  that with the entry's `env_keys`, which is now **additive-only** — for defaulted reads
+  we still want pinned per environment (`START_FN`, `PROJECT`). `OPTIONAL_ENV` exempts the
+  four genuinely-defaulted knobs. `env_values` now RAISES on a required key it has no
+  value for, instead of passing the rest and leaving the handler to crash a day later.
+  Parsed rather than imported: a deploy script must not need the runtime's dependencies to
+  know what the runtime needs.
+- Tests: derived-vs-derived guard across all 7 Lambdas; the `ACTUALS_TABLE` regression
+  pinned by name (so deleting the read cannot satisfy the guard); `env_values` refusal;
+  and an `OPTIONAL_ENV` integrity check — an entry no handler defaults, or one that is
+  ALSO read without a default, is the same bug hidden behind the exemption list.
+  Mutation-verified: restoring the hand-maintained list reds three tests.
+
 ### A stage can outlive its runtime session; the driver now rolls before the 8h cap
 
 AgentCore reclaims a runtime session at `maxLifetime` = 28800s (8h). That cap is
