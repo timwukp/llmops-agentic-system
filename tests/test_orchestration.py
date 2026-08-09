@@ -4097,9 +4097,98 @@ def test_the_sweep_function_is_deployed_by_the_deployer_that_schedules_it():
     assert '/llmops/iam/lambda_monitor_sweep_arn' in lambdas, (
         "the sweep must get its OWN role, not the driver's -- a cost-control probe with "
         "every permission the pipeline it probes has is not a control")
-    entry = lambdas.split('"monitor_sweep": {')[1].split("},")[0]
+    mod = _lambdas_mod()
+    passed = set(mod.env_keys_for(mod.LAMBDAS["monitor_sweep"]))
     for key in ("EVENTS_TABLE", "DATA_BUCKET", "DRIVER_FN", "PROJECT"):
-        assert key in entry, f"{key} is read by the handler and not passed at deploy time"
+        assert key in passed, f"{key} is read by the handler and not passed at deploy time"
+
+
+# --- #71: the env a handler requires is derived from the handler ----------------------
+# The list used to be hand-copied into LAMBDAS[*]["env_keys"], and for the driver it was
+# WRONG: handler.py reads ACTUALS_TABLE (handle_finops_tool, for the #finding# rows the
+# cost audit writes) and the list named six other variables. The driver role has granted
+# PutItem on that table since the statement was added FOR this call. So the permission was
+# there, the code was there, and the variable was not -- `KeyError: 'ACTUALS_TABLE'`,
+# measured live on 2026-08-01 (3x) and 2026-08-09 (3x, one per Lambda async retry, each
+# retry a fresh billed AgentCore turn). llmops-cost-actuals holds ZERO #finding# rows for
+# the entire life of the system.
+
+def test_every_required_env_var_a_handler_reads_is_passed_at_deploy_time():
+    """The guard that would have caught the eight-day ACTUALS_TABLE gap on day one.
+
+    Derived on both sides: what each handler requires comes from its own source, and what
+    it gets comes from the deployer. A hand-written expectation here would just be a third
+    copy of the same fact, wrong in its own way.
+    """
+    mod = _lambdas_mod()
+    gaps = {}
+    for key, cfg in mod.LAMBDAS.items():
+        required = mod.required_env_keys(cfg["src"])
+        missing = required - set(mod.env_keys_for(cfg))
+        if missing:
+            gaps[key] = sorted(missing)
+    assert not gaps, (
+        f"these handlers read env vars the deploy never passes: {gaps}. The Lambda "
+        "raises KeyError at the line that reads it -- for the finops tools that is "
+        "inside an agent turn a day after the deploy reported success.")
+
+
+def test_the_driver_gets_the_actuals_table_it_writes_findings_to():
+    """The specific regression, pinned by name.
+
+    Not covered by the derived guard above on its own: that one passes if someone deletes
+    the read instead of adding the variable, which would silently drop the audit's
+    findings rather than crash on them.
+    """
+    mod = _lambdas_mod()
+    driver_src = (REPO / "orchestration" / "harness_driver" / "handler.py").read_text()
+    assert 'os.environ["ACTUALS_TABLE"]' in driver_src, (
+        "the driver must still record the finops agent's findings; if this read is gone, "
+        "check that the findings are written somewhere else before relaxing the test")
+    assert "ACTUALS_TABLE" in mod.env_keys_for(mod.LAMBDAS["driver"])
+
+
+def test_every_value_the_deployer_passes_is_a_value_it_knows():
+    """A required key with no value in env_values is a deploy that must not proceed.
+
+    Silently passing the others is how the original bug behaved: five of six variables
+    arrived, the function came up healthy, and the sixth surfaced as a KeyError a day
+    later. Refusing names the missing key while a human is still watching the deploy.
+    """
+    mod = _lambdas_mod()
+
+    class _SSM:
+        def get_parameter(self, Name):
+            return {"Parameter": {"Value": "test-bucket"}}
+
+    for key, cfg in mod.LAMBDAS.items():
+        env = mod.env_values(_SSM(), "us-east-1", "123456789012",
+                             mod.env_keys_for(cfg), None)
+        assert set(env) == set(mod.env_keys_for(cfg)), key
+        assert all(v for v in env.values()), f"{key} got an empty value: {env}"
+
+    with pytest.raises(KeyError, match="NOT_A_REAL_SETTING"):
+        mod.env_values(_SSM(), "us-east-1", "123456789012",
+                       ["RUNS_TABLE", "NOT_A_REAL_SETTING"], None)
+
+
+def test_optional_env_vars_are_the_ones_the_handlers_actually_default():
+    """OPTIONAL_ENV is an exemption list, so it has to name real defaulted reads.
+
+    An entry that no handler reads with a default is either a typo or -- worse -- a
+    required variable somebody exempted to make this file's guards go quiet.
+    """
+    mod = _lambdas_mod()
+    sources = "\n".join(cfg["src"].read_text() for cfg in mod.LAMBDAS.values())
+    for name in mod.OPTIONAL_ENV:
+        if name == "AWS_REGION":
+            continue          # set by the Lambda runtime itself, never by us
+        assert f'os.environ.get("{name}"' in sources, (
+            f"{name} is exempted from the required-env guard but no handler reads it "
+            "with a default; if it is required, pass it instead of exempting it")
+        assert f'os.environ["{name}"]' not in sources, (
+            f"{name} is exempted AND read without a default somewhere -- that is the "
+            "exact shape of the ACTUALS_TABLE bug, hidden behind the exemption list")
 
 
 # --- #42: placeholder substitution for harness configs --------------------------------
