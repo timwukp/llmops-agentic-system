@@ -120,9 +120,27 @@ def triage_event_from_bus(record: dict, bucket: str) -> dict:
     }
 
 
-def session_id(run_id: str, stage: str, task: str) -> str:
-    """Deterministic, >=33 chars (AgentCore minimum). Same task -> same session."""
-    base = f"{run_id}-{stage}-{task}"
+#: AgentCore reclaims a runtime session at `maxLifetime` — 28800s (8h), a HARD cap that
+#: cannot be reset by activity (measured; see the account's warm-start study). A stage
+#: that runs 8-12h therefore outlives its own session, and letting the platform reclaim
+#: one mid-request is the documented anti-pattern: the invoke fails in a way nothing in
+#: the driver distinguishes from a real error. Roll to a fresh session BEFORE the cap
+#: instead. 7h leaves an hour of margin for a turn already in flight (840s) plus the
+#: continuation chain behind it.
+SESSION_MAX_LIFETIME_S = 28800
+SESSION_ROLLOVER_S = 25200
+
+
+def session_id(run_id: str, stage: str, task: str, epoch: int = 0) -> str:
+    """Deterministic, >=33 chars (AgentCore minimum). Same task -> same session.
+
+    `epoch` rolls the identity forward when the previous session approaches
+    AgentCore's 8h maxLifetime. Determinism is what makes both resumption paths work
+    — a self-reinvoke and a resurrector wake both recompute the same id from the same
+    (run, stage, task, epoch) — so the epoch has to travel in the event, never be
+    derived from a clock at call time.
+    """
+    base = f"{run_id}-{stage}-{task}" + (f"-e{epoch}" if epoch else "")
     if len(base) >= 33:
         return base[:100]
     return (base + "-" + hashlib.sha256(base.encode()).hexdigest())[:64]
@@ -914,12 +932,19 @@ def handler(event, context=None, clients=None):
 
 def _run_stage(event, context=None, c=None):
     c = c if c is not None else _clients()
-    sess = session_id(event["run_id"], event["stage"], event["task"])
     payload = {"run_id": event["run_id"], "stage": event["stage"],
                "manifest_uri": event["manifest_uri"],
                "params": {"task": event["task"], **(event.get("params") or {})}}
     if event.get("task_token"):
         payload["params"]["iteration"] = event.get("iteration", 0)
+
+    # Session epoch: which incarnation of this stage's session we are on. Travels in
+    # the event so every resumption path (self-reinvoke, resurrector wake) recomputes
+    # the SAME session id; a clock read at call time would hand two live drivers two
+    # different sessions for one stage.
+    epoch = int(event.get("_session_epoch", 0))
+    session_started_at = float(event.get("_session_started_at") or time.time())
+    sess = session_id(event["run_id"], event["stage"], event["task"], epoch)
 
     # Continuation across Lambda invocations: one harness turn can run 840s and the
     # Lambda dies at 900s, so only ONE turn fits per invocation. Whenever the loop
@@ -943,8 +968,49 @@ def _run_stage(event, context=None, c=None):
             FunctionName=context.function_name, InvocationType="Event",
             Payload=json.dumps({**event, "_continuation": messages,
                                 "_stream_retried": stream_retried,
-                                "_re_asks": re_asks}, default=str))
+                                "_re_asks": re_asks,
+                                "_session_epoch": epoch,
+                                "_session_started_at": session_started_at},
+                               default=str))
         return {"status": "self_reinvoked_between_turns"}
+
+    def _roll_session():
+        """Start the next session epoch for this stage.
+
+        A fresh session carries NO conversation history, so the pending `messages`
+        list cannot travel with it: it is usually a toolResult answering a toolUse the
+        new session never issued, which AgentCore rejects outright. Re-seed with the
+        original task payload plus a resume instruction — the same shape that made the
+        2026-08-08 hand-resurrection lossless, because every stage's real state lives
+        in S3, not in the transcript.
+        """
+        nonlocal epoch, session_started_at, sess, messages, re_asks, stream_retried
+        epoch += 1
+        session_started_at = time.time()
+        sess = session_id(event["run_id"], event["stage"], event["task"], epoch)
+        re_asks = 0
+        stream_retried = False
+        messages = _user_text(json.dumps(payload, default=str) + (
+            "\n\nRESUMING in a fresh runtime session (the previous one reached the "
+            "platform's 8h session lifetime). Nothing you wrote to S3 is lost and "
+            "nothing before this point is repeatable from memory: re-read your "
+            "manifest and your own S3 outputs to see what is already done, skip that "
+            "work, and continue. End this turn with an inline-function call."))
+        print(f"[driver] session rollover -> epoch {epoch} ({sess})")
+        try:
+            # Rolled session ids are NOT derivable from (run, stage, task) alone, and
+            # the console's batch-eval scoring reconstructs ids that way — an
+            # unrecorded epoch is a session whose spans nobody ever scores. Append it
+            # to the run row so the derivation has something to union with.
+            c["ddb"].Table(os.environ["RUNS_TABLE"]).update_item(
+                Key={"run_id": event["run_id"]},
+                UpdateExpression=("SET rolled_session_ids = "
+                                  "list_append(if_not_exists(rolled_session_ids, :e), :s)"),
+                ConditionExpression="attribute_exists(run_id)",
+                ExpressionAttributeValues={":e": [], ":s": [sess]})
+        except Exception as exc:  # noqa: BLE001 — bookkeeping must not kill the roll
+            print(f"[driver] could not record rolled session id (continuing): "
+                  f"{type(exc).__name__}: {exc}")
 
     def _heartbeat():
         """Stamp the run row before every turn: driver_beat_at + the exact payload a
@@ -962,10 +1028,13 @@ def _run_stage(event, context=None, c=None):
                 ConditionExpression="attribute_exists(run_id)",
                 ExpressionAttributeValues={
                     ":t": datetime.now(timezone.utc).isoformat(),
-                    ":p": json.dumps({k: event[k] for k in
-                                      ("run_id", "stage", "task", "harness_id",
-                                       "manifest_uri", "task_token", "iteration")
-                                      if k in event}, default=str)})
+                    ":p": json.dumps({**{k: event[k] for k in
+                                         ("run_id", "stage", "task", "harness_id",
+                                          "manifest_uri", "task_token", "iteration")
+                                         if k in event},
+                                      "_session_epoch": epoch,
+                                      "_session_started_at": session_started_at},
+                                     default=str)})
         except Exception as exc:  # noqa: BLE001 — the beat is telemetry, not the work
             print(f"[driver] heartbeat write failed (continuing): "
                   f"{type(exc).__name__}: {exc}")
@@ -973,6 +1042,11 @@ def _run_stage(event, context=None, c=None):
     first_turn = True
 
     while True:
+        # Between turns is the ONLY safe place to roll: mid-turn the session holds an
+        # unanswered toolUse. Checked before the beat so the stamped payload names the
+        # epoch a resurrector should wake into.
+        if time.time() - session_started_at >= SESSION_ROLLOVER_S:
+            _roll_session()
         _heartbeat()
         if not first_turn and _out_of_time():
             return _self_reinvoke()

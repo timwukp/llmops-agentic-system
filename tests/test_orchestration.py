@@ -19,6 +19,7 @@ import re
 import os
 import pathlib
 import sys
+import time
 
 import pytest
 
@@ -4828,3 +4829,194 @@ class TestDriverHeartbeat:
         out = driver.handler(driver_event(), clients=c)
         assert out["status"] == "completed", (
             "a throttled heartbeat killed a turn that was completing the stage")
+
+
+# a production-shaped run id: real ones are >=33 chars, so session_id returns the plain
+# base and the `-e<N>` suffix is the whole difference between epochs
+ROLL_RUN_ID = "run-20260808T154900Z-68cfa9c8"
+ROLL_MANIFEST_URI = f"s3://llmops-data-test/runs/{ROLL_RUN_ID}/manifest.json"
+ROLL_OUTPUT_URI = f"s3://llmops-data-test/runs/{ROLL_RUN_ID}/raw/data.jsonl"
+
+
+class TestSessionRollover:
+    """AgentCore reclaims a runtime session at maxLifetime = 28800s (8h). That cap is
+    absolute: activity does not reset it, and no configuration raises it. The ARC-2
+    distillation stage runs 8-12h in ONE session (deterministic id, 55+ tasks, turn
+    after turn through self-reinvokes), so it outlives its own session and the invoke
+    that crosses the line fails in a way nothing here distinguishes from a real error.
+    Rolling to a fresh session BEFORE the cap is the documented pattern."""
+
+    def _ctx(self):
+        class _Ctx:
+            function_name = "llmops-harness-driver"
+
+            def get_remaining_time_in_millis(self):
+                return 860_000
+        return _Ctx()
+
+    class _Lam:
+        def __init__(self):
+            self.invocations = []
+
+        def invoke(self, **kw):
+            self.invocations.append(kw)
+            return {"StatusCode": 202}
+
+    def test_a_session_short_of_the_cap_is_never_rolled(self):
+        """The roll costs a whole turn (fresh session, re-read S3, re-orient). Paying
+        it on a stage that finishes in minutes would be pure waste, and rolling a
+        session whose transcript still holds the task would drop context for nothing."""
+        uri = ROLL_OUTPUT_URI
+        ac = FakeAgentCore([tool_use_stream("stage_complete", {"outputs": [uri]}),
+                            text_stream("ack")])
+        c = clients(ac, FakeS3(existing=[uri]))
+        out = driver.handler(driver_event(run_id=ROLL_RUN_ID, manifest_uri=ROLL_MANIFEST_URI), clients=c)
+        assert out["status"] == "completed"
+        assert ac.calls[0]["runtimeSessionId"] == f"{ROLL_RUN_ID}-data-prep-generate", (
+            "a fresh stage got a rolled session id — epoch 0 must stay the plain "
+            "deterministic id or every past run's session ids stop matching")
+
+    def test_a_session_past_the_rollover_age_moves_to_a_fresh_one(self):
+        """Red before the fix: the driver reused one session id forever, so hour 8
+        arrived with the platform, not the driver, deciding what happened next."""
+        uri = ROLL_OUTPUT_URI
+        ac = FakeAgentCore([tool_use_stream("stage_complete", {"outputs": [uri]}),
+                            text_stream("ack")])
+        c = clients(ac, FakeS3(existing=[uri]))
+        c["ddb"].Table(ENV["RUNS_TABLE"]).items.append({"run_id": ROLL_RUN_ID})
+        # a continuation whose session was opened 7h+ ago — exactly the shape a
+        # long distillation stage reaches after ~30 self-reinvokes
+        event = driver_event(run_id=ROLL_RUN_ID, manifest_uri=ROLL_MANIFEST_URI,
+            _continuation=[{"role": "user", "content": [{"text": "carry on"}]}],
+            _session_started_at=time.time() - driver.SESSION_ROLLOVER_S - 60)
+        out = driver.handler(event, clients=c)
+        assert out["status"] == "completed"
+        assert ac.calls[0]["runtimeSessionId"] == f"{ROLL_RUN_ID}-data-prep-generate-e1", (
+            "the aged session was reused — the next invoke would have crossed "
+            "AgentCore's 8h maxLifetime and died with an unattributable error")
+
+    def test_the_rollover_threshold_leaves_margin_under_the_platform_cap(self):
+        """A threshold at (or above) the cap is not a rollover, it is a race the
+        platform wins. One in-flight harness turn is 840s, so the margin has to
+        exceed that with room for the continuation behind it."""
+        assert driver.SESSION_MAX_LIFETIME_S == 28800, (
+            "maxLifetime is a platform constant (8h); if AWS changed it, change the "
+            "citation in the code comment too")
+        margin = driver.SESSION_MAX_LIFETIME_S - driver.SESSION_ROLLOVER_S
+        assert margin >= 1800, (
+            f"only {margin}s of margin: an 840s turn plus its handoff can still be "
+            "caught by the cap")
+
+    def test_a_rolled_session_re_seeds_the_task_instead_of_replaying_a_toolresult(self):
+        """The pending message at roll time is usually a toolResult answering a
+        toolUse the OLD session issued. A fresh session never issued it, so replaying
+        it makes the first invoke invalid ('toolResult blocks ... exceeds the number
+        of toolUse blocks of previous turn' — observed live on the console's dispatch
+        path). The new session must be seeded with the task payload plus a resume
+        instruction that points the agent at S3, which is where the state actually is."""
+        uri = ROLL_OUTPUT_URI
+        ac = FakeAgentCore([tool_use_stream("stage_complete", {"outputs": [uri]}),
+                            text_stream("ack")])
+        c = clients(ac, FakeS3(existing=[uri]))
+        c["ddb"].Table(ENV["RUNS_TABLE"]).items.append({"run_id": ROLL_RUN_ID})
+        event = driver_event(run_id=ROLL_RUN_ID, manifest_uri=ROLL_MANIFEST_URI,
+            _continuation=[{"role": "user", "content": [
+                {"toolResult": {"toolUseId": "tu-1", "content": [{"text": "{}"}],
+                                "status": "success"}}]}],
+            _session_started_at=time.time() - driver.SESSION_ROLLOVER_S - 60)
+        driver.handler(event, clients=c)
+        sent = json.dumps(ac.calls[0]["messages"], default=str) \
+            if not isinstance(ac.calls[0].get("messages"), (bytes, str)) \
+            else str(ac.calls[0]["messages"])
+        assert "toolResult" not in sent, (
+            "the rolled session was handed a toolResult it never asked for — the "
+            "first invoke of every rolled session would fail")
+        assert "manifest" in sent.lower(), (
+            "the rolled session was not re-seeded with the task payload")
+
+    def test_the_epoch_rides_the_continuation_so_both_resume_paths_agree(self):
+        """Two things resume a stage: the driver's own self-reinvoke and the
+        resurrector. Both rebuild the session id from the event. If the epoch is
+        derived from a clock instead of carried, a resurrection lands in a DIFFERENT
+        session than the driver it replaced — two live sessions, one task token."""
+        src = (REPO / "orchestration/harness_driver/handler.py").read_text()
+        body = src[src.index("def _run_stage"):]
+        assert '"_session_epoch": epoch' in body, \
+            "_self_reinvoke stopped carrying the session epoch"
+        assert 'int(event.get("_session_epoch", 0))' in body, \
+            "the continuation branch stopped restoring the session epoch"
+        assert '"_session_epoch": epoch' in body.split("def _heartbeat")[1], \
+            ("the stamped heartbeat payload lost the epoch — a resurrector waking "
+             "from it would open a session the driver had already aged out of")
+
+    def test_a_rolled_session_id_is_recorded_for_span_scoring(self):
+        """The console reconstructs session ids from (run, stage, task) to point batch
+        evaluation at the right spans. A rolled id is not reconstructible from that
+        tuple, so an unrecorded epoch is a session whose spans nobody ever scores —
+        and rolled sessions are precisely the long, expensive, interesting ones."""
+        uri = ROLL_OUTPUT_URI
+        ac = FakeAgentCore([tool_use_stream("stage_complete", {"outputs": [uri]}),
+                            text_stream("ack")])
+        c = clients(ac, FakeS3(existing=[uri]))
+        c["ddb"].Table(ENV["RUNS_TABLE"]).items.append({"run_id": ROLL_RUN_ID})
+        driver.handler(driver_event(run_id=ROLL_RUN_ID, manifest_uri=ROLL_MANIFEST_URI,
+            _continuation=[{"role": "user", "content": [{"text": "carry on"}]}],
+            _session_started_at=time.time() - driver.SESSION_ROLLOVER_S - 60),
+            clients=c)
+        rolls = [u for u in c["ddb"].Table(ENV["RUNS_TABLE"]).updates
+                 if "rolled_session_ids" in u.get("UpdateExpression", "")]
+        assert rolls, "the rolled session id was never recorded on the run row"
+        assert rolls[0]["ExpressionAttributeValues"][":s"] == \
+            [f"{ROLL_RUN_ID}-data-prep-generate-e1"]
+
+    def test_recording_failure_does_not_block_the_roll(self):
+        """Bookkeeping for a scoring convenience must never outrank keeping the stage
+        alive: if the append throttles, the session still has to roll."""
+        uri = ROLL_OUTPUT_URI
+        ac = FakeAgentCore([tool_use_stream("stage_complete", {"outputs": [uri]}),
+                            text_stream("ack")])
+        c = clients(ac, FakeS3(existing=[uri]))
+
+        class _ThrottlingDDB(FakeDDB):
+            def Table(self, name):
+                t = super().Table(name)
+                if name == ENV["RUNS_TABLE"] and not getattr(t, "_wrapped", False):
+                    orig = t.update_item
+
+                    def flaky(**kw):
+                        if "rolled_session_ids" in kw.get("UpdateExpression", ""):
+                            raise Exception("ProvisionedThroughputExceededException")
+                        return orig(**kw)
+                    t.update_item = flaky
+                    t._wrapped = True
+                return t
+
+        c["ddb"] = _ThrottlingDDB()
+        out = driver.handler(driver_event(run_id=ROLL_RUN_ID, manifest_uri=ROLL_MANIFEST_URI,
+            _continuation=[{"role": "user", "content": [{"text": "carry on"}]}],
+            _session_started_at=time.time() - driver.SESSION_ROLLOVER_S - 60),
+            clients=c)
+        assert out["status"] == "completed", (
+            "a throttled bookkeeping write killed the rolled stage")
+        assert ac.calls[0]["runtimeSessionId"].endswith("-e1"), \
+            "the roll itself was skipped when its bookkeeping failed"
+
+    def test_the_console_scores_rolled_sessions_it_cannot_derive(self):
+        """Derived guard: the driver records rolled ids only so the console can use
+        them. A recorder with no reader is dead code, and the failure is silent —
+        scoring quietly covers less than it claims."""
+        src = (REPO / "deploy/console/lambda_function.py").read_text()
+        fn = src[src.index("def _recent_session_ids"):src.index("def _pipeline_runtimes")]
+        assert "rolled_session_ids" in fn, (
+            "_recent_session_ids ignores rolled session ids — every session past "
+            "hour 7 of a long stage is invisible to batch evaluation")
+
+
+class TestSessionRolloverDocs:
+    def test_the_rollover_is_documented_in_both_languages(self):
+        for name in ("docs/ARCHITECTURE.md", "docs/ARCHITECTURE.zh-TW.md"):
+            text = (REPO / name).read_text()
+            assert "28800" in text or "8h" in text or "8 小時" in text, \
+                f"{name} does not mention AgentCore's session lifetime cap"
+            assert "epoch" in text.lower(), \
+                f"{name} does not document the session-epoch rollover"

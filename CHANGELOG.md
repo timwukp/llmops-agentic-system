@@ -5,6 +5,50 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
 ## [Unreleased]
 
+### A stage can outlive its runtime session; the driver now rolls before the 8h cap
+
+AgentCore reclaims a runtime session at `maxLifetime` = 28800s (8h). That cap is
+absolute: activity does not reset it and no setting raises it. The distillation stage
+runs 8–12h in ONE deterministic session — 55+ tasks, turn after turn across
+self-reinvokes — so it outlives the session it is speaking into, and the invoke that
+crosses the line comes back as an ordinary runtime error. Nothing in the driver could
+tell that from a real failure: it would spend the one stream-salvage retry, then the
+re-ask budget, arguing with a session that can never answer again, and the stage would
+die `MissingStageComplete` with the work still unfinished. The heartbeat + resurrector
+pair (#67) cannot cover this one — the driver is alive and beating; it is the *session*
+that expired, so every revival walks back into the same dead session id. The fix is to
+stop letting the platform pick the moment.
+
+- `orchestration/harness_driver/handler.py`: `session_id()` takes an `epoch`; epoch 0
+  is byte-identical to the old id, so no past run's session ids move. `_run_stage`
+  carries `_session_epoch` + `_session_started_at` in the continuation payload and, at
+  the top of the turn loop, rolls to `…-e<N>` once the session passes
+  `SESSION_ROLLOVER_S` = 25200s — leaving 3600s of margin for an 840s turn already in
+  flight plus its handoff. Rolling happens ONLY between turns: mid-turn the session
+  holds an unanswered `toolUse`.
+- The pending message list does not travel to the new session. It is usually a
+  `toolResult` answering a `toolUse` the fresh session never issued, which AgentCore
+  rejects outright ("toolResult blocks … exceeds the number of toolUse blocks of
+  previous turn" — the same shape found live on the console's dispatch path). The new
+  session is re-seeded with the task payload plus a resume instruction pointing the
+  agent at its own S3 outputs. That is not a workaround: S3 is where the state actually
+  is, which is why the 2026-08-08 hand resurrection was lossless.
+- The epoch is CARRIED, never derived from a clock at call time — the driver's
+  self-reinvoke and the resurrector both rebuild the session id from the event, so a
+  clock read would put a resurrection in a different session than the driver it
+  replaced: two live sessions, one task token. The heartbeat's stamped payload carries
+  the epoch too, pinned by test.
+- `deploy/console/lambda_function.py`: rolled session ids are appended to the run row
+  (`rolled_session_ids`) and `_recent_session_ids` unions them in. The console
+  reconstructs ids from `(run, stage, task)` to aim batch evaluation at spans; a rolled
+  id is not derivable from that tuple, so an unrecorded epoch is a session nobody ever
+  scores — and rolled sessions are precisely the longest and most expensive ones. Both
+  DynamoDB writes are best-effort: bookkeeping for a scoring convenience must never
+  outrank keeping the stage alive.
+- Tests: 9 new (`TestSessionRollover` + docs twin guard). Mutation-verified — disabling
+  the roll reds 4 of them, and stubbing out the re-seed reds the `toolResult` pin;
+  a derived guard fails if the console stops reading what the driver records.
+
 ### A stream can outlive the Lambda wall; the drain now watches the clock
 
 boto's `read_timeout` (870s) bounds the gap BETWEEN chunks, not the stream's total
