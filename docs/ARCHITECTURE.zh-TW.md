@@ -654,6 +654,18 @@ session；`/api/refresh` 在頁面重載後用 httpOnly cookie 復原 session（
 （`conductor_tools.sign_record`），帶著核准者身分與來源 IP —— 所以一次核准是**證據**，
 而不是一個 UI 狀態。
 
+**一個 run 能用哪些模型，以被簽署的 plan 為權威**，因為模型同意是 model-specific 的：核准
+一個每千輸出 token $0.05 的 Fable-5 teacher，並不等於核准一個 DeepSeek-R1 的。所以
+`seed_manifest` 解析 `models` 的規則是：`DEFAULT_MODELS` 被 plan 覆蓋，`params.models` 只能
+補上 plan 沒提到的角色，而在 plan 已指名的角色上若有矛盾就**拒絕**。在此之前是 defaults
+直接勝出：run 68cfa9c8 的 manifest 帶著 `models.teacher = us.deepseek.r1-v1:0`，而它被簽署的
+plan 寫的是 `global.anthropic.claude-fable-5`，data-prep agent 只能自己察覺矛盾、**憑判斷**
+挑出被簽署的那個 —— 並在它自己生成的 driver 裡寫下「top-level manifest 'models' field is
+stale boilerplate」。它選對了；但它「必須選」本身就是缺陷，因為簽章存在的目的正是要把這個
+決定定下來，結果卻被交還給模型。矛盾是被拒絕、而不是被安靜解決的：矛盾意味著派發路徑與核准
+路徑對「買了什麼」有不同認知，而猜測買到的是一次未經核准的支出，且此後在每一份 artifact 裡
+都看起來像獲得授權。
+
 **Tasks 平面是唯一會跟 agent 對話的平面**，也是這個產品面向客戶的那一半：一個 engagement
 一條 thread，`llmops_orchestrator` 在裡面跑它的諮詢協議，客戶透過**預簽名**的
 `customer-data/` 上傳交付資料（key **一律由伺服器決定** —— 客戶端給的 key 就是一次路徑穿越

@@ -2936,6 +2936,62 @@ class TestConductorDispatch:
         # the audit run must complete WITHOUT reaching any GPU stage
         assert audit["Next"] == "Complete"
 
+    def test_the_signed_plan_outranks_the_boilerplate_model_defaults(self):
+        """Model consent is model-specific: approving a Fable-5 teacher is not approving
+        a DeepSeek-R1 one. So the plan a human SIGNED has to beat DEFAULT_MODELS.
+
+        Red before the fix: `models` was `{**DEFAULT_MODELS, **params.models}` with the
+        plan never consulted, so run 68cfa9c8's manifest carried
+        models.teacher=us.deepseek.r1-v1:0 while its signed plan said
+        global.anthropic.claude-fable-5 — two contradictory teacher ids in one manifest.
+        The data-prep agent resolved it by judgment, writing "top-level manifest 'models'
+        field is stale boilerplate" into the driver it generated. It chose correctly;
+        that it had to choose at all is the defect."""
+        plan = {"models": {"teacher": "global.anthropic.claude-fable-5"}}
+        m = start_pipeline.seed_manifest("run-x", "conductor", {}, plan)
+        assert m["models"]["teacher"] == "global.anthropic.claude-fable-5", (
+            "boilerplate DEFAULT_MODELS overwrote the teacher a human signed for")
+        # roles the plan is silent about still fall back to the defaults
+        assert m["models"]["student"] == start_pipeline.DEFAULT_MODELS["student"]
+
+    def test_a_plan_silent_on_models_still_gets_the_defaults(self):
+        """Most runs (scheduler, webhook) have no plan at all. The authority rule must
+        not turn "the plan didn't say" into "no teacher configured"."""
+        for plan in ({}, None, {"models": {}}):
+            m = start_pipeline.seed_manifest("run-x", "scheduler", {}, plan)
+            assert m["models"] == start_pipeline.DEFAULT_MODELS
+
+    def test_params_may_fill_gaps_the_plan_leaves_but_not_contradict_it(self):
+        """`params` is authored by the dispatching agent, so letting it win over the
+        plan would reopen the same bypass from the other side. Filling a role the plan
+        is silent about is fine; overriding a role the plan named is not."""
+        plan = {"models": {"teacher": "global.anthropic.claude-fable-5"}}
+        m = start_pipeline.seed_manifest(
+            "run-x", "conductor", {"models": {"student": "Qwen/Qwen3-4B"}}, plan)
+        assert m["models"]["teacher"] == "global.anthropic.claude-fable-5"
+        assert m["models"]["student"] == "Qwen/Qwen3-4B"
+
+    def test_a_dispatch_contradicting_the_signed_plan_is_refused(self):
+        """A disagreement here is never routine: the dispatch path and the approval path
+        disagree about what was bought. Failing costs one visible error; guessing costs
+        an unapproved spend that looks authorized in every artifact afterward."""
+        plan = {"models": {"teacher": "global.anthropic.claude-fable-5"}}
+        with pytest.raises(ValueError) as e:
+            start_pipeline.seed_manifest(
+                "run-x", "conductor", {"models": {"teacher": "us.deepseek.r1-v1:0"}}, plan)
+        msg = str(e.value)
+        assert "teacher" in msg and "fable-5" in msg and "deepseek" in msg, (
+            "the refusal must name the role AND both models — an error that says only "
+            "'models conflict' sends the operator back to diffing two JSON blobs")
+
+    def test_identical_models_in_plan_and_params_are_not_a_conflict(self):
+        """Belt-and-braces dispatches that echo the plan's own models are the common
+        case, not an error: the check is on DISAGREEMENT, not on presence."""
+        models = {"teacher": "global.anthropic.claude-fable-5"}
+        m = start_pipeline.seed_manifest("run-x", "conductor", {"models": dict(models)},
+                                        {"models": dict(models)})
+        assert m["models"]["teacher"] == "global.anthropic.claude-fable-5"
+
     def test_manifest_stores_the_approval_block_verbatim(self):
         m = start_pipeline.seed_manifest("run-x", "conductor", {}, {"p": 1},
                                          {"approved_by": "alice", "budget_usd": 50})

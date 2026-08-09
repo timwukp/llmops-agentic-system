@@ -768,6 +768,20 @@ over-budget dispatch and lets it through with the estimate recorded; `blocking` 
 Approvals are **KMS-signed and hash-chained** (`conductor_tools.sign_record`), carrying the
 approver's identity and source IP, so an approval is evidence rather than a UI state.
 
+**The signed plan is the authority on which models a run may use**, because model consent is
+model-specific: approving a Fable-5 teacher at $0.05/1k output is not approving a DeepSeek-R1
+one. So `seed_manifest` resolves `models` as `DEFAULT_MODELS` overridden by the plan, with
+`params.models` allowed to fill roles the plan is silent about and **refused** where it
+contradicts one the plan named. Before this the defaults simply won: run 68cfa9c8's manifest
+carried `models.teacher = us.deepseek.r1-v1:0` while its signed plan said
+`global.anthropic.claude-fable-5`, and the data-prep agent had to notice the contradiction and
+pick the signed one *by judgment* — writing "top-level manifest 'models' field is stale
+boilerplate" into the driver it generated. It chose correctly; that it had to choose at all is
+the defect, because the decision a signature exists to settle was handed back to the model.
+A disagreement is refused rather than silently resolved: it means the dispatch path and the
+approval path disagree about what was bought, and guessing buys an unapproved spend that looks
+authorized in every artifact afterward.
+
 **The Tasks tab is the only plane that talks to an agent**, and it is the customer-facing
 half of the product: one thread per engagement, where `llmops_orchestrator` runs its consult
 protocol, the customer hands over data via a **presigned** `customer-data/` upload (the key is
