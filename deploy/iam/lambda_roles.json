@@ -225,6 +225,36 @@
         ]
       }
     },
+    "resurrector": {
+      "_comment": "resurrector: EventBridge Scheduler target, every 15 minutes. Re-invokes the harness driver for running runs whose driver_beat_at went stale with no parked task token -- the dead-session wake that the async self-reinvoke cannot guarantee (Lambda dropped one on 2026-08-08; a run sat dead 9 hours). A separate role, per the finops_reconcile argument: a scheduled janitor must not inherit the pipeline's whole permission surface.",
+      "permissionsPolicy": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "_comment": "Scan to find stale-beat running runs (tens of rows; add a status GSI and switch to Query the day the table holds thousands), and the conditional UpdateItem that CLAIMS a resurrection -- conditional on the beat it read, so two overlapping sweeps cannot double-resurrect one silence.",
+            "Sid": "FindAndClaimStaleRuns",
+            "Effect": "Allow",
+            "Action": [
+              "dynamodb:Scan",
+              "dynamodb:UpdateItem"
+            ],
+            "Resource": "arn:aws:dynamodb:<REGION>:<ACCOUNT_ID>:table/llmops-pipeline-runs"
+          },
+          {
+            "Sid": "ReinvokeDriver",
+            "Effect": "Allow",
+            "Action": "lambda:InvokeFunction",
+            "Resource": "arn:aws:lambda:<REGION>:<ACCOUNT_ID>:function:llmops-harness-driver"
+          },
+          {
+            "Sid": "AnnounceResurrection",
+            "Effect": "Allow",
+            "Action": "events:PutEvents",
+            "Resource": "arn:aws:events:<REGION>:<ACCOUNT_ID>:event-bus/llmops-pipeline"
+          }
+        ]
+      }
+    },
     "finops_reconcile": {
       "_comment": "finops_reconcile: EventBridge Scheduler target, daily 09:00 UTC. Picks the periods to reconcile and delegates the streaming turn loop to harness-driver. It reads billing itself for nothing \u2014 the agent does that through its own execution role; this Lambda only needs to choose periods and invoke.",
       "permissionsPolicy": {

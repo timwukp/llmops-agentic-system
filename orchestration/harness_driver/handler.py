@@ -24,6 +24,7 @@ import json
 import os
 import sys
 import time
+from datetime import datetime, timezone
 from typing import Optional
 
 import boto3
@@ -919,9 +920,34 @@ def _run_stage(event, context=None, c=None):
                                 "_re_asks": re_asks}, default=str))
         return {"status": "self_reinvoked_between_turns"}
 
+    def _heartbeat():
+        """Stamp the run row before every turn: driver_beat_at + the exact payload a
+        resurrector needs to re-invoke this stage. The async self-reinvoke is
+        fire-and-forget — Lambda dropped one on 2026-08-08 (AsyncEventsDropped=1) and
+        run 68cfa9c8 sat dead for 9 hours at 4/55 with its token parked and nobody
+        left alive to be re-invoked; an operator resurrected it by hand from the
+        Step Functions history. A beat that stops while the stage is unfinished IS
+        the dead-driver signal, and the stamped payload is the resurrection. Best
+        effort: a beat that cannot be written must not kill the turn it announces."""
+        try:
+            c["ddb"].Table(os.environ["RUNS_TABLE"]).update_item(
+                Key={"run_id": event["run_id"]},
+                UpdateExpression="SET driver_beat_at = :t, driver_beat_payload = :p",
+                ConditionExpression="attribute_exists(run_id)",
+                ExpressionAttributeValues={
+                    ":t": datetime.now(timezone.utc).isoformat(),
+                    ":p": json.dumps({k: event[k] for k in
+                                      ("run_id", "stage", "task", "harness_id",
+                                       "manifest_uri", "task_token", "iteration")
+                                      if k in event}, default=str)})
+        except Exception as exc:  # noqa: BLE001 — the beat is telemetry, not the work
+            print(f"[driver] heartbeat write failed (continuing): "
+                  f"{type(exc).__name__}: {exc}")
+
     first_turn = True
 
     while True:
+        _heartbeat()
         if not first_turn and _out_of_time():
             return _self_reinvoke()
         first_turn = False

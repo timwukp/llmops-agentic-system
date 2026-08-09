@@ -50,6 +50,12 @@ OWNER_PAGED = "OwnerPaged"
 #: MODEL_FAILED_OVER: the pipeline relaunches the stage without spending a remediation
 #: iteration, and this event is how the timeline says why the same state ran twice.
 CAPACITY_STOPPED = "CapacityStopped"
+#: The resurrector re-invoked a driver whose heartbeat went silent mid-stage.
+#: Informational, like MODEL_FAILED_OVER — the run continues; this is the timeline's
+#: answer to "why did a fresh session appear an hour into a stage". A resurrection
+#: that keeps recurring for one run is the signal to read, and the resurrector
+#: escalates by itself past its cap.
+DRIVER_RESURRECTED = "DriverResurrected"
 PIPELINE_COMPLETED = "PipelineCompleted"
 PIPELINE_FAILED = "PipelineFailed"
 
@@ -72,6 +78,7 @@ ALL_EVENTS: tuple = (
     MODEL_FAILED_OVER,
     OWNER_PAGED,
     CAPACITY_STOPPED,
+    DRIVER_RESURRECTED,
     PIPELINE_COMPLETED,
     PIPELINE_FAILED,
 )

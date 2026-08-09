@@ -359,6 +359,17 @@ fleet prompt 也把這份契約明寫為 TURN-END INVARIANT，點名該 harness 
 write-first 規則（artifact 先落 S3，宣稱它的呼叫在後）—— 有一個 guard test 從各 harness
 宣告的 tools 雙向推導這句話，讓它無法與工具清單漂移。
 
+turn 的接力本身由**心跳 + 復活者**這對機制看守。driver 的自我重調是 async Lambda
+invoke —— fire-and-forget，而 Lambda 真的丟過一次（run 68cfa9c8 token 停泊、Step
+Functions 仍 RUNNING，卻死寂九小時）。driver 現在在每一輪開始前把 `driver_beat_at`
+與精確的重調 payload 蓋在 run row 上；排程的 `llmops-resurrector`（每 15 分鐘）對
+任何「beat 過期且**沒有停泊 task token**」的 running run 重調 driver —— 有停泊 token
+表示 launch-and-release 正按設計等待 SageMaker 作業，那個喚醒屬於 resume_pipeline。
+認領以掃描時讀到的 beat 為條件（不會重複復活），每個 run 有上限（超過就升級：每輪
+都死的 driver 有真缺陷，復活只是重演它）。這也讓 AgentCore 的 8 小時 session
+`maxLifetime` 在 8–12 小時的 stage 上不再是事 —— session 可以死（狀態在 S3、
+session id 確定性），因為現在有東西負責重調。
+
 ## 4. Launch-and-release 與 EventBridge 喚醒
 
 Harness 一輪有界（約 14 分鐘）；訓練作業跑數小時。規則：**harness 絕不空等作業**。
