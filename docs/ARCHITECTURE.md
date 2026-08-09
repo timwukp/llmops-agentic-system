@@ -330,6 +330,46 @@ clause, so a protocol that grows a third exit cannot leave it half-wired. A page
 now rejected unless it carries both `situation` and `recommendation`: paging an owner with
 the problem and none of the analysis leaves them exactly where they started.
 
+**A named escape hatch must be one that can open.** Wiring `page_human` on the driver path
+fixed half of that rejection; the other half named `launch_run`, which on a bus triage
+*cannot succeed at all*. `service_launch_run` refuses without a KMS-verifiable approval
+record, read from `args["approval"]` or from `params.approval_context` — and a triage built
+by `triage_event_from_bus` has neither: nothing in the repo has ever written
+`approval_context` (it was a read with no writer), and `approval` is not among the
+properties `launch_run` declares in the orchestrator's harness, so the agent cannot supply
+one either. The conductor was handed two doors, one of them painted on. Measured across
+2026-08-05..08: of the 9 runs whose escalation was triaged, **4 produced no `HumanPaged`
+event at all** — sent to a tool that refuses, they ran out of moves and the turn ended in
+prose. The rejection now names only the exit that can work on *this* invocation:
+`dispatch_is_possible(event)` decides, and when it is false the reason says plainly that
+only a human can authorize a replacement run and that `page_human` is the one path that
+changes anything. When a signed approval *is* present the dispatch advice is unchanged — a
+guard that amputated the working case would hand the owner decisions the conductor was
+authorized to make.
+
+**On this path the conductor is not the first line to a human — it is the only one.** The
+triage clause calls it "the FIRST line", which was true of the driver's own
+`handle_escalate` (that publishes to the escalation SNS topic before it emits). It is not
+true of the state machine's `EscalateFail`: that is a bare `events:putEvents`, and the bus
+has exactly one rule (`llmops-escalation-triage`) with exactly one target (the driver).
+There is no SNS anywhere on that path. So a triage that ends without resolving,
+dispatching or paging tells **nobody** — the run row reads `failed`, the execution reads
+FAILED, and the only trace is a log stream. That is what made this defect look
+intermittent rather than total: **11 of the 11 directives ever parked were
+`deliverable: false`**, and the runs that got no page were exactly the ones where the
+conductor obeyed the rejection and tried `launch_run`. Live casualties include
+`run-20260808T005301Z-c8b13faa`, `run-20260805T144522Z-86ab8a14` and
+`run-20260808T024809Z-b56281da` — each an ARC-2 lineage run that died with its scientific
+work complete and its owner never told. `_backstop_page` now closes it: a triage whose
+outcome is not in `TRIAGE_ANSWERED` pages the owner on the way out, saying explicitly that
+the page is the driver's backstop and not the conductor's judgment. It wraps the `return`
+in `handler` rather than any branch inside the loop, so it covers every way a triage can
+end without answering — prose after the re-asks, an unsupported tool, a rejected page, a
+`stage_complete` that decided nothing — and the crash path too, where a bus triage has no
+task token and `send_task_failure` therefore carries the news to no one. It is best-effort
+by construction: a page that cannot be sent must not turn a merely-unanswered triage into a
+crashed invocation, which would trade a silent failure for a louder wrong one.
+
 **An emitted event with no rule is a promise with no path to it.** The paragraph above
 says an `EscalatedToHuman` event "routes to the *driver*". It did not. The
 `llmops-pipeline` bus carried **zero** EventBridge rules from Phase 1 through Phase 5,

@@ -1358,6 +1358,208 @@ class TestDriver:
             "driver -- the only thing that runs a triage -- does not service them; "
             "they return 'unsupported' and the escalation stays stuck")
 
+    # --- #72: an unanswered triage is the LAST line, not the first -------------
+    #
+    # The escalation bus has one rule with one target (this driver), and the state
+    # machine's EscalateFail is a bare putEvents with no SNS on the path. So when a
+    # triage ends without resolving, dispatching or paging, the owner is never told at
+    # all. Measured 2026-08-05..08: 11 of 11 directives ever parked were undeliverable,
+    # and 4 of the 9 triaged runs produced no HumanPaged event.
+
+    def test_the_rejection_does_not_name_an_exit_that_cannot_work(self):
+        """launch_run needs a KMS-verifiable approval record, from args["approval"] or
+        from params.approval_context. A bus triage has NEITHER: nothing in the repo
+        writes approval_context, and `approval` is not a declared property of launch_run
+        in the orchestrator's harness, so the agent cannot supply one either.
+
+        The rejection nonetheless told the conductor to "relaunch the work with
+        launch_run" -- two doors, one painted on. Live: 4 of the 9 triaged escalations
+        produced no page at all, the conductor having been sent to a tool that refuses.
+
+        So when dispatch is impossible the rejection must name page_human ONLY."""
+        ac = FakeAgentCore([
+            tool_use_stream("resolve_escalation",
+                            {"run_id": "run-dead-7", "decision": "raise_cap",
+                             "rationale": "teacher cap too low"}),
+            tool_use_stream("page_human", {"run_id": "run-dead-7", "situation": "s",
+                                           "recommendation": "r"}),
+            text_stream("ack")])
+        c = clients(ac)
+        self._seed_run(c, "run-dead-7", "failed")
+        driver.handler(driver_event(stage="orchestrator", task="triage",
+                                    run_id="run-orch-1"), clients=c)
+        answer = json.loads(
+            ac.calls[1]["messages"][-1]["content"][0]["toolResult"]["content"][0]["text"])
+        assert answer["can_dispatch"] is False, \
+            "a bus triage has no signed approval; launch_run cannot dispatch from it"
+        assert "launch_run CANNOT" in answer["reason"], \
+            "the rejection still sends the conductor to a tool that will refuse it"
+        assert "page_human" in answer["reason"], \
+            "the rejection must name the ONE exit that works"
+
+    def test_the_rejection_still_offers_dispatch_when_dispatch_can_work(self):
+        """The guard must not amputate the working case. An invocation that DOES carry a
+        signed approval context can relaunch, and telling it to page a human instead
+        would hand the owner a decision the conductor was authorized to make."""
+        ac = FakeAgentCore([
+            tool_use_stream("resolve_escalation",
+                            {"run_id": "run-dead-8", "decision": "relaunch_stage",
+                             "rationale": "retry with a smaller batch"}),
+            tool_use_stream("page_human", {"run_id": "run-dead-8", "situation": "s",
+                                           "recommendation": "r"}),
+            text_stream("ack")])
+        c = clients(ac)
+        self._seed_run(c, "run-dead-8", "failed")
+        driver.handler(driver_event(
+            stage="orchestrator", task="triage", run_id="run-orch-1",
+            params={"escalation": {"run_id": "run-dead-8"},
+                    "approval_context": {"approval": {"plan_sha256": "abc",
+                                                      "signature": "sig"}}}), clients=c)
+        answer = json.loads(
+            ac.calls[1]["messages"][-1]["content"][0]["toolResult"]["content"][0]["text"])
+        assert answer["can_dispatch"] is True
+        assert "relaunch the work with launch_run" in answer["reason"], \
+            "an authorized conductor was denied the dispatch path it could have used"
+
+    def test_dispatch_is_impossible_on_a_triage_built_from_the_bus(self):
+        """Derived from the real emitter rather than asserted about a hand-built dict: the
+        event triage_event_from_bus produces IS what every state-machine escalation
+        becomes, and it carries no approval_context. If a future change starts seeding
+        one, this test goes red and the rejection wording should follow it."""
+        built = driver.triage_event_from_bus(
+            {"detail-type": ev.ESCALATED_TO_HUMAN,
+             "detail": {"run_id": "run-stuck-3", "stage": "eval", "reason": "gate failed"}},
+            "llmops-data-test")
+        assert driver.dispatch_is_possible(built) is False, \
+            "a bus triage looks dispatchable but service_launch_run will refuse it"
+
+    def test_a_triage_that_answers_nothing_still_reaches_the_owner(self):
+        """The third and deepest layer. The conductor is not the FIRST line to a human on
+        this path -- it is the ONLY one: `llmops-escalation-triage` is the bus's single
+        rule, its single target is this Lambda, and EscalateFail is a bare putEvents with
+        no SNS anywhere after it.
+
+        So a triage that ends in prose after its re-asks tells NOBODY. Live: run
+        c8b13faa, 86ab8a14 and b56281da each died with their scientific work complete,
+        their run row reading `failed`, and zero HumanPaged events -- the only trace was
+        a log stream."""
+        ac = FakeAgentCore([text_stream("I have analyzed the failure."),
+                            text_stream("Still analyzing."),
+                            text_stream("My analysis is complete.")])
+        c = clients(ac)
+        out = driver.handler(driver_event(
+            stage="orchestrator", task="triage", run_id="run-orch-1", task_token=None,
+            params={"escalation": {"run_id": "run-stuck-4"}}), clients=c)
+        assert c["sns"].published, \
+            "a triage ended having decided nothing and the owner was never told"
+        brief = json.loads(c["sns"].published[0]["Message"])
+        assert brief["run_id"] == "run-stuck-4", \
+            "the backstop page was filed against the conductor, not the stuck run"
+        assert "backstop" in brief["situation"], \
+            "the owner must know this page is the driver's, not the conductor's judgment"
+        assert out.get("backstop_paged") is True
+
+    def test_a_triage_that_did_its_job_is_not_paged_about(self):
+        """The backstop must not page on every triage, or it becomes noise and the owner
+        stops reading it -- which would recreate the silence it exists to break. A page
+        already reaching the owner must not produce a second one."""
+        ac = FakeAgentCore([
+            tool_use_stream("page_human", {"run_id": "run-stuck-5", "situation": "s",
+                                           "recommendation": "r"}),
+            text_stream("ack")])
+        c = clients(ac)
+        out = driver.handler(driver_event(
+            stage="orchestrator", task="triage", run_id="run-orch-1", task_token=None,
+            params={"escalation": {"run_id": "run-stuck-5"}}), clients=c)
+        assert out["status"] == "paged"
+        assert len(c["sns"].published) == 1, \
+            "the conductor paged and the backstop paged again about the same triage"
+        assert "backstop_paged" not in out
+
+    def test_a_delivered_verdict_is_not_paged_about_either(self):
+        """A resolved escalation reached a listening agent; that IS the answer. Paging on
+        top of it would tell the owner a working path had failed."""
+        ac = FakeAgentCore([
+            tool_use_stream("resolve_escalation",
+                            {"run_id": "run-live-7", "decision": "option_B",
+                             "rationale": "raise the cap"}),
+            text_stream("ack")])
+        c = clients(ac)
+        self._seed_run(c, "run-live-7", "running")
+        out = driver.handler(driver_event(
+            stage="orchestrator", task="triage", run_id="run-orch-1", task_token=None,
+            params={"escalation": {"run_id": "run-live-7"}}), clients=c)
+        assert out["status"] == "resolved"
+        assert not c["sns"].published, "a delivered verdict was paged about as a failure"
+
+    def test_a_stage_run_that_ends_without_stage_complete_is_not_paged_about(self):
+        """The backstop is triage-only. A data-prep stage that misses stage_complete
+        already has a listener -- its task token fails and the state machine reacts -- so
+        paging there would put an email in front of the owner for every stage retry."""
+        ac = FakeAgentCore([text_stream("done"), text_stream("done"), text_stream("done")])
+        c = clients(ac)
+        out = driver.handler(driver_event(), clients=c)
+        assert out["status"] == "failed"
+        assert c["sfn"].failures, "the stage token was left parked"
+        assert not c["sns"].published, \
+            "a stage failure paged the owner; only an unanswered TRIAGE should"
+
+    def test_a_crashed_triage_reaches_the_owner_too(self):
+        """A bus triage has no task token, so the crash path's send_task_failure carries
+        the news to nobody and no state machine is waiting to hear it. Without a page, a
+        crashed triage is indistinguishable from one that never fired."""
+        class Exploding:
+            calls = []
+
+            def invoke_harness(self, **kw):
+                raise RuntimeError("harness runtime unavailable")
+
+        c = clients(Exploding())
+        with pytest.raises(RuntimeError):
+            driver.handler(driver_event(
+                stage="orchestrator", task="triage", run_id="run-orch-1",
+                task_token=None,
+                params={"escalation": {"run_id": "run-stuck-6"}}), clients=c)
+        assert c["sns"].published, "a crashed triage told nobody but CloudWatch"
+        assert "harness runtime unavailable" in \
+            json.loads(c["sns"].published[0]["Message"])["situation"]
+
+    def test_a_failed_backstop_page_does_not_mask_the_real_outcome(self):
+        """The backstop runs on the way out, after the outcome is decided. An SNS failure
+        there must not turn a merely-unanswered triage into a crashed invocation -- that
+        would trade a silent failure for a louder wrong one."""
+        class DeadSns:
+            published = []
+
+            def publish(self, **kw):
+                raise RuntimeError("SNS unavailable")
+
+        ac = FakeAgentCore([text_stream("a"), text_stream("b"), text_stream("c")])
+        c = clients(ac)
+        c["sns"] = DeadSns()
+        out = driver.handler(driver_event(
+            stage="orchestrator", task="triage", run_id="run-orch-1", task_token=None,
+            params={"escalation": {"run_id": "run-stuck-7"}}), clients=c)
+        assert out["status"] == "failed"
+        assert "backstop_paged" not in out
+
+    def test_the_answered_statuses_are_the_ones_the_driver_can_return(self):
+        """TRIAGE_ANSWERED is a hand-kept tuple guarding a return value, so it can drift
+        out of step with the returns it names. Every entry must be a status some `return`
+        in the driver actually produces -- otherwise an entry is a typo that silently
+        turns the backstop off for a case nobody notices."""
+        src = (REPO / "orchestration/harness_driver/handler.py").read_text()
+        returned = set(re.findall(r'"status":\s*"([a-z_]+)"', src))
+        unknown = [s for s in driver.TRIAGE_ANSWERED if s not in returned]
+        assert not unknown, (
+            f"{unknown} appears in TRIAGE_ANSWERED but no return in the driver produces "
+            "it; the backstop is silently disabled for a status that never occurs")
+        for must in ("resolved", "paged", "dispatched"):
+            assert must in driver.TRIAGE_ANSWERED, \
+                f"{must} answers an escalation; paging on top of it is noise"
+        assert "failed" not in driver.TRIAGE_ANSWERED, \
+            "a failed triage is exactly the case the backstop exists for"
+
     def test_running_is_the_only_state_with_a_listener(self):
         """Derived, not hand-listed: every terminal status any writer in the repo can put
         on a run must be treated as unreachable. A status added later (a new terminal
@@ -4528,12 +4730,18 @@ def test_an_escalation_with_no_run_id_is_rejected_not_triaged():
 def test_the_driver_recognises_a_bus_delivery_at_its_entry_point():
     """handler() must translate before anything dereferences event["stage"], and must
     recognise the envelope by its OWN keys rather than by a missing task token: plenty of
-    legitimate driver invocations (finops, console dispatch) carry no token."""
+    legitimate driver invocations (finops, console dispatch) carry no token.
+
+    The stub returns a status the driver really produces. It used to return a synthetic
+    {"status": "ok"} -- which #72's backstop then correctly read as an UNANSWERED triage
+    and paged about, because no return in the driver produces "ok". A double answering
+    with a value production never emits is a double that tests a path production does not
+    have."""
     seen = {}
 
     def _fake_run_stage(event, context=None, c=None):
         seen.update(event)
-        return {"status": "ok"}
+        return {"status": "resolved"}
 
     real = driver._run_stage
     try:
@@ -4543,7 +4751,7 @@ def test_the_driver_recognises_a_bus_delivery_at_its_entry_point():
                              None, clients())
     finally:
         driver._run_stage = real
-    assert out == {"status": "ok"}
+    assert out == {"status": "resolved"}
     assert seen["task"] == "triage", "the bus envelope reached _run_stage untranslated"
     assert seen["params"]["escalation"]["run_id"] == "run-xyz"
 
