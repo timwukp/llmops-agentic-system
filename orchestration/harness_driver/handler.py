@@ -190,11 +190,37 @@ def _invoke(ac, harness_id: str, sess: str, messages: list, qualifier: Optional[
     return ac.invoke_harness(**kwargs)
 
 
-def _drain(resp) -> dict:
-    """Consume the stream; return {text, tool_use, stop_reason, error}."""
+#: How much Lambda wall must remain when _drain abandons a stream. Enough for the
+#: self-reinvoke call, the heartbeat write, and the runtime's own teardown — measured
+#: driver overhead is single-digit seconds; 45 gives margin without wasting a minute
+#: of every deadline-cut turn.
+DRAIN_DEADLINE_MARGIN_MS = 45_000
+
+#: _drain's error marker for a deadline cut. Checked by name at the call site, so it
+#: must stay distinguishable from a real stream death: a real death burns the one
+#: stream-salvage retry; a deadline cut must instead hand the turn to the next
+#: invocation, where the full 900s is available again.
+DEADLINE_CUT = "LambdaDeadlineApproaching"
+
+
+def _drain(resp, out_of_wall=None) -> dict:
+    """Consume the stream; return {text, tool_use, stop_reason, error}.
+
+    `out_of_wall` is the in-turn deadline check. The boto read_timeout (870s) bounds
+    the gap BETWEEN chunks, not the stream's total life — a reasoning model that
+    trickles a chunk every few seconds can stream for longer than the Lambda's 900s
+    wall, and did: run 68cfa9c8's generate turn hit the wall mid-stream at
+    03:39:49Z, the runtime killed the invocation with the harness turn unanswered,
+    and the async retry replayed a continuation whose session state no longer
+    matched — MissingStageComplete three minutes later. The between-turns
+    _out_of_time() check cannot see any of this; only the stream reader can.
+    """
     text, tool_use, stop_reason, error = [], None, None, None
     try:
         for event in resp.get("stream", []):
+            if out_of_wall is not None and out_of_wall():
+                error = DEADLINE_CUT
+                break
             if "contentBlockDelta" in event:
                 delta = event["contentBlockDelta"].get("delta", {})
                 if "text" in delta:
@@ -953,7 +979,19 @@ def _run_stage(event, context=None, c=None):
         first_turn = False
         resp = _invoke(c["agentcore"], event["harness_id"], sess, messages,
                        event.get("qualifier"))
-        out = _drain(resp)
+        out = _drain(resp, out_of_wall=lambda: bool(context) and
+                     context.get_remaining_time_in_millis() < DRAIN_DEADLINE_MARGIN_MS)
+
+        if out["error"] == DEADLINE_CUT:
+            # The Lambda wall arrived mid-stream. This is not a stream death — the
+            # harness turn is still running server-side (840s cap) and will finish
+            # without us. Hand the session to the next invocation with the salvage
+            # prompt: on resume the turn is over, and the agent is asked to restate
+            # its pending call. Burning the stream-salvage retry here instead would
+            # leave a REAL death later in the same invocation unprotected.
+            messages = _user_text("The stream was interrupted. Continue from where "
+                                  "you left off; call your pending inline function.")
+            return _self_reinvoke()
 
         if out["error"] and not stream_retried:
             # involuntary stream death — same-session salvage retry, once
