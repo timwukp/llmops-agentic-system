@@ -366,9 +366,23 @@ Functions 仍 RUNNING，卻死寂九小時）。driver 現在在每一輪開始�
 任何「beat 過期且**沒有停泊 task token**」的 running run 重調 driver —— 有停泊 token
 表示 launch-and-release 正按設計等待 SageMaker 作業，那個喚醒屬於 resume_pipeline。
 認領以掃描時讀到的 beat 為條件（不會重複復活），每個 run 有上限（超過就升級：每輪
-都死的 driver 有真缺陷，復活只是重演它）。這也讓 AgentCore 的 8 小時 session
-`maxLifetime` 在 8–12 小時的 stage 上不再是事 —— session 可以死（狀態在 S3、
-session id 確定性），因為現在有東西負責重調。
+都死的 driver 有真缺陷，復活只是重演它）。
+
+這對機制唯一蓋不住的，是 session 自己的時鐘。AgentCore 會在 `maxLifetime` =
+**28800 秒（8 小時）**收回 runtime session —— 這是硬上限，活動不會重置它，也沒有設定
+能調高。蒸餾 stage 在單一確定性 session 裡跑 8–12 小時，於是活得比 session 久；跨過
+那條線的 invoke 會以「一般 runtime 錯誤」的樣子失敗：driver 會把 stream 搶救重試、
+接著把 re-ask 額度，全花在一個永遠不會再回話的 session 上。所以 driver 改為在上限
+**之前**主動輪替。每個 stage 在 continuation payload 裡帶一個 **session epoch**；在
+turn 之間（絕不在 turn 中間 —— 那時有未被回答的 `toolUse` 懸著）一旦超過
+`SESSION_ROLLOVER_S` = 25200 秒，就把 epoch 加一、開啟 `…-e<N>`，並以任務 payload 加上
+一段續作指示重新播種 —— 待處理訊息無法隨行，因為它通常是一個 `toolResult`，回答的是
+新 session 從未發出過的 `toolUse`。什麼都沒丟：每個 stage 的狀態都在 S3，這正是
+2026-08-08 那次人工復活之所以有效的原因。epoch 是**被攜帶**的、絕不由呼叫當下的時鐘
+推導，所以自我重調與復活者永遠重建出同一個 session id，而不是兩個活著的 session 共用
+一個 task token；3600 秒的餘裕覆蓋一輪已在途中的 840 秒 turn 加上其後的接力。輪替後的
+id 會附加到 run row 上，因為那是 console 依 `(run, stage, task)` 重建時唯一推導不出來的
+東西，而最長的那些 stage 的 span 沒被評分，等於安靜地丟掉正好最有價值的資料。
 
 ## 4. Launch-and-release 與 EventBridge 喚醒
 

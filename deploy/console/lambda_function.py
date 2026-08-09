@@ -930,6 +930,11 @@ def _recent_session_ids(cap=20, stage_filter=None):
                     ran.add((stage, task))
         except Exception:
             pass
+        # A stage that outran AgentCore's 8h session lifetime rolled to `-e<N>` session
+        # ids, which no (run, stage, task) formula reproduces. The driver records each
+        # one on the run row; those are real sessions with real spans, so score them.
+        rolled = [s for s in (it.get("rolled_session_ids") or [])
+                  if not stage_filter or f"-{stage_filter}-" in str(s)]
         for stage, task in STAGE_TASKS:
             if stage_filter and stage != stage_filter:
                 continue
@@ -937,6 +942,10 @@ def _recent_session_ids(cap=20, stage_filter=None):
             if ran and not any(s == stage and (t == task or not t) for s, t in ran):
                 continue
             sids.append(session_id(rid, stage, task))
+            if len(sids) >= cap:
+                return sids
+        for s in rolled:
+            sids.append(str(s))
             if len(sids) >= cap:
                 return sids
     return sids

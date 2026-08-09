@@ -434,9 +434,26 @@ the driver for any running run whose beat is stale with **no parked task token**
 parked token means launch-and-release is waiting on a SageMaker job by design, and that
 wake belongs to resume_pipeline. The claim is conditional on the beat the sweep read
 (no double-resurrection), capped per run (past the cap it escalates: a driver that dies
-every turn has a defect revival only re-runs). This is also what makes AgentCore's
-8-hour session `maxLifetime` a non-event on 8–12h stages: sessions may die — state
-lives in S3, session ids are deterministic — because something now re-invokes.
+every turn has a defect revival only re-runs).
+
+The last exposure that pair does *not* cover is the session's own clock. AgentCore
+reclaims a runtime session at `maxLifetime` = **28800 s (8 h)** — a hard cap that
+activity does not reset and no setting raises. A distillation stage runs 8–12 h in one
+deterministic session, so it outlives it, and the invoke that crosses the line fails as
+an ordinary runtime error: the driver would spend its stream-salvage retry, then its
+re-ask budget, on a session that can never answer again. So the driver rolls **before**
+the cap instead. Each stage carries a **session epoch** in its continuation payload;
+between turns (never mid-turn, where an unanswered `toolUse` is outstanding) past
+`SESSION_ROLLOVER_S` = 25200 s it increments the epoch, opens `…-e<N>`, and re-seeds it
+with the task payload plus a resume instruction — the pending message cannot travel,
+because it is usually a `toolResult` answering a `toolUse` the new session never issued.
+Nothing is lost: every stage's state is in S3, which is exactly why the 2026-08-08 hand
+resurrection worked. The epoch is *carried*, never derived from a clock, so the
+self-reinvoke and the resurrector always rebuild the same session id rather than two live
+sessions sharing one task token; the 3600 s of margin covers an 840 s turn already in
+flight plus the continuation behind it. Rolled ids are appended to the run row because
+they are the one thing the console's `(run, stage, task)` reconstruction cannot derive,
+and unscored spans on the longest stages is a silent loss of exactly the interesting data.
 
 ## 4. Launch-and-release with EventBridge wake
 
