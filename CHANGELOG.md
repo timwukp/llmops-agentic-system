@@ -49,6 +49,37 @@ stop letting the platform pick the moment.
   the roll reds 4 of them, and stubbing out the re-seed reds the `toolResult` pin;
   a derived guard fails if the console stops reading what the driver records.
 
+### The signed plan now decides which models a run uses
+
+`seed_manifest` built `models` as `{**DEFAULT_MODELS, **params.models}` — the signed plan
+was never consulted. So a plan a human approved could name one teacher while the manifest
+that run actually carried named another, and both ids sat in the same file. Live on run
+68cfa9c8: `models.teacher = us.deepseek.r1-v1:0` (boilerplate) against
+`plan.models.teacher = global.anthropic.claude-fable-5` (signed). The data-prep agent had
+to notice the contradiction and pick the signed one **by judgment**, writing "top-level
+manifest 'models' field is stale boilerplate" into the driver it generated.
+
+It chose correctly. That it had to choose at all is the defect: model consent is
+model-specific — approving a Fable-5 teacher at $0.05/1k output is not approving a
+DeepSeek-R1 one — so this is the decision the signature exists to settle, handed back to
+the model. An agent resolving it the other way spends real money on a teacher no human
+approved, with a manifest that agrees with it.
+
+- `orchestration/start_pipeline/handler.py`: new `_resolve_models(params, plan)`. The plan
+  overrides `DEFAULT_MODELS`; `params.models` may fill roles the plan is silent about; a
+  role where the two DISAGREE raises, naming the role and both model ids. Refusing rather
+  than silently preferring the plan, because a disagreement here is never routine — it
+  means the dispatch path and the approval path disagree about what was bought. One
+  visible error costs less than an unapproved spend that looks authorized in every
+  artifact afterward.
+- Runs with no plan (scheduler, webhook — most runs) are unaffected: absent, empty, and
+  `{"models": {}}` all still resolve to `DEFAULT_MODELS`, pinned by test.
+- Tests: 5 new. Mutation-verified — disabling the conflict check reds the refusal test.
+  Swapping the merge order deliberately changes nothing and the code says why: past the
+  check, every shared role is proven equal, so the order is unobservable.
+- Docs: ARCHITECTURE.md + `.zh-TW.md` state the authority rule where approvals are
+  described as evidence.
+
 ### A stream can outlive the Lambda wall; the drain now watches the clock
 
 boto's `read_timeout` (870s) bounds the gap BETWEEN chunks, not the stream's total

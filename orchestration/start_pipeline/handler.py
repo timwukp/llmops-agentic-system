@@ -91,6 +91,48 @@ def _as_obj(value, what: str) -> dict:
                      f"got {type(value).__name__}")
 
 
+def _resolve_models(params, plan) -> dict:
+    """Which models this run may use — with the SIGNED plan as the authority.
+
+    Model consent is model-specific: a human approving a Fable-5 teacher at $0.05/1k
+    output has not approved a DeepSeek-R1 one, and vice versa. So the plan a human
+    signed outranks both the boilerplate defaults and anything the dispatching agent
+    passes in `params`. `params.models` may only fill in models the plan is silent
+    about; where the two name the same role differently, the manifest is refused.
+
+    Live failure this comes from: run 68cfa9c8's manifest carried
+    ``models.teacher = us.deepseek.r1-v1:0`` (DEFAULT_MODELS boilerplate) while its
+    signed plan said ``global.anthropic.claude-fable-5``. Both ids sat in one manifest,
+    and the data-prep agent had to notice the contradiction and pick the signed one BY
+    JUDGMENT — writing "top-level manifest 'models' field is stale boilerplate" into its
+    own generated driver. It happened to choose correctly. That is the problem: the
+    decision a signature exists to settle was delegated back to the model, and an agent
+    resolving it the other way would have spent real money on a teacher no human
+    approved, with a manifest that agreed with it.
+
+    Refusing (rather than silently preferring the plan) because a disagreement here is
+    never routine: it means the dispatch path and the approval path disagree about what
+    was bought. Failing the dispatch costs one visible error; guessing costs an
+    unapproved spend that looks authorized in every artifact afterward.
+    """
+    plan_models = _as_obj((plan or {}).get("models"), "plan.models")
+    param_models = _as_obj((params or {}).get("models"), "params.models")
+    conflicts = sorted(r for r in set(plan_models) & set(param_models)
+                       if str(plan_models[r]) != str(param_models[r]))
+    if conflicts:
+        detail = ", ".join(f"{r}: plan={plan_models[r]!r} vs params={param_models[r]!r}"
+                           for r in conflicts)
+        raise ValueError(
+            f"params.models contradicts the signed plan for {detail}. Model consent is "
+            "model-specific, so the dispatched model must be the approved one: fix the "
+            "dispatch to omit these roles, or seek a fresh acceptance for the plan you "
+            "actually want to run.")
+    # No precedence between the two beyond this point: every shared role has just been
+    # proven to agree, so the merge order is unobservable. Both still outrank
+    # DEFAULT_MODELS, which is boilerplate no human ever looked at.
+    return {**DEFAULT_MODELS, **param_models, **plan_models}
+
+
 def seed_manifest(run_id: str, trigger_source: str, params, plan,
                   approval=None) -> dict:
     params = _as_obj(params, "params")
@@ -102,7 +144,7 @@ def seed_manifest(run_id: str, trigger_source: str, params, plan,
         "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "trigger_source": trigger_source,
         "iteration": 0,
-        "models": {**DEFAULT_MODELS, **_as_obj(params.get("models"), "params.models")},
+        "models": _resolve_models(params, plan),
         "params": merged,
         "plan": plan or {},             # conductor-authored run plan, when present
         # The signed human-acceptance record, stored verbatim like the plan: a run
