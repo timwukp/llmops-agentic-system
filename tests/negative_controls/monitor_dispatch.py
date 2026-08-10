@@ -2764,6 +2764,761 @@ case("controls: a control reads git commit history, which CI clones at depth 1",
       "::test_no_negative_control_depends_on_commit_history"])
 
 
+# ---------------------------------------------------------------------------------------
+# 146-150. Bug #18: 11 interface endpoints billed for a consumer that does not exist, and
+# a cost note that was exactly half the real figure.
+#
+# Registered late, with bug #19's and bug #20's below: all three were mutation-checked by
+# hand instead of here, and the hand method produced a false result (see the bug #20 block
+# for what the .pyc cache did). A control that lives in a shell script verifies one
+# afternoon; a control registered here verifies every run, and is counted.
+
+_NETWORK = "deploy/02_network.py"
+
+
+# 146. The cost note drops the AZ factor and lands back on $2.64/day -- the exact number
+#      that was printed while $5.28 was billed, because SubnetIds makes the ENI the
+#      billed unit and the script attaches every endpoint to both subnets.
+def m146(t):
+    old = "    return ENDPOINT_USD_PER_AZ_HOUR * n_services * n_azs * 24"
+    assert t.count(old) == 1, f"the cost derivation has moved; found {t.count(old)}"
+    return t.replace(old, "    return ENDPOINT_USD_PER_AZ_HOUR * n_services * 24", 1)
+
+
+case("network: the endpoint cost note halves itself by ignoring AZs", _NETWORK, m146,
+     ["tests/test_orchestration.py"
+      "::test_the_endpoint_cost_note_counts_every_az_not_every_endpoint"])
+
+
+# 147. The printed total is inlined again rather than derived from the two lists. The
+#      original defect was a correct-LOOKING expression in the print call, so a guard on
+#      the function alone passed against it.
+def m147(t):
+    old = "endpoint_cost_per_day("
+    n = t.count(old)
+    assert n >= 2, f"endpoint_cost_per_day is no longer called from main(); found {n}"
+    body_at = t.index("def main(")
+    head, body = t[:body_at], t[body_at:]
+    assert old in body, "main() no longer calls endpoint_cost_per_day"
+    return head + body.replace(old, "(lambda *_: 5.28)(", 1)
+
+
+case("network: the printed cost is inlined instead of derived from both lists", _NETWORK,
+     m147, ["tests/test_orchestration.py::test_the_printed_cost_is_derived_from_both_lists"])
+
+
+# 148. `want_interface` is hardcoded True -- the mutation that passed every guard until a
+#      test drove main() itself. Two correct components wired together wrongly.
+def m148(t):
+    old = "    want_interface = bool(consumers) or args.force_unused_endpoints"
+    assert t.count(old) == 1, f"the want_interface decision has moved; found {t.count(old)}"
+    return t.replace(old, "    want_interface = True", 1)
+
+
+case("network: main() provisions the billed endpoints for nobody again", _NETWORK, m148,
+     ["tests/test_orchestration.py"
+      "::test_main_withholds_the_billed_endpoints_when_nothing_consumes_them"])
+
+
+# 149. The consumer check stops reading harness.prod.json, so a VPC-mode harness someone
+#      really builds would never re-enable the endpoints it needs. The check has to be
+#      able to go green on its own, or it is the hand-set flag it replaced.
+def m149(t):
+    old = '    for cfg in sorted((repo / "agents").glob("*/harness.prod.json")):'
+    assert t.count(old) == 1, f"the prod-config scan has moved; found {t.count(old)}"
+    return t.replace(old, "    for cfg in []:", 1)
+
+
+case("network: the consumer check stops reading the prod harness configs", _NETWORK, m149,
+     ["tests/test_orchestration.py::test_the_consumer_check_reads_the_files_a_deploy_reads"])
+
+
+# 150. The consumer check stops reading 07_lambdas.py for VpcConfig -- the other half of
+#      the same "capability with no deploy path" claim.
+def m150(t):
+    old = '    if lambdas.exists() and "VpcConfig" in lambdas.read_text():'
+    assert t.count(old) == 1, f"the VpcConfig scan has moved; found {t.count(old)}"
+    return t.replace(old, "    if False:", 1)
+
+
+case("network: the consumer check stops reading the Lambda deploy for VpcConfig",
+     _NETWORK, m150,
+     ["tests/test_orchestration.py::test_the_consumer_check_reads_the_files_a_deploy_reads"])
+
+
+# ---------------------------------------------------------------------------------------
+# 151-153. Bug #19: five harnesses called the terminal exit a pause.
+#
+# `escalate_human` ENDS the invocation (send_task_failure -> EscalateFail -> Fail, and
+# "escalated" is in UNREACHABLE_RUN_STATES so a directive sent afterwards reaches nobody);
+# `checkpoint` is the platform's only live human-in-the-loop pause. Descriptions that said
+# otherwise sent every blocked agent to the exit.
+
+
+# 151. A tool description calls the terminal exit a pause again.
+def m151(t):
+    d = json.loads(t)
+    hits = [tool for tool in d["tools"] if tool.get("name") == "escalate_human"]
+    assert len(hits) == 1, f"eval's escalate_human tool has moved; found {len(hits)}"
+    fn = hits[0]["config"]["inlineFunction"]
+    fn["description"] = ("The pipeline pauses and waits for a human to decide. "
+                         + fn["description"])
+    return json.dumps(d, indent=2, ensure_ascii=False)
+
+
+case("prompt: escalate_human is described as a pause again", "agents/eval/harness.json",
+     m151, ["tests/test_orchestration.py::TestConductorDispatch"
+            "::test_no_tool_description_calls_the_terminal_exit_a_pause"])
+
+
+# 152. The docs describe escalation as a pause again -- the claim an operator plans a
+#      night around, and the one that made the audit propose a second HumanGate state
+#      beside a working pause.
+def m152(t):
+    old = "**terminal**"
+    assert t.count(old) >= 1, f"the escalate row's terminal marker has moved; found {t.count(old)}"
+    return t.replace(old, "The pipeline pauses and waits", 1)
+
+
+case("docs: the escalate row calls the terminal exit a pause (EN)", "docs/ARCHITECTURE.md",
+     m152, ["tests/test_docs_claims.py::test_the_docs_do_not_describe_escalation_as_a_pause"])
+
+
+# 153. Same claim in the zh-TW twin. Registered separately because a twin that drifts is
+#      the failure mode bilingual docs actually have -- one language gets corrected.
+def m153(t):
+    old = "**終止**"
+    assert t.count(old) >= 1, f"the zh-TW terminal marker has moved; found {t.count(old)}"
+    return t.replace(old, "管線會暫停", 1)
+
+
+case("docs: the escalate row calls the terminal exit a pause (zh-TW)",
+     "docs/ARCHITECTURE.zh-TW.md", m153,
+     ["tests/test_docs_claims.py::test_the_docs_do_not_describe_escalation_as_a_pause"])
+
+
+# ---------------------------------------------------------------------------------------
+# 154-170. Bug #20: four names for one fact, and a resolver nothing consumed.
+#
+# The plan a human signs is PRICED by cost_model.py, RESOLVED by start_pipeline, and
+# EXECUTED by the driver, and all three named the model differently. Measured: a
+# console-signed Fable-5 plan produced manifest.models.teacher = us.deepseek.r1-v1:0 --
+# priced as one model, run on another, with every artifact agreeing.
+#
+# These live here rather than in a shell script for the reason this file's own docstring
+# gives: I ran them by hand first, and the .pyc hazard documented at the top of this
+# module bit exactly as described. `{**approved, **payload["params"]}` and
+# `{**payload["params"], **approved}` are the same byte count, so a mutate-run-restore
+# cycle inside one second let the restored source import the MUTATED bytecode -- the
+# override case was reported as caught while the interpreter ran the wrong code. `run()`
+# above sets PYTHONDONTWRITEBYTECODE and the loop clears __pycache__ per case, which is
+# the only reason these results mean anything.
+
+_RESOLVER = "orchestration/start_pipeline/handler.py"
+_DRIVER = "orchestration/harness_driver/handler.py"
+_D = "tests/test_orchestration.py::TestConductorDispatch"
+
+
+# 154. The resolver reads only the nested `models` block again -- the original bug. The
+#      console form posts the FLAT `teacher_model`, so `models` is absent, "the plan is
+#      silent" wins, and DEFAULT_MODELS spends on a model nobody approved.
+def m154(t):
+    old = '    plan_roles = _role_assignments(_as_obj(plan, "plan"), "plan")'
+    assert t.count(old) == 1, f"the plan-side resolve has moved; found {t.count(old)}"
+    return t.replace(old, '    plan_roles = {k: v for k, v in _as_obj(_as_obj(plan, "plan")'
+                          '.get("models"), "m").items() if k in MODEL_ROLES}', 1)
+
+
+case("resolver: the signed plan's flat teacher_model is ignored again", _RESOLVER, m154,
+     [f"{_D}::test_the_console_form_field_name_is_the_one_consent_is_read_from",
+      f"{_D}::test_every_plan_field_the_estimator_prices_from_is_one_the_dispatcher_obeys"])
+
+
+# 155. One document naming the same role twice with two ids is resolved by precedence
+#      instead of refused -- a silent choice where a signature exists to settle it.
+def m155(t):
+    old = "        if len(distinct) > 1:"
+    assert t.count(old) == 1, f"the alias-conflict gate has moved; found {t.count(old)}"
+    return t.replace(old, "        if False:", 1)
+
+
+case("resolver: a plan naming one role twice with two ids picks one silently", _RESOLVER,
+     m155, [f"{_D}::test_a_plan_that_names_one_model_twice_with_two_ids_is_refused"])
+
+
+# 156. The conflict check compares FIELD NAMES rather than facts, so
+#      params.teacher_model contradicting plan.models.teacher is waved through.
+def m156(t):
+    old = ('    conflicts = sorted(r for r in set(plan_roles) & set(param_roles)\n'
+           '                       if plan_roles[r] != param_roles[r])')
+    assert t.count(old) == 1, f"the conflict check has moved; found {t.count(old)}"
+    return t.replace(old, '    conflicts = sorted(r for r in '
+                          'set(_as_obj(plan, "plan").get("models") or {}) & '
+                          'set(_as_obj(params, "params").get("models") or {})\n'
+                          '                       if plan_roles.get(r) != param_roles.get(r))',
+                     1)
+
+
+case("resolver: an alias-spelled conflict with the signed plan is not seen", _RESOLVER,
+     m156, [f"{_D}::test_a_conflict_is_caught_across_two_different_alias_spellings"])
+
+
+# 157. The unknown-key check goes away, so `teachr` means "the plan is silent about the
+#      teacher" again and a typo becomes an unapproved spend instead of one error.
+def m157(t):
+    old = "    if unknown:"
+    assert t.count(old) == 1, f"the unknown-key gate has moved; found {t.count(old)}"
+    return t.replace(old, "    if False:", 1)
+
+
+case("resolver: a misspelled role is read as silence again", _RESOLVER, m157,
+     [f"{_D}::test_a_misspelled_role_is_refused_rather_than_read_as_silence"])
+
+
+# 158. A mirrored, licence-checked repo that fills no role is accepted -- the run trains
+#      on a model nobody cleared while the cleared one sits unused in the mirror.
+def m158(t):
+    old = "    if repo and repo not in set(found.values()):"
+    assert t.count(old) == 1, f"the mirror/role gate has moved; found {t.count(old)}"
+    return t.replace(old, "    if False:", 1)
+
+
+case("resolver: a mirrored repo filling no role is accepted", _RESOLVER, m158,
+     [f"{_D}::test_a_mirrored_repo_that_fills_no_role_is_refused"])
+
+
+# 159. The mirror check compares publishers instead of model identities, so
+#      hf_repo=meta-llama/Llama-3.2-1B with student=meta-llama/Llama-3.1-70B passes:
+#      a different model, different pinned revision, 70x the size. This escaped the
+#      first time -- the guard only tested the absent-role case, never the near-miss.
+def m159(t):
+    old = "    if repo and repo not in set(found.values()):"
+    assert t.count(old) == 1, f"the mirror/role gate has moved; found {t.count(old)}"
+    return t.replace(old, '    if repo and not any(repo.split("/")[0] in v '
+                          'for v in found.values()):', 1)
+
+
+case("resolver: the mirror check matches the publisher, not the model", _RESOLVER, m159,
+     [f"{_D}::test_a_mirrored_repo_that_fills_no_role_is_refused"])
+
+
+# 160. The alias list loses `teacher_model` -- the exact field the console form posts and
+#      cost_model prices from. The dispatcher then knows a vocabulary the UI does not use.
+def m160(t):
+    old = '"teacher": ("teacher", "teacher_model", "teacher_model_id"),'
+    assert t.count(old) == 1, f"ROLE_ALIASES' teacher row has moved; found {t.count(old)}"
+    return t.replace(old, '"teacher": ("teacher", "teacher_model_id"),', 1)
+
+
+case("resolver: the alias list drops the console's own field name", _RESOLVER, m160,
+     [f"{_D}::test_the_console_form_field_name_is_the_one_consent_is_read_from",
+      f"{_D}::test_every_plan_field_the_estimator_prices_from_is_one_the_dispatcher_obeys"])
+
+
+# 161. The estimator renames the field it prices the teacher from, out of the
+#      dispatcher's vocabulary entirely. This escaped twice: a guard that intersects
+#      cost_model's field names with ROLE_ALIASES is blind in exactly the direction the
+#      bug travels, because a renamed field simply disappears from the intersection.
+#      The fix identifies a model field by the model id it DEFAULTS to.
+def m161(t):
+    old = 'plan.get("teacher_model")'
+    assert t.count(old) >= 1, f"cost_model's teacher field has moved; found {t.count(old)}"
+    return t.replace(old, 'plan.get("tchr_mdl")')
+
+
+case("estimator: prices the teacher from a field the dispatcher never reads",
+     "pipeline/contracts/cost_model.py", m161,
+     [f"{_D}::test_the_console_form_field_name_is_the_one_consent_is_read_from",
+      f"{_D}::test_every_plan_field_the_estimator_prices_from_is_one_the_dispatcher_obeys"])
+
+
+# 162. The estimator prices a model from a field the console form cannot post, so the
+#      quote a customer signs is computed from a default they were never shown.
+def m162(t):
+    old = 'harness_model = str(plan.get("harness_model", "global.anthropic.claude-fable-5"))'
+    assert t.count(old) == 2, f"cost_model's harness field has moved; found {t.count(old)}"
+    return t.replace(old, 'harness_model = str(plan.get("harness", '
+                          '"global.anthropic.claude-fable-5"))')
+
+
+case("estimator: prices from a field the console form cannot post",
+     "pipeline/contracts/cost_model.py", m162,
+     [f"{_D}::test_the_console_form_field_name_is_the_one_consent_is_read_from"])
+
+
+# 163. The console form posts a field nothing prices and nothing dispatches. This
+#      escaped the first run for the same reason m161 did: the guard SKIPPED any field
+#      whose role it
+#      did not recognise, so renaming it made the mismatch invisible rather than red.
+def m163(t):
+    old = '"teacher_model"'
+    assert t.count(old) >= 1, f"the console's STR_KEYS has moved; found {t.count(old)}"
+    return t.replace(old, '"teacher_mdl"', 1)
+
+
+case("console: the signed form posts a field nothing prices or dispatches",
+     "deploy/console/lambda_function.py", m163,
+     [f"{_D}::test_the_console_form_field_name_is_the_one_consent_is_read_from"])
+
+
+# 164. The driver stops injecting the manifest's approved models -- the consumer half of
+#      the bug. The resolver stays correct and every prompt still reads
+#      params.teacher_model_id, so agents fall back to whatever model their persona line
+#      names. Two correct halves, never connected: this repo's recurring bug shape.
+def m164(t):
+    old = '        payload["params"] = {**approved, **facts, **payload["params"]}'
+    assert t.count(old) == 1, f"the driver's model injection has moved; found {t.count(old)}"
+    return t.replace(old, "        pass  # injection removed", 1)
+
+
+case("driver: the approved models never reach the agent turn", _DRIVER, m164,
+     [f"{_D}::test_a_stage_payload_carries_the_approved_models",
+      f"{_D}::test_a_caller_supplied_model_overrides_the_manifest_but_is_not_the_default"])
+
+
+# 165. The merge is reversed, so the manifest OVERRIDES an explicit caller param and a
+#      remediation iteration that deliberately names a model is silently overruled.
+#      The mutation this file's docstring warning is about: same byte count as the
+#      original, so a same-second hand-run cycle validated stale bytecode and reported a
+#      catch. It also escaped a second, real way -- the test recomputed the merge in its
+#      own body, and a merge order restated in a test is satisfied by any order in the
+#      code. The guard now drives the real `_run_stage`.
+def m165(t):
+    old = '        payload["params"] = {**approved, **facts, **payload["params"]}'
+    assert t.count(old) == 1, f"the driver's model merge has moved; found {t.count(old)}"
+    return t.replace(
+        old, '        payload["params"] = {**payload["params"], **approved, **facts}', 1)
+
+
+case("driver: the manifest overrides an explicit caller model", _DRIVER, m165,
+     [f"{_D}::test_a_caller_supplied_model_overrides_the_manifest_but_is_not_the_default"])
+
+
+# 166. A role the manifest is silent about gets a DEFAULT again -- the same bug one layer
+#      down. A stage that needs a teacher and finds no param must fail visibly.
+def m166(t):
+    old = ("            for role, param in MODEL_PARAM_FOR_ROLE.items()\n"
+           "            if models.get(role)}")
+    assert t.count(old) == 1, f"the role filter has moved; found {t.count(old)}"
+    return t.replace(old, "            for role, param in MODEL_PARAM_FOR_ROLE.items()\n"
+                          '            if True} if models else '
+                          '{"teacher_model_id": "us.deepseek.r1-v1:0"}', 1)
+
+
+case("driver: a role the manifest is silent about is defaulted", _DRIVER, m166,
+     [f"{_D}::test_a_stage_payload_carries_the_approved_models",
+      f"{_D}::test_a_caller_supplied_model_overrides_the_manifest_but_is_not_the_default"])
+
+
+# 167. The driver supplies the model under a param name no prompt reads, so the injection
+#      exists and reaches nobody -- indistinguishable from not injecting at all.
+def m167(t):
+    old = 'MODEL_PARAM_FOR_ROLE = {"teacher": "teacher_model_id", "student": "student_model_id",'
+    assert t.count(old) == 1, f"MODEL_PARAM_FOR_ROLE has moved; found {t.count(old)}"
+    return t.replace(old, 'MODEL_PARAM_FOR_ROLE = {"teacher": "teacher_model", '
+                          '"student": "student_model_id",', 1)
+
+
+case("driver: the approved model arrives under a name no prompt reads", _DRIVER, m167,
+     [f"{_D}::test_a_stage_payload_carries_the_approved_models",
+      f"{_D}::test_a_caller_supplied_model_overrides_the_manifest_but_is_not_the_default"])
+
+
+# 168. A malformed `models` block crashes the stage instead of degrading to "no approved
+#      models", which would take out deploy smoke tests and monitor sweeps that need none.
+def m168(t):
+    old = ("    if not isinstance(models, dict):\n"
+           "        return {}")
+    assert t.count(old) == 1, f"the manifest type guard has moved; found {t.count(old)}"
+    return t.replace(old, "    pass", 1)
+
+
+case("driver: a malformed manifest models block crashes the stage", _DRIVER, m168,
+     [f"{_D}::test_the_driver_injects_the_manifest_models_under_the_prompt_names"])
+
+
+# 169. A persona line hardcodes a model id again -- the thing an agent falls back to when
+#      its model param is absent, and the reason the platform could not run a customer's
+#      own open-weight distillation or a YOLO fine-tune without editing prompts.
+def m169(t):
+    d = json.loads(t)
+    p = d["systemPrompt"][0]["text"]
+    old = "model customisation"
+    assert p.count(old) == 1, f"the eval persona line has moved; found {p.count(old)}"
+    d["systemPrompt"][0]["text"] = p.replace(
+        old, "knowledge distillation: teacher DeepSeek-R1 on Bedrock -> "
+             "student Qwen3-1.7B", 1)
+    return json.dumps(d, indent=2, ensure_ascii=False)
+
+
+case("prompt: a persona line hardcodes the model to use again", "agents/eval/harness.json",
+     m169, [f"{_D}::test_no_prompt_hardcodes_a_model_id_as_the_one_to_use"])
+
+
+# 170. A prompt reads a model param the driver does not supply -- the absent-param
+#      fallback that made the persona line load-bearing in the first place.
+def m170(t):
+    d = json.loads(t)
+    p = d["systemPrompt"][0]["text"]
+    old = "params.student_model_id"
+    assert p.count(old) >= 1, f"finetune's student param has moved; found {p.count(old)}"
+    d["systemPrompt"][0]["text"] = p.replace(old, "params.base_model_id", 1)
+    return json.dumps(d, indent=2, ensure_ascii=False)
+
+
+case("prompt: reads a model param the driver never supplies",
+     "agents/finetune/harness.json", m170,
+     [f"{_D}::test_every_model_param_a_prompt_reads_is_one_the_driver_supplies"])
+
+
+# ---------------------------------------------------------------------------------------
+# 171-179. Bug #21: the rest of the signed plan, dropped the same way the models were.
+#
+# Bugs #9 and #20 cured model consent and then the NAME model consent is written under.
+# Both left every other field of the plan behind: seed_manifest read `plan` for models and
+# nothing else, so `{**DEFAULT_PARAMS, **params}` silently substituted ARC-shaped defaults
+# for what a human signed. Measured on a signed industrial-defect plan: priced on
+# ml.p4d.24xlarge with 40000 samples and a {"map50": 0.75} gate, executed on ml.g5.2xlarge
+# with 2000 samples and ARC's relative_solve_rate gate, every artifact agreeing.
+
+
+# 171. The merge drops the plan again -- the original bug, byte for byte.
+def m171(t):
+    old = "    return {**DEFAULT_PARAMS, **params, **plan_params}"
+    assert t.count(old) == 1, f"the params merge has moved; found {t.count(old)}"
+    return t.replace(old, "    return {**DEFAULT_PARAMS, **params}", 1)
+
+
+case("resolver: the signed plan's stage settings are dropped for ARC defaults", _RESOLVER,
+     m171,
+     [f"{_D}::test_every_plan_field_the_estimator_prices_reaches_the_stage_that_spends_it",
+      f"{_D}::test_the_plan_can_displace_the_arc_specific_defaults"])
+
+
+# 172. The ARC defaults outrank the plan -- the same merge written the other way round,
+#      which is the version that looks correct and silently discards the signature.
+def m172(t):
+    old = "    return {**DEFAULT_PARAMS, **params, **plan_params}"
+    assert t.count(old) == 1, f"the params merge has moved; found {t.count(old)}"
+    return t.replace(old, "    return {**params, **plan_params, **DEFAULT_PARAMS}", 1)
+
+
+case("resolver: DEFAULT_PARAMS outranks the plan a human signed", _RESOLVER, m172,
+     [f"{_D}::test_the_plan_can_displace_the_arc_specific_defaults"])
+
+
+# 173. The conflict gate compares `params` against the plan's TOP-LEVEL keys only, so a
+#      dispatch contradicting a field that arrived through the nested `data` block is
+#      resolved by precedence instead of refused -- silently, and on the one field a data
+#      audit is entirely about: which customer bytes it reads.
+#
+# This slot first held `{**DEFAULT_PARAMS, **plan_params, **params}` -- params outranking
+# the plan, the bug #9 bypass reopened for money. That mutation is UNOBSERVABLE and the
+# runner proved it: the gate above has already established that every key the two share
+# holds an equal value, so the two merge orders are the same dict by construction. A
+# control whose mutation cannot change any output is not evidence about the guard, it is
+# evidence about the control. The precedence that CAN be subverted is the gate's own
+# reach, which is what this mutates instead.
+def m173(t):
+    old = "    conflicts = sorted(k for k in set(plan_params) & set(params)"
+    assert t.count(old) == 1, f"the params conflict gate has moved; found {t.count(old)}"
+    return t.replace(old, "    conflicts = sorted(k for k in set(plan) & set(params)", 1)
+
+
+case("resolver: a dispatch silently overrides a plan field nested under `data`", _RESOLVER,
+     m173, [f"{_D}::test_a_dispatch_contradicting_the_signed_plans_settings_is_refused"])
+
+
+# 174. The contradiction is resolved by precedence instead of refused. Both readings are
+#      defensible, which is exactly why neither may be chosen silently.
+def m174(t):
+    old = "    if conflicts:\n        detail = \", \".join(f\"{k}: plan={plan_params[k]!r} vs params={params[k]!r}\""
+    assert t.count(old) == 1, f"the params conflict gate has moved; found {t.count(old)}"
+    return t.replace(old, "    if False:\n        detail = \", \".join(f\"{k}: plan={plan_params[k]!r} vs params={params[k]!r}\"", 1)
+
+
+case("resolver: plan-vs-dispatch disagreement picks a side silently", _RESOLVER, m174,
+     [f"{_D}::test_a_dispatch_contradicting_the_signed_plans_settings_is_refused"])
+
+
+# 175. PLAN_META_KEYS becomes an ALLOWLIST of what may reach params -- the direction that
+#      omits the field nobody thought of, which is how pipeline_mode and gates went missing.
+def m175(t):
+    old = "    out = {k: v for k, v in plan.items() if k not in PLAN_META_KEYS}"
+    assert t.count(old) == 1, f"the plan-params filter has moved; found {t.count(old)}"
+    return t.replace(old, '    out = {k: v for k, v in plan.items() '
+                          'if k in ("sample_count", "task_count")}', 1)
+
+
+case("resolver: only a remembered handful of plan fields reach params", _RESOLVER, m175,
+     [f"{_D}::test_every_plan_field_the_estimator_prices_reaches_the_stage_that_spends_it",
+      f"{_D}::test_pipeline_mode_in_a_signed_plan_reaches_the_choice_state"])
+
+
+# 176. The plan's nested `data` block stops being flattened, so data-prep's audit task
+#      reads params.source_uri and finds nothing -- and its prompt forbids guessing one.
+def m176(t):
+    old = '    data = plan.get("data")'
+    assert t.count(old) == 1, f"the data-block flatten has moved; found {t.count(old)}"
+    return t.replace(old, '    data = None', 1)
+
+
+case("resolver: the plan's data block never reaches the flat params the prompt reads",
+     _RESOLVER, m176,
+     [f"{_D}::test_the_plans_data_block_reaches_the_prompt_that_reads_it_flat"])
+
+
+# 177. The nested `data` value OVERWRITES an explicit top-level one -- the same
+#      more-specific-statement-loses defect, one layer in.
+def m177(t):
+    old = "            out.setdefault(k, v)"
+    assert t.count(old) == 1, f"the setdefault has moved; found {t.count(old)}"
+    return t.replace(old, "            out[k] = v", 1)
+
+
+case("resolver: a nested data key overwrites the plan's explicit top-level one", _RESOLVER,
+     m177, [f"{_D}::test_the_plans_data_block_reaches_the_prompt_that_reads_it_flat"])
+
+
+# 178. The console's approve->launch forwards no plan again, so a customer's priced
+#      instance types and teacher model die between the estimate record and the run.
+#
+# Two controls, because the block can be broken two ways that no single guard sees. The
+# orchestration guard reads start_run's SOURCE for `payload["plan"] =` -- so DELETING the
+# assignment (m178) trips it, but neutering the branch around it (m178b) does not: the text
+# is still there. The runner proved that escape. The catch for m178b has to be a test that
+# inspects the payload the Lambda client was actually HANDED, which is what
+# test_the_launch_payload_carries_the_priced_plan does.
+def m178(t):
+    old = '            payload["plan"] = priced'
+    assert t.count(old) == 1, f"the console plan forward has moved; found {t.count(old)}"
+    return t.replace(old, '            pass', 1)
+
+
+case("console: the priced plan is not forwarded to start-pipeline",
+     "deploy/console/lambda_function.py", m178,
+     [f"{_D}::test_the_console_launch_forwards_the_priced_plan_not_two_integers",
+      "tests/test_console_cost.py::test_the_launch_payload_carries_the_priced_plan"])
+
+
+# 178b. The forwarding code stays, unreachable -- the shape a source-text guard cannot see.
+def m178b(t):
+    old = '    if est is not None:\n        try:\n            priced = json.loads(est.get("plan", "{}"))'
+    assert t.count(old) == 1, f"the console plan forward has moved; found {t.count(old)}"
+    return t.replace(old, '    if False:\n        try:\n            priced = json.loads(est.get("plan", "{}"))', 1)
+
+
+case("console: the plan-forwarding block is present but unreachable",
+     "deploy/console/lambda_function.py", m178b,
+     ["tests/test_console_cost.py::test_the_launch_payload_carries_the_priced_plan"])
+
+
+# 179. The eval agent gates on a bar it remembers instead of the one the plan named --
+#      the consumer half. A detector run would be judged on ARC's relative_solve_rate.
+def m179(t):
+    d = json.loads(t)
+    p = d["systemPrompt"][0]["text"]
+    old = "the quality gates NAMED IN params.gates"
+    assert p.count(old) == 1, f"eval's gate line has moved; found {p.count(old)}"
+    d["systemPrompt"][0]["text"] = p.replace(
+        old, "the quality gates (student judge-score >= 0.80 x teacher score)", 1)
+    return json.dumps(d, indent=2, ensure_ascii=False)
+
+
+case("prompt: eval gates on a remembered bar, not the one the plan named",
+     "agents/eval/harness.json", m179,
+     [f"{_D}::test_the_gate_prompt_reads_the_thresholds_the_plan_named"])
+
+
+# 180. The stage results never go back to S3 -- bug #22 itself. The driver assembles
+#      `stages[stage]`, hands it to write_run_report, and drops it. Measured before the fix:
+#      `manifest.stages` was still `{}` after a deploy stage reported an endpoint_name, so
+#      the report humans read carried every metric and the manifest AGENTS read carried none.
+def m180(t):
+    old = '        _save_manifest(c["s3"], event["manifest_uri"], manifest)\n'
+    assert t.count(old) == 1, f"the manifest write-back has moved; found {t.count(old)}"
+    return t.replace(old, "", 1)
+
+
+# Only the persistence guard is named. The endpoint guard drives `_run_stage` against a
+# manifest that ALREADY holds `stages`, so it reads the forwarding and not the write-back --
+# naming it here would have been a control asserting a guard it cannot move.
+case("driver: stage results are assembled and never persisted to the manifest",
+     _DRIVER, m180,
+     [f"{_D}::test_a_completed_stages_results_persist_to_the_manifest"])
+
+
+# 181. The write-back becomes a blind put of the driver's own copy. Every specialist prompt
+#      tells the agent to append its results to this same object and the harness role really
+#      can (S3PipelineObjects grants PutObject on runs/*), so the driver is the SECOND
+#      writer -- a blind put erases whatever the agent wrote during the turn. It also puts
+#      the signed blocks back under the driver's control, which is bugs #9/#20/#21's shape.
+def m181(t):
+    old = '    current["stages"] = manifest.get("stages", {})\n'
+    assert t.count(old) == 1, f"the narrowed stages write has moved; found {t.count(old)}"
+    return t.replace(old, "    current = manifest\n", 1)
+
+
+case("driver: the manifest write-back is a blind put, not a narrowed merge",
+     _DRIVER, m181,
+     [f"{_D}::test_a_stage_write_cannot_restate_the_signed_blocks",
+      f"{_D}::test_a_concurrent_agent_write_survives_the_drivers_stage_write"])
+
+
+# 182. An absent manifest is manufactured instead of refused: a stages-only document with no
+#      plan, no approval and no models reads downstream as "a run nobody planned".
+def m182(t):
+    old = ("    if not current:\n"
+           "        # Nothing to merge into.")
+    assert t.count(old) == 1, f"the absent-manifest refusal has moved; found {t.count(old)}"
+    return t.replace(old, "    if False:\n        # Nothing to merge into.", 1)
+
+
+case("driver: a stage write manufactures a manifest for a run nobody planned",
+     _DRIVER, m182,
+     [f"{_D}::test_a_stage_write_with_no_manifest_to_merge_into_is_refused"])
+
+
+# 183. The prior-stage facts are no longer carried into the stage payload -- bug #22's
+#      consumer half. eval and monitor read `params.student_endpoint` for an endpoint the
+#      deploy stage created and named; nothing else can supply it, since no plan can be
+#      signed with an endpoint name that does not exist yet.
+def m183(t):
+    old = '        payload["params"] = {**approved, **facts, **payload["params"]}'
+    assert t.count(old) == 1, f"the params injection has moved; found {t.count(old)}"
+    return t.replace(old, '        payload["params"] = {**approved, **payload["params"]}', 1)
+
+
+# The derived guard is NOT named here: it checks the `STAGE_FACT_PARAMS` declaration, and
+# this mutation breaks the WIRING that reads it. Two different halves, so two controls --
+# m185 below moves the declaration.
+case("driver: prior-stage facts are dropped from the stage payload",
+     _DRIVER, m183,
+     [f"{_D}::test_the_endpoint_a_deploy_stage_created_reaches_the_stages_that_measure_it"])
+
+
+# 184. `stage_fact_params` defaults instead of omitting -- the bug #21 shape one layer down.
+#      A guessed endpoint name is worse than an absent one: the monitor stage reports
+#      CloudWatch metrics for something that is not the model under test, and a metric
+#      attributed to the wrong endpoint reads as evidence rather than as a gap.
+def m184(t):
+    old = "        if value:\n            out[param] = str(value)"
+    assert t.count(old) == 1, f"the stage-fact omission has moved; found {t.count(old)}"
+    return t.replace(
+        old, '        out[param] = str(value or f"llmops-{param}-latest")', 1)
+
+
+case("driver: an unreported stage fact is guessed instead of omitted",
+     _DRIVER, m184,
+     [f"{_D}::test_a_stage_fact_the_run_never_produced_is_omitted_not_guessed"])
+
+
+# 185. The declaration half: `STAGE_FACT_PARAMS` no longer claims student_endpoint, so the
+#      derived guard must notice that a param two prompts read has no writer left. This is
+#      the mutation m183 CANNOT make -- m183 breaks the wiring that reads this constant,
+#      and the derived guard reads the constant itself. Bug #21 lost two controls to exactly
+#      this confusion, so the declaration and the wiring get one control each.
+def m185(t):
+    old = '    "student_endpoint": ("deploy", "endpoint_name"),\n'
+    assert t.count(old) == 1, f"the stage-fact declaration has moved; found {t.count(old)}"
+    return t.replace(old, "", 1)
+
+
+case("driver: the stage-fact declaration drops the param two prompts read",
+     _DRIVER, m185,
+     [f"{_D}::test_every_param_a_prompt_reads_has_something_that_writes_it",
+      f"{_D}::test_the_endpoint_a_deploy_stage_created_reaches_the_stages_that_measure_it"])
+
+
+_DATAPREP = "agents/data-prep/harness.json"
+_EVAL = "agents/eval/harness.json"
+_C = "tests/test_orchestration.py::TestTheCustomersOwnDataIsActuallyRead"
+
+# 186. Bug #23 restored EXACTLY: the generate bullet reverts to the pre-cure sentence that
+#      self-instructs from params.domain and never names params.source_uri. The param stays
+#      in `audit`'s bullet, which is what made this survive so long -- a file-level grep for
+#      source_uri was green, and the broad "some dispatched task reads it" guard passes too,
+#      because audit IS dispatched. Only the full-path intersection can see it: audit's only
+#      Next is Complete, so the mode that reads the customer's file cannot train and the mode
+#      that trains cannot read the file. Both halves correct, never connected.
+def m186(t):
+    old = re.search(r'- \\"generate\\":.*?run\'s S3 prefix\.', t, re.S)
+    assert old, "the generate bullet no longer matches; re-anchor this mutation"
+    return t.replace(
+        old.group(0),
+        '- \\"generate\\": produce seed prompts per llm-prompt-engineering self-instruct '
+        'patterns for the domain in params.domain, invoke the teacher model via '
+        "'aws bedrock-runtime converse' (model id in params.teacher_model_id) in batches, "
+        'strip <think>...</think> reasoning blocks keeping final answers (unless '
+        "params.keep_reasoning), write distillation/generated.jsonl to the run's S3 prefix.",
+        1)
+
+
+case("prompt: the only data-prep task on the full path stops reading the customer's data",
+     _DATAPREP, m186,
+     [f"{_C}::test_the_full_path_and_not_only_the_audit_reads_the_source_uri",
+      f"{_C}::test_the_generate_task_prefers_customer_data_over_inventing_it"])
+
+# 187. The subtler half of #23, and the one a reviewer would wave through: generate still
+#      NAMES params.source_uri, but self-instruction leads and the customer's file becomes
+#      the second option rather than the branch. A model reading two eligible instructions
+#      takes the first, and choosing wrong produces no error -- the corpus is the right size,
+#      the schema validates, and every downstream artifact agrees. So mentioning the param is
+#      not the contract; stated precedence is. This is why the precedence guard exists
+#      separately from the reachability one: m186 cannot make this mutation, because deleting
+#      the param entirely is a different (and louder) defect.
+def m187(t):
+    old = ('  * If params.source_uri is present, THE CUSTOMER\'S OWN DATA IS THE CORPUS')
+    assert t.count(old) == 1, f"the customer-data branch has moved; found {t.count(old)}"
+    fallback = '  * ONLY if params.source_uri is absent entirely: produce seed prompts per '
+    assert t.count(fallback) == 1, "the fallback branch has moved; re-anchor this mutation"
+    # Swap the leading marker so self-instruct reads as the primary branch and the
+    # customer-data branch as the alternative, with no wording deleted anywhere.
+    t = t.replace(fallback, '  * Produce seed prompts per ', 1)
+    return t.replace(old, '  * Alternatively params.source_uri may be present, in which '
+                          "case the customer's own data can be the corpus", 1)
+
+
+case("prompt: self-instruction is offered ahead of the customer's data instead of after it",
+     _DATAPREP, m187,
+     [f"{_C}::test_the_generate_task_prefers_customer_data_over_inventing_it"])
+
+# 188. Eval reverts to scoring the 10% val split unconditionally. The broad guard stays green
+#      here on data-prep's curate alone, which reads customer_eval_uri to decontaminate the
+#      training corpus -- a real use, and precisely the wrong one to be satisfied by: the
+#      acceptance set would be excluded from training and then never measured against, so the
+#      gate reports agreement with the TEACHER on rows the customer never chose. Two
+#      defensible halves whose pairing is the bug, which is the shape this whole class tracks.
+def m188(t):
+    old = re.search(r'- \\"evaluate\\":.*?next run\.', t, re.S)
+    assert old, "the evaluate bullet no longer matches; re-anchor this mutation"
+    return t.replace(
+        old.group(0),
+        '- \\"evaluate\\": prepare the student-vs-teacher comparison on the held-out prompt '
+        'set (the 10% val split from distillation/curated.jsonl).', 1)
+
+
+case("prompt: the gate goes back to scoring the val split whatever the plan named",
+     _EVAL, m188,
+     [f"{_C}::test_the_scoring_task_anchors_the_gate_to_the_customers_acceptance_set"])
+
+# 189. Eval keeps the customer's set but drops the word that ranks the two: with "Fall back
+#      to ... only when no customer set was named" gone, both sets read as eligible and which
+#      one a run scored is decided per-turn by the model. A gate whose evaluation set varies
+#      between runs cannot be compared across runs, and nothing in the report would say so.
+def m189(t):
+    old = ('Fall back to the 10% val split from distillation/curated.jsonl only when no '
+           'customer set was named, and say in the report which set was used')
+    assert t.count(old) == 1, f"the fallback ranking has moved; found {t.count(old)}"
+    return t.replace(old, 'The 10% val split from distillation/curated.jsonl is also '
+                          'available, and say in the report which set was used', 1)
+
+
+case("prompt: the val split stops being labelled the fallback and becomes an equal option",
+     _EVAL, m189,
+     [f"{_C}::test_the_scoring_task_anchors_the_gate_to_the_customers_acceptance_set"])
+
+
 #: Where the pristine text of the file currently mutated is parked, so a kill -9 -- which
 #: no handler can intercept -- still leaves the original recoverable. Under the repo root
 #: rather than /tmp because it must be obvious to whoever finds the tree dirty, and

@@ -114,6 +114,59 @@ def test_no_test_function_name_is_defined_twice_in_a_file():
         "wrong test while still printing PASS.")
 
 
+def test_every_cited_test_name_exists():
+    """A comment that cites a test as its guarantee must cite one that exists.
+
+    These citations are load-bearing. `state_machine.asl.json`'s IncrementIteration
+    comment ends "<test> derives this list from start_pipeline's handler so it cannot
+    rot" -- a reader who trusts that sentence will not re-derive the list by hand. If the
+    named test has been renamed or deleted, the sentence promises a safety net that is
+    not there, and the promise is strongest exactly when it is false: nothing fails, so
+    nobody looks. (This landed after a rename left one such citation dangling.)
+
+    Module names like `test_orchestration` are excluded by requiring an underscore-joined
+    name of 3+ words, which is the convention every test function here follows.
+
+    Two exclusions, both found by running this guard and checking what it flagged rather
+    than by trusting the regex:
+
+    * shell tests. `tests/test_capacity_race_guard.sh` is cited five times and is a real
+      test; it just is not a Python def. The set of defined names is therefore the test
+      FILES plus the defs inside them.
+    * CHANGELOG.md. A changelog's job is to record what things used to be called -- one
+      entry is literally "test_both_readmes_... -> ..._reach_the_committed_video" -- so
+      names that no longer exist are correct there, and enforcing this rule would force
+      the history to be falsified.
+    """
+    defined = set()
+    for p in (REPO / "tests").rglob("test_*"):
+        defined.add(p.name.rsplit(".", 1)[0])          # shell tests, and module names
+        if p.suffix == ".py":
+            defined |= set(re.findall(r"^\s*def (test_[a-z0-9_]+)", p.read_text(), re.M))
+
+    files = subprocess.run(["git", "ls-files"], cwd=REPO, capture_output=True,
+                           text=True, check=True).stdout.split()
+    dangling = {}
+    for rel in files:
+        if rel.startswith("tests/") or rel == "CHANGELOG.md":
+            continue
+        if not rel.endswith((".json", ".py", ".md", ".sh")):
+            continue
+        try:
+            text = (REPO / rel).read_text()
+        except (UnicodeDecodeError, FileNotFoundError):
+            continue
+        for name in re.findall(r"\btest_(?:[a-z0-9]+_){2,}[a-z0-9]+\b", text):
+            if name not in defined:
+                dangling.setdefault(rel, set()).add(name)
+
+    assert not dangling, (
+        "these files cite tests that do not exist, so the guarantee they describe is "
+        f"unenforced: { {k: sorted(v) for k, v in dangling.items()} }. Point the comment "
+        "at the real test, or drop the claim -- a citation nobody can follow is worse "
+        "than no citation, because it stops the reader from checking.")
+
+
 def test_documented_test_counts_match_the_real_suite():
     """Every **N passed** claim in TEST_RESULTS must equal what pytest collects.
 
@@ -438,6 +491,102 @@ def test_the_model_allocation_claim_matches_the_harness_configs():
                 stray.append(f"{doc.name}: {sorted(others)} asserted without marking it "
                              f"undeployed, in: {para.strip()[:120]!r}")
     assert not stray, "; ".join(stray)
+
+
+def test_vpc_isolation_is_not_claimed_without_a_deploy_path():
+    """§11 said "the Lambdas can run VPC-isolated with interface endpoints".
+
+    `deploy/07_lambdas.py` contains `VpcConfig` zero times, and `agents/*/harness.prod.json`
+    does not exist, so nothing in the repo can route through an interface endpoint. That
+    is the same failure mode as the model-split claim above: a design lever read back as a
+    delivered feature -- and here it was load-bearing on spend, because `02_network.py`
+    provisioned 11 endpoints (billed per AZ, $5.28/day) for the consumer this sentence
+    implied.
+
+    Derived from the deploy scripts, so it inverts on its own: the day a Lambda ships with
+    VpcConfig, the docs are ALLOWED to say the Lambdas run VPC-isolated, and until then
+    they are not. Deleting the paragraph does not pass this -- the second half requires the
+    gap to be stated.
+    """
+    lambdas = (REPO / "deploy" / "07_lambdas.py").read_text()
+    prod_cfgs = sorted((REPO / "agents").glob("*/harness.prod.json"))
+    deployable = "VpcConfig" in lambdas or bool(prod_cfgs)
+
+    # "can run VPC-isolated" and the zh-TW "可以...在 VPC 內隔離運行", as a capability
+    # asserted of the Lambdas rather than described as absent.
+    claims = {
+        "ARCHITECTURE.md": re.compile(
+            r"Lambdas?\s+can\s+run\s+\*\*VPC-isolated", re.S),
+        "ARCHITECTURE.zh-TW.md": re.compile(
+            r"Lambda\s+可以\*\*在\s*VPC\s*內隔離運行"),
+    }
+    # Quoting the retracted sentence to explain it was false is the corrected prose; the
+    # marker has to sit in the same paragraph as the quote.
+    retracted = ("used to end", "zero times", "no deploy path", "原本結尾", "零次",
+                 "沒有部署路徑")
+    for doc in DOC_MODEL_CLAIMS:
+        paras = re.split(r"\n\s*\n", doc.read_text())
+        live = [p for p in paras if claims[doc.name].search(p)
+                and not any(mark in p for mark in retracted)]
+        if deployable:
+            continue  # the claim became true; nothing to enforce
+        assert not live, (
+            f"{doc.name} asserts the Lambdas run VPC-isolated, but deploy/07_lambdas.py "
+            f"has no VpcConfig and there are {len(prod_cfgs)} harness.prod.json files. "
+            f"Offending paragraph: {live[0].strip()[:160]!r}")
+
+    if not deployable:
+        # And the gap must be stated, in both languages -- otherwise this test is
+        # satisfiable by saying nothing, which is how the claim survived unchallenged.
+        for doc, needle in ((DOC_MODEL_CLAIMS[0], "routes through an interface endpoint"),
+                            (DOC_MODEL_CLAIMS[1], "會走 interface endpoint")):
+            assert needle in doc.read_text(), (
+                f"{doc.name} no longer states that nothing routes through the interface "
+                "endpoints. Silence here is what let the capability claim stand.")
+
+
+def test_the_docs_do_not_describe_escalation_as_a_pause():
+    """The worker-contract table is where a reader learns what the two exits mean.
+
+    Five harness descriptions called `escalate_human` a pause when it is the terminal
+    exit, and the docs' own row for it listed the effects without saying the run is over
+    -- true line by line, and still readable as "a pause with notifications". So this
+    asserts the *distinction*, not the absence of a word: escalation says terminal, and
+    checkpoint is named as the live human-in-the-loop pause. Derived from the driver, so
+    if `escalated` ever stops being unreachable the guard steps aside instead of going
+    stale.
+    """
+    driver = (REPO / "orchestration/harness_driver/handler.py").read_text()
+    unreachable = driver.split("UNREACHABLE_RUN_STATES = ", 1)[1][:120]
+    if '"escalated"' not in unreachable:
+        return  # escalation became recoverable; this claim is no longer the doc's job
+
+    for doc, terminal, pause, pauses in (
+            (DOC_MODEL_CLAIMS[0], "**terminal**", "human-in-the-loop pause",
+             ("The pipeline pauses", "pauses the pipeline")),
+            (DOC_MODEL_CLAIMS[1], "**終止**", "human-in-the-loop 暫停",
+             ("管線會暫停",))):
+        text = doc.read_text()
+        rows = [ln for ln in text.splitlines() if ln.startswith("| `escalate_human`")]
+        assert rows, f"{doc.name}: the escalate_human contract row is gone"
+        for row in rows:
+            assert terminal in row, (
+                f"{doc.name}: the escalate_human row does not say it is {terminal}. "
+                f"Listing its effects without that word reads as a pause with "
+                f"notifications, which is the mistake five harnesses made. Row: {row!r}")
+        cps = [ln for ln in text.splitlines() if ln.startswith("| `checkpoint`")]
+        assert cps and any(pause in ln for ln in cps), (
+            f"{doc.name}: the checkpoint row no longer names it as the "
+            f"{pause}. If the docs do not say where the pause IS, naming what "
+            "escalation is not leaves the reader with no call to make.")
+        for phrase in pauses:
+            # Retrospectives quoting the old wording are the point; a live claim is not.
+            for para in re.split(r"\n\s*\n", text):
+                if phrase not in para:
+                    continue
+                assert "used to" in para or "原本" in para, (
+                    f"{doc.name}: {phrase!r} appears outside a retrospective. "
+                    f"Paragraph: {para.strip()[:160]!r}")
 
 
 def test_no_doc_claims_a_file_that_does_not_exist():

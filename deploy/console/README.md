@@ -29,13 +29,20 @@ is how the Introduction row below got written on the same commit as the tab itse
 | Optimizations | AWS-native system-prompt recommendations + Bedrock-drafted prompts (human-review-then-apply via UpdateHarness) |
 | Cost | Estimates vs reconciled actuals, the $20,000 reference, approval queue (approver group, never self-approve), `finops-run` dispatch |
 
-Route shape: **30 handlers** — 13 public GETs, 3 session POSTs, 14 authenticated POSTs.
+Route shape: **30 handlers** — 11 public GETs, 2 authenticated consult GETs, 3 session
+POSTs, 14 authenticated POSTs.
 See [ARCHITECTURE.md §13](../../docs/ARCHITECTURE.md#13-the-admin-console--one-lambda-three-planes-with-different-rules)
 for why the three planes carry different rules.
 
 ## Auth model (ported)
 
-- All `GET` routes are public read-only (demo-friendly; nothing sensitive is returned).
+- `GET` routes are public read-only **except the consult plane** — everything under
+  `/api/tasks` needs a token *and* group membership, on both methods. This bullet used to
+  read "All `GET` routes are public read-only (demo-friendly; nothing sensitive is
+  returned)", and the parenthesis was the false half: `GET /api/tasks/{id}` returns the
+  customer's whole transcript and `/approval` returns `cognito_sub` and `source_ip`. The
+  gate is a path prefix (`_is_consult_path`), so a new panel on a thread is authenticated
+  without anyone having to remember this list.
 - Every `POST` except `/api/login`, `/api/refresh` and `/api/refresh/revoke` requires a
   Cognito access token (`Authorization: Bearer ...`), validated server-side via
   `cognito-idp GetUser`. The three exceptions are unauthenticated *because* they are the
@@ -81,7 +88,7 @@ existing `agent-cicd-admin` stack):
 | `DATA_BUCKET` | (empty) | S3 data bucket; falls back to SSM `/llmops/storage/bucket` |
 | `COGNITO_POOL_ID` / `COGNITO_CLIENT_ID` | set by deploy.sh | POST auth |
 | `JUDGE_MODEL` | `global.anthropic.claude-opus-5` | Bedrock model for prompt drafts |
-| `SPANS_SINCE` | `2026-07-28T12:00:00Z` | Sessions before OTEL always_on can never score — excluded from batch eval / insights |
+| `SPANS_SINCE` | (empty) | Sessions before OTEL always_on can never score — excluded from batch eval / insights. Falls back to SSM `/llmops/observability/spans_since`, stamped by `05_harnesses.py` on the deploy that first enables `always_on`; empty everywhere means no filter, which is deliberate — a guessed date drops real sessions silently |
 | `OPTIMIZE_HARNESS` | `llmops_orchestrator` | Default optimization target |
 | `TASKS_TABLE` | `llmops-tasks` | Consultation threads (PK `id`, `task-` prefix) |
 | `ESTIMATES_TABLE` | `llmops-cost-estimates` | Cost estimates (PK `id`) |

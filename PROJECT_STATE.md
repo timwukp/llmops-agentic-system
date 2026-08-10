@@ -51,11 +51,15 @@ Next: v2 experiments — code-as-reasoning distillation + augmentation; Kimi K3 
 | Admin console | `agent-cicd-admin` stack (Lambda+APIGW+DDB+Cognito) | ops-console deploy.sh | login secret `agent-admin/dashboard-login`; monitors orchestrator + finetune |
 | Online evals | one config per harness (Correctness/GoalSuccessRate/ToolSelectionAccuracy, 100% sampling) | deploy/06_observability.py --evals | role llmops-eval-execution |
 
-_Not deployed: VPC + endpoints (deploy/02_network.py). Not built at all: VPC-mode
+_Not deployed: VPC + endpoints (deploy/02_network.py) — confirmed 2026-08-10 by
+`describe-vpcs` and `describe-vpc-endpoints` on `tag:project=llmops-agentic-system` in
+us-east-1, both `[]`, so $0/day is being billed for it. Not built at all: VPC-mode
 harness variants — but the S3 skill mirror they depend on now exists and is what every
 harness reads: all 19 skill sources across the 7 harnesses are `s3`, none are `git`
 (guarded by tests/test_docs_claims.py). Earlier revisions named `harness.prod.json` files
-that have never existed._
+that have never existed. Nothing routes through an interface endpoint, which is why
+`02_network.py` skips the 11 billed ones by default; the free VPC, subnets, SGs and
+gateway endpoints are still built, so a prod config has something to be written against._
 
 ## Standing cost posture
 

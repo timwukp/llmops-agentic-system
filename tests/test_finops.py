@@ -1358,3 +1358,102 @@ def test_iam_documents_survive_comment_stripping_as_printable_ascii():
         # tests, while this one reported green.
         bad = [c for c in json.dumps(doc, ensure_ascii=False) if not (32 <= ord(c) < 127)]
         assert not bad, f"{path.name}: non-ASCII survives stripping: {set(bad)}"
+
+
+# ── the observability cutoff belonged to one account ──────────────────────────────
+# The console filters batch-eval and insights to runs created after SPANS_SINCE, because a
+# session sampled before OTEL_TRACES_SAMPLER=always_on has no spans and scoring it yields a
+# "failed session" that is really a missing measurement. That timestamp was a literal in
+# TWO files -- deploy/console/deploy.sh and lambda_function.py -- naming the hour tracing
+# came up in THIS account. Wrong for every other deployment, and wrong in the hiding
+# direction: a fresh deployment's runs are all newer than 2026-07-28, so they pass the
+# filter, get scored against spans nobody sampled, and return as failures with nothing
+# naming the cutoff. It is now stamped by the deploy step that makes it true.
+
+class _FakeSsm:
+    """SSM that enforces the one semantic this fix rests on: Overwrite=False refuses.
+
+    A double that accepted every put would report the idempotent implementation and the
+    cutoff-moving one as identical -- and moving the cutoff forward is the actual damage,
+    since it silently excludes runs that DO have spans.
+    """
+
+    class ParameterAlreadyExists(Exception):
+        pass
+
+    def __init__(self, params=None):
+        self.params = dict(params or {})
+        self.puts = []
+
+    def put_parameter(self, Name, Value, Overwrite=False, **kw):
+        self.puts.append((Name, Value, Overwrite))
+        if Name in self.params and not Overwrite:
+            raise self.ParameterAlreadyExists(
+                f"ParameterAlreadyExists: {Name}")
+        self.params[Name] = Value
+
+    def get_parameter(self, Name):
+        if Name not in self.params:
+            raise KeyError(f"ParameterNotFound: {Name}")
+        return {"Parameter": {"Value": self.params[Name]}}
+
+
+def test_the_spans_cutoff_is_stamped_on_the_first_always_on_deploy():
+    """The step that ENABLES always_on is the step that records when it started.
+
+    Written by the deploy rather than transcribed by a human, because a human's copy is
+    right for exactly the deployment they copied it from.
+    """
+    mod, ssm = _h5(), _FakeSsm()
+    got = mod.ensure_spans_since(ssm, now="2026-08-10T04:00:00Z")
+    assert got == "2026-08-10T04:00:00Z"
+    assert ssm.params[mod.SPANS_SINCE_PARAM] == "2026-08-10T04:00:00Z"
+    assert ssm.puts[0][2] is False, (
+        "the cutoff was written with Overwrite=True, so every redeploy moves it forward")
+
+
+def test_a_redeploy_never_moves_the_spans_cutoff_forward():
+    """Idempotent in the only direction that matters.
+
+    Spans start once. If a redeploy restamped the parameter with today's date, every run
+    between the first deploy and now -- all of which DO have spans -- would drop out of
+    batch eval and insights, and drop out silently: a missing row prompts no questions.
+    """
+    mod = _h5()
+    ssm = _FakeSsm({"/llmops/observability/spans_since": "2026-07-28T12:00:00Z"})
+    got = mod.ensure_spans_since(ssm, now="2026-08-10T04:00:00Z")
+    assert got == "2026-07-28T12:00:00Z", "a redeploy moved the cutoff to today"
+    assert ssm.params["/llmops/observability/spans_since"] == "2026-07-28T12:00:00Z"
+
+
+def test_no_deployment_specific_spans_timestamp_is_hardcoded_anywhere():
+    """The literal must be gone from BOTH files, not moved between them.
+
+    Checked as "no ISO timestamp near SPANS_SINCE" rather than as the old string, because
+    the defect is a hardcoded date for one account -- any date, not that date. A guard
+    pinned to 2026-07-28T12:00:00Z would pass the moment somebody updated it to the hour
+    THEIR account came up, which is the same bug with a fresher number.
+    """
+    for rel in ("deploy/console/lambda_function.py", "deploy/console/deploy.sh"):
+        for line in (REPO / rel).read_text().splitlines():
+            if "SPANS_SINCE" not in line or line.lstrip().startswith("#"):
+                continue
+            assert not re.search(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}", line), (
+                f"{rel} hardcodes a spans cutoff: {line.strip()!r}. It is a fact about "
+                "one deployment; read it from SSM, where the always_on deploy stamps it.")
+
+
+def test_the_console_falls_back_to_no_filter_rather_than_a_guessed_date():
+    """Empty is the safe end of this switch, and the code has to say so.
+
+    Filtering nothing leaves an unscoreable session visibly unscoreable. A guessed date
+    removes real sessions from the list entirely, and nobody asks why a row they never saw
+    is missing -- so the fallback direction is the whole design decision here.
+    """
+    src = (REPO / "deploy/console/lambda_function.py").read_text()
+    fn = src.split("def spans_since(", 1)[1].split("\ndef ", 1)[0]
+    assert "/llmops/observability/spans_since" in fn, (
+        "spans_since() does not read the parameter the deploy stamps")
+    assert re.search(r'val\s*=\s*""', fn), (
+        "spans_since() has no empty fallback: on a deployment where the parameter is "
+        "absent it must filter nothing rather than invent a cutoff")

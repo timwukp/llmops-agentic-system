@@ -266,10 +266,12 @@ versions and introspects the live CreateHarness/UpdateHarness schemas.
   files, and commit diffs. Use `<ACCOUNT_ID>` placeholders; deploy scripts substitute
   at run time. `hooks/pre-commit` and `.github/workflows/redaction-check.yml` enforce.
 - Least-privilege IAM only. No `*FullAccess` managed policies.
-- The VPC with interface endpoints is built by `deploy/02_network.py`. Harness configs
-  (`agents/*/harness.json`) are PUBLIC-network for iteration speed. VPC-mode harness
-  variants are **not built yet** and depend on the S3 skill mirror above (a VPC-mode
-  harness cannot resolve a git skill source).
+- The VPC is built by `deploy/02_network.py`. Harness configs (`agents/*/harness.json`)
+  are PUBLIC-network for iteration speed. VPC-mode harness variants are **not built yet**
+  and depend on the S3 skill mirror above (a VPC-mode harness cannot resolve a git skill
+  source). Interface endpoints bill **per AZ**, so the script skips all 11 until a
+  consumer exists; if you add a service or a subnet, the printed cost is derived from
+  `len(INTERFACE_SERVICES) × len(subnet_ids)` and needs no hand-editing.
 
 ## Repo conventions
 

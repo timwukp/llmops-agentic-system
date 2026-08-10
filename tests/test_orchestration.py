@@ -319,6 +319,40 @@ def clients(agentcore=None, s3=None):
     }
 
 
+class FakeAgentCoreControl:
+    """AgentCore control plane, with the property that matters: state PERSISTS.
+
+    The failover bug was a write to shared, durable control-plane state, so a double
+    that forgot each UpdateHarness could not express it. `model_of` reads back what was
+    written, exactly as a later run's GetHarness would.
+    """
+
+    def __init__(self, model_id="global.anthropic.claude-fable-5", status="READY",
+                 fail_update_on=()):
+        self.models = {}
+        self.default_model = model_id
+        self.status = status
+        self.updates = []
+        #: model ids whose UpdateHarness raises — the restore-failed path.
+        self.fail_update_on = set(fail_update_on)
+
+    def model_of(self, harness_id):
+        return self.models.get(harness_id, self.default_model)
+
+    def get_harness(self, harnessId, **kw):
+        return {"harness": {
+            "status": self.status,
+            "model": {"bedrockModelConfig": {"modelId": self.model_of(harnessId)}}}}
+
+    def update_harness(self, harnessId, model, **kw):
+        new = model["bedrockModelConfig"]["modelId"]
+        if new in self.fail_update_on:
+            raise RuntimeError(f"ValidationException: cannot set {new}")
+        self.updates.append((harnessId, new))
+        self.models[harnessId] = new
+        return {"harness": {"status": self.status}}
+
+
 def driver_event(**over):
     base = {"run_id": "run-test-1", "stage": "data-prep", "task": "generate",
             "harness_id": "llmops_data_prep",
@@ -2201,6 +2235,132 @@ def _terminals_from(states: dict, start: str) -> set:
             and _reaches(states, start, n)}
 
 
+# --- the field-propagation model, used by the path-walking guard below ----------
+#
+# Written because asserting Next transitions is not enough. IncrementIteration was a
+# Pass with Parameters and no ResultPath: its constructed object REPLACED the whole
+# state, dropping task_id, so every run that remediated even once died at closeout on
+# States.Runtime -- which no Catch can intercept. test_remediation_loop_wiring asserted
+# every transition on that path and passed the entire time, because transitions were
+# never the thing that broke.
+
+#: Keys whose `$.x` values are NOT reads of the state document, at any depth.
+#: ResultPath is where a result is WRITTEN -- counting it as a read made the walk
+#: report every state as missing the field it produces. ResultSelector is evaluated
+#: against the task RESULT, not the state document.
+_NOT_A_READ = ("ResultPath", "ResultSelector")
+
+
+def _scrub_writes(node):
+    """Copy of `node` with write-target keys removed at every depth.
+
+    Recursive because Catch entries carry their own ResultPath, and a Catch's
+    ResultPath is the classic false positive: `DataPrepGenerate` "reads" $.error
+    only in the sense that it writes one there when it fails.
+    """
+    if isinstance(node, dict):
+        return {k: _scrub_writes(v) for k, v in node.items() if k not in _NOT_A_READ}
+    if isinstance(node, list):
+        return [_scrub_writes(v) for v in node]
+    return node
+
+
+def _root_fields_read(state: dict) -> set:
+    """Root-level `$.field` references this state reads.
+
+    Only reads that resolve against the state document count. Context-object paths
+    ($$.…) come from Step Functions, not the state, and `$` alone is the whole
+    document; write targets are stripped by _scrub_writes.
+    """
+    out = set()
+    for m in re.findall(r'"\$\.([A-Za-z_][A-Za-z0-9_.\[\]]*)"',
+                        json.dumps(_scrub_writes(state))):
+        out.add(m.split(".")[0].split("[")[0])
+    return out
+
+
+def _fields_after(name: str, state: dict, incoming: set) -> set:
+    """What the state document holds AFTER this state runs.
+
+    Mirrors the four ASL rules that actually govern propagation:
+      * Parameters without ResultPath on a Pass  -> the object REPLACES the state.
+      * ResultPath "$"                           -> the result replaces the state.
+      * ResultPath "$.x"                         -> the result is grafted at x.
+      * ResultPath null / absent on a Pass       -> the state passes through.
+    """
+    stype = state.get("Type")
+    if stype == "Pass" and "Parameters" in state and "ResultPath" not in state:
+        return {k[:-2] if k.endswith(".$") else k for k in state["Parameters"]}
+    if "ResultPath" in state:
+        rp = state["ResultPath"]
+        if rp is None:                      # discard the result, keep the state
+            return set(incoming)
+        if rp == "$":                       # result becomes the whole state
+            return set()
+        return set(incoming) | {rp[2:].split(".")[0]}
+    if stype == "Task":
+        # A Task with no ResultPath replaces the state with its result. Every Task
+        # here sets one; if one ever does not, this models the real loss.
+        return set()
+    return set(incoming)
+
+
+def _seeded_execution_input_fields() -> set:
+    """The fields start_pipeline actually puts in the execution input.
+
+    Derived from the handler rather than transcribed: this set IS the machine's
+    entry contract, and a hand-copied list of it silently rots the day someone adds
+    a sixth field. Parsed the same way the starter-contract guards below parse it.
+    """
+    src = (REPO / "orchestration/start_pipeline/handler.py").read_text()
+    start_input = src[src.index("input=json.dumps("):]
+    start_input = start_input[:start_input.index("\n\n")]
+    fields = set(re.findall(r'"([a-z_]+)":', start_input))
+    assert "run_id" in fields and "task_id" in fields, (
+        f"failed to parse start_pipeline's execution input; got {fields}")
+    return fields
+
+
+def _walk_field_availability(states: dict, start: str, seed: set):
+    """Walk every path from `start`, returning [(state, missing_fields, path)].
+
+    A state entered along several paths is checked with the INTERSECTION of what
+    those paths provide -- a field is only safe to read if every way in supplies it.
+    """
+    catch_adds = {}   # state -> field a Catch grafts on entry
+    for n, st in states.items():
+        for c in st.get("Catch", []) or []:
+            rp = c.get("ResultPath")
+            if rp and rp.startswith("$."):
+                catch_adds.setdefault(c["Next"], set()).add(rp[2:].split(".")[0])
+
+    incoming = {start: set(seed)}
+    problems, queue, guard = [], [(start, tuple())], 0
+    while queue:
+        guard += 1
+        assert guard < 10_000, "field walk did not converge"
+        name, path = queue.pop()
+        if name not in states:
+            continue
+        st = states[name]
+        have = incoming[name]
+        missing = _root_fields_read(st) - have
+        if missing:
+            problems.append((name, sorted(missing), path + (name,)))
+        after = _fields_after(name, st, have)
+        for nxt in _exits(st):
+            arriving = set(after) | catch_adds.get(nxt, set())
+            if nxt in incoming:
+                merged = incoming[nxt] & arriving
+                if merged == incoming[nxt]:
+                    continue          # nothing new to learn on this edge
+                incoming[nxt] = merged
+            else:
+                incoming[nxt] = arriving
+            queue.append((nxt, path + (name,)))
+    return problems
+
+
 class TestStateMachine:
 
     def test_all_next_targets_exist(self, asl):
@@ -2244,6 +2404,100 @@ class TestStateMachine:
         assert _terminals_from(states, "MarkRunFailed") == {"Fail"}, (
             "the marker must lead to Fail and ONLY Fail -- a path from here to a "
             "Succeed state would report an exhausted budget as a successful run")
+
+    def test_no_state_reads_a_field_some_path_does_not_supply(self, asl):
+        """Every `$.field` a state reads must be present however the state was entered.
+
+        This is the guard that was missing. A JSONPath that is not present raises
+        States.Runtime, which NO Catch can intercept -- start_pipeline's NO_TASK
+        sentinel exists for exactly this reason and says so. So a dropped field is not
+        a degraded run, it is an uncatchable death mid-execution.
+
+        IncrementIteration dropped task_id (Pass + Parameters + no ResultPath replaces
+        the whole state), so MarkTaskDone/MarkTaskFailed read $.task_id off a document
+        that no longer had it. Every run that entered remediation once died at closeout
+        with its conductor task record left open -- the self-healing loop the README
+        leads with. It was never caught because no run had remediated yet, and because
+        the only guard asserted transitions.
+
+        Deliberately generic: it walks EVERY path and checks EVERY read, so the next
+        state that drops a field fails here instead of in production.
+        """
+        states = asl["States"]
+        # What start_pipeline actually puts in the execution input. task_id is always
+        # set (NO_TASK when there is no conductor task) precisely so it can be read.
+        seed = _seeded_execution_input_fields()
+        problems = _walk_field_availability(states, asl["StartAt"], seed)
+        assert not problems, "states read fields no path supplies:\n" + "\n".join(
+            f"  {name} reads {miss} -- reachable via {' -> '.join(path[-4:])}"
+            for name, miss, path in problems)
+
+    def test_the_field_walk_would_notice_a_dropped_field(self, asl):
+        """A guard that cannot fail is not a guard.
+
+        Mutate the document the way the real bug looked and assert the walk reports it.
+        Without this, the test above could pass because the model is too permissive
+        rather than because the machine is correct.
+        """
+        states = json.loads(json.dumps(asl["States"]))
+        seed = _seeded_execution_input_fields()
+        assert not _walk_field_availability(states, asl["StartAt"], seed)
+
+        # Reintroduce the exact defect: a Pass that rebuilds the state without task_id.
+        states["IncrementIteration"] = {
+            "Type": "Pass",
+            "Parameters": {"run_id.$": "$.run_id",
+                           "manifest_uri.$": "$.manifest_uri",
+                           "iteration.$": "States.MathAdd($.iteration, 1)"},
+            "Next": "RemediateFinetune",
+        }
+        problems = _walk_field_availability(states, asl["StartAt"], seed)
+        offenders = {name: miss for name, miss, _ in problems}
+        assert offenders, "the walk did not notice a state rebuilt without task_id"
+        assert any("task_id" in miss for miss in offenders.values()), \
+            f"the walk missed the dropped task_id; it reported {offenders}"
+
+    def test_the_remediation_path_still_carries_the_conductor_task(self, asl):
+        """Named explicitly, because this is the field whose loss was fatal.
+
+        The generic walk above would catch it, but a run through remediation is the
+        scenario that actually happened, and it deserves a test that says so by name.
+        """
+        states = asl["States"]
+        inc = states["IncrementIteration"]
+        assert _reaches(states, "IncrementIteration", "MarkTaskFailed")
+        assert _reaches(states, "IncrementIteration", "MarkTaskDone"), (
+            "remediation must still be able to reach the success closer")
+        if inc.get("Type") == "Pass" and "Parameters" in inc and "ResultPath" not in inc:
+            carried = {k[:-2] if k.endswith(".$") else k for k in inc["Parameters"]}
+            assert "task_id" in carried, (
+                "IncrementIteration rebuilds the state, so it must carry task_id "
+                "forward -- MarkTaskDone/MarkTaskFailed read it and a missing "
+                "JSONPath raises States.Runtime, which no Catch can intercept")
+
+    def test_a_state_replacing_pass_hands_back_the_whole_entry_contract(self, asl):
+        """The general form of the bug above, so the next one fails here too.
+
+        Any Pass with Parameters and no ResultPath replaces the entire state document,
+        which makes it a second writer of the machine's entry contract -- and it has to
+        honour all of it, not the subset the state it feeds happens to read. Checking
+        only "does the immediate Next read this" would have let the original bug
+        through: RemediateFinetune does not read task_id; MarkTaskDone, four hops
+        later, does. Derived from start_pipeline so adding a sixth seeded field breaks
+        here rather than in an execution.
+        """
+        seed = _seeded_execution_input_fields()
+        rebuilders = {n: st for n, st in asl["States"].items()
+                      if st.get("Type") == "Pass" and "Parameters" in st
+                      and "ResultPath" not in st}
+        assert rebuilders, "no state-replacing Pass found; has the loop been rewritten?"
+        for name, st in rebuilders.items():
+            carried = {k[:-2] if k.endswith(".$") else k for k in st["Parameters"]}
+            assert seed <= carried, (
+                f"{name} replaces the state document but drops "
+                f"{sorted(seed - carried)}; every field start_pipeline seeds must be "
+                "handed back, because a read of a path that is not there raises "
+                "States.Runtime and no Catch can intercept it")
 
     def test_every_harness_task_uses_task_token(self, asl):
         for name, st in asl["States"].items():
@@ -2962,6 +3216,203 @@ class TestEveryDeclaredTaskIsReachable:
         assert ev.MODEL_EVALUATED in emitted
 
 
+#: Params a signed plan carries that name the CUSTOMER'S OWN BYTES, mapped to the
+#: promise the platform makes about each. Not a general "every param is read" guard:
+#: these two are the ones whose silent absence is indistinguishable from success.
+CUSTOMER_DATA_PARAMS = {
+    "source_uri": "the data the customer signed for us to train on",
+    "customer_eval_uri": "the acceptance set the customer's gate is anchored to",
+}
+
+
+def _tasks_naming(param: str, dispatched: dict) -> set:
+    """Which DISPATCHED (harness, task) prompts name `param`.
+
+    Scoped to the task bullet the param appears inside, because "the prompt file
+    mentions source_uri somewhere" is exactly the false pass this guard exists to
+    prevent: bug #23 had the string present in `audit`'s bullet while `generate` --
+    the only task on the full path -- never read it, and a file-level grep was green.
+    """
+    found = set()
+    for cfg in sorted((REPO / "agents").glob("*/harness.json")):
+        doc = json.loads(cfg.read_text())
+        hid = doc.get("name") or ("llmops_" + cfg.parent.name.replace("-", "_"))
+        text = "".join(b.get("text", "") for b in (doc.get("systemPrompt") or []))
+        # Split into per-task bullets: from one `- "task":` to the next, or to Rules.
+        bullets = re.findall(r'- \\?"([a-z_]+)\\?":(.*?)(?=\n- \\?"[a-z_]+\\?":|\nRules:|$)',
+                             text, re.S)
+        for task, body in bullets:
+            if param in body and (hid, task) in dispatched:
+                found.add((hid, task))
+    return found
+
+
+class TestTheCustomersOwnDataIsActuallyRead:
+    """A plan param naming the customer's bytes must be read by a task on the run.
+
+    Bug #23: `pipeline_mode: "full"` starts at DataPrepGenerate, whose prompt said
+    "produce seed prompts per self-instruct patterns for the domain in params.domain"
+    and never mentioned params.source_uri. The ONLY task in any of the seven prompts
+    that read source_uri was data-prep's `audit`, reachable only from DataAudit, whose
+    Next is Complete. So the mode that reads the customer's data cannot train, and the
+    mode that trains cannot read the customer's data -- the sixth instance of two
+    correct halves never connected.
+
+    start_pipeline._plan_params already flattened plan.data.source_uri into params
+    correctly (the bug #21 cure). The param ARRIVED and nothing consumed it, which is
+    why no error was ever raised: a customer signed "fine-tune on my 300 tickets", the
+    run trained on 300 teacher-invented samples for the domain STRING, and the
+    manifest, the curated corpus, the eval report and the cost report all agreed.
+
+    Asserted against the DISPATCHED task set rather than the declared one, because a
+    task nobody can invoke reading the param is the defect, not the cure.
+    """
+
+    def test_every_customer_data_param_is_read_by_some_dispatched_task(self, asl):
+        dispatched = _dispatched_tasks(asl)
+        unread = {p: why for p, why in CUSTOMER_DATA_PARAMS.items()
+                  if not _tasks_naming(p, dispatched)}
+        assert not unread, (
+            "no dispatchable task's prompt reads these plan params: "
+            + "; ".join(f"params.{p} ({why})" for p, why in sorted(unread.items()))
+            + ". The signed plan carries the value, start-pipeline puts it in params, "
+            "and no stage on any path consumes it -- so the run executes on data no "
+            "human chose while every artifact agrees with the plan.")
+
+    def test_the_full_path_and_not_only_the_audit_reads_the_source_uri(self, asl):
+        """source_uri must be read by a task the FULL pipeline reaches.
+
+        The narrower half of the guard above, and the one that actually caught #23:
+        `audit` alone satisfies "some dispatched task reads it" while leaving every
+        training run blind. So the readers are intersected with what is reachable from
+        the state machine's start WITHOUT taking the data_audit branch.
+        """
+        states = asl["States"]
+        start = asl["StartAt"]
+        choice = states[start]
+        audit_only = {c.get("Next") for c in (choice.get("Choices") or [])}
+        full_entry = choice.get("Default")
+        assert full_entry and full_entry not in audit_only, (
+            f"{start} has no Default distinct from its data_audit branch; this guard "
+            "assumes the full path is the Default one")
+
+        on_full_path = set()
+        for name, st in states.items():
+            payload = (st.get("Parameters") or {}).get("Payload") or {}
+            if payload.get("harness_id") and _reaches(states, full_entry, name):
+                on_full_path.add((payload["harness_id"], payload.get("task")))
+        assert on_full_path, "no harness tasks are reachable on the full path"
+
+        readers = _tasks_naming("source_uri", _dispatched_tasks(asl))
+        assert readers & on_full_path, (
+            f"params.source_uri is read only by {sorted(readers)}, none of which the "
+            f"full pipeline reaches (it dispatches {sorted(on_full_path)}). A run in "
+            "'full' mode would train on self-instructed data and never open the file "
+            "the customer signed for.")
+
+    def test_the_generate_task_prefers_customer_data_over_inventing_it(self):
+        """Reading the param is not enough: precedence has to be stated.
+
+        A prompt that mentions source_uri while still leading with "produce seed
+        prompts" leaves the choice to the model, and the failure mode of guessing wrong
+        is invisible. So the generate bullet must make customer data the primary branch
+        and self-instruction the fallback conditioned on the param's ABSENCE.
+        """
+        doc = json.loads((REPO / "agents/data-prep/harness.json").read_text())
+        text = "".join(b.get("text", "") for b in doc["systemPrompt"])
+        bullet = re.search(r'- \\?"generate\\?":(.*?)(?=\n- \\?"[a-z_]+\\?":|\nRules:)',
+                           text, re.S)
+        assert bullet, "could not isolate the generate bullet -- the parse is broken"
+        body = bullet.group(1)
+        assert "params.source_uri" in body, (
+            "generate is the only data-prep task on the full path and it does not name "
+            "params.source_uri")
+        # The fallback must be gated on absence, not offered as an equal alternative.
+        assert re.search(r"(?:if|when)\s+params\.source_uri\s+is\s+absent", body, re.I), (
+            "generate does not condition self-instruction on params.source_uri being "
+            "ABSENT, so both branches read as available and the model picks one")
+        primacy = body.index("params.source_uri") < body.index("self-instruct")
+        assert primacy, (
+            "the self-instruct instruction precedes the customer-data instruction in "
+            "the generate bullet; the first branch a model reads is the one it takes")
+
+    def test_the_scoring_task_anchors_the_gate_to_the_customers_acceptance_set(self):
+        """customer_eval_uri has to be read by the task that SCORES, not just by curate.
+
+        The broad guard above is satisfied by data-prep's curate, which reads the param
+        to decontaminate the training corpus against it. That is a real use and it is
+        not the one the customer bought: if eval keeps scoring the 10% val split, the
+        gate measures agreement with the TEACHER on data the customer never saw, and the
+        decontamination merely guarantees the acceptance set went unused. Both halves
+        would be individually defensible and the pair would be the bug.
+        """
+        docs = {}
+        for cfg in sorted((REPO / "agents").glob("*/harness.json")):
+            doc = json.loads(cfg.read_text())
+            hid = doc.get("name") or ("llmops_" + cfg.parent.name.replace("-", "_"))
+            docs[hid] = "".join(b.get("text", "") for b in (doc.get("systemPrompt") or []))
+
+        # Which eval task produces the score is derived from the prompt, not assumed:
+        # PR C split "evaluate" into evaluate+score and the producer moved once already.
+        eval_text = docs["llmops_eval"]
+        bullets = dict(re.findall(
+            r'- \\?"([a-z_]+)\\?":(.*?)(?=\n- \\?"[a-z_]+\\?":|\nRules:|$)', eval_text, re.S))
+        assert bullets, "could not isolate the eval task bullets -- the parse is broken"
+        readers = {t for t, b in bullets.items() if "customer_eval_uri" in b}
+        assert readers, (
+            "no eval task names params.customer_eval_uri, so the gate is scored on the "
+            f"val split whatever the plan says (eval declares {sorted(bullets)}). "
+            "data-prep's curate reading it only proves the acceptance set was excluded "
+            "from training, not that anything was ever measured against it.")
+        # And the fallback must be conditional on absence, same reason as generate's.
+        body = "".join(bullets[t] for t in sorted(readers))
+        assert re.search(r"fall\s*back|only when no customer", body, re.I), (
+            "the eval prompt names customer_eval_uri without stating that the val "
+            "split is the FALLBACK; two eligible sets and no precedence means the "
+            "score's provenance is decided per-run by the model")
+
+
+#: A bedrock inference-profile id or a Hugging Face repo -- what a model
+#: IDENTITY looks like, as opposed to a token count or an instance type.
+_MODEL_ID = re.compile(r"^(?:(?:global|us|eu|apac)\.[\w-]+\.[\w.:-]+"
+                       r"|[A-Za-z][\w.-]*/[\w.-]+)$")
+
+
+def _fields_the_estimator_prices_models_from():
+    """{plan field -> is it nested under `models`} for every model cost_model prices.
+
+    Scraped from cost_model.py's own source, and a field is recognised by the model id
+    it DEFAULTS to rather than by its name. Matching on names makes a guard blind in
+    exactly the direction this bug travels: intersecting the estimator's field names
+    with the dispatcher's own alias list means renaming the estimator's field to one
+    the dispatcher does not know makes the mismatch invisible, and the guard green.
+    A scrape that can only see fields both sides agree on cannot detect the two sides
+    disagreeing. Measured: both directions escaped a name-matching version of this
+    guard, which is why controls m161 and m163 exist.
+    """
+    src = (REPO / "pipeline/contracts/cost_model.py").read_text()
+    lines = src.splitlines()
+    priced = {}
+    for i, line in enumerate(lines):
+        if "= str(" not in line:
+            continue
+        stmt, j = line, i
+        while stmt.count("(") > stmt.count(")") and j + 1 < len(lines):
+            j += 1
+            stmt += " " + lines[j].strip()
+        if not [s for s in re.findall(r'"([^"]+)"', stmt) if _MODEL_ID.match(s)]:
+            continue  # not a model id -- a token count or an instance type
+        for field in re.findall(r'plan\.get\(\s*"([a-z_]+)"', stmt):
+            if field != "models":
+                priced.setdefault(field, False)
+        for field in re.findall(r'\)\s*\.get\(\s*"([a-z_]+)"', stmt):
+            priced[field] = True
+    assert priced, ("no model-identity field found in cost_model.py -- either the "
+                    "estimator stopped pricing per model, or this scrape broke; "
+                    "either way the two paths are no longer being compared")
+    return priced
+
+
 class TestConductorDispatch:
     """launch_run — declared in the orchestrator's harness.json since Phase 5,
     serviced nowhere until the Tasks-tab work. These tests pin the fix and the
@@ -3033,6 +3484,570 @@ class TestConductorDispatch:
         assert "consult" in orch_sentence, (
             "the orchestrator's invariant lost its consult carve-out — consult turns "
             "that properly end in prose would now read as protocol failures")
+
+    def test_every_model_param_a_prompt_reads_is_one_the_driver_supplies(self):
+        """The prompts say "model id in params.teacher_model_id". NOTHING wrote it.
+
+        start-pipeline resolves the signed plan into `manifest.models`; no prompt
+        mentions `manifest.models` at all. So the agents read an absent param and fell
+        back to the only model id in front of them -- the one hardcoded in their own
+        persona line ("teacher DeepSeek-R1 on Bedrock"). That is boilerplate standing in
+        for consent, which is the whole bug: the approval path resolved a teacher and
+        the execution path never saw it.
+
+        Derived in the direction that matters: every `params.*_model_id` any prompt
+        reads must be a key the driver actually injects.
+        """
+        supplied = set(driver.MODEL_PARAM_FOR_ROLE.values())
+        assert supplied, "the driver no longer injects any approved model param"
+        for cfg in sorted((REPO / "agents").glob("*/harness.json")):
+            text = json.loads(cfg.read_text())["systemPrompt"][0]["text"]
+            read = set(re.findall(r"params\.([a-z_]*model[a-z_]*)", text))
+            unsupplied = sorted(read - supplied)
+            assert not unsupplied, (
+                f"{cfg.parent.name}: the prompt reads {unsupplied} but the driver "
+                f"supplies only {sorted(supplied)}. An agent that reads an absent model "
+                "param substitutes one it has seen, and the model a human approved is "
+                "not the model that gets billed.")
+
+    def test_the_driver_injects_the_manifest_models_under_the_prompt_names(self):
+        """The consent recorded by start-pipeline has to reach the agent turn.
+
+        Roles the manifest is silent about are OMITTED, not defaulted: a stage that
+        needs a teacher and finds no param must fail visibly. A default here would
+        recreate the bug one layer down."""
+        got = driver.model_params_from_manifest(
+            {"models": {"teacher": "global.anthropic.claude-fable-5",
+                        "student": "meta-llama/Llama-3.2-1B"}})
+        assert got == {"teacher_model_id": "global.anthropic.claude-fable-5",
+                       "student_model_id": "meta-llama/Llama-3.2-1B"}, got
+        assert driver.model_params_from_manifest({}) == {}
+        assert driver.model_params_from_manifest({"models": {}}) == {}
+        # A junk manifest must not crash the stage that reads it.
+        assert driver.model_params_from_manifest({"models": "deepseek"}) == {}
+
+    @staticmethod
+    def _stage_params(event, models, manifest=None):
+        """The params the REAL `_run_stage` builds, for a manifest holding `models`.
+
+        Drives the actual function rather than recomputing its merge: an assertion on a
+        dict this test built itself passes no matter what the driver does, which is how
+        the "two correct halves, never connected" shape of this bug survives tests.
+
+        `manifest` supplies the REST of the document (notably `stages`, which carries the
+        facts earlier stages of the run reported) so the same real code path can be driven
+        for prior-stage facts as for signed models. `models` still wins over
+        `manifest["models"]` so every existing caller keeps its meaning.
+        """
+        seen = {}
+        doc = {**(manifest or {}), "models": models}
+
+        class _S3:
+            def get_object(self, Bucket, Key):
+                return {"Body": io.BytesIO(json.dumps(doc).encode())}
+
+        def _fake_user_text(text):
+            seen.update(json.loads(text))
+            raise RuntimeError("stop once the payload has been built")
+
+        real = driver._user_text
+        driver._user_text = _fake_user_text
+        try:
+            driver._run_stage(event, c={"s3": _S3()})
+        except RuntimeError:
+            pass
+        finally:
+            driver._user_text = real
+        return seen.get("params", {})
+
+    def test_a_stage_payload_carries_the_approved_models(self):
+        """Wiring test, not a unit test: the resolver and the injector were both correct
+        in the previous bug too, and the defect was that nothing connected them."""
+        params = self._stage_params(
+            {"run_id": "run-x", "stage": "data-prep", "task": "generate",
+             "harness_id": "llmops_data_prep",
+             "manifest_uri": "s3://b/runs/run-x/manifest.json"},
+            {"teacher": "global.anthropic.claude-fable-5",
+             "student": "meta-llama/Llama-3.2-1B"})
+        assert params.get("teacher_model_id") == "global.anthropic.claude-fable-5", (
+            f"the stage payload does not carry the approved teacher: {params}")
+        assert params.get("student_model_id") == "meta-llama/Llama-3.2-1B"
+        assert params.get("task") == "generate", "the task must still be there"
+
+    def test_a_caller_supplied_model_overrides_the_manifest_but_is_not_the_default(self):
+        """A remediation iteration may legitimately name a different model, so an
+        explicit event param still wins. What must NOT happen is the reverse: the
+        manifest being ignored whenever the event says nothing.
+
+        Both directions are asserted through the real `_run_stage`, because the merge
+        ORDER is the whole content of this test -- and a merge order restated in the
+        test body is satisfied by any order in the code."""
+        base = {"run_id": "run-x", "stage": "data-prep", "task": "generate",
+                "harness_id": "llmops_data_prep",
+                "manifest_uri": "s3://b/runs/run-x/manifest.json"}
+        approved = {"teacher": "global.anthropic.claude-fable-5"}
+        override = self._stage_params(
+            {**base, "params": {"teacher_model_id": "us.deepseek.r1-v1:0"}}, approved)
+        assert override.get("teacher_model_id") == "us.deepseek.r1-v1:0", (
+            "an explicit caller override must win: a remediation iteration that names a "
+            f"model is a deliberate act, and the driver overrode it -> {override}")
+        silent = self._stage_params(base, approved)
+        assert silent.get("teacher_model_id") == "global.anthropic.claude-fable-5", (
+            "with the event silent the manifest's approved model must be supplied — "
+            "otherwise the agent falls back to whatever its prompt names")
+
+    def test_no_prompt_hardcodes_a_model_id_as_the_one_to_use(self):
+        """Every prompt's persona line used to name DeepSeek-R1 and Qwen3-1.7B, which is
+        what an agent falls back to when its model param is absent. The platform has to
+        run a customer's own open-weight distillation and a YOLO fine-tune, so a model
+        id in a prompt is either dead weight or a wrong default."""
+        banned = ("DeepSeek-R1", "Qwen3-1.7B", "Qwen/Qwen3", "us.deepseek")
+        for cfg in sorted((REPO / "agents").glob("*/harness.json")):
+            text = json.loads(cfg.read_text())["systemPrompt"][0]["text"]
+            # Scoped to the persona line and the task list -- the part that tells the
+            # agent WHAT TO USE. finops's prompt names DeepSeek-R1 inside a measured
+            # finding about the AWS Price List API ("it CANNOT price Claude Fable 5"),
+            # which is a fact about a pricing source, not an instruction to use a model.
+            # A file-wide ban would force deleting that measurement to satisfy a guard
+            # about defaults.
+            parts = re.split(r"\nRules\b", text, maxsplit=1)
+            assert len(parts) == 2, (
+                f"{cfg.parent.name}: no 'Rules' section, so this guard cannot tell the "
+                "instructions from the measured findings and would silently check "
+                "nothing. Restore the section or narrow the scope deliberately.")
+            directive = parts[0]
+            for term in banned:
+                assert term not in directive, (
+                    f"{cfg.parent.name}: the prompt still names {term!r} where it says "
+                    "what to use. That is the id an agent substitutes when "
+                    "params.*_model_id is missing, so it reads as the default rather "
+                    "than as an example.")
+
+    def test_every_param_a_prompt_reads_has_something_that_writes_it(self):
+        """The generalised form of bugs #20, #21 and #22 — derived, so it finds the NEXT one.
+
+        Three consecutive bugs were one shape: a prompt reads `params.X`, some other half
+        of the system knows X, and nothing connects them. Each was found by hand, one param
+        at a time. This enumerates every `params.X` any of the 7 prompts reads and asserts
+        that at least one writer exists for it, so instance #6 fails here instead of in a
+        run nobody can explain.
+
+        The four writers, which are the complete set:
+
+        - `DEFAULT_PARAMS` in start-pipeline (a run nobody planned)
+        - a signed plan, via `_plan_params` minus `PLAN_META_KEYS` (a run a human designed)
+        - the driver, from the manifest: `MODEL_PARAM_FOR_ROLE` (what was approved) and
+          `STAGE_FACT_PARAMS` (what an earlier stage of this run discovered)
+        - the dispatch event itself, for the few params that only exist at dispatch time
+
+        Every read param is classified EXPLICITLY below, and the classification is pinned:
+        a param appearing in a prompt without an entry here fails, and an entry for a param
+        no prompt reads fails too. That pin is the point. The first version of this guard
+        allowed "a plan may carry it" to satisfy the assertion, which made it load-bearing
+        on exactly ONE of the 25 params -- `student_endpoint` would have passed with the
+        driver's injection deleted, because a plan is not barred from naming it. A plan
+        being *permitted* to carry a field is not the same as anything *writing* it, and an
+        endpoint name is a fact no plan can be signed with.
+
+        So each category is checked against the mechanism that actually supplies it:
+        `default` against `DEFAULT_PARAMS`, `model` against `MODEL_PARAM_FOR_ROLE`,
+        `stage_fact` against `STAGE_FACT_PARAMS`, and `plan` against `PLAN_META_KEYS` (the
+        denylist that would bar it). `dispatch` is the escape hatch -- keep it short, and
+        every name in it must be a value that cannot exist before the dispatch that carries
+        it, not merely one nobody has wired yet.
+        """
+        WRITER = {
+            # dispatch-time values: they do not exist before the invocation carries them
+            "task": "dispatch",            # which task of the stage this invocation is
+            "iteration": "dispatch",       # remediation loop counter, from the ASL
+            "escalation": "dispatch",      # the EscalatedToHuman event being triaged
+            "goal": "dispatch",            # the human's request, for a conductor task
+            "plan_uri": "dispatch",        # where to write (or read) this task's plan
+            "rate_card": "dispatch",       # read fresh at invoke; a stale card misquotes
+            "report_uri": "dispatch",      # where an ops report is to be written
+            "sweep_uri": "dispatch",       # monitor_sweep's own dispatch writes it
+            "budget_usd": "dispatch",      # advisory and explicitly optional ("if given"):
+                                           # no structured field captures it, the customer
+                                           # states it in prose in the goal
+            # facts an earlier stage of THIS run discovered (bug #22)
+            "student_endpoint": "stage_fact",
+            # the models a human signed, injected by the driver (bug #20)
+            "teacher_model_id": "model",
+            "student_model_id": "model",
+            # settings with a fallback for a run nobody planned
+            "gates": "default",
+            "keep_reasoning": "default",
+            "training_instance": "default",
+            "inference_instance": "default",
+            # How many rows the corpus should end up with. Read by data-prep's generate
+            # since the bug #23 cure, which needs it to decide whether the customer's
+            # file is short of what the plan priced and the teacher must top it up.
+            "sample_count": "default",
+            # settings only a signed plan supplies (bug #21)
+            "source_uri": "plan",
+            "customer_eval_uri": "plan",
+            "domain": "plan",
+            "sample_size": "plan",
+            "hf_token_secret": "plan",
+            "keep_endpoint": "plan",
+            "latency_p50_target_ms": "plan",
+            "pipeline_mode": "plan",
+            "variance_threshold_pct": "plan",
+        }
+        read = {}
+        for cfg in sorted((REPO / "agents").glob("*/harness.json")):
+            text = json.loads(cfg.read_text())["systemPrompt"][0]["text"]
+            for param in set(re.findall(r"params\.([a-z_][a-z_0-9]*)", text)):
+                read.setdefault(param, set()).add(cfg.parent.name)
+        assert read, "this guard parsed no params at all, so it is checking nothing"
+
+        unclassified = sorted(set(read) - set(WRITER))
+        assert not unclassified, (
+            f"prompts read {unclassified} and nothing here says what writes them. Triage "
+            "each one: bugs #20, #21 and #22 were all a prompt reading a param no half of "
+            "the system delivered, and each was found by hand after a run had already "
+            "spent money. Add it to WRITER with the mechanism that supplies it.")
+        stale = sorted(set(WRITER) - set(read))
+        assert not stale, (
+            f"{stale} is classified here but no prompt reads it. Either a prompt lost the "
+            "param (so whatever writes it is now dead wiring) or this list drifted.")
+
+        for param, kind in sorted(WRITER.items()):
+            where = sorted(read[param])
+            if kind == "default":
+                assert param in start_pipeline.DEFAULT_PARAMS, (
+                    f"params.{param} (read by {where}) is classified as having a default, "
+                    f"but DEFAULT_PARAMS does not define it.")
+            elif kind == "model":
+                assert param in set(driver.MODEL_PARAM_FOR_ROLE.values()), (
+                    f"params.{param} (read by {where}) is the model consent a human "
+                    "signed, but the driver no longer injects it -- so the agent falls "
+                    "back to the model named in its own persona line (#20).")
+            elif kind == "stage_fact":
+                assert param in driver.STAGE_FACT_PARAMS, (
+                    f"params.{param} (read by {where}) is a fact an earlier stage of the "
+                    "run produced, and the driver no longer carries it forward. No plan "
+                    "can be signed with it and no default can stand in for it, so the "
+                    "agent must guess or refuse (#22).")
+            elif kind == "plan":
+                assert param not in start_pipeline.PLAN_META_KEYS, (
+                    f"params.{param} (read by {where}) is supplied only by a signed plan, "
+                    "and PLAN_META_KEYS now excludes it from the params a plan carries. "
+                    "Nothing else writes it, so the stage runs on a value no human chose.")
+            else:
+                assert kind == "dispatch", f"unknown writer kind {kind!r}"
+
+    @staticmethod
+    def _drive_stage_complete(manifest, metrics, *, store=None, run_id="run-1"):
+        """Drive the REAL `handle_stage_complete` and return (result, S3 store).
+
+        The whole content of bug #22 is whether the assembled `stages` entry reaches S3, so
+        this asserts on the bytes a fake S3 was HANDED rather than on a dict the test built.
+        """
+        key = f"runs/{run_id}/manifest.json"
+        out = {f"runs/{run_id}/deploy/endpoint.json": b"{}"} if store is None else store
+        if manifest is not None:
+            out[key] = json.dumps(manifest).encode()
+
+        class _S3:
+            def get_object(self, Bucket, Key):
+                if Key not in out:
+                    raise RuntimeError("NoSuchKey")
+                return {"Body": io.BytesIO(out[Key])}
+
+            def put_object(self, Bucket, Key, Body, **kw):
+                out[Key] = Body
+
+            def head_object(self, Bucket, Key):
+                if Key not in out:
+                    raise RuntimeError("404")
+                return {}
+
+        class _DDB:
+            def Table(self, name):
+                class _T:
+                    def put_item(self, **kw):
+                        pass
+
+                    def update_item(self, **kw):
+                        return {}
+                return _T()
+
+        class _EV:
+            def put_events(self, **kw):
+                return {"FailedEntryCount": 0}
+
+        for k, v in {"DATA_BUCKET": "b", "RUNS_TABLE": "r", "EVENT_BUS": "e",
+                     "EVENTS_TABLE": "ev"}.items():
+            os.environ[k] = v
+        res = driver.handle_stage_complete(
+            {"s3": _S3(), "ddb": _DDB(), "events": _EV(), "sfn": None},
+            {"run_id": run_id, "stage": "deploy", "task": "deploy",
+             "manifest_uri": f"s3://b/{key}"},
+            {"stage": "deploy",
+             "outputs": [f"s3://b/runs/{run_id}/deploy/endpoint.json"],
+             "metrics": metrics, "evidence": "InService"})
+        return res, out
+
+    @staticmethod
+    def _signed_manifest():
+        """A freshly built signed manifest per call, so no test can mutate another's."""
+        return {"run_id": "run-1", "created_at": "2026-08-10T00:00:00Z",
+                "trigger_source": "conductor",
+                "models": {"student": "Qwen/Qwen3-1.7B"},
+                "plan": {"budget_usd": 450, "sample_size": 40000},
+                "approval": {"approved_by": "tim"},
+                "params": {"gates": {"map50": 0.75}}, "stages": {}}
+
+    def test_a_completed_stages_results_persist_to_the_manifest(self):
+        """Bug #22. The driver assembled `stages[stage]` into a LOCAL variable, handed it to
+        `write_run_report`, and dropped it -- it had no `put_object` for the manifest at all.
+
+        Measured before the fix: after a deploy stage reported
+        `metrics.endpoint_name=llmops-student-run-1`, `manifest.stages` was still `{}`, while
+        the run REPORT carried every output and metric. So the write reached the document
+        humans read and not the one every prompt calls "the single source of truth".
+
+        That is worse than a stale field. A stage cannot see what the stage before it
+        produced, so an agent asked to diagnose a run has only its own turn to look at -- a
+        pipeline whose stages cannot read each other's results cannot iterate on a run, it
+        can only redo it."""
+        res, store = self._drive_stage_complete(
+            self._signed_manifest(), {"endpoint_name": "llmops-student-run-1"})
+        assert res["ok"] and not res.get("report_error"), res
+        saved = json.loads(store["runs/run-1/manifest.json"])
+        entry = saved.get("stages", {}).get("deploy")
+        assert entry, (
+            "the deploy stage completed and the manifest's `stages` block is still empty: "
+            f"{saved.get('stages')!r}. Nothing downstream can learn what this stage did.")
+        assert entry["status"] == "completed"
+        assert entry["metrics"]["endpoint_name"] == "llmops-student-run-1", entry
+        assert entry["outputs"] == ["s3://b/runs/run-1/deploy/endpoint.json"], entry
+
+    def test_a_stage_write_cannot_restate_the_signed_blocks(self):
+        """The write-back is narrowed to `stages`, so a driver bug cannot rewrite consent.
+
+        Bugs #9, #20 and #21 were one defect -- a default standing in for intent that WAS
+        present in a signed artifact. Writing the manifest back from the driver, on every
+        stage_complete, from data assembled around an agent's tool call, is exactly the shape
+        that reintroduces it a fourth time. So the driver re-reads and replaces ONLY `stages`,
+        and this drives the real `_save_manifest` with a tampered copy to prove the copy on
+        S3 wins."""
+        on_s3 = self._signed_manifest()
+        store = {"runs/run-1/manifest.json": json.dumps(on_s3).encode()}
+        tampered = self._signed_manifest()
+        tampered["models"] = {"student": "somebody-elses/model"}
+        tampered["approval"] = {"approved_by": "nobody"}
+        tampered["plan"] = {"budget_usd": 999999}
+        tampered["stages"] = {"deploy": {"status": "completed"}}
+
+        class _S3:
+            def get_object(self, Bucket, Key):
+                return {"Body": io.BytesIO(store[Key])}
+
+            def put_object(self, Bucket, Key, Body, **kw):
+                store[Key] = Body
+
+        driver._save_manifest(_S3(), "s3://b/runs/run-1/manifest.json", tampered)
+        saved = json.loads(store["runs/run-1/manifest.json"])
+        for block in sorted(driver.IMMUTABLE_MANIFEST_KEYS):
+            if block in on_s3:
+                assert saved[block] == on_s3[block], (
+                    f"a stage write changed the signed block {block!r}: "
+                    f"{on_s3[block]!r} -> {saved[block]!r}. The driver must never be able "
+                    "to restate what a human signed.")
+        assert saved["stages"] == {"deploy": {"status": "completed"}}, (
+            "the stage results are what this write is FOR and they did not land")
+
+    def test_a_concurrent_agent_write_survives_the_drivers_stage_write(self):
+        """Read-modify-write, not a blind put, because the driver is the SECOND writer.
+
+        5 of the 7 specialist prompts say "read it first, append your results to it, never
+        overwrite other stages' entries", and the harness role really can: `S3PipelineObjects`
+        grants `s3:PutObject` on `runs/*`. So a blind put of the copy loaded at the top of
+        `handle_stage_complete` would silently erase the human-readable stage summary the
+        prompt just asked the agent to write."""
+        store = {"runs/run-1/manifest.json": json.dumps(
+            self._signed_manifest()).encode(),
+            "runs/run-1/deploy/endpoint.json": b"{}"}
+        stale = json.loads(store["runs/run-1/manifest.json"])
+
+        # The agent writes its own note WHILE the stage runs, after the driver's copy was
+        # loaded. S3 has no compare-and-swap, so the guarantee is scoped: keys the driver
+        # does not write must survive.
+        concurrent = json.loads(store["runs/run-1/manifest.json"])
+        concurrent["agent_notes"] = {"deploy": "merged adapters, endpoint InService"}
+        store["runs/run-1/manifest.json"] = json.dumps(concurrent).encode()
+
+        stale["stages"] = {"deploy": {"status": "completed", "outputs": [],
+                                      "metrics": {}, "evidence": ""}}
+
+        class _S3:
+            def get_object(self, Bucket, Key):
+                return {"Body": io.BytesIO(store[Key])}
+
+            def put_object(self, Bucket, Key, Body, **kw):
+                store[Key] = Body
+
+        driver._save_manifest(_S3(), "s3://b/runs/run-1/manifest.json", stale)
+        saved = json.loads(store["runs/run-1/manifest.json"])
+        assert saved.get("agent_notes") == {
+            "deploy": "merged adapters, endpoint InService"}, (
+            "the driver's stage write erased what the agent wrote during the turn -- and "
+            "every specialist prompt instructs the agent to write exactly that.")
+        assert saved["stages"]["deploy"]["status"] == "completed"
+
+    def test_a_stage_write_with_no_manifest_to_merge_into_is_refused(self):
+        """An absent manifest is refused and REPORTED, never manufactured, and the token
+        still settles.
+
+        Two failure modes are being avoided at once. Writing a stages-only document would
+        manufacture a manifest with no plan, no approval and no models, which reads
+        downstream as "this run was never planned". But skipping the write silently -- which
+        is what an `if manifest:` guard around it did -- is bug #22's own failure mode
+        surviving inside the fix for it: stage results vanish and the call returns ok.
+
+        So it raises, `handle_stage_complete`'s report isolation reports it, and the task
+        token is still settled: the report is a convenience, the token is the pipeline's only
+        way to learn a paid-for stage succeeded."""
+        res, store = self._drive_stage_complete(None, {"endpoint_name": "e"})
+        assert res["ok"], "an unwritable manifest must not withhold the task token"
+        assert "report_error" in res and "ValueError" in res["report_error"], (
+            "an absent manifest was skipped SILENTLY: the stage's results are gone and the "
+            f"driver reported success -> {res}")
+        assert "runs/run-1/manifest.json" not in store, (
+            "a manifest was manufactured with no plan, no approval and no models")
+
+    def test_the_endpoint_a_deploy_stage_created_reaches_the_stages_that_measure_it(self):
+        """Bug #22's consumer half, and the reason it blocks autonomy.
+
+        `params.student_endpoint` is read by eval ("a live endpoint in
+        params.student_endpoint") and by monitor ("name in the manifest or
+        params.student_endpoint"), and it was written by NOTHING -- not the console, not
+        start-pipeline, not the driver. It is not a signed value that went missing either:
+        an endpoint name does not exist until the deploy stage creates one, so no human
+        can sign it in advance and no default can stand in for it.
+
+        Driven through the REAL `_run_stage`, because the whole content of this bug is
+        whether two correct halves are connected."""
+        params = self._stage_params(
+            {"run_id": "run-x", "stage": "monitor", "task": "health",
+             "harness_id": "llmops_monitor",
+             "manifest_uri": "s3://b/runs/run-x/manifest.json"},
+            {"student": "Qwen/Qwen3-1.7B"},
+            manifest={"stages": {"deploy": {
+                "status": "completed",
+                "metrics": {"endpoint_name": "llmops-student-run-x"}}}})
+        assert params.get("student_endpoint") == "llmops-student-run-x", (
+            "the monitor stage was not told which endpoint the deploy stage created, so "
+            f"it must either guess or refuse: {params}. A CloudWatch metric attributed to "
+            "the wrong endpoint is worse than a missing one -- it reads as evidence.")
+
+    def test_a_stage_fact_the_run_never_produced_is_omitted_not_guessed(self):
+        """Absent means absent. A default here would recreate bug #21 one layer down.
+
+        A stage that needs the endpoint and finds no param must fail visibly. Junk in the
+        manifest must not crash the stage that reads it either -- `stages` is written by
+        agents as well as by the driver."""
+        assert driver.stage_fact_params({}) == {}
+        assert driver.stage_fact_params({"stages": {}}) == {}
+        assert driver.stage_fact_params({"stages": "deployed"}) == {}
+        assert driver.stage_fact_params({"stages": {"deploy": "done"}}) == {}
+        assert driver.stage_fact_params({"stages": {"deploy": {"metrics": None}}}) == {}
+        # Reported, but empty: an empty endpoint name is not a name.
+        assert driver.stage_fact_params(
+            {"stages": {"deploy": {"metrics": {"endpoint_name": ""}}}}) == {}
+
+    def test_no_tool_description_calls_the_terminal_exit_a_pause(self):
+        """`escalate_human` ENDS the run. Five descriptions said "The pipeline pauses."
+
+        Not a missing feature -- a mislabelling, and the platform already has the pause
+        those five sentences promised. `checkpoint` yields the turn, keeps the run alive
+        and is the channel a directive arrives on (`take_directive` in the driver's
+        checkpoint branch, `put_directive` from the console or the conductor). Every one
+        of the 7 harnesses declares it.
+
+        `escalate_human` is the opposite: `handle_escalate` writes status=`escalated` and
+        `send_task_failure(error="EscalatedToHuman")` drives EscalateFail -> MarkRunFailed
+        -> Fail. And `escalated` is in `UNREACHABLE_RUN_STATES`, so once it fires no
+        directive can ever reach that run again -- `put_directive` returns
+        `reachable: False` and the driver tells the conductor the decision "CHANGES
+        NOTHING". So the tool advertised as the pause was the one call guaranteeing the
+        run could never resume, and an agent that wanted to wait for a human picked the
+        ending. The audit called this "escalate_human is one-way" and proposed building a
+        HumanGate state; that would add a SECOND pause mechanism beside a working one.
+
+        Derived from the driver, not from a word list: the terminal states come from
+        `UNREACHABLE_RUN_STATES`, so if someone makes `escalated` resumable this guard
+        stops demanding the warning instead of going stale.
+        """
+        driver = (REPO / "orchestration/harness_driver/handler.py").read_text()
+        assert '"escalated"' in driver.split("UNREACHABLE_RUN_STATES = ", 1)[1][:120], (
+            "escalate_human's run state is no longer unreachable for directives — if the "
+            "run can now hear a verdict after escalating, these descriptions may "
+            "legitimately promise a pause, and this guard should be rewritten, not deleted")
+
+        pause_words = ("pauses", "paused", "pause the pipeline")
+        for cfg in sorted((REPO / "agents").glob("*/harness.json")):
+            h = json.loads(cfg.read_text())
+            tools = {t["name"]: t for t in h.get("tools", [])
+                     if t.get("type") == "inline_function"}
+            esc = tools.get("escalate_human")
+            if esc is None:
+                continue  # the orchestrator has no escalate_human at all
+            desc = esc["config"]["inlineFunction"]["description"]
+            named = [w for w in pause_words if w in desc]
+            assert not named, (
+                f"{cfg.parent.name}: escalate_human's description calls it a {named} — "
+                "it sets status=escalated and fails the execution, and `escalated` is an "
+                "UNREACHABLE_RUN_STATE, so nothing can resume it. Point the agent at "
+                "checkpoint for anything a human could answer.")
+            # Saying what it is NOT is not enough: the agent needs the call that actually
+            # does what it wanted, or it just avoids both and ends the turn in prose --
+            # which the driver treats as a stage failure anyway.
+            assert "checkpoint" in desc, (
+                f"{cfg.parent.name}: escalate_human's description does not point at "
+                "checkpoint. An agent blocked on a human decision needs the name of the "
+                "call that keeps the run alive, not just a warning about this one")
+            assert "checkpoint" in tools, (
+                f"{cfg.parent.name}: declares escalate_human but not checkpoint, so it "
+                "has a terminal exit and no way to wait for a human at all")
+
+            # And the invariant bullet must not send a blocked agent to the exit either:
+            # "escalate_human when blocked" was the same error one layer up.
+            sentence = h["systemPrompt"][0]["text"].split(
+                "TURN-END INVARIANT")[1].split("\n- ")[0]
+            assert "escalate_human when blocked" not in sentence, (
+                f"{cfg.parent.name}: the turn-end invariant still routes 'blocked' to "
+                "escalate_human. Blocked-but-answerable is checkpoint; escalate_human is "
+                "blocked-and-unanswerable, and the two are not interchangeable")
+
+    def test_checkpoint_is_documented_as_the_directive_channel(self):
+        """The other half: the pause must SAY it is the pause, on every harness.
+
+        Paired with the guard above so the pair cannot be satisfied by weakening both
+        descriptions into vagueness -- one forbids escalate_human claiming the pause, this
+        one requires checkpoint to claim it. Derived from the driver's own contract: the
+        checkpoint branch returns {"status": "directive", ...} from take_directive, so
+        that shape is what the prompt has to teach.
+        """
+        driver = (REPO / "orchestration/harness_driver/handler.py").read_text()
+        assert '"status": "directive"' in driver, (
+            "the driver no longer returns a directive from the checkpoint branch — the "
+            "human-in-the-loop channel moved, and every checkpoint description is now "
+            "describing a mechanism that does not exist")
+        for cfg in sorted((REPO / "agents").glob("*/harness.json")):
+            h = json.loads(cfg.read_text())
+            cp = next((t for t in h.get("tools", [])
+                       if t.get("name") == "checkpoint"), None)
+            assert cp is not None, f"{cfg.parent.name} declares no checkpoint"
+            desc = cp["config"]["inlineFunction"]["description"]
+            for needed in ("directive", "status"):
+                assert needed in desc, (
+                    f"{cfg.parent.name}: checkpoint's description does not mention "
+                    f"{needed!r}. If the agent does not know a directive arrives here, "
+                    "the channel exists and nobody uses it — which is how "
+                    "resolve_escalation spent five phases writing into the void")
 
     def test_orchestrator_prompt_carries_the_consult_contract(self):
         h = json.loads((REPO / "agents/orchestrator/harness.json").read_text())
@@ -3360,6 +4375,369 @@ class TestConductorDispatch:
         m = start_pipeline.seed_manifest("run-x", "conductor", {"models": dict(models)},
                                         {"models": dict(models)})
         assert m["models"]["teacher"] == "global.anthropic.claude-fable-5"
+
+    def test_the_console_form_field_name_is_the_one_consent_is_read_from(self):
+        """The console UI is the ONLY path a customer has to sign a plan, and its form
+        posts `teacher_model` (create_estimate's STR_KEYS) -- which is also the field
+        cost_model.py prices the run from. The consent check read `models.teacher`.
+
+        So the field the human's money was quoted against and the field the dispatcher
+        obeyed were different fields, and the mismatch failed SILENTLY: `models` absent
+        means "the plan is silent", which falls through to DEFAULT_MODELS. Red before
+        the fix: teacher = us.deepseek.r1-v1:0 for a plan signed for Fable-5 -- priced
+        as one model, executed on another, with every artifact agreeing. The bug #9
+        class, reintroduced through a name rather than a precedence rule.
+
+        Derived from the console's own STR_KEYS so the two cannot drift apart again --
+        and checked as a THREE-way agreement (form posts -> estimator prices ->
+        dispatcher obeys), because a field only one of the three knows about is the bug.
+        Skipping a field this guard does not recognise is what let control m163 escape:
+        renaming the console's `teacher_model` to `teacher_mdl` left the form posting a
+        field the estimator never prices, and the whole suite stayed green.
+        """
+        console = (REPO / "deploy/console/lambda_function.py").read_text()
+        str_keys = console.split("STR_KEYS = (", 1)[1].split(")", 1)[0]
+        posted = [k.strip().strip('"\'') for k in str_keys.split(",") if "model" in k]
+        assert posted, "the console form no longer posts any *_model field"
+
+        priced = _fields_the_estimator_prices_models_from()
+        vocabulary = {a: role for role, aliases in start_pipeline.ROLE_ALIASES.items()
+                      for a in aliases}
+
+        # Every field cost_model prices from must be one the form can actually post,
+        # or the quote is computed from a default the customer never chose.
+        unpostable = sorted(f for f, nested in priced.items() if not nested
+                            and f not in posted)
+        assert not unpostable, (
+            f"cost_model prices a model from plan.{unpostable} but the console form "
+            f"posts only {sorted(posted)}. The estimate a customer signs would be "
+            "computed from a default they were never shown.")
+
+        for field in posted:
+            assert field in priced, (
+                f"the console form posts {field!r} but cost_model prices no model from "
+                f"it (it prices from {sorted(priced)}). The field the customer fills in "
+                "is not the field their money is quoted against.")
+            assert field in vocabulary, (
+                f"the console form posts {field!r} but the dispatcher's ROLE_ALIASES "
+                f"does not list it, so a plan signed through the UI dispatches on "
+                "DEFAULT_MODELS -- priced as one model, executed on another.")
+            role = vocabulary[field]
+            m = start_pipeline.seed_manifest(
+                "run-x", "conductor", {}, {field: "global.anthropic.claude-fable-5"})
+            assert m["models"].get(role) == "global.anthropic.claude-fable-5", (
+                f"the console signs plans with {field!r} and cost_model prices from it, "
+                f"but the manifest resolved {role} to {m['models'].get(role)!r} -- the "
+                "run would be priced as one model and executed on another")
+
+    def test_a_plan_that_names_one_model_twice_with_two_ids_is_refused(self):
+        """`teacher` and `teacher_model` are aliases for one fact. A document that uses
+        both with different ids contradicts itself, and no precedence rule makes one
+        reading more defensible -- preferring either would be this bug's own shape
+        (a silent choice where a signature exists to settle the question)."""
+        with pytest.raises(ValueError) as e:
+            start_pipeline.seed_manifest("run-x", "conductor", {}, {
+                "teacher_model": "us.deepseek.r1-v1:0",
+                "models": {"teacher": "global.anthropic.claude-fable-5"}})
+        msg = str(e.value)
+        assert "more than once" in msg and "deepseek" in msg and "fable-5" in msg, (
+            "the refusal must name the role and BOTH ids, or the operator is sent back "
+            f"to diffing JSON: {msg!r}")
+
+    def test_a_conflict_is_caught_across_two_different_alias_spellings(self):
+        """The consent check must compare FACTS, not field names: `params.teacher_model`
+        contradicting `plan.models.teacher` is the same unapproved spend as the
+        same-spelling case, and an alias-blind check would wave it through."""
+        with pytest.raises(ValueError) as e:
+            start_pipeline.seed_manifest(
+                "run-x", "conductor", {"teacher_model": "us.deepseek.r1-v1:0"},
+                {"models": {"teacher": "global.anthropic.claude-fable-5"}})
+        assert "contradicts the signed plan" in str(e.value)
+
+    def test_the_supply_chain_block_is_not_mistaken_for_role_assignments(self):
+        """The conductor prompt tells the orchestrator to write
+        `models: {hf_repo, revision, files_sha256, license, mirror_uri}` for any
+        open-weight model. Those describe WHERE a model came from, not WHICH role it
+        fills, and the old check treated every key as a role -- so `hf_repo` became a
+        fake role, and because no key was shared with `params`, a dispatcher-supplied
+        teacher passed the conflict check unopposed."""
+        plan = {"models": {"student": "Qwen/Qwen3-1.7B", "hf_repo": "Qwen/Qwen3-1.7B",
+                           "revision": "0e0f4b6", "license": "apache-2.0",
+                           "mirror_uri": "s3://b/models-mirror/x"}}
+        m = start_pipeline.seed_manifest("run-x", "conductor", {}, plan)
+        assert set(m["models"]) <= set(start_pipeline.MODEL_ROLES), (
+            f"provenance keys leaked into the role map: {sorted(m['models'])}")
+        assert m["models"]["student"] == "Qwen/Qwen3-1.7B"
+        # ...and with the roles now shared, a contradicting dispatch is caught.
+        with pytest.raises(ValueError):
+            start_pipeline.seed_manifest(
+                "run-x", "conductor", {"models": {"student": "Qwen/Qwen3-4B"}}, plan)
+
+    def test_a_mirrored_repo_that_fills_no_role_is_refused(self):
+        """The supply-chain block is where the LICENCE was checked and the bytes pinned.
+        A plan that mirrors `meta-llama/Llama-3.2-1B` and assigns it to no role produced
+        `student = Qwen/Qwen3-1.7B` (measured): the run trains on a model nobody cleared
+        while the cleared one sits unused in the mirror. Silent, because "the plan is
+        silent about the student" is indistinguishable from "there is no plan"."""
+        with pytest.raises(ValueError) as e:
+            start_pipeline.seed_manifest("run-x", "conductor", {}, {
+                "models": {"hf_repo": "meta-llama/Llama-3.2-1B",
+                           "revision": "9213a19", "license": "llama3.2"}})
+        assert "meta-llama/Llama-3.2-1B" in str(e.value) and "no role" in str(e.value)
+        # A role naming a DIFFERENT model from the same publisher is the near-miss that
+        # matters, and it must be refused too: `meta-llama/Llama-3.1-70B` is not the
+        # model whose revision was pinned or whose licence was read, and it is 70x the
+        # size. A guard that compared publishers (or any substring) rather than model
+        # identities would wave this through -- control m159 escaped exactly here.
+        with pytest.raises(ValueError) as near:
+            start_pipeline.seed_manifest("run-x", "conductor", {}, {
+                "models": {"student": "meta-llama/Llama-3.1-70B",
+                           "hf_repo": "meta-llama/Llama-3.2-1B",
+                           "revision": "9213a19", "license": "llama3.2"}})
+        assert "no role" in str(near.value), (
+            "the mirrored repo fills no role -- a sibling model from the same publisher "
+            f"is a different model, different bytes, different size: {near.value}")
+        # Naming the role is all it takes -- the guard is on the gap, not on mirroring.
+        m = start_pipeline.seed_manifest("run-x", "conductor", {}, {
+            "models": {"student": "meta-llama/Llama-3.2-1B",
+                       "hf_repo": "meta-llama/Llama-3.2-1B",
+                       "revision": "9213a19", "license": "llama3.2"}})
+        assert m["models"]["student"] == "meta-llama/Llama-3.2-1B"
+
+    def test_a_misspelled_role_is_refused_rather_than_read_as_silence(self):
+        """`teachr` used to mean "the plan is silent about the teacher", so the run
+        spent on DEFAULT_MODELS. A typo must cost one visible error, not a run."""
+        with pytest.raises(ValueError) as e:
+            start_pipeline.seed_manifest("run-x", "conductor", {},
+                                         {"models": {"teachr": "x"}})
+        assert "teachr" in str(e.value)
+
+    def test_every_plan_field_the_estimator_prices_from_is_one_the_dispatcher_obeys(self):
+        """A plan is PRICED by cost_model.py and EXECUTED from the manifest. When those
+        two read different field names the quote and the run can disagree with no
+        artifact showing a contradiction -- which is exactly how this bug hid for a
+        console-signed plan.
+
+        The field names are scraped out of cost_model.py's own source rather than
+        restated here: a test that re-types the expression it is checking passes by
+        construction, and would have passed on the broken code too. Every plan field
+        cost_model reads for a model role must resolve to that same model in the
+        manifest.
+        """
+        priced = _fields_the_estimator_prices_models_from()
+        vocabulary = {a: role for role, aliases in start_pipeline.ROLE_ALIASES.items()
+                      for a in aliases}
+        for field, nested in sorted(priced.items()):
+            where = f"plan.models.{field}" if nested else f"plan.{field}"
+            assert field in vocabulary, (
+                f"cost_model prices a model from {where}, but the dispatcher has no "
+                f"such field: ROLE_ALIASES does not list {field!r}. A plan signed "
+                "against that quote would dispatch on DEFAULT_MODELS instead -- priced "
+                "as one model, executed on another, which is this bug exactly.")
+            role = vocabulary[field]
+            plan = ({"models": {field: "global.anthropic.claude-fable-5"}} if nested
+                    else {field: "global.anthropic.claude-fable-5"})
+            resolved = start_pipeline._resolve_models({}, plan).get(role)
+            assert resolved == "global.anthropic.claude-fable-5", (
+                f"cost_model prices the {role} from {where}, but the dispatcher "
+                f"resolved it to {resolved!r}. The quote and the run would name "
+                "different models with nothing to flag the disagreement.")
+
+    def test_every_plan_field_the_estimator_prices_reaches_the_stage_that_spends_it(self):
+        """A plan is PRICED field by field and EXECUTED from `manifest.params`. Every
+        non-model field the estimator reads must therefore arrive in params, or the run
+        spends on something other than what was quoted.
+
+        Derived from cost_model.py's own `plan.get("...")` calls rather than listed here,
+        for the reason the model-field guard above gives: a list restated in a test is a
+        list that drifts, and the fields that went missing are exactly the ones nobody
+        remembered to add. Measured before the fix, on a signed industrial-defect plan:
+        training_instance ml.p4d.24xlarge -> ml.g5.2xlarge, sample_count 40000 -> 2000,
+        gates {"map50": 0.75} -> ARC's relative_solve_rate, because seed_manifest read
+        `plan` for models and nothing else.
+        """
+        src = (REPO / "pipeline/contracts/cost_model.py").read_text()
+        priced = {f for f in re.findall(r'plan\.get\(\s*"([a-z_0-9]+)"', src)}
+        # `models` is priced through the role map and lands in manifest.models, not params
+        # -- carrying the raw block into params too would be a second, un-normalised copy
+        # of model consent, which is the four-names defect this repo already paid for.
+        priced -= {"models"} | set(start_pipeline.PLAN_META_KEYS)
+        priced -= {a for aliases in start_pipeline.ROLE_ALIASES.values() for a in aliases}
+        assert len(priced) >= 10, (
+            f"only {len(priced)} priced plan fields scraped from cost_model.py -- the "
+            "scrape broke, and a guard that checks nothing passes loudest")
+        for field in sorted(priced):
+            probe = {"map50": 0.75} if field == "gates" else f"probe-{field}"
+            m = start_pipeline.seed_manifest("run-x", "conductor", {}, {field: probe})
+            assert m["params"].get(field) == probe, (
+                f"cost_model prices a run from plan.{field}, but a signed plan naming it "
+                f"produced params.{field}={m['params'].get(field)!r}. The quote and the "
+                "run describe different spends, and every artifact afterwards agrees with "
+                "the run -- the variance report joins them and reads the gap as an "
+                "underspend rather than as two different runs.")
+
+    def test_the_plan_can_displace_the_arc_specific_defaults(self):
+        """DEFAULT_PARAMS is ARC-shaped (`dataset: arc-agi-2`, a relative_solve_rate gate)
+        and that is only harmful if a plan cannot displace it. This is the genericity
+        property the platform is for: one signed plan must be able to describe a YOLO
+        detector run without the pipeline substituting an ARC one.
+        """
+        for field, arc_default in sorted(start_pipeline.DEFAULT_PARAMS.items()):
+            other = ({"map50": 0.75} if isinstance(arc_default, dict)
+                     else not arc_default if isinstance(arc_default, bool)
+                     else arc_default + 1 if isinstance(arc_default, (int, float))
+                     else f"not-{arc_default}")
+            m = start_pipeline.seed_manifest("run-x", "conductor", {}, {field: other})
+            assert m["params"][field] == other, (
+                f"a signed plan set {field}={other!r} and the run used "
+                f"{m['params'][field]!r} -- the ARC default outranked the human. Every "
+                "non-ARC workload (customer distillation, YOLO fine-tuning) is this case.")
+            # ...and where the plan is silent the default must still stand: absent is not
+            # a licence to leave a stage unconfigured.
+            silent = start_pipeline.seed_manifest("run-y", "scheduler", {}, None)
+            assert silent["params"][field] == arc_default
+
+    def test_a_dispatch_contradicting_the_signed_plans_settings_is_refused(self):
+        """The same rule the models already had, for the fields that spend the money.
+        Refusing rather than picking a side: a disagreement means the approval path and
+        the dispatch path describe different runs, and choosing either one silently makes
+        the artifacts agree with a spend no human authorised."""
+        with pytest.raises(ValueError) as e:
+            start_pipeline.seed_manifest("run-x", "conductor",
+                                         {"training_instance": "ml.g5.2xlarge"},
+                                         {"training_instance": "ml.p4d.24xlarge"})
+        msg = str(e.value)
+        assert "training_instance" in msg and "p4d" in msg and "g5.2xlarge" in msg, (
+            f"the refusal must name the field AND both values: {msg}")
+        # Echoing the plan's own value is the common belt-and-braces dispatch, not an
+        # error: the check is on DISAGREEMENT, not on presence.
+        m = start_pipeline.seed_manifest("run-y", "conductor",
+                                         {"training_instance": "ml.p4d.24xlarge"},
+                                         {"training_instance": "ml.p4d.24xlarge"})
+        assert m["params"]["training_instance"] == "ml.p4d.24xlarge"
+        # And params may still fill what the plan is silent about.
+        m2 = start_pipeline.seed_manifest("run-z", "conductor", {"sample_count": 500},
+                                          {"gates": {"map50": 0.9}})
+        assert m2["params"]["sample_count"] == 500
+        assert m2["params"]["gates"] == {"map50": 0.9}
+        # A field the plan states INSIDE `data` is stated by the plan just as much as a
+        # top-level one, so contradicting it must refuse too. The check has to run against
+        # the FLATTENED plan for that: comparing params against the plan's top-level keys
+        # alone leaves the nested half of every signed plan silently overridable -- and
+        # `source_uri` is the field a data audit is entirely about, which bytes it reads.
+        with pytest.raises(ValueError) as e2:
+            start_pipeline.seed_manifest(
+                "run-w", "conductor", {"source_uri": "s3://arc-agi-2/old-run/"},
+                {"data": {"source_uri": "s3://customer-a/defect-photos/"}})
+        assert "source_uri" in str(e2.value) and "customer-a" in str(e2.value), (
+            f"a params key contradicting a nested plan field was not refused: {e2.value}")
+
+    def test_the_plans_data_block_reaches_the_prompt_that_reads_it_flat(self):
+        """data-prep's "audit" task reads `params.source_uri` and
+        `params.customer_eval_uri`; the orchestrator prompt has the plan carry them
+        NESTED, inside a `data` block. Two correct halves, never connected: an audit run
+        dispatched from a signed plan arrived with no data URI at all, so the agent could
+        only refuse or guess a customer-data/ path -- and the prompt forbids guessing.
+
+        The keys are taken from the console's own readiness-panel list, which is already
+        derived from the orchestrator prompt, so this cannot drift out of step with what
+        plans really contain.
+        """
+        console = (REPO / "deploy/console/lambda_function.py").read_text()
+        block = re.search(r"DATA_READINESS_FIELDS = \((.*?)\n\)", console, re.S).group(1)
+        flat = sorted({k for k in re.findall(r'\(\s*"([a-z_.]+)"', block) if "." not in k})
+        assert len(flat) >= 4, f"readiness-field scrape found only {flat}"
+        plan = {"data": {k: f"probe-{k}" for k in flat}}
+        m = start_pipeline.seed_manifest("run-x", "conductor", {}, plan)
+        for k in flat:
+            assert m["params"].get(k) == f"probe-{k}", (
+                f"plan.data.{k} did not reach params.{k}; the prompt that consumes it "
+                f"reads the flat name, so the stage sees nothing: {m['params'].get(k)!r}")
+        # A nested key must NOT overwrite a same-named top-level one: the top level is the
+        # more specific statement, and a silent overwrite is this same defect one layer in.
+        m2 = start_pipeline.seed_manifest("run-y", "conductor", {}, {
+            "source_uri": "s3://b/explicit", "data": {"source_uri": "s3://b/nested"}})
+        assert m2["params"]["source_uri"] == "s3://b/explicit"
+
+    def test_pipeline_mode_in_a_signed_plan_reaches_the_choice_state(self):
+        """`pipeline_mode` is the most expensive field in a plan: the Choice state at the
+        top of the machine reads it out of the EXECUTION INPUT to decide whether any GPU
+        stage runs. A data_audit run is the conductor's cheap starter, sold to a customer
+        as "we audit your data before quoting the training". Signed in the plan and
+        dropped by seed_manifest, it defaulted to the full pipeline -- GPU stages on a
+        customer who bought an audit."""
+        c = {"s3": FakeS3(), "ddb": FakeDDB(), "sfn": FakeSfn(), "events": FakeEvents()}
+        start_pipeline.handler({"trigger_source": "conductor",
+                                "plan": {"pipeline_mode": "data_audit"}}, clients=c)
+        sent = json.loads(c["sfn"].executions[0]["input"])
+        assert sent["pipeline_mode"] == "data_audit", (
+            f"the plan bought an audit and the execution input says "
+            f"{sent.get('pipeline_mode')!r} -- the Choice state defaults to "
+            "DataPrepGenerate, so the run provisions GPUs nobody paid for")
+
+    def test_the_console_launch_forwards_the_priced_plan_not_two_integers(self):
+        """The console is the only path a customer has, and its approve->launch step
+        scraped the priced plan for `task_count` and `sample_count` alone. The other
+        fields the estimator priced -- both instance types, teacher_model, harness_model,
+        endpoint_hours, keep_reasoning, teardown -- were dropped, and the run executed on
+        ARC defaults while the estimate record said otherwise.
+
+        Derived from the console's OWN key lists, so a field added to the form is covered
+        without editing this test.
+        """
+        console = (REPO / "deploy/console/lambda_function.py").read_text()
+        body = re.search(r"def start_run\(body\):(.*?)\ndef ", console, re.S).group(1)
+        assert re.search(r'payload\["plan"\]\s*=', body), (
+            "start_run builds no `plan` key, so start-pipeline sees the priced plan as "
+            "absent and every field it named falls to DEFAULT_PARAMS")
+        priced_keys = set()
+        for kind in ("INT_KEYS", "FLOAT_KEYS", "STR_KEYS", "BOOL_KEYS"):
+            m = re.search(kind + r" = \((.*?)\)", console, re.S)
+            priced_keys |= set(re.findall(r'"([a-z_0-9]+)"', m.group(1)))
+        # Whatever the form priced must survive seed_manifest -- as a param, or (for a
+        # model role) normalised into manifest.models.
+        roles = {a: r for r, aliases in start_pipeline.ROLE_ALIASES.items()
+                 for a in aliases}
+        for k in sorted(priced_keys):
+            probe = "global.anthropic.claude-fable-5" if k in roles else f"probe-{k}"
+            m = start_pipeline.seed_manifest("run-x", "console", {}, {k: probe})
+            got = (m["models"].get(roles[k]) if k in roles else m["params"].get(k))
+            assert got == probe, (
+                f"the console form prices {k}, and a plan naming it produced {got!r}. "
+                "The estimate record and the run would describe different spends, and "
+                "the variance report would call the difference an underspend.")
+
+    def test_the_gate_prompt_reads_the_thresholds_the_plan_named(self):
+        """The consumer half. `params.gates` now arrives from the signed plan, and the eval
+        agent still gated on `student judge-score >= 0.80 x teacher score` -- a bar written
+        into its prompt, not the one the customer signed. So a defect-detector run whose
+        plan says {"map50": 0.75} would be judged on ARC's teacher-ratio, and a plan naming
+        a metric the report does not carry would pass by never being checked.
+
+        Same shape as bug #20's third defect: the resolver was fixed, and nothing consumed
+        it. A gate is the one place where "the agent used its judgment" is not acceptable,
+        because the gate is what the signature is FOR.
+        """
+        text = json.loads((REPO / "agents/eval/harness.json").read_text())
+        prompt = text["systemPrompt"][0]["text"]
+        gate_line = [l for l in prompt.splitlines() if l.startswith('- "gate"')]
+        assert len(gate_line) == 1, f"eval's gate task line has moved: {len(gate_line)}"
+        line = gate_line[0]
+        assert "params.gates" in line, (
+            "the gate task does not read params.gates, so the thresholds the plan named "
+            f"reach the manifest and are then ignored: {line[:200]}")
+        # An absent gates block must escalate, not fall back to a remembered number: an
+        # unnamed bar is a missing approval, and a default here promotes an unjudged run.
+        assert "escalate_human" in line, (
+            "the gate task must escalate when params.gates is absent rather than invent a "
+            "threshold -- a default bar is how a run passes a gate nobody set")
+        # The ARC gate names may appear only as examples, never as THE rule: the whole
+        # point is that a YOLO plan's map50 gate is as valid as ARC's.
+        for arc in ("relative_solve_rate", "format_validity"):
+            if arc in line:
+                assert "params.gates" in line[:line.index(arc)], (
+                    f"{arc} is named before params.gates in the gate line, which reads as "
+                    "the rule rather than as one example of it")
 
     def test_manifest_stores_the_approval_block_verbatim(self):
         m = start_pipeline.seed_manifest("run-x", "conductor", {}, {"p": 1},
@@ -4734,10 +6112,17 @@ def test_every_event_that_needs_a_listener_has_a_rule():
 
 def test_every_emitted_detail_type_is_either_ruled_or_declared_fire_and_forget():
     """The other direction: an event emitted somewhere in the repo with no rule must be
-    a DECISION, not an oversight. Fire-and-forget is fine -- most of the vocabulary is
-    audit trail and console timeline -- but it has to be visible as a choice, which
-    EVENTS_NEEDING_A_RULE's absence records. This fails when someone adds an emitter for
-    a detail-type that plainly wants a listener and nobody notices."""
+    a DECISION, not an oversight.
+
+    This test used to end by asserting only that emitted names are known, on the
+    reasoning that "fire-and-forget is recorded by EVENTS_NEEDING_A_RULE's absence".
+    Absence records nothing: an oversight is absent from that dict too, and the two are
+    indistinguishable -- the same "no rule vs rule missing" ambiguity the routed half of
+    the guard exists to remove, reintroduced one level down. So the classification is now
+    TOTAL: every event names its half, and DRIFT_DETECTED -- an accusation about a
+    deployed model, consumed by nothing -- had to be argued for in writing rather than
+    inherited by default.
+    """
     emitted = set()
     for rel in ("orchestration/harness_driver/handler.py",
                 "orchestration/start_pipeline/handler.py",
@@ -4749,10 +6134,24 @@ def test_every_emitted_detail_type_is_either_ruled_or_declared_fire_and_forget()
     emitted |= set(re.findall(r'"DetailType": "(\w+)"', asl))
     unknown = emitted - set(ev.ALL_EVENTS)
     assert not unknown, f"emitted detail-types not in ALL_EVENTS: {unknown}"
-    # Nothing to assert about the fire-and-forget ones beyond that they are known --
-    # the point of the pair is that EVENTS_NEEDING_A_RULE is the only place the
-    # distinction lives, so the previous test is what has teeth.
     assert ev.ESCALATED_TO_HUMAN in emitted
+
+    routed, forget = set(ev.EVENTS_NEEDING_A_RULE), set(ev.EVENTS_FIRE_AND_FORGET)
+    unclassified = set(ev.ALL_EVENTS) - routed - forget
+    assert not unclassified, (
+        f"{sorted(unclassified)} is in ALL_EVENTS but in neither EVENTS_NEEDING_A_RULE "
+        "nor EVENTS_FIRE_AND_FORGET. Say which: a detail-type that nothing listens to by "
+        "ACCIDENT is invisible on a live bus -- it lands, and nothing happens, with no "
+        "failure and no metric to notice.")
+    assert not routed & forget, (
+        f"{sorted(routed & forget)} is declared both routed and fire-and-forget")
+    assert not (routed | forget) - set(ev.ALL_EVENTS), (
+        f"{sorted((routed | forget) - set(ev.ALL_EVENTS))} is classified but is not a "
+        "detail-type in ALL_EVENTS")
+    for name, why in ev.EVENTS_FIRE_AND_FORGET.items():
+        assert len(why) > 20, (
+            f"{name}'s fire-and-forget reason is {why!r} -- too short to be a decision "
+            "anyone can review or disagree with")
 
 
 def test_the_triage_rule_is_on_the_custom_bus_not_the_default_one():
@@ -4825,6 +6224,111 @@ def test_the_informational_model_failover_is_not_an_escalation():
     assert "ev.MODEL_FAILED_OVER" in fn
     assert "ev.ESCALATED_TO_HUMAN" not in fn, \
         "a self-healed failover still emits the triage trigger"
+
+
+# ── the failover that never came back ─────────────────────────────────────────
+# UpdateHarness is a control-plane write on a resource all seven agents and every
+# concurrent run share. _maybe_failover_model used it to serve a need that is neither
+# shared nor durable -- one salvage retry, one invocation -- and never reverted, so a
+# single vendor 5xx burst repointed the deployed fleet PERMANENTLY. Every later run then
+# executed on a model the human never signed (the KMS approval spine's whole purpose),
+# that the cost model priced at a different tier, and that ARCHITECTURE.md §9.3
+# explicitly asserts is not what is deployed -- invisible to every guard in the tree,
+# because the divergence lives in the control plane while agents/*/harness.json reads
+# exactly as it always did.
+#
+# These drive the real handler() through a real stream death. Asserting on the source
+# text (the test above) could not have caught this: the swap was there, correct, and
+# emitted its event; what was missing was the second half.
+def _failover_clients(scripts, s3=None, ctl=None):
+    c = clients(FakeAgentCore(scripts), s3)
+    c["agentcore_control"] = ctl or FakeAgentCoreControl()
+    return c
+
+
+def _model_5xx_stream():
+    """A stream death whose error carries a vendor 5xx signature, which is what
+    _is_model_5xx keys on -- a plain ConnectionError salvages without failing over."""
+    class _S:
+        def __iter__(self):
+            yield {"contentBlockDelta": {"delta": {"text": "partial"}}}
+            raise RuntimeError("InternalServerException: model unavailable")
+    return _S()
+
+
+def test_a_model_failover_is_reverted_before_the_invocation_ends():
+    uri = "s3://llmops-data-test/runs/run-test-1/raw/data.jsonl"
+    ctl = FakeAgentCoreControl(model_id="global.anthropic.claude-fable-5")
+    c = _failover_clients([_model_5xx_stream(),
+                           tool_use_stream("stage_complete", {"outputs": [uri]}),
+                           text_stream("ack")],
+                          s3=FakeS3(existing=[uri]), ctl=ctl)
+    out = driver.handler(driver_event(), clients=c)
+
+    assert out["status"] == "completed", "the salvage retry must still succeed"
+    arn = driver._resolve_harness_arn("llmops_data_prep").rsplit("/", 1)[-1]
+    assert ctl.model_of(arn) == "global.anthropic.claude-fable-5", (
+        f"the harness was left on {ctl.model_of(arn)}; a failover is scoped to one "
+        "invocation, and an unreverted one silently repoints every future run of all "
+        "seven agents to a model no human signed")
+    # Both directions happened, in order: swap out, then back.
+    assert [m for _, m in ctl.updates] == ["global.anthropic.claude-opus-5",
+                                           "global.anthropic.claude-fable-5"], ctl.updates
+
+
+def test_the_revert_happens_even_when_the_stage_crashes():
+    """The restore is in `finally` for this reason. A failover followed by a crash is
+    the likeliest shape in production -- the 5xx burst that triggered the swap is
+    exactly the condition that goes on to kill the stage -- and it is the one where
+    leaving the fleet swapped would persist longest, because nothing succeeds to
+    prompt anyone to look."""
+    ctl = FakeAgentCoreControl()
+    # stage_complete naming an output that does not exist in S3: the driver rejects it,
+    # and with the FakeS3 empty the verification raises inside _run_stage.
+    c = _failover_clients([_model_5xx_stream()], ctl=ctl)
+
+    class _ExplodingSfn(FakeSfn):
+        def send_task_success(self, **kw):
+            raise RuntimeError("boom in settle")
+
+    c["sfn"] = _ExplodingSfn()
+    c["agentcore"] = FakeAgentCore([_model_5xx_stream(),
+                                    tool_use_stream("stage_complete", {"outputs": []}),
+                                    text_stream("ack")])
+    with pytest.raises(Exception):
+        driver.handler(driver_event(), clients=c)
+
+    arn = driver._resolve_harness_arn("llmops_data_prep").rsplit("/", 1)[-1]
+    assert ctl.model_of(arn) == "global.anthropic.claude-fable-5", (
+        "a crash after failover left the fleet on the fallback model")
+
+
+def test_an_unrevertable_failover_is_recorded_and_said_out_loud(capsys):
+    """The restore can fail -- the control plane is the same one that was 5xxing.
+
+    Then the fleet really is diverged, and the only remaining defences are the run
+    row and the log line. Both must exist, or the divergence is undetectable.
+    """
+    uri = "s3://llmops-data-test/runs/run-test-1/raw/data.jsonl"
+    ctl = FakeAgentCoreControl(fail_update_on={"global.anthropic.claude-fable-5"})
+    c = _failover_clients([_model_5xx_stream(),
+                           tool_use_stream("stage_complete", {"outputs": [uri]}),
+                           text_stream("ack")],
+                          s3=FakeS3(existing=[uri]), ctl=ctl)
+    c["ddb"].tables.setdefault("llmops-pipeline-runs", FakeTable()).items.append(
+        {"run_id": "run-test-1", "status": "running"})
+    out = driver.handler(driver_event(), clients=c)
+
+    assert out["status"] == "completed", "a failed restore must not fail the stage"
+    printed = capsys.readouterr().out
+    assert "FAILOVER NOT RESTORED" in printed, printed[-800:]
+    row = c["ddb"].tables["llmops-pipeline-runs"].items[0]
+    assert "model_failover" in row, (
+        "nothing on the run row records that this run swapped the fleet's model; a "
+        "driver that dies mid-failover would leave no witness at all")
+    rec = json.loads(row["model_failover"])
+    assert rec["to_model"] == "global.anthropic.claude-opus-5"
+    assert rec["restored"] is False
 
 
 def test_every_escalation_emitter_carries_the_stage_the_rule_filters_on():
@@ -5780,3 +7284,597 @@ class TestDeadTaskTokenSettle:
             assert r.returncode == 0, (
                 f"{key}'s bundle cannot import itself, so the function is dead at cold "
                 f"start however green the deploy looked:\n{r.stderr[-2000:]}")
+
+
+# ── teardown must be the inverse of provisioning, not a region-wide sweep ──────
+# `project=llmops-agentic-system` is a tag any principal in the account can apply, and
+# `ensure_endpoints` scopes its own read to `vpc-id`. The destroy path filtered on the
+# tag ALONE, so it was not the create's inverse: it deleted every same-tagged interface
+# endpoint in the region, including ones another team's VPC was resolving through. An
+# interface endpoint is load-bearing, its deletion is a silent outage for its consumers,
+# and re-running this script cannot undo it -- the replacement gets a new id and new DNS.
+
+@pytest.fixture(scope="module")
+def network_mod():
+    """deploy/02_network.py as a module (name starts with a digit). Import-time safe."""
+    return _load("llmops_02_network", "deploy/02_network.py")
+
+
+class _FakeEc2:
+    """Answers describe_* from a fixed inventory, honouring the filters it is given.
+
+    Honouring them is the entire point: a double that ignored `vpc-id` would report the
+    scoped and unscoped queries as identical and pass either implementation.
+    """
+
+    def __init__(self, vpcs, endpoints):
+        self.vpcs, self.endpoints = vpcs, endpoints
+        self.deleted = []
+
+    @staticmethod
+    def _matches(item, filters):
+        for f in filters or []:
+            name, values = f["Name"], f["Values"]
+            if name.startswith("tag:"):
+                key = name.split(":", 1)[1]
+                tags = {t["Key"]: t["Value"] for t in item.get("Tags", [])}
+                if tags.get(key) not in values:
+                    return False
+            elif name == "vpc-id":
+                if item.get("VpcId") not in values:
+                    return False
+            else:  # an unmodelled filter would silently match everything
+                raise AssertionError(f"_FakeEc2 does not model filter {name!r}")
+        return True
+
+    def describe_vpcs(self, Filters=None):
+        return {"Vpcs": [v for v in self.vpcs if self._matches(v, Filters)]}
+
+    def describe_vpc_endpoints(self, Filters=None):
+        return {"VpcEndpoints": [e for e in self.endpoints if self._matches(e, Filters)]}
+
+    def delete_vpc_endpoints(self, VpcEndpointIds):
+        self.deleted.extend(VpcEndpointIds)
+        return {"Unsuccessful": []}
+
+
+def _tagged(**kw):
+    return {"Tags": [{"Key": "project", "Value": "llmops-agentic-system"}], **kw}
+
+
+def test_destroy_only_touches_endpoints_in_our_own_vpc(network_mod):
+    ec2 = _FakeEc2(
+        vpcs=[_tagged(VpcId="vpc-ours")],
+        endpoints=[
+            _tagged(VpcEndpointId="vpce-ours-1", VpcId="vpc-ours",
+                    VpcEndpointType="Interface"),
+            _tagged(VpcEndpointId="vpce-ours-gw", VpcId="vpc-ours",
+                    VpcEndpointType="Gateway"),
+            # Same tag, different VPC: another deployment, or another team that happens
+            # to use the same project tag. Not ours to delete.
+            _tagged(VpcEndpointId="vpce-theirs", VpcId="vpc-theirs",
+                    VpcEndpointType="Interface"),
+        ])
+    victims = network_mod.destroy_interface_endpoints(ec2, dry=False)
+    assert victims == ["vpce-ours-1"], victims
+    assert ec2.deleted == ["vpce-ours-1"], (
+        f"destroy deleted {ec2.deleted}; anything beyond vpce-ours-1 is someone "
+        "else's load-bearing endpoint and its deletion is a silent outage")
+
+
+def test_destroy_with_no_vpc_of_ours_deletes_nothing(network_mod):
+    """The dangerous shape: nothing of ours exists, so an unscoped query returns other
+    people's endpoints and every one of them looks like a victim. No VPC means no
+    endpoints of ours are being billed, so the correct teardown is a no-op."""
+    ec2 = _FakeEc2(
+        vpcs=[],
+        endpoints=[_tagged(VpcEndpointId="vpce-theirs", VpcId="vpc-theirs",
+                           VpcEndpointType="Interface")])
+    assert network_mod.destroy_interface_endpoints(ec2, dry=False) == []
+    assert ec2.deleted == [], ec2.deleted
+
+
+def test_a_dry_run_destroy_reports_without_deleting(network_mod):
+    ec2 = _FakeEc2(
+        vpcs=[_tagged(VpcId="vpc-ours")],
+        endpoints=[_tagged(VpcEndpointId="vpce-ours-1", VpcId="vpc-ours",
+                           VpcEndpointType="Interface")])
+    assert network_mod.destroy_interface_endpoints(ec2, dry=True) == ["vpce-ours-1"]
+    assert ec2.deleted == [], "a --dry-run destroy deleted for real"
+
+
+def test_find_our_vpc_never_creates_one(network_mod):
+    """A teardown whose discovery step can CREATE the thing it is about to delete always
+    finds something to delete. ensure_vpc creates; find_our_vpc must not."""
+    ec2 = _FakeEc2(vpcs=[], endpoints=[])
+    assert network_mod.find_our_vpc(ec2) is None
+    src = (REPO / "deploy/02_network.py").read_text()
+    fn = src.split("def find_our_vpc", 1)[1].split("\ndef ", 1)[0]
+    assert "create_vpc" not in fn, "the teardown's discovery step can create a VPC"
+
+
+# ── the only billed resource here, and the two ways its cost went unreported ────────
+# An interface endpoint bills per endpoint per hour PER AVAILABILITY ZONE -- AWS bills
+# "for each hour that your VPC endpoint remains provisioned in each Availability Zone",
+# because `SubnetIds` creates one endpoint network interface per subnet and the ENI is
+# the billed unit (Pricing API `USE1-VpcEndpoint-Hours` = $0.01/hr, measured 2026-08-10).
+# The script printed `0.01 * len(INTERFACE_SERVICES) * 24` -- the one-AZ figure -- while
+# attaching every endpoint to BOTH subnets, so its own cost note was exactly half.
+#
+# And it provisioned all 11 for a consumer that does not exist: no
+# agents/*/harness.prod.json, no VpcConfig in 07_lambdas.py, /llmops/network/* read by
+# nothing. Then printed a warm success. The two defects compound -- an unused resource
+# whose price is understated is the one nobody thinks to check.
+
+class _CountingEc2(_FakeEc2):
+    """_FakeEc2 plus the create/describe surface `ensure_endpoints` needs.
+
+    Records what would be created so a test can tell "skipped the billed half" from
+    "skipped everything" -- the distinction the gate turns on, since the free substrate
+    is what a harness.prod.json has to be written against.
+    """
+
+    def __init__(self, vpcs=(), endpoints=()):
+        super().__init__(list(vpcs), list(endpoints))
+        self.created = []
+
+    def describe_route_tables(self, Filters=None):
+        return {"RouteTables": [{"RouteTableId": "rtb-main"}]}
+
+    def create_vpc_endpoint(self, **kw):
+        self.created.append((kw["VpcEndpointType"], kw["ServiceName"],
+                             tuple(kw.get("SubnetIds") or ())))
+        return {"VpcEndpoint": {"VpcEndpointId": f"vpce-{len(self.created)}"}}
+
+
+def test_the_endpoint_cost_note_counts_every_az_not_every_endpoint(network_mod):
+    """11 endpoints x 2 AZs x $0.01 x 24h = $5.28/day. The old note said $2.64."""
+    per_day = network_mod.endpoint_cost_per_day(
+        len(network_mod.INTERFACE_SERVICES), 2)
+    assert per_day == pytest.approx(5.28), per_day
+    # The exact wrong answer, pinned: $2.64 is the ONE-AZ figure, and the script attaches
+    # to two subnets. A regression that drops the AZ factor lands back on this number, so
+    # naming it here makes that mutation fail with its own history attached.
+    assert network_mod.endpoint_cost_per_day(
+        len(network_mod.INTERFACE_SERVICES), 1) == pytest.approx(2.64)
+    # Linear in BOTH dimensions -- a hardcoded total, or one that ignores either list,
+    # cannot satisfy all three of these.
+    assert network_mod.endpoint_cost_per_day(1, 1) == pytest.approx(0.24)
+    assert network_mod.endpoint_cost_per_day(12, 3) == pytest.approx(8.64)
+
+
+def test_the_printed_cost_is_derived_from_both_lists(network_mod):
+    """Structural, because the arithmetic being right does not mean it is the arithmetic
+    that gets PRINTED. The original bug was a correct-looking expression inlined in the
+    print call, so a guard on the function alone would have passed against it."""
+    src = (REPO / "deploy/02_network.py").read_text()
+    body = src.split("def main(", 1)[1]
+    assert "endpoint_cost_per_day(" in body, (
+        "main() no longer calls endpoint_cost_per_day; if the cost is computed inline "
+        "again it is unguarded again")
+    assert "len(subnet_ids)" in body.split("endpoint_cost_per_day(", 1)[1][:80], (
+        "endpoint_cost_per_day is called without the AZ count derived from subnet_ids — "
+        "a literal 2 here is the same drift the function exists to prevent")
+    # Scoped to main()'s body, not the whole file: `endpoint_cost_per_day`'s docstring
+    # QUOTES the old expression to explain what was wrong with it, and a file-wide check
+    # fails on its own explanation -- which would push the next person to delete the
+    # history rather than keep the guard.
+    assert "0.01*len(INTERFACE_SERVICES)*24" not in body.replace(" ", ""), (
+        "the one-AZ expression is back in main(): it counts endpoints and not AZs, so it "
+        "prints exactly half the real bill")
+
+
+def test_no_consumer_means_no_billed_endpoints_but_the_free_vpc_is_still_built(network_mod):
+    """The gate is on the billing line, not on the script.
+
+    Refusing outright would make the missing consumer unfixable: a harness.prod.json has
+    to be written against a VPC, subnets and security groups that exist. So the free
+    substrate is built either way and only the 11 billed endpoints are withheld.
+    """
+    ec2 = _CountingEc2(vpcs=[_tagged(VpcId="vpc-ours")])
+    created = network_mod.ensure_endpoints(
+        ec2, "vpc-ours", ["subnet-a", "subnet-b"], "sg-1", "us-east-1", dry=False,
+        interface=False)
+    kinds = {k for k, _, _ in ec2.created}
+    assert kinds == {"Gateway"}, (
+        f"created {ec2.created}; with no consumer the Interface endpoints are the whole "
+        "cost and must not be created, and the free Gateway ones must still be")
+    assert len(created) == len(network_mod.GATEWAY_SERVICES), created
+    assert not any("Interface" == k for k, _, _ in ec2.created)
+
+
+def test_every_interface_endpoint_is_attached_to_every_subnet(network_mod):
+    """The fact the cost note has to reflect, asserted against the create call itself.
+
+    If a future change attaches to one subnet, $2.64/day becomes correct and this test is
+    the thing that says so -- the arithmetic and the attachment must move together.
+    """
+    ec2 = _CountingEc2(vpcs=[_tagged(VpcId="vpc-ours")])
+    subnets = ["subnet-a", "subnet-b"]
+    network_mod.ensure_endpoints(ec2, "vpc-ours", subnets, "sg-1", "us-east-1",
+                                 dry=False, interface=True)
+    ifaces = [(s, sn) for k, s, sn in ec2.created if k == "Interface"]
+    assert len(ifaces) == len(network_mod.INTERFACE_SERVICES), ifaces
+    for svc, attached in ifaces:
+        assert attached == tuple(subnets), (
+            f"{svc} attached to {attached}, not all of {subnets}: the per-AZ cost "
+            "arithmetic in endpoint_cost_per_day no longer matches what is created")
+
+
+def test_main_withholds_the_billed_endpoints_when_nothing_consumes_them(
+        network_mod, monkeypatch, capsys):
+    """Driven through main(), because that is where the DECISION lives.
+
+    The guards above prove `ensure_endpoints(interface=False)` withholds the billed half
+    and that `find_endpoint_consumers` reads the right files -- and both still passed when
+    `want_interface` was mutated to a bare `True`. Two correct components wired together
+    wrongly is the shape of the original bug, so the wiring needs its own test.
+    """
+    calls = {}
+
+    def fake_ensure_endpoints(ec2, vpc_id, subnet_ids, sg_id, region, dry, interface=True):
+        calls["interface"] = interface
+        return []
+
+    monkeypatch.setattr(network_mod, "ensure_vpc", lambda *a, **k: ("vpc-1", False))
+    monkeypatch.setattr(network_mod, "ensure_subnets",
+                        lambda *a, **k: ["subnet-a", "subnet-b"])
+    monkeypatch.setattr(network_mod, "ensure_sg", lambda *a, **k: ("sg-1", False))
+    monkeypatch.setattr(network_mod, "ensure_endpoints", fake_ensure_endpoints)
+    monkeypatch.setattr(network_mod.boto3, "client", lambda *a, **k: object())
+
+    def run(argv, consumers):
+        calls.clear()
+        monkeypatch.setattr(network_mod, "find_endpoint_consumers",
+                            lambda *a, **k: list(consumers))
+        monkeypatch.setattr(sys, "argv", ["02_network.py", "--region", "us-east-1",
+                                          "--dry-run"] + argv)
+        rc = network_mod.main()
+        return rc, calls["interface"], capsys.readouterr()
+
+    rc, interface, out = run([], consumers=[])
+    assert interface is False, (
+        "main() asked for the 11 billed interface endpoints with no consumer — the "
+        "consumer check runs but its answer is not what the deploy branches on")
+    # Skipping is not a failure: nothing was half-applied and the free substrate is up.
+    # The signal is the stderr line plus `interface_endpoints: false` in the JSON, which
+    # is what a caller can actually branch on -- an exit code cannot say "6 of 7 things".
+    assert rc == 0, rc
+    assert "SKIPPED" in out.err, out.err
+    assert json.loads(out.out)["interface_endpoints"] is False
+
+    # A real consumer unlocks them, and the reason is reported rather than implied.
+    rc, interface, out = run([], consumers=["agents/eval/harness.prod.json runs VPC"])
+    assert interface is True and rc == 0
+    assert "5.28" in out.out, f"the per-AZ daily cost is not printed: {out.out}"
+    assert "harness.prod.json runs VPC" in out.out
+
+    # And the override works without one -- deliberately paying ahead of need is allowed,
+    # it just has to be deliberate.
+    rc, interface, out = run(["--force-unused-endpoints"], consumers=[])
+    assert interface is True and rc == 0
+    assert "no consumer" in out.out, out.out
+
+
+def test_the_consumer_check_reads_the_files_a_deploy_reads(network_mod, tmp_path):
+    """Derived from the same configs `05_harnesses.py --prod` and `07_lambdas.py` use.
+
+    A hand-set flag would be the same optimism whose absence let 11 billed endpoints be
+    provisioned for nobody; the check has to be able to go green on its own when someone
+    actually builds a VPC-mode harness.
+    """
+    # Today's repo: measured, not assumed.
+    assert network_mod.find_endpoint_consumers() == [], (
+        "something now routes through the interface endpoints — that is a real change of "
+        "state, and ARCHITECTURE §11 plus deploy/README must say so in the same commit")
+
+    def repo_with(prod_cfg=None, lambdas_src="def main(): pass\n"):
+        (tmp_path / "agents" / "eval").mkdir(parents=True, exist_ok=True)
+        (tmp_path / "deploy").mkdir(exist_ok=True)
+        (tmp_path / "deploy" / "07_lambdas.py").write_text(lambdas_src)
+        p = tmp_path / "agents" / "eval" / "harness.prod.json"
+        if prod_cfg is None:
+            p.unlink(missing_ok=True)
+        else:
+            p.write_text(json.dumps(prod_cfg))
+        return tmp_path
+
+    def cfg(mode):
+        return {"environment": {"agentCoreRuntimeEnvironment": {
+            "networkConfiguration": {"networkMode": mode}}}}
+
+    assert network_mod.find_endpoint_consumers(repo_with()) == []
+    # A prod config that is still PUBLIC routes over the internet, not the endpoints:
+    # its mere existence must not unlock the bill.
+    assert network_mod.find_endpoint_consumers(repo_with(cfg("PUBLIC"))) == []
+    vpc_mode = network_mod.find_endpoint_consumers(repo_with(cfg("VPC")))
+    assert len(vpc_mode) == 1 and "networkMode=VPC" in vpc_mode[0], vpc_mode
+    # The other consumer, independent of the harness configs.
+    lam = network_mod.find_endpoint_consumers(
+        repo_with(lambdas_src="fn(VpcConfig={'SubnetIds': s})\n"))
+    assert len(lam) == 1 and "07_lambdas.py" in lam[0], lam
+    # Unreadable is not absent: a broken prod config counts as a consumer, because
+    # silently skipping the endpoints it needs breaks a deploy instead of costing money,
+    # and of the two failure modes that is the one to avoid.
+    # repo_with() resets 07_lambdas.py too — the previous case left VpcConfig in it, and
+    # without the reset this asserts on two reasons and reads as a code failure.
+    repo_with(cfg("VPC"))
+    (tmp_path / "agents" / "eval" / "harness.prod.json").write_text("{not json")
+    broken = network_mod.find_endpoint_consumers(tmp_path)
+    assert len(broken) == 1 and "unreadable" in broken[0], broken
+
+
+# ── a global name with a regional body: the second-region deploy ───────────────────
+# IAM roles are global and these names are constants, but their policies are not: 71
+# resource ARNs across deploy/iam/*.json carry <REGION>. put_role_policy REPLACES by
+# name, so `01_iam.py --region <second>` rewrote every role's document with second-region
+# ARNs and took the first region's permissions away -- an outage in a live deployment,
+# printed as an ordinary "[update] role ..." line and exit 0.
+#
+# The obvious fix is measured out of reach rather than argued about: a role's AGGREGATE
+# inline policy is capped at 10,240 characters and llmops-harness-execution substitutes
+# to ~7.4k, so "one inline policy per region" cannot hold two regions on one role.
+# test_two_regions_of_policy_cannot_fit_on_one_role pins that, so the day someone
+# proposes per-region policy names the arithmetic answers instead of a code review.
+
+@pytest.fixture(scope="module")
+def iam_mod():
+    """deploy/01_iam.py as a module (its name starts with a digit)."""
+    return _load("llmops_01_iam", "deploy/01_iam.py")
+
+
+class _FakeIam:
+    """IAM with the one property the bug lives in: put_role_policy PERSISTS, by name.
+
+    A double that only counted calls could not express this defect. What went wrong was
+    not "a write happened" -- writes are the job -- it was that the write REPLACED a
+    document another region depended on, so the damage is only visible by reading the
+    policy back afterwards and finding the other region's ARNs gone.
+    """
+
+    def __init__(self, roles=()):
+        #: role name -> {"tags": {...}, "policy": doc or None}
+        self.roles = {n: {"tags": dict(t), "policy": p} for n, t, p in roles}
+        self.puts = []
+
+    # -- reads -------------------------------------------------------------------
+    def get_role(self, RoleName):
+        if RoleName not in self.roles:
+            raise RuntimeError(f"NoSuchEntity: {RoleName}")
+        r = self.roles[RoleName]
+        return {"Role": {"Arn": f"arn:aws:iam::123456789012:role/{RoleName}",
+                         "AssumeRolePolicyDocument": {"Version": "2012-10-17"},
+                         "Tags": [{"Key": k, "Value": v} for k, v in r["tags"].items()]}}
+
+    def get_role_policy(self, RoleName, PolicyName):
+        pol = self.roles.get(RoleName, {}).get("policy")
+        if pol is None:
+            raise RuntimeError(f"NoSuchEntity: {PolicyName}")
+        return {"PolicyDocument": pol}
+
+    # -- writes ------------------------------------------------------------------
+    def create_role(self, RoleName, Tags, **kw):
+        self.roles[RoleName] = {"tags": {t["Key"]: t["Value"] for t in Tags},
+                                "policy": None}
+
+    def get_waiter(self, _name):
+        return type("W", (), {"wait": lambda self, **kw: None})()
+
+    def update_assume_role_policy(self, **kw):
+        pass
+
+    def put_role_policy(self, RoleName, PolicyName, PolicyDocument):
+        self.puts.append(RoleName)
+        self.roles.setdefault(RoleName, {"tags": {}, "policy": None})
+        self.roles[RoleName]["policy"] = json.loads(PolicyDocument)
+
+    def tag_role(self, RoleName, Tags):
+        self.roles[RoleName]["tags"].update({t["Key"]: t["Value"] for t in Tags})
+
+    # -- helper for assertions ---------------------------------------------------
+    def regions_in_policy(self, role):
+        """Every AWS region id appearing in the role's attached document."""
+        pol = self.roles[role]["policy"]
+        return set(re.findall(r"\b([a-z]{2}(?:-[a-z]+)+-\d)\b", json.dumps(pol)))
+
+
+def _role_owned_by(region, arn_region=None):
+    """A deployed role, tagged for `region`, whose policy names `arn_region`'s ARNs."""
+    arn_region = arn_region or region
+    return ({"project": "llmops-agentic-system", "llmops:region": region},
+            {"Version": "2012-10-17", "Statement": [{
+                "Effect": "Allow", "Action": "s3:GetObject",
+                "Resource": f"arn:aws:s3:::llmops-agentic-123456789012-{arn_region}/*"}]})
+
+
+def _run_iam_main(iam_mod, monkeypatch, iam, argv):
+    """Drive 01_iam.py's main() against a fake IAM. Returns (exit_code, stdout+stderr).
+
+    Through main(), not through find_region_conflicts: the first version of the test
+    below called the checker directly, and deleting main()'s entire refusal block left
+    it green. A checker nothing consults is not a guard, so the guard has to be driven
+    the way a deploy drives it.
+    """
+    # ssm is stubbed rather than withheld so that a REGRESSION fails on the damage --
+    # policies stripped, iam.puts non-empty -- instead of tripping over a missing client
+    # on the way there. A double that blocks the broken path early hides what broke.
+    clients = {"iam": iam,
+               "sts": type("S", (), {
+                   "get_caller_identity": lambda self: {"Account": "123456789012"}})(),
+               "ssm": type("P", (), {"put_parameter": lambda self, **kw: None})()}
+
+    def fake_client(name, **kw):
+        if name not in clients:
+            raise AssertionError(f"main() reached for an unexpected client: {name}")
+        return clients[name]
+
+    monkeypatch.setattr(iam_mod.boto3, "client", fake_client)
+    monkeypatch.setattr(iam_mod.sys, "argv", ["01_iam.py"] + argv)
+    try:
+        rc = iam_mod.main()
+    except SystemExit as e:      # argparse
+        rc = e.code
+    return rc
+
+
+def test_a_second_region_deploy_is_refused_before_it_strips_the_first(
+        iam_mod, monkeypatch, capsys):
+    """The whole bug, end to end: region 2 must not take region 1's permissions away.
+
+    Asserted by reading the policies BACK and finding us-east-1 still in them -- not by
+    checking that a refusal was printed. A loud refusal with the writes happening anyway
+    is precisely the failure mode worth ruling out.
+    """
+    roles = [(n, *_role_owned_by("us-east-1")) for n in iam_mod.ROLE_NAMES]
+    iam = _FakeIam(roles)
+
+    rc = _run_iam_main(iam_mod, monkeypatch, iam,
+                       ["--region", "us-west-2", "--account-id", "123456789012"])
+
+    assert rc == 2, f"a deploy that would strip us-east-1 exited {rc}, not 2"
+    assert iam.puts == [], f"IAM was written despite the refusal: {iam.puts}"
+    for role in iam_mod.ROLE_NAMES:
+        assert iam.regions_in_policy(role) == {"us-east-1"}, (
+            f"{role} lost us-east-1 from its policy")
+    err = capsys.readouterr().err
+    assert "us-east-1" in err and "REFUSING" in err, (
+        f"the refusal does not name the region it is protecting:\n{err}")
+
+
+def test_the_takeover_flag_is_the_only_way_past_the_refusal(iam_mod, monkeypatch):
+    """The override has to work, and has to be the ONLY thing that opens this door.
+
+    Kept because a refusal with no escape hatch gets removed wholesale the first time a
+    region is legitimately decommissioned -- and then the protection is gone for good.
+    Naming it --force-region-takeover rather than --force is the point: the flag states
+    what it destroys.
+    """
+    roles = [(n, *_role_owned_by("us-east-1")) for n in iam_mod.ROLE_NAMES]
+    iam = _FakeIam(roles)
+
+    rc = _run_iam_main(iam_mod, monkeypatch, iam,
+                       ["--region", "us-west-2", "--account-id", "123456789012",
+                        "--dry-run", "--force-region-takeover"])
+
+    assert rc == 0, f"--force-region-takeover was still refused (exit {rc})"
+    assert iam.puts == [], "--dry-run wrote to IAM"
+
+
+def test_the_check_covers_every_role_before_any_role_is_written(iam_mod):
+    """Pre-flight, not per-role. A check inside the write loop is worse than none here:
+    by the time role 7 objected, roles 1-6 would already be rewritten -- the same outage,
+    now half-committed, with no record of the documents that were replaced.
+
+    Driven through the one role that is NOT tagged: the conflict is on a LATER role, so
+    an implementation that checked as it went would have written this one first.
+    """
+    names = list(iam_mod.ROLE_NAMES)
+    fresh, owned = names[0], names[-1]
+    iam = _FakeIam([(fresh, {"project": "llmops-agentic-system"}, None),
+                    (owned, *_role_owned_by("us-east-1"))])
+    conflicts = iam_mod.find_region_conflicts(iam, names, "us-west-2")
+    assert conflicts == [(owned, "us-east-1")]
+    assert iam.puts == [], "IAM was written during a check that ends in a refusal"
+    src = (REPO / "deploy/01_iam.py").read_text()
+    body = src.split("def main(", 1)[1]
+    assert body.index("find_region_conflicts") < body.index("ensure_role("), (
+        "main() calls ensure_role before checking for a region conflict, so the first "
+        "roles are already stripped by the time the conflict is found")
+
+
+def test_redeploying_the_owning_region_is_never_blocked(iam_mod):
+    """The guard must not lock the deployment out of its own redeploys. Idempotent
+    re-runs of the owning region are the common case, and a guard that blocks them gets
+    deleted rather than fixed."""
+    roles = [(n, *_role_owned_by("us-east-1")) for n in iam_mod.ROLE_NAMES]
+    iam = _FakeIam(roles)
+    assert iam_mod.find_region_conflicts(iam, iam_mod.ROLE_NAMES, "us-east-1") == []
+
+
+def test_an_untagged_or_absent_role_does_not_block_a_deploy(iam_mod):
+    """Absent, pre-tag, and unreadable roles all mean "no evidence of a conflict".
+
+    Only a tag naming a DIFFERENT region is evidence. Blocking on absence would make
+    the very first deploy into a clean account fail, and blocking on an unreadable role
+    would let a missing iam:GetRole permission masquerade as a region conflict.
+    """
+    names = list(iam_mod.ROLE_NAMES)
+    iam = _FakeIam([(names[0], {"project": "llmops-agentic-system"}, None)])  # pre-tag
+    assert iam_mod.find_region_conflicts(iam, names, "us-west-2") == []
+    assert iam_mod.find_region_conflicts(None, names, "us-west-2") == [], (
+        "an offline dry-run with no IAM client reported a conflict it cannot know about")
+
+
+def test_the_region_owner_tag_is_written_with_the_policy(iam_mod):
+    """A tag nothing writes is a guard nothing arms: the check reads llmops:region, so
+    every path that attaches a document must stamp it -- create AND update alike.
+
+    Also pins the ORDER. Stamped after put_role_policy, so a failed policy write leaves
+    the tag naming whoever owns the document actually attached; a tag written first
+    would, on that failure, block the owning region's own corrective redeploy while the
+    other region's permissions are still live -- refusing the one deploy that fixes it.
+    """
+    name = iam_mod.ROLE_NAMES[0]
+    spec = {"trust": {"Version": "2012-10-17"}, "policy": {"Version": "2012-10-17",
+            "Statement": [{"Effect": "Allow", "Action": "s3:GetObject",
+                           "Resource": "arn:aws:s3:::b-us-west-2/*"}]}}
+
+    absent = _FakeIam()                                    # create path
+    iam_mod.ensure_role(absent, name, spec, dry=False, region="us-west-2")
+    assert absent.roles[name]["tags"].get("llmops:region") == "us-west-2"
+
+    present = _FakeIam([(name, *_role_owned_by("us-west-2"))])   # update path
+    iam_mod.ensure_role(present, name, spec, dry=False, region="us-west-2")
+    assert present.roles[name]["tags"].get("llmops:region") == "us-west-2"
+
+    src = (REPO / "deploy/01_iam.py").read_text()
+    fn = src.split("def ensure_role(", 1)[1].split("\ndef ", 1)[0]
+    assert fn.index("put_role_policy") < fn.index("tag_role"), (
+        "ensure_role tags the owning region before the policy it describes has landed")
+
+
+def test_a_dry_run_predicts_the_refusal_instead_of_a_clean_diff(iam_mod):
+    """--dry-run exists to be trusted before the real run. If it printed a tidy diff for
+    a deploy that the real run refuses -- or worse, that the real run performs
+    destructively -- it would be actively misleading, so the check runs on both paths."""
+    src = (REPO / "deploy/01_iam.py").read_text()
+    body = src.split("def main(", 1)[1]
+    guard = body.split("find_region_conflicts", 1)[1].split("any_change = False", 1)[0]
+    assert "dry_run" not in guard, (
+        "the region-conflict check is conditioned on dry_run, so one of the two modes "
+        "does not report it")
+
+
+def test_two_regions_of_policy_cannot_fit_on_one_role(iam_mod):
+    """Why the fix REFUSES instead of splitting the policy per region.
+
+    Measured, not asserted from memory: IAM caps a role's aggregate inline policy at
+    10,240 characters. If a single region's documents already exceed half of that, then
+    per-region policy names cannot hold two regions, and distinct role names are the
+    only real multi-region answer. This test is what makes that a fact in the repo
+    rather than a claim in a comment -- and it will start failing the moment the
+    policies shrink enough to make the split viable, which is exactly when someone
+    should revisit the refusal.
+    """
+    specs = iam_mod.build_role_specs(
+        {"<ACCOUNT_ID>": "123456789012", "<REGION>": "us-east-1",
+         "<DATA_BUCKET>": "llmops-agentic-123456789012-us-east-1"}, None)
+    biggest = max((len(json.dumps(s["policy"])), n) for n, s in specs.items())
+    size, name = biggest
+    assert size * 2 > 10240, (
+        f"{name} is {size} chars, so two regions ({size * 2}) now fit under IAM's "
+        "10,240-char inline limit -- the refusal in 01_iam.py could become a "
+        "per-region policy split; revisit it deliberately rather than deleting this")
+    assert size < 10240, (
+        f"{name} substitutes to {size} chars, over IAM's 10,240 inline-policy limit: "
+        "put_role_policy will reject it outright")
+
+
+def test_the_role_names_the_guard_checks_are_the_ones_the_script_deploys(iam_mod):
+    """ROLE_NAMES is only meaningful if it IS the deployed set. Derived from
+    build_role_specs so a role added to deploy/iam/ cannot quietly skip the check."""
+    specs = iam_mod.build_role_specs(
+        {"<ACCOUNT_ID>": "123456789012", "<REGION>": "us-east-1",
+         "<DATA_BUCKET>": "b"}, None)
+    assert sorted(iam_mod.ROLE_NAMES) == sorted(specs), (
+        "ROLE_NAMES has drifted from the roles 01_iam.py actually provisions")
