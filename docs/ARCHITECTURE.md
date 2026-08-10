@@ -370,6 +370,27 @@ task token and `send_task_failure` therefore carries the news to no one. It is b
 by construction: a page that cannot be sent must not turn a merely-unanswered triage into a
 crashed invocation, which would trade a silent failure for a louder wrong one.
 
+**Who a record is about is decided by the invocation, never by the agent.** The backstop
+answers *whether* a page happened, and that is not the same question as whether the owner
+can find it. A triage runs under `run_id = triage-<subject>`, with the real subject passed
+down as `params.escalation.run_id` — and nothing read that key. Every consumer took the
+subject from the model's own tool arguments and fell back to `event["run_id"]`, so a
+conductor that omitted `run_id`, or echoed back the id it was invoked under, addressed the
+record to itself. Measured over every `HumanPaged` row on file (12, full scan), **3 are
+filed under a `triage-` id** — `86ab8a14`, `c8b13faa`, `b56281da`, the same three ARC-2
+runs above: the alert fired and the timeline the owner opens is empty. Requiring the
+argument is not the cure; `run_id` is not in `page_human`'s `required` list at all and *is*
+in `resolve_escalation`'s, and a model omitted it anyway — a schema's `required` is a
+request to a language model, not an enforcement. One `triage_subject(event)` now serves all
+three call sites, and the agent's copy is consulted only when the event carries no subject
+at all (the console chat path, where `event["run_id"]` **is** the subject). The same
+derivation had been spelled three ways, and `_backstop_page`'s copy was the correct one —
+which is why the backstop's own pages are the properly filed ones, and why this looked
+intermittent. A `resolve_escalation` naming no run is now **rejected** rather than skipped:
+`if subject:` used to fall past `put_directive` and the reachability check to
+`{"status": "resolved"}`, a status inside `TRIAGE_ANSWERED`, so the backstop stayed quiet
+too — an unanswered escalation reported as answered.
+
 **An emitted event with no rule is a promise with no path to it.** The paragraph above
 says an `EscalatedToHuman` event "routes to the *driver*". It did not. The
 `llmops-pipeline` bus carried **zero** EventBridge rules from Phase 1 through Phase 5,

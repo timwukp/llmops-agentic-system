@@ -314,6 +314,24 @@ directive，11 筆都是 `deliverable: false`**，而沒有收到 page 的那些
 page 不可以把「只是沒回答」的 triage 變成「崩潰」的呼叫，那是拿一個安靜的失敗換一個更大聲
 的錯誤。
 
+**一筆紀錄「是關於誰的」，由呼叫決定，永遠不由 agent 決定。** 兜底回答的是「有沒有 page
+出去」，而那跟「owner 找不找得到它」不是同一個問題。一次 triage 跑在
+`run_id = triage-<subject>` 之下，真正的主體是由 `params.escalation.run_id` 傳下來的 ——
+而**沒有任何地方讀過那個鍵**。每一個消費端都改從模型自己的 tool 參數拿主體，再 fallback 到
+`event["run_id"]`，於是一個省略 `run_id`、或把自己被呼叫時的 id 原樣回傳的指揮家，就把紀錄
+寄給了自己。對現存每一筆 `HumanPaged` 列實測（12 筆，全表掃描）：**有 3 筆被歸檔在
+`triage-` 開頭的 id 底下** —— `86ab8a14`、`c8b13faa`、`b56281da`，正是上面那三個 ARC-2
+run：警報有響，而 owner 打開的那條時間線是空的。把參數改成必填並不是解方：`run_id` 根本不在
+`page_human` 的 `required` 清單裡，卻**在** `resolve_escalation` 的清單裡，而模型照樣省略了
+它 —— schema 的 `required` 對一個語言模型是一個請求，不是一個強制。現在由單一的
+`triage_subject(event)` 服務全部三個呼叫點，agent 自己的值只在事件完全沒帶主體時才被採用
+（console 聊天路徑，那裡 `event["run_id"]` **就是**主體）。同一段推導原本被寫成三份，而
+`_backstop_page` 那一份是**對的** —— 這正是為什麼兜底自己發出的 page 是歸檔正確的那些，也是
+為什麼這個缺陷看起來時好時壞。一次沒有指名任何 run 的 `resolve_escalation`，現在會被**駁回**
+而不是被跳過：舊的 `if subject:` 會直接掠過 `put_directive` 與可達性檢查、落到
+`{"status": "resolved"}` —— 一個落在 `TRIAGE_ANSWERED` 裡的狀態，於是兜底也一起安靜了 ——
+一個沒有被回答的 escalation，被報告成已經回答。
+
 **發出去卻沒有 rule 的事件，是一個沒有路可以走的承諾。** 上面那段說 `EscalatedToHuman`
 事件「路由到的是 **driver**」。它並沒有。`llmops-pipeline` bus 從 Phase 1 到 Phase 5
 一共掛著**零**條 EventBridge rule，而這個 detail-type 有三處在發、在這份文件裡被寫成會

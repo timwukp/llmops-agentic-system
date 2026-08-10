@@ -22,6 +22,7 @@ reader happens to open.
 from __future__ import annotations
 
 import ast
+import importlib.util
 import json
 import pathlib
 import re
@@ -921,6 +922,58 @@ def test_the_control_runner_restores_its_mutation_even_when_signalled():
     assert ".negative_control_journal" in ignored, (
         "the recovery journal is not gitignored; it holds a pristine copy of a tracked "
         "source file, so an untracked-file sweep would commit the duplicate")
+
+
+def test_every_negative_control_still_matches_the_code_it_mutates():
+    """Run every ``mutate`` against the real file text, in memory, and require a change.
+
+    The 163 controls are the repo's proof that its guards guard, and nothing in the suite
+    checked that they still apply. A control's anchor is a literal from the file it patches,
+    so the ordinary act of correcting that file retires the control silently: the mutation
+    either raises its own ``assert`` or returns the text unchanged, and neither is visible
+    until somebody runs the 5-minute runner. Measured on merged main: **6 of 163 were dead**
+    -- m70/m71 (README "6 Lambdas" after the fleet became 7), m15 (PROJECT_STATE's row, same
+    cause) and m134-m137 (the four redaction coverage counts, stale since the repo grew from
+    161 tracked files to 163). Worse, an anchor that raises escaped the runner's loop
+    entirely, so cases 70-143 never ran at all while the process still exited non-zero for
+    one honest-looking reason. Both halves are fixed; this is the half that makes the next
+    one cost a second instead of a release.
+
+    Nothing is written to disk. Each ``mutate`` is a pure text transform, so the check is to
+    read the target, call it, and compare -- exactly what the runner does before it commits
+    anything. That is why the runner's mutating loop is now under ``if __name__``: this test
+    imports the module, and an import that installed signal handlers or deleted the recovery
+    journal would break pytest and destroy a killed run's only backup.
+    """
+    path = REPO / "tests/negative_controls/monitor_dispatch.py"
+    spec = importlib.util.spec_from_file_location("negative_controls_runner", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    assert not getattr(mod, "failed", None), (
+        "importing the control runner executed its mutating loop; it must run only as a "
+        "script, or this test rewrites tracked files under pytest")
+    assert len(mod.CASES) > 100, f"only {len(mod.CASES)} controls registered -- shape changed?"
+
+    dead = []
+    for name, rel, mutate, _tests in mod.CASES:
+        target = REPO / rel
+        assert target.exists(), f"{name}: mutates {rel}, which does not exist"
+        orig = target.read_text()
+        try:
+            new = mutate(orig)
+        except Exception as exc:                      # noqa: BLE001 - reporting, not handling
+            dead.append(f"{mutate.__name__} ({name}): anchor drifted -- "
+                        f"{type(exc).__name__}: {exc}")
+            continue
+        if new == orig:
+            dead.append(f"{mutate.__name__} ({name}): patch is a no-op against {rel}")
+    assert not dead, (
+        f"{len(dead)} of {len(mod.CASES)} negative controls no longer apply to the code they "
+        "mutate, so the guards they claim to verify are unverified:\n  " + "\n  ".join(dead)
+        + "\nRe-anchor each one on the current text, or derive the anchor instead of "
+        "hardcoding it -- a control naming a literal expires the moment that literal is "
+        "correctly updated.")
 
 
 def test_the_shell_suite_is_documented_with_its_assertion_count():

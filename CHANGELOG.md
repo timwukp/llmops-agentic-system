@@ -5,6 +5,75 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
 ## [Unreleased]
 
+### A page addressed to the conductor is an alert filed where nobody will look
+
+`triage_event_from_bus` has always passed the stuck run down as
+`params.escalation.run_id`, and the comment above `TRIAGE_STAGE` has always said so.
+Nothing read it. Every consumer took the subject from the model's own tool arguments and
+fell back to `event["run_id"]` — which on a triage is `triage-<subject>`, the one id that
+must never be the subject. Measured over every `HumanPaged` row in `llmops-stage-events`
+(12 rows, full scan, `ScannedCount == Count`): **3 are filed under a `triage-` id** —
+`86ab8a14`, `c8b13faa`, `b56281da`, each an ARC-2 lineage run that died with its
+scientific work complete. The alert fired; the audit trail points at the conductor. This
+is the failure the #72 backstop was built to end and could not see, because the backstop
+only asks *whether* a page happened.
+
+- `orchestration/harness_driver/handler.py`: one `triage_subject(event)` reads the subject
+  from the invocation. `handle_page_human`, the `resolve_escalation` branch and
+  `_backstop_page` all call it. The same derivation was spelled three ways, and
+  `_backstop_page`'s copy was the correct one — which is why the backstop's own pages are
+  the ones filed properly, and why the symptom looked intermittent rather than total.
+- **A `required` in a tool schema is a request, not an enforcement.** `run_id` is not in
+  `page_human`'s `required` list at all, and *is* in `resolve_escalation`'s — a model
+  omitted it anyway. Neither fact is the fix: the driver already knows the subject, so the
+  agent's copy is redundant and is now consulted only when the event carries none (the
+  console chat path, where `event["run_id"]` **is** the subject).
+- **A resolve naming no run reported `resolved`.** `if subject:` skipped `put_directive`
+  *and* the reachability check, then fell through to `{"status": "resolved"}` — a status
+  inside `TRIAGE_ANSWERED`, so the backstop stayed quiet too. An unanswered escalation
+  reported as answered, its only record filed under the conductor. It is now rejected back
+  into the same turn naming `page_human`. The returned `run_id` is the subject, not the
+  agent's copy, because the console renders that dict.
+- A page whose subject cannot be derived is still recorded, under the triaging run and
+  saying so (`run_id: ""` in the brief). The alternative is a `put_item` on an empty
+  partition key — a `ValidationException` turning a successfully-published page into a
+  crashed invocation, which is the swallow #72 exists to stop.
+- Tests: 8, and the pre-existing addressing test is now parametrized over all four argument
+  shapes a conductor can produce. It had used only the shape that works on main, which is
+  precisely why it passed while the bug shipped. Negative controls `m141`/`m142` confirm
+  both guards go red when the fix is reverted.
+- **74 of the 164 negative controls had not run in some time, and the exit code said
+  "one failure".** Found by running the full harness to check the two new cases. An anchor
+  that drifts raises out of its `mutate`, and the raise was uncaught: it terminated the
+  loop, so `m70` going stale (README corrected from 6 Lambdas to 7 two PRs earlier, the
+  mutation left behind) meant **cases 70–143 never executed at all** while the process
+  exited 1 for a single named reason that looked like the whole story. A broken anchor now
+  fails that one case and every case still gets its turn, which immediately exposed 6 dead
+  controls — `m70`/`m71` and `m15` (the 6→7 Lambda correction) and `m134`–`m137` (the four
+  redaction coverage counts, stale since the repo grew from 161 tracked files to 163).
+- **A control that hardcodes the number it tests for staleness has the defect it exists to
+  catch.** All four redaction controls named a literal count, so the ordinary act of
+  correcting that comment retired the control. They now read the number off the file and
+  decrement it. `m137` decrements only the *current* half of "N files became M" and skips
+  the value equal to the historical half: the live pair is 162 → 163, where a plain
+  decrement yields 162 → 162, which the guard rejects as "not a change at all" — red for
+  the wrong reason proves nothing about staleness.
+- **A guard nobody runs per commit is a guard that expires quietly.** The only thing that
+  checked a control's anchor was the 5-minute runner.
+  `test_every_negative_control_still_matches_the_code_it_mutates` now calls every `mutate`
+  against the real file text in memory and requires a change, in ~1.7 s with nothing
+  written to disk. It caught its first
+  regression within the same commit: guarding the runner's mutating loop behind
+  `if __name__ == "__main__"` — required so the test can import the module without
+  installing signal handlers over pytest's or deleting a killed run's recovery journal —
+  moved `_restore_from_journal()` from column 0 to column 4 and killed `m85`'s anchor.
+  Control `m143` covers the new guard.
+- Corrected against live SNS, not restated: `llmops-escalations` no longer "has zero
+  subscribers". One confirmed email recipient; 2026-07-29..08-08 the topic published 15 and
+  delivered 11 with 0 failures, the 4 undelivered all predating the 2026-08-02
+  confirmation. `handle_escalate`'s reason for not gating on SNS is unchanged and stronger:
+  a channel that now works is still the one that fails on a throttle.
+
 ### A task token Step Functions has already discarded is an answer, not a crash
 
 `resume_pipeline` has known this since 2026-07-29. The driver did not, and it cost four

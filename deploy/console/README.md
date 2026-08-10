@@ -94,7 +94,7 @@ existing `agent-cicd-admin` stack):
 | `APPROVER_GROUP` | `llmops-approver` | Cognito group that may decide approvals (never the requester) |
 | `DS_GROUP` | `llmops-datascience` | Cognito group that may create/chat tasks and mint upload URLs |
 | `APPROVAL_KEY` | `alias/llmops-approval` | KMS key signing approvals and plan acceptances (hash-chained) |
-| `LLMOPS_SNS_TOPIC` | (empty) | Escalation topic for `page_human`. **Currently has zero subscribers**, so a page publishes into the void — tracked as its own fix |
+| `LLMOPS_SNS_TOPIC` | (empty) | Escalation topic for `page_human`. Had zero subscribers until 2026-08-02; now one confirmed email recipient (measured 2026-08-10: 15 published / 11 delivered / 0 failed, the 4 undelivered all predating the confirmation). Subscribe with `deploy/03_storage.py --escalation-email <addr>`; `ensure_topic` prints `NO SUBSCRIBERS` if it ever goes back to zero |
 | `ALLOWED_ORIGIN` | (empty) | Leave empty: same-origin. Setting it widens CORS |
 | `REFRESH_COOKIE_MAX_AGE_S` | 30 days | httpOnly refresh cookie lifetime |
 
