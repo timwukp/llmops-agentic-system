@@ -68,6 +68,27 @@ only asks *whether* a page happened.
   installing signal handlers over pytest's or deleting a killed run's recovery journal —
   moved `_restore_from_journal()` from column 0 to column 4 and killed `m85`'s anchor.
   Control `m143` covers the new guard.
+- **A control that reads git history passes locally and fails only in CI.** The new guard
+  above ran green on a full-depth worktree (991/991) and went red on the PR, naming `m127` —
+  which read like a seventh drifted anchor and was not. `actions/checkout@v4` clones at
+  **depth 1**: `m127` recovered this repo's account id with `git log --all -S 'arn:aws:iam::'`
+  over historical blobs, and with one commit in the clone the walk found nothing, so the
+  control raised its own "could not reconstruct" assert. Measured: `git clone --depth 1` of
+  this branch shows **1** commit. Depth is only the shallow half — history is the wrong
+  *subject* for a control, and that version was self-expiring, its own assert saying to delete
+  the control if the id ever left history, i.e. the check evaporates exactly when the repo
+  gets cleaner. `m127` now manufactures its precondition instead of excavating it: it adds a
+  fabricated id's digest to `REAL_ACCOUNT_DIGESTS`, making that id watched by the only
+  definition the scanner has, and plants the same id as two adjacent literals. The property
+  under test is unchanged — "no split that reconstructs a *watched* id survives" — and the
+  real id is now never spelled, never looked up, and never needed.
+  `test_no_negative_control_depends_on_commit_history` parses the runner's AST and rejects
+  any `git` argv naming a history subcommand (`log`, `rev-list`, `blame`, `merge-base`, …)
+  while allowing the depth-insensitive index reads (`ls-files`, `show :path`,
+  `diff --cached`) the other controls legitimately use. The fabricated id is itself split
+  across two literals — spelled whole it would be a 12-digit run in a tracked file, moving
+  the run counts `redaction_scan.py` derives and breaking its stated invariant that the
+  *distinct* count never moves. A control may not change the measurement it sits beside.
 - Corrected against live SNS, not restated: `llmops-escalations` no longer "has zero
   subscribers". One confirmed email recipient; 2026-07-29..08-08 the topic published 15 and
   delivered 11 with 0 failures, the 4 undelivered all predating the 2026-08-02

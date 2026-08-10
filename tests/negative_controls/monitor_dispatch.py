@@ -2297,50 +2297,53 @@ def m127(t):
     all. GitHub secret scanning never flagged it either, because an account id is not a
     credential and has no detector.
 
-    The mutation cannot spell the id -- and interestingly, it cannot LOOK IT UP either. The first
-    version of this control tried to recover it from git history (`git grep -oE '[0-9]{12}'` over
-    the commits that touched `arn:aws:iam::`) and found nothing, which is the defect restating
-    itself: the id was never in history as twelve consecutive digits, only ever as two halves. So
-    the recovery has to do what a human reader does -- join adjacent literals FIRST, then look --
-    exactly the step the fixed guard added. It reuses the guard's own `_with_literals_joined` for
-    that, which means this control also fails if that helper is gutted.
+    The mutation cannot spell the real id -- and it must not try to LOOK IT UP either. The first
+    two versions of this control tried to recover it from git history (`git log -S 'arn:aws:iam::'`,
+    then join literals and ask the digest), and that approach has two independent ways to die
+    quietly, one of which it hit:
 
-    The reconstructed split then has to be a REAL match. A guard that merely counted split
-    literals would flag half the scanner (ALLOWED is split on purpose and legitimately so -- those
-    three ids are published by AWS). The property under test is specifically "no split that
-    reconstructs a WATCHED id survives", which is why the guard joins and then asks the digest.
+      * `actions/checkout@v4` clones at depth 1. CI sees ONE commit, the `-S` walk finds nothing,
+        and the control raises "could not reconstruct" -- red on every PR for a reason that has
+        nothing to do with the guard it protects. Measured: a `--depth 1` clone of this branch
+        shows 1 commit against the full history's many.
+      * even at full depth it is archaeology, not a guard. The id was never in history as twelve
+        consecutive digits, only ever as two halves -- the defect restating itself -- and the day
+        the id is scrubbed from history for real, this control's own assert says to delete it.
+        A check whose subject can legitimately disappear cannot be the check.
+
+    So the mutation manufactures the situation instead of excavating it: it adds a fabricated
+    id's digest to `REAL_ACCOUNT_DIGESTS` -- making that id genuinely WATCHED, by the only
+    definition the scanner has -- and writes the same id into the file as two adjacent literals.
+    The property under test is unchanged and needs no history at all: "no split that reconstructs
+    a WATCHED id survives". Raw, the file holds `5555` and `55555555` and no twelve-digit run, so
+    the guard's first pass sees nothing; only after `_with_literals_joined` collapses them does
+    the digest match. That is precisely the step the fixed guard added, and the reason the
+    reconstruction has to be a REAL match: a guard that merely counted split literals would flag
+    half the scanner, since ALLOWED is split on purpose and legitimately so -- those three ids are
+    published by AWS.
+
+    The real account id is therefore never needed, never spelled and never looked up, which is
+    also the property the scanner itself is built around.
     """
     import sys as _sys
     _sys.path.insert(0, str(REPO / "tests"))
     import redaction_scan as _rs
-    _sys.path.insert(0, str(REPO))
-    from tests.test_redaction_scan import _with_literals_joined
 
-    # `-S` narrows to commits that changed the number of occurrences, so this is a handful of
-    # blobs rather than a history walk.
-    revs = subprocess.run(["git", "log", "--all", "-S", "arn:aws:iam::", "--format=%H"],
-                          capture_output=True, text=True, cwd=REPO).stdout.split()
-    found = None
-    for sha in revs:
-        blob = subprocess.run(["git", "grep", "-h", "-oE",
-                               r"([0-9\"'b +]|arn:aws)[0-9\"'b +]{10,60}", sha],
-                              capture_output=True, text=True, cwd=REPO).stdout
-        for cand in dict.fromkeys(re.findall(r"(?<![0-9])[0-9]{12}(?![0-9])",
-                                             _with_literals_joined(blob))):
-            if _rs._digest_matches(cand.encode()):
-                found = cand
-                break
-        if found:
-            break
-    assert found, (
-        "could not reconstruct a watched account id from git history, so this control would "
-        "mutate nothing and pass vacuously. If the id is genuinely gone from every historical "
-        "blob, delete this control and say so -- do not leave it green")
+    # Split here too, and not for symmetry: spelled whole, these twelve digits would be a
+    # 12-digit run in a TRACKED file, which moves the "N such runs, M distinct" counts that
+    # redaction_scan.py derives -- and specifically breaks its stated invariant that the
+    # DISTINCT count never moves because every run in a test is the same published
+    # placeholder. A control is not allowed to change the measurement it sits beside.
+    fabricated = b"5555" + b"55555555"
+    assert fabricated.decode() not in t, (
+        "the fabricated id this control plants is already spelled in the file, so the mutation "
+        "would not be a change -- pick another twelve digits")
+    digest = _rs.account_digest(fabricated)
 
     anchor = "REAL_ACCOUNT_DIGESTS = (\n"
     assert t.count(anchor) == 1, f"the digest tuple has moved; found {t.count(anchor)}"
-    split = f'\n_split_id = b"{found[:6]}" + b"{found[6:]}"\n'
-    return t.replace(anchor, split + anchor, 1)
+    split = f'\n_split_id = b"{fabricated[:4].decode()}" + b"{fabricated[4:].decode()}"\n'
+    return t.replace(anchor, f'{split}{anchor}    "{digest}",\n', 1)
 
 
 case("redaction: this account's id goes back into the scanner as two adjacent halves",
@@ -2731,6 +2734,34 @@ case("controls: a control's own anchor no longer matches the code it mutates",
      "tests/negative_controls/monitor_dispatch.py", m143,
      ["tests/test_docs_claims.py"
       "::test_every_negative_control_still_matches_the_code_it_mutates"])
+
+
+def m144(t):
+    """Give a control a git-history dependency again -- the thing CI has and this laptop hides.
+
+    The reverted defect is `m127`'s original recovery of the account id by walking commits.
+    It cannot be tested by running it here: a full-depth worktree has the history, so the
+    control passes locally no matter what, which is exactly why the guard is structural and
+    exactly why this mutation reintroduces the CALL rather than the failure. The planted argv
+    is the one that shipped, verbatim.
+
+    The paired guard must also be shown NOT to fire on `git ls-files` / `git show :path` /
+    `git diff --cached`, which several controls here use legitimately and which answer
+    identically at depth 1; that half is asserted directly in the guard's own test file,
+    since a negative control can only demonstrate the red direction.
+    """
+    anchor = '    fabricated = b"5555" + b"55555555"\n'
+    assert t.count(anchor) == 1, f"m127's fabricated id has moved; found {t.count(anchor)}"
+    return t.replace(anchor, '    subprocess.run(["git", "log", "--all", "-S", '
+                             '"arn:aws:iam::", "--format=%H"],\n'
+                             '                   capture_output=True, text=True, cwd=REPO)\n'
+                     + anchor, 1)
+
+
+case("controls: a control reads git commit history, which CI clones at depth 1",
+     "tests/negative_controls/monitor_dispatch.py", m144,
+     ["tests/test_docs_claims.py"
+      "::test_no_negative_control_depends_on_commit_history"])
 
 
 #: Where the pristine text of the file currently mutated is parked, so a kill -9 -- which
