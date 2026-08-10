@@ -83,6 +83,46 @@ def _is_triage(event) -> bool:
     return event.get("stage") == TRIAGE_STAGE and event.get("task") == TRIAGE_TASK
 
 
+#: A triage return status that means the escalation was actually ANSWERED -- a verdict
+#: reached a listening agent, a run was relaunched, the owner was told, or the turn is
+#: not over yet. Anything else means the conductor finished and the stuck run is still
+#: stuck with nobody informed, which is what _backstop_page exists to prevent.
+#:
+#: `escalated` counts because handle_escalate publishes to the escalation SNS topic, so a
+#: human IS reached. `self_reinvoked_between_turns` counts because the work continues in
+#: the next invocation; paging there would page once per Lambda boundary.
+TRIAGE_ANSWERED = ("resolved", "dispatched", "paged", "escalated",
+                   "self_reinvoked_between_turns")
+
+
+def dispatch_is_possible(event) -> bool:
+    """Can ``launch_run`` actually succeed on THIS invocation?
+
+    service_launch_run refuses without a KMS-verifiable approval record, taken from
+    ``args["approval"]`` or from ``expected["approval"]``. On the driver path neither
+    exists:
+
+      * ``expected`` comes from ``params.approval_context``, and NOTHING in the repo
+        writes that key -- triage_event_from_bus builds params with `escalation` alone.
+        It has been a read with no writer since the branch was added.
+      * the agent cannot supply it either: ``approval`` is not among the properties
+        ``launch_run`` declares in agents/orchestrator/harness.json, so a conductor that
+        tried would have the field dropped before the driver ever saw it.
+
+    So launch_run on the driver path always came back "no approval record present" --
+    while the undeliverable-verdict rejection was telling the conductor to use it. That
+    is a dead end dressed as a choice, the exact phrase this file already uses for the
+    previous incarnation of the same defect: a rejection naming a path that cannot work
+    leaves triage nowhere to go, and the turn ends in prose.
+
+    Live, 2026-08-05 to 2026-08-08: 4 of the 9 runs whose escalation was triaged got
+    ZERO HumanPaged stage-event -- the conductor was sent to launch_run, refused, and
+    ran out of moves. The other 5 paged, which is why the channel looked half-working.
+    """
+    ctx = (event.get("params") or {}).get("approval_context") or {}
+    return bool(ctx.get("approval"))
+
+
 def triage_event_from_bus(record: dict, bucket: str) -> dict:
     """Turn an EventBridge EscalatedToHuman event into a driver invocation.
 
@@ -766,6 +806,60 @@ def handle_page_human(c, event, args: dict) -> dict:
     return {"ok": True, "run_id": subject_run}
 
 
+def _backstop_page(c, event, outcome: dict) -> dict:
+    """Page the owner when a triage ended without answering the escalation.
+
+    The escalation bus has exactly ONE rule (`llmops-escalation-triage`) and exactly one
+    target (this Lambda). The state machine's EscalateFail is a bare `events:putEvents`
+    with no SNS anywhere on the path -- so on the state-machine escalation path the
+    conductor is not the FIRST line to a human, it is the ONLY one. If its turn ends
+    without resolving, dispatching or paging, nobody is ever told: the run row reads
+    `failed`, the execution reads FAILED, and the only trace is a log stream.
+
+    That is the third layer of this defect and the reason it looked intermittent. Layer 1
+    was a rejection naming an exit that cannot work; layer 2 is that launch_run genuinely
+    cannot dispatch from a bus triage; layer 3 is that failing both costs the owner
+    nothing but silence. Measured 2026-08-05..08: 11 of 11 directives ever parked were
+    undeliverable, and 4 of the 9 triaged runs produced no HumanPaged event at all --
+    c8b13faa, 86ab8a14 and b56281da among them, each an ARC-2 lineage run that died with
+    scientific work complete and nobody notified.
+
+    Best effort by construction: it runs on the way out, after the outcome is already
+    decided, and a failure to page must not turn a merely-unanswered triage into a
+    crashed invocation. The brief says plainly that it comes from the driver, not from
+    the conductor's judgment, so an owner reading it knows the agent did not choose to
+    escalate -- it simply stopped.
+    """
+    if not _is_triage(event) or outcome.get("status") in TRIAGE_ANSWERED:
+        return outcome
+    subject = ((event.get("params") or {}).get("escalation") or {}).get("run_id", "")
+    try:
+        handle_page_human(c, event, {
+            "run_id": subject,
+            "situation": (
+                f"Triage of {subject or 'an escalation'} ended without resolving it "
+                f"(driver outcome: {outcome.get('status', 'unknown')}"
+                + (f" -- {outcome['reason']}" if outcome.get("reason") else "") + "). "
+                "No verdict was delivered, no run was dispatched, and the conductor did "
+                "not page you itself. This page is the driver's backstop, not the "
+                "conductor's judgment."),
+            "options": [
+                "Read the run's stage events and decide the corrective action yourself",
+                "Relaunch the work from the console's Tasks tab with adjusted params "
+                "(a dispatch needs your signature; the conductor cannot sign one)",
+                "Close the run as a documented failure",
+            ],
+            "recommendation": (
+                "Open the stuck run in the console and decide directly: an unanswered "
+                "triage means the automated path is exhausted for this run."),
+        })
+    except Exception as exc:  # noqa: BLE001 — a failed page must not mask the outcome
+        print(f"[driver] backstop page failed for triage of {subject}: "
+              f"{type(exc).__name__}: {exc}")
+        return outcome
+    return {**outcome, "backstop_paged": True}
+
+
 def handle_finops_tool(c, event, name: str, args: dict) -> dict:
     """Service one of the finops agent's terminal tools.
 
@@ -916,7 +1010,11 @@ def handler(event, context=None, clients=None):
     if event.get("detail-type") == ev.ESCALATED_TO_HUMAN and "detail" in event:
         event = triage_event_from_bus(event, os.environ["DATA_BUCKET"])
     try:
-        return _run_stage(event, context, c)
+        # _backstop_page wraps the RETURN, not a branch inside the loop, so it covers
+        # every way a triage can end without answering -- prose after re-asks, an
+        # unsupported tool, a rejected page, a stage_complete that decided nothing. A
+        # check placed at any single one of those would have to be repeated at the rest.
+        return _backstop_page(c, event, _run_stage(event, context, c))
     except Exception as exc:
         token = event.get("task_token")
         if token:
@@ -927,6 +1025,11 @@ def handler(event, context=None, clients=None):
             except Exception as report_exc:  # noqa: BLE001
                 # Nothing left to do but say so; the timeout is now the only backstop.
                 print(f"[driver] could not fail the parked token: {report_exc}")
+        # A crashed triage is also an unanswered one, and the crash reaches nobody but
+        # CloudWatch: a bus triage has no task token, so there is no send_task_failure
+        # above to carry the news and no state machine waiting to hear it.
+        _backstop_page(c, event, {"status": "crashed",
+                                  "reason": f"{type(exc).__name__}: {exc}"[:500]})
         raise
 
 
@@ -1173,19 +1276,35 @@ def _run_stage(event, context=None, c=None):
                         actor="conductor")
                     if not parked["reachable"]:
                         # Rejected back to the conductor, not returned as a verdict:
-                        # a rejection it can still act on (relaunch the stage via
-                        # launch_run, or page_human) in the SAME turn. Returning here
-                        # would end the triage having done nothing, which is the bug.
+                        # a rejection it can still act on in the SAME turn. Returning
+                        # here would end the triage having done nothing, which is the bug.
+                        #
+                        # The rejection names only exits that can actually SUCCEED on
+                        # this invocation. It used to name launch_run unconditionally --
+                        # but on the bus-triage path launch_run has no approval record to
+                        # verify against and always refuses (see dispatch_is_possible),
+                        # so the conductor was handed two doors of which one was painted
+                        # on. Live: 4 of 9 triaged escalations produced no page at all.
+                        can_dispatch = dispatch_is_possible(event)
                         messages = _tool_result_content(tu, {
                             "status": "undeliverable",
                             "run_status": parked["run_status"],
+                            "can_dispatch": can_dispatch,
                             "reason": (
                                 f"run {subject} is {parked['run_status']}: its execution "
                                 "has ended, so no agent will ever read this directive. "
                                 "The decision is recorded for audit but CHANGES NOTHING. "
-                                "To act on it, relaunch the work with launch_run "
-                                "(carrying your adjusted_params), or call page_human if "
-                                "that is above your authority.")})
+                                + ("To act on it, relaunch the work with launch_run "
+                                   "(carrying your adjusted_params), or call page_human "
+                                   "if that is above your authority."
+                                   if can_dispatch else
+                                   "This invocation carries no signed approval, so "
+                                   "launch_run CANNOT dispatch a replacement run from "
+                                   "here -- only a human can authorize one. Call "
+                                   "page_human now with your decision as the "
+                                   "recommendation: situation, options, and the "
+                                   "adjusted_params you would have applied. That is the "
+                                   "only exit that changes anything from here."))})
                         continue
                 _invoke(c["agentcore"], event["harness_id"], sess,
                         _tool_result_content(tu, {"status": "recorded"}),

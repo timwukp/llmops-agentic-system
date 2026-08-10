@@ -280,6 +280,40 @@ chat worker 處理它 —— 但 triage 從來不是 chat：`EscalatedToHuman` �
 出口，也不可能只接一半。此外，一次 page 若沒有同時帶 `situation` 與 `recommendation`
 就會被駁回：把問題丟給 owner 而不附上你已經做完的分析，等於讓他們留在原地。
 
+**被指名的逃生口，必須是一扇打得開的門。** 把 `page_human` 接到 driver 路徑上，只修好了
+那個駁回的一半；另一半指向 `launch_run`，而它在一次 bus triage 上**根本不可能成功**。
+`service_launch_run` 沒有可被 KMS 驗證的 approval 紀錄就會拒絕，而該紀錄只能來自
+`args["approval"]` 或 `params.approval_context` —— 由 `triage_event_from_bus` 建出來的
+triage 兩者都沒有：整個 repo 從來沒有任何地方寫過 `approval_context`（它是一個**有讀無寫**
+的鍵），而 `approval` 也不在 orchestrator harness 為 `launch_run` 宣告的屬性裡，所以連
+agent 自己都無法提供。指揮家被交了兩扇門，其中一扇是畫上去的。2026-08-05 至 08 實測：
+9 個escalation 被分診過的 run 裡，**有 4 個完全沒有產生 `HumanPaged` 事件** —— 被送去一個
+必定拒絕它的工具，它用完了所有的棋，那一輪就以散文結束。現在駁回只會指名**在這次呼叫上
+真的可行**的出口：由 `dispatch_is_possible(event)` 判定，為 false 時理由會明講「只有人類
+能授權一個替代的 run」，而 `page_human` 是唯一能改變任何事的路。當簽章 approval **確實**
+存在時，派發的建議保持原樣 —— 一個把可行情況也一起砍掉的守護，等於把指揮家本來有權做的
+決定丟回給 owner。
+
+**在這條路徑上，指揮家不是人類的第一道防線 —— 它是唯一的一道。** triage 條款寫著它是
+「FIRST line」，這對 driver 自己的 `handle_escalate` 成立（它會先發布到 escalation SNS
+topic 才發事件）。但對狀態機的 `EscalateFail` 不成立：那是一個裸的 `events:putEvents`，
+而 bus 上恰好只有一條 rule（`llmops-escalation-triage`）、恰好只有一個 target（driver），
+整條路徑上**沒有任何 SNS**。所以一次沒有 resolve、沒有派發、也沒有 page 的 triage，
+**誰都不會被通知** —— run 列讀作 `failed`、execution 讀作 FAILED，唯一的痕跡是一條
+log stream。這正是這個缺陷看起來時好時壞、而其實是全面失效的原因：**歷來被 park 的 11 筆
+directive，11 筆都是 `deliverable: false`**，而沒有收到 page 的那些 run，恰好就是指揮家
+**聽話地**依照駁回去嘗試 `launch_run` 的那些。實際傷亡包括
+`run-20260808T005301Z-c8b13faa`、`run-20260805T144522Z-86ab8a14` 與
+`run-20260808T024809Z-b56281da` —— 每一個都是科學工作已經完成、而 owner 從未被告知就死掉
+的 ARC-2 血脈 run。現在由 `_backstop_page` 收口：一次 triage 的結果若不在
+`TRIAGE_ANSWERED` 裡，就在離開前 page owner，並明講這封 page 是 driver 的兜底、不是指揮家
+的判斷。它包住的是 `handler` 的 `return`，而不是迴圈裡的任何一個分支，所以它涵蓋 triage
+所有「沒有回答就結束」的方式 —— re-ask 用完後的散文、不支援的工具、被駁回的 page、什麼都
+沒決定的 `stage_complete` —— 也涵蓋 crash 路徑：一次 bus triage 沒有 task token，
+`send_task_failure` 因此也把消息帶給了沒有人。它在設計上就是 best-effort：一封發不出去的
+page 不可以把「只是沒回答」的 triage 變成「崩潰」的呼叫，那是拿一個安靜的失敗換一個更大聲
+的錯誤。
+
 **發出去卻沒有 rule 的事件，是一個沒有路可以走的承諾。** 上面那段說 `EscalatedToHuman`
 事件「路由到的是 **driver**」。它並沒有。`llmops-pipeline` bus 從 Phase 1 到 Phase 5
 一共掛著**零**條 EventBridge rule，而這個 detail-type 有三處在發、在這份文件裡被寫成會

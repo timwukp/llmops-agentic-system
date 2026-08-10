@@ -5,6 +5,54 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
 ## [Unreleased]
 
+### An unanswered triage now reaches the owner; the rejection stops naming a door that is painted on
+
+Three layers of one defect. Together they made the escalation answer channel a total
+loss that looked intermittent: **11 of the 11 directives ever parked in
+`llmops-stage-events` are `deliverable: false, delivered: false`** — the channel has
+never once delivered a verdict — and of the 9 runs whose escalation was triaged between
+2026-08-05 and 08, **4 produced no `HumanPaged` event at all.**
+
+- **The rejection named an exit that cannot open.** When a verdict is undeliverable the
+  driver rejects it back into the same turn naming `launch_run` or `page_human`. But
+  `service_launch_run` refuses without a KMS-verifiable approval record, and a triage
+  built by `triage_event_from_bus` has none: nothing in the repo has ever written
+  `params.approval_context` (a read with no writer), and `approval` is not a declared
+  property of `launch_run` in `agents/orchestrator/harness.json`, so the agent cannot
+  supply one either. New `dispatch_is_possible(event)` decides, and when dispatch is
+  impossible the reason says so and names `page_human` as the only exit that changes
+  anything. With a signed approval present the advice is unchanged — pinned by its own
+  test, because a guard that amputated the working case would hand the owner decisions
+  the conductor was authorized to make.
+- **On the state-machine path the conductor is the ONLY line to a human, not the first.**
+  `EscalateFail` is a bare `events:putEvents`; the `llmops-pipeline` bus has exactly one
+  rule (`llmops-escalation-triage`) with exactly one target (this driver); there is no
+  SNS anywhere after it. So a triage that ends without resolving, dispatching or paging
+  tells nobody: the run row reads `failed`, the execution reads FAILED, the only trace is
+  a log stream. New `_backstop_page` pages the owner when the outcome is not in
+  `TRIAGE_ANSWERED`, stating plainly that the page is the driver's backstop and not the
+  conductor's judgment. It wraps the `return` in `handler` rather than a branch inside the
+  loop, so it covers every way a triage can end unanswered — prose after the re-asks, an
+  unsupported tool, a rejected page, a `stage_complete` that decided nothing — plus the
+  crash path, where a bus triage has no task token and `send_task_failure` therefore
+  reaches no one. Best-effort by construction: a page that cannot be sent must not turn a
+  merely-unanswered triage into a crashed invocation.
+- Live casualties, each an ARC-2 lineage run that died with its scientific work complete
+  and its owner never told: `run-20260808T005301Z-c8b13faa`,
+  `run-20260805T144522Z-86ab8a14`, `run-20260808T024809Z-b56281da`.
+- Tests: 10 new. Mutation-verified five ways — unwiring the backstop on the success path
+  reds the named regression; removing it entirely reds 2; restoring the unconditional
+  rejection wording reds the layer-1 test; forcing `dispatch_is_possible` to True reds 2;
+  adding `"failed"` to `TRIAGE_ANSWERED` reds 2 including the derived guard that keeps
+  that tuple honest. `test_the_answered_statuses_are_the_ones_the_driver_can_return`
+  derives the set of statuses the driver really returns, so a typo in `TRIAGE_ANSWERED`
+  cannot silently disable the backstop.
+- One existing test corrected, not merely re-run:
+  `test_the_driver_recognises_a_bus_delivery_at_its_entry_point` stubbed `_run_stage` to
+  return `{"status": "ok"}` — a status no `return` in the driver produces. The backstop
+  correctly read it as unanswered and paged. A double answering with a value production
+  never emits is a double that tests a path production does not have.
+
 ### The env a Lambda needs is read from its handler, not copied by hand
 
 `LAMBDAS["driver"]["env_keys"]` named six variables; `harness_driver/handler.py` reads
