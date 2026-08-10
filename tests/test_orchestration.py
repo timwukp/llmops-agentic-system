@@ -5373,3 +5373,243 @@ class TestSessionRolloverDocs:
                 f"{name} does not mention AgentCore's session lifetime cap"
             assert "epoch" in text.lower(), \
                 f"{name} does not document the session-epoch rollover"
+
+
+# --- #73: a dead task token is an answer, not a crash ---------------------------------
+def _gone(code="TaskTimedOut", op="SendTaskFailure"):
+    from botocore.exceptions import ClientError
+    msg = "Provided task does not exist anymore"
+    return ClientError({"Error": {"Code": code, "Message": msg}}, op)
+
+
+class _SfnRaising(FakeSfn):
+    """A Step Functions client whose settles raise. Both settles, one exception."""
+
+    def __init__(self, exc):
+        super().__init__()
+        self.exc = exc
+        self.attempts = []
+
+    def send_task_success(self, **kw):
+        self.attempts.append(kw)
+        raise self.exc
+
+    def send_task_failure(self, **kw):
+        self.attempts.append(kw)
+        raise self.exc
+
+
+class TestDeadTaskTokenSettle:
+    """Live: the driver crashed FOUR times settling a token Step Functions had already
+    discarded -- 2026-08-05T15:39:51Z, then 05:50:48Z / 05:52:03Z / 05:54:28Z on
+    2026-08-09. The last three are ONE incident: the raise made Lambda mark the async
+    invocation failed, Lambda retried it twice, and each retry was a fresh billed
+    AgentCore turn re-running an agent whose stage had already been decided, against a
+    token none of them could settle. resume_pipeline had known this since 2026-07-29;
+    the driver did not.
+    """
+
+    @pytest.mark.parametrize("code", ["TaskTimedOut", "TaskDoesNotExist"])
+    def test_a_dead_token_does_not_take_the_re_asks_exhausted_path_down(self, code):
+        """The exact live crash. Three prose turns exhaust the re-asks, the driver
+        settles MissingStageComplete, and the token is gone -- which changes nothing
+        about the verdict: the stage still failed, PipelineFailed must still be emitted,
+        and the invocation must still return rather than raise into Lambda's retry."""
+        ac = FakeAgentCore([text_stream("one"), text_stream("two"), text_stream("three")])
+        c = clients(ac)
+        c["sfn"] = _SfnRaising(_gone(code))
+        out = driver.handler(driver_event(), clients=c)
+        assert out["status"] == "failed", "a dead token turned a decided stage into a crash"
+        assert c["sfn"].attempts, "guard reads the wrong thing: no settle was attempted"
+        assert any(e["DetailType"] == ev.PIPELINE_FAILED for e in c["events"].entries), \
+            "the settle exception ate the only durable record that the stage failed"
+
+    @pytest.mark.parametrize("code", ["ThrottlingException", "InternalServerError",
+                                      "InvalidToken", "AccessDeniedException"])
+    def test_a_settle_that_might_still_land_still_raises(self, code):
+        """The discriminating half, and the reason this is code-matched rather than a
+        bare `except Exception`. A throttle or a 5xx means the settle may yet succeed, so
+        the invocation must fail and let Lambda retry it. Swallowing those would strand
+        the token for its full TimeoutSeconds -- 86400s, a day, on every long-work state
+        -- which is the zombie MarkRunDone and MarkRunFailed exist to prevent."""
+        ac = FakeAgentCore([text_stream("one"), text_stream("two"), text_stream("three")])
+        c = clients(ac)
+        c["sfn"] = _SfnRaising(_gone(code))
+        with pytest.raises(Exception) as ei:
+            driver.handler(driver_event(), clients=c)
+        assert code in str(ei.value)
+
+    def test_a_dead_token_does_not_stop_a_completed_stage_from_reporting(self):
+        """The success settle. A stage that DID the work and wrote its artifacts must
+        still return completed when the execution that asked for it has since ended:
+        the S3 outputs and the stage event are the durable record, and the token was
+        only ever the way to tell the state machine. Nothing to tell is not a failure."""
+        uri = "s3://llmops-data-test/runs/run-test-1/raw/data.jsonl"
+        ac = FakeAgentCore([tool_use_stream("stage_complete", {"outputs": [uri]}),
+                            text_stream("ack")])
+        c = clients(ac, FakeS3(existing=[uri]))
+        c["sfn"] = _SfnRaising(_gone(op="SendTaskSuccess"))
+        out = driver.handler(driver_event(), clients=c)
+        assert out["status"] == "completed"
+
+    def test_a_dead_token_does_not_stop_an_escalation_from_reaching_a_human(self):
+        """handle_escalate's settle is LAST for a reason (#72's third layer: the
+        conductor is the only line to a human on this path). If the settle raising took
+        the return down, the caller would see a crash on an escalation that had already
+        published to SNS and emitted its event -- and would retry all of it."""
+        c = clients()
+        c["sfn"] = _SfnRaising(_gone())
+        out = driver.handle_escalate(c, driver_event(), {"reason": "budget exhausted"})
+        assert out["escalated"] is True
+        assert c["sns"].published, "guard reads the wrong thing: nothing was published"
+
+    def test_the_crash_settle_still_re_raises_the_original_cause(self):
+        """The handler wrapper's settle reports a crash. If the token is gone, the
+        REAL exception must still surface -- swallowing it would turn a genuine driver
+        bug into a silent success, which is the failure the wrapper was built to end
+        (run-...-8b864805 held its token 90 minutes while a log stream was the only
+        participant who knew). The dead token changes who hears, not whether."""
+        class _Dead:
+            def invoke_harness(self, **kw):
+                raise RuntimeError("AccessDeniedException on InvokeHarness")
+
+        c = clients(_Dead())
+        c["sfn"] = _SfnRaising(_gone())
+        with pytest.raises(RuntimeError) as ei:
+            driver.handler(driver_event(), clients=c)
+        assert "AccessDenied" in str(ei.value), \
+            "the settle's own exception replaced the crash it was reporting"
+        assert c["sfn"].attempts[-1]["error"] == "DriverCrashed", \
+            "guard reads the wrong thing: the crash settle was never attempted"
+
+    def test_settle_token_picks_the_call_from_the_arguments_it_was_given(self):
+        """A funnel that took a boolean would let a failure path report success on a
+        typo. `output=` means success, its absence means failure -- so the wrong call
+        cannot be reached by passing the wrong value, only by passing the wrong key."""
+        sfn = FakeSfn()
+        assert driver.settle_token(sfn, "tok", output="{}") is True
+        assert sfn.successes and not sfn.failures
+        assert driver.settle_token(sfn, "tok", error="E", cause="c") is True
+        assert len(sfn.failures) == 1 and sfn.failures[0]["error"] == "E"
+
+    def test_settle_token_reports_whether_it_settled(self):
+        """False is not cosmetic: it is how a caller that must act differently on a
+        dead token (a future one -- none does today) can, without re-deriving the
+        error code its own except block already threw away."""
+        assert driver.settle_token(_SfnRaising(_gone()), "tok", error="E") is False
+        assert driver.settle_token(FakeSfn(), "tok", error="E") is True
+
+    def test_every_settle_in_the_driver_goes_through_the_funnel(self):
+        """The bug was one unguarded settle out of four. Guarding the one that crashed
+        would leave three, and the next one to be hit would read as a new bug. Derived
+        from the source so a fifth settle added later fails HERE rather than in
+        production -- the same reason #71 derives env_keys instead of listing them."""
+        src = (REPO / "orchestration/harness_driver/handler.py").read_text()
+        body = src.split("def settle_token(", 1)[1].split("\ndef ", 1)[0]
+        outside = [ln.strip() for ln in src.splitlines()
+                   if re.search(r"\bsend_task_(success|failure)\s*\(", ln)
+                   and ln not in body.splitlines()
+                   and not ln.lstrip().startswith("#")]
+        assert not outside, (
+            "these settles bypass settle_token(), so a dead token still crashes the "
+            f"driver there: {outside}")
+
+    def test_the_two_lambdas_that_settle_tokens_share_one_definition_of_gone(self):
+        """resume_pipeline had TASK_GONE_CODES for ten days before the driver crashed on
+        the same error. Copying the constant a second time would make the two agree only
+        until someone edited one of them, so both import it -- and neither redefines it."""
+        for rel in ("orchestration/harness_driver/handler.py",
+                    "orchestration/resume_pipeline/handler.py"):
+            src = (REPO / rel).read_text()
+            assert "from pipeline.contracts.task_tokens import is_task_gone" in src, \
+                f"{rel} does not import the shared definition"
+            assert not re.search(r"^TASK_GONE_CODES\s*=", src, re.M), \
+                f"{rel} re-defines TASK_GONE_CODES instead of importing it"
+
+    def test_is_task_gone_survives_an_exception_with_no_response(self):
+        """It is called from inside except blocks whose whole job is deciding what to do
+        next. A classifier that throws while classifying turns one failure into two."""
+        from pipeline.contracts.task_tokens import is_task_gone
+        assert is_task_gone(ValueError("not a botocore error")) is False
+        assert is_task_gone(_gone()) is True
+
+    def test_the_bundle_carries_every_module_the_handlers_import(self):
+        """task_tokens.py is imported by two handlers, and the bundle's file list was
+        hand-maintained: nothing would have noticed. The deploy would have reported
+        success and the driver would have died at cold start on ModuleNotFoundError --
+        on the code path added to stop it dying. Derived now, from the `except
+        ImportError` branch, because that branch IS the flat bundle layout."""
+        dep = _load("deploy_lambdas_bundle", "deploy/07_lambdas.py")
+        vendored = set(dep.vendored_modules())
+        assert {"events", "report", "conductor_tools", "task_tokens",
+                "manifest.schema.json"} <= vendored, vendored
+        import zipfile as _zip
+        for key, cfg in dep.LAMBDAS.items():
+            names = set(_zip.ZipFile(io.BytesIO(dep.bundle(cfg["src"]))).namelist())
+            assert "handler.py" in names
+            for mod in dep.flat_imports(cfg["src"].read_text()):
+                assert f"{mod}.py" in names, \
+                    f"{key}'s bundle omits {mod}.py, which its handler imports"
+
+    def test_the_bundle_refuses_a_module_it_cannot_find(self):
+        """The alternative to a hand-list is not a silent skip. A fallback import naming
+        a module that is in neither vendor directory is unshippable, and saying so at
+        build time is the only place anyone will read it -- update_function_code returns
+        200 for a zip that cannot import itself."""
+        dep = _load("deploy_lambdas_missing", "deploy/07_lambdas.py")
+        src = pathlib.Path(str(REPO / "tests/negative_controls")) / "_nc_bundle_handler.py"
+        src.write_text("try:\n    import x\nexcept ImportError:\n"
+                       "    import definitely_not_a_module\n")
+        try:
+            with pytest.raises(SystemExit) as ei:
+                dep.vendored_modules([src])
+            assert "definitely_not_a_module" in str(ei.value)
+        finally:
+            src.unlink()
+
+    def test_flat_imports_reads_the_fallback_branch_not_every_indented_import(self):
+        """The first attempt was a regex on indented import lines. It matched 22 names
+        across the seven handlers -- every function-local `import json`, `import boto3`,
+        and the `pipeline`/`orchestration` package heads from the TRY branch. Indentation
+        says nested; it does not say nested in the fallback."""
+        dep = _load("deploy_lambdas_flat", "deploy/07_lambdas.py")
+        got = dep.flat_imports(
+            "import os\n"
+            "try:\n"
+            "    from pipeline.contracts import events as ev\n"
+            "except ImportError:\n"
+            "    import events as ev\n"
+            "    from task_tokens import is_task_gone\n"
+            "def f():\n"
+            "    import boto3\n"
+            "    try:\n"
+            "        pass\n"
+            "    except ValueError:\n"
+            "        import decimal\n")
+        assert got == ["events", "task_tokens"], got
+
+    def test_every_bundle_actually_imports_with_only_its_own_contents(self):
+        """The static guard above checks the file LIST. This one does what cold start
+        does: unzip, put only that directory on the path, `import handler`.
+
+        Proven non-vacuous by rebuilding the driver and resume bundles with
+        task_tokens.py withheld -- the zip a hand-maintained list would have shipped --
+        which fails here with `ModuleNotFoundError: No module named 'task_tokens'`, the
+        exact error production would have raised on the first invocation after deploy.
+        A list-comparison test can only ever confirm the list I wrote; an import
+        confirms the zip.
+        """
+        import subprocess
+        import tempfile
+        import zipfile as _zip
+        dep = _load("deploy_lambdas_coldstart", "deploy/07_lambdas.py")
+        for key, cfg in dep.LAMBDAS.items():
+            d = tempfile.mkdtemp()
+            _zip.ZipFile(io.BytesIO(dep.bundle(cfg["src"]))).extractall(d)
+            r = subprocess.run([sys.executable, "-c", "import handler"],
+                               cwd=d, capture_output=True, text=True,
+                               env={**os.environ, "PYTHONPATH": d,
+                                    "AWS_REGION": "us-east-1"})
+            assert r.returncode == 0, (
+                f"{key}'s bundle cannot import itself, so the function is dead at cold "
+                f"start however green the deploy looked:\n{r.stderr[-2000:]}")

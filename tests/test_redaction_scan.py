@@ -218,7 +218,7 @@ def test_binary_classification_matches_git_for_every_tracked_file():
     purpose -- the finding is that a skip count nobody reads is where a guard goes to hide, and
     that finding does not expire when the arithmetic changes.) A guard whose name says "for every
     tracked file" was checking zero of them on the only machine that gates the merge, and
-    reported green for it. Against `4b825dc…` the diff is the whole index -- 162 files, 35 of
+    reported green for it. Against `4b825dc…` the diff is the whole index -- 163 files, 35 of
     them binary -- so it can never be empty and there is nothing left to skip on.
     """
     out = subprocess.run(["git", "diff", "--cached", "--numstat", _EMPTY_TREE],
@@ -237,7 +237,7 @@ def test_binary_classification_matches_git_for_every_tracked_file():
             f"{path}: git says binary={git_says_binary}, is_binary() disagrees")
         checked += 1
     # EVERY tracked file, which is what the name promises -- not "at least one". `assert checked`
-    # was the old floor, and it is satisfied by checking a single file out of 162: a diff against
+    # was the old floor, and it is satisfied by checking a single file out of 163: a diff against
     # HEAD covers only what this branch happens to touch, so the coverage of this guard silently
     # tracked the size of the working change. Comparing against `git ls-files` makes the promise
     # in the name falsifiable, and is what fails if the diff base is ever narrowed again.
@@ -667,7 +667,10 @@ def test_the_scanners_own_coverage_claims_match_the_repo():
 
     These numbers are load-bearing in a way a reader cannot check: they are the evidence for
     dropping the generic 12-digit rule on binaries ("measured across all N tracked files there
-    are 52 such runs") and for the empty-tree diff base covering everything. They were carefully
+    are M such runs") and for the empty-tree diff base covering everything. The counts are NOT
+    quoted here -- a docstring citing "52 such runs" is one more unchecked copy of exactly the
+    number this test derives, and it went stale the moment the env_keys tests added two runs.
+    They were carefully
     re-measured when the walkthrough mp4 and its poster were deleted -- and then left as prose,
     with nothing deriving them, which is the same defect three earlier commits in this repo
     fixed elsewhere. Re-measuring describes how a number was PRODUCED; it says nothing about
@@ -715,3 +718,19 @@ def test_the_scanners_own_coverage_claims_match_the_repo():
             f"the comment says the count became {now}, the repo has {real['tracked']} files")
         assert was != now, (
             f"the comment records {was} -> {now}, which is not a change at all")
+
+    # The 12-digit run counts in the same sentence, derived too. They were the ONE half of
+    # that sentence nothing checked: "162 files became 163" was caught by the guard above,
+    # while "52 such runs, 9 distinct" sat one clause away, hand-edited, and a mutation to
+    # `8 distinct` passed the whole suite. The counts are the entire argument for dropping
+    # the generic 12-digit rule on binaries -- the cheapness claim is what makes the KDF
+    # affordable -- so the number that carries the argument cannot be the number nobody
+    # derives. Same finding as the file counts, one clause later.
+    m = re.search(r"there are (\d+) such runs, (\d+) distinct", src)
+    assert m, ("tests/redaction_scan.py: no 12-digit run-count claim -- that count is the "
+               "evidence for hashing only candidates. Update the pattern, do not drop it")
+    runs = [c for p in tracked
+            for c in rs._ACCOUNT_CANDIDATE.findall((REPO / p).read_bytes())]
+    assert (int(m.group(1)), int(m.group(2))) == (len(runs), len(set(runs))), (
+        f"the comment claims {m.group(1)} runs / {m.group(2)} distinct, the repo has "
+        f"{len(runs)} / {len(set(runs))}")

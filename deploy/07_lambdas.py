@@ -18,6 +18,7 @@ Usage:
   python deploy/07_lambdas.py --region us-east-1 --only triage_rule     # bus rule only
 """
 import argparse
+import ast
 import io
 import json
 import pathlib
@@ -139,18 +140,91 @@ LAMBDAS = {
 STATE_MACHINE_NAME = "llmops-pipeline"
 
 
+# Where a flat bundle module name is allowed to come from, in search order. Both dirs,
+# because the vendored set spans them: the contracts plus conductor_tools.py.
+VENDOR_DIRS = (CONTRACTS, REPO / "orchestration")
+
+#: Bundled although no handler imports it: the manifest schema is data, not a module, and
+#: the schema is the artifact contract every stage writes against. Listed by hand because
+#: an import scan cannot see a file nothing imports.
+VENDOR_DATA = ("manifest.schema.json",)
+
+def flat_imports(text: str) -> list:
+    """Module names imported inside an `except ImportError:` handler, in source order.
+
+    Parsed with `ast`, not grepped. A regex over indented `import` lines was the first
+    attempt and it matched 22 names -- every function-local `import json`, every `import
+    boto3`, and the `pipeline`/`orchestration` package heads from the try branch above.
+    Indentation says "nested"; it does not say "nested in the fallback". Only the AST
+    knows which handler an import sits in, and that is precisely the question here.
+    """
+    out = []
+    for node in ast.walk(ast.parse(text)):
+        if not isinstance(node, ast.Try):
+            continue
+        for h in node.handlers:
+            names = ([h.type.id] if isinstance(h.type, ast.Name)
+                     else [e.id for e in getattr(h.type, "elts", [])
+                           if isinstance(e, ast.Name)])
+            if "ImportError" not in names:
+                continue
+            for stmt in ast.walk(ast.Module(body=h.body, type_ignores=[])):
+                if isinstance(stmt, ast.Import):
+                    out += [a.name for a in stmt.names]
+                elif isinstance(stmt, ast.ImportFrom) and stmt.module and not stmt.level:
+                    out.append(stmt.module)
+    return out
+
+
+def vendored_modules(srcs=None) -> dict:
+    """The flat modules every bundle carries, DERIVED from what the handlers import.
+
+    Hand-listed until #73. The list had drifted before and would have again: this
+    function's whole reason to exist is that `pipeline/contracts/task_tokens.py` was
+    added, imported by two handlers, and a hand-maintained `z.write` list has no way to
+    notice -- the deploy would have succeeded, and the driver would have died at cold
+    start on `ModuleNotFoundError: task_tokens`, on the very code path added to stop it
+    dying. Same failure class as the env_keys list in #71, same cure: read the source
+    that states the requirement instead of restating it.
+
+    Read out of the `except ImportError` branch specifically, because that branch IS the
+    bundle layout -- the flat name it imports is exactly the filename the zip must hold.
+    The repo-layout branch above it says `pipeline.contracts.events`, which tells you
+    nothing about what the zip is called.
+
+    Deliberately a UNION over all handlers rather than per-handler: only the driver
+    imports conductor_tools, but a bundle that is the same everywhere is one less thing
+    that can be wrong in one place and right in another, and the modules are a few KB.
+    """
+    names, unresolved = {}, []
+    for src in (srcs if srcs is not None else [c["src"] for c in LAMBDAS.values()]):
+        for name in flat_imports(src.read_text(encoding="utf-8")):
+            if name in names:
+                continue
+            found = next((d / f"{name}.py" for d in VENDOR_DIRS
+                          if (d / f"{name}.py").exists()), None)
+            if found is None:
+                unresolved.append({"module": name, "imported_by": str(src)})
+                continue
+            names[name] = found
+    if unresolved:
+        raise SystemExit(
+            "refusing to build a bundle that cannot import what its handler asks for — "
+            f"{json.dumps(unresolved, indent=2)}\n"
+            f"Searched: {[str(d) for d in VENDOR_DIRS]}. Either the module belongs in one "
+            "of those directories, or the import does not belong in an `except "
+            "ImportError` fallback branch (that branch is the Lambda bundle layout).")
+    for data in VENDOR_DATA:
+        names[data] = CONTRACTS / data
+    return names
+
+
 def bundle(src: pathlib.Path) -> bytes:
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
         z.write(src, "handler.py")
-        z.write(CONTRACTS / "events.py", "events.py")
-        z.write(CONTRACTS / "report.py", "report.py")
-        z.write(CONTRACTS / "manifest.schema.json", "manifest.schema.json")
-        # launch_run servicing + approval verification, shared verbatim with the
-        # console (its deploy.sh vendors the same file) so the two dispatch paths
-        # cannot drift. Vendored into every bundle: only the driver imports it,
-        # but a uniform bundle is one less special case in this function.
-        z.write(REPO / "orchestration" / "conductor_tools.py", "conductor_tools.py")
+        for name, path in sorted(vendored_modules().items()):
+            z.write(path, path.name)
     return buf.getvalue()
 
 

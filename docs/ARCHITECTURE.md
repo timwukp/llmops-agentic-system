@@ -530,6 +530,18 @@ fresh session after the job completes.) The chain that resumes the pipeline:
 4. `FinetuneAnalyze` then runs in a **fresh session**, reconstructing all context from AWS
    state (describe-training-job + S3 + manifest).
 
+**A dead token is an answer, not an error — on both Lambdas.** The reading above was
+resume-only for ten days, and the driver paid for it four times: `TaskTimedOut` out of the
+re-asks-exhausted settle, re-raised by the `handler()` wrapper, so Lambda marked the async
+invocation failed and retried it **twice** (2026-08-09 at 05:50:48Z, 05:52:03Z, 05:54:28Z;
+once before at 2026-08-05T15:39:51Z). Each retry was a fresh **billed** AgentCore turn
+re-running an agent whose stage had already been decided, against a token none of them could
+settle. All four of the driver's settles now go through one `settle_token()` funnel, and
+what "gone" means lives in `pipeline/contracts/task_tokens.py` — imported by both Lambdas,
+defined by neither, because two constants in two files agree only until someone edits one.
+The discrimination is unchanged and is the whole point: a throttle or 5xx still raises, so
+the settle can be retried rather than stranding the token for its full `TimeoutSeconds`.
+
 Live-verified in Phase 3 (two resume-Lambda invocations observed: one on an early failure,
 one on the successful completion; 1.5 s duration, 0 errors) and again hands-off, twice, in
 Phase 5.

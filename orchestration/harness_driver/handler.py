@@ -35,10 +35,12 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))  # repo 
 try:
     from pipeline.contracts import events as ev
     from pipeline.contracts.report import normalize_stage_complete, write_run_report
+    from pipeline.contracts.task_tokens import is_task_gone
     from orchestration import conductor_tools
 except ImportError:  # Lambda bundle layout (contracts vendored alongside)
     import events as ev  # type: ignore
     from report import normalize_stage_complete, write_run_report  # type: ignore
+    from task_tokens import is_task_gone  # type: ignore
     import conductor_tools  # type: ignore
 
 # (stage, task) -> EventBridge detail-type. eval/gate resolved dynamically.
@@ -357,6 +359,44 @@ def _load_manifest(s3, manifest_uri: str) -> dict:
         return {}
 
 
+def settle_token(sfn, token: str, **kw) -> bool:
+    """Settle a task token. Returns True if settled, False if the token was already dead.
+
+    Every ``send_task_success`` / ``send_task_failure`` in this file goes through here, so
+    "the token is gone" is answered once instead of four times. Pass ``output=`` for a
+    success and ``error=``/``cause=`` for a failure; the presence of ``output`` picks the
+    call, so a caller cannot accidentally report success on a failure path.
+
+    A dead token is an ANSWER, not an error -- the same reading this file already applies
+    to a rejected DynamoDB condition. It means the execution has ended (timed out, aborted,
+    or settled by another route), so there is nothing left to do and no retry can change
+    that. Raising instead cost four invocations: ``TaskTimedOut: 'Provided task does not
+    exist anymore'`` came out of the re-asks-exhausted settle in ``_run_stage``, the
+    ``handler()`` wrapper re-raised it, and Lambda retried the whole asynchronous
+    invocation twice -- 2026-08-09 at 05:50:48Z, 05:52:03Z and 05:54:28Z, each retry a
+    fresh billed AgentCore turn re-running an agent whose stage had already been decided
+    against a token none of them could settle. Also seen once on 2026-08-05 at 15:39:51Z.
+
+    Everything else still raises. A throttle or a 5xx means the settle may yet succeed, and
+    swallowing it would strand the token for its full ``TimeoutSeconds`` -- 86400s, a day,
+    on every long-work state -- which is the zombie ``MarkRunDone``/``MarkRunFailed`` and
+    the report/settle isolation above all exist to prevent.
+    """
+    try:
+        if "output" in kw:
+            sfn.send_task_success(taskToken=token, output=kw["output"])
+        else:
+            sfn.send_task_failure(taskToken=token, error=kw.get("error", ""),
+                                  cause=kw.get("cause", ""))
+    except Exception as exc:  # noqa: BLE001 — re-raised unless the token is provably dead
+        if not is_task_gone(exc):
+            raise
+        print(f"[driver] task token was already gone, nothing to settle: "
+              f"{type(exc).__name__}: {exc}")
+        return False
+    return True
+
+
 def _record_stage_event(ddb, run_id: str, stage: str, event_name: str, detail: dict):
     table = ddb.Table(os.environ["EVENTS_TABLE"])
     table.put_item(Item={
@@ -593,8 +633,8 @@ def handle_stage_complete(c, event, args) -> dict:
             payload["gate_passed"] = bool(metrics.get("gate_passed", True))
         if report_error:
             payload["report_write_failed"] = report_error
-        c["sfn"].send_task_success(taskToken=event["task_token"],
-                                   output=json.dumps(payload, default=str))
+        settle_token(c["sfn"], event["task_token"],
+                     output=json.dumps(payload, default=str))
     return {"ok": True, "normalized": norm,
             **({"report_error": report_error} if report_error else {})}
 
@@ -676,9 +716,9 @@ def _mark_run_escalated(ddb, run_id: str) -> bool:
 def _is_condition_failure(exc) -> bool:
     """ConditionalCheckFailedException, matched by botocore error CODE.
 
-    Same reasoning as resume_pipeline's TASK_GONE_CODES: the exception classes hang off
-    a live client instance, so referencing table.meta.client.exceptions here would make
-    this module unimportable under an injected test double.
+    Same reasoning as TASK_GONE_CODES in pipeline/contracts/task_tokens.py: the exception
+    classes hang off a live client instance, so referencing table.meta.client.exceptions
+    here would make this module unimportable under an injected test double.
     """
     code = getattr(exc, "response", {}).get("Error", {}).get("Code", "")
     return code == "ConditionalCheckFailedException"
@@ -742,9 +782,8 @@ def handle_escalate(c, event, args) -> dict:
         # path. The raise makes this except clause more load-bearing, not less.
         print(f"[driver] could not emit {ev.ESCALATED_TO_HUMAN} for {run_id}: {exc}")
     if event.get("task_token"):
-        c["sfn"].send_task_failure(taskToken=event["task_token"],
-                                   error="EscalatedToHuman",
-                                   cause=args.get("reason", "")[:250])
+        settle_token(c["sfn"], event["task_token"], error="EscalatedToHuman",
+                     cause=args.get("reason", "")[:250])
     return {"escalated": True}
 
 
@@ -1019,9 +1058,8 @@ def handler(event, context=None, clients=None):
         token = event.get("task_token")
         if token:
             try:
-                c["sfn"].send_task_failure(
-                    taskToken=token, error="DriverCrashed",
-                    cause=f"{type(exc).__name__}: {exc}"[:32000])
+                settle_token(c["sfn"], token, error="DriverCrashed",
+                             cause=f"{type(exc).__name__}: {exc}"[:32000])
             except Exception as report_exc:  # noqa: BLE001
                 # Nothing left to do but say so; the timeout is now the only backstop.
                 print(f"[driver] could not fail the parked token: {report_exc}")
@@ -1390,9 +1428,8 @@ def _run_stage(event, context=None, c=None):
 
         # Re-asks exhausted → treat as stage failure.
         if event.get("task_token"):
-            c["sfn"].send_task_failure(taskToken=event["task_token"],
-                                       error="MissingStageComplete",
-                                       cause=out["text"][:250])
+            settle_token(c["sfn"], event["task_token"],
+                         error="MissingStageComplete", cause=out["text"][:250])
         ev.emit_event(os.environ["EVENT_BUS"], ev.PIPELINE_FAILED,
                       {"run_id": event["run_id"], "stage": event["stage"],
                        "reason": "missing stage_complete"}, client=c["events"])
