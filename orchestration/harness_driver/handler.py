@@ -85,6 +85,43 @@ def _is_triage(event) -> bool:
     return event.get("stage") == TRIAGE_STAGE and event.get("task") == TRIAGE_TASK
 
 
+def triage_subject(event) -> str:
+    """The run a triage is ABOUT, read from the invocation rather than from the agent.
+
+    The comment above TRIAGE_STAGE says the subject "reaches the conductor as
+    params.escalation.run_id", and triage_event_from_bus is the only writer of that key.
+    Nothing was reading it. Every consumer instead took the subject from the model's own
+    tool arguments and fell back to `event["run_id"]` -- which on a triage is
+    `triage-<subject>`, the one id that must never be used as the subject. So a
+    conductor that omitted run_id, or echoed back the id it was invoked under, addressed
+    the record to itself.
+
+    Measured over every HumanPaged row in llmops-stage-events (12 rows, full scan,
+    ScannedCount == Count so nothing was paged over): 3 are filed under a `triage-` id --
+    86ab8a14, c8b13faa and b56281da, each an ARC-2 lineage run that died with its
+    scientific work complete. An owner opening the stuck run's timeline sees no page
+    there, because the page is in the conductor's timeline. The alert fired and the
+    audit trail points at the wrong run, which is the failure mode #72's backstop was
+    built to end and could not see: the backstop only asks WHETHER a page happened.
+
+    Why the fallback existed at all: `run_id` is not in page_human's `required` list
+    (agents/orchestrator/harness.json declares only situation + recommendation), so a
+    page legitimately arrives without one. The fix is not to require it -- the driver
+    already knows the answer and the model's copy is redundant. Prefer the event, and
+    treat the agent's value as usable only when the event carries no subject (the
+    console chat path, where there is no escalation envelope and `event["run_id"]` IS
+    the subject).
+    """
+    subject = str(((event.get("params") or {}).get("escalation") or {}).get("run_id")
+                  or "")
+    if subject:
+        return subject
+    # Not a bus triage: no escalation envelope, so event["run_id"] is the real subject.
+    # Deliberately NOT reachable on the triage path -- triage_event_from_bus raises on an
+    # escalation with no run_id, so a triage always has one.
+    return "" if _is_triage(event) else str(event.get("run_id") or "")
+
+
 #: A triage return status that means the escalation was actually ANSWERED -- a verdict
 #: reached a listening agent, a run was relaunched, the owner was told, or the turn is
 #: not over yet. Anything else means the conductor finished and the stuck run is still
@@ -732,12 +769,19 @@ def handle_escalate(c, event, args) -> dict:
     bus event AND the task-token settle down with it -- the run would then sit at
     `running` holding a live token until the state machine's timeout, hours later, over a
     notification. That is the worst possible thing to gate on this particular call:
-    `llmops-escalations` has **zero subscribers** live, so SNS is the one channel already
-    known to reach nobody, and `ensure_topic` in deploy/03_storage.py reports it as
-    "NO SUBSCRIBERS -- every escalate_human call publishes into the void" precisely
-    because the deploy cannot invent an address. A channel that today delivers to no one
-    must not be able to silence the two that do deliver: the stage event the console
-    renders, and the EscalatedToHuman event the conductor triages off the bus.
+    `llmops-escalations` had **zero subscribers** when this was written, so SNS was the
+    one channel already known to reach nobody, and `ensure_topic` in deploy/03_storage.py
+    reports that state as "NO SUBSCRIBERS -- every escalate_human call publishes into the
+    void" rather than as health, because the deploy cannot invent an address.
+
+    That has since changed and the ordering still stands. Measured 2026-08-10: one
+    confirmed email subscriber, and 2026-07-29..08-08 the topic published 15 and
+    delivered 11 with 0 failures -- the 4 undelivered all predate the confirmation on
+    2026-08-02. So SNS now reaches someone, which makes it MORE important not to gate on
+    it, not less: a working notification channel is still the one that fails on a
+    throttle or an IAM change, and it must not be able to silence the two that do not
+    leave the account -- the stage event the console renders, and the EscalatedToHuman
+    event the conductor triages off the bus.
     """
     run_id = event["run_id"]
     try:
@@ -818,7 +862,10 @@ def handle_page_human(c, event, args: dict) -> dict:
             "recommendation hands the owner the problem and none of the analysis you "
             "already did. Include 'options' too if there is a real choice to make.")}
 
-    subject_run = str(args.get("run_id") or event.get("run_id") or "")
+    # The event decides, not the agent -- see triage_subject. The agent's own run_id is
+    # kept only as the last resort for an invocation that carries no subject at all,
+    # which on the triage path cannot happen.
+    subject_run = triage_subject(event) or str(args.get("run_id") or "")
     brief = {"run_id": subject_run,
              "situation": situation,
              "options": args.get("options") or [],
@@ -831,8 +878,20 @@ def handle_page_human(c, event, args: dict) -> dict:
         Message=json.dumps(brief, indent=2, default=str))
     # Recorded against the run being escalated ABOUT, not the triaging run -- same
     # addressing rule as put_directive, for the same reason: the timeline a reader
-    # opens is the stuck run's, not the conductor's.
-    _record_stage_event(c["ddb"], subject_run or event.get("run_id", ""),
+    # opens is the stuck run's, not the conductor's. This comment CLAIMED that rule
+    # while the `or event.get("run_id")` it sat above did the opposite, and put_directive
+    # has no such fallback: 3 of the 12 pages on record went to the conductor's own
+    # timeline instead of the stuck run's.
+    #
+    # A page with no derivable subject still gets a row, because the alternative is a
+    # put_item on an empty partition key -- a ValidationException that would turn a
+    # successfully-published page into a crashed invocation, and #72 exists to stop a
+    # bookkeeping failure from swallowing an alert. It is filed under the triaging run
+    # and says so: `run_id: ""` in the brief is what distinguishes this row from the
+    # mis-addressed ones, which carried the triage id in BOTH fields. Unreachable from
+    # the bus (triage_event_from_bus raises without a subject); reachable only from a
+    # hand-built invocation.
+    _record_stage_event(c["ddb"], subject_run or str(event.get("run_id") or ""),
                         "orchestrator", "HumanPaged", brief)
     # OwnerPaged, NOT EscalatedToHuman. A page is what the conductor emits when it has
     # ALREADY triaged and found the decision above its authority; EscalatedToHuman means
@@ -871,7 +930,12 @@ def _backstop_page(c, event, outcome: dict) -> dict:
     """
     if not _is_triage(event) or outcome.get("status") in TRIAGE_ANSWERED:
         return outcome
-    subject = ((event.get("params") or {}).get("escalation") or {}).get("run_id", "")
+    # Was the same expression triage_subject now holds, spelled out a second time. This
+    # copy was the CORRECT one -- which is why the backstop's own pages are the ones
+    # filed properly -- and having it here while handle_page_human trusted the agent is
+    # exactly the drift: the driver already knew the subject at the only site that did
+    # not need the agent to tell it.
+    subject = triage_subject(event)
     try:
         handle_page_human(c, event, {
             "run_id": subject,
@@ -1299,56 +1363,80 @@ def _run_stage(event, context=None, c=None):
                 # triaging it would have reported success and changed nothing. Same
                 # class as the stranded task token: the write is authorized, and
                 # unreachable. A tool that cannot act must say so, not return 200.
-                subject = args.get("run_id") or ""
-                _record_stage_event(c["ddb"], subject or event.get("run_id", ""),
+                #
+                # The subject comes from the INVOCATION, not from the verdict. Taking it
+                # from `args` made two silent failures possible at once, because
+                # `run_id` is declared required on resolve_escalation but a model can
+                # still omit it: the audit row fell back to the triage's own id (see
+                # triage_subject), and `if subject:` then skipped put_directive AND the
+                # reachability check while this branch still returned
+                # {"status": "resolved"} -- a status inside TRIAGE_ANSWERED, so #72's
+                # backstop stayed quiet too. An unanswered escalation reported as
+                # answered, with the only record filed under the conductor.
+                subject = triage_subject(event) or str(args.get("run_id") or "")
+                _record_stage_event(c["ddb"], subject or str(event.get("run_id") or ""),
                                     "orchestrator", "EscalationResolved",
                                     {"decision": args.get("decision"),
                                      "rationale": str(args.get("rationale", ""))[:500],
                                      "adjusted_params": args.get("adjusted_params") or {}})
-                if subject:
-                    parked = put_directive(
-                        c["ddb"], subject,
-                        decision=str(args.get("decision", "")),
-                        rationale=str(args.get("rationale", "")),
-                        adjusted_params=args.get("adjusted_params") or {},
-                        actor="conductor")
-                    if not parked["reachable"]:
-                        # Rejected back to the conductor, not returned as a verdict:
-                        # a rejection it can still act on in the SAME turn. Returning
-                        # here would end the triage having done nothing, which is the bug.
-                        #
-                        # The rejection names only exits that can actually SUCCEED on
-                        # this invocation. It used to name launch_run unconditionally --
-                        # but on the bus-triage path launch_run has no approval record to
-                        # verify against and always refuses (see dispatch_is_possible),
-                        # so the conductor was handed two doors of which one was painted
-                        # on. Live: 4 of 9 triaged escalations produced no page at all.
-                        can_dispatch = dispatch_is_possible(event)
-                        messages = _tool_result_content(tu, {
-                            "status": "undeliverable",
-                            "run_status": parked["run_status"],
-                            "can_dispatch": can_dispatch,
-                            "reason": (
-                                f"run {subject} is {parked['run_status']}: its execution "
-                                "has ended, so no agent will ever read this directive. "
-                                "The decision is recorded for audit but CHANGES NOTHING. "
-                                + ("To act on it, relaunch the work with launch_run "
-                                   "(carrying your adjusted_params), or call page_human "
-                                   "if that is above your authority."
-                                   if can_dispatch else
-                                   "This invocation carries no signed approval, so "
-                                   "launch_run CANNOT dispatch a replacement run from "
-                                   "here -- only a human can authorize one. Call "
-                                   "page_human now with your decision as the "
-                                   "recommendation: situation, options, and the "
-                                   "adjusted_params you would have applied. That is the "
-                                   "only exit that changes anything from here."))})
-                        continue
+                if not subject:
+                    # No subject means there is no mailbox to park a verdict in, so this
+                    # call cannot resolve anything. Rejected into the same turn rather
+                    # than skipped: the old `if subject:` fell through to
+                    # {"status": "resolved"}, reporting a resolution that never happened
+                    # and satisfying the backstop on the way out.
+                    messages = _tool_result_content(tu, {
+                        "status": "rejected",
+                        "reason": ("this invocation names no run to resolve, so the "
+                                   "verdict has no mailbox and would change nothing. "
+                                   "Call page_human with your decision brief instead.")})
+                    continue
+                parked = put_directive(
+                    c["ddb"], subject,
+                    decision=str(args.get("decision", "")),
+                    rationale=str(args.get("rationale", "")),
+                    adjusted_params=args.get("adjusted_params") or {},
+                    actor="conductor")
+                if not parked["reachable"]:
+                    # Rejected back to the conductor, not returned as a verdict:
+                    # a rejection it can still act on in the SAME turn. Returning
+                    # here would end the triage having done nothing, which is the bug.
+                    #
+                    # The rejection names only exits that can actually SUCCEED on
+                    # this invocation. It used to name launch_run unconditionally --
+                    # but on the bus-triage path launch_run has no approval record to
+                    # verify against and always refuses (see dispatch_is_possible),
+                    # so the conductor was handed two doors of which one was painted
+                    # on. Live: 4 of 9 triaged escalations produced no page at all.
+                    can_dispatch = dispatch_is_possible(event)
+                    messages = _tool_result_content(tu, {
+                        "status": "undeliverable",
+                        "run_status": parked["run_status"],
+                        "can_dispatch": can_dispatch,
+                        "reason": (
+                            f"run {subject} is {parked['run_status']}: its execution "
+                            "has ended, so no agent will ever read this directive. "
+                            "The decision is recorded for audit but CHANGES NOTHING. "
+                            + ("To act on it, relaunch the work with launch_run "
+                               "(carrying your adjusted_params), or call page_human "
+                               "if that is above your authority."
+                               if can_dispatch else
+                               "This invocation carries no signed approval, so "
+                               "launch_run CANNOT dispatch a replacement run from "
+                               "here -- only a human can authorize one. Call "
+                               "page_human now with your decision as the "
+                               "recommendation: situation, options, and the "
+                               "adjusted_params you would have applied. That is the "
+                               "only exit that changes anything from here."))})
+                    continue
                 _invoke(c["agentcore"], event["harness_id"], sess,
                         _tool_result_content(tu, {"status": "recorded"}),
                         event.get("qualifier"))
+                # `subject`, not args["run_id"]: this dict is the driver's own return
+                # value and the console renders it, so echoing the agent's copy would
+                # report a resolution against whichever id the model happened to send.
                 return {"status": "resolved", "decision": args.get("decision"),
-                        "run_id": args.get("run_id")}
+                        "run_id": subject}
             if name == "page_human":
                 # The conductor's above-authority exit, and one of the two paths the
                 # undeliverable-verdict rejection above tells it to take. Unserviced on

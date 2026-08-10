@@ -205,7 +205,9 @@ case("PROJECT_STATE: sweep schedule unlisted", "PROJECT_STATE.md", m14,
 
 # 15. Lambda count drifts from the deployer.
 def m15(t):
-    return t.replace("| Lambdas ×6 |", "| Lambdas ×5 |")
+    old = "| Lambdas ×7 |"
+    assert old in t, "PROJECT_STATE's Lambda count row has moved; re-anchor this mutation"
+    return t.replace(old, "| Lambdas ×5 |", 1)
 case("PROJECT_STATE: Lambda count drifted", "PROJECT_STATE.md", m15,
      ["tests/test_docs_claims.py::test_the_documented_state_and_lambda_counts_match_the_deployers"])
 
@@ -621,9 +623,12 @@ case("driver: a failed timeline write takes the escalation alert down with it",
 # ── the escalation channels must be independent ───────────────────────────────────────
 #
 # 49. SNS goes back to being unwrapped and first, which is where it was: a failed publish
-#     then takes the bus event, the stage event and the token settle with it. And SNS is the
-#     channel with a KNOWN-ZERO audience (llmops-escalations has no subscribers live), so
-#     this makes the one channel that reaches nobody the gate on the two that work.
+#     then takes the bus event, the stage event and the token settle with it. When that was
+#     found, SNS was also the channel with a KNOWN-ZERO audience (llmops-escalations had no
+#     subscribers), which made the one channel reaching nobody the gate on the two that
+#     worked. It has a confirmed subscriber now (measured 2026-08-10) and the mutation is
+#     unchanged in force: the reason to wrap the publish is that a notification must not
+#     withhold a state transition, and a live channel still fails on a throttle.
 def m49(t):
     old = ('    try:\n'
            '        c["sns"].publish(TopicArn=os.environ["LLMOPS_SNS_TOPIC"],\n'
@@ -965,12 +970,12 @@ def m70(t):
     it is the only file the failure names. This mutation restores the stale digit in a file
     the guard did not used to read.
     """
-    old = "state machine + 6 Lambdas"
+    old = "state machine + 7 Lambdas"
     assert old in t, "the README's Lambda line has moved; re-anchor this mutation"
     return t.replace(old, "state machine + 5 Lambdas", 1)
 
 
-case("docs: the English README states 5 Lambdas again while the deployer deploys 6",
+case("docs: the English README states 5 Lambdas again while the deployer deploys 7",
      "README.md", m70,
      ["tests/test_docs_claims.py::test_the_documented_state_and_lambda_counts_match_the_deployers"])
 
@@ -984,12 +989,12 @@ def m71(t):
     exist. So the names beside the number are asserted too, and this mutation breaks only
     the names.
     """
-    old = "(driver / start / resume / webhook / finops / monitor-sweep)"
+    old = "(driver / start / resume / resurrector / webhook / finops / monitor-sweep)"
     assert old in t, "the README's Lambda name list has moved; re-anchor this mutation"
-    return t.replace(old, "(driver / start / resume / webhook / finops)", 1)
+    return t.replace(old, "(driver / start / resume / resurrector / webhook / finops)", 1)
 
 
-case("docs: the README's Lambda list omits monitor-sweep while the count still reads 6",
+case("docs: the README's Lambda list omits monitor-sweep while the count still reads 7",
      "README.md", m71,
      ["tests/test_docs_claims.py::test_the_documented_state_and_lambda_counts_match_the_deployers"])
 
@@ -1273,13 +1278,17 @@ def m85(t):
     journal before it trusts the tree. Delete the call and the file still gets written, still
     gets cleaned up on the normal path, and still looks like a recovery mechanism.
     """
-    # Anchored on the call at column 0, which is the invocation; the def and the reference
-    # inside this docstring are both indented or quoted. Same self-mutation hazard as m83:
-    # an unanchored "_restore_from_journal()" matches three places in this file.
-    old = "\n_restore_from_journal()\n"
+    # Anchored on the invocation, which now sits inside the `if __name__ == "__main__"` block
+    # that keeps an import side-effect-free; the def and the reference inside this docstring
+    # are quoted or at a different indent. Same self-mutation hazard as m83: an unanchored
+    # "_restore_from_journal()" matches three places in this file. The column moved from 0 to
+    # 4 when the mutating loop was guarded, which killed this anchor -- caught in one second
+    # by test_every_negative_control_still_matches_the_code_it_mutates, which is the guard
+    # that exists because four anchors had died this way unnoticed.
+    old = "\n    _restore_from_journal()\n"
     assert t.count(old) == 1, (
-        f"expected exactly one top-level recovery call, found {t.count(old)}; this case "
-        "mutates its own file, so an anchor that matches itself would test nothing")
+        f"expected exactly one recovery call at the runner's top level, found {t.count(old)}; "
+        "this case mutates its own file, so an anchor that matches itself would test nothing")
     return t.replace(old, "\n", 1)
 
 
@@ -2288,50 +2297,53 @@ def m127(t):
     all. GitHub secret scanning never flagged it either, because an account id is not a
     credential and has no detector.
 
-    The mutation cannot spell the id -- and interestingly, it cannot LOOK IT UP either. The first
-    version of this control tried to recover it from git history (`git grep -oE '[0-9]{12}'` over
-    the commits that touched `arn:aws:iam::`) and found nothing, which is the defect restating
-    itself: the id was never in history as twelve consecutive digits, only ever as two halves. So
-    the recovery has to do what a human reader does -- join adjacent literals FIRST, then look --
-    exactly the step the fixed guard added. It reuses the guard's own `_with_literals_joined` for
-    that, which means this control also fails if that helper is gutted.
+    The mutation cannot spell the real id -- and it must not try to LOOK IT UP either. The first
+    two versions of this control tried to recover it from git history (`git log -S 'arn:aws:iam::'`,
+    then join literals and ask the digest), and that approach has two independent ways to die
+    quietly, one of which it hit:
 
-    The reconstructed split then has to be a REAL match. A guard that merely counted split
-    literals would flag half the scanner (ALLOWED is split on purpose and legitimately so -- those
-    three ids are published by AWS). The property under test is specifically "no split that
-    reconstructs a WATCHED id survives", which is why the guard joins and then asks the digest.
+      * `actions/checkout@v4` clones at depth 1. CI sees ONE commit, the `-S` walk finds nothing,
+        and the control raises "could not reconstruct" -- red on every PR for a reason that has
+        nothing to do with the guard it protects. Measured: a `--depth 1` clone of this branch
+        shows 1 commit against the full history's many.
+      * even at full depth it is archaeology, not a guard. The id was never in history as twelve
+        consecutive digits, only ever as two halves -- the defect restating itself -- and the day
+        the id is scrubbed from history for real, this control's own assert says to delete it.
+        A check whose subject can legitimately disappear cannot be the check.
+
+    So the mutation manufactures the situation instead of excavating it: it adds a fabricated
+    id's digest to `REAL_ACCOUNT_DIGESTS` -- making that id genuinely WATCHED, by the only
+    definition the scanner has -- and writes the same id into the file as two adjacent literals.
+    The property under test is unchanged and needs no history at all: "no split that reconstructs
+    a WATCHED id survives". Raw, the file holds `5555` and `55555555` and no twelve-digit run, so
+    the guard's first pass sees nothing; only after `_with_literals_joined` collapses them does
+    the digest match. That is precisely the step the fixed guard added, and the reason the
+    reconstruction has to be a REAL match: a guard that merely counted split literals would flag
+    half the scanner, since ALLOWED is split on purpose and legitimately so -- those three ids are
+    published by AWS.
+
+    The real account id is therefore never needed, never spelled and never looked up, which is
+    also the property the scanner itself is built around.
     """
     import sys as _sys
     _sys.path.insert(0, str(REPO / "tests"))
     import redaction_scan as _rs
-    _sys.path.insert(0, str(REPO))
-    from tests.test_redaction_scan import _with_literals_joined
 
-    # `-S` narrows to commits that changed the number of occurrences, so this is a handful of
-    # blobs rather than a history walk.
-    revs = subprocess.run(["git", "log", "--all", "-S", "arn:aws:iam::", "--format=%H"],
-                          capture_output=True, text=True, cwd=REPO).stdout.split()
-    found = None
-    for sha in revs:
-        blob = subprocess.run(["git", "grep", "-h", "-oE",
-                               r"([0-9\"'b +]|arn:aws)[0-9\"'b +]{10,60}", sha],
-                              capture_output=True, text=True, cwd=REPO).stdout
-        for cand in dict.fromkeys(re.findall(r"(?<![0-9])[0-9]{12}(?![0-9])",
-                                             _with_literals_joined(blob))):
-            if _rs._digest_matches(cand.encode()):
-                found = cand
-                break
-        if found:
-            break
-    assert found, (
-        "could not reconstruct a watched account id from git history, so this control would "
-        "mutate nothing and pass vacuously. If the id is genuinely gone from every historical "
-        "blob, delete this control and say so -- do not leave it green")
+    # Split here too, and not for symmetry: spelled whole, these twelve digits would be a
+    # 12-digit run in a TRACKED file, which moves the "N such runs, M distinct" counts that
+    # redaction_scan.py derives -- and specifically breaks its stated invariant that the
+    # DISTINCT count never moves because every run in a test is the same published
+    # placeholder. A control is not allowed to change the measurement it sits beside.
+    fabricated = b"5555" + b"55555555"
+    assert fabricated.decode() not in t, (
+        "the fabricated id this control plants is already spelled in the file, so the mutation "
+        "would not be a change -- pick another twelve digits")
+    digest = _rs.account_digest(fabricated)
 
     anchor = "REAL_ACCOUNT_DIGESTS = (\n"
     assert t.count(anchor) == 1, f"the digest tuple has moved; found {t.count(anchor)}"
-    split = f'\n_split_id = b"{found[:6]}" + b"{found[6:]}"\n'
-    return t.replace(anchor, split + anchor, 1)
+    split = f'\n_split_id = b"{fabricated[:4].decode()}" + b"{fabricated[4:].decode()}"\n'
+    return t.replace(anchor, f'{split}{anchor}    "{digest}",\n', 1)
 
 
 case("redaction: this account's id goes back into the scanner as two adjacent halves",
@@ -2496,10 +2508,19 @@ def m134(t):
     Mutating the comment rather than adding a file because the guard derives the real count from
     `git ls-files`: a control that added a file would trip the tracked assertion for both sites at
     once and prove nothing about which one is watched.
+
+    Anchored on the guard's OWN regex rather than on a literal, and that is the second
+    finding here. Written as a literal naming 161 this control was
+    correct for exactly as long as the comment said 161 -- the repo grew to 163, the comment
+    was correctly updated, and the control silently stopped applying. Four of these went
+    stale together and none of them said so, because a raise out of `mutate` aborted the
+    whole runner at case 70. A control that hardcodes the number it is testing for staleness
+    has the defect it exists to catch, so it now reads the number off the file and decrements
+    it: whatever the comment claims today, the mutant claims one less.
     """
-    old = "measured across all 161\n#: tracked files"
-    assert t.count(old) == 1, f"the tracked-file coverage claim has moved; found {t.count(old)}"
-    return t.replace(old, "measured across all 160\n#: tracked files", 1)
+    pat = re.compile(r"(measured across all )(\d+)(\s*\n#:\s*tracked files)")
+    assert len(pat.findall(t)) == 1, "the tracked-file coverage claim has moved"
+    return pat.sub(lambda m: f"{m.group(1)}{int(m.group(2)) - 1}{m.group(3)}", t, count=1)
 
 
 case("redaction: the scanner's comment claims a tracked-file count the repo has grown past",
@@ -2519,10 +2540,14 @@ def m135(t):
     by adding a tracked BINARY file, the `tracked` assertion fired first and the `binary` half was
     never reached, so a control written that way would have looked correct while proving only what
     m134 already proves. Driven instead by editing the binary number alone.
+
+    Derived from the file, not hardcoded -- see m134 for why: the literal that named 35 went
+    stale the moment the tracked count moved, and took its own applicability with it. The
+    tracked half is left alone so this control still exercises only the binary assertion.
     """
-    old = "the whole index -- 161 files, 35 of"
-    assert t.count(old) == 1, f"the binary coverage claim has moved; found {t.count(old)}"
-    return t.replace(old, "the whole index -- 161 files, 34 of", 1)
+    pat = re.compile(r"(the whole index -- \d+ files, )(\d+)( of)")
+    assert len(pat.findall(t)) == 1, "the binary coverage claim has moved"
+    return pat.sub(lambda m: f"{m.group(1)}{int(m.group(2)) - 1}{m.group(3)}", t, count=1)
 
 
 case("redaction: the scanner's comment claims a binary-file count the repo has moved past",
@@ -2541,10 +2566,15 @@ def m136(t):
 
     Rewording rather than deleting because deletion is the honest case the guard's message tells
     you how to handle (drop the entry); a rewrite is the one that looks like nothing happened.
+
+    The count is read off the file rather than named here, and it is carried through the
+    rewrite unchanged: this control must break the guard by rewording, not by drifting a
+    number, or it would prove only what m134 and m135 already prove. Hardcoding it also made
+    the control expire silently the moment the repo grew -- see m134.
     """
-    old = "checking a single file out of 161"
-    assert t.count(old) == 1, f"the single-file phrasing has moved; found {t.count(old)}"
-    return t.replace(old, "checking just one of the 161 files", 1)
+    pat = re.compile(r"checking a single file out of (\d+)")
+    assert len(pat.findall(t)) == 1, "the single-file phrasing has moved"
+    return pat.sub(lambda m: f"checking just one of the {m.group(1)} files", t, count=1)
 
 
 case("redaction: a coverage claim is reworded so its anchored pattern matches nothing",
@@ -2557,17 +2587,27 @@ def m137(t):
     """Let the CURRENT half of the past-tense count line go stale.
 
     The carve-out that makes the past-tense phrasing legal is narrow, and this is what keeps it
-    narrow. "163 files became 161" is allowed to state a former number because it says so; the
+    narrow. "N files became M" is allowed to state a former number because it says so; the
     number it says the repo BECAME is a claim about today and is held to today. Without this the
     carve-out would be a hole the size of every count in the comment -- any stale number could be
     made legal by writing "X became Y" around it.
 
-    The historical half is deliberately NOT mutated here: 163 must stay allowed, which the guard's
-    own passing run proves and which no control should contradict.
+    The historical half is deliberately NOT mutated here: the former count must stay allowed,
+    which the guard's own passing run proves and which no control should contradict. Both halves
+    are read off the file for the reason in m134 -- the literal pair this once named ("163 files
+    became 161") stopped matching when the comment was correctly updated to "162 files became
+    163", and the control retired itself without a word.
     """
-    old = "163 files became 161"
-    assert t.count(old) == 1, f"the past-count phrase has moved; found {t.count(old)}"
-    return t.replace(old, "163 files became 160", 1)
+    pat = re.compile(r"(\d+)( files became )(\d+)")
+    found = pat.findall(t)
+    assert len(found) == 1, "the past-count phrase has moved"
+    was, now = int(found[0][0]), int(found[0][2])
+    # Only the CURRENT half moves, and it must not land on `was`: the guard also asserts
+    # was != now, so a mutant that collapsed them would go red for the wrong reason -- "not a
+    # change at all" rather than "stale" -- and prove nothing about the staleness check. The
+    # live pair is 162 -> 163, where a plain decrement does exactly that.
+    bad = next(v for v in (now - 1, now + 1, now - 2) if v != was)
+    return pat.sub(lambda m: f"{m.group(1)}{m.group(2)}{bad}", t, count=1)
 
 
 case("redaction: the past-tense count line says the repo became a size it is not",
@@ -2633,6 +2673,97 @@ case("evidence: the sentence the era carve-out derives the past fleet size from 
       "::test_the_agent_count_readers_see_first_matches_the_fleet"])
 
 
+# ── a triage's records must be addressed by the invocation, not by the agent ───────────
+#
+# 141. handle_page_human goes back to trusting the agent's run_id, which is where it was.
+#      On a triage `event["run_id"]` is `triage-<subject>`, so a page whose args omit
+#      run_id -- schema-legal, it is not in page_human's required list -- files the
+#      HumanPaged row and the owner's brief under the conductor's own timeline. Measured
+#      live: 3 of the 12 pages on record, all ARC-2 lineage runs. Restoring the fallback
+#      must red the parametrised addressing guard, not merely the one arg shape that
+#      happens to name the subject (the pre-existing test used only that shape, which is
+#      why the defect survived it).
+def m141(t):
+    old = ('    subject_run = triage_subject(event) or str(args.get("run_id") or "")')
+    assert t.count(old) == 1, f"the page addressing line has moved; found {t.count(old)}"
+    return t.replace(
+        old, '    subject_run = str(args.get("run_id") or event.get("run_id") or "")', 1)
+
+
+case("driver: a page is addressed by the agent's run_id again, not by the escalation",
+     "orchestration/harness_driver/handler.py", m141,
+     ["tests/test_orchestration.py::TestDriver"
+      "::test_a_bus_triage_page_is_addressed_by_the_event_not_the_agent",
+      "tests/test_orchestration.py::TestDriver"
+      "::test_a_page_with_no_derivable_subject_is_still_recorded"])
+
+
+# 142. resolve_escalation goes back to skipping the delivery when the agent names no run,
+#      while still returning {"status": "resolved"} -- a status inside TRIAGE_ANSWERED, so
+#      #72's backstop stays quiet too and an unanswered escalation is reported as
+#      answered. The guard must catch BOTH halves: the verdict not reaching the mailbox,
+#      and the false success.
+def m142(t):
+    old = '                if not subject:'
+    assert t.count(old) == 1, f"the subject-less resolve gate has moved; found {t.count(old)}"
+    return t.replace(old, '                if False:', 1)
+
+
+case("driver: a resolve naming no run silently reports success again",
+     "orchestration/harness_driver/handler.py", m142,
+     ["tests/test_orchestration.py::TestDriver"
+      "::test_a_resolve_naming_no_run_is_rejected_not_reported_resolved"])
+
+
+# 143. A control's anchor goes stale exactly the way six of them really did -- and the fast
+#      check has to be the thing that notices, in a second, rather than a 5-minute run
+#      nobody does per commit. This mutation drifts m1's target so it raises, which is the
+#      harder half: an anchor that RETURNS UNCHANGED is a visible no-op, while one that
+#      raises used to abort the whole runner at that case and leave everything after it
+#      silently unverified.
+def m143(t):
+    # Split literal, same reason as m83: this case mutates the file it lives in, so an
+    # anchor written whole would appear twice -- once in m1 and once here -- and the count
+    # assertion would fire against the runner's own source rather than against drift.
+    old = 'del d["States"]["Monitor' + 'Health"]'
+    assert t.count(old) == 1, f"m1's ASL mutation has moved; found {t.count(old)}"
+    return t.replace(old, 'del d["States"]["NoSuchStateHasEverExisted"]', 1)
+
+
+case("controls: a control's own anchor no longer matches the code it mutates",
+     "tests/negative_controls/monitor_dispatch.py", m143,
+     ["tests/test_docs_claims.py"
+      "::test_every_negative_control_still_matches_the_code_it_mutates"])
+
+
+def m144(t):
+    """Give a control a git-history dependency again -- the thing CI has and this laptop hides.
+
+    The reverted defect is `m127`'s original recovery of the account id by walking commits.
+    It cannot be tested by running it here: a full-depth worktree has the history, so the
+    control passes locally no matter what, which is exactly why the guard is structural and
+    exactly why this mutation reintroduces the CALL rather than the failure. The planted argv
+    is the one that shipped, verbatim.
+
+    The paired guard must also be shown NOT to fire on `git ls-files` / `git show :path` /
+    `git diff --cached`, which several controls here use legitimately and which answer
+    identically at depth 1; that half is asserted directly in the guard's own test file,
+    since a negative control can only demonstrate the red direction.
+    """
+    anchor = '    fabricated = b"5555" + b"55555555"\n'
+    assert t.count(anchor) == 1, f"m127's fabricated id has moved; found {t.count(anchor)}"
+    return t.replace(anchor, '    subprocess.run(["git", "log", "--all", "-S", '
+                             '"arn:aws:iam::", "--format=%H"],\n'
+                             '                   capture_output=True, text=True, cwd=REPO)\n'
+                     + anchor, 1)
+
+
+case("controls: a control reads git commit history, which CI clones at depth 1",
+     "tests/negative_controls/monitor_dispatch.py", m144,
+     ["tests/test_docs_claims.py"
+      "::test_no_negative_control_depends_on_commit_history"])
+
+
 #: Where the pristine text of the file currently mutated is parked, so a kill -9 -- which
 #: no handler can intercept -- still leaves the original recoverable. Under the repo root
 #: rather than /tmp because it must be obvious to whoever finds the tree dirty, and
@@ -2674,15 +2805,40 @@ def _die_on_signal(signum, _frame):
     raise KeyboardInterrupt(f"terminated by signal {signum}")
 
 
-for _sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
-    signal.signal(_sig, _die_on_signal)
-_restore_from_journal()
+#: Everything below mutates tracked files, so it runs ONLY as a script. Importing this
+#: module has to be safe and side-effect-free, because the fast anchor check in
+#: test_docs_claims.py imports it to call every ``mutate`` against in-memory text -- the
+#: only way a drifted anchor gets named in under a second instead of waiting for a 5-minute
+#: run nobody does on every commit. Four anchors had gone stale and the suite was green.
+#: The guard also has to cover the module-level setup: installing signal handlers from an
+#: imported module would clobber pytest's, and ``_restore_from_journal`` DELETES the journal,
+#: so an import racing a killed run would throw away the only copy of a mutated file's
+#: original text. This file is still not a pytest module and still is not collected -- the
+#: name does not match ``test_*``.
+if __name__ == "__main__":
+    for _sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(_sig, _die_on_signal)
+    _restore_from_journal()
 
 failed = []
-for name, rel, mutate, tests in CASES:
+for name, rel, mutate, tests in (CASES if __name__ == "__main__" else ()):
     p = REPO / rel
     orig = p.read_text()
-    new = mutate(orig)
+    # A drifted anchor raises out of `mutate`, and that assert is deliberate -- silently
+    # skipping a case whose pattern no longer matches is the no-op failure below. But it
+    # must fail ONE case, not the run: uncaught, it terminated the loop, so m70's anchor
+    # going stale (README "6 Lambdas" -> 7, corrected two PRs earlier, mutation left
+    # behind) meant cases 70-143 never executed at all while the harness exited non-zero
+    # for a single named reason. 74 controls silently unverified, and the exit code looked
+    # like the one honest failure it printed. Every case now gets its turn and every
+    # broken anchor is named in the same summary.
+    try:
+        new = mutate(orig)
+    except Exception as exc:
+        print(f"SKIP-BROKEN  {name}: mutation raised {type(exc).__name__}: {exc} "
+              "(guard NOT verified)")
+        failed.append(f"{name} / anchor drifted: {exc}")
+        continue
     if new == orig:
         print(f"SKIP-BROKEN  {name}: patch was a no-op (guard NOT verified)")
         failed.append(name)
@@ -2706,6 +2862,7 @@ for name, rel, mutate, tests in CASES:
         if not ok:
             failed.append(f"{name} / {t}")
 
-print()
-print("all guards caught their break" if not failed else f"UNCAUGHT: {failed}")
-sys.exit(1 if failed else 0)
+if __name__ == "__main__":
+    print()
+    print("all guards caught their break" if not failed else f"UNCAUGHT: {failed}")
+    sys.exit(1 if failed else 0)

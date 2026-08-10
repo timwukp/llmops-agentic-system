@@ -22,6 +22,7 @@ reader happens to open.
 from __future__ import annotations
 
 import ast
+import importlib.util
 import json
 import pathlib
 import re
@@ -921,6 +922,150 @@ def test_the_control_runner_restores_its_mutation_even_when_signalled():
     assert ".negative_control_journal" in ignored, (
         "the recovery journal is not gitignored; it holds a pristine copy of a tracked "
         "source file, so an untracked-file sweep would commit the duplicate")
+
+
+def test_every_negative_control_still_matches_the_code_it_mutates():
+    """Run every ``mutate`` against the real file text, in memory, and require a change.
+
+    The controls are the repo's proof that its guards guard, and nothing in the suite
+    checked that they still apply. (Their count is deliberately not quoted here: it is
+    derived in ``test_the_documented_negative_control_count_matches_the_runner``, and a
+    second hand-typed copy in a docstring is one more number that goes stale in silence --
+    the exact defect m134-m137 below were rewritten to stop committing.) A control's anchor
+    is a literal from the file it patches,
+    so the ordinary act of correcting that file retires the control silently: the mutation
+    either raises its own ``assert`` or returns the text unchanged, and neither is visible
+    until somebody runs the 5-minute runner. Measured on merged main: **6 of 163 were dead**
+    -- m70/m71 (README "6 Lambdas" after the fleet became 7), m15 (PROJECT_STATE's row, same
+    cause) and m134-m137 (the four redaction coverage counts, stale since the repo grew from
+    161 tracked files to 163). Worse, an anchor that raises escaped the runner's loop
+    entirely, so cases 70-143 never ran at all while the process still exited non-zero for
+    one honest-looking reason. Both halves are fixed; this is the half that makes the next
+    one cost a second instead of a release.
+
+    Nothing is written to disk. Each ``mutate`` is a pure text transform, so the check is to
+    read the target, call it, and compare -- exactly what the runner does before it commits
+    anything. That is why the runner's mutating loop is now under ``if __name__``: this test
+    imports the module, and an import that installed signal handlers or deleted the recovery
+    journal would break pytest and destroy a killed run's only backup.
+    """
+    path = REPO / "tests/negative_controls/monitor_dispatch.py"
+    spec = importlib.util.spec_from_file_location("negative_controls_runner", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    assert not getattr(mod, "failed", None), (
+        "importing the control runner executed its mutating loop; it must run only as a "
+        "script, or this test rewrites tracked files under pytest")
+    assert len(mod.CASES) > 100, f"only {len(mod.CASES)} controls registered -- shape changed?"
+
+    dead = []
+    for name, rel, mutate, _tests in mod.CASES:
+        target = REPO / rel
+        assert target.exists(), f"{name}: mutates {rel}, which does not exist"
+        orig = target.read_text()
+        try:
+            new = mutate(orig)
+        except Exception as exc:                      # noqa: BLE001 - reporting, not handling
+            dead.append(f"{mutate.__name__} ({name}): anchor drifted -- "
+                        f"{type(exc).__name__}: {exc}")
+            continue
+        if new == orig:
+            dead.append(f"{mutate.__name__} ({name}): patch is a no-op against {rel}")
+    assert not dead, (
+        f"{len(dead)} of {len(mod.CASES)} negative controls no longer apply to the code they "
+        "mutate, so the guards they claim to verify are unverified:\n  " + "\n  ".join(dead)
+        + "\nRe-anchor each one on the current text, or derive the anchor instead of "
+        "hardcoding it -- a control naming a literal expires the moment that literal is "
+        "correctly updated.")
+
+
+#: git subcommands that read COMMIT HISTORY rather than the index or the worktree. The
+#: distinction is the whole point: `ls-files`, `show :path` and `diff --cached` describe the
+#: checkout in front of you and answer identically at any clone depth, while anything below
+#: needs commits that a shallow clone simply does not have.
+#:
+#: `rev-parse` is deliberately NOT here even though it takes revisions: its common use is
+#: `--show-toplevel`/`--git-dir`, which are depth-insensitive, so banning the subcommand
+#: would reject correct code and teach the next reader that this guard is noise. The
+#: depth-sensitive uses of it all resolve a rev, and every one of those needs a walk that
+#: shows up as one of the names below.
+_HISTORY_SUBCOMMANDS = ("log", "rev-list", "blame", "bisect", "reflog", "merge-base",
+                        "describe", "shortlog", "cherry")
+
+
+def test_no_negative_control_depends_on_commit_history():
+    """A control that walks git history passes here and fails in CI, for no stated reason.
+
+    ``actions/checkout@v4`` clones at depth 1. m127 recovered this repo's account id by
+    running ``git log --all -S 'arn:aws:iam::'`` and joining split literals in each historical
+    blob; with one commit in the clone the walk found nothing, the control raised its own
+    "could not reconstruct" assert, and the PR went red on a machine nobody could reproduce
+    from -- the full-depth worktree passed 990/990. The failure named the control, which read
+    like a drifted anchor, and said nothing about depth.
+
+    Depth is the shallow half of the lesson. The deep half: history is the wrong SUBJECT for a
+    control. A negative control asserts something about the code as it stands, so it must be
+    able to manufacture its own precondition -- m127 now plants a fabricated id's digest in
+    ``REAL_ACCOUNT_DIGESTS``, which makes that id watched by the only definition the scanner
+    has, and needs no archaeology at all. The old version was also self-expiring: its assert
+    said to delete the control if the id ever left history, i.e. the check would evaporate
+    exactly when the repo got cleaner.
+
+    Enforced structurally rather than by convention, because the two categories of git call
+    look alike at a glance and only one of them is depth-sensitive. ``git ls-files``,
+    ``git show :path`` and ``git diff --cached`` read the index and are fine at any depth;
+    everything in ``_HISTORY_SUBCOMMANDS`` is not. The check reads the runner's source rather
+    than its behaviour, so a control that would only walk history on some branch is still
+    caught.
+    """
+    src = (REPO / "tests/negative_controls/monitor_dispatch.py").read_text()
+    tree = ast.parse(src)
+
+    offenders = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        # Any subprocess call shape: the first list/tuple argument whose leading element is
+        # the literal "git" is an argv, wherever it sits in the call.
+        for arg in list(node.args) + [kw.value for kw in node.keywords]:
+            if not isinstance(arg, (ast.List, ast.Tuple)) or not arg.elts:
+                continue
+            words = [e.value for e in arg.elts if isinstance(e, ast.Constant)
+                     and isinstance(e.value, str)]
+            if not words or words[0] != "git":
+                continue
+            hit = next((w for w in words[1:] if w in _HISTORY_SUBCOMMANDS), None)
+            if hit:
+                offenders.append(f"line {node.lineno}: `git {' '.join(words[1:])[:60]}` "
+                                 f"reads history via `{hit}`")
+
+    assert not offenders, (
+        "a negative control reads git commit history, which CI does not have -- "
+        "actions/checkout@v4 clones at depth 1, so this passes locally and fails on every "
+        f"PR with a message about the control instead of about depth:\n  "
+        + "\n  ".join(offenders)
+        + "\nA control must manufacture its own precondition from the checked-out tree. "
+          "git ls-files / show :path / diff --cached are fine; they read the index.")
+
+    # Both directions, because m144 can only demonstrate the red one. A guard that rejected
+    # every `git` call would pass its negative control and be wrong: controls here legitimately
+    # run `git diff --cached` and `git ls-files`, and banning those would force them to
+    # reimplement the index. So the depth-insensitive reads are asserted to survive, on the
+    # same parser and in the same argv shapes -- list and tuple, since subprocess takes either.
+    for argv in ('["git", "ls-files"]', '("git", "show", ":tests/redaction_scan.py")',
+                 '["git", "diff", "--cached", "--numstat", _EMPTY_TREE]'):
+        probe = ast.parse(f"subprocess.run({argv}, capture_output=True)")
+        for node in ast.walk(probe):
+            if isinstance(node, ast.Call):
+                for arg in node.args:
+                    if isinstance(arg, (ast.List, ast.Tuple)) and arg.elts:
+                        words = [e.value for e in arg.elts if isinstance(e, ast.Constant)
+                                 and isinstance(e.value, str)]
+                        assert not (words and words[0] == "git"
+                                    and any(w in _HISTORY_SUBCOMMANDS for w in words[1:])), (
+                            f"{argv} reads the index, not history, and answers the same at any "
+                            "clone depth -- rejecting it would make this guard a ban on git")
 
 
 def test_the_shell_suite_is_documented_with_its_assertion_count():

@@ -876,16 +876,23 @@ class TestDriver:
     #
     # The channels are independent by design and the ordering used to say otherwise:
     # SNS was the FIRST statement in handle_escalate and unwrapped, so a failed publish
-    # took the stage event, the bus event and the task-token settle with it. And SNS is
-    # the channel with a known-zero audience -- llmops-escalations has no subscribers
-    # live, which ensure_topic reports rather than papering over, because a deploy
-    # cannot invent an address. The one channel that reaches nobody was gating the two
-    # that work.
+    # took the stage event, the bus event and the task-token settle with it. When that was
+    # found, SNS was also the channel with a known-zero audience -- llmops-escalations had
+    # no subscribers, which ensure_topic reports rather than papering over, because a
+    # deploy cannot invent an address. The one channel that reached nobody was gating the
+    # two that worked.
+    #
+    # llmops-escalations now HAS a confirmed subscriber (measured 2026-08-10: 1 email
+    # subscription; 15 published / 11 delivered / 0 failed over 2026-07-29..08-08, the 4
+    # undelivered all predating the 08-02 confirmation). This test does not weaken: the
+    # reason to wrap the publish was never "nobody is listening", it was that a
+    # notification must not be able to withhold a state transition. A live channel still
+    # fails on a throttle or an IAM change, and this is what pins that behaviour.
 
     def test_a_dead_sns_topic_does_not_take_the_whole_escalation_with_it(self):
-        """The live shape of this: zero subscribers today, and a publish can fail outright
-        (topic deleted, throttle, IAM drift). The verdict still has to reach the conductor
-        on the bus, the timeline still has to show it, and the token still has to settle."""
+        """A publish can fail outright (topic deleted, throttle, IAM drift) whether or not
+        anyone is subscribed. The verdict still has to reach the conductor on the bus, the
+        timeline still has to show it, and the token still has to settle."""
         c = clients()
         c["ddb"].Table(ENV["RUNS_TABLE"]).put_item(
             Item={"run_id": "run-real-3", "status": "running"})
@@ -1058,8 +1065,8 @@ class TestDriver:
         budget escalation, and then kept spending under the cap it had just proven
         infeasible -- because "continue" was the only word the driver could say. The
         conductor's resolve_escalation wrote an EscalationResolved stage-event that
-        nothing read: a verdict into the void, the same shape as the escalation SNS
-        topic with no subscribers.
+        nothing read: a verdict into the void, the same shape the escalation SNS topic
+        had while it was still unsubscribed.
 
         A checkpoint is now the delivery point: pending directives for this run ride
         back in the toolResult, so the agent learns the verdict on its next breath."""
@@ -1243,6 +1250,65 @@ class TestDriver:
         assert out["status"] == "resolved"
         assert driver.take_directive(c["ddb"], "run-unknown-1")
 
+    def test_a_verdict_is_delivered_to_the_escalated_run_the_agent_did_not_name(self):
+        """resolve_escalation is addressed by the invocation, exactly like page_human.
+
+        `run_id` IS in resolve_escalation's required list, which is why this looked safe
+        and is not: required is a request, not an enforcement, and a model that omits it
+        used to take the branch through `if subject:` -- skipping put_directive AND the
+        reachability check -- and still return {"status": "resolved"}. `resolved` is in
+        TRIAGE_ANSWERED, so #72's backstop stayed quiet as well: an escalation that was
+        never answered, reported as answered, with the only record filed under the
+        conductor."""
+        subject = "run-live-7"
+        ac = FakeAgentCore([
+            tool_use_stream("resolve_escalation",   # no run_id at all
+                            {"decision": "option_B",
+                             "rationale": "cap raised",
+                             "adjusted_params": {"teacher_cap_usd": 39}}),
+            text_stream("ack")])
+        c = clients(ac)
+        self._seed_run(c, subject, "running")
+        out = driver.handler(driver.triage_event_from_bus(
+            {"detail": {"run_id": subject, "stage": "eval", "reason": "gate failed"}},
+            "bkt"), clients=c)
+        assert out["status"] == "resolved"
+        assert out["run_id"] == subject, \
+            f"the driver reported a resolution against {out['run_id']}"
+        pending = driver.take_directive(c["ddb"], subject)
+        assert pending and pending["adjusted_params"] == {"teacher_cap_usd": 39}, \
+            "the verdict never reached the escalated run's mailbox"
+        assert any("EscalationResolved" in str(r.get("sk", "")) and r["run_id"] == subject
+                   for r in c["ddb"].Table("llmops-stage-events").items), \
+            "the audit row was filed against the conductor, not the stuck run"
+
+    def test_a_resolve_naming_no_run_is_rejected_not_reported_resolved(self):
+        """With no subject there is no mailbox, so the call cannot resolve anything.
+
+        Rejected into the same turn (so the conductor can still page) rather than skipped
+        with a success status -- the shape that let a triage end having done nothing while
+        every layer of the guard reported health."""
+        ac = FakeAgentCore([
+            tool_use_stream("resolve_escalation",
+                            {"decision": "retry", "rationale": "transient"}),
+            tool_use_stream("page_human", {"situation": "s", "recommendation": "r"}),
+            text_stream("ack")])
+        c = clients(ac)
+        out = driver.handler(driver_event(stage="orchestrator", task="triage",
+                                          run_id="triage-orphan-2",
+                                          harness_id="llmops_orchestrator",
+                                          task_token=None), clients=c)
+        first = json.loads(
+            ac.calls[1]["messages"][-1]["content"][0]["toolResult"]["content"][0]["text"])
+        assert first["status"] == "rejected", \
+            f"a subject-less resolve was accepted: {first}"
+        assert "page_human" in first["reason"], \
+            "the rejection must name an exit that can still work"
+        assert out["status"] == "paged", "the conductor's follow-up page never went out"
+        assert not [r for r in c["ddb"].Table("llmops-stage-events").items
+                    if str(r.get("sk", "")).startswith(driver.DIRECTIVE_SK)], \
+            "a directive was parked with no run to deliver it to"
+
     def test_the_audit_record_survives_even_when_the_verdict_cannot_be_delivered(self):
         """Undeliverable is not un-decided. The stage-event and the directive row are both
         still written -- flagged deliverable=False -- because what the conductor decided is
@@ -1311,6 +1377,107 @@ class TestDriver:
         assert paged, "the page left no audit record on the run it was about"
         assert paged[0]["run_id"] == "run-stuck-9", \
             f"the page was filed against the conductor's own run: {paged[0]['run_id']}"
+
+    #: Every way a conductor can name (or fail to name) the subject in its page_human
+    #: args. The subject is a property of the INVOCATION, so all four must land on the
+    #: same run -- the test above only ever exercised the first, which is why the
+    #: fallback survived: it passes on main too.
+    PAGE_ARG_SHAPES = [
+        ("names the subject", {"run_id": "run-subject-3"}),
+        # run_id is NOT in page_human's required list (agents/orchestrator/harness.json
+        # requires situation + recommendation only), so this is schema-legal.
+        ("omits run_id", {}),
+        # What a conductor invoked as `triage-run-subject-3` naturally echoes back.
+        ("echoes the triage id", {"run_id": "triage-run-subject-3"}),
+        ("names an unrelated run", {"run_id": "run-someone-else"}),
+    ]
+
+    @pytest.mark.parametrize("label,extra", PAGE_ARG_SHAPES,
+                             ids=[s[0] for s in PAGE_ARG_SHAPES])
+    def test_a_bus_triage_page_is_addressed_by_the_event_not_the_agent(self, label, extra):
+        """The page goes to the run the ESCALATION named, whatever the agent says.
+
+        Live, measured over every HumanPaged row in llmops-stage-events (12 rows, full
+        scan): 3 were filed under a `triage-` id -- 86ab8a14, c8b13faa and b56281da, all
+        ARC-2 lineage runs that died with their scientific work complete. The owner got
+        the email and then found nothing on the stuck run's timeline, because the row was
+        in the conductor's. `subject_run = args.get("run_id") or event.get("run_id")`
+        resolved to `triage-<subject>` whenever the model omitted the field or echoed the
+        id it was invoked under, while the comment directly above it claimed to share
+        put_directive's addressing rule -- which has no such fallback.
+        """
+        subject = "run-subject-3"
+        ac = FakeAgentCore([
+            tool_use_stream("page_human",
+                            dict(extra, situation="s", recommendation="r")),
+            text_stream("ack")])
+        c = clients(ac)
+        out = driver.handler(driver.triage_event_from_bus(
+            {"detail": {"run_id": subject, "stage": "eval", "reason": "gate failed"}},
+            "bkt"), clients=c)
+
+        assert out["status"] == "paged"
+        assert out["run_id"] == subject
+        paged = [r for r in c["ddb"].Table("llmops-stage-events").items
+                 if "HumanPaged" in str(r.get("sk", ""))]
+        assert len(paged) == 1
+        assert paged[0]["run_id"] == subject, \
+            f"the page ({label}) was filed under {paged[0]['run_id']}, not the stuck run"
+        brief = json.loads(c["sns"].published[0]["Message"])
+        assert brief["run_id"] == subject, "the owner's brief names the wrong run"
+        # The triage's own id is still recorded -- it is how a reader gets from the page
+        # to the conductor's reasoning. It is just not the ADDRESS.
+        assert brief["triaging_run_id"] == f"triage-{subject}"
+        emitted = [e for e in c["events"].entries
+                   if e["DetailType"] == ev.OWNER_PAGED]
+        assert emitted and json.loads(emitted[0]["Detail"])["run_id"] == subject, \
+            "OwnerPaged carries the triage id, so a bus consumer sees the wrong run"
+
+    def test_a_console_page_still_uses_the_invoking_run(self):
+        """The event wins, but only when the event HAS a subject.
+
+        The console's chat path invokes the conductor with no escalation envelope, so
+        there `event["run_id"]` IS the run being discussed. A fix that keyed only on
+        params.escalation.run_id would file every console page under an empty key --
+        a DynamoDB ValidationException on the partition key, i.e. a crash on the
+        notification path, which is the class of failure #72 closed."""
+        ac = FakeAgentCore([
+            tool_use_stream("page_human", {"situation": "s", "recommendation": "r"}),
+            text_stream("ack")])
+        c = clients(ac)
+        out = driver.handler(driver_event(stage="orchestrator", task="plan",
+                                          run_id="run-console-4",
+                                          harness_id="llmops_orchestrator",
+                                          task_token=None), clients=c)
+        paged = [r for r in c["ddb"].Table("llmops-stage-events").items
+                 if "HumanPaged" in str(r.get("sk", ""))]
+        assert paged and paged[0]["run_id"] == "run-console-4", \
+            f"a page with no escalation envelope was misfiled: {paged}"
+        assert out.get("run_id") == "run-console-4"
+
+    def test_a_page_with_no_derivable_subject_is_still_recorded(self):
+        """A hand-built triage carrying neither an escalation nor a usable arg.
+
+        Unreachable from the bus -- triage_event_from_bus raises on an escalation with no
+        run_id -- but the row must not be written with an empty partition key, because a
+        ValidationException here would turn a page that was ALREADY published into a
+        crashed invocation, and #72 exists to stop bookkeeping from swallowing an alert.
+        Filed under the triaging run and marked as subject-less in the brief, which is
+        what distinguishes it from the mis-addressed rows: those carried the triage id in
+        both fields."""
+        ac = FakeAgentCore([
+            tool_use_stream("page_human", {"situation": "s", "recommendation": "r"}),
+            text_stream("ack")])
+        c = clients(ac)
+        driver.handler(driver_event(stage="orchestrator", task="triage",
+                                    run_id="triage-orphan", harness_id="llmops_orchestrator",
+                                    task_token=None), clients=c)
+        paged = [r for r in c["ddb"].Table("llmops-stage-events").items
+                 if "HumanPaged" in str(r.get("sk", ""))]
+        assert paged, "the page was published but left no record at all"
+        assert paged[0]["run_id"] == "triage-orphan"
+        assert json.loads(c["sns"].published[0]["Message"])["run_id"] == "", \
+            "an unaddressed page must not claim a subject it does not have"
 
     def test_a_page_with_no_recommendation_is_rejected_back_not_sent(self):
         """A page reading "needs a human" with no recommendation hands the owner the
