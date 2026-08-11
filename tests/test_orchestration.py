@@ -8602,3 +8602,87 @@ def test_the_role_names_the_guard_checks_are_the_ones_the_script_deploys(iam_mod
          "<DATA_BUCKET>": "b"}, None)
     assert sorted(iam_mod.ROLE_NAMES) == sorted(specs), (
         "ROLE_NAMES has drifted from the roles 01_iam.py actually provisions")
+
+
+# ── a comment key IAM has never heard of ────────────────────────────────────────────
+# The policy documents carry `_comment` keys and substitute() strips them before
+# PutRolePolicy. Live, #84 annotated two statements as `_comment_teardown` and
+# `_comment_orphans`; the strip matched `k != "_comment"` exactly, both keys sailed
+# through, and the deploy died on MalformedPolicyDocument — after the dry run printed
+# a clean diff, because a dry run never reaches IAM's grammar. The strip is now a
+# prefix match, and this test renders the REAL documents so the next new spelling
+# fails here instead of mid-deploy.
+
+def test_no_comment_key_of_any_spelling_reaches_iam(iam_mod):
+    specs = iam_mod.build_role_specs(
+        {"<ACCOUNT_ID>": "123456789012", "<REGION>": "us-east-1",
+         "<DATA_BUCKET>": "b"}, "mem-0000000000")
+
+    def comment_keys(obj, path="$"):
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                if k.startswith("_comment"):
+                    yield f"{path}.{k}"
+                yield from comment_keys(v, f"{path}.{k}")
+        elif isinstance(obj, list):
+            for i, v in enumerate(obj):
+                yield from comment_keys(v, f"{path}[{i}]")
+
+    leaked = [p for name, spec in sorted(specs.items())
+              for doc in (spec["trust"], spec["policy"])
+              for p in comment_keys(doc, name)]
+    assert leaked == [], (
+        f"comment keys would reach PutRolePolicy and fail as MalformedPolicyDocument: {leaked}")
+
+
+# ── the id UpdateHarness actually accepts ───────────────────────────────────────────
+# 04_wire_memory.py passed the bare harness NAME to update_harness; the control plane
+# requires `<name>-<10 char suffix>` (live: ValidationException naming the pattern
+# `[a-zA-Z][a-zA-Z0-9_]{0,39}-[a-zA-Z0-9]{10}`), so the very first attach died before
+# any harness was wired. 05_harnesses.py already resolved names through
+# list_harnesses; the fix gives 04 the same resolution, and this test drives the
+# attach the way the deploy does — through a control plane that enforces the pattern.
+
+@pytest.fixture(scope="module")
+def wire_memory_mod():
+    """deploy/04_wire_memory.py as a module (its name starts with a digit)."""
+    return _load("llmops_04_wire_memory", "deploy/04_wire_memory.py")
+
+
+def test_attach_sends_the_resolved_harness_id_not_the_name(wire_memory_mod):
+    class _FakeCtl:
+        def __init__(self):
+            self.sent = []
+
+        def list_harnesses(self):
+            return {"harnesses": [
+                {"harnessId": "llmops_finetune-Ab1Cd2Ef3G", "name": "llmops_finetune"},
+                {"harnessId": "llmops_eval-Hj4Kl5Mn6P", "name": "llmops_eval"},
+            ]}
+
+        def update_harness(self, harnessId, **kw):
+            if not re.fullmatch(r"[a-zA-Z][a-zA-Z0-9_]{0,39}-[a-zA-Z0-9]{10}", harnessId):
+                raise RuntimeError(f"ValidationException: {harnessId!r}")
+            self.sent.append(harnessId)
+
+    ctl = _FakeCtl()
+    out = wire_memory_mod.attach_to_harness(
+        ctl, "llmops_finetune", "arn:aws:bedrock-agentcore:us-east-1:123456789012:memory/m",
+        {"SEMANTIC": "sem-1", "EPISODIC": "epi-1"}, dry=False)
+    assert out == {"harness": "llmops_finetune", "attached": True}
+    assert ctl.sent == ["llmops_finetune-Ab1Cd2Ef3G"]
+
+
+def test_an_unknown_harness_name_refuses_instead_of_sending_garbage(wire_memory_mod):
+    class _EmptyCtl:
+        def list_harnesses(self):
+            return {"harnesses": []}
+
+        def update_harness(self, **kw):  # pragma: no cover — must not be reached
+            raise AssertionError("update_harness called for a harness that does not exist")
+
+    with pytest.raises(SystemExit):
+        wire_memory_mod.attach_to_harness(
+            _EmptyCtl(), "llmops_ghost",
+            "arn:aws:bedrock-agentcore:us-east-1:123456789012:memory/m",
+            {"SEMANTIC": "sem-1"}, dry=False)

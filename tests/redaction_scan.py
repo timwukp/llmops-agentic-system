@@ -108,7 +108,7 @@ ALLOWED = (b"6833" + b"13688378", b"7631" + b"04351884", b"1234" + b"56789012")
 #: about 4 days -- and a GPU does it in roughly 100 seconds. So the KDF is iterated. At 200k
 #: iterations a candidate costs ~16 ms, which makes the same sweep ~500 GPU-years, while the
 #: scan stays cheap because only 12-digit runs are ever hashed: measured across all 165
-#: tracked files there are 63 such runs, 9 distinct, and hashing the distinct set takes 0.16 s
+#: tracked files there are 66 such runs, 9 distinct, and hashing the distinct set takes 0.16 s
 #: for the entire repo. (Re-measured whenever either number moves, and they move
 #: INDEPENDENTLY, which is why both are derived and neither is inferred from the other, and
 #: this branch is the proof in both directions. Its parent moved BOTH at once from DISJOINT
