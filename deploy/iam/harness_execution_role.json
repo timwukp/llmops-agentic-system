@@ -1,5 +1,5 @@
 {
-  "_comment": "Execution role for ALL 5 llmops worker harnesses (data-prep, finetune, eval, deploy, monitor). Extends deploy/iam/execution_role_base.json (the agentcore-harness-builder skill baseline) with the pipeline's needs: S3 run/report/skills-mirror prefixes, teacher-model Bedrock access (DeepSeek-R1), scoped SageMaker lifecycle + model registry, CloudWatch/Logs read for monitoring, and the llmops-pipeline event bus. Placeholders <REGION>, <ACCOUNT_ID>, <DATA_BUCKET>, <MEMORY_ID> are substituted by deploy/01_iam.py at deploy time (account id from sts get-caller-identity \u2014 never committed). SCOPING NOTE: the base's InvokeModel statement was foundation-model/* + inference-profile/* \u2014 here it is narrowed to exactly the models this pipeline uses (anthropic.* for the harness model global.anthropic.claude-sonnet-5 incl. cross-region routing targets, deepseek.r1* as the distillation teacher), so the teacher grant is NOT a duplicate statement but a narrowing of the base one. BYOMemory* statements are dropped by 01_iam.py unless --memory-id is passed (deploy/wire_memory.py re-adds them per-Memory later, matching the base's contract). Statements with Resource '*' (BaselineImagePull, BaselineTelemetry, SageMakerList, CloudWatchMetricsRead) are actions that do not support resource-level permissions.",
+  "_comment": "Execution role for ALL 5 llmops worker harnesses (data-prep, finetune, eval, deploy, monitor). Extends deploy/iam/execution_role_base.json (the agentcore-harness-builder skill baseline) with the pipeline's needs: S3 run/report/skills-mirror prefixes, teacher-model Bedrock access (DeepSeek-R1), scoped SageMaker lifecycle + model registry, CloudWatch/Logs read for monitoring, and the llmops-pipeline event bus. Placeholders <REGION>, <ACCOUNT_ID>, <DATA_BUCKET>, <MEMORY_ID> are substituted by deploy/01_iam.py at deploy time (account id from sts get-caller-identity — never committed). SCOPING NOTE: the base's InvokeModel statement was foundation-model/* + inference-profile/* — here it is narrowed to exactly the models this pipeline uses (anthropic.* for the harness model global.anthropic.claude-sonnet-5 incl. cross-region routing targets, deepseek.r1* as the distillation teacher), so the teacher grant is NOT a duplicate statement but a narrowing of the base one. BYOMemory* statements are dropped by 01_iam.py unless --memory-id is passed (deploy/wire_memory.py re-adds them per-Memory later, matching the base's contract). Statements with Resource '*' (BaselineImagePull, BaselineTelemetry, SageMakerList, CloudWatchMetricsRead) are actions that do not support resource-level permissions.",
   "trustPolicy": {
     "Version": "2012-10-17",
     "Statement": [
@@ -190,7 +190,7 @@
         "Resource": "*"
       },
       {
-        "_comment": "The prefix list must match S3PipelineObjects: ListBucket is condition-scoped, so a prefix granted for Get/Put but absent here can be read object-by-object and never enumerated -- which is exactly the shape of 'the rate card history is there but the agent reports no card exists'. cost/* joined both lists after the first live reconcile completed its evidence-gathering and then could not write cost/actuals-<period>.json \u2014 the docs/COST.md contract names cost/ as the actuals+report prefix, but only finops/ was ever granted.",
+        "_comment": "The prefix list must match S3PipelineObjects: ListBucket is condition-scoped, so a prefix granted for Get/Put but absent here can be read object-by-object and never enumerated -- which is exactly the shape of 'the rate card history is there but the agent reports no card exists'. cost/* joined both lists after the first live reconcile completed its evidence-gathering and then could not write cost/actuals-<period>.json — the docs/COST.md contract names cost/ as the actuals+report prefix, but only finops/ was ever granted.",
         "Sid": "S3PipelineList",
         "Effect": "Allow",
         "Action": [
@@ -215,7 +215,7 @@
         }
       },
       {
-        "_comment": "gen_ai.usage token spans land in the aws/spans log group (an AgentCore-managed group OUTSIDE /aws/bedrock-agentcore/*, so BaselineLogs does not cover it). The finops reconcile task needs to read them to attribute shared Bedrock inference-profile spend per session id \u2014 this account runs other agents on the same Claude profiles, so without spans the shared spend is unattributable and stays pending. Read-only, this one group.",
+        "_comment": "gen_ai.usage token spans land in the aws/spans log group (an AgentCore-managed group OUTSIDE /aws/bedrock-agentcore/*, so BaselineLogs does not cover it). The finops reconcile task needs to read them to attribute shared Bedrock inference-profile spend per session id — this account runs other agents on the same Claude profiles, so without spans the shared spend is unattributable and stays pending. Read-only, this one group.",
         "Sid": "SpansReadForCostAttribution",
         "Effect": "Allow",
         "Action": [
@@ -242,6 +242,8 @@
           "sagemaker:CreateEndpoint",
           "sagemaker:UpdateEndpoint",
           "sagemaker:DeleteEndpoint",
+          "sagemaker:DeleteEndpointConfig",
+          "sagemaker:DeleteModel",
           "sagemaker:InvokeEndpoint",
           "sagemaker:AddTags"
         ],
@@ -250,7 +252,8 @@
           "arn:aws:sagemaker:<REGION>:<ACCOUNT_ID>:model/llmops-*",
           "arn:aws:sagemaker:<REGION>:<ACCOUNT_ID>:endpoint-config/llmops-*",
           "arn:aws:sagemaker:<REGION>:<ACCOUNT_ID>:endpoint/llmops-*"
-        ]
+        ],
+        "_comment_teardown": "DeleteEndpointConfig/DeleteModel complete the teardown the prompt already commands: the deploy prompt says 'delete the student endpoint and endpoint config', but only DeleteEndpoint was ever granted -- the same shape as the resume role's missing PutEvents, prompt-commanded and role-forbidden, unreached only because no run has yet arrived at teardown. An endpoint deleted without its config and model is HOW the orphans the sweep keeps finding get made."
       },
       {
         "Sid": "SageMakerModelRegistryScoped",
@@ -283,9 +286,12 @@
         "Action": [
           "sagemaker:ListEndpoints",
           "sagemaker:ListTags",
-          "sagemaker:ListTrainingJobs"
+          "sagemaker:ListTrainingJobs",
+          "sagemaker:ListEndpointConfigs",
+          "sagemaker:ListModels"
         ],
-        "Resource": "*"
+        "Resource": "*",
+        "_comment_orphans": "ListEndpointConfigs/ListModels extend the sweep to the two resource types teardown asymmetry orphans: a config or model whose endpoint no longer exists is invisible to an endpoint-only sweep, and the monitor self-reported exactly these two denials for 8 consecutive days. Same argument as ListEndpoints above: enumeration account-wide, every mutation stays scoped to llmops-*."
       },
       {
         "Sid": "PassSageMakerExecutionRoleOnly",
