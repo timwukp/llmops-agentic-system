@@ -5,6 +5,138 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
 ## [Unreleased]
 
+### The deadline handoff needed a chunk in order to notice that no chunk was coming — 825 of every 900 seconds had no working escape hatch
+
+The driver has two protections against the Lambda wall arriving mid-stream. On rehearsal
+`run-20260810T182807Z-e394ada9` neither could fire, and the runtime hard-killed the
+invocation with the agent's already-issued `stage_complete` unanswered:
+
+```
+REPORT RequestId: 925119d7-11e3-4fc2-b106-4cb55d83b9ac	Duration: 900000.00 ms
+Billed Duration: 900000 ms	Memory Size: 512 MB	Max Memory Used: 117 MB	Status: timeout
+```
+
+Zero application log lines. `curated.jsonl` (36,151 B), `generated.jsonl` (194,799 B) and
+`stats.json` (2,546 B) were all in S3 and the manifest carried `data-prep-curate`
+`status: complete` at 19:07:10 — and the stage failed `MissingStageComplete` at 19:09:34Z.
+The agent's own recorded cause was **literally true**: *"The curate stage … is complete and
+was verified in my previous turn."* It was; the turn that verified it was killed.
+
+Established by elimination against that one `REPORT` line, since both alternatives leave
+different fingerprints:
+
+* silent from the first read → `read_timeout` (870 s) fires at elapsed 870 → exception →
+  falls through to the per-turn log line. **Not observed** — nothing was printed.
+* a chunk arrives after elapsed 855 → `out_of_wall` → `DEADLINE_CUT` → handoff, ending at
+  ~855 s. **Not observed** — it ran the full 900.
+
+So the last chunk landed in the *open* interval (30, 855) s and the stream was silent from
+there to the wall. `read_timeout` restarts on every read, so it was next due at
+`last_chunk + 870` ∈ (900, 1725) s — entirely at or past the wall. The window is structural,
+not a race: **825 of the 900 seconds** are in it. `out_of_wall` is evaluated once per chunk,
+inside `for event in resp["stream"]`, so it needs a chunk to arrive in order to observe that
+no chunk is arriving. The margin arithmetic says the same thing from the other side:
+`read_timeout` 870 leaves 30 s of wall, and the handoff demands `DRAIN_DEADLINE_MARGIN_MS`
+= 45 — a 15 s shortfall, so even the path that *did* raise could no longer hand off in time.
+
+Cured:
+
+* **`_stream_watchdog`** — a SIGALRM armed for `remaining − 45 s`, raising *into* the reader.
+  A signal, not a reader thread: the blocking read is inside botocore's urllib3 socket, so
+  there is nothing to poll and no future to cancel. Arming is guarded on `ValueError` so an
+  off-main-thread caller degrades to the old per-chunk behaviour — a guard that turns a
+  working path into a crash is worse than the hang it prevents.
+* The watchdog's exception is relabelled `DEADLINE_CUT`, **not** a stream death: a death
+  burns the one same-session salvage retry, and spending it on a turn that never failed
+  leaves a real death later in the same stage unprotected.
+* Proven both directions against a **real socket** that accepts and then says nothing —
+  a double whose `__next__` returns cannot express "nothing returns". With the watchdog:
+  `DEADLINE_CUT` in 2.01 s. Without it: still blocked past a 6 s join, which is the live
+  900 s hard-kill in miniature.
+
+### An invocation could burn 900 seconds and record nothing
+
+Two consecutive invocations of that same curate stage — `fe22e1c6` (55.9 s) and `925119d7`
+(900 s, `Status: timeout`) — produced **956 seconds of wall and zero application log lines**.
+Bug #24 shipped "a stage that can fail must say how", but it covered only turns that
+*completed*; the paths that end an invocation *without* completing a turn stayed mute. Traced
+for the 55.9 s one: the stream died at t≈56 s → salvage branch → `continue` (silent) → loop
+top → 844 s remaining < the 850 s threshold → `_self_reinvoke()` (silent). Two silent exits,
+and from CloudWatch there was no way to tell a healthy handoff from a driver dying in a loop.
+Both now print, and the per-turn line carries `error=` so a *second* stream death — which
+falls through to it — is no longer indistinguishable from a prose turn-end.
+
+### Every triage heartbeat was refused by design and logged as a failure
+
+A triage runs under `triage-<subject>` and only `start_pipeline` creates run rows, so
+`_heartbeat`'s `ConditionExpression="attribute_exists(run_id)"` **cannot** succeed for one —
+verified: `get-item` on `triage-run-20260810T182807Z-e394ada9` returns `{}`. The condition is
+right, and for a sharper reason than the one already recorded at `_mark_run_escalated`: that
+upsert minted a two-attribute `{run_id, status}` phantom (the live scar is
+`sweep-2026-08-01`), whereas *this* one would mint a row carrying `driver_beat_at` and
+`driver_beat_payload` — precisely what the resurrector sweeps for. The driver would have been
+manufacturing resurrectable ghost runs for every non-run invocation. What was wrong is
+calling the refusal a failure: 11 × `heartbeat write failed (continuing):
+ConditionalCheckFailedException` in two minutes, every line describing correct behaviour,
+which is how the line that would mean *the beat is actually broken* stopped meaning anything.
+A rejected condition now returns quietly. The consequence beyond noise is real and is filed
+separately: a triage has no heartbeat, so **nothing can resurrect a dead triage**.
+
+### Bug #22's cure was inert in production for three days — the write it added was granted to no role, and it silently took a second, permitted write down with it
+
+Bug #22 was *"stage outputs never persist to the manifest, so no stage can read what the
+stage before it produced"*. Its cure added `_save_manifest`, writing
+`runs/<run_id>/manifest.json` on every `stage_complete`. Nothing granted the driver's role
+`s3:PutObject` on that key, so the write has **never once succeeded** in production. An IAM
+gap that makes a cure's only write fail is not a smaller bug than the one it cured — it is
+that bug, still open, with a fix in the repo that reads as landed.
+
+Found by the per-turn log line shipped hours earlier for bug #24, on rehearsal
+`run-20260810T182807Z-e394ada9`:
+
+```
+[driver] canonical report FAILED for run-20260810T182807Z-e394ada9/data-prep: AccessDenied:
+… assumed-role/llmops-lambda-driver/llmops-harness-driver is not authorized to perform:
+s3:PutObject on resource: "arn:aws:s3:::…/runs/…/manifest.json"
+```
+
+The driver role's only `PutObject` grant was `reports/*`. The `_save_manifest` docstring even
+names the grant that permits this write — *"the harness role really can (`S3PipelineObjects`
+grants PutObject on `runs/*`)"* — which is true of the **harness** role and not of the
+**driver** role that performs the write. Two correct halves, eighth instance, this time split
+across two IAM documents.
+
+**The blast radius was larger than the manifest.** The manifest write sat one line above
+`write_run_report` inside the same `try`, so the `AccessDenied` left the block before the
+report write — which the role *has* permitted since bug #22's predecessor. Measured: **8
+pipeline runs from 2026-08-08 to 2026-08-10 wrote zero objects under `reports/run-*`**, while
+the nightly monitor sweep (a different code path) wrote one every day. One statement's
+missing grant silently deleted a second, unrelated artifact, and the log line named
+`canonical report FAILED` — the one of the two writes that had *not* been refused.
+
+- **The grant, scoped to `runs/*/manifest.json`, not `runs/*`.** The driver's job under
+  `runs/` is to *verify* artifacts: it `head_object`s the curated dataset and the eval report
+  to decide whether a stage's token settles, and a role that can rewrite what it verifies can
+  launder its own evidence. The manifest is the one object under that prefix the driver
+  authors, so it is the only one it may write — and inside the document,
+  `IMMUTABLE_MANIFEST_KEYS` still keeps the signed blocks out of reach, because a prefix grant
+  and a document grant are different questions.
+- **The two writes are now independent, with independent failure records.** Neither withholds
+  the task token, and neither can suppress the other. Both failures are reported in one stage
+  event, since the row is keyed by `(run_id, stage)`.
+- **A `run_id` guard on the report write**, which splitting made reachable for the first time:
+  `report_key_for("")` falls back to the `run-latest` alias, so reporting a manifest that
+  failed to *load* would publish a document describing nothing over the last real run's
+  report. The cure for one bug creating the next is what negative controls exist to notice.
+- **The guard is derived from keys, not from actions.** The existing IAM guard was green
+  throughout — the driver *does* have `s3:PutObject`, and the report keys it checked *are*
+  permitted. It even asserted `runs/r/manifest.json` was **forbidden**: a correct claim when
+  written, which #22's cure turned into a green pin on a live defect. The new guard scrapes
+  every S3 key the driver's source can put — across the handler *and* the modules it hands
+  its client to — and matches each against the grant in both directions. A key with no grant
+  fails at review; a grant no key needs fails too, because that is how the verifier of the
+  customer's held-out data quietly becomes its writer.
+
 ### A `stage_complete` that was called was reported as never called — the driver discarded every inline function that rode with `end_turn`
 
 The seventh instance of "two correct halves, never connected", found by a rehearsal failing

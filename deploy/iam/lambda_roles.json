@@ -134,6 +134,13 @@
             "Resource": "arn:aws:s3:::<DATA_BUCKET>/reports/*"
           },
           {
+            "_comment": "The driver's SECOND write, added by bug #22's cure and granted by nothing until bug #25: _save_manifest persists a completed stage's outputs+metrics back to runs/<run_id>/manifest.json, the object every specialist prompt calls 'the single source of truth'. The cure shipped, deployed, and was inert -- live rehearsal run-20260810T182807Z-e394ada9 finished DataPrepGenerate and logged 'canonical report FAILED ... not authorized to perform: s3:PutObject on .../manifest.json'. Bug #22 was 'no stage can read what the stage before it produced', so an IAM gap that makes its write fail is not a smaller bug than #22, it IS #22, still open. Worse, the write sat one line ABOVE write_run_report inside the same try, so the AccessDenied aborted before the report the driver IS granted -- measured: 8 pipeline runs since 2026-08-08 produced zero per-run reports. That coupling is fixed in the handler; this statement is the half that was missing here. Scoped to runs/*/manifest.json, NOT runs/*: the driver's job under runs/ is to VERIFY artifacts (head_object on distillation/curated.jsonl, evaluation/report.json, the trained adapter), and a role that can rewrite the artifacts it verifies can launder its own evidence. The manifest is the one object under that prefix the driver authors, so it is the only one it may write -- and even inside it, IMMUTABLE_MANIFEST_KEYS keeps the signed blocks out of reach, because a prefix grant and a document grant are different questions.",
+            "Sid": "WriteStageResultsToRunManifest",
+            "Effect": "Allow",
+            "Action": "s3:PutObject",
+            "Resource": "arn:aws:s3:::<DATA_BUCKET>/runs/*/manifest.json"
+          },
+          {
             "_comment": "Servicing the conductor's launch_run: the driver invokes start-pipeline on the orchestrator's behalf. Without this, an orchestrator run with params.task=plan reaches the dispatch moment and dies on AccessDenied \u2014 the exact defect that made launch_run 'unsupported' for five phases.",
             "Sid": "ConductorDispatch",
             "Effect": "Allow",
