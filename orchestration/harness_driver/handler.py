@@ -276,6 +276,27 @@ def _resolve_harness_arn(harness_id: str) -> str:
     return _arn_cache[harness_id]
 
 
+#: Every tool name _run_stage's dispatch has a branch for -- i.e. every tool THIS
+#: DRIVER is the answerer for. Membership here is what licenses servicing a call that
+#: arrived with a non-tool_use stop_reason (see the override in the turn loop), so it
+#: has to stay exactly the set of branches below: a name in this set with no branch
+#: falls through to {"status": "unsupported"}, and a branch missing from this set is
+#: silently discarded when it rides with end_turn -- the bug this exists to fix.
+#:
+#: Kept as a literal rather than read from the harness config, because the question
+#: being asked is "can I service this?", which is a fact about this file, not about the
+#: control plane. Reading it remotely would answer a slightly different question
+#: (what the config DECLARES) over a network call that can fail, and a fallback for
+#: that failure is a second copy of this same list. It does not go stale unnoticed:
+#: test_the_serviced_tool_set_matches_the_dispatch_branches derives the branch names
+#: out of this module's source and asserts set equality, so adding a branch without
+#: adding the name -- or renaming either -- turns that guard red.
+SERVICED_TOOLS = frozenset({"stage_complete", "checkpoint", "escalate_human",
+                            "job_launched", "publish_cost_report", "update_rate_card",
+                            "flag_variance", "launch_run", "resolve_escalation",
+                            "page_human", "write_report"})
+
+
 def _invoke(ac, harness_id: str, sess: str, messages: list, qualifier: Optional[str]):
     """`messages` is the full messages list -- a resume needs two entries (assistant
     toolUse echo + user toolResult), so this can no longer wrap a single content
@@ -285,6 +306,39 @@ def _invoke(ac, harness_id: str, sess: str, messages: list, qualifier: Optional[
     if qualifier:
         kwargs["qualifier"] = qualifier
     return ac.invoke_harness(**kwargs)
+
+
+def _ack_terminal(c, event, sess, tu, payload, effect: str) -> None:
+    """Answer a serviced inline function whose EFFECT HAS ALREADY LANDED.
+
+    Every terminal branch below has the same shape: do the irreversible thing (settle
+    the task token, park the job, record the escalation, deliver the page, dispatch the
+    run), then send the agent a toolResult so its session sees an answer, then return a
+    status the state machine reads. The ack is the only one of those three that can
+    fail, and it is the only one that does not matter -- nothing downstream reads it,
+    and the session is finished with either way.
+
+    Before this helper, any exception here propagated out of _run_stage and turned a
+    stage that had genuinely finished -- token already settled, artifacts already in S3
+    -- into a failed invocation, leaving the state machine with a settled token AND a
+    Lambda error for the same stage. Every _invoke can fail on throttling or a 5xx
+    alone, and the override above adds a shape with no production record either way:
+    servicing a call that arrived with stopReason=end_turn now sends a resume for a turn
+    the runtime has already closed. _tool_result_content echoes the toolUse alongside
+    the result, so that resume carries its own matching call and MAY be accepted -- but
+    it is untested, and the failure mode if it is not (see the rejection quoted in
+    _tool_result_content) would land exactly here, one state after the effect.
+
+    Which is the point: a courtesy message must not be able to un-complete a stage,
+    whatever the reason it fails. Nothing downstream reads the ack.
+    """
+    try:
+        _invoke(c["agentcore"], event["harness_id"], sess,
+                _tool_result_content(tu, payload), event.get("qualifier"))
+    except Exception as exc:  # noqa: BLE001 -- the effect is already irreversible
+        print(f"[driver] ack for {tu.get('name')} was rejected "
+              f"({type(exc).__name__}: {exc}); {effect} already landed and nothing "
+              "downstream reads the ack, so this turn is finished as a success")
 
 
 #: How much Lambda wall must remain when _drain abandons a stream. Enough for the
@@ -1584,11 +1638,39 @@ def _run_stage(event, context=None, c=None):
             continue
 
         tu = out["tool_use"]
+        # One line per turn, because without it a failed stage is undiagnosable. Live:
+        # run-20260810T174626Z-3f08b4c6's generate stage burned three turns and died
+        # MissingStageComplete with `distillation/generated.jsonl` sitting in S3, and
+        # CloudWatch held only three REPORT lines. There was no way to tell "the agent
+        # narrated instead of calling" from "the agent called and the branch below
+        # dropped it" -- two different bugs with one symptom, and the evidence needed to
+        # separate them was never recorded. A stage that can fail must say how.
+        print(f"[driver] turn stage={event.get('stage')} task={event.get('task')} "
+              f"stop_reason={out['stop_reason']} tool={(tu or {}).get('name')} "
+              f"re_asks={re_asks} text_chars={len(out['text'])}")
         # Only a stopReason of "tool_use" means the harness is WAITING for a result.
         # A toolUse block riding along with end_turn was already serviced inside the
         # harness; replying to it makes the next ConverseStream invalid with
         # "toolResult blocks ... exceeds the number of toolUse blocks of previous
         # turn" (found live on the console's dispatch path, same shape here).
+        #
+        # That reasoning holds only for tools the HARNESS can service -- code_interpreter
+        # and shell, which run inside it. It does NOT hold for the inline functions this
+        # driver owns: the runtime emits those blocks and has no way to answer them, so
+        # one arriving with end_turn is not "already serviced", it is a call nobody will
+        # ever answer. Discarding it counted a fully compliant turn as prose, and after
+        # three of those the stage failed MissingStageComplete with its outputs already
+        # in S3 -- a stage_complete that was CALLED, reported as never called.
+        #
+        # So the stop_reason decides only for tools this driver cannot service; for the
+        # ones it can, the call is serviced whatever the stop_reason says. The set is
+        # the dispatch table itself (SERVICED_TOOLS), which is the same question the
+        # branches below answer.
+        if tu and out["stop_reason"] != "tool_use" and tu.get("name") in SERVICED_TOOLS:
+            print(f"[driver] {tu['name']} arrived with stop_reason="
+                  f"{out['stop_reason']}; servicing it anyway -- the harness cannot "
+                  "have serviced a call only this driver can answer")
+            out = {**out, "stop_reason": "tool_use"}
         if tu and out["stop_reason"] == "tool_use":
             # A structured call proves the agent still speaks protocol, so the
             # consecutive-prose budget re-arms — even for a rejected stage_complete
@@ -1607,15 +1689,13 @@ def _run_stage(event, context=None, c=None):
                         "reason": f"claimed outputs missing from S3: {result['missing_outputs']}. "
                                   "Write them and call stage_complete again."})
                     continue
-                _invoke(c["agentcore"], event["harness_id"], sess,
-                        _tool_result_content(tu, {"status": "acknowledged"}),
-                        event.get("qualifier"))
+                _ack_terminal(c, event, sess, tu, {"status": "acknowledged"},
+                              "the task token was settled and the outputs verified")
                 return {"status": "completed", **result["normalized"]}
             if name == "job_launched":
                 handle_job_launched(c, event, args)
-                _invoke(c["agentcore"], event["harness_id"], sess,
-                        _tool_result_content(tu, {"status": "released"}),
-                        event.get("qualifier"))
+                _ack_terminal(c, event, sess, tu, {"status": "released"},
+                              "the task token was parked for EventBridge to settle")
                 return {"status": "released", "job_name": args.get("job_name")}
             if name == "checkpoint":
                 # Just answer it and let the loop-top _out_of_time() check own the
@@ -1639,9 +1719,8 @@ def _run_stage(event, context=None, c=None):
                 continue
             if name == "escalate_human":
                 handle_escalate(c, event, args)
-                _invoke(c["agentcore"], event["harness_id"], sess,
-                        _tool_result_content(tu, {"status": "escalated"}),
-                        event.get("qualifier"))
+                _ack_terminal(c, event, sess, tu, {"status": "escalated"},
+                              "the escalation was recorded and the run paused")
                 return {"status": "escalated"}
             if name == "resolve_escalation":
                 # Conductor triage verdict: record it where the escalation lives
@@ -1731,9 +1810,8 @@ def _run_stage(event, context=None, c=None):
                                "adjusted_params you would have applied. That is the "
                                "only exit that changes anything from here."))})
                     continue
-                _invoke(c["agentcore"], event["harness_id"], sess,
-                        _tool_result_content(tu, {"status": "recorded"}),
-                        event.get("qualifier"))
+                _ack_terminal(c, event, sess, tu, {"status": "recorded"},
+                              "the verdict was recorded and parked for the subject run")
                 # `subject`, not args["run_id"]: this dict is the driver's own return
                 # value and the console renders it, so echoing the agent's copy would
                 # report a resolution against whichever id the model happened to send.
@@ -1752,9 +1830,8 @@ def _run_stage(event, context=None, c=None):
                     messages = _tool_result_content(tu, {
                         "status": "rejected", "reason": result["reason"]})
                     continue
-                _invoke(c["agentcore"], event["harness_id"], sess,
-                        _tool_result_content(tu, {"status": "paged"}),
-                        event.get("qualifier"))
+                _ack_terminal(c, event, sess, tu, {"status": "paged"},
+                              "the page was delivered to the run owner")
                 return {"status": "paged", "run_id": result["run_id"]}
             if name == "write_report":
                 # trust-but-verify, same as every artifact claim
@@ -1764,9 +1841,8 @@ def _run_stage(event, context=None, c=None):
                         "status": "rejected",
                         "reason": f"report_uri not in S3: {missing}. Write it first."})
                     continue
-                _invoke(c["agentcore"], event["harness_id"], sess,
-                        _tool_result_content(tu, {"status": "recorded"}),
-                        event.get("qualifier"))
+                _ack_terminal(c, event, sess, tu, {"status": "recorded"},
+                              "the report was verified in S3")
                 return {"status": "completed", "report_uri": args.get("report_uri"),
                         "headline": str(args.get("headline", ""))[:300]}
             if name == "launch_run":
@@ -1783,10 +1859,9 @@ def _run_stage(event, context=None, c=None):
                     messages = _tool_result_content(tu, {
                         "status": "rejected", "reason": result["reason"]})
                     continue
-                _invoke(c["agentcore"], event["harness_id"], sess,
-                        _tool_result_content(tu, {
-                            "status": "dispatched", "run_id": result["run_id"]}),
-                        event.get("qualifier"))
+                _ack_terminal(c, event, sess, tu,
+                              {"status": "dispatched", "run_id": result["run_id"]},
+                              f"run {result['run_id']} was already dispatched")
                 return {"status": "dispatched", "run_id": result["run_id"],
                         "manifest_uri": result["manifest_uri"],
                         "execution_arn": result["execution_arn"]}
@@ -1799,12 +1874,11 @@ def _run_stage(event, context=None, c=None):
                 # flag_variance is a FINDING, not the end of the task: an audit can
                 # flag several runs in one turn, so acknowledge and let it continue.
                 # The report/rate-card calls are terminal.
-                ack = _tool_result_content(tu, {"status": "recorded"})
                 if name == "flag_variance":
-                    messages = ack
+                    messages = _tool_result_content(tu, {"status": "recorded"})
                     continue
-                _invoke(c["agentcore"], event["harness_id"], sess, ack,
-                        event.get("qualifier"))
+                _ack_terminal(c, event, sess, tu, {"status": "recorded"},
+                              f"{name} was serviced and its artifact verified")
                 return {"status": "completed", "tool": name, **result["args"]}
             # unknown tool — acknowledge and continue rather than dying
             messages = _tool_result_content(tu, {"status": "unsupported"})

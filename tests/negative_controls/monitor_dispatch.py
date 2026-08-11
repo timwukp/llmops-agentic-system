@@ -3519,6 +3519,71 @@ case("prompt: the val split stops being labelled the fallback and becomes an equ
      [f"{_C}::test_the_scoring_task_anchors_the_gate_to_the_customers_acceptance_set"])
 
 
+_DRV = "tests/test_orchestration.py::TestDriver"
+
+# 190. Bug #24 restored: the stop_reason check applies to inline functions again. This is the
+#      exact pre-cure line, and the reason it looked right is that it IS right for
+#      code_interpreter and shell -- the harness services those itself, so answering one
+#      would make the next ConverseStream invalid. The half never connected: an inline
+#      function is BY DEFINITION one the harness cannot service, so a call arriving with
+#      end_turn is not "already serviced", it is a call nobody will ever answer. Live:
+#      run-20260810T174626Z-3f08b4c6 died MissingStageComplete at DataPrepGenerate with 300
+#      verified customer rows already in S3 -- a stage_complete that was CALLED, reported as
+#      never called.
+def m190(t):
+    old = re.search(r'\n        if tu and out\["stop_reason"\] != "tool_use" and tu'
+                    r'\.get\("name"\) in SERVICED_TOOLS:.*?\n            out = '
+                    r'\{\*\*out, "stop_reason": "tool_use"\}\n', t, re.S)
+    assert old, "the inline-function override no longer matches; re-anchor this mutation"
+    return t.replace(old.group(0), "\n", 1)
+
+
+case("driver: an inline function riding with end_turn is discarded and counted as prose",
+     _DRIVER, m190,
+     [f"{_DRV}::test_a_stage_complete_riding_with_end_turn_is_serviced_not_discarded",
+      f"{_DRV}::test_a_rejected_courtesy_ack_cannot_un_complete_a_settled_stage"])
+
+# 191. The override survives but SERVICED_TOOLS loses one name, so exactly one tool keeps the
+#      old behaviour. Chosen as job_launched because its discard is the quietest of the
+#      eleven: the job is running on SageMaker and billing, the token is parked, and the
+#      driver has decided the turn was prose -- so the stage fails while the GPU it launched
+#      keeps going. A per-tool version of the same bug is what a hand-kept second copy of the
+#      dispatch table produces the first time an agent gains a tool, which is why the set is
+#      derived from the branches rather than trusted.
+def m191(t):
+    old = '                            "job_launched", "publish_cost_report"'
+    assert t.count(old) == 1, f"the serviced-tool set has moved; found {t.count(old)}"
+    return t.replace(old, '                            "publish_cost_report"', 1)
+
+
+case("driver: the serviced-tool set drops one name the dispatch still has a branch for",
+     _DRIVER, m191,
+     [f"{_DRV}::test_the_serviced_tool_set_matches_the_dispatch_branches"])
+
+# 192. The ack goes back to a bare _invoke on the stage_complete branch. Nothing about the
+#      happy path changes -- the token is settled, the outputs verified, the return value
+#      identical -- so every test that does not reject an ack stays green. The bug is one
+#      state further on than #24's: the call is now serviced, and answering it re-invokes a
+#      runtime with no open toolUse, which rejects. Raising there reports a stage that
+#      genuinely finished as a crashed one, and the state machine sees a settled token AND an
+#      invocation error for the same stage.
+def m192(t):
+    old = ('                _ack_terminal(c, event, sess, tu, {"status": "acknowledged"},\n'
+           '                              "the task token was settled and the outputs '
+           'verified")\n')
+    assert t.count(old) == 1, f"the stage_complete ack has moved; found {t.count(old)}"
+    return t.replace(old,
+                     '                _invoke(c["agentcore"], event["harness_id"], sess,\n'
+                     '                        _tool_result_content(tu, '
+                     '{"status": "acknowledged"}),\n'
+                     '                        event.get("qualifier"))\n', 1)
+
+
+case("driver: a rejected courtesy ack raises after the token is already settled",
+     _DRIVER, m192,
+     [f"{_DRV}::test_a_rejected_courtesy_ack_cannot_un_complete_a_settled_stage"])
+
+
 #: Where the pristine text of the file currently mutated is parked, so a kill -9 -- which
 #: no handler can intercept -- still leaves the original recoverable. Under the repo root
 #: rather than /tmp because it must be obvious to whoever finds the tree dirty, and
