@@ -83,7 +83,7 @@ def substitute(obj, mapping):
     if isinstance(obj, list):
         return [substitute(x, mapping) for x in obj]
     if isinstance(obj, dict):
-        return {k: substitute(v, mapping) for k, v in obj.items() if k != "_comment"}
+        return {k: substitute(v, mapping) for k, v in obj.items() if not k.startswith("_comment")}
     return obj
 
 

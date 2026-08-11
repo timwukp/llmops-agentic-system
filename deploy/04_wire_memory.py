@@ -78,6 +78,15 @@ def strategy_ids(ctl, memory_id, dry):
     return out
 
 
+def resolve_harness_id(ctl, name):
+    """UpdateHarness rejects the bare name (live: ValidationException, pattern
+    `[a-zA-Z][a-zA-Z0-9_]{0,39}-[a-zA-Z0-9]{10}`) — same resolution 05_harnesses.py does."""
+    for h in ctl.list_harnesses().get("harnesses", []):
+        if h.get("name") == name or h.get("harnessId", "").rsplit("-", 1)[0] == name:
+            return h["harnessId"]
+    raise SystemExit(f"harness '{name}' not found — run 05_harnesses.py first")
+
+
 def attach_to_harness(ctl, harness_name, memory_arn, sids, dry):
     """UpdateHarness with the BYO memory block (wrapped in optionalValue)."""
     retrieval = {}
@@ -105,7 +114,7 @@ def attach_to_harness(ctl, harness_name, memory_arn, sids, dry):
     if dry:
         return {"harness": harness_name, "would_attach": block}
     ctl.update_harness(
-        harnessId=harness_name,
+        harnessId=resolve_harness_id(ctl, harness_name),
         memory={"optionalValue": block},
         clientToken=secrets.token_hex(20),
     )
