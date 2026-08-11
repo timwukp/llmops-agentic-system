@@ -25,7 +25,10 @@ The stack, oldest first — each branch's parent is the one above it:
 | #76 | `fix/inline-function-discard` | `c065fae` | scan + validate **pass** | open, awaiting merge |
 | #77 | `fix/driver-deadline-and-manifest-grant` | `6a2f258` | scan + validate **pass** | open, awaiting merge |
 | #78 (bug #27) | `fix/typed-outputs-verification` | `7ef34a9` | scan + validate **pass** | open, awaiting merge |
-| #79 (bug #28) | `fix/typed-inline-function-call` | `5cd521f` | scan + validate **pass** | open, awaiting merge |
+| #79 (bug #28) | `fix/typed-inline-function-call` | `5cd521f` + this file's own commit | scan + validate **pass** | open, awaiting merge |
+
+This file lives on #79, so its own row cannot name its own sha — read that one head from
+`gh pr view 79 --json headRefOid`. The other four are fixed and quotable.
 
 Bug #27 = `outputs` sent as a JSON string bypasses S3 verification (contracts concern).
 Bug #28 = a call the model **typed** instead of made is invisible (driver concern).
