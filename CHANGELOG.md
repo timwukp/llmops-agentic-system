@@ -5,6 +5,25 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
 ## [Unreleased]
 
+### The shared memory injected another run's conclusions into every invocation as bare fact
+
+`llmops_shared_memory`'s semantic namespace (`/users/{actorId}/facts`) is keyed by
+harness name only — the cross-run learning channel, by design — but its retrieval was
+`topK: 10, relevanceScore: 0.2`, and 0.2 is no threshold at all. Live, every finetune
+invocation received exactly 10 "facts", including a post-mortem of a **different** run's
+`MissingStageComplete` and hyperparameters from an unrelated dataset: for the current
+IT-helpdesk run, remembered ARC-AGI-2 hyperparameters injected as durable truth are not
+noise, they are a bias the agent could act on.
+
+Fixed in two layers, keeping the run-N → run-N+1 learning channel open:
+* Retrieval must earn relevance: semantic `topK 10 → 5`, `relevanceScore 0.2 → 0.6`
+  (episodic stays at 0.2 — `{sessionId}` already scopes it to the agent's own session).
+* All five memory-wired prompts now subordinate memory to the plan: retrieved memory is
+  background from other runs, possibly other domains; this run's signed plan, params and
+  manifest always outrank it. Guarded by a test derived from `04_wire_memory.py`'s own
+  harness list — wiring a sixth harness without the rule fails the suite.
+
+
 ### A failed eval inference job died with zero reflection, on a defect one sentence of SDK knowledge would have prevented
 
 Two bugs from one death. `run-20260811T040003Z-3548116f` — the deepest run the platform

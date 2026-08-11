@@ -3011,6 +3011,25 @@ class TestStateMachine:
                     "that SDK-submitted hyperparameters arrive JSON-encoded -- the "
                     "defect that killed run-20260811T040003Z-3548116f's eval job")
 
+    def test_every_memory_wired_prompt_subordinates_memory_to_the_plan(self):
+        """The shared semantic memory is the cross-run learning channel, and live it
+        injected another run's MissingStageComplete post-mortem and an unrelated
+        dataset's hyperparameters into every finetune invocation as bare "facts". The
+        retrieval threshold fix bounds HOW MUCH crosses; this rule governs what the
+        agent DOES with whatever still does. Derived from 04_wire_memory.py's own
+        harness list, so wiring a sixth harness without the rule fails here."""
+        src = (REPO / "deploy/04_wire_memory.py").read_text()
+        m = re.search(r"DEFAULT_HARNESSES = \[([^\]]+)\]", src)
+        wired = {n.strip().strip('"').removeprefix("llmops_").replace("_", "-")
+                 for n in m.group(1).split(",")}
+        assert wired == {"data-prep", "finetune", "eval", "deploy", "monitor"}, wired
+        for d in sorted(wired):
+            text = json.loads((REPO / f"agents/{d}/harness.json").read_text()
+                              )["systemPrompt"][0]["text"]
+            assert "Retrieved memory is BACKGROUND" in text and "ALWAYS outrank" in text, (
+                f"{d} is wired to the shared memory but its prompt never subordinates "
+                "retrieved facts to this run's signed plan")
+
     def test_remediate_task_reaches_finetune_harness(self, asl):
         payload = asl["States"]["RemediateFinetune"]["Parameters"]["Payload"]
         assert payload["stage"] == "finetune"
