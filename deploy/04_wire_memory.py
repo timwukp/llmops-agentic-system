@@ -82,8 +82,15 @@ def attach_to_harness(ctl, harness_name, memory_arn, sids, dry):
     """UpdateHarness with the BYO memory block (wrapped in optionalValue)."""
     retrieval = {}
     if "SEMANTIC" in sids:
+        # Semantic facts are the CROSS-RUN channel, and 0.2 was no threshold at all:
+        # live, every finetune invocation received exactly topK=10 "facts", including a
+        # post-mortem of a DIFFERENT run's MissingStageComplete and hyperparameters from
+        # an unrelated dataset -- another run's conclusions injected invisibly as truth.
+        # 0.6/5 keeps the run-N -> run-N+1 learning channel open but makes it earn
+        # relevance; the episodic namespace below stays at 0.2 because {sessionId}
+        # scopes it to the agent's OWN session.
         retrieval["/users/{actorId}/facts"] = {
-            "strategyId": sids["SEMANTIC"], "topK": 10, "relevanceScore": 0.2}
+            "strategyId": sids["SEMANTIC"], "topK": 5, "relevanceScore": 0.6}
     if "EPISODIC" in sids:
         retrieval["/episodes/{actorId}/{sessionId}"] = {
             "strategyId": sids["EPISODIC"], "topK": 10, "relevanceScore": 0.2}
