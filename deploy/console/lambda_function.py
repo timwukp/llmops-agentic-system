@@ -734,10 +734,22 @@ def run_detail(run_id):
                 passed = float(actual) >= float(threshold)
         except Exception:
             pass
-        out["gates"].append({"name": gname, "threshold": threshold,
-                             "actual": actual, "passed": passed})
+        row = {"name": gname, "threshold": threshold,
+               "actual": actual, "passed": passed}
+        # judge_score is decided by its Wilson interval, not the point estimate
+        # (agents/eval gate bullet) -- surface the bounds so a "passed: None"
+        # borderline row is legible as an escalation, not a rendering gap.
+        if gname == "judge_score":
+            for b in ("judge_score_ci_low", "judge_score_ci_high", "judge_n"):
+                if eval_metrics.get(b) is not None:
+                    row[b] = eval_metrics[b]
+        out["gates"].append(row)
     gp = eval_metrics.get("gate_passed")
     out["gateVerdict"] = ("passed" if gp is True else "failed" if gp is False else None)
+    # OOD layer: measured and reported, never gated -- rendered as its own
+    # read-only block so it cannot be mistaken for a gate row.
+    if isinstance(eval_metrics.get("ood"), dict):
+        out["oodReport"] = eval_metrics["ood"]
     # training job (tolerate missing): job_name lives on the runs-table item
     job_name = ""
     if runs_tbl:
