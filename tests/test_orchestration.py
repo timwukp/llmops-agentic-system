@@ -455,6 +455,69 @@ class TestContracts:
         norm = normalize_stage_complete({"outputs": [], "artifacts": ["s3://b/x"]})
         assert norm["outputs"] == []  # presence wins over later alias
 
+    # --- #27: outputs spelled as a JSON string skipped verification entirely ---
+
+    def test_outputs_sent_as_a_json_string_are_still_verified(self):
+        """The whole trust-but-verify mechanism, defeated by a type.
+
+        `verify_outputs` head_objects every element that `startswith("s3://")`. A
+        one-element list holding the TEXT '["s3://.../a", "s3://.../b"]' starts with '[',
+        so every URI inside it was skipped and the stage passed verification having proved
+        nothing -- an agent could claim outputs that do not exist and be believed, which is
+        the one thing the head_object exists to stop.
+
+        `metrics` had had the JSON-string parse since the contract was written; `outputs`
+        never did, and outputs is the field with a security consequence. Measured live on
+        rehearsal run-20260811T005043Z-320cc47e, whose data-prep entry recorded
+        outputs=["[\\"s3://...generated.jsonl\\", \\"s3://...manifest.json\\"]"]. Those two
+        objects did exist, so the run was honest -- which is exactly why this was invisible
+        for as long as the agents were.
+
+        Asserted through verify_outputs rather than on the normalized list alone: the shape
+        is only wrong because of what the CALLER then fails to check, and a test that stops
+        at the list would keep passing if verify_outputs' skip rule changed underneath it.
+        """
+        uris = ["s3://b/runs/r/a.jsonl", "s3://b/runs/r/b.json"]
+        norm = normalize_stage_complete({"outputs": json.dumps(uris)})
+        assert norm["outputs"] == uris
+
+        class NothingExists:
+            def head_object(self, Bucket, Key):
+                raise RuntimeError("404 NoSuchKey")
+
+        assert driver.verify_outputs(NothingExists(), norm["outputs"]) == uris
+
+    def test_a_json_quoted_single_uri_is_unwrapped_before_verification(self):
+        """'"s3://b/x"' must not keep the quote in front of the scheme.
+
+        The identical vacuous check one layer down: a leading '"' also fails
+        startswith("s3://"), so unwrapping only the list case would leave the scalar case
+        unverifiable. A bare unquoted URI is not valid JSON and must survive untouched.
+        """
+        assert normalize_stage_complete({"outputs": '"s3://b/x"'})["outputs"] == ["s3://b/x"]
+        assert normalize_stage_complete({"outputs": "s3://b/x"})["outputs"] == ["s3://b/x"]
+
+    def test_a_non_json_string_output_is_kept_verbatim(self):
+        """Parsing must not eat a claim it cannot understand.
+
+        An agent naming a local path or writing prose into `outputs` is making a claim that
+        belongs in the report where a human can see it is not an s3:// URI. Turning it into
+        [] would delete the evidence that the stage misreported.
+        """
+        assert normalize_stage_complete({"outputs": "not json"})["outputs"] == ["not json"]
+        assert normalize_stage_complete({"outputs": "[]"})["outputs"] == []
+
+    def test_a_dict_output_is_recorded_as_text_not_mined_for_uris(self):
+        """The boundary of the fix, asserted so it is a decision rather than an oversight.
+
+        A dict stays unverified -- but that is verify_outputs' documented rule for any
+        non-s3:// element, not this bug. Guessing which of its values are artifacts would
+        invent a claim the agent never made, and an invented claim that then PASSES
+        head_object is worse than a legible one that is never checked.
+        """
+        norm = normalize_stage_complete({"outputs": {"uri": "s3://b/x"}})
+        assert norm["outputs"] == ["{'uri': 's3://b/x'}"]
+
     def test_report_counts_and_findings(self):
         manifest = {"run_id": "r1", "stages": {
             "data-prep": {"status": "completed"},
