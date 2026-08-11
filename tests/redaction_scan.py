@@ -107,12 +107,16 @@ ALLOWED = (b"6833" + b"13688378", b"7631" + b"04351884", b"1234" + b"56789012")
 #: this laptop, single-threaded CPython does 3.1M sha256/s, so the whole 1e12 space falls in
 #: about 4 days -- and a GPU does it in roughly 100 seconds. So the KDF is iterated. At 200k
 #: iterations a candidate costs ~16 ms, which makes the same sweep ~500 GPU-years, while the
-#: scan stays cheap because only 12-digit runs are ever hashed: measured across all 163
+#: scan stays cheap because only 12-digit runs are ever hashed: measured across all 165
 #: tracked files there are 62 such runs, 9 distinct, and hashing the distinct set takes 0.16 s
 #: for the entire repo. (Re-measured whenever either number moves, and they move
-#: INDEPENDENTLY, which is why both are derived and neither is inferred from the other: the
-#: task_tokens contract made it 162 files became 163 while the run count held at 52, and the
-#: env_keys derivation then held the file count at 163 while adding 2 runs -- two `env_values`
+#: INDEPENDENTLY, which is why both are derived and neither is inferred from the other: this
+#: commit moved BOTH -- 163 files became 165 (the re-connect brief and the control-slice
+#: runner, neither of which contains a 12-digit run) while the run count went 54 -> 62 from
+#: this branch's new dispatch tests. Two numbers moving in one commit from disjoint files is
+#: the case that looks like a single number and is not. Earlier: the task_tokens contract
+#: moved 162 -> 163 while the run count held at 52, and the env_keys derivation then held the
+#: file count at 163 while adding 2 runs -- two `env_values`
 #: tests passing the placeholder account id. What never moves is the DISTINCT count: every run
 #: in a test is the same published placeholder, so the KDF cost is bounded by 9 no matter how
 #: many tests cite it. That is the half of the sentence the cheapness claim actually rests on.)
