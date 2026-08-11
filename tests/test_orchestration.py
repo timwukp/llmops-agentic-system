@@ -2027,6 +2027,139 @@ class TestDriver:
         # salvage re-ask went to the SAME session
         assert ac.calls[0]["runtimeSessionId"] == ac.calls[1]["runtimeSessionId"]
 
+    # --- #26: the deadline handoff needed a chunk in order to notice no chunk came ---
+
+    def test_a_stream_that_goes_quiet_at_the_wall_still_hands_off(self):
+        """The trickling-stream test above passes because a chunk keeps ARRIVING, which
+        is the only moment `out_of_wall` is evaluated. A stream that goes QUIET reaches
+        neither escape hatch, and the interval where that is true is almost the whole
+        invocation: after a chunk at elapsed t, boto's read_timeout restarts and is next
+        due at t + 870, past the 900s wall for every t > 30; `out_of_wall` needs a chunk
+        after 855. So a last chunk anywhere in (30, 855)s -- 825 of the 900 -- left the
+        runtime to hard-kill the invocation.
+
+        Live: run-20260810T182807Z-e394ada9's curate turn,
+        `REPORT RequestId: 925119d7-11e3-4fc2-b106-4cb55d83b9ac Duration: 900000.00 ms
+        Billed Duration: 900000 ms Memory Size: 512 MB Max Memory Used: 117 MB
+        Status: timeout`, with ZERO application log lines. The agent had already written
+        curated.jsonl (36,151 B), generated.jsonl (194,799 B) and stats.json (2,546 B)
+        and had already called stage_complete; the call died with the invocation and the
+        stage failed MissingStageComplete with its own outputs in S3. Its recorded cause
+        was literally true: "is complete and was verified in my previous turn".
+
+        A real blocking read, not a fake that returns: the defect IS that nothing returns.
+        A double whose __next__ hands back control could not express it.
+        """
+        import socket
+        import threading
+
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        threading.Thread(target=lambda: (srv.accept(), time.sleep(30)),
+                         daemon=True).start()
+        cli = socket.create_connection(("127.0.0.1", srv.getsockname()[1]))
+
+        class QuietStream:
+            """Blocks in recv() forever — botocore's urllib3 read on a silent stream."""
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                cli.recv(4096)
+                raise StopIteration  # unreachable: nothing will ever be sent
+
+        margin = driver.DRAIN_DEADLINE_MARGIN_MS
+        driver.DRAIN_DEADLINE_MARGIN_MS = 3_000
+        try:
+            t0 = time.time()
+            out = driver._drain({"stream": QuietStream()},
+                                remaining_ms=lambda: 5_000)
+        finally:
+            driver.DRAIN_DEADLINE_MARGIN_MS = margin
+            cli.close()
+            srv.close()
+        elapsed = time.time() - t0
+        assert out["error"] == driver.DEADLINE_CUT, (
+            f"a quiet stream returned {out['error']!r}, not a deadline cut — the "
+            "invocation would run to the wall and be hard-killed with the agent's "
+            "pending inline function unanswered")
+        assert elapsed < 4.0, (
+            f"_drain took {elapsed:.1f}s to give up on a stream it had 2s of budget "
+            "for; the watchdog did not interrupt the blocking read")
+
+    def test_a_quiet_stream_is_a_deadline_cut_not_a_stream_death(self):
+        """The two are handled differently on purpose: a death burns the one same-session
+        salvage retry, a deadline cut hands the turn to a fresh invocation with the whole
+        900s. Relabelling matters because the harness turn is still running server-side
+        (840s cap) and will finish without us — spending the retry here would leave a
+        REAL death later in the same stage unprotected."""
+        class _Quiet:
+            def __iter__(self):
+                raise driver._StreamWatchdogFired("no stream progress")
+
+        out = driver._drain({"stream": _Quiet()})
+        assert out["error"] == driver.DEADLINE_CUT, (
+            f"the watchdog's own exception leaked as a stream death ({out['error']!r}), "
+            "which burns the salvage retry on a turn that never failed")
+
+    def test_a_triage_heartbeat_is_refused_by_design_and_says_nothing(self, capsys):
+        """A triage runs under `triage-<subject>` and only start_pipeline creates run
+        rows, so a triage HAS no row and cannot have one: `attribute_exists(run_id)` must
+        refuse every triage heartbeat. The condition is right -- without it update_item's
+        upsert would mint a row carrying driver_beat_at and driver_beat_payload, which is
+        precisely what the resurrector sweeps for, so the driver would manufacture
+        resurrectable ghost runs for every non-run invocation (the {run_id, status}
+        version of that already left `sweep-2026-08-01` in the live table).
+
+        What was wrong is calling the refusal a failure. Live, run-20260810T182807Z-
+        e394ada9's triage printed 11 x "heartbeat write failed (continuing):
+        ConditionalCheckFailedException" in 2 minutes, every one of them describing
+        correct behaviour -- which is how the line that would mean "the beat is actually
+        broken" stopped meaning anything.
+        """
+        ev_ = driver_event()
+        ev_["run_id"] = "triage-run-20260810T182807Z-e394ada9"
+        ev_["stage"] = "orchestrator"
+        ev_["task"] = "triage"
+        ev_.pop("task_token", None)
+        c = clients(FakeAgentCore([text_stream("no verdict")] * 4))
+        driver.handler(ev_, clients=c)
+        out = capsys.readouterr().out
+        assert "heartbeat write failed" not in out, (
+            "a by-design refusal is still reported as a failure:\n" + "\n".join(
+                ln for ln in out.splitlines() if "heartbeat" in ln))
+        rows = c["ddb"].Table(os.environ["RUNS_TABLE"]).items
+        assert not [r for r in rows if str(r.get("run_id", "")).startswith("triage-")], (
+            f"the driver minted a ghost run row for a triage: {rows} — the resurrector "
+            "sweeps on driver_beat_at, so this row would be 'resurrected' forever")
+
+    def test_a_watchdog_that_cannot_arm_does_not_kill_the_turn(self):
+        """signal.signal raises ValueError off the main thread. A watchdog that cannot be
+        installed must degrade to the old per-chunk behaviour, not take down a turn that
+        would otherwise have succeeded: the guard exists to catch a hang, and a guard
+        that converts a working path into a crash is worse than the hang it prevents."""
+        import threading
+
+        result = {}
+
+        def run():
+            try:
+                result["out"] = driver._drain(
+                    {"stream": text_stream("hello")}, remaining_ms=lambda: 600_000)
+            except Exception as exc:  # noqa: BLE001 — the point of the test
+                result["exc"] = exc
+
+        t = threading.Thread(target=run)
+        t.start()
+        t.join(timeout=10)
+        assert "exc" not in result, (
+            f"_drain raised off the main thread ({result.get('exc')!r}) — arming the "
+            "watchdog must never be able to fail a turn")
+        assert result["out"]["text"] == "hello", (
+            "the stream was not drained when the watchdog could not be armed")
+
 
 # ---------------------------------------------------------------------------
 # start_pipeline
@@ -3860,11 +3993,15 @@ class TestConductorDispatch:
                 assert kind == "dispatch", f"unknown writer kind {kind!r}"
 
     @staticmethod
-    def _drive_stage_complete(manifest, metrics, *, store=None, run_id="run-1"):
+    def _drive_stage_complete(manifest, metrics, *, store=None, run_id="run-1", s3=None):
         """Drive the REAL `handle_stage_complete` and return (result, S3 store).
 
         The whole content of bug #22 is whether the assembled `stages` entry reaches S3, so
         this asserts on the bytes a fake S3 was HANDED rather than on a dict the test built.
+
+        `s3` overrides the default fake for the cases whose whole content is which write
+        fails: #25 was one refused PutObject silently suppressing a second, permitted one,
+        and a fake that accepts every key cannot show that.
         """
         key = f"runs/{run_id}/manifest.json"
         out = {f"runs/{run_id}/deploy/endpoint.json": b"{}"} if store is None else store
@@ -3903,7 +4040,7 @@ class TestConductorDispatch:
                      "EVENTS_TABLE": "ev"}.items():
             os.environ[k] = v
         res = driver.handle_stage_complete(
-            {"s3": _S3(), "ddb": _DDB(), "events": _EV(), "sfn": None},
+            {"s3": s3 or _S3(), "ddb": _DDB(), "events": _EV(), "sfn": None},
             {"run_id": run_id, "stage": "deploy", "task": "deploy",
              "manifest_uri": f"s3://b/{key}"},
             {"stage": "deploy",
@@ -4039,6 +4176,72 @@ class TestConductorDispatch:
             f"driver reported success -> {res}")
         assert "runs/run-1/manifest.json" not in store, (
             "a manifest was manufactured with no plan, no approval and no models")
+
+    # --- #25: one missing grant took down a second, permitted write ------------------
+    def test_a_refused_manifest_write_still_publishes_the_run_report(self):
+        """The two writes are independent artifacts and must fail independently.
+
+        They shared one `try`, manifest first. So when the driver's role turned out to lack
+        PutObject on `runs/*/manifest.json` (#25), the AccessDenied left the block before
+        `write_run_report` -- and the report write, which the role HAS allowed since bug
+        #22's predecessor, never ran. Measured in production: 8 pipeline runs from
+        2026-08-08 to 2026-08-10 wrote zero per-run reports under reports/run-*, while the
+        nightly monitor sweep (a different code path) wrote one every day. The log line said
+        "canonical report FAILED", naming the one of the two writes that had not been
+        refused.
+
+        A missing grant on artifact A must not be able to delete artifact B."""
+        store = {"runs/run-1/deploy/endpoint.json": b"{}",
+                 "runs/run-1/manifest.json": json.dumps(self._signed_manifest()).encode()}
+
+        class _DenyManifest:
+            """The live failure exactly: PutObject refused on the manifest key only."""
+
+            def get_object(self, Bucket, Key):
+                if Key not in store:
+                    raise RuntimeError("NoSuchKey")
+                return {"Body": io.BytesIO(store[Key])}
+
+            def head_object(self, Bucket, Key):
+                if Key not in store:
+                    raise RuntimeError("404")
+                return {}
+
+            def put_object(self, Bucket, Key, Body, **kw):
+                if Key.endswith("manifest.json"):
+                    raise RuntimeError(
+                        "An error occurred (AccessDenied) when calling the PutObject "
+                        f"operation: not authorized to perform: s3:PutObject on {Key}")
+                store[Key] = Body
+
+        res, out = self._drive_stage_complete(None, {"endpoint_name": "e"},
+                                              store=store, s3=_DenyManifest())
+        from pipeline.contracts.report import report_key_for
+        assert report_key_for("run-1") in out, (
+            "the manifest write was refused and took the run report down with it -- the "
+            f"report write was permitted the whole time. keys written: {sorted(out)}")
+        assert res["ok"], "neither write may withhold the task token"
+        assert "AccessDenied" in (res.get("report_error") or ""), (
+            f"the refused manifest write must still be reported: {res}")
+
+    def test_an_unreadable_manifest_does_not_overwrite_the_published_report_alias(self):
+        """Splitting the writes made this reachable, so it is stated rather than assumed.
+
+        `report_key_for("")` falls back to the alias key by design -- a report filed under a
+        blank run id is worse than one under the shared alias. But with the writes split, a
+        manifest that failed to LOAD no longer stops the report, and reporting an empty
+        manifest would publish a document describing nothing to
+        reports/run-latest/test-report-latest.json: destroying the last real run's published
+        report to announce a run whose manifest could not even be read."""
+        res, out = self._drive_stage_complete(None, {"endpoint_name": "e"})
+        from pipeline.contracts.report import REPORT_KEY
+        assert REPORT_KEY not in out, (
+            "an empty manifest was published to the run-latest alias, overwriting the last "
+            "real run's report with a report about nothing")
+        assert not [k for k in out if k.startswith("reports/")], (
+            f"a report was written for a run with no manifest: {sorted(out)}")
+        assert "skipped" in (res.get("report_error") or ""), (
+            f"the skip must be recorded, not silent: {res}")
 
     def test_the_endpoint_a_deploy_stage_created_reaches_the_stages_that_measure_it(self):
         """Bug #22's consumer half, and the reason it blocks autonomy.
@@ -4975,43 +5178,157 @@ def test_the_driver_role_can_write_the_report_the_driver_always_writes():
     assert "s3:PutObject" in allowed, (
         "handle_stage_complete writes a run report on every stage_complete; without "
         "PutObject every stage dies after doing its work")
-    doc = json.loads((REPO / "deploy/iam/lambda_roles.json").read_text())
-    writes = [st for st in doc["roles"]["driver"]["permissionsPolicy"]["Statement"]
-              if "s3:PutObject" in ([st.get("Action")] if isinstance(st.get("Action"), str)
-                                    else st.get("Action", []))]
-    assert len(writes) == 1, "one statement owns the driver's report write"
-    resources = writes[0]["Resource"]
-    resources = [resources] if isinstance(resources, str) else resources
 
     from pipeline.contracts.report import REPORT_KEY, report_key_for
-
-    # Object-key patterns this statement permits, i.e. the part after "<bucket>/".
-    # fnmatch, not hand-rolled prefix arithmetic: an IAM resource is a glob, and a helper
-    # clever enough to parse one is clever enough to crash on the very input it is meant
-    # to reject (this assertion's first draft raised IndexError on a bucket-wide grant --
-    # a test that fails for the wrong reason is a test that will pass for the wrong one).
-    patterns = [r.split(":::", 1)[1].split("/", 1)[1] if "/" in r.split(":::", 1)[1] else ""
-                for r in resources]
-
-    def _permitted(key):
-        return any(p and fnmatch.fnmatch(key, p) for p in patterns)
 
     # Every key the writer can actually produce must be permitted -- the per-run object
     # and the alias. Derived from report_key_for() rather than restating the shape, so a
     # change to the key fails HERE, at the grant, instead of live on AccessDenied after
     # the stage has already been paid for.
     for key in (report_key_for("run-20260731T183103Z-8b864805"), REPORT_KEY):
-        assert _permitted(key), f"the driver writes {key} but no statement allows it"
+        assert _driver_may_write(key), \
+            f"the driver writes {key} but no statement allows it"
 
-    # The property the narrow scope exists for, unchanged by widening to a prefix: a
-    # pipeline that can rewrite the customer's data can destroy the held-out set its own
-    # quality gates are judged against. These are the bucket's real top-level prefixes.
-    for forbidden in ("customer-data/held-out.jsonl", "runs/r/manifest.json",
+    # The property the narrow scope exists for: a pipeline that can rewrite the customer's
+    # data can destroy the held-out set its own quality gates are judged against. These are
+    # the bucket's real top-level prefixes, plus the two artifacts under runs/ that the
+    # driver VERIFIES -- it head_objects the curated dataset and the eval report to decide
+    # whether to settle a stage's token, and a role that can rewrite what it verifies can
+    # launder its own evidence. That is why #25 granted runs/*/manifest.json and not runs/*.
+    for forbidden in ("customer-data/held-out.jsonl",
+                      "runs/r/distillation/curated.jsonl",
+                      "runs/r/evaluation/report.json",
                       "contracts/x.json", "plans/p.json", "code/train.py",
                       "tasks/t.json", "finops/rates.json"):
-        assert not _permitted(forbidden), (
+        assert not _driver_may_write(forbidden), (
             f"the driver must not be able to write {forbidden}; the grant has widened "
-            "past the reports prefix")
+            "past the objects the driver authors")
+
+
+def _driver_written_keys() -> list:
+    """Concrete S3 object keys the driver's own source can put, derived from that source.
+
+    Not a hand-kept list: a second copy of the write sites is the "one model, four names"
+    defect (#20) in miniature, and bug #25 IS the version of it where the copy lived in a
+    test's forbidden-keys tuple. So the keys come from two derivations, each anchored to the
+    code that produces them:
+
+    * `Key=` expressions the driver puts directly, scraped out of the handler and out of any
+      module it hands its S3 client to (bug #22's write is in the handler, the report writes
+      are in pipeline/contracts/report.py -- a per-file scan sees only one of them, which is
+      how the driver's FIRST missing grant hid).
+    * the report keys, taken from `report_key_for()`/`REPORT_KEY` by calling them, because a
+      key built by a function is only knowable by running it.
+
+    f-string placeholders are substituted with a realistic run id rather than matched as
+    globs: IAM globs and Python format fields both use braces-and-stars in ways that look
+    similar and mean nothing alike, and the question here is whether one CONCRETE key the
+    code can emit is inside the grant.
+    """
+    from pipeline.contracts.report import REPORT_KEY, report_key_for
+
+    run = "run-20260810T182807Z-e394ada9"
+    keys = {report_key_for(run), REPORT_KEY}
+    sources = ["orchestration/harness_driver/handler.py",
+               "pipeline/contracts/report.py"]
+    for src in sources:
+        text = (REPO / src).read_text()
+        # put_object(...Key=<expr>...) -- the expression as written, then f-string fields
+        # resolved. Only put_object: get/head are reads and their keys are not this grant's
+        # business.
+        for call in re.findall(r"put_object\((.*?)\)", text, re.S):
+            m = re.search(r'Key=(?:f?")([^"]*)"', call) or re.search(r"Key=(\w+)", call)
+            if not m:
+                continue
+            raw = m.group(1)
+            if raw in ("run_key", "REPORT_KEY"):
+                continue  # the report contract's own keys, already resolved above
+            if raw == "key":
+                # `_save_manifest` splits its key out of `manifest_uri`, so the key it can
+                # write is whatever the driver puts in that field. Derived from the
+                # f-strings that BUILD manifest_uri rather than restated, because a
+                # restatement here is the same second copy that made #25 invisible: the
+                # forbidden-keys tuple in the guard above said runs/*/manifest.json was one
+                # the driver never writes, and it was right until _save_manifest existed.
+                uris = re.findall(r'manifest_uri["\']?\s*[:=]\s*f"s3://\{[a-z_]+\}/([^"]+)"',
+                                  text)
+                assert uris, (
+                    f"{src} writes Key=key from a manifest_uri and no f-string in it builds "
+                    "one -- the derivation is blind, not clean")
+                for u in uris:
+                    keys.add(re.sub(r"\{[a-z_]+\}", run, u))
+                continue
+            keys.add(re.sub(r"\{[a-z_]+\}", run, raw))
+    return sorted(keys)
+
+
+def _driver_write_patterns() -> list:
+    """Object-key globs the driver role's s3:PutObject statements permit.
+
+    fnmatch, not hand-rolled prefix arithmetic: an IAM resource is a glob, and a helper
+    clever enough to parse one is clever enough to crash on the very input it is meant to
+    reject (this logic's first draft raised IndexError on a bucket-wide grant -- a test that
+    fails for the wrong reason is a test that will pass for the wrong one).
+    """
+    doc = json.loads((REPO / "deploy/iam/lambda_roles.json").read_text())
+    patterns = []
+    for st in doc["roles"]["driver"]["permissionsPolicy"]["Statement"]:
+        acts = st.get("Action")
+        if "s3:PutObject" not in ([acts] if isinstance(acts, str) else acts or []):
+            continue
+        res = st["Resource"]
+        for r in ([res] if isinstance(res, str) else res):
+            tail = r.split(":::", 1)[1]
+            patterns.append(tail.split("/", 1)[1] if "/" in tail else "")
+    return patterns
+
+
+def _driver_may_write(key: str) -> bool:
+    return any(p and fnmatch.fnmatch(key, p) for p in _driver_write_patterns())
+
+
+def test_every_s3_key_the_driver_writes_is_inside_a_granted_prefix():
+    """Bug #25, and the shape of it is why this guard is derived rather than listed.
+
+    `test_the_driver_role_can_write_the_report_the_driver_always_writes` was GREEN
+    throughout: the driver does have s3:PutObject, and the report keys it checked are
+    permitted. It went further and asserted `runs/r/manifest.json` was FORBIDDEN -- a
+    correct claim when written, which bug #22's cure turned into a green pin on a live
+    defect. `_save_manifest` began writing exactly that key, no grant was added, and the
+    action-level guard above could not see it because the action was present and only the
+    RESOURCE was wrong.
+
+    Live: rehearsal run-20260810T182807Z-e394ada9 completed DataPrepGenerate -- 300 rows
+    generated and paid for -- and logged `not authorized to perform: s3:PutObject on
+    .../manifest.json`. Bug #22 was "no stage can read what the stage before it produced";
+    an IAM gap that makes its write fail is not a smaller bug, it is #22 still open. And
+    because both writes shared one try block, the report write that WAS permitted never ran
+    either: 8 runs since 2026-08-08 produced no per-run report.
+
+    So the contract is checked at the level the defect lives at -- keys, not actions. Every
+    S3 key the driver's own source can produce is derived from that source and matched
+    against the grant, in both directions: a key with no grant fails here instead of live
+    after the spend, and a grant no key needs is flagged too, because that is how the
+    verifier of the customer's held-out data quietly becomes its writer.
+    """
+    keys = _driver_written_keys()
+    assert len(keys) >= 3, (
+        f"only {len(keys)} driver write sites derived ({keys}) -- the scrape has gone "
+        "blind and would pass whatever the role allowed")
+    ungranted = sorted(k for k in keys if not _driver_may_write(k))
+    assert not ungranted, (
+        f"the driver writes these keys and its role permits none of them: {ungranted}. "
+        "The stage does its work, gets paid for, and dies on AccessDenied.")
+
+    # The other direction: no granted pattern may exist that nothing writes. A statement
+    # kept "just in case" is how a read-only role becomes a writer -- and reviewing it later
+    # is impossible, because there is no code to point at that needs it.
+    unused = [p for p in _driver_write_patterns()
+              if not any(fnmatch.fnmatch(k, p) for k in keys)]
+    assert not unused, (
+        f"the driver role grants PutObject on {unused} and writes nothing that matches. "
+        "Either a write was removed and the grant outlived it, or the grant is wider than "
+        "the code and nothing will ever tell you.")
 
 
 #: Handler-local boto3 calls (c["s3"].put_object(...)) mapped to the IAM action they

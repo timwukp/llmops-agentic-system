@@ -3335,9 +3335,14 @@ case("prompt: eval gates on a remembered bar, not the one the plan named",
 #      `manifest.stages` was still `{}` after a deploy stage reported an endpoint_name, so
 #      the report humans read carried every metric and the manifest AGENTS read carried none.
 def m180(t):
+    # `pass`, not deletion: since #25 split the two artifact writes, _save_manifest is the
+    # only statement in its own try block, so removing the line leaves an IndentationError
+    # and pytest exits 4 (collection error) instead of 1 (test failed). A control that
+    # cannot even import the module under test verifies nothing -- it reports the guard as
+    # UNCAUGHT while the mutation it claims to make was never really applied.
     old = '        _save_manifest(c["s3"], event["manifest_uri"], manifest)\n'
     assert t.count(old) == 1, f"the manifest write-back has moved; found {t.count(old)}"
-    return t.replace(old, "", 1)
+    return t.replace(old, "        pass  # write-back removed\n", 1)
 
 
 # Only the persistence guard is named. The endpoint guard drives `_run_stage` against a
@@ -3582,6 +3587,165 @@ def m192(t):
 case("driver: a rejected courtesy ack raises after the token is already settled",
      _DRIVER, m192,
      [f"{_DRV}::test_a_rejected_courtesy_ack_cannot_un_complete_a_settled_stage"])
+
+# 193-195. Bug #25: bug #22's cure was inert in production for three days because the write
+#      it added was granted to no role. These three controls cover the two halves of the cure
+#      plus the hazard splitting them opened.
+#
+# 193. The IAM statement is deleted, restoring the exact production state: the driver has
+#      s3:PutObject (on reports/*) and writes runs/<run_id>/manifest.json. So an
+#      action-level check stays green -- the action IS granted -- and only a KEY-level one
+#      can see it. That is why the guard derives every key the driver's source can put
+#      rather than asserting on actions: the previous guard even listed
+#      runs/r/manifest.json as forbidden, which was true when written and became a green pin
+#      on a live defect the moment _save_manifest existed.
+_ROLES = "deploy/iam/lambda_roles.json"
+
+
+def m193(t):
+    d = json.loads(t)
+    stmts = d["roles"]["driver"]["permissionsPolicy"]["Statement"]
+    keep = [s for s in stmts if s.get("Sid") != "WriteStageResultsToRunManifest"]
+    assert len(keep) == len(stmts) - 1, \
+        "WriteStageResultsToRunManifest is not in the driver role; re-anchor this mutation"
+    d["roles"]["driver"]["permissionsPolicy"]["Statement"] = keep
+    return json.dumps(d, indent=2)
+
+
+case("IAM: the driver loses PutObject on the manifest it writes on every stage_complete",
+     _ROLES, m193,
+     ["tests/test_orchestration.py::test_every_s3_key_the_driver_writes_is_inside_a_granted_prefix"])
+
+# 194. The grant widens from runs/*/manifest.json to runs/*, which is what "just make it
+#      work" produces. Every write the driver performs still succeeds, so no functional test
+#      can see it -- and the driver becomes able to rewrite distillation/curated.jsonl and
+#      evaluation/report.json, the artifacts it head_objects to decide whether a stage's
+#      token settles. A role that can rewrite what it verifies can launder its own evidence,
+#      which is the property the narrow scope exists for.
+def m194(t):
+    old = '"arn:aws:s3:::<DATA_BUCKET>/runs/*/manifest.json"'
+    assert t.count(old) == 1, f"the manifest grant has moved; found {t.count(old)}"
+    return t.replace(old, '"arn:aws:s3:::<DATA_BUCKET>/runs/*"', 1)
+
+
+case("IAM: the driver's manifest grant widens to every object under runs/",
+     _ROLES, m194,
+     ["tests/test_orchestration.py::test_the_driver_role_can_write_the_report_the_driver_always_writes"])
+
+# 195. The two writes go back into one try block, manifest first -- the shape that made one
+#      refused PutObject delete a second, permitted artifact. Nothing on the happy path
+#      changes, because when both writes succeed the two forms are indistinguishable; only a
+#      test that refuses ONE key can tell them apart.
+def m195(t):
+    # The whole span from the manifest write through the report branch is replaced, not just
+    # the two call lines: the second `except` and the `else` belong to structure this
+    # mutation removes, and leaving them orphaned is a SyntaxError -- pytest then exits 4
+    # (collection error) rather than 1, and the runner reports the guard as uncaught while
+    # the mutation it claims to have made was never really applied. A mutation that cannot
+    # produce importable code proves nothing about the guard.
+    old = re.search(
+        r'        _save_manifest\(c\["s3"\], event\["manifest_uri"\], manifest\)\n'
+        r'    except Exception.*?'
+        r'\n        print\(f"\[driver\] report SKIPPED for \{run_id\}/\{stage\}: '
+        r'\{failures\[-1\]\}"\)\n', t, re.S)
+    assert old, "the split stage-artifact writes no longer match; re-anchor this mutation"
+    return t.replace(old.group(0), (
+        '        _save_manifest(c["s3"], event["manifest_uri"], manifest)\n'
+        '        write_run_report(c["s3"], os.environ["DATA_BUCKET"], manifest)\n'
+        '    except Exception as exc:  # noqa: BLE001\n'
+        '        failures.append(f"{type(exc).__name__}: {exc}")\n'
+        '        print(f"[driver] canonical report FAILED for {run_id}/{stage}: '
+        '{failures[-1]}")\n'), 1)
+
+
+case("driver: a refused manifest write again suppresses the permitted report write",
+     _DRIVER, m195,
+     [f"{_D}::test_a_refused_manifest_write_still_publishes_the_run_report"])
+
+# 196. The run_id guard around the report write is dropped. Only reachable BECAUSE the writes
+#      were split: an unloadable manifest used to abort before the report, and now it does
+#      not, so report_key_for("") resolves to the run-latest alias and a document describing
+#      nothing overwrites the last real run's published report. The cure for one bug creating
+#      the next is the thing negative controls exist to notice.
+def m196(t):
+    old = '    if manifest.get("run_id"):\n'
+    assert t.count(old) == 1, f"the report run_id guard has moved; found {t.count(old)}"
+    return t.replace(old, '    if True:\n', 1)
+
+
+case("driver: a report for an unreadable manifest overwrites the run-latest alias",
+     _DRIVER, m196,
+     [f"{_D}::test_an_unreadable_manifest_does_not_overwrite_the_published_report_alias"])
+
+# 197-200. Bug #26: the deadline handoff needed a chunk in order to notice that no chunk was
+#      coming. `out_of_wall` is evaluated once per stream chunk, so a stream that goes QUIET
+#      reaches it never; boto's read_timeout restarts per read, so after a chunk at elapsed t
+#      it is next due at t + 870 -- past the 900s wall for every t > 30. A last chunk anywhere
+#      in (30, 855)s left both escape hatches unreachable and the runtime hard-killed the
+#      invocation with the agent's stage_complete unanswered.
+#
+# 197. The watchdog is removed, restoring the exact production state. Every existing deadline
+#      test stays green, because they all use TricklingStream -- a stream that keeps arriving,
+#      which is the only case out_of_wall can see. Only a test that BLOCKS can tell them
+#      apart, which is why the new one opens a real socket instead of using a double: a fake
+#      whose __next__ returns cannot express "nothing returns".
+def m197(t):
+    old = "        with _stream_watchdog(remaining_ms):\n"
+    assert t.count(old) == 1, f"the watchdog wrapper has moved; found {t.count(old)}"
+    return t.replace(old, "        if True:  # watchdog removed\n", 1)
+
+
+case("driver: a stream that goes quiet at the wall is hard-killed instead of handed off",
+     _DRIVER, m197,
+     [f"{_DRV}::test_a_stream_that_goes_quiet_at_the_wall_still_hands_off"])
+
+# 198. The watchdog's exception is relabelled as a stream DEATH rather than a deadline cut.
+#      Both paths recover, so the stage still finishes -- what is lost is the one same-session
+#      salvage retry, spent on a turn that never failed, leaving a REAL death later in the
+#      same stage unprotected. A functional test that only asserts "the run completed" cannot
+#      see a reserve being quietly drained.
+def m198(t):
+    old = "    except _StreamWatchdogFired as exc:\n"
+    assert t.count(old) == 1, f"the watchdog except clause has moved; found {t.count(old)}"
+    # Fall through to the generic handler, which stringifies it as a death.
+    return t.replace(old, "    except (_StreamWatchdogFired,) if False else ():\n", 1)
+
+
+case("driver: a deadline cut is mislabelled a stream death and burns the salvage retry",
+     _DRIVER, m198,
+     [f"{_DRV}::test_a_quiet_stream_is_a_deadline_cut_not_a_stream_death"])
+
+# 199. The ValueError guard around signal.signal is dropped. On the main thread nothing
+#      changes -- every production invocation and every other test still passes -- but any
+#      caller off the main thread now crashes a turn that would have succeeded. A guard that
+#      converts a working path into a failure is worse than the hang it prevents.
+def m199(t):
+    old = ("        except ValueError:  # not the main thread — degrade, do not fail\n"
+           "            yield\n"
+           "            return\n")
+    assert t.count(old) == 1, f"the off-main-thread guard has moved; found {t.count(old)}"
+    return t.replace(old, "        except ValueError:\n            raise\n", 1)
+
+
+case("driver: a watchdog that cannot be armed fails the turn instead of degrading",
+     _DRIVER, m199,
+     [f"{_DRV}::test_a_watchdog_that_cannot_arm_does_not_kill_the_turn"])
+
+# 200. The heartbeat's by-design refusal goes back to being reported as a failure. Nothing
+#      functional changes -- the beat was never going to be written for a non-run invocation
+#      -- so only a test that reads the LOG can see it. It matters because 11 lines of
+#      "heartbeat write failed" describing correct behaviour is how the line that would mean
+#      "the beat is actually broken" stopped meaning anything.
+def m200(t):
+    old = ("            if _is_condition_failure(exc):\n"
+           "                return  # not a run row: no beat to write, and none wanted\n")
+    assert t.count(old) == 1, f"the heartbeat condition check has moved; found {t.count(old)}"
+    return t.replace(old, "", 1)
+
+
+case("driver: every triage heartbeat is logged as a failure for refusing by design",
+     _DRIVER, m200,
+     [f"{_DRV}::test_a_triage_heartbeat_is_refused_by_design_and_says_nothing"])
 
 
 #: Where the pristine text of the file currently mutated is parked, so a kill -9 -- which

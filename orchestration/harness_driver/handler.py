@@ -345,6 +345,12 @@ def _ack_terminal(c, event, sess, tu, payload, effect: str) -> None:
 #: self-reinvoke call, the heartbeat write, and the runtime's own teardown — measured
 #: driver overhead is single-digit seconds; 45 gives margin without wasting a minute
 #: of every deadline-cut turn.
+#:
+#: This margin ALSO has to be reachable, which for three days it was not. It is larger
+#: than the gap the boto read_timeout leaves (900 wall - 870 read = 30s remaining, i.e.
+#: 15s short of the 45 demanded here), so on the one path that did fire an exception the
+#: handoff was already too late. See _drain's docstring for the window that made both
+#: escape hatches unreachable, and _stream_watchdog for the alarm that closes it.
 DRAIN_DEADLINE_MARGIN_MS = 45_000
 
 #: _drain's error marker for a deadline cut. Checked by name at the call site, so it
@@ -354,7 +360,81 @@ DRAIN_DEADLINE_MARGIN_MS = 45_000
 DEADLINE_CUT = "LambdaDeadlineApproaching"
 
 
-def _drain(resp, out_of_wall=None) -> dict:
+class _StreamWatchdogFired(Exception):
+    """Raised INTO the stream reader by the watchdog alarm. See _stream_watchdog."""
+
+
+def _stream_watchdog(remaining_ms):
+    """Context manager that guarantees _drain gets control back before the wall.
+
+    `out_of_wall` alone could not: it is evaluated once per chunk, inside the `for event
+    in resp["stream"]` loop, so it needs a chunk to arrive in order to notice that no
+    chunk is arriving. That is the bug (#26), and it is structural rather than a race:
+
+      * the boto read_timeout (870s) restarts on every read, so after a chunk at elapsed
+        `t` the next timeout is due at `t + 870` — past the 900s wall for any t > 30;
+      * `out_of_wall` fires only at 855s elapsed, and only if a chunk lands after that.
+
+    So a last chunk anywhere in the OPEN interval (30, 855) seconds — 825 of the 900 —
+    left BOTH escape hatches unreachable, and the runtime hard-killed the invocation.
+    Live: run-20260810T182807Z-e394ada9's curate turn, `REPORT RequestId: 925119d7-...
+    Duration: 900000.00 ms ... Status: timeout`, with zero application log lines. The
+    agent had already produced curated.jsonl, generated.jsonl and stats.json and had
+    already called stage_complete; the call died with the invocation, and the stage failed
+    MissingStageComplete with its own outputs sitting in S3. The agent's recorded cause
+    was literally true: "is complete and was verified in my previous turn".
+
+    SIGALRM rather than a reader thread with a timeout: the blocking read is inside
+    botocore's urllib3 socket, so there is nothing to poll and no future to cancel — only
+    a signal can interrupt it. Lambda's Python runtime serves the invocation on the main
+    thread, which is where signal handlers must be installed and where they are delivered,
+    so this works here for the same reason it would not work off the main thread. Setting
+    it up is guarded anyway (ValueError) so an off-main-thread caller degrades to the old
+    per-chunk behaviour instead of crashing — a watchdog that cannot arm must not take the
+    turn down with it.
+
+    The alarm raises INTO the reader, so `_drain`'s own `except` sees it like any other
+    stream death; _drain then relabels it DEADLINE_CUT, which is the distinction the call
+    site depends on (a real death burns the one salvage retry; a deadline cut hands the
+    turn to the next invocation with the full 900s).
+    """
+    import contextlib
+    import signal
+
+    @contextlib.contextmanager
+    def _cm():
+        # int() truncates toward zero, so a 1.4s budget arms at 1s, never 0 (= cancel).
+        secs = int((remaining_ms() - DRAIN_DEADLINE_MARGIN_MS) / 1000) if remaining_ms \
+            else 0
+        if secs < 1:
+            # Either no context (unit tests) or already inside the margin. Nothing to
+            # arm: the loop-top _out_of_time() check owns the too-late case.
+            yield
+            return
+
+        def _fire(signum, frame):
+            raise _StreamWatchdogFired(
+                f"no stream progress with {DRAIN_DEADLINE_MARGIN_MS}ms of wall left")
+
+        try:
+            prev = signal.signal(signal.SIGALRM, _fire)
+        except ValueError:  # not the main thread — degrade, do not fail
+            yield
+            return
+        signal.alarm(secs)
+        try:
+            yield
+        finally:
+            # Cancel BEFORE restoring, not after: the reverse order leaves a live alarm
+            # armed against whatever handler was there before, which for the default
+            # disposition terminates the process.
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, prev)
+
+    return _cm()
+
+
+def _drain(resp, out_of_wall=None, remaining_ms=None) -> dict:
     """Consume the stream; return {text, tool_use, stop_reason, error}.
 
     `out_of_wall` is the in-turn deadline check. The boto read_timeout (870s) bounds
@@ -365,28 +445,40 @@ def _drain(resp, out_of_wall=None) -> dict:
     and the async retry replayed a continuation whose session state no longer
     matched — MissingStageComplete three minutes later. The between-turns
     _out_of_time() check cannot see any of this; only the stream reader can.
+
+    `remaining_ms` arms the watchdog that makes the above ACTUALLY reachable when the
+    stream goes quiet instead of slow — the case `out_of_wall` structurally cannot see,
+    because it is only evaluated when a chunk arrives. See _stream_watchdog.
     """
     text, tool_use, stop_reason, error = [], None, None, None
     try:
-        for event in resp.get("stream", []):
-            if out_of_wall is not None and out_of_wall():
-                error = DEADLINE_CUT
-                break
-            if "contentBlockDelta" in event:
-                delta = event["contentBlockDelta"].get("delta", {})
-                if "text" in delta:
-                    text.append(delta["text"])
-            if "contentBlockStart" in event:
-                start = event["contentBlockStart"].get("start", {})
-                if "toolUse" in start:
-                    tool_use = {"toolUseId": start["toolUse"].get("toolUseId"),
-                                "name": start["toolUse"].get("name"), "input": ""}
-            if tool_use is not None and "contentBlockDelta" in event:
-                delta = event["contentBlockDelta"].get("delta", {})
-                if "toolUse" in delta:
-                    tool_use["input"] += delta["toolUse"].get("input", "")
-            if "messageStop" in event:
-                stop_reason = event["messageStop"].get("stopReason")
+        with _stream_watchdog(remaining_ms):
+            for event in resp.get("stream", []):
+                if out_of_wall is not None and out_of_wall():
+                    error = DEADLINE_CUT
+                    break
+                if "contentBlockDelta" in event:
+                    delta = event["contentBlockDelta"].get("delta", {})
+                    if "text" in delta:
+                        text.append(delta["text"])
+                if "contentBlockStart" in event:
+                    start = event["contentBlockStart"].get("start", {})
+                    if "toolUse" in start:
+                        tool_use = {"toolUseId": start["toolUse"].get("toolUseId"),
+                                    "name": start["toolUse"].get("name"), "input": ""}
+                if tool_use is not None and "contentBlockDelta" in event:
+                    delta = event["contentBlockDelta"].get("delta", {})
+                    if "toolUse" in delta:
+                        tool_use["input"] += delta["toolUse"].get("input", "")
+                if "messageStop" in event:
+                    stop_reason = event["messageStop"].get("stopReason")
+    except _StreamWatchdogFired as exc:
+        # A quiet stream at the wall is a DEADLINE CUT, not a stream death: the harness
+        # turn is still running server-side and the next invocation gets the full 900s.
+        # Labelling it as a death would instead burn the one salvage retry on a turn that
+        # never failed, leaving a REAL death later in the same stage unprotected.
+        error = DEADLINE_CUT
+        print(f"[driver] stream watchdog fired: {exc}")
     except Exception as exc:  # stream death is expected in production
         error = f"{type(exc).__name__}: {exc}"
     if tool_use is not None and isinstance(tool_use.get("input"), str):
@@ -843,16 +935,26 @@ def handle_stage_complete(c, event, args) -> dict:
     # silence. The IAM gap is fixed too, but the ordering hazard is the general bug: any
     # future failure in this write (throttling, a bucket policy, a KMS denial) would
     # have bought the same outcome.
-    report_error = None
+    # Two independent writes, two independent failure records. They used to share one
+    # `try`, with the manifest write first -- so when the driver's role turned out to lack
+    # PutObject on runs/*/manifest.json (#25), the AccessDenied aborted the block before
+    # write_run_report, and 8 runs since 2026-08-08 produced no per-run report either.
+    # The report write was permitted the whole time. One statement's missing grant silently
+    # took down a second, unrelated artifact, and the log line named only "canonical report
+    # FAILED" -- which is the one of the two that had NOT actually been refused.
+    #
+    # Sequencing this way round on purpose: the manifest is what the NEXT stage reads, the
+    # report is what humans read, and neither is worth withholding to protest the other.
+    failures = []
+    manifest = _load_manifest(c["s3"], event["manifest_uri"])
+    # No `if manifest:` guard. It used to be here, and it made the absent-manifest case
+    # SILENT: a wrong manifest_uri skipped the write and returned ok, which is bug #22's
+    # own failure mode surviving inside the fix for it. `_save_manifest` raises, the
+    # handler below reports it into the run's event stream, and the token still settles.
+    manifest.setdefault("stages", {})[stage] = {
+        "status": "completed", "outputs": norm["outputs"],
+        "metrics": norm.get("metrics", {}), "evidence": norm.get("evidence", "")}
     try:
-        manifest = _load_manifest(c["s3"], event["manifest_uri"])
-        # No `if manifest:` guard. It used to be here, and it made the absent-manifest case
-        # SILENT: a wrong manifest_uri skipped the write and returned ok, which is bug #22's
-        # own failure mode surviving inside the fix for it. `_save_manifest` raises, the
-        # except below reports it into the run's event stream, and the token still settles.
-        manifest.setdefault("stages", {})[stage] = {
-            "status": "completed", "outputs": norm["outputs"],
-            "metrics": norm.get("metrics", {}), "evidence": norm.get("evidence", "")}
         # The manifest goes BACK to S3, which it never used to. Every prompt is told
         # "the S3 manifest at manifest_uri is the single source of truth; read it first,
         # append your results to it" -- and this dict was a local variable handed to
@@ -869,10 +971,33 @@ def handle_stage_complete(c, event, args) -> dict:
         # whose stages cannot read each other's results cannot iterate on a run; it can
         # only redo it.
         _save_manifest(c["s3"], event["manifest_uri"], manifest)
-        write_run_report(c["s3"], os.environ["DATA_BUCKET"], manifest)
-    except Exception as exc:  # noqa: BLE001 — never withhold the token for a report
-        report_error = f"{type(exc).__name__}: {exc}"
-        print(f"[driver] canonical report FAILED for {run_id}/{stage}: {report_error}")
+    except Exception as exc:  # noqa: BLE001 — never withhold the token for an artifact
+        failures.append(f"manifest {type(exc).__name__}: {exc}")
+        print(f"[driver] manifest stage-write FAILED for {run_id}/{stage}: "
+              f"{failures[-1]}")
+    # Guarded on run_id, not on the manifest write's success: an unwritable manifest is no
+    # reason to withhold the report, but an EMPTY manifest is. `report_key_for("")` falls
+    # back to the alias key, so reporting a manifest that failed to load would publish a
+    # document describing nothing to reports/run-latest/ -- destroying the last real run's
+    # published report to announce a run whose manifest could not even be read. Splitting
+    # the two writes made that reachable for the first time, which is why it is stated here
+    # rather than left to the key helper.
+    if manifest.get("run_id"):
+        try:
+            write_run_report(c["s3"], os.environ["DATA_BUCKET"], manifest)
+        except Exception as exc:  # noqa: BLE001 — same reason, separately
+            failures.append(f"report {type(exc).__name__}: {exc}")
+            print(f"[driver] canonical report FAILED for {run_id}/{stage}: {failures[-1]}")
+    else:
+        failures.append(
+            f"report skipped: no manifest at {event['manifest_uri']} to report on")
+        print(f"[driver] report SKIPPED for {run_id}/{stage}: {failures[-1]}")
+
+    # One event per stage still, listing whichever writes failed: the row is keyed by
+    # (run_id, stage) and a second _record_stage_event with the same name would either
+    # overwrite the first or need a suffix nobody queries.
+    report_error = "; ".join(failures) or None
+    if report_error:
         _record_stage_event(c["ddb"], run_id, stage, "report_write_failed",
                             {"error": report_error})
 
@@ -1581,7 +1706,28 @@ def _run_stage(event, context=None, c=None):
         left alive to be re-invoked; an operator resurrected it by hand from the
         Step Functions history. A beat that stops while the stage is unfinished IS
         the dead-driver signal, and the stamped payload is the resurrection. Best
-        effort: a beat that cannot be written must not kill the turn it announces."""
+        effort: a beat that cannot be written must not kill the turn it announces.
+
+        `attribute_exists(run_id)` for the reason _mark_run_escalated spells out at
+        length: update_item is an UPSERT, so on a key with no row this call would MINT
+        one -- and here the minted shape is worse than the {run_id, status} phantom that
+        left `sweep-2026-08-01` in the table, because a row carrying driver_beat_at and
+        driver_beat_payload is exactly what the resurrector sweeps for. The driver would
+        be manufacturing resurrectable ghost runs for every non-run invocation.
+
+        But a REJECTED condition is the answer, not a failure. A triage runs under
+        `triage-<subject>` (see TRIAGE_STAGE) and only start_pipeline creates run rows, so
+        a triage has no row and CANNOT have one: every triage heartbeat was guaranteed to
+        be refused, and each one printed "heartbeat write failed (continuing)". Measured
+        on run-20260810T182807Z-e394ada9's triage: 11 such lines in 2 minutes, all of them
+        describing correct behaviour. The same distinction was already reasoned out at
+        _mark_run_escalated and simply never applied here.
+
+        The consequence beyond noise, stated so it is not mistaken for cosmetics: a triage
+        has no heartbeat, therefore nothing can resurrect a dead triage -- the resurrector
+        keys on driver_beat_at. That is a real gap, and it is a separate one; what belongs
+        here is not calling a by-design refusal a failure, so that the log line which does
+        mean "the beat is broken" still means it."""
         try:
             c["ddb"].Table(os.environ["RUNS_TABLE"]).update_item(
                 Key={"run_id": event["run_id"]},
@@ -1597,6 +1743,8 @@ def _run_stage(event, context=None, c=None):
                                       "_session_started_at": session_started_at},
                                      default=str)})
         except Exception as exc:  # noqa: BLE001 — the beat is telemetry, not the work
+            if _is_condition_failure(exc):
+                return  # not a run row: no beat to write, and none wanted
             print(f"[driver] heartbeat write failed (continuing): "
                   f"{type(exc).__name__}: {exc}")
 
@@ -1610,12 +1758,25 @@ def _run_stage(event, context=None, c=None):
             _roll_session()
         _heartbeat()
         if not first_turn and _out_of_time():
+            # Said out loud for the same reason as the per-turn line below (#24: "a stage
+            # that can fail must say how"), which covered only turns that COMPLETED. The
+            # paths that end an invocation without completing a turn stayed mute, and two
+            # of them in a row cost 956s of wall with ZERO application log lines --
+            # invocations fe22e1c6 (55.9s, silent) and 925119d7 (900s, Status: timeout) of
+            # run-20260810T182807Z-e394ada9. From CloudWatch alone there was no way to
+            # tell a healthy handoff from a driver dying in a loop.
+            print(f"[driver] handing off stage={event.get('stage')} "
+                  f"task={event.get('task')} between turns: "
+                  f"{context.get_remaining_time_in_millis()}ms wall left, "
+                  f"re_asks={re_asks}, epoch={epoch}")
             return _self_reinvoke()
         first_turn = False
         resp = _invoke(c["agentcore"], event["harness_id"], sess, messages,
                        event.get("qualifier"))
         out = _drain(resp, out_of_wall=lambda: bool(context) and
-                     context.get_remaining_time_in_millis() < DRAIN_DEADLINE_MARGIN_MS)
+                     context.get_remaining_time_in_millis() < DRAIN_DEADLINE_MARGIN_MS,
+                     remaining_ms=(context.get_remaining_time_in_millis
+                                   if context else None))
 
         if out["error"] == DEADLINE_CUT:
             # The Lambda wall arrived mid-stream. This is not a stream death — the
@@ -1630,6 +1791,16 @@ def _run_stage(event, context=None, c=None):
 
         if out["error"] and not stream_retried:
             # involuntary stream death — same-session salvage retry, once
+            #
+            # Printed, because this branch `continue`s without reaching the per-turn line
+            # below: a stream that died at t=56s took its cause with it, and the very next
+            # loop-top _out_of_time() check handed the invocation off (also silently until
+            # now), so BOTH exits from a 55.9s invocation left no record. The cause string
+            # is the whole diagnosis here -- a 5xx failover, a throttle and a socket reset
+            # are three different problems with one symptom.
+            print(f"[driver] stream died for stage={event.get('stage')} "
+                  f"task={event.get('task')}, salvage retry in the same session: "
+                  f"{out['error']}")
             stream_retried = True
             if _is_model_5xx(out["error"]):
                 _maybe_failover_model(c, event)  # vendor-quota burst: hot-swap model
@@ -1645,9 +1816,13 @@ def _run_stage(event, context=None, c=None):
         # narrated instead of calling" from "the agent called and the branch below
         # dropped it" -- two different bugs with one symptom, and the evidence needed to
         # separate them was never recorded. A stage that can fail must say how.
+        # `error` included because a SECOND stream death in one invocation falls through
+        # to here (stream_retried is already True), and a partial turn read as a prose
+        # turn-end is exactly the "two bugs, one symptom" this line exists to separate.
         print(f"[driver] turn stage={event.get('stage')} task={event.get('task')} "
               f"stop_reason={out['stop_reason']} tool={(tu or {}).get('name')} "
-              f"re_asks={re_asks} text_chars={len(out['text'])}")
+              f"re_asks={re_asks} text_chars={len(out['text'])} "
+              f"error={out['error']}")
         # Only a stopReason of "tool_use" means the harness is WAITING for a result.
         # A toolUse block riding along with end_turn was already serviced inside the
         # harness; replying to it makes the next ConverseStream invalid with

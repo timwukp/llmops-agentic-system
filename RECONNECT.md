@@ -6,8 +6,8 @@ instruction in force: **先繼續 resolve llmops pipeline 所有的 bug 再說**
 
 ## State right now
 
-`1074 passed, 0 failed` (27.4s). Negative controls **226/226** (193 mutations, 226 pairs,
-226 printed PASS lines, 0 FAIL, 0 SKIP-BROKEN, runner exit 0). Redaction scan clean, 163
+`1081 passed, 0 failed` (29.5s). Negative controls **234/234** (201 mutations, 234 pairs,
+234 printed PASS lines, 0 FAIL, 0 SKIP-BROKEN, runner exit 0). Redaction scan clean, 163
 files; the real account id appears in **zero** files repo-wide. **Nothing committed, nothing
 pushed.** 39 tracked files modified in the working tree — the last several bug fixes are all
 uncommitted together, which is the thing most worth knowing if this session dies.
@@ -305,7 +305,7 @@ Cap $400, budget $450.
 - **`timeout` does not exist on macOS**, and `cmd > log; echo "EXIT: $?"` after a redirect
   reports the *echo*'s status on some shells — both bit during this session and both make a
   broken run look clean. Capture the exit code of the run itself, on its own line, and check
-  the printed PASS-line count against the documented number (226 here).
+  the printed PASS-line count against the documented number (234 here).
 - **`grep -cE` with hand-escaped `\[`/`\*` silently mis-anchors.** An anchor check printed `0`
   for a line that was present, and ugrep errored on `{**`. Use `grep -cF` with a heredoc for
   anchor sweeps.
