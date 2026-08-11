@@ -5582,6 +5582,10 @@ _CLIENT_HANDOFFS = {
     # nobody watches an 08:00 UTC invocation, so an AccessDenied on its PutItem would make
     # the sweep look like a sweep that ran and found nothing.
     ("monitor_sweep", "orchestration/monitor_sweep/handler.py"),
+    # Added with the ev.emit_event detection below: both emit events, and neither was
+    # under the guard at all -- the resurrector's grant exists but nothing pinned it.
+    ("resurrector", "orchestration/resurrector/handler.py"),
+    ("finops_reconcile", "orchestration/finops_reconcile/handler.py"),
 ])
 def test_every_aws_call_a_handler_makes_is_in_its_role(role, src):
     """Generalizes two separately-shipped defects into one guard.
@@ -5607,6 +5611,14 @@ def test_every_aws_call_a_handler_makes_is_in_its_role(role, src):
     for marker, action in _CLIENT_HANDOFFS.get(src, []):
         if marker in text:
             needed[action] = f"{marker.strip()}...) hands the client to a helper"
+    # The shared events helper is a client handoff every handler uses the same way, so
+    # it is detected generically rather than listed per handler in _CLIENT_HANDOFFS.
+    # This is where the fourth instance of the defect class hid: resume's
+    # emit(MODEL_TRAINED) rides ev.emit_event, so no `c["events"].put_events(` literal
+    # appears in the handler, and the three roles that DID hold the grant held it
+    # because their emits had already failed live -- the scan itself saw none of them.
+    if "ev.emit_event(" in text:
+        needed["events:PutEvents"] = "ev.emit_event(...) hands c[\"events\"] to the shared helper"
 
     allowed = _allowed_actions(role)
     def granted(action):

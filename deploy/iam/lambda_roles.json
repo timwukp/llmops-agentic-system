@@ -228,6 +228,13 @@
               "states:SendTaskHeartbeat"
             ],
             "Resource": "*"
+          },
+          {
+            "Sid": "EmitSettlementEvents",
+            "_comment": "resume emits MODEL_TRAINED / CAPACITY_STOPPED / the failure event on every settle, and emit_event runs BEFORE send_task_success -- so without this grant a SUCCESSFUL training job leaves its token parked: the job completes, EventBridge fires, and this function dies on AccessDeniedException with the stage still waiting. Found live on run-20260811T040003Z-3548116f, the first run on which job_launched ever fired: every earlier run died before reaching this code, which is why a grant three other roles already held was still missing here. Fourth instance of the defect class named in ClearSettledToken above; the guard now derives this need from ev.emit_event in the handler source instead of waiting for the fifth.",
+            "Effect": "Allow",
+            "Action": "events:PutEvents",
+            "Resource": "arn:aws:events:<REGION>:<ACCOUNT_ID>:event-bus/llmops-pipeline"
           }
         ]
       }
