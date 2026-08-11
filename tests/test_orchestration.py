@@ -2969,6 +2969,48 @@ class TestStateMachine:
                 assert payload["task_token.$"] == "$$.Task.Token", name
                 assert payload["iteration.$"] == "$.iteration", name
 
+    def test_a_failed_eval_job_re_enters_eval_not_the_finetune_loop(self, asl):
+        """run-20260811T040003Z-3548116f: the eval inference job failed on a defect in
+        the eval agent's OWN inference code (an SDK-encoded hyperparameter read raw),
+        and the only catch was EscalateFail -- the run died with zero reflection while
+        FinetuneLaunch's identical failure class gets three remediation attempts.
+        Routing eval failures into that existing loop would be worse than none:
+        RemediateFinetune re-TRAINS, and no amount of retraining removes the quotes
+        from a bucket name."""
+        cats = {tuple(c["ErrorEquals"]): c for c in asl["States"]["EvalGenerate"]["Catch"]}
+        tj = cats[("TrainingJobFailed",)]
+        assert tj["Next"] == "RemediationChoiceEval"
+        assert tj["ResultPath"] == "$.error"
+        choice = asl["States"]["RemediationChoiceEval"]
+        assert choice["Default"] == "EscalateFail"
+        (only,) = choice["Choices"]
+        assert (only["Variable"], only["NumericLessThan"]) == ("$.iteration", 3), (
+            "the eval loop must spend the SAME iteration budget as the finetune loop; "
+            "a separate counter would let the two loops interleave past 3 total")
+        inc = asl["States"][only["Next"]]
+        assert inc["Next"] == "EvalGenerate", (
+            f"eval remediation re-enters {inc['Next']}; the failure lives in the eval "
+            "agent's own code, so the same agent must get the retry")
+
+    def test_every_job_launching_prompt_carries_the_hyperparameter_decoding_rule(self):
+        """The defect the rule prevents: the SageMaker Python SDK json.dumps-encodes
+        every hyperparameter value, the training toolkit decodes them only for argv and
+        SM_HP_* env, and an entry script that reads hyperparameters.json raw gets the
+        still-encoded values. Derived from tools[]: any harness that can job_launched
+        authors entry scripts, so it must carry the rule; a harness that cannot is not
+        forced to mention it."""
+        for f in sorted((REPO / "agents").glob("*/harness.json")):
+            h = json.loads(f.read_text())
+            tools = {t.get("name") for t in h.get("tools", [])}
+            text = h["systemPrompt"][0]["text"]
+            has_rule = ("never read /opt/ml/input/config/hyperparameters.json raw" in text
+                        and "SM_HP_" in text)
+            if "job_launched" in tools:
+                assert has_rule, (
+                    f"{f.parent.name} declares job_launched but its prompt never warns "
+                    "that SDK-submitted hyperparameters arrive JSON-encoded -- the "
+                    "defect that killed run-20260811T040003Z-3548116f's eval job")
+
     def test_remediate_task_reaches_finetune_harness(self, asl):
         payload = asl["States"]["RemediateFinetune"]["Parameters"]["Payload"]
         assert payload["stage"] == "finetune"

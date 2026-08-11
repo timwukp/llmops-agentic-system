@@ -5,6 +5,43 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
 ## [Unreleased]
 
+### A failed eval inference job died with zero reflection, on a defect one sentence of SDK knowledge would have prevented
+
+Two bugs from one death. `run-20260811T040003Z-3548116f` — the deepest run the platform
+has ever produced — completed all 40 acceptance-set generations on GPU and then died at
+the **final upload**:
+
+```
+Invalid bucket name ""llmops-agentic-<ACCOUNT_ID>-us-east-1"": Bucket name must match ...
+```
+
+The quotes are real. The eval agent launched its inference job via the SageMaker Python
+SDK, which `json.dumps`-encodes **every** hyperparameter value (its own
+`sagemaker_program` arrives as `"\"inference.py\""`). The training toolkit decodes them
+for `argv` and the `SM_HP_*` env vars — which is why the logged command line looked
+clean — but the agent's entry script read `/opt/ml/input/config/hyperparameters.json`
+**raw** and got the still-encoded values. `max_new_tokens` survived only because
+`json.dumps` of an int has no quotes. 467 billable seconds of correct inference lost,
+because SageMaker uploads `/opt/ml/model` only on success.
+
+Then the second bug: `EvalGenerate`'s only failure route was `States.ALL → EscalateFail`
+— the run died instantly, while the identical failure class at `FinetuneLaunch` gets
+three remediation attempts. Routing eval failures into that existing loop would have been
+worse than none: `RemediateFinetune` re-**trains**, and no amount of retraining removes
+quotes from a bucket name.
+
+Fixed:
+* Both job-launching prompts (eval, finetune) now carry the decoding rule: entry scripts
+  read hyperparameters ONLY from `argv` or `SM_HP_*`; never the raw JSON file. Guarded by
+  `test_every_job_launching_prompt_carries_the_hyperparameter_decoding_rule`, derived
+  from `tools[]` — any harness that can `job_launched` must carry the rule (red on the
+  pristine prompts, verified).
+* A second, disjoint remediation loop: `EvalGenerate` catches `TrainingJobFailed` →
+  `RemediationChoiceEval` (same `iteration < 3` budget) → `IncrementIterationEval` → back
+  into `EvalGenerate`; the prompt tells the re-entering agent to read its failed job's
+  `FailureReason` and fix its own code. The new state-replacing Pass is under the
+  existing derived handback guard from birth.
+
 ### The resume role could not emit the events its handler always emits — a SUCCESSFUL training job left its token parked
 
 The first run on which `job_launched` ever fired (`run-20260811T040003Z-3548116f`, minutes
