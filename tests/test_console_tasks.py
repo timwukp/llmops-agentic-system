@@ -4546,3 +4546,34 @@ def test_the_run_view_paints_the_verdicts_it_is_served(console):
     body = body[:body.index("const evs = d.events")]
     for want in ("never delivered", "parked, awaiting pickup", "picked up by the run"):
         assert want in body, f"the verdict table never says {want!r}"
+
+
+def test_the_gate_row_carries_the_interval_it_is_decided_by(console, monkeypatch):
+    """judge_score passes on its Wilson LOWER bound and fails on its UPPER (the eval
+    gate bullet), so a row showing only the point estimate renders an escalated
+    borderline as an inexplicable n/a. The bounds must ride the judge_score gate row
+    only, and the OOD block is served and rendered as a report, never as a gate."""
+    man = {"params": {"gates": {"judge_score": 0.45, "format_validity": 0.95}},
+           "stages": {"eval": {"metrics": {
+               "judge_score": 0.48, "judge_score_ci_low": 0.40,
+               "judge_score_ci_high": 0.56, "judge_n": 150,
+               "format_validity": 1.0, "gate_passed": False,
+               "ood": {"judge_score": 0.02, "judge_n": 40}}}}}
+    s3f = FakeS3()
+    s3f.put_object(Bucket="b", Key="runs/run-x/manifest.json",
+                   Body=json.dumps(man).encode())
+    monkeypatch.setattr(console, "s3", s3f)
+    monkeypatch.setattr(console, "data_bucket", lambda: "b")
+    monkeypatch.setattr(console, "events_tbl", None)
+    monkeypatch.setattr(console, "runs_tbl", None)
+    out = console.run_detail("run-x")
+    js = next(g for g in out["gates"] if g["name"] == "judge_score")
+    assert (js["judge_score_ci_low"], js["judge_score_ci_high"], js["judge_n"]) == \
+        (0.40, 0.56, 150)
+    fv = next(g for g in out["gates"] if g["name"] == "format_validity")
+    assert "judge_score_ci_low" not in fv, "the CI fields leaked onto a scalar gate row"
+    assert out["oodReport"] == {"judge_score": 0.02, "judge_n": 40}
+    code = _strip_comments(_front())
+    assert "d.oodReport" in code, "run_detail serves an OOD report nothing renders"
+    assert "never gated" in code, "the OOD block does not say it is not a gate"
+    assert "judge_score_ci_low" in code, "the CI bounds are served and never painted"

@@ -15,6 +15,7 @@ import fnmatch
 import importlib.util
 import io
 import json
+import math
 import re
 import os
 import pathlib
@@ -3746,6 +3747,7 @@ class TestEveryDeclaredTaskIsReachable:
 CUSTOMER_DATA_PARAMS = {
     "source_uri": "the data the customer signed for us to train on",
     "customer_eval_uri": "the acceptance set the customer's gate is anchored to",
+    "ood_eval_uri": "the OOD layer that is measured and reported but never gated",
 }
 
 
@@ -4210,6 +4212,7 @@ class TestConductorDispatch:
             # settings only a signed plan supplies (bug #21)
             "source_uri": "plan",
             "customer_eval_uri": "plan",
+            "ood_eval_uri": "plan",
             "domain": "plan",
             "sample_size": "plan",
             "hf_token_secret": "plan",
@@ -8803,3 +8806,68 @@ def test_the_filtered_budget_survives_a_self_reinvoke():
         "_self_reinvoke stopped carrying the filtered-turn counter"
     assert 'int(event.get("_filtered_turns", 0))' in body, \
         "a continuation no longer restores the filtered-turn counter"
+
+
+# ── the gate is decided by an interval, not a point ─────────────────────────────────
+# r5 exposed the old gate's arithmetic as theater: at n=40 the minimum detectable
+# effect is ~22pp and the power to distinguish 0.55 from 0.50 is ~15% -- a coin flip
+# weighted against the student -- while a raw win-rate is swingable by verbosity
+# alone. The r6 reform (deploy/evidence/GATE_POWER_ANALYSIS_r6.md) moves the gate to
+# judge_score = (wins + 0.5*ties)/n decided by its Wilson 95% interval, records
+# answer lengths for a future length correction that cannot be FITTED yet (r5 has
+# zero outcome variance), and adds an OOD layer that is measured and never gated.
+# The methodology's only home is the eval harness prompt, so these guards pin the
+# prompt the way the driver tests pin code.
+
+def _eval_prompt_bullet(task):
+    doc = json.loads((REPO / "agents/eval/harness.json").read_text())
+    text = "".join(b.get("text", "") for b in doc["systemPrompt"])
+    m = re.search(rf'- "{task}":(.*?)(?=\n- "[a-z_]+"|\nRules:)', text, re.S)
+    assert m, f"eval prompt has no {task!r} bullet"
+    return m.group(1)
+
+
+def test_the_score_bullet_defines_the_tie_credited_metric():
+    b = _eval_prompt_bullet("score")
+    assert "judge_score = (wins + 0.5*ties) / n" in b, (
+        "the gate metric's formula is gone from the score bullet -- ties fold back "
+        "into losses and the plan's judge_score threshold gates a different quantity")
+    for field in ("judge_score_ci_low", "judge_score_ci_high", "judge_n",
+                  "student_answer_chars", "reference_answer_chars"):
+        assert field in b, f"the score bullet no longer requires {field}"
+    assert "ood_eval_uri" in b and "NEVER gated" in b, (
+        "the OOD layer must be evaluated by score and marked report-only at the "
+        "point where it is produced")
+
+
+def test_the_gate_bullet_decides_by_the_wilson_interval():
+    b = _eval_prompt_bullet("gate")
+    assert "LOWER bound (judge_score_ci_low)" in b and \
+           "UPPER bound (judge_score_ci_high)" in b, (
+        "the CI decision rule is gone -- the gate is back to point-estimate theater")
+    assert "escalate_human" in b
+    assert "no plan signed" in b, (
+        "the gate bullet no longer forbids gating on the OOD report")
+
+
+def test_the_power_analysis_numbers_are_recomputable():
+    """The numbers the r6 plan's gates are signed against, recomputed rather than
+    trusted -- a number in prose is unchecked, and this doc is the approval's basis."""
+    doc = (REPO / "deploy/evidence/GATE_POWER_ANALYSIS_r6.md").read_text()
+    za, zb = 1.96, 0.8416
+    mde40 = (za + zb) * math.sqrt(0.25 / 40)
+    assert f"{mde40*100:.1f}pp" in doc, "the n=40 MDE in the doc no longer matches Eq 9"
+
+    def power(p0, p1, n):
+        z = 1.6449  # one-sided 5%
+        crit = p0 + z * math.sqrt(p0 * (1 - p0) / n)
+        return 0.5 * (1 + math.erf((p1 - crit) / math.sqrt(p1 * (1 - p1) / n) / math.sqrt(2)))
+
+    assert f"{power(0.50, 0.55, 40)*100:.1f}%" in doc, "the n=40 power figure drifted"
+    assert f"{power(0.45, 0.60, 100)*100:.0f}% power at n=100" in doc, \
+        "the n=100 power behind the recommended design drifted"
+    assert f"{power(0.45, 0.60, 150)*100:.0f}% at n=150" in doc, \
+        "the n=150 power behind the recommended design drifted"
+    # rule-of-3 upper bounds for the observed 0/40 and 0/80
+    assert f"{3/40*100:.1f}%" in doc and f"{3/80*100:.1f}%" in doc, \
+        "the observed-zero upper bounds drifted"

@@ -790,7 +790,12 @@ async function loadRun(runId){
       html += `<h2 style="margin-top:12px">Quality gates</h2><table><tr><th>Gate</th><th>Threshold</th><th>Actual</th><th>Verdict</th></tr>`+
         d.gates.map(g=>`<tr><td>${esc(g.name)}</td><td class="mono">${esc(g.threshold)}</td>`+
           `<td class="mono">${g.actual!=null?esc(g.actual):"–"}</td>`+
-          `<td>${g.passed==null?`<span class="pill idle">n/a</span>`:`<span class="pill ${g.passed?"ok":"err"}">${g.passed?"PASS":"FAIL"}</span>`}</td></tr>`).join("")+`</table>`;
+          `<td>${g.passed==null?`<span class="pill idle">n/a</span>`:`<span class="pill ${g.passed?"ok":"err"}">${g.passed?"PASS":"FAIL"}</span>`}`+
+          `${g.judge_score_ci_low!=null?` <span class="sub mono">CI [${esc(g.judge_score_ci_low)}, ${esc(g.judge_score_ci_high)}] n=${esc(g.judge_n!=null?g.judge_n:"?")}</span>`:""}</td></tr>`).join("")+`</table>`;
+    }
+    if (d.oodReport) {
+      html += `<h2 style="margin-top:12px">OOD layer (measured, never gated)</h2><table><tr><th>Metric</th><th>Value</th></tr>`+
+        Object.entries(d.oodReport).map(([k,v])=>`<tr><td>${esc(k)}</td><td class="mono">${esc(typeof v==="object"?JSON.stringify(v):v)}</td></tr>`).join("")+`</table>`;
     }
     // per-stage manifest: status / metrics / evidence
     const sk = Object.keys(stages);
