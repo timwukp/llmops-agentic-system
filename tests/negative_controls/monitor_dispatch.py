@@ -2916,7 +2916,9 @@ case("docs: the escalate row calls the terminal exit a pause (zh-TW)",
 
 _RESOLVER = "orchestration/start_pipeline/handler.py"
 _DRIVER = "orchestration/harness_driver/handler.py"
+_REPORT = "pipeline/contracts/report.py"
 _D = "tests/test_orchestration.py::TestConductorDispatch"
+_CON = "tests/test_orchestration.py::TestContracts"
 
 
 # 154. The resolver reads only the nested `models` block again -- the original bug. The
@@ -3335,9 +3337,14 @@ case("prompt: eval gates on a remembered bar, not the one the plan named",
 #      `manifest.stages` was still `{}` after a deploy stage reported an endpoint_name, so
 #      the report humans read carried every metric and the manifest AGENTS read carried none.
 def m180(t):
+    # `pass`, not deletion: since #25 split the two artifact writes, _save_manifest is the
+    # only statement in its own try block, so removing the line leaves an IndentationError
+    # and pytest exits 4 (collection error) instead of 1 (test failed). A control that
+    # cannot even import the module under test verifies nothing -- it reports the guard as
+    # UNCAUGHT while the mutation it claims to make was never really applied.
     old = '        _save_manifest(c["s3"], event["manifest_uri"], manifest)\n'
     assert t.count(old) == 1, f"the manifest write-back has moved; found {t.count(old)}"
-    return t.replace(old, "", 1)
+    return t.replace(old, "        pass  # write-back removed\n", 1)
 
 
 # Only the persistence guard is named. The endpoint guard drives `_run_stage` against a
@@ -3517,6 +3524,357 @@ def m189(t):
 case("prompt: the val split stops being labelled the fallback and becomes an equal option",
      _EVAL, m189,
      [f"{_C}::test_the_scoring_task_anchors_the_gate_to_the_customers_acceptance_set"])
+
+
+_DRV = "tests/test_orchestration.py::TestDriver"
+
+# 190. Bug #24 restored: the stop_reason check applies to inline functions again. This is the
+#      exact pre-cure line, and the reason it looked right is that it IS right for
+#      code_interpreter and shell -- the harness services those itself, so answering one
+#      would make the next ConverseStream invalid. The half never connected: an inline
+#      function is BY DEFINITION one the harness cannot service, so a call arriving with
+#      end_turn is not "already serviced", it is a call nobody will ever answer. Live:
+#      run-20260810T174626Z-3f08b4c6 died MissingStageComplete at DataPrepGenerate with 300
+#      verified customer rows already in S3 -- a stage_complete that was CALLED, reported as
+#      never called.
+def m190(t):
+    old = re.search(r'\n        if tu and out\["stop_reason"\] != "tool_use" and tu'
+                    r'\.get\("name"\) in SERVICED_TOOLS:.*?\n            out = '
+                    r'\{\*\*out, "stop_reason": "tool_use"\}\n', t, re.S)
+    assert old, "the inline-function override no longer matches; re-anchor this mutation"
+    return t.replace(old.group(0), "\n", 1)
+
+
+case("driver: an inline function riding with end_turn is discarded and counted as prose",
+     _DRIVER, m190,
+     [f"{_DRV}::test_a_stage_complete_riding_with_end_turn_is_serviced_not_discarded",
+      f"{_DRV}::test_a_rejected_courtesy_ack_cannot_un_complete_a_settled_stage"])
+
+# 191. The override survives but SERVICED_TOOLS loses one name, so exactly one tool keeps the
+#      old behaviour. Chosen as job_launched because its discard is the quietest of the
+#      eleven: the job is running on SageMaker and billing, the token is parked, and the
+#      driver has decided the turn was prose -- so the stage fails while the GPU it launched
+#      keeps going. A per-tool version of the same bug is what a hand-kept second copy of the
+#      dispatch table produces the first time an agent gains a tool, which is why the set is
+#      derived from the branches rather than trusted.
+def m191(t):
+    old = '                            "job_launched", "publish_cost_report"'
+    assert t.count(old) == 1, f"the serviced-tool set has moved; found {t.count(old)}"
+    return t.replace(old, '                            "publish_cost_report"', 1)
+
+
+case("driver: the serviced-tool set drops one name the dispatch still has a branch for",
+     _DRIVER, m191,
+     [f"{_DRV}::test_the_serviced_tool_set_matches_the_dispatch_branches"])
+
+# 192. The ack goes back to a bare _invoke on the stage_complete branch. Nothing about the
+#      happy path changes -- the token is settled, the outputs verified, the return value
+#      identical -- so every test that does not reject an ack stays green. The bug is one
+#      state further on than #24's: the call is now serviced, and answering it re-invokes a
+#      runtime with no open toolUse, which rejects. Raising there reports a stage that
+#      genuinely finished as a crashed one, and the state machine sees a settled token AND an
+#      invocation error for the same stage.
+def m192(t):
+    old = ('                _ack_terminal(c, event, sess, tu, {"status": "acknowledged"},\n'
+           '                              "the task token was settled and the outputs '
+           'verified")\n')
+    assert t.count(old) == 1, f"the stage_complete ack has moved; found {t.count(old)}"
+    return t.replace(old,
+                     '                _invoke(c["agentcore"], event["harness_id"], sess,\n'
+                     '                        _tool_result_content(tu, '
+                     '{"status": "acknowledged"}),\n'
+                     '                        event.get("qualifier"))\n', 1)
+
+
+case("driver: a rejected courtesy ack raises after the token is already settled",
+     _DRIVER, m192,
+     [f"{_DRV}::test_a_rejected_courtesy_ack_cannot_un_complete_a_settled_stage"])
+
+# 193-195. Bug #25: bug #22's cure was inert in production for three days because the write
+#      it added was granted to no role. These three controls cover the two halves of the cure
+#      plus the hazard splitting them opened.
+#
+# 193. The IAM statement is deleted, restoring the exact production state: the driver has
+#      s3:PutObject (on reports/*) and writes runs/<run_id>/manifest.json. So an
+#      action-level check stays green -- the action IS granted -- and only a KEY-level one
+#      can see it. That is why the guard derives every key the driver's source can put
+#      rather than asserting on actions: the previous guard even listed
+#      runs/r/manifest.json as forbidden, which was true when written and became a green pin
+#      on a live defect the moment _save_manifest existed.
+_ROLES = "deploy/iam/lambda_roles.json"
+
+
+def m193(t):
+    d = json.loads(t)
+    stmts = d["roles"]["driver"]["permissionsPolicy"]["Statement"]
+    keep = [s for s in stmts if s.get("Sid") != "WriteStageResultsToRunManifest"]
+    assert len(keep) == len(stmts) - 1, \
+        "WriteStageResultsToRunManifest is not in the driver role; re-anchor this mutation"
+    d["roles"]["driver"]["permissionsPolicy"]["Statement"] = keep
+    return json.dumps(d, indent=2)
+
+
+case("IAM: the driver loses PutObject on the manifest it writes on every stage_complete",
+     _ROLES, m193,
+     ["tests/test_orchestration.py::test_every_s3_key_the_driver_writes_is_inside_a_granted_prefix"])
+
+# 194. The grant widens from runs/*/manifest.json to runs/*, which is what "just make it
+#      work" produces. Every write the driver performs still succeeds, so no functional test
+#      can see it -- and the driver becomes able to rewrite distillation/curated.jsonl and
+#      evaluation/report.json, the artifacts it head_objects to decide whether a stage's
+#      token settles. A role that can rewrite what it verifies can launder its own evidence,
+#      which is the property the narrow scope exists for.
+def m194(t):
+    old = '"arn:aws:s3:::<DATA_BUCKET>/runs/*/manifest.json"'
+    assert t.count(old) == 1, f"the manifest grant has moved; found {t.count(old)}"
+    return t.replace(old, '"arn:aws:s3:::<DATA_BUCKET>/runs/*"', 1)
+
+
+case("IAM: the driver's manifest grant widens to every object under runs/",
+     _ROLES, m194,
+     ["tests/test_orchestration.py::test_the_driver_role_can_write_the_report_the_driver_always_writes"])
+
+# 195. The two writes go back into one try block, manifest first -- the shape that made one
+#      refused PutObject delete a second, permitted artifact. Nothing on the happy path
+#      changes, because when both writes succeed the two forms are indistinguishable; only a
+#      test that refuses ONE key can tell them apart.
+def m195(t):
+    # The whole span from the manifest write through the report branch is replaced, not just
+    # the two call lines: the second `except` and the `else` belong to structure this
+    # mutation removes, and leaving them orphaned is a SyntaxError -- pytest then exits 4
+    # (collection error) rather than 1, and the runner reports the guard as uncaught while
+    # the mutation it claims to have made was never really applied. A mutation that cannot
+    # produce importable code proves nothing about the guard.
+    old = re.search(
+        r'        _save_manifest\(c\["s3"\], event\["manifest_uri"\], manifest\)\n'
+        r'    except Exception.*?'
+        r'\n        print\(f"\[driver\] report SKIPPED for \{run_id\}/\{stage\}: '
+        r'\{failures\[-1\]\}"\)\n', t, re.S)
+    assert old, "the split stage-artifact writes no longer match; re-anchor this mutation"
+    return t.replace(old.group(0), (
+        '        _save_manifest(c["s3"], event["manifest_uri"], manifest)\n'
+        '        write_run_report(c["s3"], os.environ["DATA_BUCKET"], manifest)\n'
+        '    except Exception as exc:  # noqa: BLE001\n'
+        '        failures.append(f"{type(exc).__name__}: {exc}")\n'
+        '        print(f"[driver] canonical report FAILED for {run_id}/{stage}: '
+        '{failures[-1]}")\n'), 1)
+
+
+case("driver: a refused manifest write again suppresses the permitted report write",
+     _DRIVER, m195,
+     [f"{_D}::test_a_refused_manifest_write_still_publishes_the_run_report"])
+
+# 196. The run_id guard around the report write is dropped. Only reachable BECAUSE the writes
+#      were split: an unloadable manifest used to abort before the report, and now it does
+#      not, so report_key_for("") resolves to the run-latest alias and a document describing
+#      nothing overwrites the last real run's published report. The cure for one bug creating
+#      the next is the thing negative controls exist to notice.
+def m196(t):
+    old = '    if manifest.get("run_id"):\n'
+    assert t.count(old) == 1, f"the report run_id guard has moved; found {t.count(old)}"
+    return t.replace(old, '    if True:\n', 1)
+
+
+case("driver: a report for an unreadable manifest overwrites the run-latest alias",
+     _DRIVER, m196,
+     [f"{_D}::test_an_unreadable_manifest_does_not_overwrite_the_published_report_alias"])
+
+# 197-200. Bug #26: the deadline handoff needed a chunk in order to notice that no chunk was
+#      coming. `out_of_wall` is evaluated once per stream chunk, so a stream that goes QUIET
+#      reaches it never; boto's read_timeout restarts per read, so after a chunk at elapsed t
+#      it is next due at t + 870 -- past the 900s wall for every t > 30. A last chunk anywhere
+#      in (30, 855)s left both escape hatches unreachable and the runtime hard-killed the
+#      invocation with the agent's stage_complete unanswered.
+#
+# 197. The watchdog is removed, restoring the exact production state. Every existing deadline
+#      test stays green, because they all use TricklingStream -- a stream that keeps arriving,
+#      which is the only case out_of_wall can see. Only a test that BLOCKS can tell them
+#      apart, which is why the new one opens a real socket instead of using a double: a fake
+#      whose __next__ returns cannot express "nothing returns".
+def m197(t):
+    old = "        with _stream_watchdog(remaining_ms):\n"
+    assert t.count(old) == 1, f"the watchdog wrapper has moved; found {t.count(old)}"
+    return t.replace(old, "        if True:  # watchdog removed\n", 1)
+
+
+case("driver: a stream that goes quiet at the wall is hard-killed instead of handed off",
+     _DRIVER, m197,
+     [f"{_DRV}::test_a_stream_that_goes_quiet_at_the_wall_still_hands_off"])
+
+# 198. The watchdog's exception is relabelled as a stream DEATH rather than a deadline cut.
+#      Both paths recover, so the stage still finishes -- what is lost is the one same-session
+#      salvage retry, spent on a turn that never failed, leaving a REAL death later in the
+#      same stage unprotected. A functional test that only asserts "the run completed" cannot
+#      see a reserve being quietly drained.
+def m198(t):
+    old = "    except _StreamWatchdogFired as exc:\n"
+    assert t.count(old) == 1, f"the watchdog except clause has moved; found {t.count(old)}"
+    # Fall through to the generic handler, which stringifies it as a death.
+    return t.replace(old, "    except (_StreamWatchdogFired,) if False else ():\n", 1)
+
+
+case("driver: a deadline cut is mislabelled a stream death and burns the salvage retry",
+     _DRIVER, m198,
+     [f"{_DRV}::test_a_quiet_stream_is_a_deadline_cut_not_a_stream_death"])
+
+# 199. The ValueError guard around signal.signal is dropped. On the main thread nothing
+#      changes -- every production invocation and every other test still passes -- but any
+#      caller off the main thread now crashes a turn that would have succeeded. A guard that
+#      converts a working path into a failure is worse than the hang it prevents.
+def m199(t):
+    old = ("        except ValueError:  # not the main thread — degrade, do not fail\n"
+           "            yield\n"
+           "            return\n")
+    assert t.count(old) == 1, f"the off-main-thread guard has moved; found {t.count(old)}"
+    return t.replace(old, "        except ValueError:\n            raise\n", 1)
+
+
+case("driver: a watchdog that cannot be armed fails the turn instead of degrading",
+     _DRIVER, m199,
+     [f"{_DRV}::test_a_watchdog_that_cannot_arm_does_not_kill_the_turn"])
+
+# 200. The heartbeat's by-design refusal goes back to being reported as a failure. Nothing
+#      functional changes -- the beat was never going to be written for a non-run invocation
+#      -- so only a test that reads the LOG can see it. It matters because 11 lines of
+#      "heartbeat write failed" describing correct behaviour is how the line that would mean
+#      "the beat is actually broken" stopped meaning anything.
+def m200(t):
+    old = ("            if _is_condition_failure(exc):\n"
+           "                return  # not a run row: no beat to write, and none wanted\n")
+    assert t.count(old) == 1, f"the heartbeat condition check has moved; found {t.count(old)}"
+    return t.replace(old, "", 1)
+
+
+case("driver: every triage heartbeat is logged as a failure for refusing by design",
+     _DRIVER, m200,
+     [f"{_DRV}::test_a_triage_heartbeat_is_refused_by_design_and_says_nothing"])
+
+# 201-202. Bug #27: `outputs` sent as a JSON STRING skipped verification entirely.
+#      `verify_outputs` head_objects every element that startswith("s3://"); a one-element
+#      list holding the text '["s3://a", "s3://b"]' starts with '[', so nothing inside it was
+#      ever checked and the stage passed verification having proved nothing. `metrics` had
+#      had the JSON-string parse since the contract was written -- outputs, the field with a
+#      security consequence, did not.
+
+# 201. The list parse is removed, restoring production: the string is wrapped as a single
+#      element again. Every other normalize test stays green because they all pass a real
+#      list or a bare URI -- the two shapes that were never broken.
+def m201(t):
+    old = ("        if isinstance(parsed, list):\n"
+           "            outputs = parsed\n")
+    assert t.count(old) == 1, f"the outputs list-parse has moved; found {t.count(old)}"
+    return t.replace(old, "        if False:\n            outputs = parsed\n", 1)
+
+
+case("contracts: outputs sent as a JSON string bypass s3 verification entirely",
+     _REPORT, m201,
+     [f"{_CON}::test_outputs_sent_as_a_json_string_are_still_verified"])
+
+# 202. The JSON-scalar unwrap is removed. '"s3://b/x"' keeps its leading quote, which also
+#      fails startswith("s3://") -- the identical vacuous check one layer down. Fixing only
+#      the list case would have left this reachable, and no functional test can see it
+#      because the run still completes either way.
+def m202(t):
+    old = ("        elif isinstance(parsed, str):\n"
+           "            outputs = [parsed]\n")
+    assert t.count(old) == 1, f"the outputs scalar-unwrap has moved; found {t.count(old)}"
+    return t.replace(old, "        elif False:\n            outputs = [parsed]\n", 1)
+
+
+case("contracts: a JSON-quoted single URI keeps its quote and is never verified",
+     _REPORT, m202,
+     [f"{_CON}::test_a_json_quoted_single_uri_is_unwrapped_before_verification"])
+
+# 203-207. Bug #28: the model TYPED the call instead of making one, so no structured reader
+#      could see it. #24's sibling and its opposite: there the runtime emitted a block the
+#      driver discarded, here the runtime emitted no block at all. One control per branch of
+#      the cure, because each branch is a different way to get this wrong -- and two of them
+#      (204, 205) fail SAFE-looking, i.e. the run still completes while the driver believes
+#      something it never verified.
+#
+# 203. The dispatch hook is deleted, restoring production exactly: a turn whose text is
+#      `<invoke name="job_launched">...` is prose. Live cost: rehearsal
+#      run-20260811T005043Z-320cc47e launched SageMaker job
+#      llmops-qlora-...-i0, confirmed it InProgress, wrote the manifest, then typed the
+#      signal twice -- stage failed MissingStageComplete while the job ran on to Completed
+#      (442 billable seconds) with no parked token, so nothing would ever have settled it.
+#      Measured: `tool=job_launched` appears ZERO times in 25 days of driver logs.
+def m203(t):
+    old = re.search(r'\n        if not tu:\n            typed = parse_typed_call'
+                    r'\(out\["text"\]\).*?\n                out = \{\*\*out, '
+                    r'"stop_reason": "tool_use"\}\n', t, re.S)
+    assert old, "the typed-call dispatch hook no longer matches; re-anchor this mutation"
+    return t.replace(old.group(0), "\n", 1)
+
+
+case("driver: a call the model typed instead of made is invisible and counted as prose",
+     _DRIVER, m203,
+     [f"{_DRV}::test_a_typed_job_launched_parks_the_token_instead_of_failing_the_stage",
+      f"{_DRV}::test_a_typed_stage_complete_still_has_to_prove_its_outputs_exist"])
+
+# 204. The `serviced` gate is dropped, so ANY name in `<invoke name="...">` is recovered.
+#      This is the mutation that looks like a simplification and is the security bug: shell
+#      and code_interpreter run INSIDE the harness, so a typed one is either a transcript of
+#      a call already served or text quoted from a log, a customer ticket, or a training
+#      sample -- and the driver would then dispatch prose. Nothing functional goes red; only
+#      a test that asserts a refusal can see it.
+def m204(t):
+    old = ("        if name not in serviced:\n"
+           "            continue\n")
+    assert t.count(old) == 1, f"the serviced-name gate has moved; found {t.count(old)}"
+    return t.replace(old, "        if False:\n            continue\n", 1)
+
+
+case("driver: a typed shell/code_interpreter call is recovered and dispatched from prose",
+     _DRIVER, m204,
+     [f"{_DRV}::test_a_typed_shell_call_is_never_recovered"])
+
+# 205. The parameter JSON parse is removed, so a typed `outputs` arrives as the literal text
+#      '["s3://a", "s3://b"]'. That is bug #27's exact shape one layer up: the string starts
+#      with '[', so verify_outputs skips it and every URI inside passes unchecked. The run
+#      still completes, which is what makes this the worst of the five -- the driver reports
+#      verified outputs it never head_object'd.
+def m205(t):
+    old = ("            try:\n"
+           "                args[pm.group(1)] = json.loads(raw)\n")
+    assert t.count(old) == 1, f"the typed-parameter parse has moved; found {t.count(old)}"
+    return t.replace(old, "            try:\n                args[pm.group(1)] = raw\n", 1)
+
+
+case("driver: a typed JSON list stays text, so verify_outputs skips every URI in it",
+     _DRIVER, m205,
+     [f"{_DRV}::test_a_typed_outputs_list_arrives_as_a_list_not_as_text"])
+
+# 206. The null-id branch in _tool_result_content is dropped, so a recovered call is answered
+#      with an assistant toolUse echo carrying toolUseId=None plus a matching toolResult. The
+#      runtime has no such pending call and rejects the pair -- and on a NON-terminal branch
+#      (checkpoint, a rejected stage_complete) that rejection kills the next turn rather than
+#      a courtesy message, converting the recovery into a different stage failure.
+def m206(t):
+    old = re.search(r'    if not tool_use\.get\("toolUseId"\):\n        return _user_text'
+                    r'\(.*?\n(?=    return \[)', t, re.S)
+    assert old, "the recovered-call text branch no longer matches; re-anchor this mutation"
+    return t.replace(old.group(0), "", 1)
+
+
+case("driver: a recovered call is echoed back with a null toolUseId the runtime rejects",
+     _DRIVER, m206,
+     [f"{_DRV}::test_a_recovered_call_is_answered_as_text_not_as_a_tool_result"])
+
+# 207. The `if not tu` precondition widens to unconditional, so a recovered call OVERRIDES a
+#      real one in the same turn. A turn that narrates one call and structurally makes
+#      another then gets serviced on the narration -- the driver acting on what the agent
+#      talked about instead of what it did, which is the whole failure mode the `serviced`
+#      gate in 204 exists to bound, arriving by a different door.
+def m207(t):
+    old = "        if not tu:\n            typed = parse_typed_call"
+    assert t.count(old) == 1, f"the typed-call precondition has moved; found {t.count(old)}"
+    return t.replace(old, "        if True:\n            typed = parse_typed_call", 1)
+
+
+case("driver: a typed call in the same turn's text displaces the real tool call",
+     _DRIVER, m207,
+     [f"{_DRV}::test_a_real_tool_call_always_wins_over_a_typed_one"])
 
 
 #: Where the pristine text of the file currently mutated is parked, so a kill -9 -- which

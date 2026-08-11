@@ -77,6 +77,45 @@ def normalize_stage_complete(args: dict | None) -> dict:
     if outputs is None:
         outputs = []
     if isinstance(outputs, str):
+        # A JSON-encoded LIST is parsed before the scalar wrap, for the same reason
+        # `metrics` below parses a JSON-encoded dict -- agents emit both. Skipping it here
+        # was not a cosmetic gap: `verify_outputs` head_objects every element that
+        # `startswith("s3://")`, and a one-element list holding the string
+        # '["s3://.../a.jsonl", "s3://.../b.json"]' starts with '[', so it was SKIPPED and
+        # the stage passed verification having proved nothing. That is the whole
+        # trust-but-verify mechanism defeated by a type: an agent could claim outputs that
+        # do not exist and be believed, which is precisely what the head_object exists to
+        # stop. Measured live on rehearsal run-20260811T005043Z-320cc47e, whose data-prep
+        # entry recorded outputs as ["[\"s3://...generated.jsonl\", \"s3://...manifest.json\"]"]
+        # -- those two objects DID exist, so the run was honest and the check was still
+        # vacuous. A non-list JSON scalar ("s3://b/x" is valid JSON) must stay a scalar,
+        # hence the isinstance check rather than trusting whatever comes back.
+        #
+        # A JSON-encoded SCALAR is unwrapped for the same reason: '"s3://b/x"' round-trips
+        # to a bare URI, whereas keeping the raw text leaves the quote character in front
+        # of the scheme and `verify_outputs` skips it -- the identical vacuous check, one
+        # layer down. A bare unquoted s3:// URI is not valid JSON, so it lands in the
+        # except branch and is wrapped as before; anything else (dict, number) keeps its
+        # original text so the claim stays legible in the report instead of being reshaped
+        # into something that looks verified.
+        try:
+            parsed = json.loads(outputs)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, list):
+            outputs = parsed
+        elif isinstance(parsed, str):
+            outputs = [parsed]
+        else:
+            outputs = [outputs]
+    elif not isinstance(outputs, (list, tuple)):
+        # A dict, int or bool is wrapped as TEXT and deliberately not mined for URIs. It
+        # stays unverified, but that is `verify_outputs`' existing and documented rule for
+        # any element that is not an s3:// URI -- not the defect above. The defect above was
+        # a value that WAS a list of s3:// URIs and got skipped for being spelled as a
+        # string; guessing which of a dict's values are meant to be artifacts would invent
+        # a claim the agent did not make, and an invented claim that then passes
+        # head_object is worse than a legible one that is never checked.
         outputs = [outputs]
     outputs = [str(o) for o in outputs if o is not None]
 
