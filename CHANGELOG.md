@@ -5,6 +5,41 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
 ## [Unreleased]
 
+### The resume role could not emit the events its handler always emits — a SUCCESSFUL training job left its token parked
+
+The first run on which `job_launched` ever fired (`run-20260811T040003Z-3548116f`, minutes
+after the fix below was deployed) exposed the next domino: the training job ran to
+`Completed` (436 billable seconds), EventBridge woke `resume_pipeline`, and it died at
+
+```
+AccessDeniedException: ... llmops-lambda-resume is not authorized to perform: events:PutEvents
+```
+
+`emit_event(MODEL_TRAINED)` runs BEFORE `send_task_success` — deliberately, so the timeline
+never claims a settle that did not land — which means the crash left the task token parked
+with the stage still waiting on a job that had already succeeded. Production was not
+drifted: `deploy/iam/lambda_roles.json` had simply never granted it, and the role's own
+`ClearSettledToken` comment names this exact defect class ("start_pipeline's
+events:PutEvents, the driver's s3:PutObject") — this is the fourth instance.
+
+Why the guard built for the first three missed it:
+`test_every_aws_call_a_handler_makes_is_in_its_role` scanned for the literal
+`c["events"].put_events(`, but **every** handler emits through the shared helper
+`ev.emit_event(..., client=c["events"])` — so the scan saw no emit in ANY handler, and the
+three roles that did hold the grant held it only because their emits had already failed
+live, one at a time. The reachability is also why 25 days of runs never hit it: every
+earlier run died before a tracked training job could complete against a parked token, so
+this line of the settle path had never executed in production.
+
+Fixed:
+* `deploy/iam/lambda_roles.json`: `EmitSettlementEvents` on the resume role —
+  `events:PutEvents` scoped to the `llmops-pipeline` bus, same shape as start's grant.
+* The guard now derives `events:PutEvents` from `ev.emit_event(` in the handler source
+  (a generic client handoff, not a per-handler `_CLIENT_HANDOFFS` entry), and the
+  parametrize gains `resurrector` and `finops_reconcile`, which were under no IAM guard at
+  all. Red-first: with the detection added and the grant absent, the guard fails on
+  exactly `resume`; the other six roles pass.
+
 ### A call the model TYPED instead of made was invisible — `job_launched` has never once fired in 25 days of production
 
 Rehearsal `run-20260811T005043Z-320cc47e` did the finetune stage's work correctly and end to
