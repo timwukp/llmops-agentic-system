@@ -73,7 +73,7 @@ SELF_FUNCTION = os.environ.get("AWS_LAMBDA_FUNCTION_NAME", "")
 COGNITO_POOL_ID = os.environ.get("COGNITO_POOL_ID", "")
 COGNITO_CLIENT_ID = os.environ.get("COGNITO_CLIENT_ID", "")
 JUDGE_MODEL = os.environ.get("JUDGE_MODEL", "global.anthropic.claude-opus-5")
-SPANS_SINCE = os.environ.get("SPANS_SINCE", "2026-07-28T12:00:00Z")  # OTEL_TRACES_SAMPLER=always_on since
+SPANS_SINCE_ENV = os.environ.get("SPANS_SINCE", "")
 OPTIMIZE_HARNESS = os.environ.get("OPTIMIZE_HARNESS", "llmops_orchestrator")
 ALLOWED_ORIGIN = os.environ.get("ALLOWED_ORIGIN", "")  # same-origin by default — leave empty
 
@@ -191,6 +191,40 @@ def data_bucket():
         b = ssm.get_parameter(Name="/llmops/storage/bucket")["Parameter"]["Value"]
     _BUCKET_CACHE = b
     return b
+
+
+_SPANS_SINCE_CACHE = None
+
+
+def spans_since():
+    """The cutoff before which no session has spans: env, else SSM, else "" (no filter).
+
+    Was a hardcoded `2026-07-28T12:00:00Z` in both this file and console/deploy.sh -- the
+    hour always_on tracing came up in THIS account. That is a fact about one deployment,
+    and it was wrong for every other in the direction that hides itself: a fresh
+    deployment's runs are all NEWER than that date, so they pass the filter, get scored
+    against spans that were never sampled, and come back as "failed sessions" with nothing
+    pointing at the cutoff as the cause.
+
+    The value now comes from the step that MAKES it true: 05_harnesses.py sets
+    OTEL_TRACES_SAMPLER=always_on and stamps /llmops/observability/spans_since on its
+    first deploy. Empty is the deliberate fallback rather than a date, because filtering
+    nothing leaves unscoreable sessions visibly unscoreable, while a guessed date makes
+    real sessions silently vanish from batch eval -- and a missing row prompts no
+    questions, where a bad score does.
+    """
+    global _SPANS_SINCE_CACHE
+    if _SPANS_SINCE_CACHE is not None:
+        return _SPANS_SINCE_CACHE
+    val = SPANS_SINCE_ENV
+    if not val:
+        try:
+            val = ssm.get_parameter(
+                Name="/llmops/observability/spans_since")["Parameter"]["Value"]
+        except Exception:  # noqa: BLE001 — not deployed yet: filter nothing, never guess
+            val = ""
+    _SPANS_SINCE_CACHE = val
+    return val
 
 
 def _resolve_harness_id(name_or_id):
@@ -915,7 +949,8 @@ def _recent_session_ids(cap=20, stage_filter=None):
         rid = str(it.get("run_id", ""))
         if not rid:
             continue
-        if SPANS_SINCE and str(it.get("created_at", "")) < SPANS_SINCE:
+        cutoff = spans_since()
+        if cutoff and str(it.get("created_at", "")) < cutoff:
             continue
         ran = set()
         try:
@@ -1326,7 +1361,24 @@ def start_run(body):
                 except Exception:
                     pass
 
+    # The priced plan travels to start-pipeline as `plan`, which is what makes the run
+    # the run that was approved. It used to be scraped for exactly two integers, so the
+    # other seven fields the estimator PRICED -- both instance types, teacher_model,
+    # harness_model, endpoint_hours, keep_reasoning, teardown -- were dropped, and the
+    # pipeline ran on ARC-shaped defaults instead. That is unobservable afterwards: the
+    # variance report joins this estimate to that run's actuals and reports the gap as an
+    # underspend rather than as two different runs. start-pipeline gives `plan` precedence
+    # over `params` and refuses a contradiction, so the two integers above staying in
+    # `params` is redundant-but-consistent, not a second source of truth.
     payload = {"trigger_source": "console", "params": params}
+    if est is not None:
+        try:
+            priced = json.loads(est.get("plan", "{}"))
+        except Exception:
+            priced = {}
+        if isinstance(priced, dict) and priced:
+            payload["plan"] = priced
+
     r = lam.invoke(FunctionName=START_FN, InvocationType="RequestResponse",
                    Payload=json.dumps(payload).encode())
     try:
@@ -2140,6 +2192,37 @@ def _task_session(task):
 def _user_may_task(user):
     groups = (user or {}).get("groups", []) or []
     return DS_GROUP in groups or APPROVER_GROUP in groups
+
+
+#: Path prefix of the consult plane: one customer engagement per thread.
+CONSULT_PREFIX = "/api/tasks"
+
+
+def _is_consult_path(path):
+    """True for every route that reads or writes a customer engagement.
+
+    A PREFIX, not a list of paths, and that is the whole fix rather than a tidier
+    spelling of it. Four consult READS -- /api/tasks, /api/tasks/{id} and that thread's
+    approval and readiness panels -- were served anonymously on a public API Gateway URL
+    for the platform's whole life, because the auth chokepoint was keyed on the HTTP
+    METHOD: `if method == "POST": user = _authed_user(...)`. So the design property the
+    docs boast, "adding a route cannot accidentally add an unauthenticated write", was
+    exactly true and exactly insufficient -- it says nothing about adding an
+    unauthenticated READ of the customer plane, which is how all four got there. What
+    leaked was not operational fact: GET /api/tasks/{id} returns the whole DynamoDB item,
+    which is the customer's transcript, and /approval returns approved_by, cognito_sub
+    and source_ip -- the identity fields the KMS signature exists to bind.
+
+    Enumerating the four would have fixed today's leak and left the mechanism that
+    produced it intact, so the fifth panel added to a thread would arrive anonymous the
+    same way. A prefix cannot be outgrown by a route nobody remembered to add to a list.
+
+    The read plane above it stays public deliberately: /api/overview and friends are
+    already-reconciled operational fact, and gating them would add friction fifty times
+    a day while protecting what is already in the architecture diagrams. Authority is a
+    different question from visibility -- but a customer's conversation is neither.
+    """
+    return path == CONSULT_PREFIX or path.startswith(CONSULT_PREFIX + "/")
 
 
 def _append_messages(task_id, msgs, extra_update="", extra_names=None, extra_values=None,
@@ -3567,16 +3650,27 @@ def handler(event, context):
             out["variance"] = cost_variance(estimates=out["estimates"],
                                             overview=cost_overview())
             return _resp(200, out)
-        if method == "GET" and path == "/api/tasks":
-            return _resp(200, list_tasks(qs.get("limit", 25)))
-        if method == "GET" and path.startswith("/api/tasks/"):
-            seg = path[len("/api/tasks/"):].split("/")
-            if len(seg) == 1:
-                return _resp_result(get_task(seg[0]))
-            if len(seg) == 2 and seg[1] == "approval":
-                return _resp_result(task_approval(seg[0]))
-            if len(seg) == 2 and seg[1] == "readiness":
-                return _resp_result(task_readiness(seg[0]))
+        # The consult plane's READS are authenticated too, gated by PREFIX rather than by
+        # a list of paths. Every route above this line is aggregated operational fact --
+        # what ran, what it scored, what it cost -- and is public on purpose. Everything
+        # under /api/tasks is a customer engagement.
+        if method == "GET" and _is_consult_path(path):
+            user = _authed_user(headers)
+            if user is None:
+                return _resp(401, {"error": "unauthorized"})
+            if not _user_may_task(user):
+                return _resp(403, {"error": f"membership in {DS_GROUP} or "
+                                            f"{APPROVER_GROUP} required"})
+            if path == "/api/tasks":
+                return _resp(200, list_tasks(qs.get("limit", 25)))
+            if path.startswith("/api/tasks/"):
+                seg = path[len("/api/tasks/"):].split("/")
+                if len(seg) == 1:
+                    return _resp_result(get_task(seg[0]))
+                if len(seg) == 2 and seg[1] == "approval":
+                    return _resp_result(task_approval(seg[0]))
+                if len(seg) == 2 and seg[1] == "readiness":
+                    return _resp_result(task_readiness(seg[0]))
 
         raw = event.get("body") or "{}"
         if event.get("isBase64Encoded"):

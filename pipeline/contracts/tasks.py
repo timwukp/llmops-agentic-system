@@ -52,6 +52,16 @@ NON_ASL_DISPATCH_SITES: dict = {
     # invokes the conductor directly rather than through the driver, since there is no task
     # token to settle and no state machine execution to belong to.
     ("orchestrator", "consult"): "deploy/console/lambda_function.py",
+    # Event-driven, because an escalation arrives from whichever stage raised it rather than
+    # from a place in the run's sequence: ensure_triage_rule (deploy/07_lambdas.py) puts an
+    # EscalatedToHuman rule on the llmops-pipeline bus targeting the driver, and
+    # triage_event_from_bus builds the payload that names this harness and task. The DRIVER
+    # is the dispatch site, not the deploy script: the script creates the wire, the handler
+    # decides what travels down it, and only the handler names llmops_orchestrator. Was an
+    # "ACCEPTED GAP, closed on a branch (PR #35)" in TASKS_WITHOUT_A_DISPATCH_SITE; the rule
+    # is on main now (07_lambdas.py:685), so it moved here rather than being deleted -- the
+    # task IS dispatched, just not by the state machine, which is what this dict is for.
+    ("orchestrator", "triage"): "orchestration/harness_driver/handler.py",
 }
 
 #: (harness_dir, task) -> why it has no dispatch site at all.
@@ -78,22 +88,11 @@ TASKS_WITHOUT_A_DISPATCH_SITE: dict = {
         "training/config.json itself. The clause stays because `remediate` writes a REVISED "
         "training/config.json and is told to 'proceed exactly as launch' -- both share "
         "prepare's contract, so deleting it would delete the description of what they do."),
-    ("eval", "evaluate"): (
-        "ACCEPTED GAP, closed on a branch: `gate` applies thresholds to "
-        "evaluation/report.json and nothing writes that report (#57). The EvalGenerate "
-        "state exists on fix/eval-generate-dispatch (PR #33) and not on main. Kept here so "
-        "the guard runs at all until that merges -- an entry that has to be REMOVED to go "
-        "green is a to-do the test itself enforces."),
     ("orchestrator", "plan"): (
         "BY DESIGN, subsumed by `consult`: a run plan is what a consultation PRODUCES, and "
         "the console dispatches the conversation, not the artifact. `plan` remains declared "
         "as the contract for the plan JSON that both `consult` and conductor_tools' "
         "launch_run servicing read, so it describes a shape rather than a turn."),
-    ("orchestrator", "triage"): (
-        "ACCEPTED GAP, closed on a branch: an EscalatedToHuman rule on the llmops-pipeline "
-        "bus dispatches it, and that bus had ZERO rules (#59). The rule exists on "
-        "feat/route-escalations-to-conductor (PR #35) and not on main -- which is exactly "
-        "why the driver's page_human servicing (#54) sat unreachable."),
     ("orchestrator", "report"): (
         "ACCEPTED GAP. A cross-run rollup nothing invokes: the conductor has a "
         "`write_report` tool it can call mid-turn, but no caller ever dispatches the report "

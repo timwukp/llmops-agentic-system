@@ -12,10 +12,21 @@ dry-runs), then create-or-updates:
   llmops-lambda-start          <- iam/lambda_roles.json roles.start
   llmops-lambda-resume         <- iam/lambda_roles.json roles.resume
   llmops-lambda-webhook        <- iam/lambda_roles.json roles.webhook
+  llmops-lambda-resurrector       <- iam/lambda_roles.json roles.resurrector
+  llmops-lambda-monitor_sweep     <- iam/lambda_roles.json roles.monitor_sweep
+  llmops-lambda-finops_reconcile  <- iam/lambda_roles.json roles.finops_reconcile
   llmops-sfn-execution         <- iam/sfn_execution_role.json (the state machine itself)
+
+(This list is prose; ROLE_NAMES below is derived from iam/ and is the authoritative set.)
 
 Each role gets one inline policy named `llmops-permissions` and tag project=llmops-agentic-system.
 Role ARNs are published to SSM under /llmops/iam/<role>_arn for the later deploy steps.
+
+SINGLE-REGION. The role names are global constants but their policies embed <REGION>, so
+deploying a second region into the same account would replace each inline policy and strip
+the first region's ARNs. A `llmops:region` tag records the owner and a pre-flight refuses
+such a deploy (exit 2) rather than half-applying it; --force-region-takeover overrides and
+breaks the other region. Real multi-region needs distinct role names, not this script.
 
 BYO-memory statements in the harness role are dropped unless --memory-id is given
 (deploy/wire_memory.py re-grants them per-Memory after the shared memory exists).
@@ -39,6 +50,23 @@ import boto3
 TAG_KEY, TAG_VAL = "project", "llmops-agentic-system"
 IAM_DIR = Path(__file__).resolve().parent / "iam"
 INLINE_POLICY_NAME = "llmops-permissions"
+
+#: Role tag recording which region's ARNs the inline policy was built for.
+#
+# IAM is GLOBAL and these role names are constants, but the policies are not global:
+# 71 resource ARNs across deploy/iam/*.json carry <REGION>. put_role_policy REPLACES
+# by name, so running this script for a second region rewrote every role's policy with
+# region-2 ARNs and silently stripped region 1's permissions -- an outage in a running
+# deployment, reported as a successful deploy, with the diff scrolling past as ordinary
+# "update" output.
+#
+# The tempting fix -- one inline policy per region -- cannot work: IAM caps the
+# AGGREGATE inline policy size for a role at 10,240 characters and the harness policy
+# alone substitutes to ~7.4k, so two regions do not fit on one role at all. Genuine
+# multi-region therefore needs distinct role NAMES (the --name-prefix work, P3 in the
+# audit), which is a larger change than this script. Until then the honest behaviour is
+# to refuse: a deploy that would take a role away from another region stops and says so.
+REGION_TAG_KEY = "llmops:region"
 
 
 def load_doc(name):
@@ -104,6 +132,13 @@ def build_role_specs(mapping, memory_id):
     return specs
 
 
+#: Every role this script provisions. Derived by building the specs with an empty
+#: substitution map (substitute() is the identity for an empty mapping), so a role added
+#: to deploy/iam/ is covered by the region-conflict pre-flight automatically instead of
+#: being quietly skipped by a hand-maintained list that nobody remembers to extend.
+ROLE_NAMES = tuple(build_role_specs({}, None))
+
+
 def get_existing(iam, role_name):
     """Best-effort read of the current role state; None means 'absent or unreadable'."""
     try:
@@ -116,6 +151,42 @@ def get_existing(iam, role_name):
     except Exception:
         pol = None
     return trust, pol
+
+
+def role_region(iam, role_name):
+    """The region this role's inline policy was last built for, or None if unknown.
+
+    None covers three cases that all mean "do not block": the role does not exist, it
+    predates this tag, or we cannot read it. Only a tag that names a DIFFERENT region is
+    evidence of a conflict, so an unreadable role never blocks a first deploy.
+    """
+    try:
+        tags = iam.get_role(RoleName=role_name)["Role"].get("Tags", [])
+    except Exception:
+        return None
+    for t in tags:
+        if t["Key"] == REGION_TAG_KEY:
+            return t["Value"]
+    return None
+
+
+def find_region_conflicts(iam, role_names, region):
+    """[(role, other_region)] for roles already built for a region that is not this one.
+
+    A pre-flight over EVERY role, run before the first write. Checking inside the
+    per-role loop would be too late to help: by the time role 7 raised the alarm,
+    put_role_policy would already have replaced roles 1-6 and taken those permissions
+    away from the other region -- the exact outage the check exists to prevent, now
+    half-committed and with no record of what the previous documents were.
+    """
+    if iam is None:
+        return []
+    out = []
+    for name in role_names:
+        other = role_region(iam, name)
+        if other and other != region:
+            out.append((name, other))
+    return out
 
 
 def show_diff(label, current, desired):
@@ -131,7 +202,7 @@ def show_diff(label, current, desired):
     return True
 
 
-def ensure_role(iam, name, spec, dry):
+def ensure_role(iam, name, spec, dry, region):
     trust_now, policy_now = get_existing(iam, name) if iam else (None, None)
     action = "update" if trust_now is not None else "create"
     print(f"  [{action}] role {name}")
@@ -145,14 +216,22 @@ def ensure_role(iam, name, spec, dry):
             RoleName=name,
             AssumeRolePolicyDocument=json.dumps(spec["trust"]),
             Description=f"{TAG_VAL} least-privilege role (managed by deploy/01_iam.py)",
-            Tags=[{"Key": TAG_KEY, "Value": TAG_VAL}],
+            Tags=[{"Key": TAG_KEY, "Value": TAG_VAL},
+                  {"Key": REGION_TAG_KEY, "Value": region}],
         )
         iam.get_waiter("role_exists").wait(RoleName=name)
     elif json.dumps(trust_now, sort_keys=True) != json.dumps(spec["trust"], sort_keys=True):
         iam.update_assume_role_policy(RoleName=name, PolicyDocument=json.dumps(spec["trust"]))
     iam.put_role_policy(RoleName=name, PolicyName=INLINE_POLICY_NAME,
                         PolicyDocument=json.dumps(spec["policy"]))
-    iam.tag_role(RoleName=name, Tags=[{"Key": TAG_KEY, "Value": TAG_VAL}])
+    # Stamped AFTER the policy, never before. If the policy write fails the tag must
+    # still name whoever owns the document that is actually attached: a tag claiming a
+    # region whose statements never landed would block that region's own redeploy while
+    # leaving the other region's permissions in place -- refusing the one deploy that
+    # would have fixed things. This order fails the harmless way instead: the tag lags,
+    # and the owning region's next run corrects it.
+    iam.tag_role(RoleName=name, Tags=[{"Key": TAG_KEY, "Value": TAG_VAL},
+                                      {"Key": REGION_TAG_KEY, "Value": region}])
     return changed
 
 
@@ -163,6 +242,10 @@ def main():
     ap.add_argument("--bucket", help="data bucket name (default llmops-agentic-<acct>-<region>)")
     ap.add_argument("--memory-id", help="BYO AgentCore Memory id; omit until wire_memory.py runs")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--force-region-takeover", action="store_true",
+                    help="deploy even though the roles belong to another region — this "
+                         "STRIPS that region's permissions and breaks its running "
+                         "deployment; only correct when that region is already gone")
     args = ap.parse_args()
 
     account_id = args.account_id
@@ -192,9 +275,31 @@ def main():
 
     print(f"{'DRY-RUN — ' if args.dry_run else ''}region={args.region} "
           f"bucket={bucket} roles={len(specs)}")
+
+    conflicts = find_region_conflicts(iam, list(specs), args.region)
+    if conflicts and args.force_region_takeover:
+        for name, other in conflicts:
+            print(f"  [takeover] {name}: was {other}, now {args.region} — "
+                  f"{other}'s permissions are being removed")
+        conflicts = []
+    if conflicts:
+        print(f"\nREFUSING: these roles are global and currently carry {args.region}-"
+              "incompatible policies built for another region:\n", file=sys.stderr)
+        for name, other in conflicts:
+            print(f"  {name}: built for {other}", file=sys.stderr)
+        print(f"\nDeploying {args.region} would replace the inline policy on each and "
+              f"strip every {conflicts[0][1]} ARN from it, breaking that deployment "
+              "with no warning. Two regions cannot share one role: IAM caps a role's "
+              "total inline policy at 10,240 chars and the harness policy alone is "
+              "~7.4k, so per-region policy names do not fit either. Run distinct role "
+              f"names per region, or tear down {conflicts[0][1]} first "
+              f"(--force-region-takeover overrides, and WILL break {conflicts[0][1]}).",
+              file=sys.stderr)
+        return 2
+
     any_change = False
     for name, spec in specs.items():
-        any_change |= ensure_role(iam, name, spec, args.dry_run)
+        any_change |= ensure_role(iam, name, spec, args.dry_run, args.region)
 
     if not args.dry_run:
         ssm = boto3.client("ssm", region_name=args.region)

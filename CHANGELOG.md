@@ -5,6 +5,423 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
 ## [Unreleased]
 
+### A "full" run never opened the customer's data — `generate` invented a corpus from `params.domain`
+
+The sixth instance of "two correct halves, never connected", and the one that would have
+been demonstrated to a customer as a success. In `pipeline_mode: "full"` the state machine
+starts at `DataPrepGenerate`, whose prompt said *"produce seed prompts per
+llm-prompt-engineering self-instruct patterns for the domain in params.domain"* and **never
+mentioned `params.source_uri`**. The only task in any of the seven prompts that read
+`source_uri` was data-prep's `audit`, and `DataAudit`'s only `Next` is `Complete`. So the
+mode that reads the customer's data cannot train, and the mode that trains cannot read the
+customer's data.
+
+`start_pipeline._plan_params` already flattened `plan.data.source_uri` into `params`
+correctly — that was bug #21's cure. The param **arrived and nothing consumed it**, which is
+why no error was ever raised: a customer signs *"fine-tune on my 300 tickets"*, the run
+trains on 300 teacher-invented samples generated from the domain **string**, and the
+manifest, the curated corpus, the eval report and the cost report all agree with each other
+and with the plan. There is no artifact a reviewer could open that would look wrong.
+
+`params.customer_eval_uri` had the same shape one stage later: the eval prompt scored the
+10% val split from `curated.jsonl` unconditionally, so a gate the plan anchored to the
+customer's acceptance set actually measured agreement with the **teacher** on rows the
+customer never chose.
+
+Fixed at the prompt layer, which is where the defect is — no ASL change, so no new state to
+deploy:
+
+- data-prep **`generate`** now decides its source FIRST: if `params.source_uri` is present,
+  *the customer's own data is the corpus and it is not yours to replace* — read it, validate
+  schema and row count against `params.sample_count`, and invoke the teacher only to fill a
+  field the rows lack or to top up to the count the plan priced, recording customer-vs-teacher
+  row provenance in the manifest. An unreadable or unparseable `source_uri` is
+  `escalate_human`, **not a licence to self-instruct**. Self-instruction is now conditioned on
+  the param being **absent entirely**, and a synthetic corpus must say so in the manifest.
+- data-prep **`curate`** drops any training row that appears in `params.customer_eval_uri` and
+  reports the count. Training on the rows the gate is scored against produces a passing gate
+  that means nothing, and it is not detectable downstream — the report simply looks good.
+- **eval** anchors the gate to `params.customer_eval_uri` when the plan names one, comparing
+  the student against the reference answers *in that file* rather than against the teacher,
+  and falls back to the val split **only** when no customer set was named — stating in the
+  report which set was used, since a score whose evaluation set is unstated cannot be
+  compared to the next run.
+
+Guarded by four derived tests (`TestTheCustomersOwnDataIsActuallyRead`) that scrape the
+per-task bullets out of the prompts rather than restating them, and intersect the readers
+with what the **full** path actually dispatches — a file-level grep for `source_uri` was
+green throughout this bug's life, and so was "some dispatched task reads it", because `audit`
+satisfied both. Precedence is asserted separately from presence: a prompt that names the
+param while still leading with *"produce seed prompts"* leaves the choice to the model, and
+guessing wrong is invisible. Five negative controls (m186–m189) restore the pre-cure prompt,
+demote the customer branch below self-instruction without deleting a word, revert eval to the
+val split, and strip the fallback ranking; each was watched to fail the named guard.
+
+### No stage could read what the stage before it produced — the manifest's `stages` block was never written
+
+The fifth instance of "two correct halves, never connected", and the first where the lost
+information is not a signature but **a fact the run itself produced**. Every specialist
+prompt calls the S3 manifest *"the single source of truth"* and is told to *"read it first,
+append your results to it"*. The driver assembled each finished stage's results into
+`manifest["stages"][stage]` — status, outputs, metrics, evidence — handed that dict to
+`write_run_report`, and **dropped it**. It had no `put_object` for the manifest at all.
+
+Measured, by driving the real driver: after a deploy stage reported
+`metrics.endpoint_name=llmops-student-run-1`, `manifest.stages` was still `{}`. The run
+*report* carried every output and metric. So the write reached the document **humans** read
+and not the one **agents** read.
+
+That is worse than a stale field, and it is the reason it blocks autonomy:
+
+- `params.student_endpoint` is read by eval (*"a live endpoint in params.student_endpoint"*)
+  and by monitor (*"name in the manifest or params.student_endpoint"*), and was written by
+  **nothing** — not the console, not start-pipeline, not the driver. An endpoint name does
+  not exist until the deploy stage creates one, so **no plan can be signed with it and no
+  default can stand in for it**. `models.student.endpoint_name` exists in
+  `manifest.schema.json` and nothing has ever written that either.
+- finetune's *analyze* task is told to diagnose a failed run from artifacts the manifest does
+  not list.
+- **An agent asked to reflect on a run had only its own turn to reflect on.** A pipeline
+  whose stages cannot read each other's results cannot iterate on a run; it can only redo it.
+
+Fixed in two halves, because the bug was in both. **Producer:** `_save_manifest` persists the
+stage results — read-modify-write, not a blind put, because the driver is the *second*
+writer (5 of the 7 prompts tell the agent to append to this same object, and
+`S3PipelineObjects` grants the harness role `PutObject` on `runs/*`), and narrowed to
+`stages` alone, because a driver that can rewrite `models`/`plan`/`approval`/`params` is
+exactly the defect bugs #9/#20/#21 each were — see `IMMUTABLE_MANIFEST_KEYS`. An absent
+manifest is **refused and reported**, never manufactured: a stages-only document would read
+downstream as a run nobody planned. **Consumer:** `STAGE_FACT_PARAMS` carries a prior stage's
+reported facts into later stages under the names the prompts already read, mirroring
+`MODEL_PARAM_FOR_ROLE`. Absent facts are omitted, never guessed — a CloudWatch metric
+attributed to the wrong endpoint is worse than a missing one, because it reads as evidence.
+
+S3 has no compare-and-swap, so the write is *narrowed* rather than atomic: the ASL is fully
+serial (no `Parallel`/`Map` states), so two stages never complete at once, and the remaining
+window is one stage's agent writing between the driver's read and its put.
+
+**6 new guards, 6 controls (m180–m185), 9 pairs.** The generalising one is
+`test_every_param_a_prompt_reads_has_something_that_writes_it`: it enumerates all 25
+`params.X` the 7 prompts read and pins each to the mechanism that supplies it, so instance #6
+of this shape fails in the suite instead of in a run nobody can explain. Its first version
+was **load-bearing on exactly one param** — it let "a plan is *permitted* to carry it"
+count as a writer, which `student_endpoint` satisfies vacuously; being permitted to carry a
+field is not the same as anything writing it. Two controls also had to be corrected rather
+than the guards they named: m180 named a test that drives `_run_stage` against a manifest
+already holding `stages` (it reads the forwarding, not the write-back), and m183 mutates the
+wiring while the derived guard reads the *declaration* — so the declaration got its own
+control, m185. Same lesson as bug #21's two escapes: **before writing a control, ask which
+observable value the mutation moves.**
+
+Two suspects from bug #21's list are **withdrawn, not fixed**: `sweep_uri` is written by
+`monitor_sweep/handler.py:96` and `variance_threshold_pct` by `finops_reconcile`. And
+`params.budget_usd` is **not** a bug of this class — the consult prompt calls it advisory and
+explicitly optional (*"compare it to params.budget_usd if given"*), no structured field
+captures it, and the customer states it in prose. Absence is the designed behaviour there.
+
+### A signed plan's instances, sample counts and gates were dropped; ARC defaults ran instead
+
+Bug #9 cured model consent being overridden. Bug #20 cured the *name* model consent is
+written under. **Both left every other field of the plan behind**: `seed_manifest` consulted
+`plan` for models and nothing else, and merged the rest as
+`{**DEFAULT_PARAMS, **params}` — so ARC-shaped defaults silently took the place of what a
+human signed. Measured, on a signed industrial-defect plan (the customer-facing shape this
+platform exists for):
+
+- Priced on `ml.p4d.24xlarge` with 40 000 samples and a `{"map50": 0.75}` gate; the run
+  executed on `ml.g5.2xlarge` with 2 000 samples and ARC's `relative_solve_rate` gate.
+  **Eight fields silently replaced, and `domain` dropped entirely.**
+- `plan.data.{source_uri, customer_eval_uri}` never reached the flat `params` that
+  data-prep's *audit* task reads, so an audit run arrived **with no data URI at all** — and
+  its prompt correctly forbids guessing one. Two correct halves, never connected: the
+  fourth instance of this codebase's recurring shape.
+- **`pipeline_mode: data_audit` was dropped**, and the ASL's `StartAt` Choice reads that key
+  from the *execution input* with `Default: DataPrepGenerate`. A customer who bought a cheap
+  data audit got GPUs provisioned.
+- **The console — the only path a customer has to sign a plan — forwarded no `plan` at
+  all.** Approve→launch scraped the stored estimate for `task_count` and `sample_count`, so
+  every other field the estimator *priced* died between the estimate record and the run.
+- Consumer half: the eval agent's gate task named its own bar (*"student judge-score >= 0.80
+  x teacher score"*) and never read `params.gates`. A detector run would have been judged on
+  ARC's metric. **A gate is the one place "the agent used its judgment" is unacceptable,
+  because the gate is what the signature is FOR.**
+
+What makes this class expensive is that it is **unobservable afterwards**: the variance
+report joins the estimate record to the run's actuals and reports the gap as an
+*underspend*, not as two different runs. Every artifact agrees.
+
+Fixed. `PLAN_META_KEYS` names the keys that are *about* a plan (prose, price, authorship);
+**everything else in a signed plan is a stage setting and reaches `params`**. A denylist,
+not an allowlist, and the direction is the whole point: an allowlist omits the field nobody
+thought of, and the omission is invisible because a default takes its place — which is
+exactly how `pipeline_mode`, `training_instance` and `gates` came to be dropped. A plan field
+a future orchestrator writes now arrives by default and must be *named* to be excluded, so
+the failure mode is a stage ignoring a field rather than a run executing settings no human
+chose. `_plan_params` flattens the nested `data` block one level out with `setdefault`, so an
+explicit top-level key still wins — a silent overwrite there would be the same defect one
+layer in. `_merge_params` takes its precedence and its refusal straight from
+`_resolve_models`: `DEFAULT_PARAMS < params < signed plan`, and a plan/params
+**disagreement is refused** naming the field and both values, because a disagreement means
+the approval path and the dispatch path describe different spends. The conflict check runs
+against the *flattened* plan, so contradicting `data.source_uri` refuses too.
+
+The console now forwards the priced plan verbatim. Three prompts stopped naming values they
+had memorised: eval gates on `params.gates` (a metric named but missing is a **failed** gate;
+`params.gates` absent entirely escalates to a human, because an unnamed bar is a missing
+approval), and finetune/deploy read `params.training_instance` / `params.inference_instance`
+— *the instance the run was PRICED on* — and must say which they chose and why when the param
+is absent, rather than defaulting silently to one they have used before.
+
+This **subsumes** the separately-flagged genericity item "DEFAULT_PARAMS hardcodes
+`arc-agi-2`". Those defaults were never the problem; a plan being unable to displace them
+was. `dataset: arc-agi-2`, `keep_reasoning` and the `relative_solve_rate` / `format_validity`
+gates are harmless as the fallback for a run nobody planned, and they now lose to any plan
+that names a COCO dataset and a `map50` gate.
+
+9 new guards. **10 controls registered (m171–m179 incl. m178b), 10 caught, 13 pairs.** Two
+of them exist only because they escaped the runner first, and both were the *control's* fault
+rather than the guard's: a mutation swapping `params` and the plan in the merge order is
+**unobservable** — the conflict gate above it has already proven every shared key equal, so
+both orders are the same dict by construction — and it was replaced with the precedence that
+*can* be subverted, the gate's own reach over nested fields. The other read `start_run`'s
+source text for `payload["plan"] =`, which passes against an `if False:` wrapped around the
+block; the catch had to become a test that inspects the payload the Lambda client was
+actually handed.
+
+### One model had four names, so a run was priced as Fable 5 and executed on DeepSeek-R1
+
+A plan is **priced** by `cost_model.py`, **resolved** by `start_pipeline`, and **executed**
+by the driver. All three named the model differently, and every artifact agreed with itself:
+
+- **The console is the only path a customer has to sign a plan, and its field name was not
+  the one consent was read from.** `create_estimate`'s `STR_KEYS`
+  (`deploy/console/lambda_function.py:1545`) posts `plan.teacher_model`, and `cost_model.py`
+  prices the teacher line from `plan.teacher_model` **or** `plan.models.teacher`.
+  `_resolve_models` matched **only** `plan.models.teacher`. So a console-signed plan
+  arrived with `models` absent, which reads as *"the plan is silent about the teacher"*,
+  fell through to `DEFAULT_MODELS`, and produced `manifest.models.teacher =
+  us.deepseek.r1-v1:0` for a plan signed for `global.anthropic.claude-fable-5` — measured.
+  **A consent check that reads a different field name than the consent is written under is
+  not a check.** This is bug #9's class reintroduced through a *name* rather than a
+  precedence rule.
+- **A mirrored, licence-checked model that filled no role trained nothing.** The conductor
+  prompt has the orchestrator write `{hf_repo, revision, files_sha256, license,
+  mirror_uri}` for any open-weight model — the block where the licence was read and the
+  bytes were pinned. A plan mirroring `meta-llama/Llama-3.2-1B` and assigning it to no role
+  produced `manifest.student = Qwen/Qwen3-1.7B`: the run trains on a model nobody cleared
+  while the cleared one sits unused in the mirror.
+- **The resolver was correct and nothing consumed it.** Every prompt reads
+  `params.teacher_model_id` / `params.student_model_id`; **nothing ever wrote them**, and no
+  prompt mentions `manifest.models` at all. So agents read an absent param and fell back to
+  the only model id in front of them — the one hardcoded in their own persona line
+  (*"teacher DeepSeek-R1 on Bedrock → student Qwen3-1.7B"*). Boilerplate standing in for
+  consent. **"Two correct halves, never connected" is this codebase's third instance of the
+  same bug shape** (bug #18's `want_interface`, bug #20's resolver/consumer split).
+
+Fixed. `ROLE_ALIASES` accepts every spelling of a role on **read** and normalises to one
+role name — accepted rather than declared illegal, because three of the four names sit in
+signed artifacts on S3 that cannot be rewritten, and a plan a human signed last week must
+still dispatch as the model they approved. A role named twice with two different ids is
+**refused**, not resolved by precedence: one document contradicting itself is not a case
+where any reading is defensible. A `models` key that is neither a role nor a provenance key
+is refused, so `teachr` costs one visible error instead of a run — it used to mean silence.
+A mirrored repo assigned to no role is refused by name.
+
+Consumer half: `MODEL_PARAM_FOR_ROLE` + `model_params_from_manifest` in the driver inject
+the manifest's approved models into every stage payload under the param names the prompts
+already read. One extra S3 GET per stage (~10ms) rather than trusting the dispatch event,
+because the manifest is where the resolved consent was recorded. A caller-supplied value
+still wins — a remediation iteration may legitimately override — but it can no longer be
+the **default**. Roles the manifest is silent about are **omitted**, not defaulted: a stage
+that needs a teacher and finds no param must fail visibly, and a default there would
+recreate this bug one layer down.
+
+Six persona lines now say *"model customisation: a teacher model on Bedrock distils into a
+student model fine-tuned on SageMaker"* and state that **which** models is never theirs to
+assume. `deploy` no longer names Qwen3-1.7B as the merge target, and `finetune` now chooses
+its method from the model and data — QLoRA/LoRA SFT for a decoder LLM, **full fine-tuning
+for a small vision model such as a YOLO detector, where adapters do not apply** — and says
+which it chose and why. That is the platform goal made real in the prompts rather than
+asserted in a doc.
+
+12 new guards, all derived rather than restated: the console↔estimator↔dispatcher field
+names are cross-checked in **all three** directions, and cost_model's model fields are
+scraped from its own source and recognised **by the model id they default to**, not by
+their names.
+
+**25 negative controls registered (m146–m170), 25 caught, asserting 31 (guard, mutation)
+pairs.** Three of them exist because they escaped first:
+
+- A guard that intersected cost_model's field names with the dispatcher's own alias list
+  was **blind in exactly the direction the bug travels** — a renamed field simply drops out
+  of an intersection (m161, m163).
+- The mirror check was only ever tested against an *absent* role, so a near-miss
+  (`hf_repo: meta-llama/Llama-3.2-1B` with `student: meta-llama/Llama-3.1-70B` — different
+  model, different pinned revision, 70× the size) passed a publisher-substring match (m159).
+- The merge-order test **recomputed the merge in its own body**, and a merge order restated
+  in a test is satisfied by any order in the code. It now drives the real `_run_stage`.
+
+**And the mutation evidence for this fix was itself wrong once.** Running mutations by hand
+instead of through `tests/negative_controls/monitor_dispatch.py` reproduced the exact
+failure that runner's docstring has warned about since #58: CPython validates a `.pyc`
+against *(source mtime in whole seconds, source size)*, and `{**approved,
+**payload["params"]}` and `{**payload["params"], **approved}` are the same byte count — so a
+mutate-run-restore cycle inside one second ran the **mutated bytecode against the restored
+source** and reported a catch. Bug #18's and bug #19's controls had also only ever been
+hand-run; both are now registered here too (m146–m153), which is why the documented control
+count jumps by 31 rather than by this fix's own 23.
+
+### Five harnesses called the terminal exit a pause, and the turn-end rule sent blocked agents to it
+
+Audited as a design fork — *build a real `HumanGate` ASL state, or concede the platform has
+no human-in-the-loop pause*. **It is neither: measuring dissolved the fork.** The platform
+already has a working live pause, `checkpoint`, and the bug is that five tool descriptions
+pointed away from it:
+
+- **`escalate_human` is the terminal exit.** `handle_escalate` → `_mark_run_escalated` sets
+  the run `escalated` and `send_task_failure(error="EscalatedToHuman")` fails the state
+  machine task → `EscalateFail` → `MarkRunFailed` → `Fail`. `"escalated"` is the first
+  member of `UNREACHABLE_RUN_STATES`, so `put_directive` returns `reachable: False` and the
+  console tells the operator their verdict "CHANGES NOTHING". Five descriptions
+  (data-prep, deploy, eval, finetune, monitor) introduced it with **"The pipeline pauses"**.
+  Measured 5, not the audited 7: finops's description was already correct about authority,
+  and the orchestrator has no `escalate_human` at all.
+- **The TURN-END INVARIANT compounded it.** Six prompts ended their invariant bullet with
+  `"checkpoint to get another turn, escalate_human when blocked."` — so an agent blocked on
+  a decision a human *could* make was told, in the one rule it is asked to obey every turn,
+  to take the exit that guarantees the answer arrives too late.
+- **`checkpoint` was already the answer.** All 7 harnesses declare it, its description
+  already documents `{"status": "directive", ...}`, and it yields the turn while keeping the
+  run alive. Building a `HumanGate` state would have added a **second** pause mechanism
+  beside a working one — which is why the fix is wording, not architecture.
+
+Fixed: 5 `escalate_human` descriptions now say TERMINAL, name the consequence
+(`escalated` is unreachable, so a later verdict is audit-only), and point at `checkpoint`;
+finops's gained the same pointer while keeping its authority clause intact; 6 invariant
+bullets now route "blocked on a decision" to `checkpoint` and reserve `escalate_human` for
+"no human answer could let you continue". `docs/ARCHITECTURE.md` §3 + zh-TW twin: the
+`escalate_human` contract row now says **terminal** and states the unreachability, the
+`checkpoint` row is named as the platform's only live human-in-the-loop pause, and a new
+paragraph states the distinction in prose.
+
+The retrospective quoting *"The pipeline pauses"* lives here rather than in the prompts,
+because a description that quotes the phrase it forbids trips the guard that forbids it —
+the same self-reference trap the `02_network.py` cost guard hit. All 7 configs pass
+`validate_config.py`.
+
+3 new guards: `test_no_tool_description_calls_the_terminal_exit_a_pause` and
+`test_checkpoint_is_documented_as_the_directive_channel` (harness-derived),
+`test_the_docs_do_not_describe_escalation_as_a_pause` (doc tables, derived from the
+driver). All three read `UNREACHABLE_RUN_STATES` and **stand down** if escalation ever
+becomes recoverable, rather than pinning today's semantics as forever-true.
+**11 mutations applied, 11 caught** — plus one stand-down case verified.
+
+
+### `02_network.py` billed 11 interface endpoints for a consumer that does not exist, and halved its own cost note
+
+Audited as *"~$2.64/day is being spent on an unused VPC"*. **That premise is false, and
+measuring it first is what found the real defects**: `describe-vpcs` and
+`describe-vpc-endpoints` on `tag:project=llmops-agentic-system` in us-east-1 both return
+`[]` — nothing is deployed and $0/day is billed. Three real defects instead:
+
+- **The printed cost was exactly half.** The note computed
+  `0.01 × len(INTERFACE_SERVICES) × 24 = ~$2.64/day`, but AWS bills an interface endpoint
+  *"for each hour that your VPC endpoint remains provisioned in each Availability Zone"* —
+  `SubnetIds` creates **one endpoint network interface per subnet** and the ENI is the
+  billed unit (Pricing API `USE1-VpcEndpoint-Hours` = $0.01/hr, measured 2026-08-10).
+  `ensure_endpoints` passes both subnets, so every one of the 11 is billed twice:
+  **$5.28/day**, and $2.64 was the one-AZ answer. Now
+  `endpoint_cost_per_day(len(INTERFACE_SERVICES), len(subnet_ids))` — derived from both
+  lists, because a hardcoded total drifts silently on the twelfth service or the third AZ,
+  and a cost note that is wrong is worse than absent: it is the number someone budgets
+  against before leaving this up over a weekend.
+- **All 11 were provisioned for nobody, and the script printed a warm success.**
+  `agents/*/harness.prod.json` does not exist and never has, all 7 live configs are
+  `networkMode: PUBLIC`, `deploy/07_lambdas.py` contains `VpcConfig` **zero times**, and
+  `/llmops/network/*` is written at `02_network.py:201` and read by nothing.
+  `find_endpoint_consumers` reads the same files a deploy reads — not a hand-set flag,
+  which would be the same optimism the missing check already cost — so it goes green on its
+  own the day someone writes a VPC-mode harness. `--force-unused-endpoints` overrides for
+  anyone deliberately paying ahead of need.
+- **The gate is on the billing line, not on the script.** The VPC, both subnets, both
+  security groups, the gateway endpoints and the SSM parameters are free — and are exactly
+  what a `harness.prod.json` has to be written *against*. Refusing outright would make the
+  missing consumer unfixable. Exit stays **0**, unlike `01_iam.py`'s refusal-with-2: nothing
+  failed and nothing was half-applied. The signal is the stderr line plus
+  `interface_endpoints: false` in the JSON, which is what a caller can branch on — an exit
+  code cannot say *"built 6 of 7 things"*.
+
+`docs/ARCHITECTURE.md` §11 said *"the Lambdas can run **VPC-isolated with interface
+endpoints**"*. With no `VpcConfig` anywhere, that was a capability with **no deploy path** —
+the same failure mode as §9 item 3's model split, a design lever read back as a delivered
+feature, and here it was load-bearing on spend because it implied the consumer those 11
+endpoints were provisioned for. Corrected in both language twins, plus `README.md` +
+`.zh-TW`, `SECURITY.md`, `AGENTS.md`, `PROJECT_STATE.md` and `deploy/README.md` (run-order
+row and teardown note).
+
+7 new guards. `test_vpc_isolation_is_not_claimed_without_a_deploy_path` derives from
+`07_lambdas.py` and the prod configs, so it **inverts on its own** when the claim becomes
+true, and its second half requires the gap to be *stated* — deleting the paragraph does not
+pass it. `test_main_withholds_the_billed_endpoints_when_nothing_consumes_them` drives the
+real `main()`, added after mutating `want_interface = True` passed every other guard: two
+correct components wired together wrongly is the shape of the original bug, so the wiring
+needed its own test. 9 mutations applied, 9 caught.
+
+### An auth chokepoint keyed on the HTTP method left four customer reads anonymous
+
+`GET /api/tasks`, `GET /api/tasks/{id}`, and that thread's `/approval` and `/readiness`
+panels answered **200 to a caller with no credentials at all**, on a public API Gateway
+URL, for the platform's whole life. What they hand over is not operational fact:
+`/api/tasks/{id}` returns the entire DynamoDB item — the customer's transcript — and
+`/approval` returns `approved_by`, `cognito_sub` and `source_ip`, the identity fields the
+KMS signature exists to bind.
+
+The cause is one line: `if method == "POST": user = _authed_user(headers)`. So the property
+`docs/ARCHITECTURE.md` §13 boasted — *"adding a route cannot accidentally add an
+unauthenticated write"* — was **exactly true and exactly insufficient**. It says nothing
+about adding an unauthenticated *read of the customer plane*, which is how all four got
+there, and `tests/test_console_routes.py` derived four numbers from the router while asking
+only which **POSTs** were unauthenticated. §13's own table listed `/api/tasks` in the public
+read plane *and* in the "authed **and** group-checked" consult plane; the code agreed with
+the first one.
+
+- `deploy/console/lambda_function.py`: the gate is keyed on the **plane**, as a path prefix
+  (`_is_consult_path`, `CONSULT_PREFIX = "/api/tasks"`), and checks `_user_may_task` as well
+  as `_authed_user` — a valid token proves who you are, not that you may read someone's
+  engagement. Enumerating the four leaking routes would have closed the hole and left the
+  mechanism that produced it intact: the fifth panel added to a thread would arrive
+  anonymous the same way. `test_the_consult_gate_is_a_prefix_not_a_list_of_paths` pins the
+  shape, and a mutation replacing the prefix with today's four paths fails it.
+- 401 and 403 stay distinct. An operator provisioned only to watch the Pipeline tab holds a
+  perfectly valid token; telling them their session expired sends them round a re-login that
+  cannot help, and is not true.
+- `frontend.html`: the four reads go through a new `authGet()`, which reports refusal as
+  `{denied: reason}` so each panel names the wall it hit. The thread rail's empty state says
+  *"no consultations yet"* — a different fact from *"you are not signed in"*, and reassuring
+  when wrong. `authGet` never prompts: `loadTasks` polls every 15s, and a helper that called
+  `signIn()` would throw a password box at a signed-out operator four times a minute.
+- The repaint on session change lives in `setAuthUi`, the one place login, cookie restore,
+  expiry and sign-out all pass through — otherwise signing in while on the Tasks tab leaves
+  *"sign in to view consultations"* on screen and the fix reads as still broken. That
+  introduced a `loadTasks → authGet → restoreSession → setAuthUi` cycle that does **not**
+  bottom out for a first-time visitor (no cookie ⇒ `SESSION` stays null), so `RESTORE_TRIED`
+  bounds it to one attempt per page load; `clearSession` re-arms it (a dead 8-hour access
+  token must not cost the 30-day refresh cookie) and `signOut` latches it shut.
+- The operational read plane stays public **on purpose** and is pinned by a test:
+  `/api/overview` and friends are already-reconciled fact, all of it in the diagrams. The
+  reasoning that makes them public was read as a rule about *reads* rather than about
+  *operational fact*, and that misreading is the bug — a customer's conversation is neither.
+- Route shape restated everywhere from the router: **11 public GETs, 2 authenticated consult
+  GETs, 3 session POSTs, 14 authenticated POSTs** (30 handlers, unchanged). Both
+  `ARCHITECTURE` variants, `deploy/console/README.md`, and the §13 sentence that measured
+  `GET /api/tasks` as a live 200 — kept, and labelled as the artifact of the leak, because
+  the measurement was taken and written down as confirmation of a design that was about
+  POSTs.
+- 10 new guards (5 behavioural, driven through `handler()`; 5 structural). Six mutations
+  applied and all caught: gate emptied, group check dropped, prefix replaced by an
+  enumeration, frontend reverted to a raw `fetch`, a fifth consult read added above the
+  gate, and the gate emptied against the behavioural set alone.
+
 ### A page addressed to the conductor is an alert filed where nobody will look
 
 `triage_event_from_bus` has always passed the stuck run down as

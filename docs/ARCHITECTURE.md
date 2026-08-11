@@ -273,8 +273,8 @@ calls, which are the sole channel by which an agent affects the pipeline.
 |---|---|---|
 | `stage_complete` | stage done, here are outputs + metrics | **trust-but-verify**: `head_object` every claimed `s3://` output; missing outputs → the call is *rejected* back to the agent ("write them and call stage_complete again"). The driver — never the agent — writes the canonical run report. `outputs: []` is a legitimate success. |
 | `job_launched` | long job launched (SageMaker training) | launch-and-release: park the Step Functions task token in DynamoDB keyed by job name; release the session (§4) |
-| `checkpoint` | turn budget nearing, progress persisted | re-invoke the same session to continue (self-reinvoke if the Lambda itself is near its limit) |
-| `escalate_human` | out of budget or out of authority | SNS notification, run marked `escalated`, `EscalatedToHuman` event, task token failed |
+| `checkpoint` | turn budget nearing, progress persisted, **or blocked on a human decision** | re-invoke the same session to continue (self-reinvoke if the Lambda itself is near its limit). This is the platform's only **live** human-in-the-loop pause: the driver returns any parked `{"status": "directive", ...}` on the next turn, so a blocked agent keeps its run alive by checkpointing, not by escalating. |
+| `escalate_human` | out of budget or out of authority | **terminal**: SNS notification, run marked `escalated`, `EscalatedToHuman` event, task token failed → `EscalateFail` → `Fail`. `escalated` is in `UNREACHABLE_RUN_STATES`, so a directive sent afterwards is recorded for audit and reaches nobody. |
 
 Inside that contract, **which stage and task ran is the driver's fact, not the agent's.**
 Outputs, metrics and evidence are the agent's to report — nobody else knows them. `stage`
@@ -607,6 +607,18 @@ and the old default-True coercion *promoted a null to a pass*. The fix in the dr
   (0/16 twice, `closed_think_rate` 0%) and the verdict **stood** — it was not "fixed"
   into a pass. A gate you can talk your way past is not a gate.
 
+**`escalate_human` ends the run; `checkpoint` is the pause.** Five harness tool descriptions
+used to introduce `escalate_human` with *"The pipeline pauses"* — the exact opposite of what
+the driver does, and the TURN-END INVARIANT compounded it by naming `escalate_human` as the
+call "when blocked". An agent blocked on a decision a human could make would therefore reach
+for the one call that guarantees the human's answer arrives too late: `_mark_run_escalated`
+sets the run `escalated` and `send_task_failure(error="EscalatedToHuman")` fails the state
+machine task, and because `escalated` is an unreachable run state, `put_directive` returns
+`reachable: False` and the console tells the operator their verdict "CHANGES NOTHING".
+`checkpoint` is what they wanted: it yields the turn, keeps the run alive, and is the channel
+a directive is delivered on. Escalation is for the case where no human answer could let the
+stage continue.
+
 ## 8. The remediation loop (≤ 3 iterations)
 
 `QualityGateChoice` fail → `RemediationChoice`: while `iteration < 3`,
@@ -711,8 +723,28 @@ shorter deadline that no surface reports.
 ## 11. VPC posture for production
 
 Harness configs (`agents/*/harness.json`) run PUBLIC-network for iteration speed. The
-VPC itself is built by `deploy/02_network.py` and the Lambdas can run **VPC-isolated with
-interface endpoints — no internet egress**.
+free substrate — VPC, two private subnets with no IGW and no NAT, both security groups,
+the S3 and DynamoDB gateway endpoints — is built by `deploy/02_network.py`.
+
+This paragraph used to end "and the Lambdas can run **VPC-isolated with interface
+endpoints — no internet egress**". `deploy/07_lambdas.py` contains the string `VpcConfig`
+**zero times**, so that was a capability with no deploy path — the same failure mode as
+§9 item 3's model split, a design read back as a delivered feature. **Nothing in this repo
+routes through an interface endpoint today**: `agents/*/harness.prod.json` does not exist
+(let alone one with a non-`PUBLIC` `networkMode`), and `/llmops/network/*` is written by
+`02_network.py:201` and read by nothing.
+
+Which is why the 11 interface endpoints are the one thing that script now **skips by
+default**. They are also the only part of it that bills, and it used to print
+`0.01 × 11 × 24 = ~$2.64/day` while attaching every endpoint to *both* subnets — AWS
+bills an interface endpoint "for each hour that your VPC endpoint remains provisioned in
+each Availability Zone", because `SubnetIds` creates one endpoint network interface per
+subnet and the ENI is the billed unit. The real figure is **$5.28/day**, and $2.64 was
+the one-AZ answer. `endpoint_cost_per_day(len(INTERFACE_SERVICES), len(subnet_ids))`
+derives it from both lists so a twelfth service or a third AZ cannot silently make the
+printed number wrong again; `find_endpoint_consumers` reads the same files a deploy reads,
+so it goes green on its own the day someone writes a VPC-mode harness, and
+`--force-unused-endpoints` overrides it for anyone deliberately paying ahead of need.
 
 The skill sources have moved: all **19 skill sources across the 7 harnesses are `s3`
 sources today; none are `git`** — verified by
@@ -798,14 +830,27 @@ and no CDN**:
 plus the S3 origin the upload path needs. One artifact means the UI can never be a version
 out of step with the API it calls — the failure mode a separately-deployed SPA invites.
 
-Its design is three planes that deliberately do **not** share rules:
+Its design is four planes that deliberately do **not** share rules:
 
 | plane | handlers | rule |
 |---|---|---|
-| **read** | 13 GETs (`/api/overview`, `/api/pipeline`, `/api/run`, `/api/observability`, `/api/cost-overview`, `/api/tasks`, …) | public, aggregated server-side |
+| **read** | 11 GETs (`/api/overview`, `/api/pipeline`, `/api/run`, `/api/observability`, `/api/cost-overview`, …) | public, aggregated server-side |
 | **session** | 3 POSTs: `/api/login`, `/api/refresh`, `/api/refresh/revoke` | unauthenticated **by necessity** — these mint or revoke the credential |
 | **write** | 14 POSTs: `/api/start-run`, `/api/cost-approval*`, `/api/finops-run`, `/api/optimize*`, `/api/native-rec*`, `/api/batch-eval`, … | Cognito at one chokepoint |
-| **consult** | `/api/tasks`, `/api/tasks/{id}/{message,accept,close}`, `/api/data-upload-url` | authed **and** group-checked; the only plane that invokes an agent |
+| **consult** | everything under `/api/tasks`, **both methods** — 2 GET handlers (`/api/tasks`, `/api/tasks/{id}[/approval|/readiness]`) and the POSTs `/api/tasks/{id}/{message,accept,close}` plus `/api/data-upload-url` | authed **and** group-checked; the only plane that invokes an agent |
+
+An earlier version of this table listed `/api/tasks` in the read plane *and* in the consult
+plane, and the code agreed with the first one: four consult **reads** — the thread list, the
+thread itself, and its approval and readiness panels — were served anonymously on a public
+API Gateway URL for the platform's whole life. `GET /api/tasks/{id}` returns the whole
+DynamoDB item, which is the customer's transcript; `/approval` returns `approved_by`,
+`cognito_sub` and `source_ip`, the identity fields the KMS signature exists to bind. The
+cause was that the chokepoint was keyed on the **HTTP method** (`if method == "POST"`), so
+the property this section boasted — adding a route cannot accidentally add an
+unauthenticated *write* — was exactly true and exactly insufficient. The gate is now keyed
+on the **plane**, as a path prefix (`_is_consult_path`): enumerating the four leaking routes
+would have closed the hole and left the mechanism that produced it intact, so the fifth
+panel added to a thread would arrive anonymous the same way.
 
 **Every POST that acts on the platform is authenticated in exactly one place.** The router
 resolves `_authed_user(headers)` once, before dispatching any POST, and returns 401 on
@@ -814,8 +859,10 @@ a *user* rather than a boolean because two downstream checks need identity, not 
 authentication: the approver-group test, and the never-self-approve test that compares the
 approver's username to the requester's. Verified live, unauthenticated: `/api/tasks`,
 `/api/start-run`, `/api/cost-approval`, `/api/data-upload-url`, `/api/finops-run` and
-`/api/tasks/{id}/message` all return **401**, while `/api/overview`, `/api/tasks` and
-`/api/cost-overview` GET **200**.
+`/api/tasks/{id}/message` all return **401**, while `/api/overview` and `/api/cost-overview`
+GET **200**. `GET /api/tasks` was in the 200 list when this was measured; it is a 401 now, and
+that line is the artifact of the leak — the measurement was taken and written down as
+confirmation of the design, because the design being checked was the one about POSTs.
 
 **Three POSTs sit above that chokepoint, and naming them is part of the design.** `/api/login`
 mints a session; `/api/refresh` restores one from the httpOnly cookie after a page reload (the
@@ -828,11 +875,19 @@ all four numbers from the router and compares the pre-chokepoint set against an 
 allowlist, so a *fourth* unauthenticated POST fails the suite by name. A count alone would not
 have caught it: a new unauthenticated write that replaced a session route keeps the count.
 
-**Reads are public on purpose, writes never are.** Everything on the read plane is
-already-reconciled operational fact — what ran, what it scored, what it cost. Gating it would
-add friction to the thing an operator does fifty times a day while protecting nothing that
-isn't in the diagrams. Authority is a different question from visibility, so it attaches only
-to the writes.
+**Operational reads are public on purpose; customer reads never are.** Everything on the read
+plane is already-reconciled operational fact — what ran, what it scored, what it cost. Gating
+it would add friction to the thing an operator does fifty times a day while protecting nothing
+that isn't in the diagrams. Authority is a different question from visibility, so on that
+plane it attaches only to the writes.
+
+The consult plane is where that reasoning stops, and reading it as a rule about *reads* rather
+than about *operational fact* is what produced the leak above: a customer's conversation is
+neither reconciled nor operational, and it is not in any diagram. So the consult gate checks
+group membership too, not merely a valid token — otherwise any account provisioned to watch
+the Pipeline tab could read every engagement in the account. 401 and 403 stay distinct there
+for the same reason as on the write plane: telling an operator who is simply in the wrong
+group that their session expired sends them round a re-login that cannot help.
 
 **The cost gate is server-side, and advisory by configuration rather than by accident.**
 `APPROVAL_LIMIT_USD` (default 2000) and `BUDGET_MODE` (`advisory`, or `blocking`) live in the
@@ -854,6 +909,108 @@ the defect, because the decision a signature exists to settle was handed back to
 A disagreement is refused rather than silently resolved: it means the dispatch path and the
 approval path disagree about what was bought, and guessing buys an unapproved spend that looks
 authorized in every artifact afterward.
+
+**That was only half the fix, and the other half is why one model may be named several ways.**
+The precedence rule was right while the *field name* was wrong: the console form — the only
+path a customer has to sign a plan — posts `plan.teacher_model` and `cost_model.py` prices the
+run from it, while the resolver matched only `plan.models.teacher`. So a console-signed plan
+arrived with `models` absent, which reads as *"the plan is silent about the teacher"*, and fell
+through to the defaults: **priced as Fable 5, executed on DeepSeek-R1, with every artifact
+agreeing.** A consent check that reads a different field name than the consent is written under
+is not a check. `ROLE_ALIASES` therefore accepts every spelling of a role on **read** and
+normalises to one role name — accepted rather than declared illegal, because three of the four
+names sit in signed artifacts on S3 that cannot be rewritten, and a plan signed last week must
+still dispatch as the model it approved. A role named twice with two different ids is refused;
+so is a `models` key that is neither a role nor supply-chain provenance, because `teachr` used
+to mean silence and silence spends. And a mirrored open-weight repo — the block where the
+licence was read and the revision pinned — that is assigned to **no role** is refused by name:
+a plan mirroring `meta-llama/Llama-3.2-1B` produced `student = Qwen/Qwen3-1.7B`, training on a
+model nobody cleared while the cleared one sat unused in the mirror.
+
+**The resolved consent reaches the agent turn as stage params.** `_run_stage` reads
+`manifest.models` and injects the approved ids under the names the prompts already read
+(`params.teacher_model_id`, `params.student_model_id`, `params.judge_model_id`) — one extra S3
+GET per stage rather than trusting the dispatch event, because the manifest is where the
+consent was recorded. Nothing used to write those params, so agents read an absent value and
+fell back to the only model id in front of them: the one hardcoded in their own persona line.
+Boilerplate standing in for consent, which is why no prompt names a model any more. A
+caller-supplied value still wins — a remediation iteration may legitimately override — but it
+is no longer the default, and roles the manifest is silent about are **omitted** rather than
+defaulted, so a stage that needs a teacher and has none fails visibly instead of choosing one.
+
+**The same authority rule covers every OTHER field of the plan, which took two more fixes to
+learn.** The two above cured model consent and then the name it is written under, and both left
+the rest of the plan behind: `seed_manifest` consulted `plan` for models and merged everything
+else as `DEFAULT_PARAMS` overridden by `params` alone. So a signed industrial-defect plan priced
+on `ml.p4d.24xlarge` with 40 000 samples and a `{"map50": 0.75}` gate **executed** on
+`ml.g5.2xlarge` with 2 000 samples and ARC's `relative_solve_rate` gate; `pipeline_mode:
+data_audit` was dropped, so a customer who bought a cheap audit had GPUs provisioned by the
+`StartAt` Choice's `Default`; and the console's approve→launch forwarded no plan at all, having
+scraped it for two integers. None of it is visible afterwards — the variance report joins the
+estimate to the actuals and reads the gap as an **underspend** rather than as two different runs.
+
+`PLAN_META_KEYS` now names the keys that are *about* a plan (prose, price, authorship) and
+**every other field reaches `params`**. That is a denylist on purpose: an allowlist omits the
+field nobody thought of, and the omission is invisible because a default takes its place, which
+is precisely how `pipeline_mode` and `gates` went missing. A field a future orchestrator writes
+arrives by default and must be *named* to be excluded, so the failure mode is a stage ignoring a
+field rather than a run executing settings no human chose. The nested `data` block is flattened
+one level out — data-prep's audit task reads `params.source_uri` flat, and an audit dispatched
+from a signed plan used to arrive with no data URI at all — with an explicit top-level key still
+winning, since a silent overwrite there is the same defect one layer in. Precedence and refusal
+are the model rule verbatim: **`DEFAULT_PARAMS` < `params` < signed plan**, disagreements refused
+by name against the *flattened* plan. This is also what makes the platform generic: `dataset:
+arc-agi-2` and the `relative_solve_rate` / `format_validity` gates are fine as the fallback for
+a run nobody planned, and they now lose to a plan naming a COCO dataset and a `map50` gate.
+
+**Consumer half, again: a gate may not name its own bar.** The eval agent's gate task read
+*"student judge-score >= 0.80 x teacher score"* out of its own prompt, so a detector run would
+have been judged on ARC's metric. It reads `params.gates` now; a metric named there but missing
+from the report is a **failed** gate, and `params.gates` absent entirely escalates to a human,
+because an unnamed bar is a missing approval. Finetune and deploy likewise read
+`params.training_instance` / `params.inference_instance` — the instance the run was *priced* on —
+and must state which they chose and why when the param is absent.
+
+**A stage's results go back to S3, so the next stage can read them.** Every specialist prompt
+calls the manifest at `manifest_uri` *"the single source of truth"* and is told to read it first
+and append its own results — and for a long time there was nothing there to read. The driver
+assembled each finished stage's `{status, outputs, metrics, evidence}` into a local dict, handed
+it to `write_run_report`, and dropped it; it had no `put_object` for the manifest at all. So the
+run *report* carried every metric and the *manifest* carried none: `stages` was still `{}` after
+a deploy stage reported an `endpoint_name`. The write is a **read-modify-write narrowed to
+`stages`**, for two independent reasons. The driver is the *second* writer — `S3PipelineObjects`
+grants the harness role `PutObject` on `runs/*` and 5 of the 7 prompts tell the agent to append
+here — so a blind put would erase what the agent wrote during its own turn. And a driver that
+could rewrite `models` / `plan` / `approval` / `params` is exactly the defect bugs #9, #20 and
+#21 each were, so `IMMUTABLE_MANIFEST_KEYS` are taken from the copy on S3 and never from the
+driver's. An absent manifest is **refused and reported**, never manufactured: a stages-only
+document has no plan, no approval and no models, which reads downstream as a run nobody planned.
+The refusal degrades to a reported warning like the report write above it — the task token is the
+pipeline's only way to learn a paid-for stage succeeded, and nothing may withhold it.
+
+**The facts a run discovers travel like the consent it was signed with.** `MODEL_PARAM_FOR_ROLE`
+carries what a human *signed* into the stages that must obey it; `STAGE_FACT_PARAMS` carries what
+the run itself *produced* into the stages that must measure it. `params.student_endpoint` — read
+by eval and by monitor — is the case that named the pattern: an endpoint name does not exist
+until the deploy stage creates one, so no plan can be signed with it and no default can stand in
+for it, and it was written by nothing at all. It is read from the producing stage's own report in
+`stages`, never from `models`, because `models` is the record of model *consent* and the driver
+must not write it. Absent facts are **omitted, not defaulted** — a stage that needs the endpoint
+and finds no param must fail visibly, because a CloudWatch metric attributed to the wrong
+endpoint is worse than a missing one: it reads as evidence. This is also what a self-iterating
+pipeline needs to exist at all. An agent asked to diagnose a run used to have only its own turn
+to look at, and a pipeline whose stages cannot read each other's results cannot iterate on a run
+— it can only redo it.
+
+**Every param a prompt reads is pinned to the mechanism that writes it.** Bugs #20, #21 and #22
+were one shape found three times by hand, so the fourth is derived instead:
+`test_every_param_a_prompt_reads_has_something_that_writes_it` enumerates all 25 `params.X` the 7
+prompts read and classifies each as supplied by `DEFAULT_PARAMS`, a signed plan, the driver
+(`MODEL_PARAM_FOR_ROLE` or `STAGE_FACT_PARAMS`), or the dispatch event. A param appearing in a
+prompt with no entry fails, and an entry no prompt reads fails too — the second direction catches
+wiring that has gone dead. The dispatch category is the escape hatch, so it is short and every
+member must be a value that *cannot exist* before the invocation carries it, not merely one
+nobody has wired yet.
 
 **The Tasks tab is the only plane that talks to an agent**, and it is the customer-facing
 half of the product: one thread per engagement, where `llmops_orchestrator` runs its consult

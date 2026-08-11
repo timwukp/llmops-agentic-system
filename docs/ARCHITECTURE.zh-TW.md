@@ -233,8 +233,8 @@ Agent 不用自由文本「彙報」—— driver 只信任結構化的 inline-f
 |---|---|---|
 | `stage_complete` | 階段完成，附 outputs + metrics | **trust-but-verify**：對每個聲稱的 `s3://` 輸出做 `head_object`；缺失 → 呼叫被*駁回*給 agent（「寫出來再呼叫一次」）。規範報告由 driver —— 而非 agent —— 寫入。`outputs: []` 是合法的成功。 |
 | `job_launched` | 長作業已發起（SageMaker 訓練） | launch-and-release：把 Step Functions task token 按 job name 停放進 DynamoDB，釋放 session（§4） |
-| `checkpoint` | 回合預算將盡，進度已持久化 | 在同一 session 重新調用以繼續（Lambda 本身臨界時自我重調） |
-| `escalate_human` | 預算或權限耗盡 | SNS 通知、運行標記 `escalated`、發 `EscalatedToHuman` 事件、task token 置失敗 |
+| `checkpoint` | 回合預算將盡、進度已持久化，**或卡在需要人類決策** | 在同一 session 重新調用以繼續（Lambda 本身臨界時自我重調）。這是平台唯一**活著**的 human-in-the-loop 暫停：driver 會在下一回合把停放的 `{"status": "directive", ...}` 回傳給 agent，所以卡住的 agent 要靠 checkpoint 保住運行，而不是靠升級。 |
+| `escalate_human` | 預算或權限耗盡 | **終止**：SNS 通知、運行標記 `escalated`、發 `EscalatedToHuman` 事件、task token 置失敗 → `EscalateFail` → `Fail`。`escalated` 在 `UNREACHABLE_RUN_STATES` 裡，所以事後送出的 directive 只會被記錄供稽核，沒有人收得到。 |
 
 在這個契約裡，**跑的是哪個 stage、哪個 task，是 driver 的事實，不是 agent 的**。outputs、
 metrics、evidence 都該由 agent 回報 —— 沒有別人知道。`stage` 和 `task` 剛好相反：driver 自己
@@ -517,6 +517,15 @@ eval agent 發出 `gate_passed: null` + `needs_human: true`，而舊的 default-
   `closed_think_rate` 0%），而判決**站住了** —— 沒有被「修」成通過。
   能被說服放行的門檻不是門檻。
 
+**`escalate_human` 會結束運行；真正的暫停是 `checkpoint`。** 有五個 harness 的工具說明原本用
+*「The pipeline pauses」*（管線會暫停）介紹 `escalate_human` —— 與 driver 實際行為正好相反，而
+TURN-END INVARIANT 又把 `escalate_human` 寫成「卡住時」該呼叫的那個，等於雙重誤導。於是一個卡在
+人類可以回答的決策上的 agent，會去呼叫那個保證人類答案來不及生效的呼叫：`_mark_run_escalated`
+把運行標記為 `escalated`，`send_task_failure(error="EscalatedToHuman")` 讓狀態機任務失敗；又因為
+`escalated` 是不可達的運行狀態，`put_directive` 會回 `reachable: False`，console 也會告訴操作者
+他的裁決「CHANGES NOTHING」。他真正想要的是 `checkpoint`：讓出回合、保住運行，而且那才是
+directive 送達的通道。升級只留給「沒有任何人類答案能讓這個階段繼續」的情況。
+
 ## 8. 補救迴路（≤ 3 次迭代）
 
 `QualityGateChoice` 失敗 → `RemediationChoice`：只要 `iteration < 3`，就
@@ -606,9 +615,26 @@ Lambda 硬上限 **900 秒**，而 harness 回合預算（`timeoutSeconds`）是
 
 ## 11. 生產環境的 VPC 態勢
 
-harness 配置（`agents/*/harness.json`）走 PUBLIC 網絡以求迭代速度。VPC 本身由
-`deploy/02_network.py` 建立，Lambda 可以**在 VPC 內隔離運行，走 interface
-endpoints —— 無互聯網出口**。
+harness 配置（`agents/*/harness.json`）走 PUBLIC 網絡以求迭代速度。免費的底層設施 ——
+VPC、兩個沒有 IGW 也沒有 NAT 的私有子網、兩個 security group、S3 與 DynamoDB 的 gateway
+endpoints —— 由 `deploy/02_network.py` 建立。
+
+這一段原本結尾寫著「Lambda 可以**在 VPC 內隔離運行，走 interface endpoints —— 無互聯網
+出口**」。`deploy/07_lambdas.py` 裡 `VpcConfig` 這個字串出現**零次**，所以那是一個沒有部署
+路徑的能力聲明 —— 與 §9 第 3 項的模型分層是同一種失效模式：把設計槓桿當成已交付的功能來讀。
+**今天這個 repo 裡沒有任何東西會走 interface endpoint**：`agents/*/harness.prod.json` 一個
+都不存在（更不用說 `networkMode` 不是 `PUBLIC` 的），而 `/llmops/network/*` 由
+`02_network.py:201` 寫入、沒有任何東西讀取。
+
+正因如此，那 11 個 interface endpoint 現在是這個腳本**預設跳過**的唯一一項。它們也是整個
+腳本唯一會計費的部分，而它過去印出的是 `0.01 × 11 × 24 = ~$2.64/天`，卻同時把每個 endpoint
+都掛到**兩個**子網上 —— AWS 對 interface endpoint 的計費是「按你的 VPC endpoint 在**每一個
+可用區**中處於已配置狀態的每一小時」，因為 `SubnetIds` 會在每個子網各建立一個 endpoint
+network interface，而 ENI 才是計費單位。真實數字是 **$5.28/天**，$2.64 是單一可用區的答案。
+`endpoint_cost_per_day(len(INTERFACE_SERVICES), len(subnet_ids))` 從兩個列表推導出這個數字，
+所以第 12 個服務或第 3 個可用區不可能再讓印出來的數字悄悄變錯；`find_endpoint_consumers`
+讀的是部署本身會讀的那些檔案，所以哪天有人真的寫出 VPC 模式的 harness，它會自己轉綠；
+`--force-unused-endpoints` 則留給刻意提前付費的人覆寫。
 
 技能來源已經切換完成：目前 **7 個 harness 上的 19 個技能來源全部是 `s3`，沒有一個是 `git`** ——
 由 `tests/test_docs_claims.py::test_the_skill_source_claims_match_the_harness_configs`
@@ -680,22 +706,33 @@ Dashboard 是**單一個 Lambda**
 內嵌，頁面帶著 `CSP connect-src 'self'` 加上上傳路徑所需的 S3 origin。單一產物意味著 UI 永遠
 不可能比它呼叫的 API 舊一個版本 —— 那正是「前端後端分開部署」會招來的故障模式。
 
-它的設計是三個**刻意不共用規則**的平面：
+它的設計是四個**刻意不共用規則**的平面：
 
 | 平面 | handler | 規則 |
 |---|---|---|
-| **讀** | 13 條 GET（`/api/overview`、`/api/pipeline`、`/api/run`、`/api/observability`、`/api/cost-overview`、`/api/tasks`…） | 公開，伺服器端彙總 |
+| **讀** | 11 條 GET（`/api/overview`、`/api/pipeline`、`/api/run`、`/api/observability`、`/api/cost-overview`…） | 公開，伺服器端彙總 |
 | **session** | 3 條 POST：`/api/login`、`/api/refresh`、`/api/refresh/revoke` | **必然**未認證 —— 它們是產生／撤銷憑證的那三條 |
 | **寫** | 14 條 POST：`/api/start-run`、`/api/cost-approval*`、`/api/finops-run`、`/api/optimize*`、`/api/native-rec*`、`/api/batch-eval`… | 在單一關卡過 Cognito |
-| **諮詢** | `/api/tasks`、`/api/tasks/{id}/{message,accept,close}`、`/api/data-upload-url` | 需認證**並且**查群組；唯一會調用 agent 的平面 |
+| **諮詢** | `/api/tasks` 底下的**全部**路由、**兩種 method 都算** —— 2 個 GET handler（`/api/tasks`、`/api/tasks/{id}[/approval|/readiness]`）以及 POST `/api/tasks/{id}/{message,accept,close}` 與 `/api/data-upload-url` | 需認證**並且**查群組；唯一會調用 agent 的平面 |
+
+這張表的先前版本把 `/api/tasks` 同時列在讀平面**和**諮詢平面裡，而程式碼照的是第一個：四條諮詢
+**讀取** —— 討論串清單、討論串本身，以及它的核准紀錄與資料整備面板 —— 在一個公開的 API Gateway
+網址上，整個平台的生命期裡都是匿名可讀的。`GET /api/tasks/{id}` 回的是整個 DynamoDB item，也就是
+客戶的對話記錄；`/approval` 回的是 `approved_by`、`cognito_sub` 與 `source_ip`，正是 KMS 簽章
+存在的意義所要綁定的那幾個身分欄位。原因是那個關卡是掛在 **HTTP method** 上的
+（`if method == "POST"`），所以本節誇的那個性質 —— 新增一條路由不可能順手新增一個未認證的
+**寫入** —— 完全正確，也完全不夠。現在關卡改掛在**平面**上，用路徑前綴實作（`_is_consult_path`）：
+把那四條漏掉的路由逐一列舉，會補掉這個洞卻留下產生它的機制，於是討論串上新增的第五個面板會用
+一模一樣的方式再次匿名。
 
 **每一條會對平台動手的 POST，都在同一個地方被認證。** router 在派發任何 POST *之前* 解析一次
 `_authed_user(headers)`，失敗就回 401 —— 所以新增一條路由不可能順手新增一個未認證的寫入。
 它解析出來的是一個**使用者**而不是布林值，因為下游有兩個檢查需要身分而不只是「已認證」：
 approver 群組檢查，以及比對 approver 與 requester 帳號的「不得自我核准」檢查。未認證實測：
 `/api/tasks`、`/api/start-run`、`/api/cost-approval`、`/api/data-upload-url`、`/api/finops-run`
-與 `/api/tasks/{id}/message` 全部回 **401**；而 `/api/overview`、`/api/tasks`、
-`/api/cost-overview` 的 GET 回 **200**。
+與 `/api/tasks/{id}/message` 全部回 **401**；而 `/api/overview`、`/api/cost-overview` 的 GET
+回 **200**。當初實測時 `GET /api/tasks` 是列在那組 200 裡的；它現在是 401，而那一行正是這個漏洞
+留下的痕跡 —— 量測做了、也寫下來當成設計被證實的證據，因為被檢查的那個設計講的是 POST。
 
 **有三條 POST 在那個關卡之上，而把它們指名出來本身就是設計的一部分。** `/api/login` 產生
 session；`/api/refresh` 在頁面重載後用 httpOnly cookie 復原 session（**cookie 就是憑證**，
@@ -706,9 +743,15 @@ session；`/api/refresh` 在頁面重載後用 httpOnly cookie 復原 session（
 並把「關卡之上」那組拿去比對一份明確的白名單，所以**第四條**未認證的 POST 會以名字讓套件失敗。
 光靠數量抓不到：一條新的未認證寫入若替換掉一條 session 路由，數量是不變的。
 
-**讀是刻意公開的，寫永遠不是。** 讀平面上的一切都是已經對帳完的運維事實 —— 跑過什麼、
-評了幾分、花了多少。把它擋起來，只會給操作者一天要做五十次的動作加上摩擦，而保護不了任何
-架構圖裡沒有的東西。**權限**和**可見性**是兩個不同的問題，所以權限只掛在寫入上。
+**運維的讀是刻意公開的；客戶的讀永遠不是。** 讀平面上的一切都是已經對帳完的運維事實 ——
+跑過什麼、評了幾分、花了多少。把它擋起來，只會給操作者一天要做五十次的動作加上摩擦，而保護不了
+任何架構圖裡沒有的東西。**權限**和**可見性**是兩個不同的問題，所以在那個平面上，權限只掛在寫入上。
+
+諮詢平面正是這條推論失效的地方，而把它讀成一條關於「**讀取**」的規則、而不是關於「**運維事實**」
+的規則，就是上面那個漏洞的成因：客戶的對話既沒有對帳、也不是運維事實，而且不在任何一張架構圖裡。
+所以諮詢關卡除了 token 之外還會查群組 —— 否則任何一個只為了看 Pipeline 分頁而開的帳號，都能讀
+帳號裡的每一筆客戶委託。那裡的 401 與 403 也和寫平面一樣必須分開：跟一個只是群組不對的操作者說
+「你的 session 過期了」，是把他送進一個幫不上忙的重新登入迴圈。
 
 **成本閘門在伺服器端，而且「advisory」是配置出來的，不是漏掉的。** `APPROVAL_LIMIT_USD`
 （預設 2000）與 `BUDGET_MODE`（`advisory` 或 `blocking`）住在 Lambda 裡而不是 UI 裡：
@@ -728,6 +771,94 @@ stale boilerplate」。它選對了；但它「必須選」本身就是缺陷，
 決定定下來，結果卻被交還給模型。矛盾是被拒絕、而不是被安靜解決的：矛盾意味著派發路徑與核准
 路徑對「買了什麼」有不同認知，而猜測買到的是一次未經核准的支出，且此後在每一份 artifact 裡
 都看起來像獲得授權。
+
+**但那只修了一半，另一半正是「同一個模型可以有好幾個名字」的原因。** 優先順序規則是對的，
+錯的是**欄位名稱**：console 表單 —— 客戶唯一能簽署 plan 的路徑 —— 送出的是
+`plan.teacher_model`，`cost_model.py` 也是從它算價的，而 resolver 只比對
+`plan.models.teacher`。於是一份由 console 簽署的 plan 抵達時 `models` 是不存在的，這被讀成
+「plan 對 teacher 沒有表態」，然後落回 defaults：**按 Fable 5 定價、在 DeepSeek-R1 上執行，
+而每一份 artifact 都自我一致。** 一個「讀的欄位跟同意被寫入的欄位不是同一個」的同意檢查，
+不是檢查。因此 `ROLE_ALIASES` 在**讀取**時接受一個角色的所有拼法並正規化成單一角色名 ——
+是接受、而不是宣告非法，因為那四個名字裡有三個就寫在 S3 上已簽署、無法回頭改寫的 artifact
+裡，而上週被簽署的 plan 今天仍必須派發成它當初核准的那個模型。同一個角色被指名兩次卻是兩個
+不同 id 會被拒絕；`models` 裡既不是角色、也不是供應鏈來源的 key 同樣被拒絕，因為 `teachr`
+過去意味著「沒有表態」，而沒有表態會花錢。至於被鏡像的 open-weight repo —— 那個區塊正是
+licence 被讀過、revision 被釘住的地方 —— 若**沒有被指派給任何角色**，會被指名拒絕：一份鏡像
+`meta-llama/Llama-3.2-1B` 的 plan 產出了 `student = Qwen/Qwen3-1.7B`，訓練的是沒人核可過的
+模型，而被核可的那個閒置在鏡像裡。
+
+**被解析出來的同意，會以 stage params 抵達 agent 的那個回合。** `_run_stage` 讀
+`manifest.models`，並把核准過的 id 以 prompt 本來就在讀的名字注入
+（`params.teacher_model_id`、`params.student_model_id`、`params.judge_model_id`）—— 每個
+stage 多一次 S3 GET，而不是信任派發事件，因為 manifest 才是同意被記錄下來的地方。過去沒有
+任何東西會寫這些 param，所以 agent 讀到的是不存在的值，然後退回它眼前唯一的那個模型 id：寫死
+在它自己人物設定句裡的那一個。那是用樣板文字冒充同意 —— 這也是現在沒有任何 prompt 指名模型
+的原因。呼叫方明確給的值仍然勝出（一次補救迭代可以正當地覆寫），但它不再是預設值；而 manifest
+沒有表態的角色是被**省略**、不是被給預設值，所以一個需要 teacher 卻沒有 teacher 的 stage 會
+明確失敗，而不是自己挑一個。
+
+**同一條「以簽署的 plan 為權威」規則，適用於 plan 的每一個其他欄位 —— 而這件事又花了兩次修
+才學會。** 上面兩次修的是模型同意、以及同意被寫入的名字，兩次都把 plan 的其餘部分留在原地：
+`seed_manifest` 只為了 models 去讀 `plan`，其他全部按「`DEFAULT_PARAMS` 被 `params` 覆蓋」合併。
+於是一份按 `ml.p4d.24xlarge`、40 000 筆樣本、`{"map50": 0.75}` 閘門定價的工業瑕疵檢測 plan，
+**實際執行**在 `ml.g5.2xlarge`、2 000 筆樣本、ARC 的 `relative_solve_rate` 閘門上；
+`pipeline_mode: data_audit` 被丟掉，所以買的是一次便宜資料稽核的客戶，被 `StartAt` Choice 的
+`Default` 開了 GPU；而 console 的 approve→launch 根本沒轉送 plan——它只從裡面刮出兩個整數。
+這些事後全都看不見：variance 報告把 estimate 與實際支出對接起來，然後把落差讀成**少花了錢**，
+而不是讀成「這是兩個不同的 run」。
+
+現在 `PLAN_META_KEYS` 指名的是那些「關於 plan 本身」的 key（敘述、價格、作者），而**其餘每一個
+欄位都會抵達 `params`**。這是刻意採用黑名單：白名單一定會漏掉那個沒人想到的欄位，而且因為有
+預設值頂上，漏掉這件事是看不見的 —— `pipeline_mode` 與 `gates` 正是這樣不見的。未來某個
+orchestrator 新寫的欄位現在會預設抵達，要排除就必須被**指名**，所以失效模式變成「某個 stage
+忽略了一個欄位」，而不是「一個 run 安靜地執行了沒有人選過的設定」。巢狀的 `data` 區塊會被往外
+攤平一層 —— data-prep 的稽核任務讀的是攤平的 `params.source_uri`，而過去由簽署 plan 派發的稽核
+run 抵達時根本沒有任何資料 URI —— 且明確寫在頂層的 key 仍然勝出，因為在這裡安靜覆寫，就是同一個
+缺陷往裡走一層。優先順序與拒絕原封不動沿用模型那條規則：**`DEFAULT_PARAMS` < `params` < 被簽署
+的 plan**，矛盾一律指名拒絕，且比對的是**攤平後**的 plan。這也正是這個平台之所以通用的原因：
+`dataset: arc-agi-2` 與 `relative_solve_rate` / `format_validity` 閘門，作為「沒人規劃過的 run」
+的退路是沒問題的，而它們現在會輸給任何指名 COCO 資料集與 `map50` 閘門的 plan。
+
+**消費端那一半，又一次：閘門不可以自己指名標準。** eval agent 的閘門任務過去是從它自己的 prompt
+裡讀出「student judge-score >= 0.80 x teacher score」，所以一個偵測器 run 會被拿 ARC 的指標去判。
+現在它讀 `params.gates`；在那裡被指名、但報告裡沒有的指標，算**未通過**；而 `params.gates` 整個
+不存在時會升級給人，因為沒有被指名的標準，就是一份缺席的核准。finetune 與 deploy 同樣讀
+`params.training_instance` / `params.inference_instance` —— 也就是這個 run 當初**被定價**的機型
+—— 而在該 param 不存在時，必須說出自己選了哪一個、以及為什麼。
+
+**一個 stage 的結果會寫回 S3，下一個 stage 才讀得到。** 每一份專家 prompt 都稱 `manifest_uri`
+上的 manifest 是「唯一的事實來源」，並要求 agent 先讀它、再把自己的結果附加上去 —— 而過去很長
+一段時間，那裡根本沒有東西可讀。driver 把每個完成的 stage 的 `{status, outputs, metrics,
+evidence}` 組裝進一個區域變數，交給 `write_run_report`，然後就丟掉了；它對 manifest 完全沒有任何
+`put_object`。所以 run **報告**裡有每一個指標，**manifest** 裡一個都沒有：在 deploy stage 已經回報
+了 `endpoint_name` 之後，`stages` 還是 `{}`。這個寫入是**先讀後寫、且收窄到只寫 `stages`**，理由
+有兩個，彼此獨立。driver 是**第二個**寫入者 —— `S3PipelineObjects` 授予 harness role 對 `runs/*`
+的 `PutObject`，而 7 份 prompt 裡有 5 份要求 agent 附加在這裡 —— 所以盲目覆寫會抹掉 agent 在自己
+那一輪裡寫下的東西。而一個能改寫 `models` / `plan` / `approval` / `params` 的 driver，正是 bug
+#9、#20、#21 三次都是的那個缺陷，所以 `IMMUTABLE_MANIFEST_KEYS` 一律取自 S3 上的那份，絕不取自
+driver 手上的那份。manifest 不存在時是**拒絕並回報**，絕不憑空製造：一份只有 stages 的文件沒有
+plan、沒有核准、沒有 models，在下游讀起來就是「一個沒有人規劃過的 run」。這個拒絕會像它上面那個
+報告寫入一樣降級成一則被回報的警告 —— task token 是 pipeline 唯一能得知「一個已經付了錢的 stage
+成功了」的途徑，任何事情都不得扣住它。
+
+**一個 run 自己發現的事實，和它被簽署時的同意一樣會被傳遞下去。** `MODEL_PARAM_FOR_ROLE` 把人
+**簽署**的內容帶給必須服從它的 stage；`STAGE_FACT_PARAMS` 把 run 自己**產出**的內容帶給必須量測
+它的 stage。`params.student_endpoint` —— eval 與 monitor 都會讀 —— 就是命名這個模式的那個案例：
+endpoint 名稱在 deploy stage 建立它之前並不存在，所以沒有任何 plan 能事先簽下它，也沒有任何預設值
+能代替它，而它過去根本沒有任何東西在寫。它是從產出它的那個 stage 自己在 `stages` 裡的回報讀出來
+的，絕不從 `models` 讀，因為 `models` 是模型**同意**的紀錄，driver 不得寫它。缺席的事實是**省略，
+不是填預設** —— 一個需要 endpoint 卻找不到該 param 的 stage 必須明顯地失敗，因為一個被歸錯 endpoint
+的 CloudWatch 指標比缺少指標更糟：它讀起來像證據。這也正是一個能自我迭代的 pipeline 得以成立的前提。
+過去一個被要求診斷某個 run 的 agent，只有自己那一輪可以看；而一個各 stage 讀不到彼此結果的 pipeline
+無法對一個 run 進行迭代 —— 它只能重做一次。
+
+**每一個 prompt 會讀的 param，都被釘在那個真正寫它的機制上。** bug #20、#21、#22 是同一個形狀被
+手工找到三次，所以第四次改成推導出來的：
+`test_every_param_a_prompt_reads_has_something_that_writes_it` 枚舉 7 份 prompt 讀取的全部 25 個
+`params.X`，並把每一個分類為由 `DEFAULT_PARAMS`、被簽署的 plan、driver（`MODEL_PARAM_FOR_ROLE` 或
+`STAGE_FACT_PARAMS`）、或派發事件本身供給。一個出現在 prompt 裡卻沒有分類的 param 會失敗，一個沒有
+任何 prompt 讀取的分類項也會失敗 —— 後面這個方向抓的是已經變成死線路的接線。派發那一類是逃生門，
+所以它很短，且每一個成員都必須是在那次派發帶著它之前**不可能存在**的值，而不只是還沒有人接起來的值。
 
 **Tasks 平面是唯一會跟 agent 對話的平面**，也是這個產品面向客戶的那一半：一個 engagement
 一條 thread，`llmops_orchestrator` 在裡面跑它的諮詢協議，客戶透過**預簽名**的

@@ -460,10 +460,20 @@ const API = "";  // same-origin
 // /api/refresh) — script cannot touch it, so an XSS bug costs an attacker one 8-hour
 // access token rather than 30 days of re-issue. Read-only browsing needs no sign-in.
 let SESSION = null;
+//: Whether this page load has already tried the refresh cookie. See authGet.
+let RESTORE_TRIED = false;
 function authHeaders(){ return SESSION ? {"authorization": "Bearer "+SESSION.token} : {}; }
 function setAuthUi(){
   const b = $("loginBtn");
   if (b) b.textContent = SESSION ? ("admin · sign out") : "Sign in";
+  // Repaint the consult plane on every session transition, in the ONE place all four
+  // of them pass through (login, cookie restore, expiry, sign-out). loadTasks stops its
+  // own poll when it is refused, so without this an operator who signs in while looking
+  // at the Tasks tab keeps staring at "sign in to view consultations" — the fix would
+  // read as still broken — and one who signs out keeps a populated rail on screen.
+  if (typeof loadTasks === "function" && localStorage.getItem("adminTab") === "tasks") {
+    loadTasks();
+  }
 }
 // Two ways to lose a session, and they must NOT be the same function.
 // clearSession(): this access token is no longer usable (expired, or a 401 came back).
@@ -471,9 +481,15 @@ function setAuthUi(){
 // signOut(): the human asked to leave. Revoke server-side and drop the cookie.
 // Collapsing these would make an 8-hour token expiry destroy the 30-day session —
 // i.e. it would reintroduce the exact re-login-on-refresh bug this code fixes.
-function clearSession(){ SESSION = null; setAuthUi(); }
+// Re-arms the cookie attempt: this access token is dead but the 30-day refresh cookie is
+// probably fine, and that distinction is the whole reason these two functions are
+// separate. Latching it shut here would make an 8-hour expiry cost the 30-day session.
+function clearSession(){ SESSION = null; RESTORE_TRIED = false; setAuthUi(); }
 function signOut(){
   clearSession();
+  // ...but a human who signed out has no cookie to restore. Set after clearSession, which
+  // resets it: one doomed /api/refresh per sign-out is noise nobody needs to pay for.
+  RESTORE_TRIED = true;
   // Not awaited: the UI is already signed out, and a slow Cognito RevokeToken must not
   // make the button feel broken. The cookie is cleared by the response either way.
   fetch(API+"/api/refresh/revoke",{method:"POST",credentials:"same-origin"}).catch(()=>{});
@@ -511,6 +527,30 @@ async function ensureToken(){
   if (SESSION) return true;
   if (await restoreSession()) return true;  // cookie may still be good — no prompt
   return await signIn();
+}
+// GET on the consult plane: authenticated, and SILENT about it. Never calls signIn() —
+// loadTasks polls every 15s while the Tasks tab is open, and a helper that prompted
+// would throw a password box at a signed-out operator four times a minute. A silent
+// restoreSession is enough: the refresh cookie survives a reload, which is the case
+// this is for. Returns {denied:<reason>} so each caller can say WHICH wall it hit
+// in its own panel — an empty thread rail is indistinguishable from "no consultations
+// yet", which is the message it used to show while the real answer was "sign in".
+async function authGet(path){
+  if (SESSION && SESSION.exp && Date.now() > SESSION.exp) clearSession();
+  // restoreSession ends in setAuthUi, which repaints the Tasks tab, which calls back in
+  // here — and when the cookie is absent SESSION stays null, so the naive version
+  // recurses forever on exactly the case it exists to handle (a first-time visitor).
+  // One attempt per page: after it, "no session" is an answer, not a thing to retry.
+  if (!SESSION && !RESTORE_TRIED) { RESTORE_TRIED = true; await restoreSession(); }
+  if (!SESSION) return {denied:"sign in to view consultations"};
+  let resp;
+  try { resp = await fetch(API+path,{headers:authHeaders()}); }
+  catch(e){ return {denied:"network error: "+(e.message||String(e))}; }
+  if (resp.status===401) { clearSession(); return {denied:"session expired — sign in again"}; }
+  // 403 is not 401: the token is good and this account simply is not in the group. Saying
+  // "sign in" to someone already signed in sends them round a loop that cannot help.
+  if (resp.status===403) return {denied:"your account is not in the consultation group"};
+  try { return await resp.json(); } catch(e){ return {denied:"unreadable response"}; }
 }
 const $ = (id) => document.getElementById(id);
 // XSS sinks (ported): escape at the sink; jstr() for values landing in inline handlers.
@@ -1551,8 +1591,8 @@ async function loadReadiness(t){
   if (key === READY_KEY) return;
   READY_KEY = key;
   try {
-    const d = await fetch(API+"/api/tasks/"+encodeURIComponent(t.id)+"/readiness").then(r=>r.json());
-    READY_DATA = d && !d.error ? d : null;
+    const d = await authGet("/api/tasks/"+encodeURIComponent(t.id)+"/readiness");
+    READY_DATA = d && !d.error && !d.denied ? d : null;
   } catch(_){ READY_DATA = null; }
   renderReadiness(t);
 }
@@ -1761,7 +1801,11 @@ function renderTaskActions(t){
 
 async function loadTasks(){
   try {
-    const d = await fetch(API+"/api/tasks").then(r=>r.json());
+    const d = await authGet("/api/tasks");
+    // Say which wall we hit, and stop the poll: a 15s retry loop against a 401 is a
+    // wasted Cognito round-trip every 15 seconds and the message never changes.
+    if (d.denied) { tasksPoll(false); $("taskList").innerHTML =
+      `<span class="sub">${esc(d.denied)}</span>`; return; }
     const items = d.tasks||[];
     $("taskList").innerHTML = items.length ? items.map(t=>
       `<div class="th${t.id===TASK_SEL?" sel":""}" onclick="selectTask('${esc(t.id)}')">`+
@@ -1777,7 +1821,8 @@ async function loadTasks(){
 async function loadTaskDetail(){
   if (!TASK_SEL) return;
   try {
-    const t = await fetch(API+"/api/tasks/"+encodeURIComponent(TASK_SEL)).then(r=>r.json());
+    const t = await authGet("/api/tasks/"+encodeURIComponent(TASK_SEL));
+    if (t.denied) { tasksPoll(false); $("taskChatMsg").textContent = t.denied; return; }
     if (t.error) { $("taskChatMsg").textContent = t.error; return; }
     TASK_CACHE = t;
     renderThread(t);
@@ -1997,7 +2042,12 @@ async function viewApproval(){
   if (!TASK_SEL) return false;
   const el = $("taskAsk");
   try {
-    const d = await fetch(API+"/api/tasks/"+encodeURIComponent(TASK_SEL)+"/approval").then(r=>r.json());
+    const d = await authGet("/api/tasks/"+encodeURIComponent(TASK_SEL)+"/approval");
+    if (d.denied) {
+      el.innerHTML = `<div class="inlineask"><div class="askq">${esc(d.denied)}</div>`+
+        `<div class="flex"><button onclick="askCancel()">Close</button></div></div>`;
+      return false;
+    }
     el.innerHTML = `<div class="inlineask"><div class="askq">Approval records (${(d.approvals||[]).length})`+
       ` &middot; key <span class="mono">${esc(d.key_arn||d.key||"")}</span></div>`+
       `<pre style="max-height:260px;overflow:auto">${esc(JSON.stringify(d.approvals||[], null, 1))}</pre>`+

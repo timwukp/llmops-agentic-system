@@ -649,6 +649,58 @@ def test_an_approved_estimate_launches_and_is_stamped_with_the_execution(blockin
     assert listed["sfn_execution_arn"] == item["sfn_execution_arn"]
 
 
+def test_the_launch_payload_carries_the_priced_plan(wired):
+    """What was priced must be what is dispatched — asserted on the real invoke payload.
+
+    The console is the only path a customer has to sign a plan, and approve->launch used
+    to scrape the stored plan for `task_count` and `sample_count` alone. Every other field
+    the estimator PRICED -- both instance types, teacher_model, harness_model,
+    endpoint_hours, keep_reasoning, teardown -- was dropped, so the run executed on
+    start-pipeline's ARC-shaped defaults while the estimate record said otherwise. Nothing
+    afterwards can see it: the variance report joins this estimate to that run's actuals
+    and reports the gap as an underspend rather than as two different runs.
+
+    A sibling guard in test_orchestration.py reads start_run's SOURCE for `payload["plan"]`
+    and round-trips the keys through seed_manifest. That is a text search, so it passes
+    against `if False:` around the forwarding block -- proven by the negative-control
+    runner, which is why this test exists. Here the payload is the one the fake Lambda
+    client actually received, so the only way to pass is to send it.
+
+    Derived from the console's own key lists, so a field added to the estimate form is
+    covered without editing this test.
+    """
+    src = (REPO / "deploy/console/lambda_function.py").read_text()
+    priced = {}
+    for kind, val in (("INT_KEYS", 7), ("FLOAT_KEYS", 1.5),
+                      ("STR_KEYS", "probe"), ("BOOL_KEYS", True)):
+        m = re.search(kind + r" = \((.*?)\)", src, re.S)
+        for k in re.findall(r'"([a-z_0-9]+)"', m.group(1)):
+            priced[k] = val
+    assert len(priced) >= 12, f"the estimate form's key lists did not parse: {priced}"
+    # sample_count must stay large enough to price, and n_stages/minutes_per_stage feed
+    # the harness line; the probe values above are only shaped to be type-valid.
+    priced["sample_count"] = 2000
+    priced["training_instance"] = "ml.g5.2xlarge"      # must exist in the rate card
+    priced["inference_instance"] = "ml.g5.xlarge"
+    priced["endpoint_hours"] = 0
+
+    eid = _mk_estimate(wired, priced)["estimate_id"]
+    assert wired.m.start_run({"estimate_id": eid})["ok"]
+    assert len(wired.invokes) == 1
+    sent = json.loads(wired.invokes[0]["Payload"].decode())
+    assert "plan" in sent, (
+        "the launch payload carries no `plan`, so start-pipeline reads the signed plan as "
+        "absent and every field it priced falls to DEFAULT_PARAMS")
+    stored = json.loads(wired.est.items[eid]["plan"])
+    assert stored, "the estimate stored no plan at all"
+    for k, v in sorted(stored.items()):
+        assert sent["plan"].get(k) == v, (
+            f"the estimator priced {k}={v!r} and the launch payload sent "
+            f"{sent['plan'].get(k)!r}. The estimate record and the run would describe "
+            "different spends, and the variance report would call the difference an "
+            "underspend.")
+
+
 def test_an_under_limit_estimate_launches_without_approval(wired):
     """The gate must not become a tollbooth on every run — only on expensive ones."""
     eid = _mk_estimate(wired)["estimate_id"]

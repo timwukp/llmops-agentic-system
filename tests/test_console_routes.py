@@ -36,7 +36,14 @@ _ROUTE = re.compile(
 
 
 def _router() -> dict[str, list[str]]:
-    """Split every route handler by method and by side of the auth chokepoint."""
+    """Split every route handler by method and by side of the auth chokepoints.
+
+    Two chokepoints, not one, because there are two things being gated and they are not
+    the same question. The POST gate asks "may you act on the platform"; the consult gate
+    asks "may you read a customer's engagement". Keying auth on the METHOD alone is what
+    left four consult READS anonymous, so the GET list is split here the same way the
+    POST list is -- a GET is only reported as `public_get` if nothing authenticated it.
+    """
     lines = LAMBDA.read_text().split("\n")
     choke = [i for i, l in enumerate(lines)
              if l.strip() == 'if method == "POST":'
@@ -48,14 +55,36 @@ def _router() -> dict[str, list[str]]:
         "this guard has stopped guarding anything.")
     choke = choke[0]
 
-    out = {"get": [], "session_post": [], "authed_post": []}
+    # The consult-read gate: `if method == "GET" and _is_consult_path(path):` followed by
+    # an _authed_user call. Located the same way, and asserted to exist -- a guard that
+    # silently found no gate would classify every consult read as public and pass.
+    cons = [i for i, l in enumerate(lines)
+            if "_is_consult_path(path)" in l and 'method == "GET"' in l
+            and "_authed_user" in "\n".join(lines[i:i + 6])]
+    assert len(cons) == 1, (
+        f"expected exactly one authenticated consult-GET gate in {LAMBDA.name}, found "
+        f"{len(cons)} at lines {[i + 1 for i in cons]}. Zero means the consult plane's "
+        "reads are anonymous again -- GET /api/tasks/{id} returns the customer's whole "
+        "transcript and /approval returns cognito_sub and source_ip.")
+    cons = cons[0]
+    # Where that block's body ends: the first line at or below its own indent level.
+    cons_indent = len(lines[cons]) - len(lines[cons].lstrip())
+    cons_end = len(lines)
+    for i in range(cons + 1, len(lines)):
+        if lines[i].strip() and (len(lines[i]) - len(lines[i].lstrip())) <= cons_indent:
+            cons_end = i
+            break
+
+    out = {"public_get": [], "authed_get": [], "session_post": [], "authed_post": []}
     for i, l in enumerate(lines):
         m = _ROUTE.search(l)
         if not m:
             continue
         path, meth = m.group("p"), m.group("m")
-        if meth == "GET":
-            out["get"].append(path)
+        if cons < i < cons_end:
+            out["authed_get"].append(path)
+        elif meth == "GET":
+            out["public_get"].append(path)
         elif meth == "POST":
             out["session_post"].append(path)
         elif i > choke:
@@ -93,6 +122,95 @@ def test_every_non_session_post_is_below_the_chokepoint():
         "The unauthenticated match wins, so the authed handler below never runs.")
 
 
+def test_no_route_on_the_consult_prefix_is_ever_anonymous():
+    """The customer plane is authenticated on BOTH methods, derived from the prefix.
+
+    This is the assertion the old guard could not make, because it only ever asked which
+    POSTs were unauthenticated. Four consult GETs -- /api/tasks, /api/tasks/{id} and that
+    thread's /approval and /readiness panels -- were served anonymously on a public API
+    Gateway URL for the platform's whole life. The doc's boast that "adding a route cannot
+    accidentally add an unauthenticated write" was true, and it was the wrong claim to be
+    checking: nothing said an unauthenticated READ of a customer's transcript was possible.
+
+    Stated over the PREFIX rather than the four known paths, so the fifth panel added to a
+    thread is covered by arithmetic instead of by whoever remembers this file exists.
+    """
+    r = _router()
+    anonymous = sorted(p for p in r["public_get"] + r["session_post"]
+                       if p == "/api/tasks" or p.startswith("/api/tasks"))
+    assert not anonymous, (
+        f"these consult-plane routes are served without authentication: {anonymous}. "
+        "Everything under /api/tasks is one customer's engagement -- the thread item is "
+        "their transcript and the approval record carries cognito_sub and source_ip. "
+        "Move the route inside the authenticated consult block; do not add an exception.")
+    assert r["authed_get"], (
+        "no GETs were found inside the authenticated consult block -- either the block "
+        "was removed or the parse broke, and both report a leak as clean.")
+
+
+def test_the_consult_gate_is_a_prefix_not_a_list_of_paths():
+    """`_is_consult_path` must match by prefix, and the router must use it.
+
+    An enumeration of the four leaking routes would have closed today's hole and left the
+    mechanism intact: route five arrives anonymous the same way, and this test would still
+    pass. So the shape is pinned, not just the outcome.
+    """
+    src = LAMBDA.read_text()
+    fn = src.split("def _is_consult_path(", 1)[1].split("\ndef ", 1)[0]
+    assert "startswith(CONSULT_PREFIX" in fn, (
+        "_is_consult_path no longer matches by prefix. A list of known task routes leaves "
+        "the next one added to the thread anonymous, which is the bug, not the symptom.")
+    # And every consult read must go through it, rather than re-deriving the membership
+    # test at the router -- two copies of "what counts as consult" is one copy too many.
+    assert src.count("_is_consult_path(path)") >= 1, (
+        "the router does not consult _is_consult_path; a predicate nothing calls is not "
+        "a gate.")
+
+
+def test_a_consult_read_checks_the_group_and_not_only_the_token():
+    """Authentication is not authorisation: the consult reads need the group check too.
+
+    The write side has always called `_user_may_task` (DS_GROUP or APPROVER_GROUP). If the
+    reads only checked that a token was valid, then every operator with a dashboard login
+    -- including one provisioned purely to watch the Pipeline tab -- could read every
+    customer transcript in the account. 401 and 403 also have to stay distinct, or an
+    approver who is simply in the wrong group gets told their session expired and loops
+    through a re-login that cannot help.
+    """
+    src = LAMBDA.read_text()
+    block = src.split('if method == "GET" and _is_consult_path(path):', 1)[1]
+    block = block.split("\n        raw = event.get", 1)[0]
+    assert "_authed_user(headers)" in block, "the consult read gate does not authenticate"
+    assert "_user_may_task(user)" in block, (
+        "the consult read gate authenticates but does not check group membership, so any "
+        "valid dashboard token can read every customer's transcript.")
+    assert "401" in block and "403" in block, (
+        "the consult read gate does not distinguish 401 from 403. The frontend routes them "
+        "differently on purpose: 401 clears the session, 403 must not.")
+
+
+def test_the_console_ui_sends_credentials_on_every_consult_read():
+    """The four consult GETs in frontend.html must go through the authed helper.
+
+    A server-side gate plus a bare `fetch` on the page is not a working feature: the whole
+    Tasks tab 401s and the operator sees an empty rail. Derived by finding every fetch of
+    an /api/tasks URL and requiring none of them to be raw.
+    """
+    html = (REPO / "deploy" / "console" / "frontend.html").read_text()
+    raw = re.findall(r'fetch\(API\+"(/api/tasks[^"]*)"', html)
+    raw += re.findall(r'fetch\(API\+"(/api/tasks)"', html)
+    assert not raw, (
+        f"these consult reads use a raw fetch with no Authorization header: {sorted(set(raw))}. "
+        "They now return 401. Use authGet(), which attaches the token and reports refusal "
+        "as {denied: reason} so the panel can say which wall it hit.")
+    assert "async function authGet(" in html, "authGet is missing from the console UI"
+    # A denial must be NAMED. The rail's empty state says "no consultations yet", which is
+    # a different fact from "you are not signed in" and reads as reassuring when wrong.
+    assert html.count("d.denied") + html.count("t.denied") >= 4, (
+        "fewer than four consult call sites handle a {denied} result; one that ignores it "
+        "renders a refusal as an empty panel.")
+
+
 def test_the_docs_state_the_real_route_counts():
     """ARCHITECTURE (both languages) and the diagram must quote the router's numbers.
 
@@ -101,7 +219,8 @@ def test_the_docs_state_the_real_route_counts():
     facts, so they are checked rather than proofread.
     """
     r = _router()
-    total = len(r["get"]) + len(r["session_post"]) + len(r["authed_post"])
+    total = (len(r["public_get"]) + len(r["authed_get"])
+             + len(r["session_post"]) + len(r["authed_post"]))
     svg = (REPO / "docs" / "architecture-console.svg").read_text()
     assert f"{total} route handlers" in svg, (
         f"the console diagram no longer states the handler count ({total}); it is "

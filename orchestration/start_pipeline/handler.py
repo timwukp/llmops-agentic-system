@@ -91,14 +91,96 @@ def _as_obj(value, what: str) -> dict:
                      f"got {type(value).__name__}")
 
 
+#: The roles a manifest assigns a model to. `models` is a role->model-id map and
+#: nothing else, which is what makes the conflict check below meaningful.
+MODEL_ROLES = ("teacher", "student", "judge", "harness")
+
+#: Per-role aliases a signed plan may use for the SAME fact, newest name first.
+#
+# One fact must have one name, but it already had four before this map existed, and
+# three of them are in signed artifacts on S3 that cannot be rewritten: the console's
+# estimate form posts `plan.teacher_model` (its STR_KEYS list, which is also what
+# cost_model.py prices), the conductor prompt says "teacher/student models", and
+# `plan.models.teacher` is what this function used to read. So the aliases are
+# accepted on READ and normalised to one role name, rather than declared illegal --
+# a plan a human signed last week must still dispatch as the model they approved.
+ROLE_ALIASES = {
+    "teacher": ("teacher", "teacher_model", "teacher_model_id"),
+    "student": ("student", "student_model", "student_model_id"),
+    "judge": ("judge", "judge_model", "judge_model_id"),
+    "harness": ("harness", "harness_model", "harness_model_id"),
+}
+
+#: `plan.models` keys that describe WHERE an open-weight model came from, not WHICH
+#: model fills a role. The conductor prompt tells the orchestrator to write exactly
+#: this block for any open-weight model, so it arrives in real signed plans.
+SUPPLY_CHAIN_KEYS = ("hf_repo", "revision", "files_sha256", "license", "mirror_uri",
+                     "mirrored_at")
+
+
+def _role_assignments(source: dict, where: str) -> dict:
+    """Pull role -> model-id out of one plan/params dict, under any accepted alias.
+
+    Reads both the flat form (`teacher_model`) and the nested `models` block, because
+    both appear in artifacts that are already signed. A role named twice in the same
+    source with two different ids is refused rather than resolved by precedence: one
+    document contradicting itself is not a case where any reading is defensible.
+    """
+    nested = _as_obj(source.get("models"), f"{where}.models")
+    found = {}
+    for role, aliases in ROLE_ALIASES.items():
+        seen = {}
+        for alias in aliases:
+            for scope, doc in ((where, source), (f"{where}.models", nested)):
+                val = doc.get(alias)
+                if val in (None, ""):
+                    continue
+                seen[f"{scope}.{alias}"] = str(val)
+        distinct = sorted(set(seen.values()))
+        if len(distinct) > 1:
+            detail = ", ".join(f"{k}={v!r}" for k, v in sorted(seen.items()))
+            raise ValueError(
+                f"{where} names the {role} model more than once, with different ids: "
+                f"{detail}. These are aliases for ONE fact, so this document "
+                "contradicts itself -- fix it to name the model once.")
+        if distinct:
+            found[role] = distinct[0]
+    unknown = sorted(set(nested) - set(sum(ROLE_ALIASES.values(), ()))
+                     - set(SUPPLY_CHAIN_KEYS))
+    if unknown:
+        raise ValueError(
+            f"{where}.models has keys that are neither a model role nor supply-chain "
+            f"provenance: {unknown}. Roles are {list(MODEL_ROLES)}; provenance keys are "
+            f"{list(SUPPLY_CHAIN_KEYS)}. Refusing rather than guessing, because a "
+            "misspelled role silently becomes 'the plan is silent about the teacher', "
+            "and the run then spends on a default no human approved.")
+    # A mirrored model must fill a role. The conductor prompt has the orchestrator
+    # write {hf_repo, revision, license, mirror_uri} for any open-weight model, and
+    # that block is where the LICENCE was checked and the bytes were pinned. If it
+    # names a repo no role uses, the run trains on a model whose licence nobody
+    # cleared while the cleared one sits unused in the mirror -- and it does so
+    # silently, because "the plan is silent about the student" is indistinguishable
+    # from "there is no plan". Measured: a plan mirroring meta-llama/Llama-3.2-1B
+    # produced manifest.student = Qwen/Qwen3-1.7B.
+    repo = str(nested.get("hf_repo") or "")
+    if repo and repo not in set(found.values()):
+        raise ValueError(
+            f"{where}.models mirrors {repo!r} but assigns it to no role. The "
+            f"supply-chain block is where the licence was checked and the revision "
+            f"pinned, so a repo that fills no role means the run would train on a "
+            f"DIFFERENT model than the one that was cleared. Name the role explicitly "
+            f"(e.g. \"student\": \"{repo}\") alongside the provenance keys.")
+    return found
+
+
 def _resolve_models(params, plan) -> dict:
     """Which models this run may use — with the SIGNED plan as the authority.
 
     Model consent is model-specific: a human approving a Fable-5 teacher at $0.05/1k
     output has not approved a DeepSeek-R1 one, and vice versa. So the plan a human
     signed outranks both the boilerplate defaults and anything the dispatching agent
-    passes in `params`. `params.models` may only fill in models the plan is silent
-    about; where the two name the same role differently, the manifest is refused.
+    passes in `params`. `params` may only fill in roles the plan is silent about;
+    where the two name the same role differently, the manifest is refused.
 
     Live failure this comes from: run 68cfa9c8's manifest carried
     ``models.teacher = us.deepseek.r1-v1:0`` (DEFAULT_MODELS boilerplate) while its
@@ -114,13 +196,23 @@ def _resolve_models(params, plan) -> dict:
     never routine: it means the dispatch path and the approval path disagree about what
     was bought. Failing the dispatch costs one visible error; guessing costs an
     unapproved spend that looks authorized in every artifact afterward.
+
+    THE ABOVE WAS ONLY HALF THE FIX, and the other half is why this reads aliases now.
+    It matched `plan.models.teacher` exactly, while the console's estimate form posts
+    `plan.teacher_model` (deploy/console/lambda_function.py STR_KEYS) and prices the run
+    from it. So a plan signed through the console UI -- the only path a customer has --
+    landed here with `models` absent, fell through to DEFAULT_MODELS, and produced a run
+    PRICED as Fable-5 and EXECUTED on DeepSeek-R1, with every artifact agreeing. The
+    same class of defect as the one above, reintroduced through a name rather than a
+    precedence rule: a consent check that reads a different field name than the consent
+    is written under is not a check.
     """
-    plan_models = _as_obj((plan or {}).get("models"), "plan.models")
-    param_models = _as_obj((params or {}).get("models"), "params.models")
-    conflicts = sorted(r for r in set(plan_models) & set(param_models)
-                       if str(plan_models[r]) != str(param_models[r]))
+    plan_roles = _role_assignments(_as_obj(plan, "plan"), "plan")
+    param_roles = _role_assignments(_as_obj(params, "params"), "params")
+    conflicts = sorted(r for r in set(plan_roles) & set(param_roles)
+                       if plan_roles[r] != param_roles[r])
     if conflicts:
-        detail = ", ".join(f"{r}: plan={plan_models[r]!r} vs params={param_models[r]!r}"
+        detail = ", ".join(f"{r}: plan={plan_roles[r]!r} vs params={param_roles[r]!r}"
                            for r in conflicts)
         raise ValueError(
             f"params.models contradicts the signed plan for {detail}. Model consent is "
@@ -130,7 +222,83 @@ def _resolve_models(params, plan) -> dict:
     # No precedence between the two beyond this point: every shared role has just been
     # proven to agree, so the merge order is unobservable. Both still outrank
     # DEFAULT_MODELS, which is boilerplate no human ever looked at.
-    return {**DEFAULT_MODELS, **param_models, **plan_models}
+    return {**DEFAULT_MODELS, **param_roles, **plan_roles}
+
+
+#: Keys of a signed plan that are ABOUT the plan rather than settings for a stage.
+#
+# Everything else in a plan is a stage setting and reaches `params`. A denylist, not an
+# allowlist, and that direction is the whole point: an allowlist omits the field nobody
+# thought of, and the omission is invisible because a default silently takes its place --
+# exactly how `pipeline_mode`, `training_instance` and `gates` came to be dropped. A new
+# plan field a future orchestrator writes now arrives by default and has to be named here
+# to be excluded, so the failure mode is a stage seeing a field it ignores, not a run
+# quietly executing settings no human chose.
+#
+# `models` is excluded because _resolve_models already normalises it into `manifest.models`
+# under one role name per model; carrying the raw block into params too would put a second,
+# un-normalised copy of model consent in the manifest, which is the four-names defect.
+PLAN_META_KEYS = frozenset({
+    "models",              # resolved separately, into manifest.models
+    "assumptions",         # prose for the human who signed
+    "plan_summary",
+    "cost_estimate_usd",   # what it was priced at, not an instruction to a stage
+    "rate_card_as_of",
+    "budget_usd",
+    "created_at",
+    "created_by",
+})
+
+
+def _plan_params(plan: dict) -> dict:
+    """The stage settings a signed plan carries — flattened one level out of `data`.
+
+    A plan's `data` block is nested ({source_uri, datasheet, customer_eval_uri,
+    decontamination, ...}) while the prompts that consume it read flat params:
+    data-prep's "audit" task reads `params.source_uri` and `params.customer_eval_uri`.
+    Both halves were correct and never connected, so an audit run dispatched from a
+    signed plan arrived with no data URI at all and the agent had to refuse or guess.
+
+    Nested keys do NOT overwrite a same-named top-level key: the top level is the more
+    specific statement, and a silent overwrite here would be the same defect one layer in.
+    """
+    out = {k: v for k, v in plan.items() if k not in PLAN_META_KEYS}
+    data = plan.get("data")
+    if isinstance(data, dict):
+        for k, v in data.items():
+            out.setdefault(k, v)
+    return out
+
+
+def _merge_params(params: dict, plan: dict) -> dict:
+    """DEFAULT_PARAMS < params < signed plan, with plan/params conflicts refused.
+
+    The precedence and the refusal are both taken from _resolve_models, because this is
+    the same question about every other field it asks about models. Bug #9 fixed model
+    consent, bug #20 fixed the NAME model consent is written under -- and both left the
+    rest of the plan behind. Measured on a signed industrial-defect plan: a run priced on
+    ml.p4d.24xlarge with 40000 samples and a {"map50": 0.75} gate executed on
+    ml.g5.2xlarge with 2000 samples and ARC's relative_solve_rate gate, because
+    seed_manifest read `plan` for models and nothing else. Every artifact agreed, and the
+    variance report joined the estimate to the actual and read the underspend as success.
+
+    DEFAULT_PARAMS keeps losing to both, which is also what makes the platform generic:
+    `dataset: "arc-agi-2"` and the relative_solve_rate/format_validity gates are only
+    harmful because a plan naming a YOLO dataset and a map50 gate could not displace them.
+    """
+    plan_params = _plan_params(plan)
+    conflicts = sorted(k for k in set(plan_params) & set(params)
+                       if plan_params[k] != params[k])
+    if conflicts:
+        detail = ", ".join(f"{k}: plan={plan_params[k]!r} vs params={params[k]!r}"
+                           for k in conflicts)
+        raise ValueError(
+            f"params contradicts the signed plan for {detail}. What a human signed and "
+            "what is being dispatched must be the same run: fix the dispatch to omit "
+            "these keys, or seek a fresh acceptance for the plan you actually want. "
+            "Refusing rather than picking a side, because a disagreement here means the "
+            "approval path and the dispatch path describe different spends.")
+    return {**DEFAULT_PARAMS, **params, **plan_params}
 
 
 def seed_manifest(run_id: str, trigger_source: str, params, plan,
@@ -138,7 +306,7 @@ def seed_manifest(run_id: str, trigger_source: str, params, plan,
     params = _as_obj(params, "params")
     plan = _as_obj(plan, "plan")
     approval = _as_obj(approval, "approval")
-    merged = {**DEFAULT_PARAMS, **(params or {})}
+    merged = _merge_params(params or {}, plan or {})
     return {
         "run_id": run_id,
         "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),

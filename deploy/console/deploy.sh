@@ -14,7 +14,11 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REGION="${REGION:-us-east-1}"
 DATA_BUCKET="${DATA_BUCKET:-}"                 # optional; Lambda falls back to SSM /llmops/storage/bucket
 JUDGE_MODEL="${JUDGE_MODEL:-global.anthropic.claude-opus-5}"
-SPANS_SINCE="${SPANS_SINCE:-2026-07-28T12:00:00Z}"  # ISO ts when OTEL_TRACES_SAMPLER=always_on was enabled
+# Empty by default ON PURPOSE: the Lambda reads /llmops/observability/spans_since, which
+# 05_harnesses.py stamps on the deploy that first sets OTEL_TRACES_SAMPLER=always_on. This
+# used to default to 2026-07-28T12:00:00Z -- the hour tracing came up in one account, which
+# silently excluded every run in any other deployment. Set it only to override that stamp.
+SPANS_SINCE="${SPANS_SINCE:-}"                 # ISO ts; empty = read from SSM
 OPTIMIZE_HARNESS="${OPTIMIZE_HARNESS:-llmops_orchestrator}"
 
 # ── security tunables (ported) ────────────────────────────────────────────────

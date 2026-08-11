@@ -76,9 +76,12 @@ Lambda + HTTP API + Cognito 獨立棧，從
 - **訓練採 launch-and-release** —— harness 絕不空等數小時的作業：發起作業後呼叫
   `job_launched` 釋放 session，管線經 `waitForTaskToken` + EventBridge SageMaker 狀態變化
   規則在全新 session 中恢復。狀態存在 S3 manifest，絕不存在 session 裡。
-- **企業級態勢** —— 全程最小權限 IAM；VPC 與 interface endpoints（無互聯網出口）由
+- **企業級態勢** —— 全程最小權限 IAM；VPC（無互聯網出口、無 NAT）由
   `deploy/02_network.py` 建立。VPC 模式的 harness 變體與其所需的 S3 技能鏡像**尚未實作**:
-  VPC 模式的 harness 無法解析 `git` 技能來源,所以鏡像是前置條件,不是優化。
+  VPC 模式的 harness 無法解析 `git` 技能來源,所以鏡像是前置條件,不是優化。也正因為目前
+  沒有任何東西會走它們，這個腳本現在**預設跳過那 11 個計費的 interface endpoint** ——
+  它們過去是為一個不存在的消費者以 $5.28/天在配置，而當時的成本註記寫的是 $2.64，
+  因為它數的是 endpoint 個數而不是可用區個數。
 
 ## 為什麼這些 agent 能自己承擔這些例行工作：三層疊加，而不是單一模型
 

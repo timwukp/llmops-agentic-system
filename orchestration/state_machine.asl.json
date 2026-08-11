@@ -321,9 +321,12 @@
     },
     "IncrementIteration": {
       "Type": "Pass",
+      "Comment": "Parameters with no ResultPath REPLACES the state document, so this object is the whole state on every remediating run. It must therefore hand back everything start_pipeline seeded into the execution input: task_id is read by MarkTaskDone/MarkTaskFailed at closeout, and a JSONPath that is not present raises States.Runtime, which no Catch can intercept — the run dies mid-flight with the conductor's task row left open. test_a_state_replacing_pass_hands_back_the_whole_entry_contract derives this list from start_pipeline's handler so it cannot rot.",
       "Parameters": {
         "run_id.$": "$.run_id",
         "manifest_uri.$": "$.manifest_uri",
+        "pipeline_mode.$": "$.pipeline_mode",
+        "task_id.$": "$.task_id",
         "iteration.$": "States.MathAdd($.iteration, 1)"
       },
       "Next": "RemediateFinetune"

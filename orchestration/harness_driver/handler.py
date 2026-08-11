@@ -396,6 +396,151 @@ def _load_manifest(s3, manifest_uri: str) -> dict:
         return {}
 
 
+#: Manifest blocks the driver must never rewrite, because a human's signature is what put
+#: them there. `models` is the resolved model consent, `plan` and `approval` are the signed
+#: artifacts themselves, and `params` is what those two were merged into by start-pipeline.
+#:
+#: Bugs #9, #20 and #21 were all one defect: a default standing in for intent that WAS
+#: present in a signed artifact. Writing the manifest back from the driver -- on every
+#: stage_complete, from data assembled around an agent's tool call -- is exactly the shape
+#: that could reintroduce it a fourth time, so the write is narrowed to what a STAGE
+#: produced instead of being a whole-document put. A field being absent from this set is
+#: not permission to write it: `_save_manifest` writes only `stages`.
+IMMUTABLE_MANIFEST_KEYS = frozenset({"models", "plan", "approval", "params",
+                                     "run_id", "created_at", "trigger_source"})
+
+
+def _save_manifest(s3, manifest_uri: str, manifest: dict) -> None:
+    """Persist the run's stage results, re-reading first so a concurrent write survives.
+
+    Read-modify-write rather than a blind put, and only the `stages` block is taken from
+    the caller's copy. Two reasons, both measured rather than defensive:
+
+    1. **Every specialist prompt tells the agent to append its own results to this same
+       object**, and the harness role really can (`S3PipelineObjects` grants PutObject on
+       `runs/*`). So the driver is the SECOND writer, not the only one. A blind put of the
+       copy loaded at the top of `handle_stage_complete` would silently erase whatever the
+       agent wrote during the turn -- the human-readable stage summary the prompts ask for.
+    2. **The signed blocks must not be rewritable by this path at all.** Re-reading and
+       replacing only `stages` means a driver bug cannot restate model consent or the plan,
+       which is the defect bugs #9/#20/#21 each were.
+
+    S3 has no compare-and-swap, so this narrows the write rather than making it atomic: the
+    ASL is fully serial (no Parallel/Map states), so two stages never complete at once, and
+    the remaining window is one stage's agent writing between this read and this put. That
+    is a real but bounded gap, and it is smaller than the alternative of not persisting
+    stage results at all -- which is what the code did before, at 100% loss.
+    """
+    bucket, _, key = manifest_uri[5:].partition("/")
+    current = _load_manifest(s3, manifest_uri)
+    if not current:
+        # Nothing to merge into. Refusing rather than creating the object: the manifest is
+        # seeded by start-pipeline from a signed plan, so an absent one here means the URI
+        # is wrong or the run does not exist, and writing a stages-only document would
+        # manufacture a manifest with no plan, no approval and no models -- which reads
+        # downstream as "this run was never planned".
+        raise ValueError(
+            f"refusing to write stage results to {manifest_uri}: no manifest is there to "
+            "merge into. start-pipeline seeds the manifest from the signed plan; a "
+            "stages-only document would look like a run nobody planned.")
+    # The signed blocks are taken from `current` (just re-read) and never from the caller's
+    # copy, so divergence between the two cannot reach S3 through here. But it is worth
+    # NOTICING: the harness role can write this object, so a block changing between
+    # start-pipeline's seed and this stage's completion means either an agent rewrote a
+    # human's signature or the driver corrupted its own copy. Both are bug #9's class, and
+    # both are invisible afterwards because the value that reaches downstream is correct.
+    # Recorded rather than raised -- the stage results below are still worth persisting, and
+    # withholding them to protest a field we are not writing would trade one loss for two.
+    tampered = sorted(k for k in IMMUTABLE_MANIFEST_KEYS
+                      if k in current and k in manifest and current[k] != manifest[k])
+    if tampered:
+        print(f"[driver] signed manifest blocks changed mid-run for {manifest_uri}: "
+              f"{tampered} — keeping the copy on S3, not the driver's")
+
+    current["stages"] = manifest.get("stages", {})
+    s3.put_object(Bucket=bucket, Key=key,
+                  Body=json.dumps(current, indent=2, default=str).encode(),
+                  ContentType="application/json")
+
+
+#: What each stage prompt calls the model it must use, mapped to its manifest role.
+#
+# The prompts say "model id in params.teacher_model_id" (data-prep "generate", eval
+# "score"). NOTHING has ever written that key: start-pipeline resolves the signed
+# plan's models into `manifest.models`, and no prompt mentions `manifest.models` at
+# all. So the agents read an absent field and fall back to the model named in their
+# own persona line -- "teacher DeepSeek-R1 on Bedrock" -- which is boilerplate, not
+# consent. Injecting the resolved roles here, under the names the prompts already
+# use, means the consent that start-pipeline enforces is the consent the agent obeys.
+MODEL_PARAM_FOR_ROLE = {"teacher": "teacher_model_id", "student": "student_model_id",
+                        "judge": "judge_model_id"}
+
+
+def model_params_from_manifest(manifest: dict) -> dict:
+    """`{teacher_model_id: ..., ...}` for the roles this run's manifest assigns.
+
+    Roles the manifest is silent about are omitted rather than defaulted: a stage that
+    needs a teacher and finds none must fail visibly, not spend on a guess. The whole
+    class of bug here is a default standing in for an approval.
+    """
+    models = manifest.get("models") or {}
+    if not isinstance(models, dict):
+        return {}
+    return {param: str(models[role])
+            for role, param in MODEL_PARAM_FOR_ROLE.items()
+            if models.get(role)}
+
+
+#: Facts a stage PRODUCES that a later stage's prompt reads as a param: the param name each
+#: prompt uses, mapped to where the producing stage reported it in `stages`.
+#
+# `MODEL_PARAM_FOR_ROLE` above carries what a human SIGNED into the stages that obey it.
+# This carries what the run itself DISCOVERED, and nothing carried it before: an endpoint
+# name does not exist until the deploy stage creates one, so no plan can be signed with it
+# and no default can stand in for it. `params.student_endpoint` is read by eval ("a live
+# endpoint in params.student_endpoint") and by monitor ("name in the manifest or
+# params.student_endpoint") and was written by NOTHING -- not the console, not
+# start-pipeline, not the driver. The deploy stage reported `endpoint_name` in its
+# stage_complete metrics, the driver put it in a local dict, and it was dropped.
+#
+# So both halves were correct and never connected, for the fifth time in this repo -- but
+# the information here is not a signature that went missing, it is a fact the run itself
+# produced. That is the difference that matters for autonomy: a pipeline whose stages cannot
+# read each other's results cannot reflect on a run or iterate on it, only redo it.
+#
+# Read from `stages`, never from `models`: `models.student.endpoint_name` exists in
+# manifest.schema.json, but `models` is the resolved record of model CONSENT and the driver
+# must not write it (see IMMUTABLE_MANIFEST_KEYS). The stage's own report is the honest
+# home for a stage's own finding.
+STAGE_FACT_PARAMS = {
+    "student_endpoint": ("deploy", "endpoint_name"),
+}
+
+
+def stage_fact_params(manifest: dict) -> dict:
+    """`{student_endpoint: ...}` for facts an earlier stage of THIS run reported.
+
+    Absent facts are omitted, never defaulted or guessed -- same rule as the models above.
+    A stage that needs the endpoint and finds no param must fail visibly, because the
+    alternative is an agent inventing a plausible endpoint name and reporting CloudWatch
+    metrics for something that is not the model under test. A metric attributed to the
+    wrong endpoint is worse than a missing metric: it reads as evidence.
+    """
+    stages = manifest.get("stages")
+    if not isinstance(stages, dict):
+        return {}
+    out = {}
+    for param, (stage, key) in STAGE_FACT_PARAMS.items():
+        entry = stages.get(stage)
+        if not isinstance(entry, dict):
+            continue
+        metrics = entry.get("metrics")
+        value = metrics.get(key) if isinstance(metrics, dict) else None
+        if value:
+            out[param] = str(value)
+    return out
+
+
 def settle_token(sfn, token: str, **kw) -> bool:
     """Settle a task token. Returns True if settled, False if the token was already dead.
 
@@ -647,11 +792,30 @@ def handle_stage_complete(c, event, args) -> dict:
     report_error = None
     try:
         manifest = _load_manifest(c["s3"], event["manifest_uri"])
-        if manifest:
-            manifest.setdefault("stages", {})[stage] = {
-                "status": "completed", "outputs": norm["outputs"],
-                "metrics": norm.get("metrics", {}), "evidence": norm.get("evidence", "")}
-            write_run_report(c["s3"], os.environ["DATA_BUCKET"], manifest)
+        # No `if manifest:` guard. It used to be here, and it made the absent-manifest case
+        # SILENT: a wrong manifest_uri skipped the write and returned ok, which is bug #22's
+        # own failure mode surviving inside the fix for it. `_save_manifest` raises, the
+        # except below reports it into the run's event stream, and the token still settles.
+        manifest.setdefault("stages", {})[stage] = {
+            "status": "completed", "outputs": norm["outputs"],
+            "metrics": norm.get("metrics", {}), "evidence": norm.get("evidence", "")}
+        # The manifest goes BACK to S3, which it never used to. Every prompt is told
+        # "the S3 manifest at manifest_uri is the single source of truth; read it first,
+        # append your results to it" -- and this dict was a local variable handed to
+        # write_run_report and then dropped. So the report (which humans read) carried
+        # every stage's outputs and metrics while the manifest (which AGENTS read)
+        # carried none of them: `stages` was still `{}` after a deploy stage reported
+        # `endpoint_name`. Measured, not inferred.
+        #
+        # That is what makes it worse than a stale field. A stage cannot see what the
+        # stage before it produced, so eval and monitor read `params.student_endpoint`
+        # for an endpoint deploy had just created and named, finetune's "analyze" task
+        # is told to diagnose from artifacts the manifest does not list, and an agent
+        # asked to reflect on a run has only its own turn to reflect on. A pipeline
+        # whose stages cannot read each other's results cannot iterate on a run; it can
+        # only redo it.
+        _save_manifest(c["s3"], event["manifest_uri"], manifest)
+        write_run_report(c["s3"], os.environ["DATA_BUCKET"], manifest)
     except Exception as exc:  # noqa: BLE001 — never withhold the token for a report
         report_error = f"{type(exc).__name__}: {exc}"
         print(f"[driver] canonical report FAILED for {run_id}/{stage}: {report_error}")
@@ -1041,12 +1205,84 @@ def _is_model_5xx(error: str) -> bool:
                ("InternalServerException", "ServiceUnavailableException"))
 
 
+def _agentcore_control(c: dict):
+    """Control-plane client, created on first use — same shape as _kms above.
+
+    A lazy accessor rather than a client built inside the failover function, because a
+    client constructed in the callee cannot be injected, and a failover path no test
+    can drive is a failover path no test was driving: the swap-with-no-restore bug
+    lived in exactly the region this seam made unreachable.
+    """
+    if "agentcore_control" not in c:
+        region = os.environ.get("AWS_REGION", "us-east-1")
+        c["agentcore_control"] = boto3.client("bedrock-agentcore-control",
+                                              region_name=region)
+    return c["agentcore_control"]
+
+
+def _set_harness_model(ctl, harness_full_id: str, model: dict, model_id: str,
+                       wait_ready: bool) -> None:
+    """Point a harness at `model_id`. `model` is the config dict from GetHarness.
+
+    `wait_ready` is False on the restore path: nothing is about to invoke, so paying
+    ~15s of Lambda wall to watch a transition that completes on its own would only
+    make the restore likelier to be cut off by the deadline it is racing.
+    """
+    model["bedrockModelConfig"]["modelId"] = model_id
+    ctl.update_harness(harnessId=harness_full_id, model=model,
+                       clientToken=hashlib.sha256(
+                           f"{harness_full_id}-{model_id}".encode()).hexdigest()[:40])
+    if not wait_ready:
+        return
+    for _ in range(24):  # wait READY (~15s typical)
+        if ctl.get_harness(harnessId=harness_full_id)["harness"]["status"] == "READY":
+            break
+        time.sleep(5)
+
+
+def _record_failover(c, event, harness_full_id: str, from_model: str, to_model: str,
+                     restored: bool) -> None:
+    """Leave the swap on the run row, so a driver that dies mid-failover is visible.
+
+    The restore below is reliable while the driver lives, and the driver does not
+    always live: Lambda dropped an async self-reinvoke on 2026-08-08. Without a record
+    the only trace of a harness pointing somewhere its own agents/*/harness.json does
+    not declare would be a control-plane read nobody performs. Best effort -- a
+    bookkeeping write must not break the retry it is describing.
+    """
+    try:
+        c["ddb"].Table(os.environ["RUNS_TABLE"]).update_item(
+            Key={"run_id": event["run_id"]},
+            UpdateExpression="SET model_failover = :f",
+            ConditionExpression="attribute_exists(run_id)",
+            ExpressionAttributeValues={":f": json.dumps({
+                "harness_id": harness_full_id, "from_model": from_model,
+                "to_model": to_model, "restored": restored,
+                "at": datetime.now(timezone.utc).isoformat()})})
+    except Exception as exc:  # noqa: BLE001
+        print(f"[driver] could not record failover state: {type(exc).__name__}: {exc}")
+
+
 def _maybe_failover_model(c, event) -> None:
     """Hot-swap the harness to its fallback model on a vendor 5xx burst.
-    Best-effort: any failure here must not break the salvage retry."""
+
+    Best-effort: any failure here must not break the salvage retry.
+
+    UpdateHarness is a CONTROL-PLANE write on a resource all seven agents and every
+    concurrent run share, so the swap is global and outlives this stage. It is being
+    used to serve a need that is neither: one salvage retry, in one invocation. So the
+    swap is scoped -- the original model is parked on `c` and `handler()` restores it
+    on the way out, whichever way this invocation ends.
+
+    Unscoped, a single 5xx burst repointed the deployed fleet permanently: every later
+    run would execute on a model the human never signed (the whole point of the KMS
+    approval spine), that the cost model never priced (Fable 5 and Opus 5 are different
+    tiers), and that docs/ARCHITECTURE.md §9.3 asserts is NOT what is deployed -- with
+    nothing in the tree able to notice, because the divergence lives in the control
+    plane and agents/*/harness.json still reads the way it always did.
+    """
     try:
-        region = os.environ.get("AWS_REGION", "us-east-1")
-        ctl = boto3.client("bedrock-agentcore-control", region_name=region)
+        ctl = _agentcore_control(c)
         arn = _resolve_harness_arn(event["harness_id"])
         harness_full_id = arn.rsplit("/", 1)[-1]
         h = ctl.get_harness(harnessId=harness_full_id)["harness"]
@@ -1055,14 +1291,11 @@ def _maybe_failover_model(c, event) -> None:
         fallback = MODEL_FALLBACKS.get(current)
         if not fallback:
             return
-        model["bedrockModelConfig"]["modelId"] = fallback
-        ctl.update_harness(harnessId=harness_full_id, model=model,
-                           clientToken=hashlib.sha256(
-                               f"{harness_full_id}-{fallback}".encode()).hexdigest()[:40])
-        for _ in range(24):  # wait READY (~15s typical)
-            if ctl.get_harness(harnessId=harness_full_id)["harness"]["status"] == "READY":
-                break
-            time.sleep(5)
+        _set_harness_model(ctl, harness_full_id, model, fallback, wait_ready=True)
+        # Parked BEFORE the event so a crash between the two still restores.
+        c["_failover"] = {"ctl": ctl, "harness_full_id": harness_full_id,
+                          "model": model, "from_model": current, "to_model": fallback}
+        _record_failover(c, event, harness_full_id, current, fallback, restored=False)
         # ModelFailedOver, NOT EscalatedToHuman. Nothing is being escalated: the
         # failover already fixed it and the retry continues. This carried the word
         # "informational" inside a reason string, which was harmless only while the bus
@@ -1076,6 +1309,38 @@ def _maybe_failover_model(c, event) -> None:
                       "informational, pipeline continuing"}, client=c["events"])
     except Exception:  # noqa: BLE001 — never let failover break the retry path
         pass
+
+
+def _restore_failover_model(c, event) -> None:
+    """Put a failed-over harness back on its declared model.
+
+    Called from handler()'s finally, so it runs on every exit -- settled, raised, or
+    self-reinvoked. A self-reinvoke that needs the fallback again will 5xx again and
+    fail over again, which costs one more swap and keeps the invariant that the fleet
+    converges back to what agents/*/harness.json declares. The alternative -- carrying
+    the swap forward across invocations -- is the unbounded version, and unbounded is
+    what the bug was.
+    """
+    swap = c.pop("_failover", None)
+    if not swap:
+        return
+    try:
+        _set_harness_model(swap["ctl"], swap["harness_full_id"], swap["model"],
+                           swap["from_model"], wait_ready=False)
+        _record_failover(c, event, swap["harness_full_id"], swap["to_model"],
+                         swap["from_model"], restored=True)
+        ev.emit_event(os.environ["EVENT_BUS"], ev.MODEL_FAILED_OVER, {
+            "run_id": event.get("run_id", "?"), "stage": event.get("stage", "?"),
+            "from_model": swap["to_model"], "to_model": swap["from_model"],
+            "reason": f"ModelFailover restored: {swap['to_model']} -> "
+                      f"{swap['from_model']} (temporary failover ended); "
+                      "informational, pipeline continuing"}, client=c["events"])
+    except Exception as exc:  # noqa: BLE001 — the stage is already settled by here
+        # Loud, because the fleet is now pointing somewhere it does not declare and
+        # the run row's model_failover record is the only other witness.
+        print(f"[driver] FAILOVER NOT RESTORED: {swap['harness_full_id']} is still on "
+              f"{swap['to_model']}, declared {swap['from_model']}: "
+              f"{type(exc).__name__}: {exc}")
 
 
 RE_ASK = ("Your turn ended without an inline-function call. If your task is "
@@ -1133,6 +1398,12 @@ def handler(event, context=None, clients=None):
         _backstop_page(c, event, {"status": "crashed",
                                   "reason": f"{type(exc).__name__}: {exc}"[:500]})
         raise
+    finally:
+        # A model failover is scoped to THIS invocation. In `finally` because every
+        # other exit here is already accounted for by name -- settled, crashed,
+        # self-reinvoked -- and a restore placed at any one of them would have to be
+        # repeated at the rest, which is the reasoning _backstop_page above records.
+        _restore_failover_model(c, event)
 
 
 def _run_stage(event, context=None, c=None):
@@ -1142,6 +1413,37 @@ def _run_stage(event, context=None, c=None):
                "params": {"task": event["task"], **(event.get("params") or {})}}
     if event.get("task_token"):
         payload["params"]["iteration"] = event.get("iteration", 0)
+
+    # The models the SIGNED plan approved, under the param names the prompts read.
+    #
+    # An extra S3 GET per stage (~10ms) rather than trusting the dispatch event: the
+    # manifest is where start-pipeline recorded the resolved consent, and the event is
+    # authored by whatever dispatched this stage. A caller-supplied value still wins,
+    # because a remediation iteration may legitimately override -- but it can no longer
+    # be the DEFAULT, which is how "params.teacher_model_id" came to mean "whatever
+    # model the persona line happens to name".
+    #
+    # The same read also carries forward what EARLIER STAGES OF THIS RUN discovered --
+    # `params.student_endpoint` from the deploy stage's reported `endpoint_name`. One GET
+    # serves both: two reads of one object would be a second failure surface for the same
+    # fact, and could hand one stage a manifest the other did not see.
+    #
+    # Caller-supplied values win over both, and the run's own facts win over nothing. The
+    # precedence is deliberate and only looks arbitrary: `approved` and `facts` cannot
+    # collide (a signed model role is not a runtime endpoint), so their order between
+    # themselves is unobservable, and putting the dispatch event last preserves the
+    # remediation override that `model_params_from_manifest` was written for.
+    try:
+        manifest = _load_manifest(c["s3"], event["manifest_uri"])
+        approved = model_params_from_manifest(manifest)
+        facts = stage_fact_params(manifest)
+        payload["params"] = {**approved, **facts, **payload["params"]}
+    except Exception as exc:  # noqa: BLE001
+        # Not fatal: stages that need no model (deploy smoke tests, monitor sweeps) must
+        # not be blocked by a manifest read. The stage that DOES need one will fail on
+        # the absent param, which is the visible failure a silent default replaced.
+        print(f"[driver] could not read approved models or prior-stage facts from the "
+              f"manifest ({type(exc).__name__}: {exc}) -- continuing without them")
 
     # Session epoch: which incarnation of this stage's session we are on. Travels in
     # the event so every resumption path (self-reinvoke, resurrector wake) recomputes

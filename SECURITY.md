@@ -32,7 +32,10 @@ documentation example ID, used only in offline dry-run usage examples).
 - **Least-privilege IAM only** — every role in `deploy/iam/` is resource-scoped;
   no `*FullAccess` managed policies anywhere.
 - **VPC isolation** — `deploy/02_network.py` builds a dedicated VPC with no internet
-  gateway and all AWS dependencies via VPC endpoints. VPC-mode *harness* variants are
+  gateway, and can reach every AWS dependency through VPC endpoints. The 11 billed
+  *interface* endpoints are skipped by default because nothing routes through them yet
+  (`--force-unused-endpoints` overrides); the free S3 and DynamoDB gateway endpoints are
+  always built. VPC-mode *harness* variants are
   **not built yet**; their skill-mirror prerequisite is now met — all 19 skill sources
   are `s3`, a pinned snapshot under `skills/` that a VPC-mode harness can reach over the
   S3 endpoint, fetched with `GetObject` + `ListBucket` and no write. Nothing reads GitHub

@@ -22,6 +22,7 @@ Usage:
   python deploy/05_harnesses.py --region us-east-1 --agent data-prep --prod  # harness.prod.json
 """
 import argparse
+import datetime
 import json
 import pathlib
 import secrets
@@ -72,6 +73,45 @@ def ensure_env(cfg):
     env = cfg.setdefault("environmentVariables", {})
     env.setdefault("OTEL_TRACES_SAMPLER", "always_on")
     return cfg
+
+
+#: Where the console reads the "spans exist from here on" cutoff.
+SPANS_SINCE_PARAM = "/llmops/observability/spans_since"
+
+
+def ensure_spans_since(ssm, now=None):
+    """Record when always_on tracing first became true here, once, and never again.
+
+    The console filters batch-eval and insights to runs created after this timestamp,
+    because a session with no spans cannot be scored and scoring it produces a "failed
+    session" that is really a missing measurement. Its value was a literal in TWO places
+    (`deploy/console/deploy.sh` and `lambda_function.py`), naming the hour tracing was
+    switched on in THIS account -- correct here, wrong for every other deployment, and
+    wrong in the direction that hides the problem: a fresh deployment's runs are all
+    NEWER than 2026-07-28, so they pass the filter, get scored, and come back as failed
+    sessions with no hint that the cutoff is the reason.
+
+    So it is written by the step that CAUSES the fact -- ensure_env sets
+    OTEL_TRACES_SAMPLER=always_on right here -- rather than transcribed by a human into a
+    deploy script. `Overwrite=False`: the first deploy is when spans start, and a later
+    redeploy must not move the cutoff forward over runs that do have spans. An existing
+    value is the answer, not a conflict, so ParameterAlreadyExists is success.
+    """
+    stamp = now or datetime.datetime.now(datetime.timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ")
+    try:
+        ssm.put_parameter(Name=SPANS_SINCE_PARAM, Value=stamp, Type="String",
+                          Description="UTC time OTEL_TRACES_SAMPLER=always_on was first "
+                                      "deployed; the console scores no run older",
+                          Overwrite=False)
+        print(f"  ssm {SPANS_SINCE_PARAM} = {stamp} (first always_on deploy)")
+        return stamp
+    except Exception as exc:  # noqa: BLE001 — already set is the normal case, not an error
+        if "ParameterAlreadyExists" not in str(type(exc).__name__) + str(exc):
+            raise
+        got = ssm.get_parameter(Name=SPANS_SINCE_PARAM)["Parameter"]["Value"]
+        print(f"  ssm {SPANS_SINCE_PARAM} = {got} (already set; left alone)")
+        return got
 
 
 def existing_harness(ctl, name):
@@ -412,6 +452,9 @@ def main():
         if not args.dry_run:
             ssm.put_parameter(Name=f"/llmops/harness/{agent}", Value=res["harness_id"],
                               Type="String", Overwrite=True)
+
+    if not args.dry_run:
+        ensure_spans_since(ssm)
 
     print(json.dumps({"results": results, "prod": args.prod, "dry_run": args.dry_run}, indent=2))
 

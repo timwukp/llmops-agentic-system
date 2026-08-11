@@ -88,11 +88,13 @@ Key design decisions (full rationale in [docs/ARCHITECTURE.md](docs/ARCHITECTURE
   it launches, calls `job_launched`, and the pipeline resumes in a fresh session via
   `waitForTaskToken` + an EventBridge SageMaker state-change rule. State lives in the
   S3 manifest, never in the session.
-- **Enterprise posture** — least-privilege IAM throughout; the VPC with interface
-  endpoints (no internet egress) is built by `deploy/02_network.py`. VPC-mode harness
-  variants and the S3 skill mirror they require are **not built yet**: a VPC-mode
-  harness cannot resolve a `git` skill source, so the mirror is a prerequisite, not a
-  refinement.
+- **Enterprise posture** — least-privilege IAM throughout; the VPC (no internet egress,
+  no NAT) is built by `deploy/02_network.py`. VPC-mode harness variants and the S3 skill
+  mirror they require are **not built yet**: a VPC-mode harness cannot resolve a `git`
+  skill source, so the mirror is a prerequisite, not a refinement. Because nothing routes
+  through them yet, the script now **skips the 11 billed interface endpoints by default**
+  — they were being provisioned for no consumer at $5.28/day, under a cost note that said
+  $2.64 because it counted endpoints and not Availability Zones.
 
 ## Why the agents can carry the routine work themselves: three layers, not one model
 

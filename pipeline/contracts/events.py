@@ -99,6 +99,49 @@ EVENTS_NEEDING_A_RULE: dict = {
         "an escalated run waits for a human who was never told"),
 }
 
+#: The other half of the classification: detail-types that are deliberately fire-and-forget,
+#: each with the reason nothing is scheduled off it.
+#:
+#: This exists because ABSENCE RECORDS NOTHING. The comment above used to say a detail-type
+#: missing from EVENTS_NEEDING_A_RULE was "fire-and-forget by decision" -- but an oversight
+#: is also missing from it, and the two are indistinguishable, which is the same
+#: "no rule vs rule missing" ambiguity one level up. DriftDetected is the case in point: it
+#: is an accusation about a deployed model, it was emitted by nothing for the platform's
+#: whole life, it now has a real emitter, and nothing consumes it. Whether that is right is
+#: a judgement -- but it has to be a RECORDED one.
+#:
+#: A test asserts every event in ALL_EVENTS appears in exactly one of the two dicts, so a
+#: newly added detail-type cannot default into silence: the author has to say which it is.
+EVENTS_FIRE_AND_FORGET: dict = {
+    PIPELINE_STARTED: "console timeline and audit trail; the state machine drives the run",
+    DATASET_GENERATED: "timeline; the next state is dispatched by the state machine",
+    DATASET_CURATED: "timeline; the state machine dispatches FinetuneLaunch next",
+    TRAINING_STARTED: "timeline; the SageMaker rule (default bus) drives the resume",
+    MODEL_TRAINED: "timeline; resume_pipeline settles the task token directly",
+    MODEL_EVALUATED: "timeline; EvalGate reads the report, not the event",
+    QUALITY_GATE_PASSED: "timeline; the state machine branches on the gate itself",
+    QUALITY_GATE_FAILED: "timeline; RemediationChoice branches in-machine",
+    MODEL_REGISTERED: "timeline and audit trail",
+    MODEL_DEPLOYED: "timeline and audit trail",
+    SMOKE_TEST_PASSED: "timeline and audit trail",
+    ENDPOINT_DELETED: "cost audit trail; the sweep reports, the deploy agent acts",
+    DRIFT_DETECTED: (
+        "REVIEW: emitted by a monitor:health finding, consumed by nothing. A rule routing "
+        "it to the conductor would be defensible, but a drift signal whose cause the agent "
+        "could not determine is exactly what the monitor prompt sends to escalate_human "
+        "instead -- so routing this too would page twice for one finding. Left "
+        "fire-and-forget deliberately, pending a rollback policy worth triggering "
+        "automatically; move it to EVENTS_NEEDING_A_RULE when there is one"),
+    MODEL_FAILED_OVER: "informational by construction; the run self-healed and continues",
+    OWNER_PAGED: "the page IS the delivery (SNS); a rule would re-triage a finished triage",
+    CAPACITY_STOPPED: "informational; the state machine relaunches without an iteration",
+    DRIVER_RESURRECTED: "informational; the resurrector escalates on its own past its cap",
+    PIPELINE_COMPLETED: "timeline and audit trail; nothing downstream is scheduled",
+    PIPELINE_FAILED: (
+        "timeline; the FAILING path already escalates through EscalateFail, which emits "
+        "EscalatedToHuman -- the routed one"),
+}
+
 #: For each detail-type an EventBridge rule may deliver straight to a Lambda, the name of
 #: the function in that Lambda's handler that translates the bus envelope into the
 #: payload the handler actually runs on.

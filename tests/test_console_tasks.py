@@ -3004,9 +3004,14 @@ def test_the_session_routes_are_the_only_unauthenticated_posts(console):
     check is CORRECT — which makes it the easiest place for a fourth route to be added
     above it by accident and become an unauthenticated write."""
     src = (REPO / "deploy/console/lambda_function.py").read_text()
-    pre_auth = src.split("if user is None")[0]
-    # everything from the body parse to the auth check: the unauthenticated zone
-    zone = pre_auth[pre_auth.index('raw = event.get("body")'):]
+    # Everything from the body parse to the POST auth check: the unauthenticated zone.
+    # The END is anchored on the POST chokepoint itself, not on the first `if user is
+    # None` — the consult-READ gate above it has one of those too, so splitting on the
+    # first match truncated this zone to nothing. That raised rather than passing, but
+    # only because the expected set is pinned; an empty zone with a subset assertion
+    # would have read as "no unauthenticated POSTs at all".
+    start = src.index('raw = event.get("body")')
+    zone = src[start:src.index('if method == "POST":\n', start)]
     paths = set(re.findall(r'path == "(/api/[^"]+)"', zone))
     assert paths == {"/api/login", "/api/refresh", "/api/refresh/revoke"}, \
         f"unauthenticated POST routes drifted: {sorted(paths)}"
@@ -3018,6 +3023,107 @@ def test_a_non_session_post_is_unaffected_by_the_cookie(auth):
     have quietly become a second credential on every write route."""
     r = _post(auth.console, "/api/tasks", {"goal": "x"}, cookies=["llmops_rt=refresh-1"])
     assert r["statusCode"] == 401
+
+
+class _CognitoGroups:
+    """GetUser plus a per-user group list, so 401 and 403 are separable outcomes.
+
+    A double that only answered "valid / invalid" could not tell the two apart, and the
+    difference is the whole reason the read gate calls `_user_may_task` as well as
+    `_authed_user`: a token proves who you are, not that you may read a customer's thread.
+    """
+
+    def __init__(self, groups=("llmops-datascience",)):
+        self.groups = list(groups)
+
+    def get_user(self, AccessToken):
+        if AccessToken != "good-token":
+            raise RuntimeError("NotAuthorizedException")
+        return {"Username": "alice"}
+
+    def admin_list_groups_for_user(self, **kw):
+        return {"Groups": [{"GroupName": g} for g in self.groups]}
+
+
+def _get(console, path, token=None):
+    """Drive handler() with a GET, the way API Gateway does."""
+    ev = {"requestContext": {"http": {"method": "GET", "path": path,
+                                      "sourceIp": "10.0.0.9"}},
+          "headers": {"authorization": f"Bearer {token}"} if token else {}}
+    return console.handler(ev, None)
+
+
+#: Every consult read, as (path, what an anonymous caller would have been handed).
+CONSULT_READS = [
+    ("/api/tasks", "every thread's goal, created_by, cost estimate and plan summary"),
+    ("/api/tasks/task-1", "the whole DynamoDB item: the customer's transcript"),
+    ("/api/tasks/task-1/approval", "approved_by, cognito_sub and source_ip"),
+    ("/api/tasks/task-1/readiness", "the customer's data description from plan.json"),
+]
+
+
+@pytest.mark.parametrize("path,leaked", CONSULT_READS)
+def test_an_anonymous_consult_read_is_refused(console, monkeypatch, path, leaked):
+    """Driven through handler(), because a source-text guard cannot prove the 401 lands.
+
+    All four of these returned 200 to a caller with no credentials at all, on a public API
+    Gateway URL, for the platform's whole life -- the auth chokepoint was keyed on the HTTP
+    METHOD (`if method == "POST"`), so the design property the docs boasted ("adding a
+    route cannot accidentally add an unauthenticated write") was true and beside the point.
+    """
+    monkeypatch.setattr(console, "cognito", _CognitoGroups())
+    monkeypatch.setattr(console, "COGNITO_POOL_ID", "us-east-1_test")
+    r = _get(console, path)
+    assert r["statusCode"] == 401, (
+        f"GET {path} returned {r['statusCode']} to an anonymous caller, handing over "
+        f"{leaked}")
+
+
+@pytest.mark.parametrize("path,_leaked", CONSULT_READS)
+def test_a_valid_token_outside_the_group_gets_403_not_401(console, monkeypatch, path,
+                                                          _leaked):
+    """Authentication is not authorisation, and the two codes must not be merged.
+
+    An operator provisioned only to watch the Pipeline tab has a perfectly valid token.
+    401 would send them round a re-login that cannot help; it also would not be true.
+    """
+    monkeypatch.setattr(console, "cognito", _CognitoGroups(groups=()))
+    monkeypatch.setattr(console, "COGNITO_POOL_ID", "us-east-1_test")
+    r = _get(console, path, token="good-token")
+    assert r["statusCode"] == 403, (
+        f"GET {path} answered {r['statusCode']} for a valid token with no consultation "
+        "group membership; 403 is the honest code and the frontend routes it differently")
+
+
+def test_the_operational_read_plane_stays_public(console, monkeypatch):
+    """The fix must not gate the tabs an operator opens fifty times a day.
+
+    Named individually rather than asserted as "everything else": a gate that crept onto
+    the operational reads would be a regression in the opposite direction, and the reason
+    those are public -- already-reconciled fact, all of it in the diagrams -- is a
+    different argument from the one that protects a customer's conversation.
+    """
+    monkeypatch.setattr(console, "cognito", _CognitoGroups())
+    monkeypatch.setattr(console, "COGNITO_POOL_ID", "us-east-1_test")
+    for path in ("/api/overview", "/api/pipeline", "/api/observability",
+                 "/api/cost-overview", "/api/evaluations"):
+        r = _get(console, path)
+        assert r["statusCode"] != 401, f"GET {path} is meant to be public, got 401"
+        assert r["statusCode"] != 403, f"GET {path} is meant to be public, got 403"
+
+
+def test_a_consult_read_with_a_good_token_and_group_is_served(console, monkeypatch):
+    """The gate must let the legitimate reader through — otherwise the Tasks tab is dead.
+
+    A 401/403-only suite would pass against a gate that refused everyone, which is the
+    other way to make this feature "secure".
+    """
+    monkeypatch.setattr(console, "cognito", _CognitoGroups())
+    monkeypatch.setattr(console, "COGNITO_POOL_ID", "us-east-1_test")
+    r = _get(console, "/api/tasks", token="good-token")
+    assert r["statusCode"] == 200, (
+        f"a datascience-group member was refused the thread list ({r['statusCode']}); the "
+        "gate is now denying the people it exists to admit")
 
 
 def test_cookies_are_absent_from_responses_that_set_none(auth):
@@ -4229,8 +4335,13 @@ def test_the_panel_does_not_refetch_the_plan_on_every_poll():
     guard = [ln for ln in body.splitlines() if re.search(r"if \(key === READY_KEY\)", ln)]
     assert guard, f"no cache check against READY_KEY: {body}"
     assert "return" in guard[0], f"the cache check does not skip the fetch: {guard[0]}"
-    # and the fetch must come AFTER it, or the check saves nothing
-    assert body.index("if (key === READY_KEY)") < body.index("fetch(")
+    # and the request must come AFTER it, or the check saves nothing. Matched on either
+    # spelling: the consult reads went through authGet() when the plane stopped being
+    # anonymous, and a guard anchored on the bare word `fetch(` would have raised
+    # ValueError on the rename rather than checking anything.
+    req = min((body.index(c) for c in ("authGet(", "fetch(") if c in body), default=-1)
+    assert req > 0, f"loadReadiness makes no request at all: {body}"
+    assert body.index("if (key === READY_KEY)") < req
     assert "plan_uri" in body and "status" in body, \
         "the cache key must include what can change the answers"
 

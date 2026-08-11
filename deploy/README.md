@@ -22,7 +22,7 @@ time from `sts get-caller-identity` and are never committed to the repo.
 | # | Script | What it creates | When |
 |---|--------|-----------------|------|
 | 01 | `01_iam.py` | 6 roles: `llmops-harness-execution`, `llmops-sagemaker-execution`, `llmops-lambda-{driver,start,resume,webhook}` + inline policies; SSM `/llmops/iam/*` | always, first |
-| 02 | `02_network.py` | dedicated VPC, 2 private subnets, SGs, gateway + interface VPC endpoints; SSM `/llmops/network/*` | **prod only** (dev harnesses use PUBLIC network mode) |
+| 02 | `02_network.py` | dedicated VPC, 2 private subnets, SGs, gateway endpoints, SSM `/llmops/network/*` — all free. The 11 **billed** interface endpoints are skipped unless something routes through them (`--force-unused-endpoints` overrides) | **prod only** (dev harnesses use PUBLIC network mode) |
 | 03 | `03_storage.py` | S3 data bucket (versioned, SSE-S3, public-access-block, `runs/` 90-day lifecycle), DDB `llmops-pipeline-runs` + `llmops-stage-events`, EventBridge bus `llmops-pipeline`, SNS `llmops-escalations`; SSM `/llmops/storage/*` | always |
 | 04 | `04_wire_memory.py` | shared BYO AgentCore Memory (SEMANTIC+EPISODIC), attach to every harness, per-Memory IAM grant; SSM `/llmops/memory/*` | after 05 creates harnesses (re-run to attach new ones) |
 | 05 | `05_harnesses.py` | all 7 harnesses from `agents/*/harness.json`; injects `OTEL_TRACES_SAMPLER=always_on`. `--prod` reads `harness.prod.json`, which **no agent has yet** (VPC-mode variants are unbuilt and need the S3 skill mirror first); SSM `/llmops/harness/*` | after 01/03 (and 02 for prod) |
@@ -45,9 +45,18 @@ environment and harness configs without touching AWS state.
 ## Teardown notes
 
 Reverse order. Nothing here bills meaningfully while idle **except** the interface VPC
-endpoints from step 02 (~$0.01/hr each) — drop them anytime with
+endpoints from step 02 — drop them anytime with
 `02_network.py --region us-east-1 --destroy` (gateway endpoints, subnets and the VPC
 itself are free and are kept).
+
+They bill **$0.01/hr each *per Availability Zone***, not per endpoint: `SubnetIds` creates
+one endpoint network interface per subnet and the ENI is the billed unit, so 11 services
+across 2 subnets is **22** billed endpoint-hours per hour, ~**$5.28/day**. The script used
+to print ~$2.64/day — the one-AZ answer — which is why `02_network.py` now derives the
+figure from `len(INTERFACE_SERVICES) × len(subnet_ids)`. It also **skips the 11 interface
+endpoints by default**, because nothing in this repo routes through them yet (no
+non-`PUBLIC` harness config, no Lambda with `VpcConfig`); everything free is still built,
+and `--force-unused-endpoints` overrides.
 
 - **SageMaker endpoints** are the real cost risk: they are created/deleted by the
   pipeline itself, so after any aborted run check `aws sagemaker list-endpoints` for
