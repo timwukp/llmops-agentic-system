@@ -231,6 +231,14 @@
         },
         {
           "ErrorEquals": [
+            "TrainingJobFailed"
+          ],
+          "ResultPath": "$.error",
+          "Comment": "A FAILED eval inference job is an inference-code defect, not a model defect -- so it re-enters THIS state (the eval agent diagnoses its own failed job and fixes its own code), never RemediateFinetune, which re-trains: found live on run-20260811T040003Z-3548116f, where retraining could not have removed the quotes an SDK-encoded hyperparameter carried into the final put_object.",
+          "Next": "RemediationChoiceEval"
+        },
+        {
+          "ErrorEquals": [
             "States.ALL"
           ],
           "ResultPath": "$.error",
@@ -717,6 +725,30 @@
         }
       ],
       "Next": "Fail"
+    },
+    "RemediationChoiceEval": {
+      "Type": "Choice",
+      "Comment": "Same self-iteration budget as RemediationChoice, but the eval loop re-enters EvalGenerate: the failure being remediated lives in the eval agent's own inference code, and the finetune loop's RemediateFinetune would spend GPU money re-training a model that is not the problem.",
+      "Choices": [
+        {
+          "Variable": "$.iteration",
+          "NumericLessThan": 3,
+          "Next": "IncrementIterationEval"
+        }
+      ],
+      "Default": "EscalateFail"
+    },
+    "IncrementIterationEval": {
+      "Type": "Pass",
+      "Comment": "State-replacing Pass, same contract obligations as IncrementIteration (the handback guard derives over every such Pass, so this one is under it from birth).",
+      "Parameters": {
+        "run_id.$": "$.run_id",
+        "manifest_uri.$": "$.manifest_uri",
+        "pipeline_mode.$": "$.pipeline_mode",
+        "task_id.$": "$.task_id",
+        "iteration.$": "States.MathAdd($.iteration, 1)"
+      },
+      "Next": "EvalGenerate"
     }
   }
 }

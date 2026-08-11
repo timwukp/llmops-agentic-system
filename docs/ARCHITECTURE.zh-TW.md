@@ -535,6 +535,13 @@ directive 送達的通道。升級只留給「沒有任何人類答案能讓這�
 預算耗盡 → `EscalateFail`。同一預算也寫進 agent 的任務 prompt（「診斷、修正、重試 ——
 最多 3 次；然後 `escalate_human`」），機器層與 agent 層的預算一致。
 
+另有**第二條、完全獨立的迴路**處理 eval *推理 job* 本身的失敗（在
+run-20260811T040003Z-3548116f 上實地發現）：`EvalGenerate` Catch `TrainingJobFailed` →
+`RemediationChoiceEval`（共用同一個 `iteration < 3` 預算）→ `IncrementIterationEval` →
+回到 `EvalGenerate` 自己。它刻意**不**接進 finetune 迴路：那條迴路會重新訓練,而推理
+腳本的缺陷 —— 實例是生讀了被 SDK JSON 編碼的 hyperparameter —— 重訓多少次都治不好。
+eval agent 重新進場、讀自己那個失敗 job 的 `FailureReason`、修自己的程式碼、重新 launch。
+
 迴路最好的證據是它的誠實邊界（Phase 5，第 5 輪運行）：eval agent 回報
 `FAIL_CLOSED_NO_INPUT`（2 樣本規模不存在質量信號），狀態機正確地武裝了
 `RemediateFinetune` —— 而 finetune agent 回答

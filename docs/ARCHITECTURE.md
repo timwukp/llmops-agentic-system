@@ -630,6 +630,14 @@ Budget exhausted → `EscalateFail`. The same budget appears inside the agents' 
 prompts ("diagnose, fix, retry — max 3; then `escalate_human`"), so the machine-level
 and agent-level budgets agree.
 
+A **second, disjoint loop** covers a failed eval *inference job* (found live on
+run-20260811T040003Z-3548116f): `EvalGenerate` catches `TrainingJobFailed` →
+`RemediationChoiceEval` (same `iteration < 3` budget) → `IncrementIterationEval` →
+back into `EvalGenerate` itself. It deliberately does **not** join the finetune loop:
+that loop re-trains, and an inference-script defect — the live case was an SDK-encoded
+hyperparameter read raw — is not curable by retraining. The eval agent re-enters, reads
+its own failed job's `FailureReason`, fixes its own code, and relaunches.
+
 The loop's honest edge case is its best evidence (Phase 5, run 5): the eval agent
 returned `FAIL_CLOSED_NO_INPUT` (no quality signal exists at 2-sample scale), the machine
 correctly armed `RemediateFinetune` — and the finetune agent answered
