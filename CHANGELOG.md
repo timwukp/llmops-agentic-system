@@ -5,6 +5,27 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
 ## [Unreleased]
 
+### Teardown was asymmetric by permission, and the sweep could not see what it orphaned
+
+The deploy prompt has always commanded "delete the student endpoint and endpoint config"
+— but only `DeleteEndpoint` was ever granted. Prompt-commanded, role-forbidden: the same
+shape as the resume role's missing `PutEvents`, unreached only because no run has yet
+arrived at teardown. An endpoint deleted without its config and model is precisely how
+the orphans accumulate — and the monitor could not see them either: it self-reported
+`ListEndpointConfigs` and `ListModels` denials for 8 consecutive days, on its own
+initiative, with no prompt task covering those resource types.
+
+Fixed along the role's own established argument (enumerate account-wide, mutate only
+llmops-*, report rather than delete):
+* `SageMakerLifecycleScoped` gains `DeleteEndpointConfig` + `DeleteModel` (llmops-* only);
+  the deploy teardown prompt now names all three deletions as CLIs, which brings them
+  under the prompt-to-role guard — the prose phrasing had kept them invisible to it.
+* `SageMakerList` gains `ListEndpointConfigs` + `ListModels`; the monitor's sweep now
+  covers configs and models whose endpoint no longer exists (report, never delete).
+* Four new `_CLI_TO_IAM` mappings, demanded by the guard itself before the suite would
+  pass — an unmapped command is an unchecked permission.
+
+
 ### The shared memory injected another run's conclusions into every invocation as bare fact
 
 `llmops_shared_memory`'s semantic namespace (`/users/{actorId}/facts`) is keyed by
