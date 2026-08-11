@@ -2916,7 +2916,9 @@ case("docs: the escalate row calls the terminal exit a pause (zh-TW)",
 
 _RESOLVER = "orchestration/start_pipeline/handler.py"
 _DRIVER = "orchestration/harness_driver/handler.py"
+_REPORT = "pipeline/contracts/report.py"
 _D = "tests/test_orchestration.py::TestConductorDispatch"
+_CON = "tests/test_orchestration.py::TestContracts"
 
 
 # 154. The resolver reads only the nested `models` block again -- the original bug. The
@@ -3747,6 +3749,41 @@ case("driver: every triage heartbeat is logged as a failure for refusing by desi
      _DRIVER, m200,
      [f"{_DRV}::test_a_triage_heartbeat_is_refused_by_design_and_says_nothing"])
 
+# 201-202. Bug #27: `outputs` sent as a JSON STRING skipped verification entirely.
+#      `verify_outputs` head_objects every element that startswith("s3://"); a one-element
+#      list holding the text '["s3://a", "s3://b"]' starts with '[', so nothing inside it was
+#      ever checked and the stage passed verification having proved nothing. `metrics` had
+#      had the JSON-string parse since the contract was written -- outputs, the field with a
+#      security consequence, did not.
+
+# 201. The list parse is removed, restoring production: the string is wrapped as a single
+#      element again. Every other normalize test stays green because they all pass a real
+#      list or a bare URI -- the two shapes that were never broken.
+def m201(t):
+    old = ("        if isinstance(parsed, list):\n"
+           "            outputs = parsed\n")
+    assert t.count(old) == 1, f"the outputs list-parse has moved; found {t.count(old)}"
+    return t.replace(old, "        if False:\n            outputs = parsed\n", 1)
+
+
+case("contracts: outputs sent as a JSON string bypass s3 verification entirely",
+     _REPORT, m201,
+     [f"{_CON}::test_outputs_sent_as_a_json_string_are_still_verified"])
+
+# 202. The JSON-scalar unwrap is removed. '"s3://b/x"' keeps its leading quote, which also
+#      fails startswith("s3://") -- the identical vacuous check one layer down. Fixing only
+#      the list case would have left this reachable, and no functional test can see it
+#      because the run still completes either way.
+def m202(t):
+    old = ("        elif isinstance(parsed, str):\n"
+           "            outputs = [parsed]\n")
+    assert t.count(old) == 1, f"the outputs scalar-unwrap has moved; found {t.count(old)}"
+    return t.replace(old, "        elif False:\n            outputs = [parsed]\n", 1)
+
+
+case("contracts: a JSON-quoted single URI keeps its quote and is never verified",
+     _REPORT, m202,
+     [f"{_CON}::test_a_json_quoted_single_uri_is_unwrapped_before_verification"])
 
 #: Where the pristine text of the file currently mutated is parked, so a kill -9 -- which
 #: no handler can intercept -- still leaves the original recoverable. Under the repo root

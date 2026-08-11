@@ -5,6 +5,24 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
 ## [Unreleased]
 
+### `outputs` sent as a JSON string bypassed S3 verification entirely — trust-but-verify defeated by a type
+
+`verify_outputs` `head_object`s every element that `startswith("s3://")`. A one-element list
+holding the string `'["s3://…/generated.jsonl", "s3://…/manifest.json"]'` starts with `[`, so
+it was **skipped** and the stage passed verification having proved nothing — an agent could
+claim outputs that do not exist and be believed, which is precisely what the `head_object`
+exists to stop. Measured live on rehearsal `run-20260811T005043Z-320cc47e`, whose `data-prep`
+manifest entry recorded exactly that shape. Those two objects *did* exist, so the run was
+honest and the check was still vacuous.
+
+`normalize_stage_complete` now parses a JSON-encoded list before the scalar wrap (`metrics`
+had had that parse since the contract was written; `outputs`, the field with a security
+consequence, did not), and unwraps a JSON-encoded scalar — `'"s3://b/x"'` kept its quote in
+front of the scheme, the identical vacuous check one layer down. A bare unquoted URI is not
+valid JSON, so it still lands in the `except` branch and is wrapped as before; a dict or
+number keeps its original text, because an invented claim that then passes `head_object` is
+worse than a legible one that is never checked.
+
 ### The deadline handoff needed a chunk in order to notice that no chunk was coming — 825 of every 900 seconds had no working escape hatch
 
 The driver has two protections against the Lambda wall arriving mid-stream. On rehearsal
