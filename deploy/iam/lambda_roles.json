@@ -255,6 +255,16 @@
             "Resource": "arn:aws:dynamodb:<REGION>:<ACCOUNT_ID>:table/llmops-pipeline-runs"
           },
           {
+            "_comment": "The non-run half (#37): triages beat into the events table's __liveness__ partition because the runs table must not hold rows for invocations that are not runs (a minted row carrying driver_beat_at is a resurrectable ghost). Query, not Scan -- the sweep reads exactly one partition key and must never pay for (or depend on) the shape of real stage events; UpdateItem is the same conditional claim the runs half makes.",
+            "Sid": "FindAndClaimStaleLivenessBeats",
+            "Effect": "Allow",
+            "Action": [
+              "dynamodb:Query",
+              "dynamodb:UpdateItem"
+            ],
+            "Resource": "arn:aws:dynamodb:<REGION>:<ACCOUNT_ID>:table/llmops-stage-events"
+          },
+          {
             "Sid": "ReinvokeDriver",
             "Effect": "Allow",
             "Action": "lambda:InvokeFunction",

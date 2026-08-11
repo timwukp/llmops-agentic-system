@@ -7430,6 +7430,7 @@ def test_a_call_site_without_a_definition_does_not_satisfy_the_check():
 resurrector = _load("resurrector", "orchestration/resurrector/handler.py")
 
 RES_ENV = {"RUNS_TABLE": "llmops-pipeline-runs", "EVENT_BUS": "llmops-pipeline",
+           "EVENTS_TABLE": "llmops-stage-events",
            "DRIVER_FN": "llmops-harness-driver", "AWS_REGION": "us-east-1"}
 
 
@@ -8871,3 +8872,108 @@ def test_the_power_analysis_numbers_are_recomputable():
     # rule-of-3 upper bounds for the observed 0/40 and 0/80
     assert f"{3/40*100:.1f}%" in doc and f"{3/80*100:.1f}%" in doc, \
         "the observed-zero upper bounds drifted"
+
+
+# ── the non-run heartbeat and its resurrection (#37) ─────────────────────────────────
+# A triage runs under `triage-<subject>` and deliberately has no run row, so for as
+# long as the resurrector's only eye was the runs table, a dead triage was unrevivable:
+# the async self-reinvoke that Lambda dropped on 2026-08-08 for a RUN would, dropped
+# for a TRIAGE, leave the escalation unanswered forever with nothing whose job it was
+# to notice. Widening attribute_exists(run_id) was rejected -- a minted row carrying
+# driver_beat_at IS a resurrectable ghost run -- so the beat routes into EVENTS_TABLE's
+# dedicated `__liveness__` partition, and the resurrector reads that one partition.
+
+def test_the_two_liveness_partition_spellings_are_one():
+    """Driver and resurrector ship in separate bundles and each declares the constant;
+    same argument as the console's DIRECTIVE_SK pin."""
+    assert driver.LIVENESS_PK == resurrector.LIVENESS_PK
+
+
+class TestNonRunLivenessBeat:
+    def _triage_event(self):
+        ev_ = driver_event()
+        ev_["run_id"] = "triage-run-x"
+        ev_["stage"] = "orchestrator"
+        ev_["task"] = "triage"
+        ev_.pop("task_token", None)
+        return ev_
+
+    def test_a_triage_heartbeat_lands_in_the_liveness_partition(self):
+        c = clients(FakeAgentCore([text_stream("no verdict")] * 4))
+        driver.handler(self._triage_event(), clients=c)
+        beats = [i for i in c["ddb"].Table(os.environ["EVENTS_TABLE"]).items
+                 if i.get("run_id") == driver.LIVENESS_PK
+                 and i.get("sk") == "beat#triage-run-x"]
+        assert beats, ("the refused runs-table heartbeat was dropped instead of routed "
+                       "to __liveness__ -- a dead triage is unrevivable again")
+        payload = json.loads(beats[0]["payload"])
+        assert payload["run_id"] == "triage-run-x" and payload["stage"] == "orchestrator"
+        # ...and the terminal return marked it done, so the resurrector reads this
+        # ending as an ending, not as a death to revive (which would re-page a human).
+        assert str(beats[0].get("done_at") or ""), (
+            "a FINISHED triage's liveness item was left revivable -- the resurrector "
+            "would re-run it and page a second human about an answered question")
+
+    def test_a_run_with_a_row_writes_no_liveness_item(self):
+        uri = "s3://llmops-data-test/runs/run-test-1/raw/data.jsonl"
+        ac = FakeAgentCore([tool_use_stream("stage_complete", {"outputs": [uri]}),
+                            text_stream("ack")])
+        c = clients(ac, FakeS3(existing=[uri]))
+        ev_ = driver_event()
+        c["ddb"].Table(os.environ["RUNS_TABLE"]).items.append(
+            {"run_id": ev_["run_id"], "status": "running"})
+        driver.handler(ev_, clients=c)
+        strays = [i for i in c["ddb"].Table(os.environ["EVENTS_TABLE"]).items
+                  if i.get("run_id") == driver.LIVENESS_PK]
+        assert not strays, (
+            f"a run with a run row also beat into __liveness__: {strays} -- two "
+            "heartbeats for one invocation means two resurrectors can each claim one")
+
+
+def _liveness_item(subject="triage-run-x", minutes_old=45, **over):
+    at = (datetime.datetime.now(datetime.timezone.utc)
+          - datetime.timedelta(minutes=minutes_old)).isoformat()
+    item = {"run_id": resurrector.LIVENESS_PK, "sk": f"beat#{subject}",
+            "beat_at": at, "done_at": "",
+            "payload": json.dumps({"run_id": subject, "stage": "orchestrator",
+                                   "task": "triage", "harness_id": "llmops_orchestrator",
+                                   "manifest_uri": "", "iteration": 0})}
+    item.update(over)
+    return item
+
+
+class TestNonRunResurrection:
+    def _run(self, items, env_over=None):
+        env = {**RES_ENV, **(env_over or {})}
+        for k, v in env.items():
+            os.environ[k] = v
+        c = _res_clients([])
+        c["ddb"].Table(RES_ENV["EVENTS_TABLE"]).items.extend(items)
+        out = resurrector.handler({}, clients=c)
+        return out, c
+
+    def test_a_stale_liveness_beat_is_resurrected_with_its_own_payload(self):
+        out, c = self._run([_liveness_item()])
+        assert out["acted"] and out["acted"][0]["action"] == "resurrected"
+        assert out["acted"][0]["run_id"] == "triage-run-x"
+        sent = json.loads(c["lambda"].calls[0]["Payload"])
+        assert sent["run_id"] == "triage-run-x" and sent["task"] == "triage"
+        assert any(e["DetailType"] == ev.DRIVER_RESURRECTED
+                   for e in c["events"].entries)
+
+    def test_a_done_liveness_item_is_an_ending_not_a_death(self):
+        out, c = self._run([_liveness_item(done_at="2026-08-11T20:00:00+00:00")])
+        assert not out["acted"] and not c["lambda"].calls, (
+            "a triage that ENDED was resurrected -- it will re-run its verdict and "
+            "page a second human about an answered question")
+
+    def test_a_fresh_liveness_beat_is_left_alone(self):
+        out, c = self._run([_liveness_item(minutes_old=5)])
+        assert not out["acted"] and not c["lambda"].calls
+
+    def test_the_liveness_cap_escalates_instead_of_reviving_forever(self):
+        out, c = self._run([_liveness_item(resurrections=5)])
+        assert out["acted"] and out["acted"][0]["action"] == "escalated"
+        assert not c["lambda"].calls
+        assert any(e["DetailType"] == ev.ESCALATED_TO_HUMAN
+                   for e in c["events"].entries)

@@ -1668,6 +1668,34 @@ RE_ASK = ("Your turn ended without an inline-function call. If your task is "
           "list if nothing was produced).")
 
 
+#: The EVENTS_TABLE partition for non-run driver heartbeats (#37). The resurrector
+#: duplicates this constant (separate bundles); a test pins the two spellings together.
+LIVENESS_PK = "__liveness__"
+
+
+def _settle_liveness(c, event, result):
+    """Mark a non-run invocation's liveness item done on every terminal return.
+
+    One choke point instead of a mark at every terminal branch: the statuses that end
+    an invocation are exactly the ones that are not the between-turns handoff. Gated by
+    attribute_exists so a run-run (which has no liveness item) is a cheap no-op -- the
+    condition failure IS the branch. An exception path deliberately never reaches this
+    (handler re-raises first): a CRASHED invocation must stay revivable, that being the
+    entire point of the beat."""
+    if (result or {}).get("status") == "self_reinvoked_between_turns":
+        return
+    try:
+        c["ddb"].Table(os.environ["EVENTS_TABLE"]).update_item(
+            Key={"run_id": LIVENESS_PK,
+                 "sk": "beat#" + str(event.get("run_id") or "")},
+            UpdateExpression="SET done_at = :t",
+            ConditionExpression="attribute_exists(run_id)",
+            ExpressionAttributeValues={
+                ":t": datetime.now(timezone.utc).isoformat()})
+    except Exception:  # noqa: BLE001 — no item (a run-run) or a race; telemetry only
+        pass
+
+
 def handler(event, context=None, clients=None):
     """Run one stage, and never strand the task token on the way out.
 
@@ -1699,7 +1727,9 @@ def handler(event, context=None, clients=None):
         # every way a triage can end without answering -- prose after re-asks, an
         # unsupported tool, a rejected page, a stage_complete that decided nothing. A
         # check placed at any single one of those would have to be repeated at the rest.
-        return _backstop_page(c, event, _run_stage(event, context, c))
+        result = _run_stage(event, context, c)
+        _settle_liveness(c, event, result)
+        return _backstop_page(c, event, result)
     except Exception as exc:
         token = event.get("task_token")
         if token:
@@ -1866,11 +1896,13 @@ def _run_stage(event, context=None, c=None):
         describing correct behaviour. The same distinction was already reasoned out at
         _mark_run_escalated and simply never applied here.
 
-        The consequence beyond noise, stated so it is not mistaken for cosmetics: a triage
-        has no heartbeat, therefore nothing can resurrect a dead triage -- the resurrector
-        keys on driver_beat_at. That is a real gap, and it is a separate one; what belongs
-        here is not calling a by-design refusal a failure, so that the log line which does
-        mean "the beat is broken" still means it."""
+        The refusal is also the HANDOFF (#37): a non-run invocation still needs a
+        heartbeat somewhere, or nothing can resurrect a dead triage. The runs table is
+        the wrong somewhere -- a minted row carrying driver_beat_at is a resurrectable
+        ghost run -- so the rejected condition routes the same beat into EVENTS_TABLE
+        under the dedicated `__liveness__` partition, which the resurrector reads with
+        a Query. done_at is written by _settle_liveness on every terminal return, so a
+        finished triage's silence is an ending, not a death."""
         try:
             c["ddb"].Table(os.environ["RUNS_TABLE"]).update_item(
                 Key={"run_id": event["run_id"]},
@@ -1887,8 +1919,33 @@ def _run_stage(event, context=None, c=None):
                                      default=str)})
         except Exception as exc:  # noqa: BLE001 — the beat is telemetry, not the work
             if _is_condition_failure(exc):
-                return  # not a run row: no beat to write, and none wanted
+                _beat_liveness()  # not a run row: the beat belongs in __liveness__
+                return
             print(f"[driver] heartbeat write failed (continuing): "
+                  f"{type(exc).__name__}: {exc}")
+
+    def _beat_liveness():
+        """The non-run half of the heartbeat: one item per invocation identity in
+        EVENTS_TABLE's `__liveness__` partition. done_at is SET to empty here so a
+        recurring subject (the same escalation re-triaged later) comes back alive
+        after an earlier terminal mark; _settle_liveness writes the real timestamp."""
+        try:
+            c["ddb"].Table(os.environ["EVENTS_TABLE"]).update_item(
+                Key={"run_id": LIVENESS_PK,
+                     "sk": "beat#" + str(event.get("run_id") or "")},
+                UpdateExpression="SET beat_at = :t, payload = :p, done_at = :none",
+                ExpressionAttributeValues={
+                    ":t": datetime.now(timezone.utc).isoformat(),
+                    ":none": "",
+                    ":p": json.dumps({**{k: event[k] for k in
+                                         ("run_id", "stage", "task", "harness_id",
+                                          "manifest_uri", "task_token", "iteration")
+                                         if k in event},
+                                      "_session_epoch": epoch,
+                                      "_session_started_at": session_started_at},
+                                     default=str)})
+        except Exception as exc:  # noqa: BLE001 — still telemetry
+            print(f"[driver] liveness beat write failed (continuing): "
                   f"{type(exc).__name__}: {exc}")
 
     first_turn = True
