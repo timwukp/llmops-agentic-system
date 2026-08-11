@@ -3785,6 +3785,98 @@ case("contracts: a JSON-quoted single URI keeps its quote and is never verified"
      _REPORT, m202,
      [f"{_CON}::test_a_json_quoted_single_uri_is_unwrapped_before_verification"])
 
+# 203-207. Bug #28: the model TYPED the call instead of making one, so no structured reader
+#      could see it. #24's sibling and its opposite: there the runtime emitted a block the
+#      driver discarded, here the runtime emitted no block at all. One control per branch of
+#      the cure, because each branch is a different way to get this wrong -- and two of them
+#      (204, 205) fail SAFE-looking, i.e. the run still completes while the driver believes
+#      something it never verified.
+#
+# 203. The dispatch hook is deleted, restoring production exactly: a turn whose text is
+#      `<invoke name="job_launched">...` is prose. Live cost: rehearsal
+#      run-20260811T005043Z-320cc47e launched SageMaker job
+#      llmops-qlora-...-i0, confirmed it InProgress, wrote the manifest, then typed the
+#      signal twice -- stage failed MissingStageComplete while the job ran on to Completed
+#      (442 billable seconds) with no parked token, so nothing would ever have settled it.
+#      Measured: `tool=job_launched` appears ZERO times in 25 days of driver logs.
+def m203(t):
+    old = re.search(r'\n        if not tu:\n            typed = parse_typed_call'
+                    r'\(out\["text"\]\).*?\n                out = \{\*\*out, '
+                    r'"stop_reason": "tool_use"\}\n', t, re.S)
+    assert old, "the typed-call dispatch hook no longer matches; re-anchor this mutation"
+    return t.replace(old.group(0), "\n", 1)
+
+
+case("driver: a call the model typed instead of made is invisible and counted as prose",
+     _DRIVER, m203,
+     [f"{_DRV}::test_a_typed_job_launched_parks_the_token_instead_of_failing_the_stage",
+      f"{_DRV}::test_a_typed_stage_complete_still_has_to_prove_its_outputs_exist"])
+
+# 204. The `serviced` gate is dropped, so ANY name in `<invoke name="...">` is recovered.
+#      This is the mutation that looks like a simplification and is the security bug: shell
+#      and code_interpreter run INSIDE the harness, so a typed one is either a transcript of
+#      a call already served or text quoted from a log, a customer ticket, or a training
+#      sample -- and the driver would then dispatch prose. Nothing functional goes red; only
+#      a test that asserts a refusal can see it.
+def m204(t):
+    old = ("        if name not in serviced:\n"
+           "            continue\n")
+    assert t.count(old) == 1, f"the serviced-name gate has moved; found {t.count(old)}"
+    return t.replace(old, "        if False:\n            continue\n", 1)
+
+
+case("driver: a typed shell/code_interpreter call is recovered and dispatched from prose",
+     _DRIVER, m204,
+     [f"{_DRV}::test_a_typed_shell_call_is_never_recovered"])
+
+# 205. The parameter JSON parse is removed, so a typed `outputs` arrives as the literal text
+#      '["s3://a", "s3://b"]'. That is bug #27's exact shape one layer up: the string starts
+#      with '[', so verify_outputs skips it and every URI inside passes unchecked. The run
+#      still completes, which is what makes this the worst of the five -- the driver reports
+#      verified outputs it never head_object'd.
+def m205(t):
+    old = ("            try:\n"
+           "                args[pm.group(1)] = json.loads(raw)\n")
+    assert t.count(old) == 1, f"the typed-parameter parse has moved; found {t.count(old)}"
+    return t.replace(old, "            try:\n                args[pm.group(1)] = raw\n", 1)
+
+
+case("driver: a typed JSON list stays text, so verify_outputs skips every URI in it",
+     _DRIVER, m205,
+     [f"{_DRV}::test_a_typed_outputs_list_arrives_as_a_list_not_as_text"])
+
+# 206. The null-id branch in _tool_result_content is dropped, so a recovered call is answered
+#      with an assistant toolUse echo carrying toolUseId=None plus a matching toolResult. The
+#      runtime has no such pending call and rejects the pair -- and on a NON-terminal branch
+#      (checkpoint, a rejected stage_complete) that rejection kills the next turn rather than
+#      a courtesy message, converting the recovery into a different stage failure.
+def m206(t):
+    old = re.search(r'    if not tool_use\.get\("toolUseId"\):\n        return _user_text'
+                    r'\(.*?\n(?=    return \[)', t, re.S)
+    assert old, "the recovered-call text branch no longer matches; re-anchor this mutation"
+    return t.replace(old.group(0), "", 1)
+
+
+case("driver: a recovered call is echoed back with a null toolUseId the runtime rejects",
+     _DRIVER, m206,
+     [f"{_DRV}::test_a_recovered_call_is_answered_as_text_not_as_a_tool_result"])
+
+# 207. The `if not tu` precondition widens to unconditional, so a recovered call OVERRIDES a
+#      real one in the same turn. A turn that narrates one call and structurally makes
+#      another then gets serviced on the narration -- the driver acting on what the agent
+#      talked about instead of what it did, which is the whole failure mode the `serviced`
+#      gate in 204 exists to bound, arriving by a different door.
+def m207(t):
+    old = "        if not tu:\n            typed = parse_typed_call"
+    assert t.count(old) == 1, f"the typed-call precondition has moved; found {t.count(old)}"
+    return t.replace(old, "        if True:\n            typed = parse_typed_call", 1)
+
+
+case("driver: a typed call in the same turn's text displaces the real tool call",
+     _DRIVER, m207,
+     [f"{_DRV}::test_a_real_tool_call_always_wins_over_a_typed_one"])
+
+
 #: Where the pristine text of the file currently mutated is parked, so a kill -9 -- which
 #: no handler can intercept -- still leaves the original recoverable. Under the repo root
 #: rather than /tmp because it must be obvious to whoever finds the tree dirty, and

@@ -2004,6 +2004,151 @@ class TestDriver:
             f"{len(raw)} terminal branch(es) still ack with a bare _invoke instead of "
             "_ack_terminal, so a rejected ack there still raises after the effect landed")
 
+    # --- #28: a call the model TYPED instead of made ---------------------------
+    #
+    # #24 recovered an inline function the runtime EMITTED and the driver discarded.
+    # This is the other way for the same stage to die: the model never emits a block at
+    # all, it writes the call out as text. Live on rehearsal run-20260811T005043Z-320cc47e,
+    # whose finetune agent prepared the data, launched SageMaker job
+    # llmops-qlora-...-i0, verified it InProgress, updated the manifest, and then ended
+    # two consecutive turns with the literal string `<invoke name="job_launched">`.
+    # Counted as prose both times -> MissingStageComplete, while the job it had correctly
+    # launched ran on to Completed (442 billable seconds). Measured scale: across 25 days
+    # of driver logs `tool=job_launched` appears ZERO times, `tool=stage_complete` three.
+
+    #: The exact text of the 08:20:26Z turn, trimmed to the invoke block. A synthesised
+    #: fixture would test the regex I wrote rather than the output that broke the run.
+    TYPED_JOB_LAUNCHED = (
+        'Job `llmops-qlora-run-20260811T005043Z-320cc47e-i0` confirmed **InProgress** '
+        '(Pending capacity), manifest entry `stages.finetune` already written.\n'
+        'Re-issuing the launch signal per launch-and-release:\n\n'
+        '<invoke name="job_launched">\n'
+        '<parameter name="job_name">llmops-qlora-run-20260811T005043Z-320cc47e-i0'
+        '</parameter>\n'
+        '<parameter name="job_arn">arn:aws:sagemaker:us-east-1:123456789012:'
+        'training-job/llmops-qlora-run-20260811T005043Z-320cc47e-i0</parameter>\n'
+        '<parameter name="status">InProgress</parameter>\n'
+        '<parameter name="iteration">0</parameter>\n'
+        '</invoke>')
+
+    def test_a_typed_job_launched_parks_the_token_instead_of_failing_the_stage(self):
+        """The live failure, end to end: the agent typed the call and the stage died.
+
+        This must release, not fail. The job really was running -- so the alternative
+        the driver actually chose (MissingStageComplete) both fails a stage that
+        succeeded AND orphans a live SageMaker job with no parked token, meaning
+        nothing settles when it finishes."""
+        ac = FakeAgentCore([text_stream(self.TYPED_JOB_LAUNCHED),
+                            text_stream("acknowledged")])
+        c = clients(ac)
+        out = driver.handler(driver_event(stage="finetune", task="launch"), clients=c)
+        assert out["status"] == "released", (
+            f"a typed job_launched was still invisible: {out}")
+        assert not c["sfn"].failures, \
+            "MissingStageComplete fired on a turn that announced a real launched job"
+        parked = next(u for u in c["ddb"].Table(ENV["RUNS_TABLE"]).updates
+                      if ":j" in (u.get("ExpressionAttributeValues") or {}))
+        assert parked["ExpressionAttributeValues"][":j"] == \
+            "llmops-qlora-run-20260811T005043Z-320cc47e-i0", \
+            "the job name came from somewhere other than the parameters the model wrote"
+        assert parked["ExpressionAttributeValues"][":t"] == "tok-123", \
+            "the task token was not parked, so nothing will settle on job completion"
+
+    def test_a_typed_stage_complete_still_has_to_prove_its_outputs_exist(self):
+        """Recovering the call must not upgrade the claim. A typed stage_complete goes
+        through verify_outputs exactly like a real one: claim an object that is not in
+        the bucket and the stage is rejected, not settled. Otherwise the recovery path
+        becomes a way to pass verification by writing prose -- strictly worse than the
+        bug, because a run would then report success having produced nothing."""
+        missing = "s3://llmops-data-test/runs/run-test-1/distillation/never-written.jsonl"
+        typed = ('All done.\n<invoke name="stage_complete">\n'
+                 '<parameter name="stage">data-prep</parameter>\n'
+                 '<parameter name="task">generate</parameter>\n'
+                 f'<parameter name="outputs">["{missing}"]</parameter>\n</invoke>')
+        ac = FakeAgentCore([text_stream(typed), text_stream("retrying"),
+                            text_stream("still nothing")])
+        c = clients(ac, FakeS3(existing=[]))
+        out = driver.handler(driver_event(), clients=c)
+        assert out["status"] == "failed", \
+            "a typed stage_complete settled a stage whose claimed output does not exist"
+        assert not c["sfn"].successes, "the token was settled on an unverified claim"
+        rejection = json.dumps(ac.calls[1]["messages"])
+        assert "rejected" in rejection and "never-written" in rejection, (
+            "the agent was not told WHICH claimed output was missing, so it cannot fix "
+            f"it: {rejection[:300]}")
+
+    def test_a_typed_outputs_list_arrives_as_a_list_not_as_text(self):
+        """The #27 shape, one layer up. A typed `outputs` parameter holding
+        '["s3://a", "s3://b"]' must be parsed into a list before it reaches
+        verify_outputs -- as one string it starts with '[', so head_object skips it and
+        every URI inside passes unchecked. Both URIs below are absent from the bucket,
+        so a run that "passes" here is a run whose verification did nothing."""
+        a = "s3://llmops-data-test/runs/run-test-1/a.jsonl"
+        b = "s3://llmops-data-test/runs/run-test-1/b.json"
+        call = driver.parse_typed_call(
+            '<invoke name="stage_complete">'
+            f'<parameter name="outputs">["{a}", "{b}"]</parameter></invoke>')
+        assert call["input"]["outputs"] == [a, b], (
+            f"a typed JSON list stayed text: {call['input']['outputs']!r}")
+        assert driver.verify_outputs(FakeS3(existing=[]), call["input"]["outputs"]) \
+            == [a, b], "both missing URIs were skipped -- the check is vacuous again"
+
+    def test_a_typed_shell_call_is_never_recovered(self):
+        """The boundary, and it is a security one, not a tidiness one. shell runs INSIDE
+        the harness, so a typed shell is at best a transcript of a call the runtime
+        already served and at worst text the agent quoted from a log or a customer
+        document. A driver that executes either is executing prose. Only functions this
+        driver alone can answer -- SERVICED_TOOLS -- are recoverable, which is the same
+        rule the end_turn override follows."""
+        assert driver.parse_typed_call(
+            '<invoke name="shell"><parameter name="command">rm -rf /</parameter>'
+            '</invoke>') is None
+        assert driver.parse_typed_call(
+            '<invoke name="code_interpreter"><parameter name="code">1</parameter>'
+            '</invoke>') is None
+        for name in sorted(driver.SERVICED_TOOLS):
+            assert driver.parse_typed_call(
+                f'<invoke name="{name}"><parameter name="x">1</parameter></invoke>'
+                )["name"] == name, f"{name} is dispatchable but not recoverable"
+
+    def test_a_real_tool_call_always_wins_over_a_typed_one(self):
+        """A turn can do both: emit a real block AND narrate a call in its text. The
+        structured one is what the runtime actually did, so it must win -- otherwise a
+        recovered transcript of an EARLIER call could override the current one, settling
+        a stage on stale parameters."""
+        uri = "s3://llmops-data-test/runs/run-test-1/distillation/generated.jsonl"
+        ac = FakeAgentCore([tool_use_stream_ending_in_prose(
+            "stage_complete", {"outputs": [uri]},
+            text=self.TYPED_JOB_LAUNCHED)])
+        c = clients(ac, FakeS3(existing=[uri]))
+        out = driver.handler(driver_event(), clients=c)
+        assert out["status"] == "completed", (
+            "the typed job_launched in the same turn's text displaced a real "
+            f"stage_complete block: {out}")
+        assert c["sfn"].successes, "the real stage_complete was not the one serviced"
+
+    def test_a_recovered_call_is_answered_as_text_not_as_a_tool_result(self):
+        """There is no toolUseId to answer: the model typed the call, so the runtime
+        never minted one. Echoing a null id back would be rejected ("the number of
+        toolResult blocks ... exceeds the number of toolUse blocks of previous turn"),
+        which on a NON-terminal branch (checkpoint, a rejected stage_complete) kills the
+        next turn rather than a courtesy message. The agent still has to learn the
+        outcome, so it arrives as plain text."""
+        recovered = driver.parse_typed_call(
+            '<invoke name="checkpoint"><parameter name="progress_uri">s3://b/p'
+            '</parameter></invoke>')
+        assert recovered["toolUseId"] is None
+        msgs = driver._tool_result_content(recovered, {"status": "continue"})
+        assert len(msgs) == 1 and msgs[0]["role"] == "user", \
+            f"a recovered call was answered with a toolUse/toolResult pair: {msgs}"
+        blob = json.dumps(msgs)
+        assert "toolResult" not in blob and "toolUse" not in blob, \
+            f"a null toolUseId still reaches the runtime: {blob}"
+        assert "continue" in blob, "the agent was not told the outcome at all"
+        # A REAL call keeps the pair — this must not have become text for everyone.
+        real = {"toolUseId": "tu-1", "name": "checkpoint", "input": {}}
+        assert len(driver._tool_result_content(real, {"status": "continue"})) == 2
+
     def test_a_stream_that_outlives_the_lambda_wall_hands_off_instead_of_dying(self):
         """boto's read_timeout (870s) bounds the gap BETWEEN chunks, not the stream's
         life: a reasoning model trickling a chunk every few seconds can stream past

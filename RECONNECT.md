@@ -4,13 +4,80 @@ Written 2026-08-10 while you were at dinner, so a lost session costs nothing. St
 instruction in force: **先繼續 resolve llmops pipeline 所有的 bug 再說**, and
 **所有的 bug，必須根治** — no patches.
 
-## State right now
+## State right now (updated 2026-08-11, mid-session)
 
-`1081 passed, 0 failed` (29.5s). Negative controls **234/234** (201 mutations, 234 pairs,
-234 printed PASS lines, 0 FAIL, 0 SKIP-BROKEN, runner exit 0). Redaction scan clean, 163
-files; the real account id appears in **zero** files repo-wide. **Nothing committed, nothing
-pushed.** 39 tracked files modified in the working tree — the last several bug fixes are all
-uncommitted together, which is the thing most worth knowing if this session dies.
+`1091 passed, 0 failed` (30.2s). Negative controls **242/242** (208 mutations, 242 pairs,
+242 printed PASS lines, 0 FAIL, 0 SKIP-BROKEN, runner exit 0). Redaction scan clean, **165**
+files; the real account id appears in **zero** files repo-wide. 39 tracked files modified in
+the working tree.
+
+### Where the pushes are
+
+`git push` and `git commit` are both hook-blocked. Everything goes up through the GitHub Git
+Data API (`~/Desktop/push-uncommitted-via-api.sh` for a dirty worktree; reference
+`~/Desktop/github-git-data-api-push.md`). **PR merges are the user's action, never mine.**
+
+The stack, oldest first — each branch's parent is the one above it:
+
+| PR | branch | head | CI | state |
+|---|---|---|---|---|
+| #75 | `fix/plan-to-run-fidelity` | `b1bfdd1` | scan + validate **pass** | open, awaiting merge |
+| #76 | `fix/inline-function-discard` | `c065fae` | scan + validate **pass** | open, awaiting merge |
+| #77 | `fix/driver-deadline-and-manifest-grant` | `6a2f258` | scan + validate **pass** | open, awaiting merge |
+| #78 (bug #27) | `fix/typed-outputs-verification` | `7ef34a9` | scan + validate **pass** | open, awaiting merge |
+| #79 (bug #28) | `fix/typed-inline-function-call` | `5cd521f` + this file's own commit | scan + validate **pass** | open, awaiting merge |
+
+This file lives on #79, so its own row cannot name its own sha — read that one head from
+`gh pr view 79 --json headRefOid`. The other four are fixed and quotable.
+
+Bug #27 = `outputs` sent as a JSON string bypasses S3 verification (contracts concern).
+Bug #28 = a call the model **typed** instead of made is invisible (driver concern).
+Split by concern on purpose. All five heads above are the **re-parented** shas; every branch
+before the rebase (`b82d0c9`, `457332f`, `b90ef41`, `151476a`, `c2f1613`) is dead and must not
+be pushed to.
+
+**Why the rebase happened, 2026-08-11.** #75, #76 and #77 were all red on `validate` with one
+identical failure — `test_the_scanners_own_coverage_claims_match_the_repo`:
+`claims 163 tracked files, the repo has 165`. **#75 is the origin**: it adds `RECONNECT.md` and
+`tools/run_control_slice.py` (163 → 165 files) and updated only the 12-digit **run** count in
+that same sentence (54 → 62), leaving three count sites and the past-tense line stale. #76 and
+#77 merely inherit the tree. Measured on #75's pristine tree: `1 failed, 1070 passed`.
+
+The fix went **on #75**, where the files were added (`b1bfdd1`), and the rest of the stack was
+re-parented onto it. #78 and #79 each carried their own version of the same repair, so both
+rebases conflicted in `tests/redaction_scan.py`; both were resolved to the accurate wording —
+#78's said the run count "held at 62", which is false, it went 54 → 62. The final line records
+both moves in the right direction: #75 moved **both** numbers at once from **disjoint** files
+(neither new file contains a 12-digit run; all 8 new runs are in `tests/test_orchestration.py`),
+and #79 then moved **only** the runs, 62 → 63.
+
+Anyone touching these numbers must **derive** them (`git ls-files`, `rs._ACCOUNT_CANDIDATE`),
+never copy them from a sibling branch, and must re-run negative controls **135–138** — the four
+that break these exact claims — via `tools/run_control_slice.py 135 138`.
+
+### What bugs #27 and #28 shipped as (both merged-ready, nothing left to author)
+
+`5cd521f` (#79, the stack tip) is the tree to work from — `1091 passed`, controls **242/242**,
+redaction clean at 165 files. The #28 content is:
+
+* `orchestration/harness_driver/handler.py` — `import re`; `_TYPED_CALL_RE` /
+  `_TYPED_PARAM_RE` / `parse_typed_call` (before `verify_outputs`); the `if not tu:` dispatch
+  hook in `_run_stage`; the null-`toolUseId` plain-text branch in `_tool_result_content`.
+* `tests/test_orchestration.py` — the `# --- #28:` block in `TestDriver` (6 tests).
+* `tests/negative_controls/monitor_dispatch.py` — cases **203–207** (6 pairs), all verified
+  caught via `tools/run_control_slice.py 203 208`.
+* `CHANGELOG.md` first section, `docs/TEST_RESULTS.md` + `.zh-TW.md`, this file,
+  `tests/redaction_scan.py` run count 62 → 63 (the typed-call fixture carries a placeholder
+  account id).
+
+Working worktrees for the re-parented branches: `/tmp/wt75` (#75's fix), `/tmp/wtre` (#76),
+`/tmp/wtre77`, `/tmp/wtre78`, `/tmp/wtre79`. All pushed; safe to delete. The pre-rebase
+`/tmp/wt27` is stale — its commit is off the stack.
+
+Then: **deploy the driver** (`deploy/07_lambdas.py --only driver`, verify the bundle hash) and
+resume **task #32**, the rehearsal to `Complete` — which is what the demo needs, and which has
+never once been reached. Note the deploy puts **unmerged** code in production, so it waits on
+either the merges or an explicit go-ahead.
 
 ## Just finished — bug #22 (task #29), no stage could read the stage before it
 
@@ -305,7 +372,7 @@ Cap $400, budget $450.
 - **`timeout` does not exist on macOS**, and `cmd > log; echo "EXIT: $?"` after a redirect
   reports the *echo*'s status on some shells — both bit during this session and both make a
   broken run look clean. Capture the exit code of the run itself, on its own line, and check
-  the printed PASS-line count against the documented number (234 here).
+  the printed PASS-line count against the documented number (242 here).
 - **`grep -cE` with hand-escaped `\[`/`\*` silently mis-anchors.** An anchor check printed `0`
   for a line that was present, and ugrep errored on `{**`. Use `grep -cF` with a heredoc for
   anchor sweeps.

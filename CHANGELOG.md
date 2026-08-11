@@ -5,6 +5,66 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
 ## [Unreleased]
 
+### A call the model TYPED instead of made was invisible — `job_launched` has never once fired in 25 days of production
+
+Rehearsal `run-20260811T005043Z-320cc47e` did the finetune stage's work correctly and end to
+end: prepared the dataset, uploaded the sourcedir, created SageMaker training job
+`llmops-qlora-run-20260811T005043Z-320cc47e-i0`, verified it `InProgress`, wrote the manifest.
+Then it ended two consecutive turns with this as **literal text in a text block**:
+
+```
+<invoke name="job_launched">
+<parameter name="job_name">llmops-qlora-run-20260811T005043Z-320cc47e-i0</parameter>
+...
+</invoke>
+```
+
+The driver reads structured content blocks, so both turns were counted as prose, the re-ask
+budget ran out, and the stage died `MissingStageComplete` at 01:25:54Z — while the training
+job it had correctly launched ran on to `Completed` (**442 billable seconds, ≈$0.15**) with no
+parked task token, so nothing was ever going to settle it. The work was done; only the
+sentence announcing it was in the wrong grammar.
+
+This is #24's sibling and its opposite. There the runtime *emitted* a block and the driver
+discarded it on `stop_reason`; here the runtime emitted **no block at all**.
+
+Established, not inferred:
+
+* every assistant content block in that stage carries only `shell` / `skills` toolUses —
+  `job_launched` appears in none of them;
+* all 236 textual occurrences of `job_launched` in the harness log are prompt text or
+  injected memory, and `<invoke` appears in **no** repo prompt or skill — its first
+  appearance anywhere is 08:20:01Z, as model output;
+* 25 days of `/aws/lambda/llmops-harness-driver`: `tool=job_launched` **0**,
+  `tool=stage_complete` **3**. The tool has never once been spoken as a real call in
+  production, while a live probe of the same harness and model answers a direct request for
+  it with a proper `toolUse` block (`HAS LITERAL <invoke: False`).
+
+So the tool is live and callable, and this is a **per-turn behaviour no declaration can
+prevent** — the prompts already mandate the call (`TURN-END INVARIANT`; `RE_ASK` names
+`job_launched` outright), and the agent complied in substance twice and was not heard. The
+trigger was the 08:14:40Z `ReadTimeoutError` → `EventLoopException` raised inside
+`_handle_tool_execution → recurse_event_loop`, i.e. after `shell` ran and while the model was
+generating the reply that would have carried the call; the salvage prompt then asked it to
+restate its pending call, and it restated it as prose.
+
+Cured in `parse_typed_call` + a dispatch hook in `_run_stage`, deliberately narrow — a parser
+that reads intent out of prose is how a driver starts inventing claims:
+
+* recovered **only when no real `toolUse` block arrived**, so a genuine call always wins over
+  a transcribed one;
+* gated on `SERVICED_TOOLS`. A typed `shell` or `code_interpreter` is **refused**: those run
+  inside the harness, so a typed one is at best a transcript of a call already served and at
+  worst text quoted from a log, a customer ticket or a training sample — and a driver that
+  executes either is executing prose;
+* parameters come only from `<parameter>` tags the model actually wrote. Nothing is inferred
+  from the surrounding sentence, and `stage_complete`'s outputs still go through
+  `verify_outputs` — a recovered claim is not a trusted claim;
+* JSON-looking values are parsed, so a typed `outputs` arrives as a **list** rather than as
+  text starting with `[` — the exact shape that made `verify_outputs` vacuous below;
+* a recovered call has **no `toolUseId`** (the runtime never minted one), so it is answered as
+  plain text instead of an echo-plus-`toolResult` pair the runtime would reject on a null id.
+
 ### `outputs` sent as a JSON string bypassed S3 verification entirely — trust-but-verify defeated by a type
 
 `verify_outputs` `head_object`s every element that `startswith("s3://")`. A one-element list
