@@ -542,6 +542,42 @@ _TYPED_CALL_RE = re.compile(r'<invoke\s+name="([A-Za-z_][A-Za-z0-9_]*)"\s*>(.*?)
 _TYPED_PARAM_RE = re.compile(r'<parameter\s+name="([A-Za-z_][A-Za-z0-9_]*)"\s*>(.*?)'
                              r'</parameter>', re.DOTALL)
 
+#: The SECOND observed spelling of a typed call: Python source, `stage_complete(**{...})`
+#: (or without the splat), with a JSON object as the whole argument. Live: the triage of
+#: run-20260811T101948Z-f9d34d27 wrote a complete, correct verdict, announced "emitting
+#: the completion signal now" -- and printed exactly this shape as prose. The XML regex
+#: above cannot see it, so a fix deployed against one spelling died to the next one.
+#: The `{` is captured so the brace matcher knows where the object starts.
+_TYPED_PYCALL_RE = re.compile(r'\b([A-Za-z_][A-Za-z0-9_]*)\(\s*(?:\*\*)?\s*(\{)')
+
+
+def _balanced_braces(text: str, start: int) -> Optional[str]:
+    """The substring of `text` from the `{` at `start` to its matching `}`, JSON-aware.
+
+    A regex cannot do this (braces nest, and `}` appears inside string values), and
+    json.JSONDecoder.raw_decode cannot either once the model indents Python-style.
+    String/escape state tracked so a `}` inside a quoted summary does not close early.
+    """
+    depth, in_str, esc = 0, False, False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if esc:
+            esc = False
+        elif in_str:
+            if ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+        elif ch == '"':
+            in_str = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1]
+    return None
+
 
 def parse_typed_call(text: str, serviced=SERVICED_TOOLS) -> Optional[dict]:
     """Recover an inline function the model WROTE OUT as text instead of calling.
@@ -587,7 +623,7 @@ def parse_typed_call(text: str, serviced=SERVICED_TOOLS) -> Optional[dict]:
     """
     if not text:
         return None
-    found = None
+    found, found_at = None, -1
     for match in _TYPED_CALL_RE.finditer(text):
         name = match.group(1)
         if name not in serviced:
@@ -599,7 +635,26 @@ def parse_typed_call(text: str, serviced=SERVICED_TOOLS) -> Optional[dict]:
                 args[pm.group(1)] = json.loads(raw)
             except (json.JSONDecodeError, ValueError):
                 args[pm.group(1)] = raw
-        found = {"toolUseId": None, "name": name, "input": args}
+        found, found_at = {"toolUseId": None, "name": name, "input": args}, match.start()
+    # The Python spelling, held to a stricter bar than the XML one: the whole argument
+    # must be ONE valid JSON object (the live example is), because in Python source a
+    # non-JSON fragment is indistinguishable from code the agent is merely quoting.
+    # A kwargs form (`stage_complete(run_id="x")`) stays prose for the same reason.
+    # Last typed call wins ACROSS spellings -- position decides, matching _drain's
+    # one-slot capture: a turn that narrates and then commits ends on the commitment.
+    for match in _TYPED_PYCALL_RE.finditer(text):
+        name = match.group(1)
+        if name not in serviced or match.start() <= found_at:
+            continue
+        body = _balanced_braces(text, match.start(2))
+        if body is None:
+            continue
+        try:
+            args = json.loads(body)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(args, dict):
+            found, found_at = {"toolUseId": None, "name": name, "input": args}, match.start()
     return found
 
 
@@ -1724,10 +1779,12 @@ def _run_stage(event, context=None, c=None):
         messages = event["_continuation"]
         stream_retried = bool(event.get("_stream_retried"))
         re_asks = int(event.get("_re_asks", 0))
+        filtered_turns = int(event.get("_filtered_turns", 0))
     else:
         messages = _user_text(json.dumps(payload, default=str))
         stream_retried = False
         re_asks = 0  # up to 2 CONSECUTIVE: nudge, final demand; any serviced tool call re-arms it
+        filtered_turns = 0  # consecutive platform-suppressed turns; see the filtered branch
 
     def _out_of_time() -> bool:
         return bool(context) and context.get_remaining_time_in_millis() < 850_000
@@ -1738,6 +1795,7 @@ def _run_stage(event, context=None, c=None):
             Payload=json.dumps({**event, "_continuation": messages,
                                 "_stream_retried": stream_retried,
                                 "_re_asks": re_asks,
+                                "_filtered_turns": filtered_turns,
                                 "_session_epoch": epoch,
                                 "_session_started_at": session_started_at},
                                default=str))
@@ -1753,8 +1811,10 @@ def _run_stage(event, context=None, c=None):
         2026-08-08 hand-resurrection lossless, because every stage's real state lives
         in S3, not in the transcript.
         """
-        nonlocal epoch, session_started_at, sess, messages, re_asks, stream_retried
+        nonlocal epoch, session_started_at, sess, messages, re_asks, stream_retried, \
+            filtered_turns
         epoch += 1
+        filtered_turns = 0
         session_started_at = time.time()
         sess = session_id(event["run_id"], event["stage"], event["task"], epoch)
         re_asks = 0
@@ -1950,6 +2010,7 @@ def _run_stage(event, context=None, c=None):
             # was mid-flight, because two prose turns much earlier had used up the
             # allowance and nothing ever gave it back.
             re_asks = 0
+            filtered_turns = 0  # same consecutiveness rule as re_asks
             name, args = tu["name"], tu.get("input") or {}
             if name == "stage_complete":
                 result = handle_stage_complete(c, event, args)
@@ -2153,6 +2214,46 @@ def _run_stage(event, context=None, c=None):
             # unknown tool — acknowledge and continue rather than dying
             messages = _tool_result_content(tu, {"status": "unsupported"})
             continue
+
+        # A platform-suppressed turn is not the agent's answer. Live: EvalGate of
+        # run-20260811T101948Z-f9d34d27 resumed after a between-turns handoff and the
+        # very next turn came back stop_reason=content_filtered with ZERO text and no
+        # tool -- the model was gagged, not silent. re_asks was already at its cap
+        # from two real prose turns, so the empty turn fell through to the exhaustion
+        # branch below and the stage died MissingStageComplete, blaming the agent for
+        # a sentence the platform swallowed. The two failures need different names:
+        # prose exhaustion is the agent declining protocol; this is the protocol being
+        # unavailable. So a filtered turn gets its own bounded budget (it does not
+        # consume re_asks -- the agent said nothing to be re-asked about), and when
+        # THAT runs out the token settles as ContentFiltered, a cause an operator can
+        # act on, instead of MissingStageComplete, which sends them hunting through a
+        # transcript for prose that never existed.
+        if not out["text"] and out["stop_reason"] in ("content_filtered",
+                                                      "guardrail_intervened"):
+            if filtered_turns < 2:
+                filtered_turns += 1
+                print(f"[driver] turn was suppressed by the platform "
+                      f"({out['stop_reason']}); asking again "
+                      f"({filtered_turns}/2, re_asks untouched)")
+                messages = _user_text(
+                    "Your previous reply was suppressed by the platform content "
+                    "filter and was NEVER delivered -- nothing you just wrote was "
+                    "seen or recorded. Do not repeat it verbatim. State your "
+                    "conclusion plainly, without quoting raw data, and end this "
+                    "turn with the required inline-function call.")
+                continue
+            if event.get("task_token"):
+                settle_token(c["sfn"], event["task_token"],
+                             error="ContentFiltered",
+                             cause=f"{filtered_turns + 1} consecutive turns were "
+                                   f"suppressed by the platform "
+                                   f"({out['stop_reason']}); no agent output was "
+                                   "delivered")
+            ev.emit_event(os.environ["EVENT_BUS"], ev.PIPELINE_FAILED,
+                          {"run_id": event["run_id"], "stage": event["stage"],
+                           "reason": "content filtered"}, client=c["events"])
+            return {"status": "failed", "reason": "content_filtered"}
+        filtered_turns = 0
 
         # Stream ended without a tool call.
         if re_asks < 2:

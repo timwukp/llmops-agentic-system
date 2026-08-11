@@ -8686,3 +8686,120 @@ def test_an_unknown_harness_name_refuses_instead_of_sending_garbage(wire_memory_
             _EmptyCtl(), "llmops_ghost",
             "arn:aws:bedrock-agentcore:us-east-1:TESTACCTID00:memory/m",
             {"SEMANTIC": "sem-1"}, dry=False)
+
+
+# ── the SECOND spelling of a typed call ─────────────────────────────────────────────
+# #28's fix taught the driver to read `<invoke name="x">` written out as prose. Live,
+# the triage of run-20260811T101948Z-f9d34d27 then wrote a complete, correct verdict,
+# announced "emitting the completion signal now" -- and printed the call as PYTHON
+# SOURCE: `stage_complete(**{...})`, a JSON object behind a kwargs splat. The XML regex
+# cannot see that shape, so the stage died MissingStageComplete with its decision doc
+# already verified in S3 and the driver's backstop paged a human about a triage that
+# had, in substance, succeeded. Same bug, second grammar.
+
+def test_a_call_typed_as_python_source_is_recovered():
+    text = (
+        "Nothing further is owed this turn; emitting the completion signal now.\n\n"
+        "stage_complete(**{\n"
+        '  "run_id": "triage-run-x",\n'
+        '  "stage": "orchestrator",\n'
+        '  "status": "complete",\n'
+        '  "outputs": [\n    "s3://b/runs/x/triage/decision.json"\n  ],\n'
+        '  "summary": "closed as gate-FAIL (0.00 vs 0.55); a brace } inside a string '
+        'must not close the object early"\n'
+        "})\n")
+    call = driver.parse_typed_call(text)
+    assert call is not None, "the python spelling of a typed call was read as prose"
+    assert call["name"] == "stage_complete"
+    assert call["input"]["outputs"] == ["s3://b/runs/x/triage/decision.json"]
+    assert call["input"]["status"] == "complete"
+    # without the splat is the same commitment
+    assert driver.parse_typed_call(
+        'stage_complete({"run_id": "r", "outputs": []})')["input"] == {
+            "run_id": "r", "outputs": []}
+
+
+def test_the_python_spelling_is_gated_and_strict():
+    """Held to a stricter bar than the XML shape: only SERVICED_TOOLS, and the whole
+    argument must be one valid JSON object -- in Python source, anything less is
+    indistinguishable from code the agent is merely quoting."""
+    # a typed `shell` belongs to the harness, not this driver
+    assert driver.parse_typed_call('shell({"command": "rm -rf /"})') is None
+    # unquoted keys are Python, not JSON: quoting-a-snippet territory, stays prose
+    assert driver.parse_typed_call("stage_complete({run_id: 'x'})") is None
+    # kwargs form stays prose for the same reason
+    assert driver.parse_typed_call('stage_complete(run_id="x", status="complete")') is None
+    # an unbalanced object never resolves
+    assert driver.parse_typed_call('stage_complete(**{"run_id": "x"') is None
+
+
+def test_the_last_typed_call_wins_across_spellings():
+    """Position decides, matching _drain's one-slot capture: a turn that narrates one
+    plan and then commits to another ends on the commitment."""
+    xml_then_py = (
+        '<invoke name="checkpoint"><parameter name="next_action">resume</parameter>'
+        '</invoke>\nOn reflection, the stage is done:\n'
+        'stage_complete(**{"run_id": "r", "outputs": []})')
+    assert driver.parse_typed_call(xml_then_py)["name"] == "stage_complete"
+    py_then_xml = (
+        'stage_complete(**{"run_id": "r", "outputs": []})\nActually, not yet:\n'
+        '<invoke name="checkpoint"><parameter name="next_action">resume</parameter>'
+        '</invoke>')
+    assert driver.parse_typed_call(py_then_xml)["name"] == "checkpoint"
+
+
+# ── a gagged turn is not a prose turn ───────────────────────────────────────────────
+# EvalGate of run-20260811T101948Z-f9d34d27 resumed from a between-turns handoff and
+# the next turn arrived stop_reason=content_filtered, ZERO text, no tool: the platform
+# suppressed the model's output. re_asks was already at its cap from two real prose
+# turns, so the empty turn fell straight through the exhaustion branch and the stage
+# died MissingStageComplete -- the agent blamed for a sentence it was not allowed to
+# say. A suppressed turn gets its own bounded budget, and exhausting THAT is named
+# ContentFiltered, so the operator reads "the platform gagged the agent three times"
+# instead of hunting a transcript for prose that never existed.
+
+def filtered_stream():
+    return [{"messageStop": {"stopReason": "content_filtered"}}]
+
+
+def test_a_filtered_turn_does_not_spend_the_prose_budget():
+    uri = "s3://llmops-data-test/runs/run-test-1/raw/data.jsonl"
+    ac = FakeAgentCore([
+        text_stream("narrating instead of calling"),   # re_ask 1
+        text_stream("still narrating"),                # re_ask 2 (cap -- the live state)
+        filtered_stream(),                             # the platform gags the model
+        tool_use_stream("stage_complete", {"outputs": [uri]}),
+        text_stream("ack")])
+    c = clients(ac, FakeS3(existing=[uri]))
+    out = driver.handler(driver_event(), clients=c)
+    assert out["status"] == "completed", (
+        "a platform-suppressed turn was billed to the prose budget and killed a "
+        "stage whose very next turn completed the protocol")
+    assert not c["sfn"].failures
+    # the retry prompt must say the reply was never delivered, or the agent reasons
+    # as if its filtered text is on the record
+    nudge = ac.calls[3]["messages"][-1]["content"][0]["text"]
+    assert "suppressed" in nudge and "NEVER delivered" in nudge
+
+
+def test_three_consecutive_filtered_turns_settle_as_content_filtered():
+    ac = FakeAgentCore([filtered_stream(), filtered_stream(), filtered_stream()])
+    c = clients(ac)
+    out = driver.handler(driver_event(), clients=c)
+    assert out == {"status": "failed", "reason": "content_filtered"}
+    assert c["sfn"].failures[0]["error"] == "ContentFiltered", (
+        "a run killed by the platform filter must not be labelled "
+        "MissingStageComplete -- the two need different operator responses")
+    assert any(e["DetailType"] == ev.PIPELINE_FAILED for e in c["events"].entries)
+
+
+def test_the_filtered_budget_survives_a_self_reinvoke():
+    """Same argument as _re_asks: 'consecutive' is counted across Lambda invocations,
+    and the live failure happened ON a resumed invocation -- if the counter does not
+    ride the continuation payload, every handoff refills it."""
+    src = (REPO / "orchestration/harness_driver/handler.py").read_text()
+    body = src[src.index("def _run_stage"):]
+    assert '"_filtered_turns": filtered_turns' in body, \
+        "_self_reinvoke stopped carrying the filtered-turn counter"
+    assert 'int(event.get("_filtered_turns", 0))' in body, \
+        "a continuation no longer restores the filtered-turn counter"
