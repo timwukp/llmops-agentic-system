@@ -8615,7 +8615,7 @@ def test_the_role_names_the_guard_checks_are_the_ones_the_script_deploys(iam_mod
 
 def test_no_comment_key_of_any_spelling_reaches_iam(iam_mod):
     specs = iam_mod.build_role_specs(
-        {"<ACCOUNT_ID>": "123456789012", "<REGION>": "us-east-1",
+        {"<ACCOUNT_ID>": "TESTACCTID00", "<REGION>": "us-east-1",
          "<DATA_BUCKET>": "b"}, "mem-0000000000")
 
     def comment_keys(obj, path="$"):
@@ -8667,7 +8667,7 @@ def test_attach_sends_the_resolved_harness_id_not_the_name(wire_memory_mod):
 
     ctl = _FakeCtl()
     out = wire_memory_mod.attach_to_harness(
-        ctl, "llmops_finetune", "arn:aws:bedrock-agentcore:us-east-1:123456789012:memory/m",
+        ctl, "llmops_finetune", "arn:aws:bedrock-agentcore:us-east-1:TESTACCTID00:memory/m",
         {"SEMANTIC": "sem-1", "EPISODIC": "epi-1"}, dry=False)
     assert out == {"harness": "llmops_finetune", "attached": True}
     assert ctl.sent == ["llmops_finetune-Ab1Cd2Ef3G"]
@@ -8684,5 +8684,5 @@ def test_an_unknown_harness_name_refuses_instead_of_sending_garbage(wire_memory_
     with pytest.raises(SystemExit):
         wire_memory_mod.attach_to_harness(
             _EmptyCtl(), "llmops_ghost",
-            "arn:aws:bedrock-agentcore:us-east-1:123456789012:memory/m",
+            "arn:aws:bedrock-agentcore:us-east-1:TESTACCTID00:memory/m",
             {"SEMANTIC": "sem-1"}, dry=False)
