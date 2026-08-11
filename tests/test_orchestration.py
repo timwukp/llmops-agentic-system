@@ -284,6 +284,24 @@ def text_stream(text):
     ]
 
 
+def tool_use_stream_ending_in_prose(name, args, text="and that completes the task."):
+    """A real shape from production: the agent calls an inline function AND narrates,
+    and the runtime stops the message with `end_turn` rather than `tool_use`.
+
+    Observed on run-20260810T174626Z-3f08b4c6, whose data-prep agent wrote 300 rows
+    to S3 and called stage_complete in a turn shaped exactly like this. The driver read
+    only the stop_reason, decided the block had already been serviced inside the
+    harness, and counted the turn as prose -- three times, then failed the stage
+    MissingStageComplete with the outputs sitting in the bucket.
+    """
+    return [
+        {"contentBlockStart": {"start": {"toolUse": {"toolUseId": "tu-1", "name": name}}}},
+        {"contentBlockDelta": {"delta": {"toolUse": {"input": json.dumps(args)}}}},
+        {"contentBlockDelta": {"delta": {"text": text}}},
+        {"messageStop": {"stopReason": "end_turn"}},
+    ]
+
+
 class DyingStream:
     """Iterable that raises mid-stream — a production stream death."""
 
@@ -1818,6 +1836,110 @@ class TestDriver:
             "_self_reinvoke stopped carrying the re-ask counter"
         assert 'int(event.get("_re_asks", 0))' in body, \
             "the continuation branch stopped restoring the re-ask counter"
+
+    # --- #24: a called stage_complete reported as never called -----------------
+    #
+    # The two halves, again. Half one: only stopReason == "tool_use" means the harness
+    # is waiting for a result, so a toolUse riding with end_turn must not be answered --
+    # true, and it is why the resume-rejection bug on the console's dispatch path was
+    # cured. Half two: an inline function is BY DEFINITION one the harness cannot
+    # service, so the runtime emits the block and waits for the driver. Both correct,
+    # never connected: the stop_reason check was applied to inline functions too, and
+    # every inline call that arrived with end_turn was silently dropped and counted as
+    # prose. Live cost: run-20260810T174626Z-3f08b4c6 failed MissingStageComplete at
+    # DataPrepGenerate with 300 verified customer rows already written to S3.
+
+    def test_a_stage_complete_riding_with_end_turn_is_serviced_not_discarded(self):
+        """The whole bug in one turn: the agent does the work, writes the artifact, calls
+        stage_complete, and adds a closing sentence -- so the runtime stops the message
+        with end_turn instead of tool_use. The stage IS complete and the driver must
+        settle it. Before the fix this returned failed/MissingStageComplete after three
+        such turns, which is a compliant agent being told it never called the tool."""
+        uri = "s3://llmops-data-test/runs/run-test-1/distillation/generated.jsonl"
+        ac = FakeAgentCore([tool_use_stream_ending_in_prose(
+            "stage_complete", {"outputs": [uri]})])
+        c = clients(ac, FakeS3(existing=[uri]))
+        out = driver.handler(driver_event(), clients=c)
+        assert out["status"] == "completed", (
+            f"a called stage_complete was discarded because it rode with end_turn: "
+            f"{out}")
+        assert c["sfn"].successes, "the task token was never settled"
+        assert not c["sfn"].failures, \
+            "MissingStageComplete fired on a turn that called stage_complete"
+
+    def test_the_serviced_tool_set_matches_the_dispatch_branches(self):
+        """SERVICED_TOOLS licenses the override above, so it has to BE the dispatch
+        table. Derived from this module's source, in both directions, because both
+        skews are silent:
+
+          * a name in the set with no branch reaches `{"status": "unsupported"}`, and
+            the override made that reachable from an end_turn turn too;
+          * a branch missing from the set gets discarded whenever it rides with
+            end_turn -- which is the bug this whole section exists to cure, reappearing
+            for one tool instead of all of them.
+
+        Scraped rather than restated: a hand-kept second copy of the list is exactly
+        the "one model, four names" defect, and a guard that lists the names itself
+        would agree with a stale set."""
+        src = (REPO / "orchestration/harness_driver/handler.py").read_text()
+        body = src[src.index("def _run_stage"):]
+        branches = set(re.findall(r'if name == "([a-z_]+)"', body))
+        # the finops trio is dispatched through a tuple membership test, not an
+        # equality branch; derive it from that tuple rather than naming it here
+        finops = re.search(r"FINOPS_TERMINAL_TOOLS = \(([^)]*)\)", src)
+        assert finops, "FINOPS_TERMINAL_TOOLS moved; this guard can no longer see it"
+        branches |= set(re.findall(r'"([a-z_]+)"', finops.group(1)))
+        assert len(branches) > 5, \
+            f"the branch scrape found only {branches} -- the parse is broken, not clean"
+        declared = set(driver.SERVICED_TOOLS)
+        assert branches == declared, (
+            "SERVICED_TOOLS and the dispatch branches have drifted.\n"
+            f"  branches with no entry in the set (dropped when they ride with "
+            f"end_turn): {sorted(branches - declared)}\n"
+            f"  entries with no branch (serviced as 'unsupported'): "
+            f"{sorted(declared - branches)}")
+
+    def test_a_rejected_courtesy_ack_cannot_un_complete_a_settled_stage(self):
+        """Servicing the call is only half of it. The ack that follows re-invokes the
+        harness with a toolResult, and by then the token is settled and the artifacts are
+        verified -- so if that invoke raises, the stage genuinely finished and the Lambda
+        reports a crash anyway, leaving the state machine with a settled token AND an
+        invocation error for the same stage. The two halves reassembled one state on.
+
+        The rejection scripted below is a hazard, not a recorded event: servicing a call
+        that arrived with end_turn sends a resume for a turn the runtime has closed, and
+        whether it accepts one is untested (_tool_result_content echoes the toolUse, so
+        it may). It does not matter which way that goes -- throttling and 5xx reach the
+        same line, and nothing downstream reads an ack. Checked through the shared helper
+        rather than one branch, because all eight terminal branches have this shape."""
+        uri = "s3://llmops-data-test/runs/run-test-1/distillation/generated.jsonl"
+
+        class _RejectingAck(FakeAgentCore):
+            def invoke_harness(self, **kw):
+                last = kw["messages"][-1]["content"][0]
+                if "toolResult" in last:
+                    raise RuntimeError("ValidationException: The number of toolResult "
+                                       "blocks at messages.1.content exceeds the number "
+                                       "of toolUse blocks of previous turn")
+                return super().invoke_harness(**kw)
+
+        ac = _RejectingAck([tool_use_stream_ending_in_prose(
+            "stage_complete", {"outputs": [uri]})])
+        c = clients(ac, FakeS3(existing=[uri]))
+        out = driver.handler(driver_event(), clients=c)
+        assert out["status"] == "completed", (
+            "a rejected courtesy ack turned a finished stage into a crashed one; the "
+            "token was already settled when it fired")
+        assert c["sfn"].successes, "the task token was never settled"
+
+        src = (REPO / "orchestration/harness_driver/handler.py").read_text()
+        body = src[src.index("def _run_stage"):]
+        # Every terminal branch acks then returns. Any that still calls _invoke
+        # directly is one control-plane hiccup away from the same bug.
+        raw = re.findall(r'^\s+_invoke\(c\["agentcore"\]', body, re.M)
+        assert not raw, (
+            f"{len(raw)} terminal branch(es) still ack with a bare _invoke instead of "
+            "_ack_terminal, so a rejected ack there still raises after the effect landed")
 
     def test_a_stream_that_outlives_the_lambda_wall_hands_off_instead_of_dying(self):
         """boto's read_timeout (870s) bounds the gap BETWEEN chunks, not the stream's

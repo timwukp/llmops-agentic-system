@@ -5,6 +5,66 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
 ## [Unreleased]
 
+### A `stage_complete` that was called was reported as never called — the driver discarded every inline function that rode with `end_turn`
+
+The seventh instance of "two correct halves, never connected", found by a rehearsal failing
+rather than by a test, and the only one so far whose symptom accused the agent of the
+driver's bug.
+
+Half one, in the turn loop: *only* a `stopReason` of `tool_use` means the harness is waiting
+for a result, so a `toolUse` block arriving with `end_turn` must not be answered. That is
+true, and it is why the console's dispatch path stopped breaking sessions with *"The number
+of toolResult blocks at messages.N.content exceeds the number of toolUse blocks of previous
+turn"*. Half two, in the harness configs: an **inline function** is by definition one the
+harness cannot service — the runtime emits the block and waits for this driver to answer it.
+Both correct. Connected, they say that a `stage_complete` riding with `end_turn` was
+"already serviced inside the harness", when in fact it was a call nobody would ever answer.
+The driver dropped the block, counted the turn as prose, and after three such turns failed
+the stage `MissingStageComplete`.
+
+Live cost: rehearsal `run-20260810T174626Z-3f08b4c6` died at `DataPrepGenerate` after 4.7
+minutes with `distillation/generated.jsonl` **already in S3** — 300 rows, 261 of them the
+customer's own prompts, teacher never invoked, exactly what bug #23's cure had just made
+possible. The stage had finished. The `TaskFailed` cause text was the agent's own closing
+sentence, which is what a discarded call looks like from the outside: an agent narrating
+that its work is done. Reproduced in isolation before changing anything (`_drain` returns
+`tool_use` + `stop_reason: end_turn`; the dispatch guard drops it), because "the agent
+narrated instead of calling" and "the agent called and the driver discarded it" are
+different bugs with one symptom.
+
+- The `stop_reason` now decides only for tools the driver **cannot** service. For the eleven
+  it can — the dispatch table, named once as `SERVICED_TOOLS` — the call is serviced whatever
+  the stop reason says, with a log line recording that it happened.
+- `SERVICED_TOOLS` is checked against the dispatch branches **scraped out of the handler's own
+  source**, in both directions, because both skews are silent: a name with no branch reaches
+  `{"status": "unsupported"}`, and a branch with no name is discarded whenever it rides with
+  `end_turn` — this same bug, narrowed to one tool. A hand-kept second copy of the list is the
+  "one model, four names" defect (#20) in miniature.
+- **The ack after a settled stage can no longer un-settle it.** Servicing the call was only
+  half the cure: the courtesy `toolResult` that follows re-invokes the harness *after* the
+  token is settled and the artifacts verified, so any failure there reports a finished stage
+  as a crashed one — leaving the state machine holding a settled token *and* a Lambda error
+  for the same stage. Throttling and 5xx already reached that line; servicing an
+  `end_turn`-arrived call adds a resume for a turn the runtime has closed, which may or may
+  not be accepted (untested — `_tool_result_content` echoes the `toolUse`, so it can be).
+  The cure does not depend on which: nothing downstream reads an ack. All eight terminal
+  branches
+  (`stage_complete`, `job_launched`, `escalate_human`, `resolve_escalation`, `page_human`,
+  `write_report`, `launch_run`, the finops pair) now ack through one `_ack_terminal` helper
+  that logs a rejection and continues, since nothing downstream reads the ack.
+- **The driver now logs one line per turn** — stage, task, `stop_reason`, tool name, re-ask
+  count, text length. Without it this bug was undiagnosable: CloudWatch held three `REPORT`
+  lines for the three turns and nothing about what any of them contained. A stage that can
+  fail must be able to say how.
+
+Guards: three, all derived. A `stage_complete` in a turn shaped like the live one
+(`tool_use` block + closing prose + `end_turn`) must complete the stage; `SERVICED_TOOLS`
+must equal the scraped branch set; and a rejected ack must leave the stage completed, with
+no terminal branch still acking through a bare `_invoke`. Four negative-control pairs (m190
+–m192), each watched to fail in the registered runner — including one that removes a single
+name from `SERVICED_TOOLS`, since a per-tool version of this bug is what a stale second copy
+of the dispatch table produces.
+
 ### A "full" run never opened the customer's data — `generate` invented a corpus from `params.domain`
 
 The sixth instance of "two correct halves, never connected", and the one that would have
