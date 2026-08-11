@@ -22,6 +22,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -507,7 +508,20 @@ def _tool_result_content(tool_use: dict, payload: dict) -> list:
     same bug hid behind the stream-retry, a rejected result looking like stream death.
 
     JSON travels in a TEXT block: `json` blocks come back as
-    "runtimeClientError ... content_type=<json_> | unsupported type"."""
+    "runtimeClientError ... content_type=<json_> | unsupported type".
+
+    A RECOVERED call (parse_typed_call) has no toolUseId, because the model typed the
+    call instead of making one and the runtime therefore never minted an id. There is no
+    pending call to answer in that session, so the echo-plus-result pair is not just
+    unnecessary, it is a lie the runtime would reject on a null id. Such a call is
+    answered as PLAIN TEXT: the agent still learns the outcome, which is the only thing
+    the reply is for, and the two shapes stay honest about which one actually happened.
+    """
+    if not tool_use.get("toolUseId"):
+        return _user_text(f"Result of your {tool_use.get('name')} call "
+                          f"(recovered from your message text, which wrote the call out "
+                          f"instead of invoking it -- invoke it as a tool next time): "
+                          f"{json.dumps(payload, default=str)}")
     return [
         {"role": "assistant", "content": [{"toolUse": {
             "toolUseId": tool_use["toolUseId"],
@@ -518,6 +532,75 @@ def _tool_result_content(tool_use: dict, payload: dict) -> list:
             "content": [{"text": json.dumps(payload, default=str)}],
             "status": "success"}}]},
     ]
+
+
+#: A call the model TYPED instead of made: `<invoke name="x">` with `<parameter name="k">v`
+#: children, closed by `</invoke>`. Non-greedy body, DOTALL, because the parameters sit on
+#: their own lines and a turn can carry more than one of these.
+_TYPED_CALL_RE = re.compile(r'<invoke\s+name="([A-Za-z_][A-Za-z0-9_]*)"\s*>(.*?)</invoke>',
+                            re.DOTALL)
+_TYPED_PARAM_RE = re.compile(r'<parameter\s+name="([A-Za-z_][A-Za-z0-9_]*)"\s*>(.*?)'
+                             r'</parameter>', re.DOTALL)
+
+
+def parse_typed_call(text: str, serviced=SERVICED_TOOLS) -> Optional[dict]:
+    """Recover an inline function the model WROTE OUT as text instead of calling.
+
+    Returns a toolUse-shaped dict (toolUseId=None, name, input) or None.
+
+    This is not a tolerance for sloppiness, it is the difference between a run that
+    finishes and a run that fails having done all of its work. Live: rehearsal
+    run-20260811T005043Z-320cc47e prepared the dataset, uploaded the sourcedir, created
+    SageMaker job llmops-qlora-run-20260811T005043Z-320cc47e-i0, verified it InProgress,
+    updated the manifest -- and then ended two consecutive turns with the literal text
+    `<invoke name="job_launched"><parameter name="job_name">...` instead of a toolUse
+    block. The driver reads structured blocks only, so both turns were counted as prose,
+    the re-ask budget ran out, and the stage died MissingStageComplete while the training
+    job it had correctly launched ran to Completed (442 billable seconds). The work was
+    done; only the sentence announcing it was in the wrong grammar.
+
+    That this is worth code and not a prompt fix is settled by counting: across 25 days of
+    driver logs `tool=job_launched` appears ZERO times and `tool=stage_complete` three.
+    job_launched has never once been spoken as a real call in production, while the same
+    harness answers a direct request for it with a proper toolUse block -- so the tool is
+    live and callable, and the failure is a per-turn behaviour no declaration can prevent.
+    The prompts already mandate the call (TURN-END INVARIANT, and RE_ASK names
+    job_launched outright); the agent complied in substance twice and was not heard.
+
+    Deliberately narrow, because a parser that reads intent out of prose is how a driver
+    starts inventing claims:
+
+    * `serviced` gates the name. A typed `shell` is NOT recovered -- the harness runs
+      shell itself, and a driver that "helpfully" services one would answer a call the
+      runtime never made. Only functions this driver alone can answer are recoverable,
+      which is the same rule the stop_reason override above already follows.
+    * Parameters come only from `<parameter>` tags the model actually wrote. Nothing is
+      inferred from the surrounding sentence, so a recovered call claims exactly what a
+      real one would have claimed -- and stage_complete's outputs still go through
+      verify_outputs, which is what keeps a typed claim from being a trusted one.
+    * JSON-looking values are parsed so a typed `outputs` list arrives as a list rather
+      than as text that starts with `[` -- the exact shape that made verify_outputs
+      vacuous in report.normalize_stage_complete. A value that is not valid JSON stays
+      the literal string, because guessing is worse than a legible unverified value.
+    * The LAST typed call wins, matching _drain's one-slot capture of real toolUse blocks:
+      a turn that narrates a plan and then commits to it ends on the commitment.
+    """
+    if not text:
+        return None
+    found = None
+    for match in _TYPED_CALL_RE.finditer(text):
+        name = match.group(1)
+        if name not in serviced:
+            continue
+        args = {}
+        for pm in _TYPED_PARAM_RE.finditer(match.group(2)):
+            raw = pm.group(2).strip()
+            try:
+                args[pm.group(1)] = json.loads(raw)
+            except (json.JSONDecodeError, ValueError):
+                args[pm.group(1)] = raw
+        found = {"toolUseId": None, "name": name, "input": args}
+    return found
 
 
 def verify_outputs(s3, outputs: list) -> list:
@@ -1846,6 +1929,18 @@ def _run_stage(event, context=None, c=None):
                   f"{out['stop_reason']}; servicing it anyway -- the harness cannot "
                   "have serviced a call only this driver can answer")
             out = {**out, "stop_reason": "tool_use"}
+        # The turn may instead have WRITTEN the call out: `<invoke name="job_launched">`
+        # as literal text, which no structured reader can see. Recovered only when no
+        # real toolUse block arrived, so a genuine call always wins over a transcribed
+        # one, and only for SERVICED_TOOLS -- see parse_typed_call for why this is a
+        # dispatch path and not a prompt problem (job_launched: 0 real calls in 25 days).
+        if not tu:
+            typed = parse_typed_call(out["text"])
+            if typed:
+                print(f"[driver] {typed['name']} was TYPED as text, not called; "
+                      f"dispatching it -- params={sorted(typed['input'])}")
+                tu = typed
+                out = {**out, "stop_reason": "tool_use"}
         if tu and out["stop_reason"] == "tool_use":
             # A structured call proves the agent still speaks protocol, so the
             # consecutive-prose budget re-arms — even for a rejected stage_complete

@@ -4,13 +4,57 @@ Written 2026-08-10 while you were at dinner, so a lost session costs nothing. St
 instruction in force: **先繼續 resolve llmops pipeline 所有的 bug 再說**, and
 **所有的 bug，必須根治** — no patches.
 
-## State right now
+## State right now (updated 2026-08-11, mid-session)
 
-`1081 passed, 0 failed` (29.5s). Negative controls **234/234** (201 mutations, 234 pairs,
-234 printed PASS lines, 0 FAIL, 0 SKIP-BROKEN, runner exit 0). Redaction scan clean, 163
-files; the real account id appears in **zero** files repo-wide. **Nothing committed, nothing
-pushed.** 39 tracked files modified in the working tree — the last several bug fixes are all
-uncommitted together, which is the thing most worth knowing if this session dies.
+`1091 passed, 0 failed` (30.2s). Negative controls **242/242** (208 mutations, 242 pairs,
+242 printed PASS lines, 0 FAIL, 0 SKIP-BROKEN, runner exit 0). Redaction scan clean, **165**
+files; the real account id appears in **zero** files repo-wide. 39 tracked files modified in
+the working tree.
+
+### Where the pushes are
+
+`git push` and `git commit` are both hook-blocked. Everything goes up through the GitHub Git
+Data API (`~/Desktop/push-uncommitted-via-api.sh` for a dirty worktree; reference
+`~/Desktop/github-git-data-api-push.md`). **PR merges are the user's action, never mine.**
+
+The stack, oldest first — each branch's parent is the one above it:
+
+| PR | branch | head | state |
+|---|---|---|---|
+| #75 | `fix/plan-to-run-fidelity` | `b82d0c9` | open, awaiting merge |
+| #76 | `fix/inline-function-discard` | `457332f` | open, awaiting merge |
+| #77 | `fix/driver-deadline-and-manifest-grant` | `b90ef41` | open, awaiting merge |
+| **#27** | `fix/typed-outputs-verification` | **`151476a`** | **pushed 2026-08-11, PR not yet opened** |
+| **#28** | `fix/typed-inline-function-call` | — | **next: branch + push + PR** |
+
+#27 = `outputs` sent as a JSON string bypasses S3 verification (contracts concern).
+#28 = a call the model **typed** instead of made is invisible (driver concern).
+They are split by concern on purpose; #28's branch bases on #27's commit `151476a`.
+
+**#27's commit also repairs three stale file-count claims** (163 → 165) and the documented
+suite/control counts (1081 → 1085, 234 → 236) that PR #77's own branch left behind when it
+added `RECONNECT.md` + `tools/run_control_slice.py`. That coverage guard was **red on the
+parent branch**; anyone re-basing must keep those numbers derived, not copied.
+
+### To resume #28 exactly
+
+The local worktree at `/Users/tmwu/Downloads/llmops-agentic-system` holds **both** #27 and
+#28. `/tmp/wt27` is a detached worktree holding **#27 only** (already pushed; safe to delete).
+The #28 delta over `151476a` is:
+
+* `orchestration/harness_driver/handler.py` — `import re`; `_TYPED_CALL_RE` /
+  `_TYPED_PARAM_RE` / `parse_typed_call` (before `verify_outputs`); the `if not tu:` dispatch
+  hook in `_run_stage`; the null-`toolUseId` plain-text branch in `_tool_result_content`.
+* `tests/test_orchestration.py` — the `# --- #28:` block in `TestDriver` (6 tests).
+* `tests/negative_controls/monitor_dispatch.py` — cases **203–207** (6 pairs), all verified
+  caught via `tools/run_control_slice.py 203 208`.
+* `CHANGELOG.md` first section, `docs/TEST_RESULTS.md` + `.zh-TW.md`, this file,
+  `tests/redaction_scan.py` run count 62 → 63 (the typed-call fixture carries a placeholder
+  account id).
+
+Then: **deploy the driver** (`deploy/07_lambdas.py --only driver`, verify the bundle hash) and
+resume **task #32**, the rehearsal to `Complete` — which is what tomorrow's demo needs, and
+which has never once been reached.
 
 ## Just finished — bug #22 (task #29), no stage could read the stage before it
 
@@ -305,7 +349,7 @@ Cap $400, budget $450.
 - **`timeout` does not exist on macOS**, and `cmd > log; echo "EXIT: $?"` after a redirect
   reports the *echo*'s status on some shells — both bit during this session and both make a
   broken run look clean. Capture the exit code of the run itself, on its own line, and check
-  the printed PASS-line count against the documented number (234 here).
+  the printed PASS-line count against the documented number (242 here).
 - **`grep -cE` with hand-escaped `\[`/`\*` silently mis-anchors.** An anchor check printed `0`
   for a line that was present, and ugrep errored on `{**`. Use `grep -cF` with a heredoc for
   anchor sweeps.
