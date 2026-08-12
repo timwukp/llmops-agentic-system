@@ -445,6 +445,8 @@ stale/cap/claim 契約；正常終結會**刪除** item（結束不是死亡，�
 —— 絕不用它自己的 `triage-` id —— 並隨升級一併刪除。排程作業（sweep、finops）刻意
 **不可復活**：崩潰的排程等下一次排程，而不是重跑非冪等的工作。
 
+這整條迴圈現在是**對已部署 bundle 的實測驗證**，不再只是單元測試：`tools/probe_liveness_resurrection.py` 下載 Lambda 現在真正在跑的程式碼，用一個合成 triage 對著真實的 events 表把 beat → sweep → 認領 → 復活 → 上限升級 → 終態刪除整條走完，2026-08-12 **18/18 通過**。它之所以存在，是因為這是唯一一條「健康」與「壞掉」讀起來一模一樣的路徑 —— triage 大約一個月才死一次，所以`checked_liveness: 0` 在幾乎每一天都正常，而「Query 打錯分區」、「少了 `dynamodb:Query`」、「兩個各自打包的副本對 `__liveness__` 這個字串不一致」，會產生完全相同的讀數。它殺掉的六個 mutant 見 TEST_RESULTS。
+
 兩半都會在結束時把「檢查了什麼」**印出來**，因為排程的 invoke 是非同步的，handler
 回傳的計數沒有任何人讀。這對非 run 的那一半尤其重要：只要當天沒有 triage 死掉，它
 的健康狀態就是 *零* 個 beat —— 沒有那行 log，一次完美運作的掃描和一次瞄錯分區的

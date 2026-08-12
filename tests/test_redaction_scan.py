@@ -218,7 +218,7 @@ def test_binary_classification_matches_git_for_every_tracked_file():
     purpose -- the finding is that a skip count nobody reads is where a guard goes to hide, and
     that finding does not expire when the arithmetic changes.) A guard whose name says "for every
     tracked file" was checking zero of them on the only machine that gates the merge, and
-    reported green for it. Against `4b825dc…` the diff is the whole index -- 171 files, 35 of
+    reported green for it. Against `4b825dc…` the diff is the whole index -- 172 files, 35 of
     them binary -- so it can never be empty and there is nothing left to skip on.
     """
     out = subprocess.run(["git", "diff", "--cached", "--numstat", _EMPTY_TREE],
@@ -237,7 +237,7 @@ def test_binary_classification_matches_git_for_every_tracked_file():
             f"{path}: git says binary={git_says_binary}, is_binary() disagrees")
         checked += 1
     # EVERY tracked file, which is what the name promises -- not "at least one". `assert checked`
-    # was the old floor, and it is satisfied by checking a single file out of 171: a diff against
+    # was the old floor, and it is satisfied by checking a single file out of 172: a diff against
     # HEAD covers only what this branch happens to touch, so the coverage of this guard silently
     # tracked the size of the working change. Comparing against `git ls-files` makes the promise
     # in the name falsifiable, and is what fails if the diff base is ever narrowed again.
@@ -734,3 +734,37 @@ def test_the_scanners_own_coverage_claims_match_the_repo():
     assert (int(m.group(1)), int(m.group(2))) == (len(runs), len(set(runs))), (
         f"the comment claims {m.group(1)} runs / {m.group(2)} distinct, the repo has "
         f"{len(runs)} / {len(set(runs))}")
+
+
+def test_an_unstaged_new_file_is_a_lying_census():
+    """Every census in this repo reads `git ls-files`, so an UNSTAGED new file makes them all
+    answer a question CI will answer differently.
+
+    This is the only guard here whose target is the workstation rather than the repo. On this
+    machine `git push` is unavailable and branches go up through the Git Data API from the
+    WORKING TREE, so a new file can be pushed while the index has never heard of it -- and
+    `git ls-files` reads the index. The four counts above, the lambda census in
+    test_docs_claims.py and the asset census in test_intro_video.py then all measure a repo
+    with one fewer file than the branch has, agree with the stale comment they are checking,
+    and go red only on CI. That has now happened FOUR times and cost two red PRs; the fourth
+    time a full local suite had passed minutes before the push.
+
+    The cure is one command (`git add -N <path>`), which is exactly why it needed a guard
+    rather than a note: advice that must be remembered at the right moment is not a control.
+    In CI this assertion is trivially true (a checkout has no untracked files), which is the
+    point -- it moves the detection to the machine that was missing it. Verified by planting
+    an untracked file and watching it fail, because a guard nobody has ever seen fail is
+    indistinguishable from `assert True`.
+
+    Deliberately NOT solved by making the censuses read the working tree instead: the index is
+    the branch's truth, and a census over untracked files would count local scratch as shipped
+    code -- the same defect in the other direction.
+    """
+    untracked = subprocess.run(["git", "ls-files", "--others", "--exclude-standard"],
+                               capture_output=True, text=True, cwd=REPO, check=True
+                               ).stdout.split()
+    assert not untracked, (
+        "these files exist in the working tree but not in the index, so every `git ls-files` "
+        f"census in this suite is measuring a different repo than CI will: {untracked}. Run "
+        "`git add -N <path>` for anything the next push includes, or add it to .gitignore if "
+        "it is local scratch")

@@ -22,12 +22,46 @@ page is its ledger.
 
 | Check | Result | How to reproduce |
 |---|---|---|
-| Unit tests (contracts, cost model, driver loop, Lambdas, state machine document) | **1163/1163 passed** | `.venv/bin/python -m pytest tests/ -q --ignore=tests/golden` |
+| Unit tests (contracts, cost model, driver loop, Lambdas, state machine document) | **1164/1164 passed** | `.venv/bin/python -m pytest tests/ -q --ignore=tests/golden` |
 | Shell suite — N-way capacity race guard (`tests/test_capacity_race_guard.sh`) | **10/10 assertions** | `bash tests/test_capacity_race_guard.sh` |
 | Negative controls — every guard broken in turn, confirmed to fail | **242/242 negative controls** | `.venv/bin/python tests/negative_controls/monitor_dispatch.py` |
 | Harness config validation (5 specialists + conductor + auditor) | **7/7 `RESULT: OK`** | `python deploy/validate_config.py --config agents/<a>/harness.json` |
 | Architecture SVG geometry (no wire crossings, no wire through a card) | **CLEAN** | `python tests/test_svg_geometry.py docs/architecture-*.svg` |
 | Redaction scan (account IDs, credentials, account-bearing ARNs) | CLEAN | `.github/workflows/redaction-check.yml` |
+
+### Live probe — the triage liveness loop (#37), against what Lambda is serving
+
+Not CI-enforced and deliberately not a unit test: the non-run half of the resurrector is
+the one path whose healthy state is indistinguishable from a broken one. A triage dies
+maybe once a month, so `checked_liveness: 0` is the normal reading on almost every day —
+and a Query against the wrong partition, a missing `dynamodb:Query` grant, or two
+separately-bundled copies that disagree about the string `__liveness__` would each
+produce exactly that same reading. So this probe downloads the **deployed** driver and
+resurrector bundles and drives the whole loop against the **real** `llmops-stage-events`
+table.
+
+| Check | Result | How to reproduce |
+|---|---|---|
+| Non-run (triage) liveness beat → sweep → claim → revive → cap-escalate → terminal delete | **18/18 checks passed** against the deployed bundles (2026-08-12), 18/18 against this checkout | `python tools/probe_liveness_resurrection.py --region us-east-1` |
+
+No agent turn (the fake AgentCore client raises before the first invoke, so the real
+heartbeat runs and the billed part never starts), no real `lambda:invoke`, no real
+`events:PutEvents`, and the resurrector's run-row half is handed an empty stub because
+forcing `STALE_MINUTES=0` would otherwise claim and revive every live run. The one real
+mutation is a single item in the dedicated `__liveness__` partition under a synthetic
+subject, deleted before exit.
+
+**Mutation-checked, 6/6 killed:** the resurrector reading a different partition (11/18) ·
+the beat dropping `params` from the stamped payload, which is what a revival triages from
+(15/18) · a terminal return marking instead of deleting (17/18) · the cap path escalating
+against the triage itself rather than the run it was about (17/18) · the beat losing its
+`attribute_exists(run_id)` condition and minting a ghost run row (4/6) · the sweep losing
+its freshness guard and reviving live triages (16/18).
+
+That fifth mutant is why the probe deletes a ghost row as well as reporting it: the row it
+left behind **inverted the next probe run** — with a runs row present the conditional beat
+*succeeds*, so the handoff into `__liveness__` never runs and every check below it fails
+for entirely the wrong reason.
 
 ## Live invocations per phase
 
@@ -99,7 +133,7 @@ Full record: [VERIFICATION_finops.md](../deploy/evidence/VERIFICATION_finops.md)
 
 | Check | Result | How to reproduce |
 |---|---|---|
-| Unit tests (all suites, incl. `test_cost_model.py` + `test_finops.py`) | **1163 passed** | `.venv/bin/python -m pytest tests/ -q` |
+| Unit tests (all suites, incl. `test_cost_model.py` + `test_finops.py`) | **1164 passed** | `.venv/bin/python -m pytest tests/ -q` |
 | Harness config validation, 7 agents | **`RESULT: OK`** | `python deploy/validate_config.py --config agents/finops/harness.json` |
 | Live fleet | **7 harnesses READY** | `list_harnesses` via the repo's vendored boto3 |
 | Canonical module has a distribution path | prints `would upload 4 contract files` | `python deploy/03_storage.py --region us-east-1 --account-id 123456789012 --dry-run` |

@@ -107,7 +107,7 @@ ALLOWED = (b"6833" + b"13688378", b"7631" + b"04351884", b"1234" + b"56789012")
 #: this laptop, single-threaded CPython does 3.1M sha256/s, so the whole 1e12 space falls in
 #: about 4 days -- and a GPU does it in roughly 100 seconds. So the KDF is iterated. At 200k
 #: iterations a candidate costs ~16 ms, which makes the same sweep ~500 GPU-years, while the
-#: scan stays cheap because only 12-digit runs are ever hashed: measured across all 171
+#: scan stays cheap because only 12-digit runs are ever hashed: measured across all 172
 #: tracked files there are 63 such runs, 9 distinct, and hashing the distinct set takes 0.16 s
 #: for the entire repo. (Re-measured whenever either number moves, and they move
 #: INDEPENDENTLY, which is why both are derived and neither is inferred from the other, and
@@ -126,15 +126,20 @@ ALLOWED = (b"6833" + b"13688378", b"7631" + b"04351884", b"1234" + b"56789012")
 #: the run count held at 63 again, then the r6c scaling diagnosis moved 168 -> 169 (an evidence
 #: doc of percentages, token counts and dollar amounts) and pinning the canonical judge prompt
 #: moved 169 -> 170 (a markdown instrument whose only numbers are counts and
-#: intervals), and the v2 augment-path fix then moved 170 files became 171 (a test module whose
-#: only numbers are byte and line counts). FIVE commits running, the file count moved and the
+#: intervals), the v2 augment-path fix then moved 170 -> 171 (a test module whose
+#: only numbers are byte and line counts), and the #37 liveness probe moved
+#: 171 files became 172 (a probe script whose only numbers are check counts and a
+#: STALE_MINUTES). SIX commits running, the file count moved and the
 #: run count did not move once --
 #: which is the whole reason these are two derived numbers and not one. The CI-only detection
-#: has now repeated THREE times: `git ls-files` reads the INDEX, so on this push-via-API
+#: has now repeated FOUR times: `git ls-files` reads the INDEX, so on this push-via-API
 #: workstation a new file is invisible to the census until it is staged, and the guard agrees
 #: with the stale comment right up until CI disagrees with both. The third occurrence cost a
 #: red PR because a full local suite had passed minutes earlier -- the cure is to `git add` the
 #: new file BEFORE the last local run, which is the only way a census sees what CI will see.
+#: The fourth cost another red PR the same way, which is why that cure is no longer advice:
+#: test_an_unstaged_new_file_is_a_lying_census reds the local suite while the file is still
+#: untracked, so the census cannot be asked a question CI will answer differently.
 #: Earlier: the task_tokens
 #: contract moved 162 -> 163 while the run count held at 52, and the env_keys derivation then
 #: held the file count at 163 while adding 2 runs -- two `env_values`

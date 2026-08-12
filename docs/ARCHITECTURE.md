@@ -528,6 +528,8 @@ resurrection count), while a cap-exhausted item escalates against the run the tr
 jobs (sweep, finops) are deliberately **not** revivable: a crashed schedule waits for
 its next schedule rather than re-running non-idempotent work.
 
+That whole loop is now **live-verified against the deployed bundles**, not just unit-tested: `tools/probe_liveness_resurrection.py` downloads what Lambda is serving, drives a synthetic triage through beat → sweep → claim → revive → cap-escalate → terminal delete against the real events table, and passed **18/18** on 2026-08-12. It exists because this is the one path whose healthy state and broken state read identically — a triage dies about once a month, so `checked_liveness: 0` is normal on almost every day, and a Query on the wrong partition, a missing `dynamodb:Query`, or two separately-bundled copies disagreeing about the string `__liveness__` all produce that same reading. See TEST_RESULTS for the six mutants it kills.
+
 Both halves end by **printing** what they checked, because the schedule's invoke is
 asynchronous and the counts the handler returns are read by nobody. That matters most
 for the non-run half, whose healthy state is *zero* beats on any day no triage is dead:
