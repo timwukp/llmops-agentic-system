@@ -963,6 +963,21 @@ run，產出的是一份「無事可報」的報告。現在 driver 會附加到
 `in_flight`（不是 pass 也不是 fail —— 那個結果還不存在），並且發佈 `unrecognized`，讓四個子項加起來
 等於 `total`。`total` 與 `passed + failed` 之間那道縫，正是這件事藏了 14 次 run 的地方。
 
+**由聲稱者自己挑的摘要不算檢查。** `deploy/03_storage.py` 會把正典的成對評審 prompt 鏡像到
+`code/eval/judge_prompt_pairwise.md`，理由是「比較兩個 run 於是變成比較摘要，而不是比較論點」——
+但從來沒有任何程式把那個摘要跟任何東西比對過。評分的 agent 把 `judge_prompt_sha256` 寫在它自己的
+`judge_score` 旁邊，這讓這份證明的可信度剛好等於它本該去佐證的那個數字。r5 就是它要抓的那個失效：
+eval prompt 說「固定的評審 prompt」而其實一個都沒固定，那個 run 自己寫了一份只有 A 或 B 的量測工具，
+它的 `judge_ties: 0` 當時被讀成學生的性質，實際上是一份不提供平手選項的 prompt 的性質。現在 driver
+自己去取那個正典物件、對它的位元組算雜湊、把比對結果寫進 `manifest.attestations` ——放在 stage
+條目**旁邊**而不是裡面，因為那個條目是 agent 的聲稱空間，而一份存在聲稱裡面的量測就不再獨立於那個
+聲稱。三種結果，不是一種：**不符**（這個分數跟任何其他 run 都不可比，`high`）、**沒有**摘要（這個分數
+沒有指名它的量測工具，`medium`）、正典物件**讀不到**（檢查根本沒發生，`medium`）——把第三種報成第一種，
+等於用部署的缺口去責怪一個 run。誰該提出這份證明，是從 metrics 裡的評審數字推導出來的，不是靠一份
+`(stage, task)` 名單，因為 eval prompt 允許夠小的 prompt 集合在 `evaluate` 而不是 `score` 裡完成
+評分，而一份名單會安靜地停止檢查走了那條路的 run。driver 絕不用正典摘要去替補一個缺失的聲稱：那會把
+一份不存在的證明變成一份假的證明。
+
 **一個 run 自己發現的事實，和它被簽署時的同意一樣會被傳遞下去。** `MODEL_PARAM_FOR_ROLE` 把人
 **簽署**的內容帶給必須服從它的 stage；`STAGE_FACT_PARAMS` 把 run 自己**產出**的內容帶給必須量測
 它的 stage。`params.student_endpoint` —— eval 與 monitor 都會讀 —— 就是命名這個模式的那個案例：

@@ -166,6 +166,42 @@ def normalize_stage_complete(args: dict | None) -> dict:
     }
 
 
+def _instrument_finding(att: dict) -> dict:
+    """The finding for ONE failed instrument attestation, by cause.
+
+    Three outcomes, deliberately not collapsed into one "attestation failed", because they
+    ask a reader for three different actions:
+
+    * **mismatch** -- the stage judged with something other than the canonical instrument,
+      which is r5's defect exactly (a self-authored A-or-B prompt reporting judge_ties: 0).
+      The number is not comparable to any other run's, so it is the highest of the three.
+    * **absent** -- a score that does not name its instrument. The score may be perfectly
+      good; nobody can place it beside another run's, which is what the digest was for.
+    * **unreadable** -- the canonical object could not be fetched, so the check itself did
+      not happen. Reporting this as a mismatch would blame the run for the deploy's gap;
+      staying silent would let a check that never ran read as a check that passed.
+    """
+    claimed, canonical = att.get("claimed_sha256", ""), att.get("canonical_sha256", "")
+    where = att.get("key", "the canonical judge prompt")
+    if att.get("error"):
+        return {"severity": "medium",
+                "title": "Judge instrument could not be verified",
+                "detail": f"{where} was unreadable ({att['error']}), so the digest this "
+                          f"stage claimed ({claimed or 'none'}) was checked against "
+                          "nothing. Run deploy/03_storage.py to mirror the instrument."}
+    if not claimed:
+        return {"severity": "medium",
+                "title": "Judge score does not name its instrument",
+                "detail": f"no judge_prompt_sha256 was reported, so this score cannot be "
+                          f"compared to another run's. {where} currently hashes to "
+                          f"{canonical}."}
+    return {"severity": "high",
+            "title": "Judge score was produced by a non-canonical instrument",
+            "detail": f"claimed judge_prompt_sha256 {claimed} != {where} ({canonical}). "
+                      "The score was measured with a different instrument than the one "
+                      "every other run is measured with; it is not comparable."}
+
+
 def build_run_report(manifest: dict) -> dict:
     """Derive the ops-console report document from a run manifest."""
     now = datetime.datetime.now(datetime.timezone.utc).isoformat()
@@ -222,6 +258,23 @@ def build_run_report(manifest: dict) -> dict:
             "detail": esc.get("reason") or "see SNS notification / DDB stage events",
         })
 
+    # What the driver MEASURED about a stage's claims, as opposed to what the stage said.
+    # One finding per distinct claim, not per record: a run whose gate task echoes the score
+    # task's judge digest is one unverified instrument, not two, and a reader who is told
+    # twice starts discounting the telling.
+    attestations = list(manifest.get("attestations") or [])
+    seen_claims = set()
+    for att in attestations:
+        att = att or {}
+        if att.get("verified"):
+            continue
+        claim = (att.get("kind", ""), att.get("claimed_sha256", ""),
+                 att.get("canonical_sha256", ""))
+        if claim in seen_claims:
+            continue
+        seen_claims.add(claim)
+        findings.append({"stage": att.get("stage", "unknown"), **_instrument_finding(att)})
+
     return {
         "generated_at": now,
         "run_id": manifest.get("run_id", "unknown"),
@@ -252,6 +305,10 @@ def build_run_report(manifest: dict) -> dict:
         # Carried verbatim as well as summarised into `findings`: the finding says a human
         # was called, the record says which iteration called them and why.
         "escalations": escalations,
+        # Carried whether or not they failed: an attestation that PASSED is the digest two
+        # runs are compared on, so a report that only published the failures would leave a
+        # comparable score with nothing to compare it by.
+        "attestations": attestations,
     }
 
 

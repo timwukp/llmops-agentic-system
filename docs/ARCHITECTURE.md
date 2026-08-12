@@ -1138,6 +1138,26 @@ failure — that outcome does not exist yet), and `unrecognized` is published so
 sub-counts reconcile to `total`. The gap between `total` and `passed + failed` is exactly
 what hid this for 14 runs.
 
+**A digest the claimant chose is not a check.** `deploy/03_storage.py` mirrors the canonical
+pairwise judge prompt to `code/eval/judge_prompt_pairwise.md` so that "comparing two runs is a
+digest comparison rather than an argument" — and nothing compared the digest to anything. The
+scoring agent wrote `judge_prompt_sha256` beside its own `judge_score`, which gives the
+attestation exactly the standing of the number it was supposed to corroborate. r5 is the
+failure it exists to catch: the eval prompt said "fixed judge prompts" and fixed none, that run
+authored its own A-or-B-only instrument, and its `judge_ties: 0` was read as a property of the
+student when it was a property of a prompt that offered no tie. The driver now fetches the
+canonical object itself, hashes its bytes, and files the comparison in `manifest.attestations`
+— **beside** the stage entry rather than inside it, because that entry is the agent's claim
+space and a measurement stored inside a claim stops being independent of it. Three outcomes,
+not one: a **mismatch** (the score is not comparable to any other run's, `high`), an **absent**
+digest (the score names no instrument, `medium`), and an **unreadable** canonical object (the
+check did not run, `medium`) — reporting the third as the first would blame a run for a gap in
+the deploy. Whoever owes the attestation is derived from the judge numbers in the metrics, not
+from a `(stage, task)` name list, because the eval prompt lets a small enough prompt set be
+scored inside `evaluate` instead of `score` and a name list would quietly stop checking that
+run. The driver never substitutes the canonical digest for a missing claim: that converts an
+absent attestation into a false one.
+
 **The facts a run discovers travel like the consent it was signed with.** `MODEL_PARAM_FOR_ROLE`
 carries what a human *signed* into the stages that must obey it; `STAGE_FACT_PARAMS` carries what
 the run itself *produced* into the stages that must measure it. `params.student_endpoint` — read
