@@ -208,6 +208,38 @@ def ensure_contracts(s3, bucket, dry):
             "to": [f"s3://{bucket}/contracts/", f"s3://{bucket}/pipeline/contracts/"]}
 
 
+def ensure_code(s3, bucket, dry):
+    """Upload pipeline/training/distill/ to s3://<bucket>/code/distill/ and VERIFY it.
+
+    The finetune agent authored its own train_qlora.py on every run because the
+    canonical script was IAM-unreadable -- its own docstring said so verbatim on
+    run-20260811T165529Z-ce628817 ("canonical code/train_qlora.py unreadable by
+    harness role"). Codegen roulette: the same agent produced a working trainer on
+    r5 and r6c and an UnboundLocalError on r6a. The cure is the skills argument over
+    again: a canonical artifact the role can READ and may not WRITE, mirrored by the
+    deploy so drift is a deploy-time diff, not a per-run surprise. Read-back verified
+    byte-for-byte under the deployer's credentials (the ROLE's read is granted in
+    deploy/iam/harness_execution_role.json, S3CanonicalCodeReadOnly).
+    """
+    src_dir = pathlib.Path(__file__).resolve().parent.parent / "pipeline" / "training" / "distill"
+    files = sorted(p for p in src_dir.glob("*") if p.is_file())
+    if not files:
+        raise SystemExit("pipeline/training/distill/ is empty -- the finetune prompt "
+                         "names this mirror, so an empty upload would strand every launch")
+    if dry:
+        return {"would": f"upload {len(files)} canonical code files",
+                "to": f"s3://{bucket}/code/distill/"}
+    verified = []
+    for p in files:
+        key = f"code/distill/{p.name}"
+        s3.upload_file(str(p), bucket, key)
+        body = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+        if body != p.read_bytes():
+            raise SystemExit(f"read-back mismatch for s3://{bucket}/{key}")
+        verified.append(p.name)
+    return {"uploaded_and_verified": verified, "to": f"s3://{bucket}/code/distill/"}
+
+
 def mounted_skills(repo):
     """Every skill path the harness configs mount, mapped to the harnesses mounting it.
 
@@ -667,6 +699,7 @@ def main():
     # Reported on its own line for the same reason as CORS: when this is skipped there is
     # no other visible symptom until a source is switched and every session fails at start.
     results["skills"] = ensure_skills(s3, bucket, args.dry_run, args.skills_src)
+    results["code"] = ensure_code(s3, bucket, args.dry_run)
     results[RUNS_TABLE] = {
         "status": ensure_table(ddb, RUNS_TABLE, {
             "AttributeDefinitions": [

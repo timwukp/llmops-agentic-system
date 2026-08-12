@@ -167,6 +167,15 @@
         "Resource": "arn:aws:s3:::<DATA_BUCKET>/skills/*"
       },
       {
+        "Sid": "S3CanonicalCodeReadOnly",
+        "_comment": "The canonical training sourcedir (code/distill/*, mirrored by deploy/03_storage.py ensure_code). GetObject ONLY, same argument as S3SkillsReadOnly one statement up: an agent that can write the script it trains with can rewrite the thing its gate judges. The grant exists because its absence was load-bearing: the finetune agent's own generated-script docstring on run-20260811T165529Z-ce628817 read 'canonical code/train_qlora.py unreadable by harness role', so every run re-authored the trainer from scratch -- r5 and r6c got working ones, r6a got an UnboundLocalError and died. No ListBucket needed: the finetune prompt names the exact keys.",
+        "Effect": "Allow",
+        "Action": [
+          "s3:GetObject"
+        ],
+        "Resource": "arn:aws:s3:::<DATA_BUCKET>/code/*"
+      },
+      {
         "Sid": "S3CustomerDataReadOnly",
         "_comment": "The customer's own data: readable, never writable. Both prompts point data-prep at customer-data/ and nothing granted it, so the first real consult run dispatched, reached DataPrepGenerate and died on s3:ListBucket/GetObject without reading one task. Read-only because a pipeline that can rewrite the customer's data can destroy the held-out set its own gates are judged on.",
         "Effect": "Allow",
