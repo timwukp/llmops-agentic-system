@@ -535,6 +535,27 @@ without the line, a sweep working perfectly and a Query aimed at the wrong parti
 left identical traces — start, end, silence. The printed counts are the standing evidence
 that the partition is read at all.
 
+Printing is not noticing, though, and for a long time nothing did. Between 2026-07-29 and
+2026-08-12 Lambda **dropped 19 async invocations** (driver 11, resume 8) — each one a
+stage that stopped with its token parked — and there was not one CloudWatch alarm on any
+function in this system: the nine-hour death was found by a human reading an execution
+history, the resume Lambda's missing `events:PutEvents` grant by a human reading logs a
+day later. `deploy/06_observability.py --alarms` now creates twelve, in three families
+that each detect something the others cannot. **`<fn>-errors`** (every function
+`07_lambdas.py` deploys, derived from it so a new Lambda cannot ship unwatched) is the
+primary detector: every one of those 19 drops landed on a day that also had function
+errors, and resume's ratio is exactly 3 — one attempt plus the two default retries — so
+this family fires first, always. **`<fn>-silent`** covers the three scheduled functions
+whose *silence* is the failure; `TreatMissingData` must be `breaching` there, because an
+uninvoked Lambda publishes no datapoint rather than a zero, and with the ordinary
+`notBreaching` the alarm would sit in INSUFFICIENT_DATA forever and detect precisely
+nothing. `llmops-start-pipeline` deliberately has none: its nightly schedule ships
+disabled, and a permanently-red alarm teaches an operator to ignore the whole set.
+**`<fn>-async-dropped`** is kept not as an earlier warning but as a different *meaning* —
+an error that retried is self-healed, while a drop is work that is gone. There is no
+`ExecutionsFailed` alarm on the state machine: a run that honestly fails its quality gate
+is this pipeline working, not an incident.
+
 The last exposure that pair does *not* cover is the session's own clock. AgentCore
 reclaims a runtime session at `maxLifetime` = **28800 s (8 h)** — a hard cap that
 activity does not reset and no setting raises. A distillation stage runs 8–12 h in one
