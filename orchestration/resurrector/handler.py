@@ -30,8 +30,18 @@ RESURRECTIONS_MAX caps how many times one run can be revived (default 5): a run 
 driver dies every turn has a real defect that revival only re-runs; past the cap this
 Lambda emits ESCALATED_TO_HUMAN instead, which routes to the conductor's triage.
 
-Env: RUNS_TABLE, DRIVER_FN, EVENT_BUS, STALE_MINUTES (default 20), RESURRECTIONS_MAX
-(default 5).
+The non-run half (#37): a triage runs under `triage-<subject>` and deliberately has no
+run row -- the driver's heartbeat refuses to mint one (see _heartbeat's docstring), so
+for a year of incidents a dead triage was unrevivable: the resurrector keys on
+driver_beat_at and the one place it looked was the runs table. Widening the runs-table
+condition was rejected outright (a minted row carrying driver_beat_at IS a resurrectable
+ghost run); instead the driver beats non-run invocations into EVENTS_TABLE under the
+dedicated partition `__liveness__` (sk = `beat#<id>`, one item per invocation identity,
+done_at set on terminal return). This sweep reads that one partition with a Query --
+never a scan over real stage events -- and applies the same stale/cap/claim contract.
+
+Env: RUNS_TABLE, EVENTS_TABLE, DRIVER_FN, EVENT_BUS, STALE_MINUTES (default 20),
+RESURRECTIONS_MAX (default 5).
 """
 from __future__ import annotations
 
@@ -41,6 +51,11 @@ import sys
 from datetime import datetime, timezone
 
 import boto3
+from boto3.dynamodb.conditions import Key
+
+#: The EVENTS_TABLE partition that holds non-run driver heartbeats. A constant the
+#: driver duplicates (separate bundles); tests pin the two spellings together.
+LIVENESS_PK = "__liveness__"
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))  # repo layout
 try:
@@ -135,4 +150,63 @@ def handler(event, context=None, clients=None):
         out.append({"run_id": run_id, "action": "resurrected",
                     "age_min": round(age), "n": n + 1})
 
-    return {"checked_running": checked, "acted": out}
+    # ── the non-run half: one dedicated partition, one Query, same contract ──────
+    ev_table = c["ddb"].Table(os.environ["EVENTS_TABLE"])
+    kc = Key("run_id").eq(LIVENESS_PK) & Key("sk").begins_with("beat#")
+    resp = ev_table.query(KeyConditionExpression=kc)
+    beats = resp.get("Items", [])
+    while resp.get("LastEvaluatedKey"):
+        resp = ev_table.query(KeyConditionExpression=kc,
+                              ExclusiveStartKey=resp["LastEvaluatedKey"])
+        beats.extend(resp.get("Items", []))
+
+    liveness_checked = 0
+    for item in beats:
+        if str(item.get("done_at") or ""):
+            continue  # the invocation ended on its own terms; silence after an ending
+        liveness_checked += 1
+        beat = str(item.get("beat_at") or "")
+        payload_raw = str(item.get("payload") or "")
+        if not beat or not payload_raw:
+            continue
+        age = _age_minutes(beat, now)
+        if age < stale_min:
+            continue
+
+        subject = str(item["sk"])[len("beat#"):]
+        n = int(item.get("resurrections") or 0)
+        if n >= cap:
+            # Routes to a FRESH triage of the dead one -- not recursion: the new triage
+            # is alive, and if it dies too, ITS liveness item gets the same cap.
+            ev.emit_event(os.environ["EVENT_BUS"], ev.ESCALATED_TO_HUMAN,
+                          {"run_id": subject, "stage": "resurrector",
+                           "reason": f"non-run driver (liveness beat) dead {age:.0f}min; "
+                                     f"resurrection cap ({cap}) exhausted"},
+                          client=c["events"])
+            out.append({"run_id": subject, "action": "escalated", "age_min": round(age)})
+            continue
+
+        try:
+            ev_table.update_item(
+                Key={"run_id": LIVENESS_PK, "sk": item["sk"]},
+                UpdateExpression="SET resurrections = :n, beat_at = :t",
+                ConditionExpression="beat_at = :seen",
+                ExpressionAttributeValues={":n": n + 1,
+                                           ":t": now.isoformat(),
+                                           ":seen": beat})
+        except Exception:  # ConditionalCheckFailed — someone else moved first
+            out.append({"run_id": subject, "action": "lost-claim"})
+            continue
+
+        c["lambda"].invoke(FunctionName=os.environ["DRIVER_FN"],
+                           InvocationType="Event",
+                           Payload=payload_raw.encode())
+        ev.emit_event(os.environ["EVENT_BUS"], ev.DRIVER_RESURRECTED,
+                      {"run_id": subject, "stage": "resurrector",
+                       "silent_minutes": round(age), "resurrection": n + 1},
+                      client=c["events"])
+        out.append({"run_id": subject, "action": "resurrected",
+                    "age_min": round(age), "n": n + 1})
+
+    return {"checked_running": checked, "checked_liveness": liveness_checked,
+            "acted": out}

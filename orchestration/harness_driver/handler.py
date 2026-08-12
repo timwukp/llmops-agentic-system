@@ -1668,6 +1668,34 @@ RE_ASK = ("Your turn ended without an inline-function call. If your task is "
           "list if nothing was produced).")
 
 
+#: The EVENTS_TABLE partition for non-run driver heartbeats (#37). The resurrector
+#: duplicates this constant (separate bundles); a test pins the two spellings together.
+LIVENESS_PK = "__liveness__"
+
+
+def _settle_liveness(c, event, result):
+    """Mark a non-run invocation's liveness item done on every terminal return.
+
+    One choke point instead of a mark at every terminal branch: the statuses that end
+    an invocation are exactly the ones that are not the between-turns handoff. Gated by
+    attribute_exists so a run-run (which has no liveness item) is a cheap no-op -- the
+    condition failure IS the branch. An exception path deliberately never reaches this
+    (handler re-raises first): a CRASHED invocation must stay revivable, that being the
+    entire point of the beat."""
+    if (result or {}).get("status") == "self_reinvoked_between_turns":
+        return
+    try:
+        c["ddb"].Table(os.environ["EVENTS_TABLE"]).update_item(
+            Key={"run_id": LIVENESS_PK,
+                 "sk": "beat#" + str(event.get("run_id") or "")},
+            UpdateExpression="SET done_at = :t",
+            ConditionExpression="attribute_exists(run_id)",
+            ExpressionAttributeValues={
+                ":t": datetime.now(timezone.utc).isoformat()})
+    except Exception:  # noqa: BLE001 — no item (a run-run) or a race; telemetry only
+        pass
+
+
 def handler(event, context=None, clients=None):
     """Run one stage, and never strand the task token on the way out.
 
@@ -1699,7 +1727,9 @@ def handler(event, context=None, clients=None):
         # every way a triage can end without answering -- prose after re-asks, an
         # unsupported tool, a rejected page, a stage_complete that decided nothing. A
         # check placed at any single one of those would have to be repeated at the rest.
-        return _backstop_page(c, event, _run_stage(event, context, c))
+        result = _run_stage(event, context, c)
+        _settle_liveness(c, event, result)
+        return _backstop_page(c, event, result)
     except Exception as exc:
         token = event.get("task_token")
         if token:
@@ -1780,11 +1810,13 @@ def _run_stage(event, context=None, c=None):
         stream_retried = bool(event.get("_stream_retried"))
         re_asks = int(event.get("_re_asks", 0))
         filtered_turns = int(event.get("_filtered_turns", 0))
+        infra_error_turns = int(event.get("_infra_error_turns", 0))
     else:
         messages = _user_text(json.dumps(payload, default=str))
         stream_retried = False
         re_asks = 0  # up to 2 CONSECUTIVE: nudge, final demand; any serviced tool call re-arms it
         filtered_turns = 0  # consecutive platform-suppressed turns; see the filtered branch
+        infra_error_turns = 0  # consecutive dead-stream turns; see the outage branch
 
     def _out_of_time() -> bool:
         return bool(context) and context.get_remaining_time_in_millis() < 850_000
@@ -1796,6 +1828,7 @@ def _run_stage(event, context=None, c=None):
                                 "_stream_retried": stream_retried,
                                 "_re_asks": re_asks,
                                 "_filtered_turns": filtered_turns,
+                                "_infra_error_turns": infra_error_turns,
                                 "_session_epoch": epoch,
                                 "_session_started_at": session_started_at},
                                default=str))
@@ -1812,9 +1845,10 @@ def _run_stage(event, context=None, c=None):
         in S3, not in the transcript.
         """
         nonlocal epoch, session_started_at, sess, messages, re_asks, stream_retried, \
-            filtered_turns
+            filtered_turns, infra_error_turns
         epoch += 1
         filtered_turns = 0
+        infra_error_turns = 0
         session_started_at = time.time()
         sess = session_id(event["run_id"], event["stage"], event["task"], epoch)
         re_asks = 0
@@ -1866,11 +1900,13 @@ def _run_stage(event, context=None, c=None):
         describing correct behaviour. The same distinction was already reasoned out at
         _mark_run_escalated and simply never applied here.
 
-        The consequence beyond noise, stated so it is not mistaken for cosmetics: a triage
-        has no heartbeat, therefore nothing can resurrect a dead triage -- the resurrector
-        keys on driver_beat_at. That is a real gap, and it is a separate one; what belongs
-        here is not calling a by-design refusal a failure, so that the log line which does
-        mean "the beat is broken" still means it."""
+        The refusal is also the HANDOFF (#37): a non-run invocation still needs a
+        heartbeat somewhere, or nothing can resurrect a dead triage. The runs table is
+        the wrong somewhere -- a minted row carrying driver_beat_at is a resurrectable
+        ghost run -- so the rejected condition routes the same beat into EVENTS_TABLE
+        under the dedicated `__liveness__` partition, which the resurrector reads with
+        a Query. done_at is written by _settle_liveness on every terminal return, so a
+        finished triage's silence is an ending, not a death."""
         try:
             c["ddb"].Table(os.environ["RUNS_TABLE"]).update_item(
                 Key={"run_id": event["run_id"]},
@@ -1887,8 +1923,33 @@ def _run_stage(event, context=None, c=None):
                                      default=str)})
         except Exception as exc:  # noqa: BLE001 — the beat is telemetry, not the work
             if _is_condition_failure(exc):
-                return  # not a run row: no beat to write, and none wanted
+                _beat_liveness()  # not a run row: the beat belongs in __liveness__
+                return
             print(f"[driver] heartbeat write failed (continuing): "
+                  f"{type(exc).__name__}: {exc}")
+
+    def _beat_liveness():
+        """The non-run half of the heartbeat: one item per invocation identity in
+        EVENTS_TABLE's `__liveness__` partition. done_at is SET to empty here so a
+        recurring subject (the same escalation re-triaged later) comes back alive
+        after an earlier terminal mark; _settle_liveness writes the real timestamp."""
+        try:
+            c["ddb"].Table(os.environ["EVENTS_TABLE"]).update_item(
+                Key={"run_id": LIVENESS_PK,
+                     "sk": "beat#" + str(event.get("run_id") or "")},
+                UpdateExpression="SET beat_at = :t, payload = :p, done_at = :none",
+                ExpressionAttributeValues={
+                    ":t": datetime.now(timezone.utc).isoformat(),
+                    ":none": "",
+                    ":p": json.dumps({**{k: event[k] for k in
+                                         ("run_id", "stage", "task", "harness_id",
+                                          "manifest_uri", "task_token", "iteration")
+                                         if k in event},
+                                      "_session_epoch": epoch,
+                                      "_session_started_at": session_started_at},
+                                     default=str)})
+        except Exception as exc:  # noqa: BLE001 — still telemetry
+            print(f"[driver] liveness beat write failed (continuing): "
                   f"{type(exc).__name__}: {exc}")
 
     first_turn = True
@@ -1950,6 +2011,43 @@ def _run_stage(event, context=None, c=None):
             messages = _user_text("The stream was interrupted. Continue from where "
                                   "you left off; call your pending inline function.")
             continue
+
+        # A platform outage is not the agent's answer. Live: r6c's EvalScore met a
+        # Bedrock ServiceUnavailable storm (02:18-02:36Z, 2026-08-12) AFTER its one
+        # salvage retry was spent; every subsequent dead-stream turn fell through to
+        # the prose branch, was billed to the re-ask budget (re_asks 0->1->2 with
+        # text_chars=0 and error= on every line), and the stage died
+        # MissingStageComplete -- the agent blamed for silence while the MODEL API was
+        # down. Its triage then suffocated in the same storm. Same disease as
+        # stop_reason=content_filtered, same cure: an own bounded budget that rides
+        # the continuation payload, a backoff (storms last minutes, not seconds), and
+        # an exhaustion that settles under its real name -- ModelUnavailable tells the
+        # operator to check the vendor, MissingStageComplete sends them hunting a
+        # transcript that never existed.
+        if out["error"]:
+            if infra_error_turns < 4:
+                infra_error_turns += 1
+                if _is_model_5xx(out["error"]):
+                    _maybe_failover_model(c, event)
+                wait_s = min(20 * infra_error_turns, 60)
+                print(f"[driver] stream died again ({infra_error_turns}/4), backing "
+                      f"off {wait_s}s before the retry (re_asks untouched): "
+                      f"{out['error']}")
+                time.sleep(wait_s)
+                messages = _user_text("The stream was interrupted. Continue from "
+                                      "where you left off; call your pending inline "
+                                      "function.")
+                continue
+            if event.get("task_token"):
+                settle_token(c["sfn"], event["task_token"],
+                             error="ModelUnavailable",
+                             cause=f"{infra_error_turns + 1} consecutive turns died "
+                                   f"on stream errors; last: {str(out['error'])[:180]}")
+            ev.emit_event(os.environ["EVENT_BUS"], ev.PIPELINE_FAILED,
+                          {"run_id": event["run_id"], "stage": event["stage"],
+                           "reason": "model unavailable"}, client=c["events"])
+            return {"status": "failed", "reason": "model_unavailable"}
+        infra_error_turns = 0
 
         tu = out["tool_use"]
         # One line per turn, because without it a failed stage is undiagnosable. Live:

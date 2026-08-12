@@ -3740,7 +3740,8 @@ case("driver: a watchdog that cannot be armed fails the turn instead of degradin
 #      "the beat is actually broken" stopped meaning anything.
 def m200(t):
     old = ("            if _is_condition_failure(exc):\n"
-           "                return  # not a run row: no beat to write, and none wanted\n")
+           "                _beat_liveness()  # not a run row: the beat belongs in __liveness__\n"
+           "                return\n")
     assert t.count(old) == 1, f"the heartbeat condition check has moved; found {t.count(old)}"
     return t.replace(old, "", 1)
 
