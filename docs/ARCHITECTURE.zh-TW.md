@@ -1013,6 +1013,23 @@ invoke 了 start-pipeline。沒有任何東西依賴這個繞道 —— driver �
 `verify_record` 的 `except` 分支 —— production 在每一份被篡改的紀錄上都會走的那個分支 —— 從來沒有
 被任何測試執行過。
 
+**一個對不起來的數字，是一台儀器最便宜的稽核。** Gate 改革給了 eval 兩層驗收集 —— 一層是會 gate 的
+in-distribution 集，一層是只量測、永不 gate 的 OOD 集 —— 而它們寫進同一個
+`evaluation/judge_details.jsonl`。兩個檔案的列都從 0 開始編號，而這件事本身就足以在「沒有任何一次
+judge 判錯」的情況下把算術弄壞。在這份分析自己身上實測（離線跑的）：137 個項目裡有 40 個和另一層的
+項目共用同一個 index，所以用 index 當 key 會把某個 ID 項目的 A 位置判決和某個 OOD 項目的 B 位置判決
+配成一對，並讓 40 個 ID 項目掉出自己那一層。彙總結果回報**一個 97 項的層只有 57 項**，而背後每一次
+judge 呼叫都是對著正確的內容做的。是記帳錯，不是判斷錯 —— 這正是為什麼看起來什麼問題都沒有。score
+bullet 現在要求每一列都帶 `layer` 和 `item_id`，並且禁止用列號或檔內 index 做任何 join 的 key ——
+光有欄位只是裝飾，因為當初離線那次每一列也都記了 layer，照樣配錯。真正承重的那一半是對帳：`judge_n`
+只算**被評分過**的項目，所以掉了項目會讓分母安靜地縮小，而分母縮小後的 Wilson 區間會**更窄**，圍在
+錯的樣本周圍 —— 這是唯一一個會把記帳失誤變成「對一個沒人選過的集合做出決定性 gate 判決」的方向。因此
+每一層都要回報 `items_in_layer`（從它自己的驗收檔案讀，不是沿用上游數字），並斷言
+`judge_n + judge_unscorable == items_in_layer`；對不起來就是 `escalate_human` 並附上兩個數字，不是
+一行註腳。同一次初版的另一個孿生缺陷已經釘住了：在 `maxTokens: 400` 下，預設會先推理的 judge 把整個
+預算花在 `reasoningContent` 裡，274 次呼叫有 30 次回傳空的 text block —— 也就是**被截斷**的 judge 會
+被當成「無法決定」的 judge 計分。
+
 **沒有任何部署路徑會送出去的檔案不算一個元件，而把路徑寫死的 guard 沒有能力發現這件事。**
 `pipeline/training/train_qlora.py` 帶著三條交付性規則、liger-kernel 前置檢查、以及 model mirror 的
 完整性驗證；15 個單元測試在斷言它們；一份驗證文件記錄了五個真實 `ml.g5.2xlarge` job 作為證據，包含

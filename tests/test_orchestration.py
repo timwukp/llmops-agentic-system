@@ -9763,6 +9763,36 @@ def test_the_score_bullet_defines_the_tie_credited_metric():
         "point where it is produced")
 
 
+def test_the_score_bullet_keys_two_layers_apart_and_reconciles_each_denominator():
+    """Two acceptance layers, one details file, and both number their rows from zero.
+
+    Not hypothetical: the offline analysis behind deploy/evidence/SCALING_DIAGNOSIS_r6c_8B.md
+    hit it under exactly the conditions this bullet now creates. 40 of 137 items shared an
+    index across layers, so keying on the index cross-paired an ID item's A-position verdict
+    with an OOD item's B-position verdict and dropped 40 ID items out of their own layer --
+    the aggregate reported 57 items for a 97-item layer while every judgment behind it was
+    correct. Bookkeeping, not judging, which is precisely why nothing looked wrong.
+
+    The reconciliation is the load-bearing half. judge_n counts SCORED items, so a lost item
+    shrinks the denominator silently, and a Wilson interval on a shrunken denominator is
+    NARROWER around the wrong sample -- the one direction that turns a bookkeeping slip into a
+    decisive gate verdict on a set nobody chose. `judge_n + judge_unscorable == items_in_layer`
+    is the cheapest audit available here and it is what caught both defects in the first pass.
+    """
+    b = _eval_prompt_bullet("score")
+    for token in ("item_id", 'layer ("id" or "ood")'):
+        assert token in b, (
+            f"the score bullet no longer requires {token} on every judge_details.jsonl row, so "
+            "two layers sharing one file cannot be told apart")
+    assert "never on a row number or a per-file index" in b, (
+        "the bullet must forbid the key that actually broke, not merely suggest a better one")
+    assert "items_in_layer" in b and "judge_n + judge_unscorable == items_in_layer" in b, (
+        "the score bullet no longer reconciles each layer's denominator against the acceptance "
+        "file it was scored on -- a silently shrunken n reads as a tighter interval")
+    assert "escalate_human" in b, (
+        "a denominator that does not reconcile must stop the stage, not annotate it")
+
+
 def test_the_gate_bullet_decides_by_the_wilson_interval():
     b = _eval_prompt_bullet("gate")
     assert "LOWER bound (judge_score_ci_low)" in b and \

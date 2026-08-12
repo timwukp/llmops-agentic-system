@@ -1202,6 +1202,26 @@ because the double was too kind: `FakeKms.verify` returns `{"SignatureValid": fa
 KMS *raises* `KMSInvalidSignatureException`, so `verify_record`'s `except` branch — the branch
 production takes on every tampered record — had never been executed by any test.
 
+**A count that does not reconcile is the cheapest audit an instrument has.** The gate reform gave
+eval two acceptance layers — an in-distribution set that gates and an OOD set that is measured and
+never gates — writing into one `evaluation/judge_details.jsonl`. Both files number their rows from
+zero, and that is enough to break the arithmetic without breaking a single judgment. Measured on
+this exact analysis, run offline: 40 of 137 items shared an index across the layers, so keying on
+the index paired an ID item's A-position verdict with an OOD item's B-position verdict and dropped
+40 ID items out of their own layer. The aggregate reported **57 items for a 97-item layer** and
+every judge call behind it had been made against the correct content. Bookkeeping, not judging,
+which is exactly why nothing looked wrong. The score bullet now requires `layer` and `item_id` on
+every row and forbids keying a join on a row number or a per-file index — the fields alone are
+decoration, since the offline run recorded the layer too and still cross-paired. The load-bearing
+half is the reconciliation: `judge_n` counts *scored* items, so a lost item shrinks the denominator
+silently, and a Wilson interval on a shrunken denominator is **narrower** around the wrong sample —
+the one direction in which a bookkeeping slip becomes a *decisive* gate verdict on a set nobody
+chose. Each layer therefore reports `items_in_layer`, read from its own acceptance file, and asserts
+`judge_n + judge_unscorable == items_in_layer`; a mismatch is `escalate_human` with both numbers,
+not a footnote. The sibling defect in the same first pass is already pinned: at `maxTokens: 400` a
+judge that reasons by default spent its whole budget inside `reasoningContent` and returned an empty
+text block on 30 of 274 calls, so a **truncated** judge would have been scored as an undecided one.
+
 **A file nothing deploys is not a component, and a guard that names its path cannot notice.**
 `pipeline/training/train_qlora.py` carried three deliverability rules, a liger-kernel preflight
 and a model-mirror integrity check; 15 unit tests asserted them; a verification doc recorded five
