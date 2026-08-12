@@ -4033,13 +4033,36 @@ class TestConductorDispatch:
 
         Derived in the direction that matters: every `params.*_model_id` any prompt
         reads must be a key the driver actually injects.
+
+        The match is deliberately wider than `*_model_id` so a prompt reading
+        `params.judge_model` cannot slip past it, which means it also catches model params
+        that are legitimately NOT the driver's to inject. Those are named one at a time
+        below with the authority that supplies them -- an exception list, not a loosened
+        pattern, and each entry is checked to be real in both directions.
         """
+        # A model param a SIGNED PLAN supplies. `model_artifact_uri` is not a model
+        # identity `manifest.models` could resolve: it is the S3 location of an artifact a
+        # PREVIOUS run already produced and paid for, and the only authority that can name
+        # WHICH artifact a re-judge re-scores is the plan authorising that re-judge. The
+        # driver injecting it would be the bug #20 shape inverted -- execution-path
+        # boilerplate standing in for a human's choice of what is being measured.
+        plan_supplied = {"model_artifact_uri"}
+        for name in sorted(plan_supplied):
+            assert name not in start_pipeline.PLAN_META_KEYS, (
+                f"{name} is exempted here as plan-supplied but PLAN_META_KEYS strips it "
+                "out of a plan's params, so nothing would reach the agent")
+            assert any(f"params.{name}" in
+                       json.loads(cfg.read_text())["systemPrompt"][0]["text"]
+                       for cfg in (REPO / "agents").glob("*/harness.json")), (
+                f"{name} is exempted here but no prompt reads it -- drop the exemption "
+                "rather than leaving a hole shaped like a param that no longer exists")
+
         supplied = set(driver.MODEL_PARAM_FOR_ROLE.values())
         assert supplied, "the driver no longer injects any approved model param"
         for cfg in sorted((REPO / "agents").glob("*/harness.json")):
             text = json.loads(cfg.read_text())["systemPrompt"][0]["text"]
             read = set(re.findall(r"params\.([a-z_]*model[a-z_]*)", text))
-            unsupplied = sorted(read - supplied)
+            unsupplied = sorted(read - supplied - plan_supplied)
             assert not unsupplied, (
                 f"{cfg.parent.name}: the prompt reads {unsupplied} but the driver "
                 f"supplies only {sorted(supplied)}. An agent that reads an absent model "
@@ -4230,6 +4253,12 @@ class TestConductorDispatch:
             "latency_p50_target_ms": "plan",
             "pipeline_mode": "plan",
             "variance_threshold_pct": "plan",
+            # eval_only's two prerequisites. Only a plan can name WHICH artifact a re-judge
+            # re-scores, and start-pipeline refuses the dispatch outright when either is
+            # missing (MODE_REQUIRED_PARAMS) rather than starting a run whose only legal
+            # ending is an escalation.
+            "model_artifact_uri": "plan",
+            "source_run_id": "plan",
         }
         read = {}
         for cfg in sorted((REPO / "agents").glob("*/harness.json")):
@@ -4926,6 +4955,173 @@ class TestConductorDispatch:
         assert audit["Parameters"]["Payload"]["harness_id"] == "llmops_data_prep"
         # the audit run must complete WITHOUT reaching any GPU stage
         assert audit["Next"] == "Complete"
+
+    def test_state_machine_eval_only_re_judges_without_reaching_a_training_stage(self):
+        """eval_only exists to re-score an artifact an earlier run already paid for.
+
+        Its whole value is that it spends no GPU on training, so the guard has to be
+        mode-aware: a plain reachability walk from the eval entry sees BOTH branches of
+        every Choice and therefore reaches RemediateFinetune, which is exactly the state
+        this mode must not be able to enter. So Choice states that test `$.pipeline_mode`
+        are resolved for this mode and the rest are left open -- meaning the walk still
+        explores a gate pass and a gate fail, and only the mode conditions are honoured.
+
+        Red without `EvalOnlyStopChoice`: a gate fail falls into RemediationChoice ->
+        IncrementIteration -> RemediateFinetune, launching a training job in a mode whose
+        entry deliberately skipped training, against a manifest with no finetune stage in
+        it to remediate. A gate pass falls into Deploy, standing up an endpoint off a
+        re-measurement nobody approved as a deployment.
+        """
+        asl = json.loads((REPO / "orchestration/state_machine.asl.json").read_text())
+        states = asl["States"]
+
+        def reachable_in_mode(mode, start=None, seen=None):
+            """Reachability with `$.pipeline_mode`-testing Choices resolved to `mode`."""
+            if seen is None:
+                seen = set()
+            if start is None:
+                start = asl["StartAt"]
+            if start in seen:
+                return seen
+            seen.add(start)
+            st = states[start]
+            exits = _exits(st)
+            if st.get("Type") == "Choice":
+                mode_branches = [c for c in st.get("Choices", [])
+                                 if _tests_pipeline_mode(c)]
+                if mode_branches:
+                    taken = [c["Next"] for c in mode_branches if _mode_of(c) == mode]
+                    exits = taken or ([st["Default"]] if "Default" in st else [])
+            for nxt in exits:
+                reachable_in_mode(mode, nxt, seen)
+            return seen
+
+        def _tests_pipeline_mode(choice):
+            return any(r.get("Variable") == "$.pipeline_mode"
+                       for r in choice.get("And", [choice]))
+
+        def _mode_of(choice):
+            for r in choice.get("And", [choice]):
+                if r.get("Variable") == "$.pipeline_mode" and "StringEquals" in r:
+                    return r["StringEquals"]
+            return None
+
+        eval_only = reachable_in_mode("eval_only")
+        # The guard is only meaningful if the mode is actually routed somewhere distinct.
+        assert "EvalGenerate" in eval_only, "eval_only never reaches the eval stage"
+        full = reachable_in_mode("full")
+        assert "DataPrepGenerate" in full and "RemediateFinetune" in full, (
+            "the mode-resolving walk lost the full path, so it proves nothing about "
+            "eval_only being narrower")
+        # The line above is NOT sufficient, and a mutation proved it: pointing this new
+        # Choice's Default at Complete stops the FULL pipeline at the gate -- never
+        # deploying, never remediating -- and the assertion still passed, because
+        # RemediateFinetune stays reachable through FinetuneLaunch's Catch. A sanity check
+        # satisfied by an unrelated path is not a sanity check. What must survive is the
+        # GATE's own routing, so name the states only a gate verdict leads to.
+        assert "QualityGateChoice" in full, (
+            "in full mode the gate verdict is no longer consulted: EvalOnlyStopChoice's "
+            "Default must fall through to it, or every run ends at the report regardless "
+            "of whether it passed")
+        assert "Deploy" in full, "a passing full run can no longer reach Deploy"
+
+        def harnesses(names):
+            return {((states[n].get("Parameters") or {}).get("Payload") or {})
+                    .get("harness_id")
+                    for n in names} - {None}
+
+        forbidden = {"llmops_data_prep", "llmops_finetune"} & harnesses(eval_only)
+        assert not forbidden, (
+            f"eval_only can reach {sorted(forbidden)}: this mode is dispatched with no "
+            "corpus and no training stage in its manifest, so a GPU stage here spends "
+            "money on a run that cannot use the result")
+        assert "Deploy" not in eval_only, (
+            "a passing re-judge reaches Deploy -- re-measuring an artifact is not "
+            "approval to serve it, and the plan a human signed in this mode bought a "
+            "number, not an endpoint")
+        # and it must still be able to finish: a mode that cannot succeed is not a mode
+        assert _reaches(states, "EvalGenerate", "Succeed")
+
+    def test_every_pipeline_mode_the_machine_routes_on_is_one_the_dispatcher_knows(self):
+        """The ASL's modes and start-pipeline's knowledge of them must not drift apart.
+
+        The machine routes on a string it reads out of the execution input; the dispatcher
+        is the only thing that puts it there and the only place that can refuse a mode
+        whose inputs are missing. A mode in one and not the other is the `data_audit`
+        regression again -- that key was dropped on the way in while the Choice still
+        branched on it, so a customer who bought a cheap audit had GPUs provisioned.
+        """
+        asl = json.loads((REPO / "orchestration/state_machine.asl.json").read_text())
+        routed = set()
+        for st in asl["States"].values():
+            for c in st.get("Choices", []):
+                for rule in c.get("And", [c]):
+                    if rule.get("Variable") == "$.pipeline_mode" and "StringEquals" in rule:
+                        routed.add(rule["StringEquals"])
+        assert routed, "no state routes on pipeline_mode at all"
+        known = set(start_pipeline.MODE_REQUIRED_PARAMS) | {"full", "data_audit"}
+        assert routed <= known, (
+            f"the state machine routes on {sorted(routed - known)}, which start-pipeline "
+            "does not know: nothing validates that mode's inputs, and nothing documents "
+            "what it needs")
+        # every mode with prerequisites must be one the machine actually routes on
+        assert set(start_pipeline.MODE_REQUIRED_PARAMS) <= routed, (
+            f"{sorted(set(start_pipeline.MODE_REQUIRED_PARAMS) - routed)} has "
+            "prerequisites declared but no Choice branches on it, so the dispatcher "
+            "gatekeeps a mode that would run the default full pipeline anyway")
+
+    def test_eval_only_is_refused_without_the_artifact_it_would_re_judge(self):
+        """A mode that can only escalate must be refused before it becomes a run.
+
+        eval_only skips data-prep and finetune, so the eval agent has neither a fallback
+        val split (curate writes it) nor a finetune stage entry naming the model artifact.
+        Starting anyway produces a manifest, a runs-table row and a PipelineStarted event
+        that all assert work is under way that the pipeline cannot do -- and the failure
+        surfaces inside an agent turn, where it reads as an agent defect.
+        """
+        good = {"pipeline_mode": "eval_only",
+                "model_artifact_uri": "s3://b/runs/run-x/finetune/model.tar.gz",
+                "customer_eval_uri": "s3://b/customer-data/t/eval.jsonl"}
+        m = start_pipeline.seed_manifest("run-y", "conductor", {}, good)
+        assert m["params"]["model_artifact_uri"] == good["model_artifact_uri"]
+
+        for drop in ("model_artifact_uri", "customer_eval_uri"):
+            plan = {k: v for k, v in good.items() if k != drop}
+            with pytest.raises(ValueError) as e:
+                start_pipeline.seed_manifest("run-y", "conductor", {}, plan)
+            msg = str(e.value)
+            assert drop in msg and "eval_only" in msg, (
+                f"the refusal for a missing {drop} must name both the param and the "
+                f"mode, got: {msg}")
+        # an empty string is the same absence: a plan template with the key left blank
+        blank = {**good, "model_artifact_uri": ""}
+        with pytest.raises(ValueError):
+            start_pipeline.seed_manifest("run-y", "conductor", {}, blank)
+        # and the prerequisites must not leak onto the modes that do not declare them
+        for mode in ("full", "data_audit"):
+            start_pipeline.seed_manifest("run-y", "conductor", {},
+                                         {"pipeline_mode": mode, "source_uri": "s3://b/d"})
+
+    def test_the_eval_prompt_is_told_where_the_artifact_comes_from_in_eval_only(self):
+        """The mode is only real if the agent knows what changes about its inputs.
+
+        The prompt normally finds the model through this run's own finetune stage. In
+        eval_only that stage does not exist, and the failure mode if the prompt is silent
+        is the worst kind of plausible: the agent picks the newest artifact in the bucket
+        and reports a score that looks like a re-measurement of the artifact the plan
+        named. So the prompt must name the param, and must forbid the fallback.
+        """
+        text = json.loads((REPO / "agents/eval/harness.json").read_text())
+        text = text["systemPrompt"][0]["text"]
+        assert "eval_only" in text and "params.model_artifact_uri" in text, (
+            "the eval prompt does not mention the mode or the param it depends on")
+        # the sentence that forbids guessing, and the one that says the run stops here
+        low = text.lower()
+        for phrase, why in (("escalate", "an absent artifact uri must escalate"),
+                            ("never fall back", "guessing an artifact must be forbidden"),
+                            ("neither deploys", "the prompt must say the run stops at the "
+                                                "verdict, so the report IS the deliverable")):
+            assert phrase in low, f"{why}: {phrase!r} is missing from the eval prompt"
 
     def test_the_signed_plan_outranks_the_boilerplate_model_defaults(self):
         """Model consent is model-specific: approving a Fable-5 teacher is not approving

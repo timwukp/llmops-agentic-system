@@ -57,7 +57,8 @@ from having none.
 
 The state machine (`orchestration/state_machine.asl.json`) has **12 harness-task states
 on the happy path** — each a `waitForTaskToken` Lambda invocation of the harness driver
-— plus the loop-only `RemediateFinetune` and the audit-only `DataAudit`:
+— plus the loop-only `RemediateFinetune`, the audit-only `DataAudit`, and (in `eval_only`
+mode) an entry that starts partway down this same path, at the eval stage:
 
 ```
 DataPrepGenerate → DataPrepCurate → FinetuneLaunch → FinetuneAnalyze → EvalGenerate → EvalScore → EvalGate
@@ -65,6 +66,25 @@ DataPrepGenerate → DataPrepCurate → FinetuneLaunch → FinetuneAnalyze → E
                               RemediateFinetune ←───────┘   … then, on gate pass:
              Deploy → SmokeTest → MonitorHealth → Teardown → MonitorReport
 ```
+
+**Three entry modes, decided by one `Choice` at `StartAt`** reading `pipeline_mode` out of
+the execution input (it cannot read the manifest from S3, which is why the mode rides in the
+input at all). `full` is the `Default` above. `data_audit` is the conductor's cheap starter:
+audit the customer's data and stop before any GPU exists. **`eval_only`** enters at
+`EvalGenerate` to re-judge an artifact an earlier run already produced and paid for, and
+`EvalOnlyStopChoice` stops it at the gate verdict — a pass does **not** reach `Deploy` and a
+fail does **not** reach `RemediateFinetune`. Both halves of that are deliberate: re-measuring
+an artifact is not approval to serve it, and there is no finetune stage in this manifest to
+remediate, so the remediation path would launch GPU training in the one mode whose entry
+exists to avoid it. The mode is refused at dispatch unless the plan names both
+`model_artifact_uri` (nothing in this run can produce one) and `customer_eval_uri` (the 10%
+val split the eval agent normally falls back to is written by the `curate` task this mode
+skips) — `MODE_REQUIRED_PARAMS` in start-pipeline, because a run that can only escalate
+should never get a run id, a manifest and a `PipelineStarted` event first.
+
+It exists because of r6c: an 8B run produced a 12.2 GiB model, the reformed judge metric had
+to re-score it, and with only `full` and `data_audit` the only way to do that was a script in
+someone's working directory — unversioned, unaudited, and invisible to the runs table.
 
 The two monitor states are placed by the shape of their work, not by taste.
 **`MonitorHealth`** must read CloudWatch *while the endpoint exists*, and `Teardown`
