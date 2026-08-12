@@ -10057,6 +10057,181 @@ def test_the_documented_alarm_count_matches_the_alarms_the_deploy_creates():
             f"({_ALARM_COUNT_WORDS[n][lang]})")
 
 
+class _FakeLogs:
+    """A CloudWatch Logs double.
+
+    `describe_log_groups` pages DELIBERATELY, two pages even for two groups: the real API
+    paginates, and a caller that reads only the first page is the defect this system has now
+    made twice (list_functions reported 3 of 8 Lambdas, list_agent_runtimes 10 of 19 --
+    and the nine it dropped included the largest log producer in the account).
+    `put_retention_policy` refuses a group that was never created, because that is what the
+    real API does and it is the reason `retention()` creates first.
+    """
+
+    class exceptions:
+        class ResourceAlreadyExistsException(Exception):
+            pass
+
+    def __init__(self, groups=(), existing=None):
+        self._groups = list(groups)
+        self.existing = set(groups if existing is None else existing)
+        self.created, self.put = [], []
+
+    def get_paginator(self, op):
+        assert op == "describe_log_groups", f"unexpected paginator {op!r}"
+        outer = self
+
+        class _P:
+            def paginate(self, logGroupNamePrefix):
+                names = [g for g in outer._groups if g.startswith(logGroupNamePrefix)]
+                mid = (len(names) + 1) // 2
+                for chunk in (names[:mid], names[mid:]):
+                    yield {"logGroups": [{"logGroupName": n} for n in chunk]}
+        return _P()
+
+    def create_log_group(self, logGroupName):
+        if logGroupName in self.existing:
+            raise self.exceptions.ResourceAlreadyExistsException(logGroupName)
+        self.existing.add(logGroupName)
+        self.created.append(logGroupName)
+
+    def put_retention_policy(self, logGroupName, retentionInDays):
+        if logGroupName not in self.existing:
+            raise AssertionError(f"retention set on a group that does not exist: {logGroupName}")
+        self.put.append((logGroupName, retentionInDays))
+
+
+#: The real names, as this account actually has them (live 2026-08-12). The harness id
+#: suffixes are the point: nothing in the repo knows `KuSKXUaxyP` or `D8SPwm7Kog`.
+_LIVE_AGENTCORE_GROUPS = [
+    "/aws/bedrock-agentcore/llmops_data_prep-KuSKXUaxyP",
+    "/aws/bedrock-agentcore/runtimes/harness_llmops_data_prep-D8SPwm7Kog-DEFAULT",
+    "/aws/bedrock-agentcore/runtimes/harness_llmops_orchestrator-2sx6hzCapx-DEFAULT",
+    "/aws/bedrock-agentcore/evaluations/results/llmops_eval_iuIIs96fFM_online_eval-v5qT6I9Puq",
+    # another project in the same account -- shares the prefix, is not ours
+    "/aws/bedrock-agentcore/runtimes/katalon_warm-V1jqxYFNFt-DEFAULT",
+    "/aws/bedrock-agentcore/uitestagent",
+]
+
+
+def test_retention_covers_every_lambda_any_deploy_script_creates():
+    """Lambda creates its own log group on first invoke, with NO retention, forever.
+
+    Nothing in this repo had ever set one: measured 2026-08-12, all eight llmops Lambda log
+    groups read `NEVER`, including `llmops-admin` (11 MB in seven days). The census is the
+    same one the alarms use, so a Lambda cannot be watched-but-unbounded or vice versa.
+    """
+    obs = _obs_mod()
+    logs = _FakeLogs(_LIVE_AGENTCORE_GROUPS)
+    targets = obs.retention_targets(logs)
+    for fn in obs.deployed_functions():
+        assert f"/aws/lambda/{fn}" in targets, f"{fn} has no log retention target"
+    assert len(obs.deployed_functions()) >= 8, obs.deployed_functions()
+
+
+def test_retention_targets_the_group_with_the_traffic_not_a_name_built_from_a_constant():
+    """The first draft of this built the AgentCore names from HARNESSES. It was wrong live.
+
+    The groups that hold the volume are named after ids the repo never sees --
+    `llmops_data_prep-KuSKXUaxyP`, `runtimes/harness_llmops_data_prep-D8SPwm7Kog-DEFAULT` --
+    so `/aws/bedrock-agentcore/llmops_data_prep` names NOTHING that exists, and putting a
+    policy on it would have created five empty groups beside the ones with the traffic while
+    the deploy reported success. Measured over the seven days to 2026-08-12: 1236 MB
+    ingested, 1225 MB of it into runtime DEFAULT groups with no retention, and 0 bytes into
+    the delivery groups that already carry a 30-day policy. So this list is DISCOVERED.
+    """
+    obs = _obs_mod()
+    targets = obs.retention_targets(_FakeLogs(_LIVE_AGENTCORE_GROUPS))
+    for real in _LIVE_AGENTCORE_GROUPS:
+        if obs.OURS in real:
+            assert real in targets, f"{real} holds this system's logs and is not covered"
+    for h in obs.HARNESSES:
+        assert f"/aws/bedrock-agentcore/{h}" not in targets, (
+            f"/aws/bedrock-agentcore/{h} is a name built from HARNESSES, not a group that "
+            "exists; a policy on it creates an empty group and reports success")
+
+
+def test_retention_leaves_another_projects_log_groups_alone():
+    """This account is shared. `katalon_*` and `uitestagent` are not this system's data.
+
+    Retention is a data-lifetime decision about someone else's logs, so the discriminator is
+    the same one the whole repo uses for cross-system contamination: the name says llmops or
+    it is not ours.
+    """
+    obs = _obs_mod()
+    targets = obs.retention_targets(_FakeLogs(_LIVE_AGENTCORE_GROUPS))
+    foreign = [g for g in targets if g.startswith(obs.AGENTCORE_LOGS) and obs.OURS not in g]
+    assert not foreign, f"would set retention on log groups that are not ours: {foreign}"
+
+
+def test_retention_creates_a_missing_group_before_setting_its_policy():
+    """A policy cannot be put on a group that does not exist yet, and Lambda's does not.
+
+    Without the create, a freshly deployed function keeps its logs forever until someone
+    re-runs this AFTER the first invocation — an ordering nobody remembers, and one whose
+    failure is invisible (the deploy would report the group it skipped as fine). The
+    already-exists path is exercised too: it must be swallowed, not raised.
+    """
+    obs = _obs_mod()
+    logs = _FakeLogs(_LIVE_AGENTCORE_GROUPS)
+    out = obs.retention(logs, dry=False)
+    assert [r["group"] for r in out] == obs.retention_targets(logs), "plan != what it did"
+    assert all(d == obs.RETENTION_DAYS for _, d in logs.put), logs.put
+    lam = {f"/aws/lambda/{fn}" for fn in obs.deployed_functions()}
+    assert lam <= set(logs.created), f"never created: {sorted(lam - set(logs.created))}"
+    assert not (set(logs.created) & set(_LIVE_AGENTCORE_GROUPS)), (
+        "re-created a group that already existed instead of swallowing the exception")
+    assert {g for g, _ in logs.put} == set(logs.existing) - (
+        {g for g in _LIVE_AGENTCORE_GROUPS if obs.OURS not in g})
+
+
+def test_the_runtime_listing_follows_every_page():
+    """`list_agent_runtimes()` returned 10 of 19 with a nextToken nobody followed.
+
+    Its caller in `online_eval` reports `no runtime <name>` and skips creating that
+    harness's evaluation config, so a runtime that exists reads as one that does not, purely
+    by page position — and the nine dropped on 2026-08-12 included
+    `harness_llmops_data_prep`. Same defect as the unpaginated `list_functions()` that
+    reported 3 of 8 Lambdas.
+    """
+    obs = _obs_mod()
+    pages = [[{"agentRuntimeName": f"harness_llmops_{i}", "agentRuntimeId": f"id{i}"}]
+             for i in range(3)]
+
+    class _Ctl:
+        def __init__(self):
+            self.tokens = []
+
+        def list_agent_runtimes(self, **kw):
+            self.tokens.append(kw.get("nextToken"))
+            i = int(kw["nextToken"]) if kw.get("nextToken") else 0
+            resp = {"agentRuntimes": pages[i]}
+            if i + 1 < len(pages):
+                resp["nextToken"] = str(i + 1)
+            return resp
+
+    ctl = _Ctl()
+    got = obs.list_runtimes(ctl)
+    assert [r["agentRuntimeId"] for r in got] == ["id0", "id1", "id2"], got
+    assert ctl.tokens == [None, "1", "2"], ctl.tokens
+
+
+def test_the_retention_period_is_the_one_the_deliveries_already_use():
+    """One convention, derived — not a second number that agrees today and drifts later.
+
+    `setup_observability.py` has defaulted to 30 days since the deliveries were first wired;
+    --retention exists to make that same policy reach the groups nobody was applying it to,
+    so the two must not be able to disagree.
+    """
+    obs = _obs_mod()
+    m = re.search(r'--retention-days",\s*type=int,\s*default=(\d+)',
+                  _deploy_src_orch("setup_observability.py"))
+    assert m, "setup_observability.py no longer states a --retention-days default"
+    assert obs.RETENTION_DAYS == int(m.group(1)), (
+        f"--retention would set {obs.RETENTION_DAYS} days while the deliveries set "
+        f"{m.group(1)}; two numbers for one convention")
+
+
 def test_the_silence_alarms_are_exactly_the_schedules_that_ship_enabled():
     """An alarm that is always ALARM trains the operator to ignore all of them.
 

@@ -18,11 +18,19 @@ hours later: 19 async invocations were DROPPED between 2026-07-29 and 2026-08-12
 (driver 11, resume 8) and each one is a pipeline stage that stopped and told
 nobody. See alarms() for what each family detects and why.
 
+And (--retention) a retention policy on every log group this system fills. Measured
+2026-08-12 over seven days: 1236 MB ingested into llmops log groups, and 1225 MB of it
+landed in groups that NEVER expire -- while the delivery groups that do carry a 30-day
+policy received 0 bytes. See retention_targets() for the two sources and why one of them
+has to be listed from the ACCOUNT: the groups with the traffic are named after ids this
+repo never sees, so building their names from HARNESSES creates empty groups beside them.
+
 Usage:
   python deploy/06_observability.py --region us-east-1 --dry-run
   python deploy/06_observability.py --region us-east-1              # deliveries only
   python deploy/06_observability.py --region us-east-1 --evals      # + online eval configs
   python deploy/06_observability.py --region us-east-1 --alarms     # + Lambda alarms
+  python deploy/06_observability.py --region us-east-1 --retention  # + log retention
 """
 import argparse
 import ast
@@ -102,7 +110,7 @@ def online_eval(ctl, region, harness, role_arn, dry):
         return {"harness": harness, "eval_config": name, "action": "exists"}
     # resolve the runtime id for the DEFAULT log group
     runtime_id = None
-    for rt in ctl.list_agent_runtimes().get("agentRuntimes", []):
+    for rt in list_runtimes(ctl):
         if rt.get("agentRuntimeName") == runtime_name:
             runtime_id = rt.get("agentRuntimeId")
             break
@@ -176,6 +184,94 @@ def deployed_functions() -> list:
         raise SystemExit("07_lambdas.py has no LAMBDAS assignment — alarm list unknown")
     console = console_function()
     return fns + ([console] if console not in fns else [])
+
+
+#: How long every log group this system fills keeps data. Not a new number:
+#: setup_observability.py has defaulted to 30 days since the deliveries were first wired, so
+#: --retention makes the SAME convention reach the groups nobody was applying it to. The
+#: record that has to outlive 30 days is the audit trail in DynamoDB (stage events + run
+#: rows) and the artifacts in S3, neither of which is a log group.
+RETENTION_DAYS = 30
+
+#: Where this system's AgentCore log groups live, and the substring that says a group under
+#: it is ours. Discovered rather than derived, and that is a measurement, not a preference:
+#: the group that actually holds an agent's application logs and spans is
+#: `/aws/bedrock-agentcore/runtimes/<runtime-id>-DEFAULT`, whose id nothing in this repo
+#: knows, and the delivery groups' real names carry the harness id too
+#: (`llmops_data_prep-KuSKXUaxyP`), which HARNESSES does not have. Building these names from
+#: HARNESSES creates five EMPTY groups beside the ones with the traffic -- tried, measured,
+#: discarded.
+AGENTCORE_LOGS = "/aws/bedrock-agentcore/"
+OURS = "llmops"
+
+
+def list_runtimes(ctl) -> list:
+    """Every AgentCore runtime, paginated. The unpaginated call is a silent undercount.
+
+    Measured 2026-08-12: `list_agent_runtimes()` returned 10 of 19 runtimes with a
+    nextToken nobody followed -- and the nine it left out included harness_llmops_data_prep,
+    the largest log producer in the account. Its caller in online_eval() reports
+    "no runtime <name>" and skips creating that harness's evaluation config, so a runtime
+    that exists reads as one that does not, purely by page position. Same defect as the
+    unpaginated list_functions() that reported 3 of 8 Lambdas.
+    """
+    out, token = [], None
+    while True:
+        resp = ctl.list_agent_runtimes(**({"nextToken": token} if token else {}))
+        out += resp.get("agentRuntimes", [])
+        token = resp.get("nextToken")
+        if not token:
+            return out
+
+
+def retention_targets(logs) -> list:
+    """Every log group this system fills. Two sources, because two things create them.
+
+    * `/aws/lambda/<fn>` for every function ANY deploy script creates (see CONSOLE_DEPLOY) --
+      REPO-derived, because the repo is what creates those functions. Lambda creates the
+      group itself on first invoke, with no retention, so nothing here had ever set one.
+    * every group under AGENTCORE_LOGS whose name contains OURS -- ACCOUNT-derived, because
+      AgentCore creates these and names them after ids the repo never sees. This is where
+      the volume is: measured over seven days to 2026-08-12, 1236 MB ingested into this
+      system's log groups, 1225 MB of it into never-expiring runtime DEFAULT groups, while
+      the delivery groups that DO carry a 30-day policy received 0 bytes. The retention
+      control existed and was pointed at the surface with no traffic.
+
+    Known bound, stated rather than hidden: a runtime created AFTER this runs has an
+    unbounded group until the next run. A group that does not exist holds no data, so the
+    exposure starts at the first invoke, not at create.
+    """
+    targets = [f"/aws/lambda/{fn}" for fn in deployed_functions()]
+    for page in logs.get_paginator("describe_log_groups").paginate(
+            logGroupNamePrefix=AGENTCORE_LOGS):
+        targets += [g["logGroupName"] for g in page["logGroups"]
+                    if OURS in g["logGroupName"]]
+    return targets
+
+
+def retention(logs, dry):
+    """Put RETENTION_DAYS on every group retention_targets() names.
+
+    `create_log_group` first, ignoring "already exists": a Lambda's group does not exist
+    until its first invoke, and a policy cannot be put on a group that is not there -- so
+    without the create, a freshly deployed function would keep its logs forever until
+    someone re-ran this after the first invocation, which is precisely the kind of ordering
+    nobody remembers. Deleting nothing today is checked, not assumed: the oldest stream in
+    this account is 2026-07-29, 14 days inside a 30-day window.
+    """
+    out = []
+    for group in retention_targets(logs):
+        if dry:
+            out.append({"group": group, "would_set_days": RETENTION_DAYS})
+            continue
+        try:
+            logs.create_log_group(logGroupName=group)
+            created = True
+        except logs.exceptions.ResourceAlreadyExistsException:
+            created = False
+        logs.put_retention_policy(logGroupName=group, retentionInDays=RETENTION_DAYS)
+        out.append({"group": group, "days": RETENTION_DAYS, "created": created})
+    return out
 
 
 def alarms(cw, topic_arn, dry):
@@ -260,6 +356,8 @@ def main():
     ap.add_argument("--evals", action="store_true", help="also attach online eval configs")
     ap.add_argument("--alarms", action="store_true",
                     help="also create the Lambda CloudWatch alarms ($0.10/alarm/month)")
+    ap.add_argument("--retention", action="store_true",
+                    help=f"also cap every log group this system fills at {RETENTION_DAYS} days")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
     targets = args.harness or HARNESSES
@@ -273,6 +371,9 @@ def main():
             role_arn = ssm.get_parameter(Name="/llmops/iam/eval_execution_arn")["Parameter"]["Value"]
         results["online_evals"] = [online_eval(ctl, args.region, h, role_arn, args.dry_run)
                                    for h in targets]
+    if args.retention:
+        results["retention"] = retention(
+            boto3.client("logs", region_name=args.region), args.dry_run)
     if args.alarms:
         topic_arn = None
         if not args.dry_run:
