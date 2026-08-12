@@ -9598,6 +9598,32 @@ class TestNonRunResurrection:
             "the cap-exhausted item survived its escalation -- every 15-minute sweep "
             "re-escalates it forever")
 
+    def test_the_sweep_reports_what_it_checked_because_nothing_reads_its_return(
+            self, capsys):
+        """Verified live on 2026-08-12: 23 post-deploy invocations, 0 errors -- which
+        proves the Query is PERMITTED, and nothing more. The schedule invokes this
+        Lambda asynchronously, so the returned counts are discarded, and an idle sweep
+        was indistinguishable in CloudWatch from a Query against the wrong partition:
+        both are START/END/REPORT and silence. The non-run half's healthy state is
+        `0 beats` on every day no triage is dead, so a count nobody can read is the
+        whole audit trail missing."""
+        self._run([_liveness_item(minutes_old=5)])
+        line = [l for l in capsys.readouterr().out.splitlines()
+                if l.startswith("[resurrector] ")]
+        assert len(line) == 1, f"expected exactly one summary line, got {line}"
+        got = json.loads(line[0][len("[resurrector] "):])
+        assert got["checked_liveness"] == 1, (
+            "the printed count must be the number of beats the Query actually returned; "
+            f"got {got}")
+        assert got["acted"] == [], "a fresh beat is not an action"
+
+    def test_the_summary_line_names_the_beat_it_revived(self, capsys):
+        """The counts alone would let a resurrection go unlogged, which is the one event
+        in this Lambda worth reconstructing after the fact."""
+        self._run([_liveness_item()])
+        out = capsys.readouterr().out
+        assert "triage-run-x" in out and "resurrected" in out, out
+
 
 # ── a platform outage is not the agent's answer ──────────────────────────────────────
 # r6c's EvalScore met a Bedrock ServiceUnavailable storm (02:18-02:36Z, 2026-08-12)
