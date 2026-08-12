@@ -27,6 +27,25 @@ from typing import Any
 #: it is an ALIAS now, not the only copy -- see report_key_for().
 REPORT_KEY = "reports/run-latest/test-report-latest.json"
 
+#: Stage statuses that mean "this stage finished its work", from BOTH writers of
+#: manifest["stages"]. The driver writes "completed" (handler.handle_stage_complete);
+#: the specialist agents are told to append their own stage entry to the same manifest
+#: and they write "complete" under a "<stage>.<task>[.i<n>]" key. Only the driver's
+#: spelling was listed here, so on r5 (run-20260811T101948Z-f9d34d27) a run in which
+#: every stage succeeded published pass_counts {"total": 14, "passed": 3, "failed": 0}:
+#: 7 entries read "complete" and 4 read "launched", and none of the 11 was counted as
+#: anything. The console renders that as 3 of 14 passing.
+#:
+#: "passed"/"succeeded" have never been observed from either writer; they are kept
+#: because removing a tolerated spelling can only lose a stage, never gain one.
+STAGE_DONE = ("completed", "complete", "passed", "succeeded")
+#: Finished and wrong. Distinct from STAGE_IN_FLIGHT: a failure is a finding.
+STAGE_FAILED = ("failed", "error")
+#: Work handed to something asynchronous (a training job, an endpoint deploy) and not
+#: yet reported back. Neither a pass nor a failure -- counting it either way states an
+#: outcome that does not exist yet.
+STAGE_IN_FLIGHT = ("launched", "running", "in_progress")
+
 
 def report_key_for(run_id: str) -> str:
     """The per-run report key. One object per run, so two runs cannot overwrite.
@@ -153,7 +172,7 @@ def build_run_report(manifest: dict) -> dict:
     stages: dict = manifest.get("stages", {}) or {}
 
     findings = []
-    passed = failed = 0
+    passed = failed = in_flight = 0
     stage_summaries = {}
     for name, entry in stages.items():
         entry = entry or {}
@@ -165,9 +184,11 @@ def build_run_report(manifest: dict) -> dict:
             "outputs": entry.get("outputs", []),
             "metrics": entry.get("metrics", {}),
         }
-        if status in ("completed", "passed", "succeeded"):
+        if status in STAGE_DONE:
             passed += 1
-        elif status in ("failed", "error"):
+        elif status in STAGE_IN_FLIGHT:
+            in_flight += 1
+        elif status in STAGE_FAILED:
             failed += 1
             findings.append({
                 "severity": "high",
@@ -195,8 +216,22 @@ def build_run_report(manifest: dict) -> dict:
             "total": len(stages),
             "passed": passed,
             "failed": failed,
+            "in_flight": in_flight,
+            # The four sub-counts reconcile to `total` by construction, so a status
+            # spelling neither vocabulary above knows shows up HERE as a non-zero number
+            # instead of vanishing into the gap between total and passed+failed. That gap
+            # is what hid the "complete"/"launched" bug: 3 of 14 looked like a failing run
+            # rather than like a report that could not read its own input.
+            "unrecognized": len(stages) - passed - failed - in_flight,
         },
         "models": manifest.get("models", {}),
+        # Append-only, one record per driver-verified stage completion, in order. The
+        # `stages` map above holds ONE entry per stage name, so iteration 1's finetune
+        # result overwrites iteration 0's and a remediation loop destroys the before/after
+        # comparison it exists to produce -- measured on r5, whose manifest keeps only
+        # iteration-1 metrics for both `finetune` and `eval`. Carried through to the report
+        # because the report is the artifact a human opens.
+        "stage_history": list(manifest.get("stage_history") or []),
     }
 
 

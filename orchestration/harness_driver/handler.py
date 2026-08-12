@@ -694,7 +694,8 @@ IMMUTABLE_MANIFEST_KEYS = frozenset({"models", "plan", "approval", "params",
                                      "run_id", "created_at", "trigger_source"})
 
 
-def _save_manifest(s3, manifest_uri: str, manifest: dict) -> None:
+def _save_manifest(s3, manifest_uri: str, manifest: dict,
+                   history_record: dict | None = None) -> None:
     """Persist the run's stage results, re-reading first so a concurrent write survives.
 
     Read-modify-write rather than a blind put, and only the `stages` block is taken from
@@ -714,6 +715,14 @@ def _save_manifest(s3, manifest_uri: str, manifest: dict) -> None:
     the remaining window is one stage's agent writing between this read and this put. That
     is a real but bounded gap, and it is smaller than the alternative of not persisting
     stage results at all -- which is what the code did before, at 100% loss.
+
+    `history_record` is appended to `stage_history` on the copy JUST RE-READ, never taken
+    from the caller's snapshot. That is the difference between the two blocks: `stages` is
+    replaced wholesale, so an entry written into it during the window is lost, while an
+    append to the fresh list cannot lose a record that landed while the caller was working.
+    The list is append-only on purpose -- it is the only place a per-iteration result
+    survives, since `stages[<stage>]` keeps exactly one entry per stage name and iteration
+    1 overwrites iteration 0 there.
     """
     bucket, _, key = manifest_uri[5:].partition("/")
     current = _load_manifest(s3, manifest_uri)
@@ -742,6 +751,10 @@ def _save_manifest(s3, manifest_uri: str, manifest: dict) -> None:
               f"{tampered} — keeping the copy on S3, not the driver's")
 
     current["stages"] = manifest.get("stages", {})
+    if history_record:
+        history = current.get("stage_history")
+        current["stage_history"] = ([*history, history_record]
+                                    if isinstance(history, list) else [history_record])
     s3.put_object(Bucket=bucket, Key=key,
                   Body=json.dumps(current, indent=2, default=str).encode(),
                   ContentType="application/json")
@@ -1119,9 +1132,34 @@ def handle_stage_complete(c, event, args) -> dict:
     # SILENT: a wrong manifest_uri skipped the write and returned ok, which is bug #22's
     # own failure mode surviving inside the fix for it. `_save_manifest` raises, the
     # handler below reports it into the run's event stream, and the token still settles.
-    manifest.setdefault("stages", {})[stage] = {
+    entry = {
         "status": "completed", "outputs": norm["outputs"],
         "metrics": norm.get("metrics", {}), "evidence": norm.get("evidence", "")}
+    manifest.setdefault("stages", {})[stage] = entry
+    # ...and the same result again, immutably, keyed by nothing. `stages` is keyed by STAGE
+    # NAME, so the entry above is the only record of a stage and the next task of that stage
+    # replaces it -- including across iterations. On r5 (run-20260811T101948Z-f9d34d27,
+    # remediation loop, 2 iterations) the surviving manifest holds iteration-1 content for
+    # both `finetune` (metrics.iteration == 1) and `eval` (metrics.delta_judge_win_rate_vs_i0
+    # present, and no row left to compare against): the driver-verified iteration-0 training
+    # losses and judge counts are gone. A remediation loop whose whole purpose is "did the
+    # one targeted change help?" was overwriting the before half of its own answer. The i0
+    # numbers survived that run only because the eval agent happened to archive report-i0.json
+    # by hand.
+    #
+    # Not fixed by keying on "<stage>.<task>.i<n>" instead: stage_fact_params and the
+    # specialist prompts read manifest["stages"][<stage>] by bare stage name, and the agents
+    # already write their own thin "<stage>.<task>.i<n>" entries into the same map -- the
+    # driver writing that key too would race an agent for it and win or lose per run. A
+    # separate append-only list collides with neither reader.
+    record = {"stage": stage, "task": task,
+              "iteration": event.get("iteration", manifest.get("iteration")),
+              "recorded_at": datetime.now(timezone.utc).isoformat(), **entry}
+    # Appended in two places, deliberately, and NOT double-counted: this copy is what
+    # write_run_report reads below, and _save_manifest ignores the caller's stage_history
+    # entirely -- it appends `record` to the list it re-reads from S3, so the durable list
+    # gains exactly one entry per completion even though two dicts saw the append.
+    manifest.setdefault("stage_history", []).append(record)
     try:
         # The manifest goes BACK to S3, which it never used to. Every prompt is told
         # "the S3 manifest at manifest_uri is the single source of truth; read it first,
@@ -1138,7 +1176,7 @@ def handle_stage_complete(c, event, args) -> dict:
         # asked to reflect on a run has only its own turn to reflect on. A pipeline
         # whose stages cannot read each other's results cannot iterate on a run; it can
         # only redo it.
-        _save_manifest(c["s3"], event["manifest_uri"], manifest)
+        _save_manifest(c["s3"], event["manifest_uri"], manifest, history_record=record)
     except Exception as exc:  # noqa: BLE001 — never withhold the token for an artifact
         failures.append(f"manifest {type(exc).__name__}: {exc}")
         print(f"[driver] manifest stage-write FAILED for {run_id}/{stage}: "
