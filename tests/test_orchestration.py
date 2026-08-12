@@ -2907,6 +2907,42 @@ def _walk_field_availability(states: dict, start: str, seed: set):
     return problems
 
 
+def _job_launching_tasks() -> set:
+    """(stage, task) for every prompt bullet that promises to emit job_launched.
+
+    Which states can be hit by a training-job error is a property of the AGENTS, not
+    of the ASL: resume_pipeline reads the parked token off the run row and settles it
+    with CapacityStopped / TrainingJobFailed without ever asking which state parked
+    it. So the set of states needing those Catches is derived here from the side that
+    decides it, and a launch task added to a prompt later drags the ASL with it.
+
+    Two parsing details, both load-bearing:
+
+      * The text is CUT at the global `Rules:` block first. That block ends with the
+        turn-end invariant, which mentions job_launched, and the LAST task bullet's
+        chunk runs to end-of-text -- so without the cut, whichever task happens to be
+        listed last is credited with launching jobs. The naive version of this
+        derivation over-collected exactly FinetuneAnalyze and EvalGate that way, and
+        it would have "passed" while asserting something false.
+      * systemPrompt is a list of blocks, so the blocks are joined before matching:
+        a bullet split across two blocks is otherwise invisible.
+    """
+    out = set()
+    for cfg in sorted((REPO / "agents").glob("*/harness.json")):
+        doc = json.loads(cfg.read_text())
+        text = "".join(b.get("text", "") for b in (doc.get("systemPrompt") or []))
+        cut = re.search(r"(?m)^\s*Rules:", text)
+        tasks_only = text[:cut.start()] if cut else text
+        hits = [(m.start(), m.group(1)) for m in
+                re.finditer(r'(?m)^\s*[-*]\s*\\?"([a-z_]+)\\?"\s*:', tasks_only)]
+        assert hits, f"{cfg}: parsed no task bullets before Rules: -- the parse broke"
+        for i, (pos, task) in enumerate(hits):
+            end = hits[i + 1][0] if i + 1 < len(hits) else len(tasks_only)
+            if "job_launched" in tasks_only[pos:end]:
+                out.add((cfg.parent.name, task))
+    return out
+
+
 class TestStateMachine:
 
     def test_all_next_targets_exist(self, asl):
@@ -3530,9 +3566,57 @@ class TestStateMachine:
                 assert cat.get("ResultPath") == "$.error", (
                     f"{name}'s capacity catch must file the error under $.error and "
                     "keep $.iteration — replacing the state resets the run's context")
-        assert set(found) >= {"FinetuneLaunch", "EvalGenerate"}, (
-            f"the capacity exemption covers {found}; both launch-and-release states "
-            "park tracked jobs and both race capacity")
+        assert set(found) == self._launch_states(asl), (
+            f"the capacity exemption covers {sorted(found)}, but the states that "
+            f"launch tracked jobs are {sorted(self._launch_states(asl))}")
+
+    #: The set that was hardcoded here until 2026-08-13 was
+    #: `>= {"FinetuneLaunch", "EvalGenerate"}` -- a floor over the two states that
+    #: already had the Catch, so it could only ever agree with the ASL it was reading.
+    #: RemediateFinetune launches a job too (its prompt bullet promises job_launched)
+    #: and had ONLY States.ALL -> EscalateFail, so a $0-billed capacity stop killed a
+    #: run in the middle of recovering, and this test said nothing for months.
+    @staticmethod
+    def _launch_states(asl: dict) -> set:
+        """ASL states dispatching a (stage, task) whose prompt promises job_launched."""
+        launchers = _job_launching_tasks()
+        out = set()
+        for name, st in asl["States"].items():
+            payload = (st.get("Parameters") or {}).get("Payload") or {}
+            if (payload.get("stage"), payload.get("task")) in launchers:
+                out.add(name)
+        assert out, "no state dispatches a launch task -- the derivation is broken"
+        return out
+
+    def test_a_job_launching_state_can_survive_a_failed_job(self, asl):
+        """The other half: a launch state must also Catch TrainingJobFailed into the
+        remediation Choice. States.ALL -> EscalateFail is the correct LAST resort, but
+        when it is the ONLY clause, the two errors resume_pipeline actually sends --
+        CapacityStopped and TrainingJobFailed, the two most likely outcomes of the
+        very job this state launched -- both skip the iteration budget the pipeline
+        was built around and escalate on the first try."""
+        for name in sorted(self._launch_states(asl)):
+            catches = asl["States"][name].get("Catch", [])
+            routes = {e: c["Next"] for c in catches for e in c.get("ErrorEquals", [])}
+            nxt = routes.get("TrainingJobFailed")
+            assert nxt, (
+                f"{name} launches a tracked job but has no TrainingJobFailed catch, so "
+                f"a failed job hits {routes.get('States.ALL')} without ever consulting "
+                "the iteration budget")
+            assert asl["States"][nxt]["Type"] == "Choice", (
+                f"{name}'s TrainingJobFailed catch goes to {nxt}, which is a "
+                f"{asl['States'][nxt]['Type']}; it must reach a Choice that re-checks "
+                "$.iteration, or the remediation budget is unreachable")
+            # States.ALL must be the LAST CLAUSE: Step Functions matches Catch clauses
+            # in order, so a States.ALL anywhere above shadows every clause below it.
+            # Asserted on the clause index, not on the flattened error list -- a
+            # duplicated catch-all ("States.ALL first, and again at the bottom") leaves
+            # the last error looking correct while the first clause swallows everything.
+            catchall = [i for i, c in enumerate(catches)
+                        if "States.ALL" in c.get("ErrorEquals", [])]
+            assert catchall in ([], [len(catches) - 1]), (
+                f"{name}'s States.ALL sits at clause(s) {catchall} of "
+                f"{len(catches)}; every clause after the first one can never match")
 
     def test_a_conductor_dispatched_task_is_closed_out_when_its_run_ends(self, asl):
         """The zombie-run bug, one level up: the TASK stays 'dispatched' forever.

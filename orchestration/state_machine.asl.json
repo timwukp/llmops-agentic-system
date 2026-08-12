@@ -392,6 +392,22 @@
       "Catch": [
         {
           "ErrorEquals": [
+            "CapacityStopped"
+          ],
+          "ResultPath": "$.error",
+          "Comment": "This state LAUNCHES a training job (the remediate task applies its one targeted change and relaunches), so it parks a task token that resume_pipeline settles exactly like FinetuneLaunch's -- that Lambda reads the parked token off the run row and never asks which state parked it. Until 2026-08-13 the only Catch here was States.ALL, so a $0-billed capacity stop on a remediation relaunch went to EscalateFail: the cheapest possible non-failure killed the run at the one moment it was already recovering. Same shape as FinetuneLaunch's: re-enter with $.iteration UNCHANGED, because capacity is weather, and let resume_pipeline's capacity_retries cap be the loop guard.",
+          "Next": "RemediateFinetune"
+        },
+        {
+          "ErrorEquals": [
+            "TrainingJobFailed"
+          ],
+          "ResultPath": "$.error",
+          "Comment": "A remediation whose own job fails is a spent iteration, not an escalation: RemediationChoice re-checks the iteration budget and only escalates once it is exhausted. Terminates because IncrementIteration is on the path back here.",
+          "Next": "RemediationChoice"
+        },
+        {
+          "ErrorEquals": [
             "States.ALL"
           ],
           "ResultPath": "$.error",
