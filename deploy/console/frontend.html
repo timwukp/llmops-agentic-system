@@ -630,7 +630,10 @@ function renderExecPicker(){
 // BORDERLINE means the pipeline escalated rather than decide (Wilson interval straddles the
 // bar), NOT MEASURED means the eval report omitted a gated metric -- which the eval prompt
 // defines as a FAILED gate, so it is red -- and NOT EVALUATED means the run died before it
-// was measured, which is the only one of the five that is genuinely no verdict.
+// was measured, which is the only one of the five that is genuinely no verdict. UNRECONCILED
+// is a bookkeeping failure, not a quality one: judge_n plus the unscorable items does not add
+// up to the rows in the acceptance file, and the eval score bullet calls such a score not
+// reportable -- so it is red, and it is NOT the same red as a gate the student missed.
 const GATE_PILL = {
   "passed":        `<span class="pill ok">PASS</span>`,
   "failed":        `<span class="pill err">FAIL</span>`,
@@ -638,13 +641,25 @@ const GATE_PILL = {
   "not_measured":  `<span class="pill err">NOT MEASURED</span>`,
   "not_evaluated": `<span class="pill idle">not evaluated</span>`,
   "unreadable":    `<span class="pill err">UNREADABLE</span>`,
+  "unreconciled":  `<span class="pill err">DENOMINATOR</span>`,
 };
 // The denominator an interval was computed over, under the metric FAMILY's name -- the row
 // carries judge_score plus judge_n, so the family is the metric name minus its last
 // component. Derived rather than spelled "judge_n", so the next interval-bearing gate metric
 // shows its n instead of silently showing an interval with no sample size behind it.
-function gateN(g){ const v = g[String(g.name||"").split("_").slice(0,-1).join("_")+"_n"];
-  return v==null ? null : v; }
+function gateFam(g){ return String(g.name||"").split("_").slice(0,-1).join("_"); }
+function gateN(g){ const v = g[gateFam(g)+"_n"]; return v==null ? null : v; }
+// An n is a claim with exceptions, and the exceptions belong beside it. `judge_n` counts
+// SCORED items only, and the items the judge could not read are not a random sample -- on the
+// 8B run the 4 permanently unjudgeable ones clustered on the credential/MFA categories the
+// student scored 0.000 on. So an unqualified `n=94` next to a narrow interval is the most
+// flattering way there is to print a 97-row layer.
+function gateDenom(g){
+  const n = gateN(g); if (n==null) return "";
+  const u = g[gateFam(g)+"_unscorable"], layer = g["items_in_layer"];
+  return ` n=${esc(n)}`+(u!=null&&Number(u)>0?` · ${esc(u)} unscorable`:"")
+    +(layer!=null?` of ${esc(layer)}`:"");
+}
 
 // ── stage-flow diagram: 9 logical stages + remediation loop ──────────────────
 const STAGE_SUBS = {"data-prep-generate":"teacher generates","data-prep-curate":"curate + split",
@@ -817,7 +832,7 @@ async function loadRun(runId){
           // three the same is how run-phase2-main-0001 shows "gate failed" over a table of
           // blanks with no way to tell which gate failed.
           `<td>${GATE_PILL[g.status]||GATE_PILL[g.passed==null?"not_evaluated":(g.passed?"passed":"failed")]}`+
-          `${g[g.name+"_ci_low"]!=null?` <span class="sub mono">CI [${esc(g[g.name+"_ci_low"])}, ${esc(g[g.name+"_ci_high"])}]${gateN(g)!=null?` n=${esc(gateN(g))}`:""}</span>`:""}</td></tr>`).join("")+`</table>`;
+          `${g[g.name+"_ci_low"]!=null?` <span class="sub mono">CI [${esc(g[g.name+"_ci_low"])}, ${esc(g[g.name+"_ci_high"])}]${gateDenom(g)}</span>`:""}</td></tr>`).join("")+`</table>`;
     }
     if (d.oodReport) {
       html += `<h2 style="margin-top:12px">OOD layer (measured, never gated)</h2><table><tr><th>Metric</th><th>Value</th></tr>`+

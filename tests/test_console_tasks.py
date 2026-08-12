@@ -4931,10 +4931,137 @@ def test_every_gate_status_the_server_can_send_has_a_pill_that_renders_it(consol
     statuses = {v for k, v in vars(console).items()
                 if k.startswith("GATE_") and isinstance(v, str)}
     # A derived census that finds nothing agrees with any frontend at all, so the count is
-    # pinned: the six are passed/failed/borderline/not_measured/not_evaluated/unreadable.
-    assert len(statuses) == 6, f"the status vocabulary changed: {sorted(statuses)}"
+    # pinned: passed/failed/borderline/not_measured/not_evaluated/unreadable/unreconciled.
+    assert len(statuses) == 7, f"the status vocabulary changed: {sorted(statuses)}"
     code = _strip_comments(_front())
     pills = code[code.index("const GATE_PILL"):]
     pills = pills[:pills.index("};")]
     for st in sorted(statuses):
         assert f'"{st}"' in pills, f"run_detail can send status {st!r} and nothing paints it"
+
+
+# ── D10: the items nobody could score ────────────────────────────────────────
+#
+# The pipeline's gate rule has THREE clauses and this row ran two of them. `judge_n` counts
+# SCORED items only; a judge call can fail to return a verdict for reasons that have nothing to
+# do with the answers, and `pipeline/eval/judge_prompt_pairwise.md` measured that on the 8B run:
+# 9 of 274 (item, position) slots content_filtered, retrying recovered 5, and the 4 that stayed
+# unjudgeable clustered on the credential / MFA / access categories where the student scored
+# 0.000. So the missingness is not random and the interval on the survivors UNDERSTATES the
+# uncertainty rather than widening to cover it, which is why the gate bullet recomputes its
+# verdict with every unscorable item imputed as a win, then a loss, then a tie, and escalates
+# when those disagree. The console decided PASS off the survivors-only bound and displayed
+# `n=94` for a 97-row layer with the 3 missing items nowhere on the page.
+#
+# The real ID-layer numbers from that run, which every fixture below is anchored to.
+_8B_ID = {"judge_score": 0.2234, "judge_score_ci_low": 0.151, "judge_score_ci_high": 0.318,
+          "judge_n": 94, "judge_wins": 3, "judge_ties": 36, "judge_losses": 55,
+          "judge_unscorable": 3, "items_in_layer": 97}
+
+
+def test_a_decisive_pass_the_unscorable_items_could_overturn_is_not_a_pass(console):
+    """The failure this fixes, in arithmetic. Survivors: 94 scored, judge_score 0.5532, Wilson
+    lower bound 0.4520 -- at or above the 0.45 bar, so the row painted PASS and `passed: True`.
+    Impute the 3 unscorable items as losses and the same rule over 97 gives 0.5361 with a lower
+    bound of 0.4374, which is BORDERLINE: the verdict moves, so the eval agent escalates with
+    all three imputations and `gate_passed` is not True. A console that says PASS there is
+    publishing the one verdict the pipeline explicitly declined to reach."""
+    near = {**_8B_ID, "judge_score": 0.5532, "judge_score_ci_low": 0.4520,
+            "judge_score_ci_high": 0.6499, "judge_wins": 42, "judge_ties": 20,
+            "judge_losses": 32}
+    row = _gate(console, "judge_score", 0.45, near)
+    assert (row["status"], row["passed"]) == ("borderline", None), (
+        f"a PASS survived items nobody could score that overturn it: {row!r}")
+    # The clause is what did it, not the bounds: with nothing unscorable the SAME bounds pass.
+    scored_all = {**near, "judge_unscorable": 0, "judge_n": 97, "judge_wins": 43,
+                  "judge_ties": 21, "judge_losses": 33}
+    assert _gate(console, "judge_score", 0.45, scored_all)["status"] == "passed", (
+        "the imputation clause is rejecting the bounds themselves, not the missing items")
+
+
+def test_unanimous_imputations_do_not_manufacture_a_borderline(console):
+    """The other direction, and the reason this is a recompute and not a tolerance. The 8B run
+    is the worked example in the instrument doc: every imputation FAILS decisively, so the 4
+    items it could not read were never decision-relevant and escalating would have been noise.
+    A rule whose only behaviour is to fire is a rule that teaches an operator to ignore it."""
+    row = _gate(console, "judge_score", 0.45, _8B_ID)
+    assert (row["status"], row["passed"]) == ("failed", False), f"{row!r}"
+    assert console._imputed_verdicts(_8B_ID, "judge", 0.45) == {"failed"}, (
+        "the imputations of the run this rule was calibrated on no longer agree")
+
+
+def test_unscorable_items_nobody_can_account_for_are_not_a_pass(console):
+    """`judge_unscorable: 3` with no wins/ties/losses to recompute from is a report saying
+    items are missing and withholding what the console would need to check whether they matter.
+    Painting PASS there claims a check that could not run."""
+    blind = {"judge_score": 0.55, "judge_score_ci_low": 0.46, "judge_score_ci_high": 0.64,
+             "judge_n": 94, "judge_unscorable": 3, "items_in_layer": 97}
+    row = _gate(console, "judge_score", 0.45, blind)
+    assert (row["status"], row["passed"]) == ("borderline", None), f"{row!r}"
+    assert console._imputed_verdicts(blind, "judge", 0.45) is None
+    # ...and a report from before those fields existed is not retroactively undecidable: 30 of
+    # the 34 gated runs in this account predate them, and painting every one of them borderline
+    # is how a real borderline stops being visible.
+    legacy = {"judge_score": 0.55, "judge_score_ci_low": 0.46, "judge_score_ci_high": 0.64,
+              "judge_n": 94}
+    assert _gate(console, "judge_score", 0.45, legacy)["status"] == "passed", f"{legacy!r}"
+    assert console._imputed_verdicts(legacy, "judge", 0.45) == set()
+
+
+def test_a_score_that_fails_its_own_denominator_reconciliation_gets_no_verdict(console):
+    """D8 made the eval agent assert `judge_n + judge_unscorable == items_in_layer` and refuse
+    to report a score that fails it. This page is the only reader that can catch a report which
+    asserted it and got it wrong -- and the harm runs the flattering way, because a silently
+    shrunken denominator makes the Wilson interval NARROWER around the wrong sample. Its own
+    status, not `failed`: a bookkeeping failure and a student that missed a bar call for
+    completely different work."""
+    wrong = {**_8B_ID, "items_in_layer": 137}
+    row = _gate(console, "judge_score", 0.45, wrong)
+    assert (row["status"], row["passed"]) == ("unreconciled", False), f"{row!r}"
+    # It reconciles at 97 -- so the check is reading the numbers, not rejecting the shape.
+    assert _gate(console, "judge_score", 0.45, _8B_ID)["status"] == "failed"
+
+
+def test_the_row_shows_the_items_its_denominator_leaves_out(console):
+    """A number served and never painted is the defect one layer up. `judge_n` on its own is a
+    claim with exceptions, and the exceptions are exactly what an operator needs to see."""
+    row = _gate(console, "judge_score", 0.45, _8B_ID)
+    assert (row["judge_n"], row["judge_unscorable"], row["items_in_layer"]) == (94, 3, 97), (
+        f"the row hides the items its denominator excludes: {row!r}")
+    code = _strip_comments(_front())
+    assert "gateDenom" in code and "unscorable" in code, (
+        "run_detail serves the unscorable count and the page never prints it")
+    assert 'g["items_in_layer"]' in code, "the layer size is served and never painted"
+    # Derived from the row's metric family, like `_n` already is -- a hardcoded "judge_"
+    # would print nothing for the next interval-bearing gate metric.
+    assert '"judge_unscorable"' not in code, (
+        "the unscorable count is painted from a hardcoded metric family")
+    # ...and only where there is an interval to qualify. A scalar gate has no denominator.
+    scalar = _gate(console, "format_validity", 0.95,
+                   {"format_validity": 1.0, "judge_unscorable": 3, "items_in_layer": 97})
+    assert "items_in_layer" not in scalar and "judge_unscorable" not in scalar, f"{scalar!r}"
+
+
+def test_the_console_reads_the_field_names_the_eval_prompt_mandates(console):
+    """The two ends have to agree on the spelling or this whole check is vacuous -- and one of
+    them is not family-prefixed, which is the kind of detail a rename quietly breaks.
+    `items_in_layer` is a property of the LAYER (the row count of the acceptance file), while
+    `judge_unscorable` hangs off the metric family, so the names are derived from the eval score
+    bullet's own reconciliation formula rather than retyped here."""
+    prompt = json.loads((REPO / "agents/eval/harness.json").read_text())
+    text = prompt["systemPrompt"][0]["text"]
+    formula = re.search(r"assert (\w+) \+ (\w+) == (\w+)", text)
+    assert formula, "the eval score bullet no longer states the reconciliation it asserts"
+    judged, unscorable, layer = formula.groups()
+    src = (REPO / "deploy/console/lambda_function.py").read_text()
+    fam, _, suffix = judged.rpartition("_")
+    assert f'f"{{family}}_{suffix}"' in src, (
+        f"the eval report calls the scored count {judged!r} and the console reads something else")
+    assert f'f"{{family}}_{unscorable.split("_", 1)[1]}"' in src, (
+        f"the eval report calls the excluded count {unscorable!r} and the console reads "
+        "something else")
+    assert f'"{layer}"' in src, (
+        f"the eval report calls the layer size {layer!r} and the console reads something else")
+    assert fam == unscorable.split("_", 1)[0], (
+        f"{judged!r} and {unscorable!r} no longer share a family, so deriving one from the "
+        "metric name no longer finds the other")

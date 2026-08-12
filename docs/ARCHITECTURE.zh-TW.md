@@ -1071,6 +1071,22 @@ in-distribution 那一層擋 deploy；OOD 那一層被量、被報，永遠不 g
 OOD 集、而一個已完成的 eval 沒有帶回來」時會顯示 **NOT REPORTED** —— 條件是 eval 真的已經回報過，
 因為對每一個只是還在跑推論的 run 都發一次警報，正是讓 operator 學會忽略那個真警報的方式。
 
+**一個 `n` 是一個帶著例外的主張，而一個只印出主張、不印出例外的頁面，印的是比較好看的那一半。**
+`judge_n` 只數**被評分過**的項目。judge 的一次呼叫可能因為與答案完全無關的原因拿不到判決，而這種
+缺失不是隨機的：在 8B 那次 run 裡，274 個（項目, 位置）槽位中有 9 個回來是 `content_filtered`，
+重試救回 5 個，而永遠judge不動的那 4 個，全部集中在 credential / MFA / access 這幾個 student 得分
+0.000 的類別。所以「只算存活者」的區間，比「算整層」的區間**更窄也更高**；eval 的 gate bullet 對此
+的回答是把判決重算三次 —— 把每個 unscorable 項目分別當成 win、當成 loss、當成 tie —— 只有這三次
+不一致時才 escalate，而在 8B 那次它們是一致的。console 只跑了這條規則三個子句裡的兩個：它用
+「只有存活者」的下界判 PASS，而且對一個 **97 列**的層印出 `n=94`，被排除的那 3 個項目在整個頁面上
+完全不存在。在門檻附近，這兩件事其實是同一個缺陷的兩次發作 —— 存活者 0.5532、下界 0.4520，越過
+0.45 的 gate；同一條規則把那 3 個項目當成 loss 重算得到 0.5361、下界 0.4374，那是 borderline ——
+於是頁面畫出了 **PASS**，而那正是 pipeline 已經選擇 escalate、拒絕自己下的那個判決。現在這一列會跑
+第三個子句，在區間旁邊帶上 `judge_unscorable` 與 `items_in_layer`，並且**重新驗證** D8 的分母核對
+（`judge_n + judge_unscorable == items_in_layer`）而不是信任它：agent 被要求拒絕報告一個核對不上的
+分數，而這個頁面是唯一能抓到「宣稱核對過、實際算錯了」的那份報告的讀者。分母核對不上會拿到它自己的
+判決，因為記帳錯誤與 student 沒過標準，要做的事完全不同。
+
 **一個 run 自己發現的事實，和它被簽署時的同意一樣會被傳遞下去。** `MODEL_PARAM_FOR_ROLE` 把人
 **簽署**的內容帶給必須服從它的 stage；`STAGE_FACT_PARAMS` 把 run 自己**產出**的內容帶給必須量測
 它的 stage。`params.student_endpoint` —— eval 與 monitor 都會讀 —— 就是命名這個模式的那個案例：

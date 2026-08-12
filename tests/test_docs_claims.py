@@ -1121,6 +1121,19 @@ def test_every_negative_control_still_matches_the_code_it_mutates():
             continue
         if new == orig:
             dead.append(f"{mutate.__name__} ({name}): patch is a no-op against {rel}")
+            continue
+        # A third way for a control to be dead while reporting PASS: the mutation breaks the
+        # PARSER. Then every test that imports the file errors out, pytest exits 1 exactly as it
+        # does for a failed assertion, and the guard's assertions never run at all. m236 was
+        # that -- two lines removed from inside a `try:`, leaving it empty -- and the only place
+        # it showed was the kill mode in the printed tail, which nothing reads. Python sources
+        # only: breaking a JSON or Markdown parser is often the very break being asserted.
+        if rel.endswith(".py"):
+            try:
+                compile(new, rel, "exec")
+            except SyntaxError as exc:
+                dead.append(f"{mutate.__name__} ({name}): mutation of {rel} does not parse "
+                            f"({exc}), so it kills by import error, not by behaviour")
     assert not dead, (
         f"{len(dead)} of {len(mod.CASES)} negative controls no longer apply to the code they "
         "mutate, so the guards they claim to verify are unverified:\n  " + "\n  ".join(dead)

@@ -4318,6 +4318,84 @@ case("console: a run still generating answers is reported as having omitted its 
      [f"{_TC}test_an_eval_stage_still_running_has_not_omitted_its_ood_layer"])
 
 
+#: D10: the items nobody could score. Every one of these four weakenings moves the verdict in
+#: the FLATTERING direction, because that is the direction a shrinking denominator moves: the
+#: items the judge cannot read are not a random sample (they clustered on the categories the
+#: student scored 0.000 on), so an interval over the survivors is narrower and higher than the
+#: one over the layer, and every artifact still agrees with itself.
+def m234(t):
+    old = ("            imputed = _imputed_verdicts(metrics, family, bar)\n"
+           "            if imputed is None or len(imputed) > 1:\n"
+           "                return GATE_BORDERLINE\n"
+           "            return imputed.pop() if imputed else verdict\n")
+    assert t.count(old) == 1, f"the imputation clause has moved; found {t.count(old)}"
+    # The pre-D10 console verbatim: decide on the survivors-only bound and never ask whether
+    # the items nobody scored could overturn it. Two of the gate rule's three clauses.
+    return t.replace(old, "            return verdict\n", 1)
+
+
+case("console: a decisive PASS is painted off the survivors-only interval, so a row the "
+     "pipeline escalated over its unscorable items reads as a passed gate",
+     _CN, m234,
+     [f"{_TC}test_a_decisive_pass_the_unscorable_items_could_overturn_is_not_a_pass"])
+
+
+def m235(t):
+    old = "    if unscorable <= 0:\n        return set()\n"
+    assert t.count(old) == 1, f"the nothing-to-impute branch has moved; found {t.count(old)}"
+    # Inverts the missing-counts answer: a report that says items are unscorable and withholds
+    # the tally now reads as a report with nothing to impute, so the check silently vanishes on
+    # exactly the reports that cannot support it.
+    return t.replace(old, "    if unscorable <= 0:\n        return set()\n"
+                          "    if f\"{family}_wins\" not in metrics:\n        return set()\n", 1)
+
+
+case("console: unscorable items with no wins/ties/losses to recompute from read as nothing to "
+     "impute, so the check disappears on the reports that cannot support it",
+     _CN, m235,
+     [f"{_TC}test_unscorable_items_nobody_can_account_for_are_not_a_pass"])
+
+
+def m236(t):
+    # The WHOLE block, so the mutant still parses. Deleting only the comparison leaves an empty
+    # `try:` body, and an IndentationError kills the test by breaking the import -- a PASS that
+    # says nothing about the guard. The runner now refuses a mutation that does not compile.
+    old = ("            layer_n, judged = metrics.get(\"items_in_layer\"),"
+           " metrics.get(f\"{family}_n\")\n"
+           "            if layer_n is not None and judged is not None:\n"
+           "                try:\n"
+           "                    if int(judged) + int(metrics.get(f\"{family}_unscorable\") or 0)"
+           " != int(layer_n):\n"
+           "                        return GATE_UNRECONCILED\n"
+           "                except (TypeError, ValueError):\n"
+           "                    return GATE_UNREADABLE\n")
+    assert t.count(old) == 1, f"the reconciliation check has moved; found {t.count(old)}"
+    # Trusts D8's assertion instead of verifying it. The agent is required to refuse a score
+    # whose denominator does not reconcile; this page was the only reader that could catch a
+    # report which asserted it and got it wrong.
+    return t.replace(old, "", 1)
+
+
+case("console: the denominator is displayed and never reconciled, so a score the eval bullet "
+     "calls unreportable is painted with a narrower interval around the wrong sample",
+     _CN, m236,
+     [f"{_TC}test_a_score_that_fails_its_own_denominator_reconciliation_gets_no_verdict"])
+
+
+def m237(t):
+    old = '        extras += [f"{family}_n", f"{family}_unscorable", "items_in_layer"]'
+    assert t.count(old) == 1, f"the denominator extras have moved; found {t.count(old)}"
+    # Back to n alone. The verdict still accounts for the missing items; the page the operator
+    # reads shows `n=94` for a 97-row layer and nothing about the three it left out.
+    return t.replace(old, '        extras += [f"{family}_n"]', 1)
+
+
+case("console: the row shows its denominator and hides the items excluded from it, so n=94 "
+     "beside a narrow interval is how a 97-row layer gets printed",
+     _CN, m237,
+     [f"{_TC}test_the_row_shows_the_items_its_denominator_leaves_out"])
+
+
 #: Where the pristine text of the file currently mutated is parked, so a kill -9 -- which
 #: no handler can intercept -- still leaves the original recoverable. Under the repo root
 #: rather than /tmp because it must be obvious to whoever finds the tree dirty, and
@@ -4397,6 +4475,21 @@ for name, rel, mutate, tests in (CASES if __name__ == "__main__" else ()):
         print(f"SKIP-BROKEN  {name}: patch was a no-op (guard NOT verified)")
         failed.append(name)
         continue
+    # A mutation that does not PARSE kills every test that imports the file, so the case
+    # reports PASS without the guard's assertions ever running. m236 was that: it deleted two
+    # lines out of a `try:` body, left it empty, and "was caught" by an IndentationError. rc is
+    # 1 for a collection error and for a failed assertion alike, so nothing downstream can tell
+    # them apart -- only the kill mode in the printed tail did, and nothing reads that. Python
+    # sources only: a JSON or Markdown mutation that breaks a parser is frequently the exact
+    # break being asserted.
+    if rel.endswith(".py"):
+        try:
+            compile(new, rel, "exec")
+        except SyntaxError as exc:
+            print(f"SKIP-BROKEN  {name}: mutation does not parse ({exc}) -- it would kill by "
+                  "import error rather than by behaviour (guard NOT verified)")
+            failed.append(f"{name} / mutation does not parse: {exc}")
+            continue
     # Journal BEFORE mutating, never after: a crash in the window between the two would
     # otherwise leave a mutated file with no record of what it used to be.
     JOURNAL.write_text(json.dumps({"path": rel, "text": orig, "case": name}))

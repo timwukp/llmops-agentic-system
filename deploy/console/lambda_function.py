@@ -25,6 +25,7 @@ Env: CONSOLE_TABLE, RUNS_TABLE, EVENTS_TABLE, DATA_BUCKET (optional — falls ba
 import base64
 import hashlib
 import json
+import math
 import os
 import secrets
 import time
@@ -724,6 +725,74 @@ GATE_NOT_MEASURED = "not_measured"
 GATE_NOT_EVALUATED = "not_evaluated"
 #: A value is there and is not a number a threshold can be compared against.
 GATE_UNREADABLE = "unreadable"
+#: The score failed its own denominator reconciliation: `judge_n + judge_unscorable` does not
+#: equal the `items_in_layer` the acceptance file actually holds. The eval score bullet calls
+#: such a score NOT REPORTABLE, so this is fail-CLOSED like GATE_UNREADABLE and deliberately
+#: not GATE_FAILED -- a bookkeeping failure and a quality failure call for different work, and
+#: a number that does not reconcile is worse than a missing one because it looks measured.
+GATE_UNRECONCILED = "unreconciled"
+
+
+def _wilson(score, n, z=1.96):
+    """Wilson interval for `score` over `n`, the same instrument the eval report carries.
+
+    Used ONLY to compare imputations to EACH OTHER -- never to second-guess the bounds the
+    report already carries. Two implementations of one formula disagreeing in the last decimal
+    would otherwise manufacture a borderline out of rounding, which is the D7 mistake with the
+    arithmetic reversed.
+    """
+    if n <= 0:
+        return None
+    d = 1.0 + z * z / n
+    centre = (score + z * z / (2 * n)) / d
+    half = z * math.sqrt(max(score * (1 - score), 0.0) / n + z * z / (4 * n * n)) / d
+    return centre - half, centre + half
+
+
+def _bounds_verdict(low, high, bar):
+    """PASS iff the lower bound clears the bar, FAIL iff the upper bound is under it."""
+    if low >= bar:
+        return GATE_PASSED
+    return GATE_FAILED if high < bar else GATE_BORDERLINE
+
+
+def _imputed_verdicts(metrics, family, bar):
+    """The gate rule's THIRD clause: could the items nobody could score change the verdict?
+
+    Returns the set of verdicts under unscorable-as-win / -as-loss / -as-tie. Empty set when
+    there is nothing to impute, and `None` when items were unscorable and the recompute is
+    impossible -- a distinction the caller needs, because "no missing items" and "missing items
+    I cannot account for" are opposite facts and the pre-D8 reports look like the second.
+    """
+    raw = metrics.get(f"{family}_unscorable")
+    if raw is None:
+        return set()
+    try:
+        unscorable = int(raw)
+    except (TypeError, ValueError):
+        return None
+    if unscorable <= 0:
+        return set()
+    try:
+        wins = float(metrics[f"{family}_wins"])
+        ties = float(metrics[f"{family}_ties"])
+        losses = float(metrics[f"{family}_losses"])
+        n = int(metrics[f"{family}_n"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    # The counts have to describe the same sample the score does, or the imputation is being
+    # applied to a tally that is not the one behind the interval.
+    if n <= 0 or abs(wins + ties + losses - n) > 1e-9:
+        return None
+    verdicts = set()
+    total = n + unscorable
+    for extra_wins, extra_ties in ((unscorable, 0), (0, 0), (0, unscorable)):
+        score = (wins + extra_wins + 0.5 * (ties + extra_ties)) / total
+        interval = _wilson(score, total)
+        if interval is None:
+            return None
+        verdicts.add(_bounds_verdict(interval[0], interval[1], bar))
+    return verdicts
 
 
 def gate_row(name, threshold, metrics, eval_reported):
@@ -746,6 +815,19 @@ def gate_row(name, threshold, metrics, eval_reported):
     string "judge_score": whether a metric is decided by an interval is a property of what
     the report carries about it, and a name list would silently drop back to point estimates
     for the next metric that reports bounds.
+
+    A third defect, from the same family and found later (D10): **a denominator was shown and
+    the items it excludes were not.** The pipeline's gate rule has three clauses and this row
+    ran two of them. `judge_n` counts SCORED items only; items the judge could not read are
+    reported beside it as `judge_unscorable`, and the instrument doc measured that missingness
+    to be non-random (9 of 274 slots content_filtered on the 8B run, the 4 permanently
+    unjudgeable items clustering on the credential/MFA categories where the student scored
+    0.000). So the interval on the survivors UNDERSTATES rather than widens, and the eval gate
+    bullet answers that by recomputing its verdict with every unscorable item imputed as a win,
+    then a loss, then a tie, escalating if those disagree. This row decided PASS off the
+    survivors-only bound alone, so near the bar it could paint PASS on a run the pipeline
+    escalated -- and it displayed `n=94` for a 97-row layer with the 3 missing items nowhere on
+    the page, which is the one place a human would ever see them.
     """
     actual = metrics.get(name)
     row = {"name": name, "threshold": threshold, "actual": actual}
@@ -754,9 +836,15 @@ def gate_row(name, threshold, metrics, eval_reported):
     # report carries judge_score / judge_score_ci_low / judge_n, so the family is the metric
     # name minus its last component. Carried only alongside the bounds, since a denominator
     # next to a point estimate invites reading a width into it that was never computed.
+    family = name.rsplit("_", 1)[0]
     extras = [f"{name}_ci_low", f"{name}_ci_high"]
     if low is not None and high is not None:
-        extras.append(f"{name.rsplit('_', 1)[0]}_n")
+        # `<family>_n` and `<family>_unscorable` travel together or the denominator is a claim
+        # with its own exceptions hidden. `items_in_layer` is NOT family-derived because it is
+        # a property of the LAYER and not of the metric -- it is the row count of the
+        # acceptance file, the same name the eval score bullet mandates when it requires
+        # `judge_n + judge_unscorable == items_in_layer`.
+        extras += [f"{family}_n", f"{family}_unscorable", "items_in_layer"]
     for extra in extras:
         if metrics.get(extra) is not None:
             row[extra] = metrics[extra]
@@ -770,11 +858,29 @@ def gate_row(name, threshold, metrics, eval_reported):
             return GATE_UNREADABLE
         if low is not None and high is not None:
             try:
-                if float(low) >= bar:
-                    return GATE_PASSED
-                return GATE_FAILED if float(high) < bar else GATE_BORDERLINE
+                verdict = _bounds_verdict(float(low), float(high), bar)
             except (TypeError, ValueError):
                 return GATE_UNREADABLE
+            # Verify D8's reconciliation instead of trusting it. The agent is required to
+            # assert it and to refuse to report a score that fails it; this page is the only
+            # reader that can catch a report that asserted it and got it wrong, and a shrunken
+            # denominator makes the interval NARROWER around the wrong sample.
+            layer_n, judged = metrics.get("items_in_layer"), metrics.get(f"{family}_n")
+            if layer_n is not None and judged is not None:
+                try:
+                    if int(judged) + int(metrics.get(f"{family}_unscorable") or 0) != int(layer_n):
+                        return GATE_UNRECONCILED
+                except (TypeError, ValueError):
+                    return GATE_UNREADABLE
+            # A decisive verdict is only decisive if the items nobody scored cannot move it.
+            # The gate bullet's own wording is "if the verdict is identical under all three,
+            # proceed WITH IT", so a unanimous imputation is the verdict -- not a check the
+            # survivors-only verdict gets to overrule. It can only ever be reached when items
+            # were actually unscorable; with nothing to impute the reported bounds decide.
+            imputed = _imputed_verdicts(metrics, family, bar)
+            if imputed is None or len(imputed) > 1:
+                return GATE_BORDERLINE
+            return imputed.pop() if imputed else verdict
         try:
             return GATE_PASSED if float(actual) >= bar else GATE_FAILED
         except (TypeError, ValueError):
@@ -783,8 +889,9 @@ def gate_row(name, threshold, metrics, eval_reported):
     row["status"] = _decide()
     # `passed` is kept because the frontend and the /api/status rollup already read it, and
     # is fail-CLOSED for everything except the row nobody measured: a gate whose metric the
-    # report omits, or whose value cannot be read, is not a passed gate. Only
-    # GATE_NOT_EVALUATED is None, because there is genuinely no verdict to give.
+    # report omits, whose value cannot be read, or whose denominator does not reconcile is not
+    # a passed gate. Only GATE_NOT_EVALUATED is None, because there is genuinely no verdict to
+    # give -- and GATE_BORDERLINE, which is the pipeline declining to reach one.
     row["passed"] = (True if row["status"] == GATE_PASSED
                      else None if row["status"] in (GATE_NOT_EVALUATED, GATE_BORDERLINE)
                      else False)
