@@ -1264,6 +1264,56 @@ def test_a_content_filtered_turn_fails_loudly_instead_of_blaming_the_agent(
     assert calls["n"] == 1, "do not re-ask a filtered session — nothing can get out"
 
 
+@pytest.mark.parametrize("accept", [True, False])
+def test_a_guardrail_block_is_reported_like_a_content_filter_not_as_silence(
+        wired, monkeypatch, accept):
+    """Bedrock spells a suppressed turn two ways. Handling only `content_filtered`
+    left `guardrail_intervened` to fall through to the generic paths, where it read
+    as the agent's own behaviour: on an accept turn as "accepted plan was not
+    dispatched by the agent" (after burning two dispatch re-asks), and on a consult
+    turn as status=drafting with an EMPTY reply — a task that looks healthy and
+    tells nobody anything. The operator needs the block, and needs it named: only
+    `guardrail_intervened` points at the guardrail they attached and can change."""
+    tid = _mk_task(wired, status="accepting" if accept else "drafting")
+    if accept:
+        wired.tasks.items[tid]["approvals"] = [
+            _signed_approval(wired.kms, b'{"goal":"x"}')]
+    calls = {"n": 0}
+
+    class _AC:
+        def invoke_harness(self, **kw):
+            calls["n"] += 1
+            return _fake_stream({"messageStop": {"stopReason": "guardrail_intervened"}})
+
+    monkeypatch.setattr(wired.console, "agentcore_chat", _AC())
+    monkeypatch.setattr(wired.console, "_resolve_harness_id", lambda x: "llmops_orchestrator-x")
+    wired.console.run_task_turn(tid, accept=accept)
+    t = wired.tasks.items[tid]
+    err = str(t.get("error_msg", ""))
+    assert t["status"] == "error", \
+        f"a suppressed turn left status={t['status']!r}; nothing tells the operator"
+    assert "guardrail_intervened" in err, err
+    assert "content_filtered" not in err, \
+        ("the message names a model-side filter for a guardrail block, sending the "
+         f"operator to the wrong control: {err}")
+    assert "was not dispatched by the agent" not in err, \
+        "a platform block must not be recorded as the agent refusing to dispatch"
+    assert calls["n"] == 1, "do not re-ask a blocked session — nothing can get out"
+
+
+def test_both_blocked_stop_reasons_are_the_drivers(wired):
+    """The worker and the harness driver must agree on what "the platform suppressed
+    this turn" looks like — a spelling the driver knows and this worker does not is
+    how a guardrail block became "the agent didn't dispatch"."""
+    driver = (REPO / "orchestration/harness_driver/handler.py").read_text()
+    for reason in wired.console._BLOCKED_STOP_REASONS:
+        assert f'"{reason}"' in driver, \
+            f"the worker treats {reason} as a platform block; the driver does not"
+    assert set(wired.console._BLOCKED_STOP_REASONS) == {
+        "content_filtered", "guardrail_intervened"}, \
+        "Bedrock's suppressed-turn stop reasons changed; update the driver too"
+
+
 def test_a_dispatched_run_survives_a_runaway_tool_loop(wired, monkeypatch):
     """If the agent keeps calling tools past the round cap AFTER dispatching, the
     run exists and is spending money. Reporting the task as `error` would hide a

@@ -2786,6 +2786,16 @@ _DISPATCH_RE_ASK = (
     "function NOW, exactly once, with {plan_uri, params, cost_estimate_usd}, using "
     "the plan_uri you wrote. Emit only that tool call.")
 
+# The two stop reasons that mean the platform suppressed the turn rather than the model
+# producing it. Bedrock spells a model-side filter `content_filtered` and an attached
+# guardrail's intervention `guardrail_intervened`; the harness driver has handled both
+# since the EvalGate incident, this worker handled only the first. A guardrail block on
+# a consult turn therefore ended the task as `drafting` with an EMPTY reply -- no error,
+# nothing for the customer to read, nothing for the operator to search -- and on an
+# accept turn it ended as "accepted plan was not dispatched by the agent", which is the
+# exact false accusation the branch below exists to prevent, one spelling away.
+_BLOCKED_STOP_REASONS = ("content_filtered", "guardrail_intervened")
+
 # How often the in-flight reply is written for the browser to see. The frontend polls
 # every 3s while a turn is running (frontend.html: busy ? 3000 : 15000), so a shorter
 # flush buys nothing a customer can perceive and costs a DynamoDB write per flush.
@@ -2976,14 +2986,19 @@ def run_task_turn(task_id, accept=False):
                 "call your pending inline function.")
             continue
 
-        if (out["stop_reason"] == "content_filtered" and not out["text"]
+        if (out["stop_reason"] in _BLOCKED_STOP_REASONS and not out["text"]
                 and not out["tool_use"]):
             # The model was BLOCKED, not disobedient. Re-asking cannot help (nothing
             # can leave that session) and calling it "the agent didn't dispatch"
-            # points the operator at the wrong thing entirely.
-            _task_fail(task_id, "the model's reply was blocked (stopReason="
-                                "content_filtered); no output could be produced. "
-                                "Rephrase and resend, or start a fresh session.")
+            # points the operator at the wrong thing entirely. The stop reason is
+            # named from the stream, not hardcoded: two spellings reach here and an
+            # error_msg that says content_filtered for a guardrail block sends the
+            # operator to the model's own filter instead of to the guardrail they
+            # attached, which is the one thing they can actually change.
+            _task_fail(task_id, f"the model's reply was blocked (stopReason="
+                                f"{out['stop_reason']}); no output could be "
+                                "produced. Rephrase and resend, or start a fresh "
+                                "session.")
             return
 
         tu = out["tool_use"]
