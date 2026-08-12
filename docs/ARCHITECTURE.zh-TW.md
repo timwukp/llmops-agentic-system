@@ -420,6 +420,14 @@ Functions 仍 RUNNING，卻死寂九小時）。driver 現在在每一輪開始�
 認領以掃描時讀到的 beat 為條件（不會重複復活），每個 run 有上限（超過就升級：每輪
 都死的 driver 有真缺陷，復活只是重演它）。
 
+Triage 走另一扇門獲得同樣的保護（#37）：它刻意沒有 run row，被拒絕的 runs-table
+心跳改寫進 events table 專用的 `__liveness__` 分區 —— payload 帶上 `params`，因為
+triage 的工作單只存在於調用本身。復活者用一個 Query 讀那個分區，套用同一套
+stale/cap/claim 契約；正常終結會**刪除** item（結束不是死亡，刪除也不留下不朽的
+歷史或被繼承的復活計數），觸頂的 item 則以 triage **所關於的那個 run** 為主體升級
+—— 絕不用它自己的 `triage-` id —— 並隨升級一併刪除。排程作業（sweep、finops）刻意
+**不可復活**：崩潰的排程等下一次排程，而不是重跑非冪等的工作。
+
 這對機制唯一蓋不住的，是 session 自己的時鐘。AgentCore 會在 `maxLifetime` =
 **28800 秒（8 小時）**收回 runtime session —— 這是硬上限，活動不會重置它，也沒有設定
 能調高。蒸餾 stage 在單一確定性 session 裡跑 8–12 小時，於是活得比 session 久；跨過

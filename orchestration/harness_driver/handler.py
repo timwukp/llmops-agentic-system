@@ -1674,26 +1674,30 @@ LIVENESS_PK = "__liveness__"
 
 
 def _settle_liveness(c, event, result):
-    """Mark a non-run invocation's liveness item done on every terminal return.
+    """DELETE a triage's liveness item on every terminal return.
 
     One choke point instead of a mark at every terminal branch: the statuses that end
-    an invocation are exactly the ones that are not the between-turns handoff. Gated by
-    attribute_exists so a run-run (which has no liveness item) is a cheap no-op -- the
-    condition failure IS the branch. An exception path deliberately never reaches this
-    (handler re-raises first): a CRASHED invocation must stay revivable, that being the
-    entire point of the beat."""
+    an invocation are exactly the ones that are not the between-turns handoff. A
+    delete rather than a done_at mark, by review finding: a marked item is immortal
+    (the 15-minute sweep re-reads the whole history forever) and its resurrection
+    count leaks into the subject's NEXT incarnation, which would arrive dead at the
+    cap it inherited. Deleting a nonexistent item is a no-op in DynamoDB, so no
+    condition is needed -- but a REAL failure is printed, not swallowed: a throttled
+    delete left silent is a finished triage the sweep will revive to page a second
+    human about an answered question. An exception path deliberately never reaches
+    this (handler re-raises first): a CRASHED invocation must stay revivable, that
+    being the entire point of the beat."""
+    if not _is_triage(event):
+        return
     if (result or {}).get("status") == "self_reinvoked_between_turns":
         return
     try:
-        c["ddb"].Table(os.environ["EVENTS_TABLE"]).update_item(
+        c["ddb"].Table(os.environ["EVENTS_TABLE"]).delete_item(
             Key={"run_id": LIVENESS_PK,
-                 "sk": "beat#" + str(event.get("run_id") or "")},
-            UpdateExpression="SET done_at = :t",
-            ConditionExpression="attribute_exists(run_id)",
-            ExpressionAttributeValues={
-                ":t": datetime.now(timezone.utc).isoformat()})
-    except Exception:  # noqa: BLE001 — no item (a run-run) or a race; telemetry only
-        pass
+                 "sk": "beat#" + str(event.get("run_id") or "")})
+    except Exception as exc:  # noqa: BLE001
+        print(f"[driver] liveness settle delete failed -- the resurrector may revive "
+              f"a finished triage: {type(exc).__name__}: {exc}")
 
 
 def handler(event, context=None, clients=None):
@@ -1929,21 +1933,29 @@ def _run_stage(event, context=None, c=None):
                   f"{type(exc).__name__}: {exc}")
 
     def _beat_liveness():
-        """The non-run half of the heartbeat: one item per invocation identity in
-        EVENTS_TABLE's `__liveness__` partition. done_at is SET to empty here so a
-        recurring subject (the same escalation re-triaged later) comes back alive
-        after an earlier terminal mark; _settle_liveness writes the real timestamp."""
+        """The non-run half of the heartbeat — for TRIAGES ONLY, by review finding:
+        a crashed scheduled job (sweep-<date>, finops-<period>) must wait for its next
+        schedule, not get five async re-runs of non-idempotent work; a triage is the
+        one non-run whose loss is unrecoverable, because its escalation exists nowhere
+        but in the invocation. Which is also why `params` rides the payload -- a run
+        re-resolves its work order from the manifest, a triage's work order IS
+        params.escalation, and a revival without it triages blind and files its pages
+        under an empty subject. One item per subject; _settle_liveness DELETES it on
+        terminal return, so a recurring subject starts a fresh item with a fresh
+        resurrection count."""
+        if not _is_triage(event):
+            return  # a crashed scheduled job waits for its next schedule
         try:
             c["ddb"].Table(os.environ["EVENTS_TABLE"]).update_item(
                 Key={"run_id": LIVENESS_PK,
                      "sk": "beat#" + str(event.get("run_id") or "")},
-                UpdateExpression="SET beat_at = :t, payload = :p, done_at = :none",
+                UpdateExpression="SET beat_at = :t, payload = :p",
                 ExpressionAttributeValues={
                     ":t": datetime.now(timezone.utc).isoformat(),
-                    ":none": "",
                     ":p": json.dumps({**{k: event[k] for k in
                                          ("run_id", "stage", "task", "harness_id",
-                                          "manifest_uri", "task_token", "iteration")
+                                          "manifest_uri", "task_token", "iteration",
+                                          "params")
                                          if k in event},
                                       "_session_epoch": epoch,
                                       "_session_started_at": session_started_at},
@@ -2030,18 +2042,33 @@ def _run_stage(event, context=None, c=None):
                 if _is_model_5xx(out["error"]):
                     _maybe_failover_model(c, event)
                 wait_s = min(20 * infra_error_turns, 60)
+                messages = _user_text("The stream was interrupted. Continue from "
+                                      "where you left off; call your pending inline "
+                                      "function.")
+                # A real stream death can arrive with as little as ~45s of wall left
+                # (DRAIN_DEADLINE_MARGIN_MS) -- sleeping 60s there gets the invocation
+                # hard-killed mid-sleep: no reinvoke, no settle, the counter's progress
+                # lost. If the backoff does not fit, hand the retry to a fresh
+                # invocation instead; its cold start IS the backoff.
+                if context and context.get_remaining_time_in_millis() < (
+                        wait_s * 1000 + 120_000):
+                    print(f"[driver] stream died again ({infra_error_turns}/4) with "
+                          f"too little wall left to back off in-place -- handing off: "
+                          f"{out['error']}")
+                    return _self_reinvoke()
                 print(f"[driver] stream died again ({infra_error_turns}/4), backing "
                       f"off {wait_s}s before the retry (re_asks untouched): "
                       f"{out['error']}")
                 time.sleep(wait_s)
-                messages = _user_text("The stream was interrupted. Continue from "
-                                      "where you left off; call your pending inline "
-                                      "function.")
                 continue
             if event.get("task_token"):
+                # +2: the first death is absorbed by the salvage retry before this
+                # counter starts, and the exhausting death is the one in hand -- an
+                # operator correlating against the vendor status page needs the true
+                # window, not one turn short.
                 settle_token(c["sfn"], event["task_token"],
                              error="ModelUnavailable",
-                             cause=f"{infra_error_turns + 1} consecutive turns died "
+                             cause=f"{infra_error_turns + 2} consecutive turns died "
                                    f"on stream errors; last: {str(out['error'])[:180]}")
             ev.emit_event(os.environ["EVENT_BUS"], ev.PIPELINE_FAILED,
                           {"run_id": event["run_id"], "stage": event["stage"],
@@ -2122,6 +2149,20 @@ def _run_stage(event, context=None, c=None):
                               "the task token was settled and the outputs verified")
                 return {"status": "completed", **result["normalized"]}
             if name == "job_launched":
+                # Live (r6a, 2026-08-12): a remediating agent called job_launched with
+                # an EMPTY job_name; job_name is a GSI key on the runs table, DynamoDB
+                # rejects "" for index keys, and the unguarded write crashed the WHOLE
+                # invocation (DriverCrashed) -- a protocol slip by the agent became an
+                # infra failure blamed on the driver. Rejected into the same turn
+                # instead, like a stage_complete with missing outputs.
+                if not str(args.get("job_name") or "").strip():
+                    messages = _tool_result_content(tu, {
+                        "status": "rejected",
+                        "reason": "job_launched carried no job_name, so nothing can "
+                                  "ever wake this run. Name the job you actually "
+                                  "created (DescribeTrainingJob to confirm it), or "
+                                  "fix the launch and call again."})
+                    continue
                 handle_job_launched(c, event, args)
                 _ack_terminal(c, event, sess, tu, {"status": "released"},
                               "the task token was parked for EventBridge to settle")

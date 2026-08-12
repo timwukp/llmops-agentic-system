@@ -36,9 +36,11 @@ for a year of incidents a dead triage was unrevivable: the resurrector keys on
 driver_beat_at and the one place it looked was the runs table. Widening the runs-table
 condition was rejected outright (a minted row carrying driver_beat_at IS a resurrectable
 ghost run); instead the driver beats non-run invocations into EVENTS_TABLE under the
-dedicated partition `__liveness__` (sk = `beat#<id>`, one item per invocation identity,
-done_at set on terminal return). This sweep reads that one partition with a Query --
-never a scan over real stage events -- and applies the same stale/cap/claim contract.
+dedicated partition `__liveness__` (sk = `beat#<id>`, one item per subject, DELETED on
+terminal return so an ending leaves nothing to revive and a recurring subject starts a
+fresh resurrection count). This sweep reads that one partition with a Query -- never a
+scan over real stage events -- and applies the same stale/cap/claim contract; a
+cap-exhausted item is escalated against its ORIGINAL subject and deleted.
 
 Env: RUNS_TABLE, EVENTS_TABLE, DRIVER_FN, EVENT_BUS, STALE_MINUTES (default 20),
 RESURRECTIONS_MAX (default 5).
@@ -162,8 +164,6 @@ def handler(event, context=None, clients=None):
 
     liveness_checked = 0
     for item in beats:
-        if str(item.get("done_at") or ""):
-            continue  # the invocation ended on its own terms; silence after an ending
         liveness_checked += 1
         beat = str(item.get("beat_at") or "")
         payload_raw = str(item.get("payload") or "")
@@ -173,18 +173,32 @@ def handler(event, context=None, clients=None):
         if age < stale_min:
             continue
 
-        subject = str(item["sk"])[len("beat#"):]
+        dead_id = str(item["sk"])[len("beat#"):]
         n = int(item.get("resurrections") or 0)
         if n >= cap:
-            # Routes to a FRESH triage of the dead one -- not recursion: the new triage
-            # is alive, and if it dies too, ITS liveness item gets the same cap.
+            # The escalation subject is the run the dead triage was ABOUT, read from
+            # the stamped params -- never the triage's own id: `triage-<x>` as subject
+            # mints a recursive `triage-triage-<x>` against a manifest that does not
+            # exist (triage_subject's docstring calls it the one id that must never be
+            # the subject). And the item is DELETED with the same escalation, or a
+            # 15-minute sweep re-escalates it forever -- 96 billed triages a day was
+            # this review finding's arithmetic.
+            try:
+                subject = str(json.loads(payload_raw).get("params", {})
+                              .get("escalation", {}).get("run_id") or "")
+            except Exception:
+                subject = ""
             ev.emit_event(os.environ["EVENT_BUS"], ev.ESCALATED_TO_HUMAN,
-                          {"run_id": subject, "stage": "resurrector",
-                           "reason": f"non-run driver (liveness beat) dead {age:.0f}min; "
-                                     f"resurrection cap ({cap}) exhausted"},
+                          {"run_id": subject or dead_id, "stage": "resurrector",
+                           "reason": f"triage {dead_id} (liveness beat) dead "
+                                     f"{age:.0f}min; resurrection cap ({cap}) "
+                                     "exhausted -- the triage dies every revival",
+                           "dead_triage": dead_id},
                           client=c["events"])
-            out.append({"run_id": subject, "action": "escalated", "age_min": round(age)})
+            ev_table.delete_item(Key={"run_id": LIVENESS_PK, "sk": item["sk"]})
+            out.append({"run_id": dead_id, "action": "escalated", "age_min": round(age)})
             continue
+        subject = dead_id
 
         try:
             ev_table.update_item(

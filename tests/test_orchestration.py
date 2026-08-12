@@ -194,6 +194,14 @@ class FakeTable:
         # caller's problem and tens-of-rows is the documented scale.
         return {"Items": list(self.items)}
 
+    def delete_item(self, **kw):
+        # Deleting a nonexistent item is a no-op in DynamoDB, and the same here --
+        # _settle_liveness leans on exactly that property.
+        key = kw.get("Key") or {}
+        self.items[:] = [i for i in self.items
+                         if not all(i.get(k) == v for k, v in key.items())]
+        return {}
+
 
 class FakeDDB:
     def __init__(self):
@@ -8895,24 +8903,44 @@ class TestNonRunLivenessBeat:
         ev_["run_id"] = "triage-run-x"
         ev_["stage"] = "orchestrator"
         ev_["task"] = "triage"
+        ev_["params"] = {"escalation": {"run_id": "run-subject-7", "reason": "gate"}}
         ev_.pop("task_token", None)
         return ev_
 
-    def test_a_triage_heartbeat_lands_in_the_liveness_partition(self):
+    def _beats(self, c):
+        return [i for i in c["ddb"].Table(os.environ["EVENTS_TABLE"]).items
+                if i.get("run_id") == driver.LIVENESS_PK]
+
+    def test_a_crashed_triage_leaves_a_revivable_beat_carrying_its_work_order(self):
+        """The beat exists FOR the crash: a dropped async invoke or a hard death must
+        leave (a) an item the sweep can see and (b) the params -- a triage's work order
+        lives nowhere else, and a revival without params.escalation triages blind and
+        files its pages under an empty subject (review finding 1)."""
+        class _CrashingAgentCore(FakeAgentCore):
+            def invoke_harness(self, **kw):
+                raise RuntimeError("hard crash mid-stage")
+
+        c = clients(_CrashingAgentCore([]))
+        with pytest.raises(Exception):
+            driver.handler(self._triage_event(), clients=c)
+        beats = self._beats(c)
+        assert beats and beats[0]["sk"] == "beat#triage-run-x", (
+            "a crashed triage left no liveness item -- it is unrevivable again")
+        payload = json.loads(beats[0]["payload"])
+        assert payload["params"]["escalation"]["run_id"] == "run-subject-7", (
+            "the beat payload dropped params -- a revived triage loses its entire "
+            "work order and triages blind")
+
+    def test_a_finished_triage_deletes_its_beat(self):
+        """An ending is not a death. A done_at MARK was the first design and the review
+        killed it twice over: a marked item is immortal (96 sweeps/day re-read all
+        history forever) and its resurrection count leaks into the subject's next
+        incarnation, which would arrive dead at an inherited cap."""
         c = clients(FakeAgentCore([text_stream("no verdict")] * 4))
         driver.handler(self._triage_event(), clients=c)
-        beats = [i for i in c["ddb"].Table(os.environ["EVENTS_TABLE"]).items
-                 if i.get("run_id") == driver.LIVENESS_PK
-                 and i.get("sk") == "beat#triage-run-x"]
-        assert beats, ("the refused runs-table heartbeat was dropped instead of routed "
-                       "to __liveness__ -- a dead triage is unrevivable again")
-        payload = json.loads(beats[0]["payload"])
-        assert payload["run_id"] == "triage-run-x" and payload["stage"] == "orchestrator"
-        # ...and the terminal return marked it done, so the resurrector reads this
-        # ending as an ending, not as a death to revive (which would re-page a human).
-        assert str(beats[0].get("done_at") or ""), (
-            "a FINISHED triage's liveness item was left revivable -- the resurrector "
-            "would re-run it and page a second human about an answered question")
+        assert not self._beats(c), (
+            "a FINISHED triage's liveness item survived -- the resurrector will "
+            "revive it and page a second human about an answered question")
 
     def test_a_run_with_a_row_writes_no_liveness_item(self):
         uri = "s3://llmops-data-test/runs/run-test-1/raw/data.jsonl"
@@ -8923,21 +8951,38 @@ class TestNonRunLivenessBeat:
         c["ddb"].Table(os.environ["RUNS_TABLE"]).items.append(
             {"run_id": ev_["run_id"], "status": "running"})
         driver.handler(ev_, clients=c)
-        strays = [i for i in c["ddb"].Table(os.environ["EVENTS_TABLE"]).items
-                  if i.get("run_id") == driver.LIVENESS_PK]
-        assert not strays, (
-            f"a run with a run row also beat into __liveness__: {strays} -- two "
-            "heartbeats for one invocation means two resurrectors can each claim one")
+        assert not self._beats(c), (
+            "a run with a run row also beat into __liveness__ -- two heartbeats for "
+            "one invocation means two resurrectors can each claim one")
+
+    def test_a_scheduled_job_is_not_made_revivable(self):
+        """Review finding 4: monitor_sweep (sweep-<date>) and finops_reconcile
+        (finops-<period>) also invoke the driver with non-run ids -- and their work is
+        NOT idempotent (variance pages, audit rows). A crashed scheduled job waits for
+        its next schedule; only a triage, whose escalation exists nowhere else, earns
+        a revival."""
+        ev_ = driver_event()
+        ev_["run_id"] = "sweep-2026-08-12"
+        ev_["stage"] = "monitor"
+        ev_["task"] = "sweep"
+        ev_.pop("task_token", None)
+        c = clients(FakeAgentCore([text_stream("no call")] * 4))
+        driver.handler(ev_, clients=c)
+        assert not self._beats(c), (
+            "a scheduled sweep became revivable -- five async re-runs of "
+            "non-idempotent work, 20 minutes apart")
 
 
 def _liveness_item(subject="triage-run-x", minutes_old=45, **over):
     at = (datetime.datetime.now(datetime.timezone.utc)
           - datetime.timedelta(minutes=minutes_old)).isoformat()
     item = {"run_id": resurrector.LIVENESS_PK, "sk": f"beat#{subject}",
-            "beat_at": at, "done_at": "",
+            "beat_at": at,
             "payload": json.dumps({"run_id": subject, "stage": "orchestrator",
                                    "task": "triage", "harness_id": "llmops_orchestrator",
-                                   "manifest_uri": "", "iteration": 0})}
+                                   "manifest_uri": "", "iteration": 0,
+                                   "params": {"escalation":
+                                              {"run_id": "run-subject-7"}}})}
     item.update(over)
     return item
 
@@ -8961,22 +9006,35 @@ class TestNonRunResurrection:
         assert any(e["DetailType"] == ev.DRIVER_RESURRECTED
                    for e in c["events"].entries)
 
-    def test_a_done_liveness_item_is_an_ending_not_a_death(self):
-        out, c = self._run([_liveness_item(done_at="2026-08-11T20:00:00+00:00")])
-        assert not out["acted"] and not c["lambda"].calls, (
-            "a triage that ENDED was resurrected -- it will re-run its verdict and "
-            "page a second human about an answered question")
+    def test_an_ended_triage_left_nothing_to_revive(self):
+        """Deletion IS the done mark now: after _settle_liveness the partition holds
+        no item, so an empty sweep proves the ending was honored."""
+        out, c = self._run([])
+        assert not out["acted"] and not c["lambda"].calls
 
     def test_a_fresh_liveness_beat_is_left_alone(self):
         out, c = self._run([_liveness_item(minutes_old=5)])
         assert not out["acted"] and not c["lambda"].calls
 
-    def test_the_liveness_cap_escalates_instead_of_reviving_forever(self):
+    def test_the_liveness_cap_escalates_once_against_the_original_subject(self):
+        """Two review findings in one: (a) the escalation subject must be the run the
+        triage was ABOUT (its own `triage-<x>` id would mint a recursive
+        `triage-triage-<x>` against a manifest that does not exist), and (b) the item
+        must be DELETED with the escalation, or the 15-minute sweep re-escalates it
+        forever -- 96 billed triages a day."""
         out, c = self._run([_liveness_item(resurrections=5)])
         assert out["acted"] and out["acted"][0]["action"] == "escalated"
         assert not c["lambda"].calls
-        assert any(e["DetailType"] == ev.ESCALATED_TO_HUMAN
-                   for e in c["events"].entries)
+        esc = [json.loads(e["Detail"]) for e in c["events"].entries
+               if e["DetailType"] == ev.ESCALATED_TO_HUMAN]
+        assert esc and esc[0]["run_id"] == "run-subject-7", (
+            f"the cap escalation is addressed to {esc and esc[0]['run_id']!r}, not to "
+            "the original subject -- triage_event_from_bus will nest triage-triage-")
+        left = [i for i in c["ddb"].Table(RES_ENV["EVENTS_TABLE"]).items
+                if i.get("run_id") == resurrector.LIVENESS_PK]
+        assert not left, (
+            "the cap-exhausted item survived its escalation -- every 15-minute sweep "
+            "re-escalates it forever")
 
 
 # ── a platform outage is not the agent's answer ──────────────────────────────────────
@@ -9014,6 +9072,10 @@ class TestModelOutageBudget:
             "a vendor outage must not be labelled MissingStageComplete -- one sends "
             "the operator to the AWS status page, the other into a transcript that "
             "never existed")
+        # 6 deaths: salvage + budget 1-4 + the exhausting one. The first cause string
+        # said 5 -- an operator correlating against the vendor status page would
+        # reconstruct the outage window one turn short (review finding 9).
+        assert "6 consecutive turns" in c["sfn"].failures[0]["cause"]
         assert any(e["DetailType"] == ev.PIPELINE_FAILED for e in c["events"].entries)
 
     def test_the_outage_budget_survives_a_self_reinvoke(self):
@@ -9026,3 +9088,58 @@ class TestModelOutageBudget:
             "_self_reinvoke stopped carrying the outage counter"
         assert 'int(event.get("_infra_error_turns", 0))' in body, \
             "a continuation no longer restores the outage counter"
+
+
+def test_a_job_launched_without_a_name_is_rejected_not_crashed():
+    """Live (r6a): a remediating agent's job_launched carried job_name="" -- a GSI key
+    on the runs table, which DynamoDB rejects -- and the unguarded write took down the
+    whole invocation as DriverCrashed. The empty call is the AGENT's protocol slip; it
+    gets the same treatment as a stage_complete with missing outputs: rejected into
+    the same turn with instructions, never written."""
+    ac = FakeAgentCore([
+        tool_use_stream("job_launched", {"job_name": ""}),
+        tool_use_stream("job_launched", {"job_name": "llmops-qlora-run-test-1-i0"}),
+        text_stream("ack")])
+    c = clients(ac)
+    out = driver.handler(driver_event(), clients=c)
+    assert out["status"] == "released" and out["job_name"] == "llmops-qlora-run-test-1-i0", (
+        f"the empty job_launched was not rejected-and-retried: {out}")
+    written = [u["ExpressionAttributeValues"].get(":j")
+               for u in c["ddb"].Table(os.environ["RUNS_TABLE"]).updates
+               if ":j" in (u.get("ExpressionAttributeValues") or {})]
+    assert "" not in written, (
+        "an empty job_name reached the runs-table write -- in production that write "
+        "is a ValidationException that kills the invocation")
+
+
+def test_the_outage_backoff_respects_the_lambda_wall(monkeypatch):
+    """A real stream death can arrive with ~45s of wall left (DRAIN_DEADLINE_MARGIN_MS);
+    sleeping 60s there gets the invocation hard-killed mid-sleep -- no reinvoke, no
+    settle, the counter's progress lost (review finding 7). When the backoff does not
+    fit, the retry is handed to a fresh invocation; its cold start IS the backoff."""
+    slept = []
+    monkeypatch.setattr(driver.time, "sleep", lambda s: slept.append(s))
+    ac = FakeAgentCore([DyingStream(), DyingStream()])  # salvage, then outage branch
+
+    class _TightCtx:
+        function_name = "llmops-harness-driver"
+        def get_remaining_time_in_millis(self):
+            # Plenty of wall until the second turn has actually run (so the loop-top
+            # _out_of_time check lets both turns start), then the late-turn squeeze:
+            # the stream death arrived with 70s left, the way a real death at the
+            # ~840s turn cap does.
+            return 900_000 if len(ac.calls) < 2 else 70_000
+
+    class _ReinvokeLambda:
+        def __init__(self):
+            self.calls = []
+        def invoke(self, **kw):
+            self.calls.append(kw)
+            return {"StatusCode": 202}
+
+    c = clients(ac)
+    c["lambda"] = _ReinvokeLambda()
+    out = driver.handler(driver_event(task_token=None), clients=c, context=_TightCtx())
+    assert out == {"status": "self_reinvoked_between_turns"}, (
+        f"{out} -- the outage branch slept into the Lambda wall instead of handing off")
+    assert not slept, f"slept {slept} with only 70s of wall left"
