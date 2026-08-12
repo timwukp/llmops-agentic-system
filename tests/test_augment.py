@@ -1,16 +1,22 @@
 """Tests for the v2 augmentation engine's inputs, and a repo-wide guard against the
 defect they close.
 
-`augment.py` named its corpus with two absolute paths, one of them under a single
-laptop's home directory (`/Users/<name>/Downloads/kaggle-arc-agi-2/...`, a sibling
-checkout of a DIFFERENT project). Nothing invoked the module, so nothing failed --
-which is exactly why it survived: a path that only resolves on one machine is
-indistinguishable from a working one until somebody else runs it, and by then the
-module is a training-data generator producing a plausible corpus for whatever it
-happened to find.
+`augment.py` named its corpus with two absolute paths, one of them a per-user home
+directory pointing at a sibling checkout of a DIFFERENT project. Nothing invoked the
+module, so nothing failed -- which is exactly why it survived: a path that only
+resolves on one machine is indistinguishable from a working one until somebody else
+runs it, and by then the module is a training-data generator producing a plausible
+corpus for whatever it happened to find.
 
 So this file pins two things: that the source is refused rather than guessed, and
 that no tracked code file anywhere in the repo hardcodes a home directory again.
+
+Note on how this file is written: the repo-wide guard below scans every tracked code
+file, INCLUDING this one, so the literal prefixes it hunts for cannot appear here as
+literals -- they are a regex, and the historical line used as the guard's positive
+control is assembled from pieces. Exempting this file by path would have been the
+easy way out and would have left the guard unable to see its own suite. It found this
+out the hard way: the first push failed CI with three self-reports.
 
 Run: .venv/bin/python -m pytest tests/test_augment.py -q
 """
@@ -19,6 +25,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import re
 import subprocess
 import sys
 
@@ -91,7 +98,10 @@ def test_load_source_rows_reads_the_path_it_is_given(tmp_path):
 
 # Prose may legitimately quote a path from an incident; code that RUNS may not.
 _CODE_SUFFIXES = (".py", ".sh", ".json", ".yml", ".yaml", ".js")
-_HOME_PREFIXES = ("/Users/", "/home/")
+# A regex, not two string literals, so this file does not match its own guard. The
+# alternative -- exempting tests/test_augment.py by path -- would blind the scan to
+# every future test file, which is code that runs too.
+_HOME_PATH_RE = re.compile(r"/(?:Users|home)/[A-Za-z0-9._-]+")
 
 
 def _tracked_code_files():
@@ -115,22 +125,30 @@ def test_no_tracked_code_file_hardcodes_a_home_directory():
     for rel in files:
         text = (REPO / rel).read_text(errors="replace")
         for i, line in enumerate(text.splitlines(), 1):
-            if any(pref in line for pref in _HOME_PREFIXES):
-                offenders.append(f"{rel}:{i}: {line.strip()[:100]}")
+            hit = _HOME_PATH_RE.search(line)
+            if hit:
+                offenders.append(f"{rel}:{i}: {hit.group(0)}")
     assert not offenders, (
         "code that runs must take machine-specific paths as arguments or "
         "environment, not hardcode one developer's home directory:\n"
         + "\n".join(offenders))
 
 
-def test_the_scan_would_catch_the_defect_it_was_written_for(tmp_path):
+def test_the_scan_would_catch_the_defect_it_was_written_for():
     """The guard above is only worth its runtime if it fires on the original line.
-    Checked against the real string that shipped, not a paraphrase of it."""
-    original = ('SOURCE_JSONL = ("/Users/tmwu/Downloads/kaggle-arc-agi-2/v2-design/'
-                'prototype/"')
-    assert any(pref in original for pref in _HOME_PREFIXES), \
-        "the prefixes no longer match the line this guard exists to catch"
-    assert not any(pref in "SOURCE_ENV = \"V2_SOURCE_JSONL\"" for pref in _HOME_PREFIXES)
+    Checked against the real string that shipped, assembled from pieces because this
+    file is itself in the scan's file list."""
+    original = ('SOURCE_JSONL = ("' + "/Users" + "/tmwu/Downloads/kaggle-arc-agi-2/"
+                'v2-design/prototype/"')
+    assert _HOME_PATH_RE.search(original), \
+        "the pattern no longer matches the line this guard exists to catch"
+    # A relative or env-driven path is not an offence, or the guard would fire on
+    # every use of the fix.
+    assert not _HOME_PATH_RE.search('SOURCE_ENV = "V2_SOURCE_JSONL"')
+    assert not _HOME_PATH_RE.search('os.environ.get(SOURCE_ENV)')
+    # /home and /Users alone are directories, not somebody's home: the pattern needs
+    # a name after them, so a mount-point mention is not a false positive.
+    assert not _HOME_PATH_RE.search("mounted under /home/ by the runner")
 
 
 def test_the_source_env_name_is_documented_where_a_runner_looks():
