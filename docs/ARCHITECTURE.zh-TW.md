@@ -451,6 +451,23 @@ stale/cap/claim 契約；正常終結會**刪除** item（結束不是死亡，�
 Query 留下的痕跡一模一樣：開始、結束、寂靜。印出的計數是「那個分區確實有被讀」的
 唯一常設證據。
 
+不過「印出來」不等於「有人發現」，而很長一段時間裡沒有任何東西發現。2026-07-29 到
+2026-08-12 之間，Lambda **丟掉了 19 次非同步 invoke**（driver 11、resume 8）——每一次
+都是一個 stage 停住、token 還被 park 著——而這個系統的所有函式上，CloudWatch alarm
+一個都沒有：那次九小時的死亡是人翻執行歷史發現的，resume 少掉 `events:PutEvents` 授權
+是人隔了一天翻 log 發現的。`deploy/06_observability.py --alarms` 現在建立十二個 alarm，
+分三族，每一族偵測的東西另外兩族看不到。**`<fn>-errors`**（`07_lambdas.py` 部署的每一個
+函式，而且是從它推導出來的，所以新增一個 Lambda 不可能沒人看）是主偵測器：那 19 次丟棄
+全部落在當天也有 function error 的日子，而 resume 的比例正好是 3——一次嘗試加上兩次預設
+重試——所以這一族永遠先響。**`<fn>-silent`** 蓋的是三個「沉默本身就是故障」的排程函式；
+那裡的 `TreatMissingData` 必須是 `breaching`，因為沒被 invoke 的 Lambda 送出的是**沒有
+資料點**而不是 0，用平常的 `notBreaching` 這個 alarm 會永遠停在 INSUFFICIENT_DATA，剛好
+偵測不到它存在的唯一理由。`llmops-start-pipeline` 刻意沒有：它的 nightly 排程出廠是關閉
+的，而一個永遠紅著的 alarm 只會教會維運的人忽略整組。**`<fn>-async-dropped`** 留下來不是
+因為它更早，而是因為它的**意義不同**——重試成功的 error 是自己好了，被丟棄則是工作沒了。
+狀態機上沒有 `ExecutionsFailed` alarm：一個誠實地沒過品質門檻的 run，是這條 pipeline 正常
+運作，不是事故。
+
 這對機制唯一蓋不住的，是 session 自己的時鐘。AgentCore 會在 `maxLifetime` =
 **28800 秒（8 小時）**收回 runtime session —— 這是硬上限，活動不會重置它，也沒有設定
 能調高。蒸餾 stage 在單一確定性 session 裡跑 8–12 小時，於是活得比 session 久；跨過

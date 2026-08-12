@@ -10,6 +10,7 @@ Run: .venv/bin/python -m pytest tests/test_orchestration.py -q
 """
 from __future__ import annotations
 
+import ast
 import datetime
 import fnmatch
 import hashlib
@@ -9798,3 +9799,163 @@ def test_the_prompts_hyperparameter_contract_matches_the_scripts_argparse():
         f"the launch bullet names {sorted(missing)} but the canonical script's "
         "argparse does not define them -- the launch will pass hyperparameters the "
         "trainer silently drops or crashes on")
+
+
+# ── the alarms: who notices, and how long the silence may last ──────────────────────
+# Measured before any of this was written: between 2026-07-29 and 2026-08-12 Lambda
+# DROPPED 19 async invocations (llmops-harness-driver 11, llmops-resume-pipeline 8) and
+# there was not one CloudWatch alarm on any function in this system. Every failure was
+# found by a human reading logs -- the 2026-08-08 drop nine hours later, the 2026-08-11
+# PutEvents AccessDenied a day later. These guards pin the three things the alarm deploy
+# must not get wrong: coverage, the silence rule, and where the message goes.
+
+def _obs_mod():
+    return _load("deploy_observability", "deploy/06_observability.py")
+
+
+def _alarm_plans(topic="arn:aws:sns:us-east-1:TESTACCTID00:llmops-escalations"):
+    """The exact kwargs the deploy would hand CloudWatch (dry=False, fake client)."""
+    class _CW:
+        def __init__(self):
+            self.puts = []
+
+        def put_metric_alarm(self, **kw):
+            self.puts.append(kw)
+
+    cw = _CW()
+    _obs_mod().alarms(cw, topic, dry=False)
+    return cw.puts
+
+
+def _default_enabled_schedules():
+    """The schedules 08_triggers.py creates ENABLED when run with no flags.
+
+    Derived from the call sites, not copied from them: a schedule passed
+    `not args.no_*` (a store_true defaulting False) ships enabled, while one passed
+    `args.enable_schedule` ships DISABLED and has to be opted into. Flipping either
+    default in the deploy script therefore reds this file instead of silently
+    changing what the alarms mean.
+    """
+    tree = ast.parse(_deploy_src_orch("08_triggers.py"))
+    consts = {n.targets[0].id: n.value.value for n in ast.walk(tree)
+              if isinstance(n, ast.Assign) and isinstance(n.value, ast.Constant)
+              and isinstance(n.targets[0], ast.Name)
+              and n.targets[0].id.endswith("SCHEDULE_NAME")}
+    named = {}
+    for fn in [n for n in ast.walk(tree)
+               if isinstance(n, ast.FunctionDef) and n.name.startswith("ensure_")
+               and "schedule" in n.name]:
+        used = [consts[x.id] for x in ast.walk(fn)
+                if isinstance(x, ast.Name) and x.id in consts]
+        if used:
+            named[fn.name] = used[0]
+    assert len(named) == 4, f"expected 4 schedule creators in 08_triggers.py, got {named}"
+    enabled = set()
+    for call in [n for n in ast.walk(tree) if isinstance(n, ast.Call)]:
+        fname = getattr(call.func, "id", "")
+        if fname in named and len(call.args) >= 4:
+            if ast.unparse(call.args[3]).startswith("not args."):
+                enabled.add(named[fname])
+    return enabled
+
+
+def test_every_lambda_the_deploy_creates_has_an_errors_alarm():
+    """Coverage is DERIVED from 07_lambdas.py, not listed beside it.
+
+    A hand-kept alarm list is how the eighth Lambda becomes the one nobody watches:
+    the function ships, the list is not touched, and nothing anywhere says a name is
+    missing. The regex here reads the same file by a different route than the
+    deployer's ast walk, so a parser that quietly returns a short list fails too.
+    """
+    fns = set(re.findall(r'"fn":\s*"([^"]+)"', _deploy_src_orch("07_lambdas.py")))
+    assert len(fns) >= 7, f"only found {fns} in 07_lambdas.py -- the regex broke"
+    alarmed = {p["Dimensions"][0]["Value"] for p in _alarm_plans()
+               if p["MetricName"] == "Errors"}
+    assert alarmed == fns, (
+        f"Lambdas with no errors alarm: {sorted(fns - alarmed)}; alarms for functions "
+        f"the deploy does not create: {sorted(alarmed - fns)}")
+
+
+def test_the_silence_alarms_are_exactly_the_schedules_that_ship_enabled():
+    """An alarm that is always ALARM trains the operator to ignore all of them.
+
+    `llmops-nightly` ships DISABLED on purpose (--enable-schedule opts in), so
+    llmops-start-pipeline is invoked zero times a day BY DESIGN. A silence alarm on it
+    would go to ALARM at deploy and stay there, and the first thing anyone learns from
+    a permanently red alarm is not to look at this account's alarms at all.
+    """
+    obs = _obs_mod()
+    assert set(obs.SILENCE_ALARMS) == _default_enabled_schedules(), (
+        f"silence alarms {sorted(obs.SILENCE_ALARMS)} vs schedules that actually ship "
+        f"enabled {sorted(_default_enabled_schedules())}")
+    silent = {p["Dimensions"][0]["Value"] for p in _alarm_plans()
+              if p["AlarmName"].endswith("-silent")}
+    assert "llmops-start-pipeline" not in silent, (
+        "a silence alarm on the nightly's target would sit in ALARM forever")
+    assert silent == {s["fn"] for s in obs.SILENCE_ALARMS.values()}
+
+
+def test_a_silence_alarm_treats_missing_data_as_breaching():
+    """The one setting this family cannot get wrong.
+
+    A Lambda nobody invoked publishes NO `Invocations` datapoint -- not a zero. With
+    the ordinary `notBreaching`, "no data" reads as "fine", the alarm never leaves
+    INSUFFICIENT_DATA, and the exact condition it exists to detect (the schedule
+    stopped firing) is the condition it cannot see. `breaching` is what makes absence
+    the signal.
+    """
+    for p in _alarm_plans():
+        want = "breaching" if p["AlarmName"].endswith("-silent") else "notBreaching"
+        assert p["TreatMissingData"] == want, (
+            f"{p['AlarmName']} treats missing data as {p['TreatMissingData']!r}, "
+            f"expected {want!r}")
+        if p["AlarmName"].endswith("-silent"):
+            assert p["ComparisonOperator"] == "LessThanThreshold", (
+                f"{p['AlarmName']} alarms on {p['ComparisonOperator']} -- a silence "
+                "alarm fires when invocations fall BELOW one")
+
+
+def test_every_alarm_notifies_the_escalation_topic_and_nothing_on_recovery():
+    """An alarm with no action is a dashboard nobody opens.
+
+    Same SNS topic as the pipeline's own ESCALATED_TO_HUMAN path, resolved from the
+    parameter 03_storage.py writes -- one place an operator watches. AlarmActions only:
+    OKActions on a five-minute error alarm turns one flapping invocation into two
+    messages, and the recovery of a stage that already lost its work is not news.
+    """
+    obs = _obs_mod()
+    storage = _deploy_src_orch("03_storage.py")
+    prefix = re.search(r'Name=f"([^"{]*)\{k\}"', storage)
+    assert prefix, "03_storage.py no longer writes its params under an f-string prefix"
+    assert '"escalations_topic_arn"' in storage, (
+        "03_storage.py does not publish an escalations_topic_arn parameter")
+    assert obs.TOPIC_PARAM == prefix.group(1) + "escalations_topic_arn", (
+        f"{obs.TOPIC_PARAM} is not the parameter 03_storage.py publishes "
+        f"({prefix.group(1)}escalations_topic_arn) -- the alarms would notify nothing")
+    topic = "arn:aws:sns:us-east-1:TESTACCTID00:llmops-escalations"
+    plans = _alarm_plans(topic)
+    assert plans, "the alarm deploy planned nothing at all"
+    for p in plans:
+        assert p["AlarmActions"] == [topic], f"{p['AlarmName']} notifies {p['AlarmActions']}"
+        assert p["ActionsEnabled"] is True, f"{p['AlarmName']} has actions disabled"
+        assert "OKActions" not in p, f"{p['AlarmName']} pages on recovery too"
+        assert p["AlarmDescription"].strip(), f"{p['AlarmName']} has no description"
+
+
+def test_the_async_dropped_alarms_name_functions_that_exist():
+    """AsyncEventsDropped only exists for a function something invokes ASYNCHRONOUSLY.
+
+    Both of these are async-delivered (the driver's own turn handoff and the
+    resurrector's re-invoke; EventBridge's job-state delivery to resume), and both are
+    where all 19 observed drops landed. A rename that leaves this list behind gives an
+    alarm on a dimension that never reports -- INSUFFICIENT_DATA forever, which looks
+    exactly like healthy.
+    """
+    obs = _obs_mod()
+    fns = set(re.findall(r'"fn":\s*"([^"]+)"', _deploy_src_orch("07_lambdas.py")))
+    assert set(obs.ASYNC_DELIVERED) <= fns, (
+        f"{sorted(set(obs.ASYNC_DELIVERED) - fns)} is not a function 07_lambdas.py "
+        "deploys")
+    dropped = {p["Dimensions"][0]["Value"] for p in _alarm_plans()
+               if p["MetricName"] == "AsyncEventsDropped"}
+    assert dropped == set(obs.ASYNC_DELIVERED)
