@@ -286,3 +286,22 @@ versions and introspects the live CreateHarness/UpdateHarness schemas.
   Never hand-edit the SVGs.
 - `PROJECT_STATE.md` records deployed resource names/versions (redacted); update it
   whenever you create or delete AWS resources.
+- **Do not stack PRs unless `delete_branch_on_merge` is on.** GitHub retargets an open
+  child PR's base to the parent's base only when the parent's head branch is *deleted*
+  after merge — the merge alone does nothing. With branches kept, merging a stack
+  bottom-up puts every child's merge commit on a branch that was itself merged a second
+  earlier: every PR reads MERGED and nothing after the first reaches `main`. That happened
+  here twice — 2026-08-11 (#76/#77/#78/#83, unnoticed for a day) and 2026-08-12 (12 PRs
+  merged, 1 landed, 28 files missing) — and neither the test suite nor CI could see it,
+  because both run on a branch while the defect is a property of the graph *after* the
+  merge. Prefer basing every PR on `main`. Check the setting with
+  `gh api repos/O/R --jq .delete_branch_on_merge`, and note it is necessary but not
+  sufficient: a ruleset that restricts branch deletion suppresses the deletion, and with
+  it the retarget.
+- `tools/audit_landed.py` is the detector for exactly that: for every PR labelled MERGED
+  it asks whether the merge commit — or, for a stack rescued by merging the tip, the head
+  commit — is reachable from the default branch, and exits non-zero if either the answer
+  is no or *no answer could be obtained*. `.github/workflows/landed-check.yml` runs it on
+  every push to `main`, on every PR close, and daily, with `fetch-depth: 0` because a
+  depth-1 checkout cannot answer an ancestry question. A merge-commit-only miss is
+  reported as **residue**: nothing is lost, but a stack collapsed and was rescued.
