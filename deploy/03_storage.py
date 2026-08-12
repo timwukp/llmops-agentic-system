@@ -7,6 +7,10 @@ Creates (all tagged project=llmops-agentic-system):
       lifecycle: objects under runs/ expire after 90 days,
       CORS: PUT/GET/HEAD from the console's HTTP API origin only (browser-direct
         dataset upload via presigned PUT; skipped, never wildcarded, if unresolved)
+      code/eval/: the canonical pairwise judge prompt (pipeline/eval/), read-back verified.
+        The eval prompt is told to read it and to ESCALATE rather than compose its own, so
+        this upload is what makes a scoring stage possible at all -- and the digest it
+        returns is what report.json records as judge_prompt_sha256.
       skills/: the SKILL.md trees the harness configs mount, mirrored with --skills-src
         so harnesses can move off `git` sources; each SKILL.md is validated for YAML
         frontmatter BEFORE upload (a bad source fails at SESSION START, not at
@@ -32,6 +36,7 @@ Usage:
   python deploy/03_storage.py --region us-east-1 --account-id 123456789012 --dry-run  # offline
 """
 import argparse
+import hashlib
 import json
 import pathlib
 import sys
@@ -238,6 +243,58 @@ def ensure_code(s3, bucket, dry):
             raise SystemExit(f"read-back mismatch for s3://{bucket}/{key}")
         verified.append(p.name)
     return {"uploaded_and_verified": verified, "to": f"s3://{bucket}/code/distill/"}
+
+
+#: The one prefix the eval instrument is mirrored to. Under code/ because the harness role
+#: already has GetObject on code/* and no PutObject anywhere in it -- readable by the agent
+#: that consumes it, not writable by the agent it measures.
+EVAL_PREFIX = "code/eval/"
+
+
+def ensure_eval_instrument(s3, bucket, dry):
+    """Upload pipeline/eval/ to s3://<bucket>/code/eval/ and VERIFY it byte-for-byte.
+
+    Same argument as ensure_code one function up, applied to the measuring instrument instead
+    of the trainer. The eval prompt said "fixed judge prompts" and fixed none, so the pairwise
+    judge prompt was re-authored every run and two runs' judge_score numbers were not strictly
+    comparable. r5 reported `judge_ties: 0` -- read at the time as "no ties in 40 items", it
+    was an artifact of an A-or-B-only prompt that run wrote; the canonical text ties on 38% of
+    in-distribution items on the same task.
+
+    Under `code/` on purpose, not a new prefix: the harness role's S3CanonicalCodeReadOnly
+    already grants GetObject on `code/*` and nothing grants it PutObject there, which is
+    exactly the property a canonical artifact needs (readable, not writable by the thing that
+    consumes it). A new `eval/` prefix would have needed a new grant to say the same thing.
+
+    The digest is returned so the deploy log records WHICH instrument is live: report.json
+    carries judge_prompt_sha256, and comparing two runs is then a digest comparison rather
+    than an argument.
+    """
+    src_dir = pathlib.Path(__file__).resolve().parent.parent / "pipeline" / "eval"
+    files = sorted(p for p in src_dir.glob("*") if p.is_file())
+    if not files:
+        raise SystemExit("pipeline/eval/ is empty -- the eval prompt names this mirror and is "
+                         "told to escalate rather than author its own judge prompt, so an "
+                         "empty upload would stall every scoring stage")
+    # One prefix, spelled once. The dry-run branch and the upload branch each had their own
+    # f-string first, and a mutation test proved they could disagree while every guard stayed
+    # green: the guard derives the prompt's URI from the DRY report, so `--dry-run` could
+    # promise code/eval/ while the real upload wrote somewhere else -- the "no deploy path"
+    # failure with a deploy path that lies. EVAL_PREFIX is the reason that mutant now dies.
+    prefix = EVAL_PREFIX
+    if dry:
+        return {"would": f"upload {len(files)} eval instrument files",
+                "to": f"s3://{bucket}/{prefix}"}
+    verified = {}
+    for p in files:
+        key = f"{prefix}{p.name}"
+        body = p.read_bytes()
+        s3.upload_file(str(p), bucket, key)
+        got = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+        if got != body:
+            raise SystemExit(f"read-back mismatch for s3://{bucket}/{key}")
+        verified[p.name] = hashlib.sha256(body).hexdigest()
+    return {"uploaded_and_verified": verified, "to": f"s3://{bucket}/{prefix}"}
 
 
 def mounted_skills(repo):
@@ -700,6 +757,7 @@ def main():
     # no other visible symptom until a source is switched and every session fails at start.
     results["skills"] = ensure_skills(s3, bucket, args.dry_run, args.skills_src)
     results["code"] = ensure_code(s3, bucket, args.dry_run)
+    results["eval_instrument"] = ensure_eval_instrument(s3, bucket, args.dry_run)
     results[RUNS_TABLE] = {
         "status": ensure_table(ddb, RUNS_TABLE, {
             "AttributeDefinitions": [

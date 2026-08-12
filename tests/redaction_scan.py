@@ -107,7 +107,7 @@ ALLOWED = (b"6833" + b"13688378", b"7631" + b"04351884", b"1234" + b"56789012")
 #: this laptop, single-threaded CPython does 3.1M sha256/s, so the whole 1e12 space falls in
 #: about 4 days -- and a GPU does it in roughly 100 seconds. So the KDF is iterated. At 200k
 #: iterations a candidate costs ~16 ms, which makes the same sweep ~500 GPU-years, while the
-#: scan stays cheap because only 12-digit runs are ever hashed: measured across all 169
+#: scan stays cheap because only 12-digit runs are ever hashed: measured across all 170
 #: tracked files there are 63 such runs, 9 distinct, and hashing the distinct set takes 0.16 s
 #: for the entire repo. (Re-measured whenever either number moves, and they move
 #: INDEPENDENTLY, which is why both are derived and neither is inferred from the other, and
@@ -123,11 +123,14 @@ ALLOWED = (b"6833" + b"13688378", b"7631" + b"04351884", b"1234" + b"56789012")
 #: working tree's.
 #: The canonical-trainer fix then moved the files again, 166 -> 168 (the distill trainer and
 #: its requirements.txt -- run ids with a T in the middle are not 12-digit runs) while
-#: the run count held at 63 again. Then the r6c scaling diagnosis repeated BOTH halves of that
-#: shape -- the drift and the CI-only detection: 168 files became 169 (an evidence doc of
-#: percentages, token counts and dollar amounts, no 12-digit run) while the run count held at
-#: 63 for the third time, and again `git ls-files` on this workstation said 168 because the doc
-#: was not yet in the index. Earlier: the task_tokens
+#: the run count held at 63 again, then the r6c scaling diagnosis moved 168 -> 169 (an evidence
+#: doc of percentages, token counts and dollar amounts) and pinning the canonical judge prompt
+#: moved 169 files became 170 (a markdown instrument whose only numbers are counts and
+#: intervals). Four commits running, the file count moved and the run count did not move once --
+#: which is the whole reason these are two derived numbers and not one. The CI-only detection
+#: also repeated twice: `git ls-files` reads the INDEX, so on this push-via-API workstation a
+#: new file is invisible to the census until it is staged, and the guard agrees with the stale
+#: comment right up until CI disagrees with both. Earlier: the task_tokens
 #: contract moved 162 -> 163 while the run count held at 52, and the env_keys derivation then
 #: held the file count at 163 while adding 2 runs -- two `env_values`
 #: tests passing the placeholder account id. What never moves is the DISTINCT count: every run

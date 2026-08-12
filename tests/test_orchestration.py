@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import datetime
 import fnmatch
+import hashlib
 import importlib.util
 import inspect
 import io
@@ -9026,6 +9027,225 @@ def test_the_scaling_diagnosis_numbers_reconcile_with_each_other():
     assert f"${tin * 15 / 1e6 + tout * 75 / 1e6:.2f} of judge" in doc, (
         "the stated cost is not the token counts at Opus 5 list price ($15/$75 per Mtok) "
         "-- a cost claim nobody can rederive is the estimate all over again")
+
+
+# ── the measuring instrument itself is pinned, and n stops shrinking silently ─────────
+# Two defects the 8B diagnosis surfaced, both about the ruler rather than the student.
+# (1) The pairwise judge prompt had no home: the eval prompt said "fixed judge prompts"
+# and fixed none, and the mirrored llm-evaluation skill implements only a 1-5 absolute
+# score, so the instrument was re-authored every run. r5's `judge_ties: 0` was read as a
+# fact about the student and was a fact about that run's A-or-B-only prompt. (2) A judge
+# call that is content-filtered, unparseable or truncated produced no verdict, and
+# nothing said what happens to the item -- so `n` shrank and the report still looked
+# complete. Both are now prompt-shape guards, because the prompt is where the
+# methodology lives.
+
+def _eval_instrument_mirror():
+    """The S3 URI the deploy actually uploads the instrument to, derived from the deploy.
+
+    Read out of `ensure_eval_instrument`'s own dry-run rather than restated, so a prompt
+    naming a key nothing mirrors fails here. That failure mode is not hypothetical in this
+    repo: the finetune agent authored its own trainer on every run because the canonical
+    script it was told to download was unreachable, and the prompt and the deploy each
+    looked correct in isolation.
+    """
+    storage = _load("llmops_03_storage_for_eval", "deploy/03_storage.py")
+    got = storage.ensure_eval_instrument(None, "<bucket>", dry=True)
+    files = sorted(p.name for p in (REPO / "pipeline/eval").glob("*") if p.is_file())
+    assert files, "pipeline/eval/ is empty, so there is no instrument to pin"
+    assert len(files) == 1, (
+        f"pipeline/eval/ holds {files}; this guard pins ONE canonical instrument and the "
+        "eval prompt names it by name -- decide which is canonical or teach both sides")
+
+    # The DRY report is not evidence about the upload. Both branches had their own
+    # f-string at first and a mutation proved they could disagree with every guard green:
+    # --dry-run promising code/eval/ while the real PutObject wrote elsewhere is a deploy
+    # path that lies, which is worse than none. So run the real branch against a fake
+    # client and assert the key it actually writes is the one the dry report named.
+    class _FakeS3:
+        def __init__(self):
+            self.written = {}
+
+        def upload_file(self, local, bucket, key):
+            self.written[key] = pathlib.Path(local).read_bytes()
+
+        def get_object(self, Bucket, Key):  # noqa: N803 - boto3's own spelling
+            return {"Body": io.BytesIO(self.written[Key])}
+
+    fake = _FakeS3()
+    real = storage.ensure_eval_instrument(fake, "<bucket>", dry=False)
+    assert sorted(fake.written) == [f"code/eval/{n}" for n in files], (
+        f"the upload branch wrote {sorted(fake.written)}, the dry branch promised "
+        f"{got['to']} -- the two spellings have diverged")
+    for key in fake.written:
+        assert got["to"] + key.rsplit("/", 1)[1] == f"s3://<bucket>/{key}", (
+            f"dry-run reports {got['to']}, the upload writes {key}")
+    # Every field a human reads out of either branch, not just the one this helper returns.
+    # `to` and the file count are what the deploy log shows and what a reviewer checks the
+    # mirror against; both survived a mutation while the upload itself stayed correct, which
+    # is a deploy that did the right thing and reported a different one.
+    assert real["to"] == got["to"], (
+        f"the upload branch reports {real['to']}, the dry branch {got['to']} -- the deploy "
+        "log would name a prefix the deploy did not write")
+    assert got["would"] == f"upload {len(files)} eval instrument files", (
+        f"--dry-run says {got['would']!r} for {len(files)} file(s) in pipeline/eval/")
+    # The digests, recomputed -- not just present. `verified[name] = ""` survived the first
+    # version of this assertion, which checked the KEYS only: a deploy log full of empty
+    # digests would then have read as "instrument pinned, digest recorded".
+    assert set(real["uploaded_and_verified"]) == set(files), \
+        "the deploy no longer reports a digest per instrument file"
+    for name, digest in real["uploaded_and_verified"].items():
+        want = hashlib.sha256((REPO / "pipeline/eval" / name).read_bytes()).hexdigest()
+        assert digest == want, (
+            f"the deploy reports {digest!r} for {name}, its bytes hash to {want} -- "
+            "report.json's judge_prompt_sha256 comes from here, so a wrong or empty digest "
+            "makes 'the same ruler' unfalsifiable")
+    return got["to"] + files[0]
+
+
+def test_the_score_bullet_reads_the_canonical_judge_prompt_instead_of_writing_one():
+    b = _eval_prompt_bullet("score")
+    uri = _eval_instrument_mirror()
+    assert uri in b, (
+        f"the score bullet no longer names {uri} -- the pairwise instrument is then "
+        "re-authored every run and two runs' judge_score are not comparable (r5 reported "
+        "judge_ties: 0 from a prompt that offered no tie)")
+    assert "judge_prompt_sha256" in b, (
+        "the report must carry the instrument's digest; without it 'same ruler' is a claim "
+        "about the past rather than a check a reader can run")
+    assert "do NOT fall back to authoring your own judge prompt" in b, (
+        "an unreadable instrument must stop the stage. Falling back is worse than failing: "
+        "the run continues and emits a number that looks like the last one")
+
+
+def test_the_score_bullet_will_not_let_an_unjudgeable_item_vanish():
+    b = _eval_prompt_bullet("score")
+    for field in ("judge_unscorable", "judge_unscorable_ids"):
+        assert field in b, f"the score bullet no longer requires {field}"
+    assert "counts SCORED items only" in b, (
+        "judge_n must exclude unscorable items explicitly -- the harm here is a silently "
+        "shrinking denominator, and a report that does not say so cannot be audited")
+    assert "never counted as a tie, a win or a loss" in b, (
+        "an unscorable item folded into any verdict is a made-up measurement")
+    assert "stop reason" in b and "maxTokens" in b, (
+        "a reasoning judge bills reasoning as output tokens: at 400 it returns an EMPTY "
+        "text block with stopReason max_tokens, which is not a tie. The prompt must make "
+        "that visible rather than leave it to be inferred")
+
+
+def test_the_gate_bullet_asks_whether_the_unscored_items_could_change_its_answer():
+    b = _eval_prompt_bullet("gate")
+    for imputation in ("as a win", "as a loss", "as a tie"):
+        assert imputation in b, (
+            f"the gate bullet no longer imputes unscorable items {imputation} -- a fixed "
+            "tolerance cannot answer whether the missing items matter, and the missingness "
+            "is not random (the filter clusters on credential and access content)")
+    assert "identical under all three" in b and "escalate_human" in b, (
+        "the rule must be decision-relevance: proceed when the verdict cannot move, "
+        "escalate when it can")
+
+
+def test_the_deploy_refuses_an_instrument_that_did_not_land_intact():
+    """A read-back that is never allowed to differ is not a verification.
+
+    `_eval_instrument_mirror`'s fake client echoes back exactly what it stored, so its
+    `got != body` branch is unreachable there -- defanging that check to `got is None`
+    survived a mutation with the whole eval suite green. This is the other half: a client
+    whose GetObject returns something else must stop the deploy, because the point of the
+    read-back is the case where S3 holds bytes the repo does not.
+    """
+    storage = _load("llmops_03_storage_readback", "deploy/03_storage.py")
+
+    class _LyingS3:
+        def upload_file(self, local, bucket, key):
+            pass
+
+        def get_object(self, Bucket, Key):  # noqa: N803 - boto3's own spelling
+            return {"Body": io.BytesIO(b"not what the repo holds")}
+
+    with pytest.raises(SystemExit) as e:
+        storage.ensure_eval_instrument(_LyingS3(), "<bucket>", dry=False)
+    assert "read-back mismatch" in str(e.value), (
+        f"the deploy exited with {e.value!r} instead of naming the mismatch -- the judge "
+        "prompt's digest is recorded from local bytes, so an upload that silently did not "
+        "land makes every run's judge_prompt_sha256 a claim about the wrong file")
+
+
+def test_the_deploy_refuses_to_mirror_an_empty_instrument_directory(tmp_path):
+    """An empty mirror is the failure this whole file exists to prevent, so it must be loud.
+
+    The eval prompt is told to escalate rather than author its own judge prompt, so a
+    successful deploy that uploaded nothing would stall every scoring stage with a message
+    about S3 rather than about the deploy. Exercised by loading the deploy module beside an
+    empty pipeline/eval/, since the source directory is derived from the module's own path.
+    """
+    d = tmp_path / "deploy"
+    d.mkdir()
+    (tmp_path / "pipeline" / "eval").mkdir(parents=True)
+    copy = d / "03_storage.py"
+    copy.write_bytes((REPO / "deploy/03_storage.py").read_bytes())
+    storage = _load("llmops_03_storage_empty_eval", str(copy))
+
+    for dry in (True, False):
+        with pytest.raises(SystemExit) as e:
+            storage.ensure_eval_instrument(None, "<bucket>", dry=dry)
+        assert "pipeline/eval/ is empty" in str(e.value), (
+            f"dry={dry} exited with {e.value!r}; the refusal must name the empty directory")
+
+
+def test_the_canonical_judge_instrument_is_internally_consistent():
+    """The instrument file's own numbers, recomputed. Same rule as the diagnosis doc it
+    was extracted from: a worked example nobody derives is prose, and this one exists to
+    let a reader calibrate a rule that deliberately did NOT fire on the run that motivated
+    it -- so the rows must genuinely all reach the same verdict."""
+    doc = (REPO / "pipeline/eval/judge_prompt_pairwise.md").read_text()
+
+    # The four substitutions, and only those four: anything else varying between runs is
+    # the drift this file exists to stop.
+    assert re.search(r"there are exactly four", doc)
+    placeholders = set(re.findall(r"\{(\w+)\}", doc))
+    assert placeholders == {"task_description", "prompt", "a", "b"}, (
+        f"the instrument's substitution set is {sorted(placeholders)}; the prompt body and "
+        "the rule above it must agree on exactly which four vary")
+    assert '"winner": "A" | "B" | "tie"' in doc, (
+        "the verdict set is the whole finding: an A-or-B-only instrument produced r5's "
+        "judge_ties: 0 and a 38-point shift in the reported tie rate")
+
+    rows = re.findall(r"^\| (ID|OOD) \| ([a-z= ]+) \| (\d+) \| (\d+) \| (\d+) \| (\d+) \| "
+                      r"([0-9.]+) \| \[([0-9.]+), ([0-9.]+)\] \| (\w+) \|", doc, re.M)
+    assert len(rows) == 8, (
+        f"the worked example parses as {len(rows)} rows, not 8 (2 layers x as-scored plus "
+        "three imputations); nothing below is checked otherwise")
+    verdicts = {}
+    for layer, imputation, n, w, t, l, score, lo, hi, verdict in rows:
+        n, w, t, l = int(n), int(w), int(t), int(l)
+        assert w + t + l == n, f"{layer}/{imputation}: {w}+{t}+{l} outcomes under n={n}"
+        successes = w + 0.5 * t
+        assert f"{successes / n:.4f}" == score, (
+            f"{layer}/{imputation}: {score} is not (wins + 0.5*ties)/n = {successes / n:.4f}")
+        z, p = 1.96, successes / n
+        d = 1 + z * z / n
+        centre = (p + z * z / (2 * n)) / d
+        half = (z / d) * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n))
+        assert f"{centre - half:.3f}" == lo and f"{centre + half:.3f}" == hi, (
+            f"{layer}/{imputation}: [{lo}, {hi}] is not Wilson 95% at ({successes}, {n}) = "
+            f"[{centre - half:.3f}, {centre + half:.3f}]")
+        # The verdict column must be what the gate's own rule returns at the 0.45 bar,
+        # not a label. This is the assertion that makes the table an example of the RULE
+        # rather than a table that happens to sit under it.
+        expect = "PASS" if centre - half >= 0.45 else \
+                 ("FAIL" if centre + half < 0.45 else "BORDERLINE")
+        assert verdict == expect, (
+            f"{layer}/{imputation}: the row says {verdict}, the Wilson rule at bar 0.45 "
+            f"says {expect}")
+        verdicts.setdefault(layer, set()).add(verdict)
+    for layer, seen in verdicts.items():
+        assert len(seen) == 1, (
+            f"{layer}: the imputations disagree ({sorted(seen)}), so this run WOULD have "
+            "escalated and the doc's claim that the rule stayed quiet is false")
+    assert "would NOT have fired" in doc, (
+        "the calibration point is that the rule was silent here; if the numbers ever say "
+        "otherwise, the prose has to change with them")
 
 
 # ── the non-run heartbeat and its resurrection (#37) ─────────────────────────────────

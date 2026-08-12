@@ -199,7 +199,7 @@
         "Resource": "*"
       },
       {
-        "_comment": "The prefix list must match S3PipelineObjects: ListBucket is condition-scoped, so a prefix granted for Get/Put but absent here can be read object-by-object and never enumerated -- which is exactly the shape of 'the rate card history is there but the agent reports no card exists'. cost/* joined both lists after the first live reconcile completed its evidence-gathering and then could not write cost/actuals-<period>.json — the docs/COST.md contract names cost/ as the actuals+report prefix, but only finops/ was ever granted.",
+        "_comment": "The prefix list must match S3PipelineObjects: ListBucket is condition-scoped, so a prefix granted for Get/Put but absent here can be read object-by-object and never enumerated -- which is exactly the shape of 'the rate card history is there but the agent reports no card exists'. cost/* joined both lists after the first live reconcile completed its evidence-gathering and then could not write cost/actuals-<period>.json — the docs/COST.md contract names cost/ as the actuals+report prefix, but only finops/ was ever granted. code/* joined this list when the canonical judge prompt was pinned: it had been granted GetObject by S3CanonicalCodeReadOnly and never made listable, so an agent probing for the canonical trainer with `aws s3 ls` saw an empty prefix and concluded the artifact did not exist -- indistinguishable from the IAM-unreadable state that made the finetune agent author its own trainer every run.",
         "Sid": "S3PipelineList",
         "Effect": "Allow",
         "Action": [
@@ -218,7 +218,8 @@
               "cost/*",
               "models-mirror/*",
               "customer-data/*",
-              "skills/*"
+              "skills/*",
+              "code/*"
             ]
           }
         }
