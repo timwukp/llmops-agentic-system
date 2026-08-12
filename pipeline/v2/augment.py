@@ -28,7 +28,13 @@ format (train == inference format). This also transparently handles
 the two header variants present in the source file.
 
 Usage:
-    python3 augment.py [--limit N] [--workers K] [--n-variants 24]
+    python3 augment.py --source <triplets.jsonl> [--arc-dir DIR]
+                       [--limit N] [--workers K] [--n-variants 24]
+
+    --source (or $V2_SOURCE_JSONL) is required: the distill output holding the
+    sandbox-verified (task_id, prompt, code) rows. --arc-dir (or
+    $V2_ARC_TRAINING_DIR) is an optional speedup only -- without it the train
+    pairs are parsed back out of the prompt text.
 
 Output: pipeline/v2/out/augmented.jsonl
         pipeline/v2/out/augment_stats.json
@@ -50,9 +56,17 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from verify_sandbox import verify_code  # noqa: E402
 
-SOURCE_JSONL = ("/Users/tmwu/Downloads/kaggle-arc-agi-2/v2-design/prototype/"
-                "distill_output/training_pairs_perfect_849.jsonl")
-ARC_TRAINING_DIR = "/tmp/arc/data/training"
+# The source triplets and the raw ARC tasks are INPUTS, named per invocation. They were
+# once absolute paths under one laptop's home directory, which meant the module could only
+# ever run on that laptop -- and would have failed there too the moment the sibling
+# checkout moved. There is no default for the source: a wrong default silently augments
+# the wrong corpus, while a missing one stops with a message naming the flag.
+SOURCE_ENV = "V2_SOURCE_JSONL"
+ARC_DIR_ENV = "V2_ARC_TRAINING_DIR"
+# /tmp/arc is a scratch extraction of the public ARC-AGI training set and is only an
+# optimisation: load_train_pairs falls back to parsing the pairs out of the prompt text,
+# so an absent directory costs fidelity nowhere.
+DEFAULT_ARC_TRAINING_DIR = "/tmp/arc/data/training"
 OUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "out")
 
 BASE_NAME = "_transform_base"
@@ -76,9 +90,23 @@ GEOMS = {
 # Source loading
 # --------------------------------------------------------------------------
 
-def load_source_rows(limit: int | None = None) -> list[dict]:
+def resolve_source(cli_value: str | None) -> str:
+    """Where the sandbox-verified triplets live: --source, else $V2_SOURCE_JSONL."""
+    path = cli_value or os.environ.get(SOURCE_ENV)
+    if not path:
+        raise SystemExit(
+            f"no source triplets given: pass --source <triplets.jsonl> or set "
+            f"${SOURCE_ENV}. This is the distill output holding (task_id, prompt, "
+            f"code) rows; there is deliberately no default because augmenting the "
+            f"wrong corpus produces a plausible training set for the wrong task.")
+    if not os.path.exists(path):
+        raise SystemExit(f"source triplets not found: {path}")
+    return path
+
+
+def load_source_rows(source_jsonl: str, limit: int | None = None) -> list[dict]:
     rows = []
-    with open(SOURCE_JSONL) as f:
+    with open(source_jsonl) as f:
         for line in f:
             rows.append(json.loads(line))
     return rows[:limit] if limit else rows
@@ -97,9 +125,9 @@ def parse_pairs_from_prompt(prompt: str) -> list[dict]:
             for i in range(0, len(grids), 2)]
 
 
-def load_train_pairs(task_id: str, prompt: str) -> list[dict]:
-    """Prefer /tmp/arc data; fall back to prompt parsing."""
-    path = os.path.join(ARC_TRAINING_DIR, f"{task_id}.json")
+def load_train_pairs(task_id: str, prompt: str, arc_dir: str) -> list[dict]:
+    """Prefer the raw ARC task JSON; fall back to parsing the prompt."""
+    path = os.path.join(arc_dir, f"{task_id}.json")
     if os.path.exists(path):
         with open(path) as f:
             task = json.load(f)
@@ -266,11 +294,16 @@ def plan_variants(task_id: str, n_variants: int) -> list[dict]:
 # Per-task worker
 # --------------------------------------------------------------------------
 
-def process_task(args: tuple[dict, int]) -> dict:
-    """Generate + sandbox-verify all variants for one source triplet."""
-    row, n_variants = args
+def process_task(args: tuple[dict, int, str]) -> dict:
+    """Generate + sandbox-verify all variants for one source triplet.
+
+    arc_dir travels in the tuple rather than being read from a module global: the
+    worker pool uses `spawn` on Windows, which re-imports this module in a fresh
+    interpreter, so a global mutated by main() in the parent would silently revert
+    to its default in every worker."""
+    row, n_variants, arc_dir = args
     task_id, prompt, code = row["task_id"], row["prompt"], row["code"]
-    pairs = load_train_pairs(task_id, prompt)
+    pairs = load_train_pairs(task_id, prompt, arc_dir)
 
     emitted, rejected = [], []
 
@@ -321,15 +354,28 @@ def main() -> None:
                     help="only process first N source rows (smoke test)")
     ap.add_argument("--workers", type=int, default=max(1, os.cpu_count() - 2))
     ap.add_argument("--n-variants", type=int, default=24)
+    ap.add_argument("--source", default=None,
+                    help=f"sandbox-verified (task_id, prompt, code) triplets as "
+                         f"jsonl; required, or set ${SOURCE_ENV}")
+    ap.add_argument("--arc-dir", default=None,
+                    help=f"directory of raw ARC task JSON (optional speedup; the "
+                         f"pairs are otherwise parsed out of the prompt). Defaults "
+                         f"to ${ARC_DIR_ENV} then {DEFAULT_ARC_TRAINING_DIR}")
     args = ap.parse_args()
 
+    source = resolve_source(args.source)
+    arc_dir = (args.arc_dir or os.environ.get(ARC_DIR_ENV)
+               or DEFAULT_ARC_TRAINING_DIR)
+
     os.makedirs(OUT_DIR, exist_ok=True)
-    rows = load_source_rows(args.limit)
+    rows = load_source_rows(source, args.limit)
+    print(f"source: {source}\narc_dir: {arc_dir}"
+          f"{'' if os.path.isdir(arc_dir) else ' (absent -- parsing prompts)'}")
     print(f"source rows: {len(rows)}, workers: {args.workers}, "
           f"n_variants: {args.n_variants}")
 
     t0 = time.time()
-    tasks = [(r, args.n_variants) for r in rows]
+    tasks = [(r, args.n_variants, arc_dir) for r in rows]
     if args.workers > 1:
         ctx = mp.get_context("fork" if sys.platform != "win32" else "spawn")
         with ctx.Pool(args.workers) as pool:
