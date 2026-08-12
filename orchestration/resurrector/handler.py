@@ -222,5 +222,15 @@ def handler(event, context=None, clients=None):
         out.append({"run_id": subject, "action": "resurrected",
                     "age_min": round(age), "n": n + 1})
 
-    return {"checked_running": checked, "checked_liveness": liveness_checked,
-            "acted": out}
+    summary = {"checked_running": checked, "checked_liveness": liveness_checked,
+               "acted": out}
+    # The schedule invokes this Lambda ASYNCHRONOUSLY, so the value returned below goes
+    # nowhere -- nothing reads it. Until this line existed, a sweep that read both tables
+    # and found nothing to do left the same trace in CloudWatch as a sweep whose Query
+    # matched the wrong partition or never ran: START, END, REPORT, silence. That matters
+    # most for the non-run half, whose healthy state is "0 beats" on every day no triage
+    # is dead -- i.e. almost every day -- so `checked_liveness` in the log is the only
+    # standing evidence the partition is being read at all. One JSON line, ~96 a day, so
+    # Logs Insights can filter it and the ingestion cost stays under a cent a month.
+    print(f"[resurrector] {json.dumps(summary, default=str)}")
+    return summary

@@ -528,6 +528,13 @@ resurrection count), while a cap-exhausted item escalates against the run the tr
 jobs (sweep, finops) are deliberately **not** revivable: a crashed schedule waits for
 its next schedule rather than re-running non-idempotent work.
 
+Both halves end by **printing** what they checked, because the schedule's invoke is
+asynchronous and the counts the handler returns are read by nobody. That matters most
+for the non-run half, whose healthy state is *zero* beats on any day no triage is dead:
+without the line, a sweep working perfectly and a Query aimed at the wrong partition
+left identical traces — start, end, silence. The printed counts are the standing evidence
+that the partition is read at all.
+
 The last exposure that pair does *not* cover is the session's own clock. AgentCore
 reclaims a runtime session at `maxLifetime` = **28800 s (8 h)** — a hard cap that
 activity does not reset and no setting raises. A distillation stage runs 8–12 h in one
