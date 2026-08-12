@@ -4232,6 +4232,92 @@ case("eval: the per-layer denominator is reported and never reconciled, so losin
      [f"{_TO}test_the_score_bullet_keys_two_layers_apart_and_reconciles_each_denominator"])
 
 
+#: D9: the report-only layer's floor, on both sides. The OOD layer never blocks a deploy by
+#: design, so every one of these five weakenings costs a run NOTHING at the time -- which is
+#: the whole reason they need controls: the only thing that ever notices is the next person
+#: who cites an OOD number, and by then the artifacts all agree.
+_DP = "agents/data-prep/harness.json"
+_CN = "deploy/console/lambda_function.py"
+_TC = "tests/test_console_tasks.py::"
+_DECON = (f"{_TO}TestTheCustomersOwnDataIsActuallyRead::"
+          "test_every_acceptance_layer_is_decontaminated_and_its_count_recorded")
+
+
+def m229(t):
+    old = ("Do the SAME against params.ood_eval_uri when it is given, and report BOTH counts "
+           "under decontamination_dropped in stats.json, one key per URI")
+    assert t.count(old) == 1, f"the OOD decontamination clause has moved; found {t.count(old)}"
+    # Back to the gated layer only. The param still arrives at data-prep (_plan_params
+    # flattens all of plan.data) and no task reads it, which is exactly how it was.
+    return t.replace(old, "Report the number dropped in stats.json", 1)
+
+
+case("data-prep: only the GATED acceptance layer is decontaminated, so training rows may "
+     "duplicate the OOD set -- which fails nothing and reads HIGHER, the direction that "
+     "argues the student generalises",
+     _DP, m229, [_DECON])
+
+
+def m230(t):
+    old = "report BOTH counts under decontamination_dropped in stats.json, one key per URI"
+    assert t.count(old) == 1, f"the per-URI count clause has moved; found {t.count(old)}"
+    # Keeps the CHECK and loses the RECORD. A single aggregate count cannot distinguish a
+    # layer checked and found clean from a layer skipped -- both write one number.
+    return t.replace(old, "report the number dropped in stats.json", 1)
+
+
+case("data-prep: both layers are decontaminated and only one aggregate count is recorded, so "
+     "a skipped layer and a clean layer produce the same stats.json",
+     _DP, m230, [_DECON])
+
+
+def m231(t):
+    # The anchor is the JSON SOURCE, where the prompt's inner quotes are backslash-escaped:
+    # the runner mutates file text, not a parsed document, so `"ood"` here is `\"ood\"` there.
+    old = ('So if you cannot read '
+           'the file, cannot parse it, or run out of budget before scoring it, STILL write '
+           '\\"ood\\" carrying items_in_layer, judge_n and an ood_error string naming what '
+           'stopped you, and escalate_human.')
+    assert t.count(old) == 1, f"the OOD failure path has moved; found {t.count(old)}"
+    # Half a rule, in the m222 shape: the MANDATE survives and the way to obey it when
+    # scoring failed does not, so the honest outcome for an unreadable layer is silence.
+    return t.replace(old, "", 1)
+
+
+case("eval: the `ood` object is mandatory with no way to write one when scoring failed, so "
+     "an unreadable OOD layer is reported by omitting it",
+     _EV, m231,
+     [f"{_TO}test_the_score_bullet_may_not_omit_the_ood_object_it_was_asked_for"])
+
+
+def m232(t):
+    old = ('    elif eval_reported and (man.get("params") or {}).get("ood_eval_uri"):\n'
+           '        out["oodMissing"] = str((man["params"])["ood_eval_uri"])\n')
+    assert t.count(old) == 1, f"the oodMissing branch has moved; found {t.count(old)}"
+    # The pre-D9 console verbatim: draw the block on presence, say nothing on absence.
+    return t.replace(old, "", 1)
+
+
+case("console: the OOD block renders on presence alone, so a layer the signed plan asked "
+     "for and the report omits is the same page as a run that never had one",
+     _CN, m232,
+     [f"{_TC}test_an_ood_layer_the_plan_asked_for_and_the_report_omits_is_not_silence"])
+
+
+def m233(t):
+    old = 'elif eval_reported and (man.get("params") or {}).get("ood_eval_uri"):'
+    assert t.count(old) == 1, f"the oodMissing guard has moved; found {t.count(old)}"
+    # Drops the not-yet-measured half. Now every run mid-inference is accused of omitting
+    # its OOD layer, which is how an operator learns to ignore the alarm that is real.
+    return t.replace(old, 'elif (man.get("params") or {}).get("ood_eval_uri"):', 1)
+
+
+case("console: a run still generating answers is reported as having omitted its OOD layer, "
+     "so the true omission arrives inside a stream of false ones",
+     _CN, m233,
+     [f"{_TC}test_an_eval_stage_still_running_has_not_omitted_its_ood_layer"])
+
+
 #: Where the pristine text of the file currently mutated is parked, so a kill -9 -- which
 #: no handler can intercept -- still leaves the original recoverable. Under the repo root
 #: rather than /tmp because it must be obvious to whoever finds the tree dirty, and

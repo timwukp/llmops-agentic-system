@@ -4209,11 +4209,73 @@ class TestTheCustomersOwnDataIsActuallyRead:
             "data-prep's curate reading it only proves the acceptance set was excluded "
             "from training, not that anything was ever measured against it.")
         # And the fallback must be conditional on absence, same reason as generate's.
+        #
+        # Scoped to the sentences that actually mention the val split. Searching the whole
+        # bullet for /fall back/ made this half of the guard VACUOUS: the same bullet says
+        # "never fall back to the newest artifact you can find in the bucket" about
+        # eval_only's model_artifact_uri, which satisfied the regex no matter what the
+        # prompt said about the two evaluation sets. Measured: control m189 -- which strips
+        # the ranking out of the val-split sentence, the exact defect this line exists to
+        # catch -- was UNCAUGHT, while the documented control count reported it passing.
+        # A guard an unrelated sentence can satisfy is not a guard.
         body = "".join(bullets[t] for t in sorted(readers))
-        assert re.search(r"fall\s*back|only when no customer", body, re.I), (
+        val = [s for s in re.split(r"(?<=\.)\s+", body) if "val split" in s]
+        assert val, (
+            "the eval prompt no longer mentions the val split at all, so this guard cannot "
+            "tell whether it is still ranked below the customer's set")
+        assert any(re.search(r"fall\s*back|only when no customer", s, re.I) for s in val), (
             "the eval prompt names customer_eval_uri without stating that the val "
             "split is the FALLBACK; two eligible sets and no precedence means the "
-            "score's provenance is decided per-run by the model")
+            "score's provenance is decided per-run by the model. Sentences naming the "
+            "val split: " + " | ".join(s.strip()[:120] for s in val))
+
+    def test_every_acceptance_layer_is_decontaminated_and_its_count_recorded(self):
+        """Both acceptance layers, not just the gated one.
+
+        curate decontaminated against customer_eval_uri and named ood_eval_uri nowhere,
+        while `_plan_params` flattens all of `plan.data` -- so the param ARRIVED at
+        data-prep and no task read it. The gated layer is the one that looks like it
+        matters and it is the one that needs this LEAST: contamination there inflates a
+        number something checks, while contamination in the report-only layer fails
+        nothing at all and simply reads HIGHER, which is the evidence someone would cite
+        to say the student generalises. Both directions of "bigger student" and "synthesis
+        closes the OOD gap" were refuted 0-3 in our own research pass, so the OOD number
+        is the thing being measured, not a decoration.
+
+        Measured with curate's own rule (prompt trigram-Jaccard >= 0.6) on the live files:
+        0 of the 40 OOD rows overlap the 300-row source, max 0.1882, 23 OOD categories
+        against 12 source categories with an empty intersection. So the layer is clean
+        TODAY, by hand, and no artifact anywhere records that anyone checked -- which is
+        the other half of this guard: a 0 that was written is a different fact from a 0
+        nobody computed.
+
+        The layers are derived from CUSTOMER_DATA_PARAMS rather than listed, so a third
+        acceptance layer reds this instead of quietly skipping decontamination.
+        """
+        layers = sorted(p for p in CUSTOMER_DATA_PARAMS if p.endswith("_eval_uri"))
+        assert len(layers) >= 2, (
+            f"this guard derives the acceptance layers from CUSTOMER_DATA_PARAMS and found "
+            f"{layers}; with fewer than two it cannot tell 'decontaminates every layer' "
+            "from 'decontaminates the only layer there is'")
+        doc = json.loads((REPO / "agents/data-prep/harness.json").read_text())
+        text = "".join(b.get("text", "") for b in doc["systemPrompt"])
+        bullet = re.search(r'- \\?"curate\\?":(.*?)(?=\n- \\?"[a-z_]+\\?":|\nRules:)',
+                           text, re.S)
+        assert bullet, "could not isolate the curate bullet -- the parse is broken"
+        body = bullet.group(1)
+        unchecked = [p for p in layers if p not in body]
+        assert not unchecked, (
+            "curate does not decontaminate the training corpus against "
+            + ", ".join(f"params.{p}" for p in unchecked)
+            + ". The param is flattened into params for every stage and no data-prep task "
+            "reads it, so overlap between the training corpus and that acceptance layer is "
+            "neither prevented nor visible afterwards.")
+        assert "decontamination_dropped" in body and "one key per URI" in body, (
+            "curate reports no per-layer drop count in stats.json; a single aggregate (or "
+            "none) cannot distinguish a layer checked and found clean from a layer skipped")
+        assert "escalate_human" in body, (
+            "an unreadable acceptance URI must stop curate, not pass as a decontamination "
+            "that dropped 0 rows -- those two outcomes write the same number")
 
 
 #: A bedrock inference-profile id or a Hugging Face repo -- what a model
@@ -9791,6 +9853,33 @@ def test_the_score_bullet_keys_two_layers_apart_and_reconciles_each_denominator(
         "file it was scored on -- a silently shrunken n reads as a tighter interval")
     assert "escalate_human" in b, (
         "a denominator that does not reconcile must stop the stage, not annotate it")
+
+
+def test_the_score_bullet_may_not_omit_the_ood_object_it_was_asked_for():
+    """A report-only layer that can vanish withdraws the trade the gate was built on.
+
+    The dual-layer design deliberately lets the OOD layer never block a deploy, and the
+    only thing that makes that honest is that it is always measured and always reported.
+    Nothing enforced the second half: `params.ood_eval_uri` set with no `report.json.ood`
+    was byte-identical to a run that never asked for the layer -- the driver reads only
+    `gate_passed`, and the console drew the block on presence alone. So an unreadable file,
+    an exhausted budget, or a model that simply skipped it all landed as silence, and the
+    page that would have shown the omission is the same page that shows the gate PASS.
+
+    Absence must therefore be illegal rather than discouraged: the failure path writes the
+    object WITH its error, because an instruction to report the layer is satisfied by a
+    model that could not and said nothing.
+    """
+    b = _eval_prompt_bullet("score")
+    assert "ABSENCE is never a legal outcome" in b, (
+        "the score bullet asks for an `ood` object without making its omission illegal; a "
+        "conditional instruction is silence-shaped when the condition is hard to meet")
+    assert 'STILL write "ood"' in b and "ood_error" in b, (
+        "there is no failure path that reports the OOD layer -- an unreadable or unscored "
+        "layer has nothing to write, so it writes nothing and reads as never requested")
+    assert "ID layer ALONE" in b, (
+        "the bullet no longer says WHY the object is mandatory (the gate blocks on the ID "
+        "layer alone), which is the sentence that makes the rule survive an edit")
 
 
 def test_the_gate_bullet_decides_by_the_wilson_interval():

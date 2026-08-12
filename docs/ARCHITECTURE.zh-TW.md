@@ -1050,6 +1050,27 @@ prompt 指名它的 S3 key、要求 agent 執行它、並禁止在 FAIL 的 payl
 `UnboundLocalError: trainer` 上 —— 這是即興寫出來的 trainer 第二次讓一次 run 報廢 —— 而目前所有 job
 能活下來，只是因為它們都在一個「背後沒有任何存檔點」的 7200 秒 `MaxRuntime` 之內跑完了。
 
+**一個沒有任何 gate 的層，它的底線必須寫兩次，因為沒有別的東西會發現。** 雙層 gate 只用
+in-distribution 那一層擋 deploy；OOD 那一層被量、被報，永遠不 gate。這個交換只有在「那一層真的
+被量」的前提下才誠實，而它的兩端都沒有任何東西在執行。進來這一端：data-prep 的 `curate` 只針對
+`params.customer_eval_uri` 對訓練語料做去污染，整份 prompt 沒有出現過 `params.ood_eval_uri` ——
+而 `_plan_params()` 會把 `plan.data` 整層攤平，所以這個參數每一次 run 都送到了 data-prep，只是
+沒有任何 task 讀它。會 gate 的那一層才是最不需要這道保護的：那裡的重疊會把一個「有東西在檢查」的
+數字撐高，而 report-only 那一層的重疊完全不會讓任何東西失敗，它只會**讀起來更高** —— 而那正是
+任何人拿來主張「student 有泛化能力」時會引用的證據；「換更大的 student」與「synthesis 能補上 OOD
+落差」這兩條在本系統自己的研究回合裡都被判 0-3 refuted，所以 OOD 這個數字是實驗的**對象**，不是
+裝飾。用 `curate` 自己的規則（prompt trigram-Jaccard ≥ 0.6）對兩個真實檔案量測：40 列 OOD 中
+**0 列**與 300 列 source 重疊，最大值 0.1882，23 個 OOD 類別對 12 個 source 類別、交集為空。乾淨
+—— 靠手工，而且沒有任何地方記錄過 —— 這就是這個缺口的另一半：一個**被寫下來**的 0，和一個沒有人
+算過的 0，是兩件不同的事實。出去這一端：`params.ood_eval_uri` 有給、`report.json` 沒有 `ood`，
+在位元上和「這次 run 從來沒要求過這一層」完全相同 —— driver 只讀 `gate_passed`，而 console 只憑
+「存在」來決定要不要畫這個區塊，就寫在一段「為 gate 各列做出的正是這個區分」的註解下面六行。所以
+現在 `curate` 會對 `CUSTOMER_DATA_PARAMS` 指名的每一個驗收層做去污染，並且每個 URI 各記一個
+掉列數；`score` bullet 讓缺少 `ood` 物件變成非法，並且給失敗路徑一個可以寫的東西
+（`items_in_layer`、`judge_n`、`ood_error`）而不是沉默；而 run 檢視頁在「已簽署的 plan 指名了
+OOD 集、而一個已完成的 eval 沒有帶回來」時會顯示 **NOT REPORTED** —— 條件是 eval 真的已經回報過，
+因為對每一個只是還在跑推論的 run 都發一次警報，正是讓 operator 學會忽略那個真警報的方式。
+
 **一個 run 自己發現的事實，和它被簽署時的同意一樣會被傳遞下去。** `MODEL_PARAM_FOR_ROLE` 把人
 **簽署**的內容帶給必須服從它的 stage；`STAGE_FACT_PARAMS` 把 run 自己**產出**的內容帶給必須量測
 它的 stage。`params.student_endpoint` —— eval 與 monitor 都會讀 —— 就是命名這個模式的那個案例：
