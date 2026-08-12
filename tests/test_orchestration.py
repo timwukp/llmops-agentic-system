@@ -8943,6 +8943,91 @@ def test_the_power_analysis_numbers_are_recomputable():
         "the observed-zero upper bounds drifted"
 
 
+def test_the_scaling_diagnosis_numbers_reconcile_with_each_other():
+    """The r6c 8B diagnosis is the document that says "stop buying bigger students", so
+    every number in it is recomputed from another number in it rather than trusted.
+
+    Same rule as the power analysis above, one step stricter: the raw judgments live
+    outside the repo (137 items x 2 positions, judged offline against surviving S3
+    artifacts), so what CAN be checked here is internal consistency -- and that is exactly
+    what caught this analysis's real bugs. The first aggregate said 57 items in a 97-item
+    layer, and the tell was not a bad score, it was two counts that would not reconcile.
+    A doc whose parts agree only in prose has the same defect at rest.
+    """
+    doc = (REPO / "deploy/evidence/SCALING_DIAGNOSIS_r6c_8B.md").read_text()
+
+    # 1. The headline table: n must be the outcomes it is made of, judge_score must be the
+    #    tie-credited formula the gate uses, and the interval must be the Wilson interval
+    #    the reformed gate decides by -- read out of the table, not restated here.
+    rows = re.findall(r"^\| (?:in|out-of)-distribution \(`(\w+)`\) \| (\d+) \| (\d+) \| (\d+) \| "
+                      r"(\d+) \| \*\*([0-9.]+)\*\* \| \[([0-9.]+), ([0-9.]+)\]",
+                      doc, re.M)
+    assert len(rows) == 2, "the diagnosis' headline table no longer parses; nothing below is checked"
+    judged = {}
+    for layer, n, w, t, l, score, lo, hi in rows:
+        n, w, t, l = int(n), int(w), int(t), int(l)
+        assert w + t + l == n, f"{layer}: {w}+{t}+{l} outcomes reported under n={n}"
+        successes = w + 0.5 * t
+        assert f"{successes / n:.4f}" == score, (
+            f"{layer}: judge_score {score} is not (wins + 0.5*ties)/n = {successes / n:.4f} "
+            "-- the doc reports a quantity the gate does not compute")
+        z, p = 1.96, successes / n
+        d = 1 + z * z / n
+        centre = (p + z * z / (2 * n)) / d
+        half = (z / d) * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n))
+        assert f"{centre - half:.3f}" == lo and f"{centre + half:.3f}" == hi, (
+            f"{layer}: interval [{lo}, {hi}] is not Wilson 95% at ({successes}, {n}) = "
+            f"[{centre - half:.3f}, {centre + half:.3f}]")
+        judged[layer] = n
+        if layer == "id":
+            assert centre + half < 0.45, (
+                "the ID upper bound no longer clears the 0.45 bar, so the doc's decisive "
+                "FAIL is not what its own numbers say")
+
+    # 2. Judged + unscorable must equal the layer. This is the count that caught the
+    #    idx-collision bug, so it is the one a reader is owed: the acceptance set is
+    #    97 ID + 40 OOD = the 137 answers the run produced, and the four items no judge
+    #    could settle are named individually rather than subtracted silently.
+    unscorable = re.search(r"Unscorable and reported, not scored: (.+?) \(see", doc).group(1)
+    named = re.findall(r"`(id|ood)#\d+`", unscorable)
+    assert "137 student answers" in doc and "97-row ID" in doc
+    for layer, size in (("id", 97), ("ood", 40)):
+        assert judged[layer] + named.count(layer) == size, (
+            f"{layer}: {judged[layer]} judged + {named.count(layer)} unscorable != {size} "
+            "in the layer -- items are vanishing between the table and the set")
+    assert judged["id"] + judged["ood"] + len(named) == 97 + 40 == 137
+
+    # 3. The decontamination chain, arithmetic and all: this is the doc's actual argument,
+    #    and "41%" is the number the four options are ranked against.
+    chain = [int(x) for x in re.findall(r"^ ?-?(\d+) (?:input rows|exact|near|dropped|quality)",
+                                        doc, re.M)]
+    assert chain[:5] == [300, 39, 33, 94, 13], f"the chain no longer reads as stated: {chain}"
+    start, ex, near, decon, qual = chain[:5]
+    assert f"-> {start - ex - near}" in doc and f"-> {start - ex - near - decon}" in doc
+    assert f"{start - ex - near - decon - qual} output rows" in doc
+    train, val = (int(x) for x in re.search(r"\((\d+) train / (\d+) val\)", doc).groups())
+    assert train + val == start - ex - near - decon - qual, (
+        f"{train} train + {val} val != the {start - ex - near - decon - qual} rows curated")
+    assert f"{decon} of the {start - ex - near} surviving rows — " \
+           f"{round(decon / (start - ex - near) * 100)}%" in doc, \
+        "the share deleted for resembling the acceptance set drifted from its own operands"
+
+    # 4. The guardrail-refusal rate, and the cost. A judged item costs two calls, so the
+    #    slot count is derivable; the cost is derivable from the token counts and Opus 5
+    #    list price, which is what makes "I estimated $5 and spent $9.08" auditable rather
+    #    than an apology.
+    slots, pct = re.search(r"\*\*(\d+) of the (?:\d+) \(item, position\) slots — ([0-9.]+)%",
+                           doc).groups()
+    assert f"of the {137 * 2} (item, position) slots" in doc, \
+        "274 slots is 137 items judged in both positions; the doc no longer says so"
+    assert f"{int(slots) / (137 * 2) * 100:.1f}" == pct, "the content_filtered rate drifted"
+    tin, tout = (int(x.replace(",", "")) for x in
+                 re.search(r"\(([\d,]+) input \+ ([\d,]+) output tokens", doc).groups())
+    assert f"${tin * 15 / 1e6 + tout * 75 / 1e6:.2f} of judge" in doc, (
+        "the stated cost is not the token counts at Opus 5 list price ($15/$75 per Mtok) "
+        "-- a cost claim nobody can rederive is the estimate all over again")
+
+
 # ── the non-run heartbeat and its resurrection (#37) ─────────────────────────────────
 # A triage runs under `triage-<subject>` and deliberately has no run row, so for as
 # long as the resurrector's only eye was the runs table, a dead triage was unrevivable:
