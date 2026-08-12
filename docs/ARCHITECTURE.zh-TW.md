@@ -526,6 +526,22 @@ finetune agent 發起 SageMaker 訓練作業 —— eval agent 的學生推論�
 那個區分本身沒變，而且正是重點所在：限流或 5xx 依然拋出，讓結算可以被重試，
 而不是把 token 擱置到它完整的 `TimeoutSeconds`。
 
+**「描述這件工作」不該有能力取消這件工作。** 上面兩條結算路徑都預設結算**被執行到**。
+2026-08-11 04:22 UTC 有一次沒有：`llmops-resume-pipeline` 出廠時少了
+`events:PutEvents`，於是 `emit_event(ModelTrained)` —— 它就排在 `send_task_success`
+**前面**、同一個 `try` 裡 —— 拋出 `AccessDeniedException`，一個**成功完成**的訓練作業，
+它的階段從此不知道自己已經完成。EventBridge 對著同一面牆重試兩次，第三次投遞變成
+`AsyncEventsDropped`：6 次錯誤、2 次丟棄，`run-20260811T040003Z-3548116f` 留著一個停放的
+token 等 resurrector 來找。授權已經補上，但授權不是這件事的教訓 ——
+**讓一個缺失的授權能造成這種後果的「順序」才是。** Driver 從 #52 起就有相反的規則
+（`test_a_failed_bus_emit_still_settles_the_task_token`）；resume 的三個 emit 現在走同一個
+包裝函式，而一個從原始碼推導的測試會在「第四個用舊寫法寫的 emit」上失敗 ——
+這條規則無法再被一個呼叫點一個呼叫點地遺忘。這裡的取捨是明講的，而且很便宜：事件匯流排
+上只有一條規則（`EscalatedToHuman`，而這個 Lambda 從不發它）、沒有 archive，
+stage-events 表由 driver 自己寫 —— 所以這三個事件今天沒有任何消費者，而結算釋放的是一個
+已經付過錢的階段。被跳過的 emit 會印出來，而 `llmops-resume-pipeline-errors`
+（見警報一節）不再需要那行輸出是一個 traceback 才能注意到。
+
 Phase 3 實測驗證（觀察到兩次 resume Lambda 調用：一次在早期失敗、一次在成功完成；
 時長 1.5 秒、0 錯誤），Phase 5 又兩次全程無人驗證。
 
