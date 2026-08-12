@@ -1,0 +1,7 @@
+transformers>=4.52
+trl>=0.17
+peft>=0.15
+accelerate>=1.6
+bitsandbytes>=0.46.1
+datasets>=3.5
+liger-kernel>=0.5.8

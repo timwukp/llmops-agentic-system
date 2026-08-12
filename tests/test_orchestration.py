@@ -6154,6 +6154,10 @@ def test_the_state_machine_only_dispatches_tasks_the_prompts_declare():
 #: of truth for the AWS API surface and would rot faster than the prompts do.
 _CLI_TO_IAM = {
     ("sts", "get-caller-identity"): None,  # implicitly allowed for any principal
+    # `aws s3 cp` from the bucket is s3:GetObject on the exact key (downloads only in
+    # any prompt today -- the canonical-trainer fetch; an upload spelling would need
+    # PutObject and should fail here first).
+    ("s3", "cp"): "s3:GetObject",
     ("sagemaker", "list-training-jobs"): "sagemaker:ListTrainingJobs",
     ("sagemaker", "list-endpoints"): "sagemaker:ListEndpoints",
     ("sagemaker", "list-tags"): "sagemaker:ListTags",
@@ -9143,3 +9147,70 @@ def test_the_outage_backoff_respects_the_lambda_wall(monkeypatch):
     assert out == {"status": "self_reinvoked_between_turns"}, (
         f"{out} -- the outage branch slept into the Lambda wall instead of handing off")
     assert not slept, f"slept {slept} with only 70s of wall left"
+
+
+# ── the canonical trainer and the end of codegen roulette ───────────────────────────
+# The finetune agent authored train_qlora.py from scratch on every run because the
+# canonical script was IAM-unreadable (its own generated docstring said so on
+# run-20260811T165529Z-ce628817). Same agent, same prompt: r5 and r6c got working
+# trainers, r6a got an UnboundLocalError and died at 39s. The cure is the skills
+# argument again -- a canonical artifact the role can READ and may not WRITE -- and
+# these guards pin its three legs: the mirror, the grant, and the prompt that names it.
+
+def test_the_canonical_trainer_mirror_verifies_what_it_uploads(storage_mod, tmp_path):
+    class _S3:
+        def __init__(self):
+            self.objects = {}
+        def upload_file(self, path, bucket, key):
+            self.objects[key] = open(path, "rb").read()
+        def get_object(self, Bucket, Key):
+            class _B:
+                def __init__(self, b): self._b = b
+                def read(self): return self._b
+            return {"Body": _B(self.objects[Key])}
+    s3 = _S3()
+    out = storage_mod.ensure_code(s3, "bkt", dry=False)
+    assert "code/distill/train_qlora.py" in s3.objects
+    assert "code/distill/requirements.txt" in s3.objects
+    assert set(out["uploaded_and_verified"]) == {"train_qlora.py", "requirements.txt"}
+
+
+def test_the_canonical_trainer_grant_is_read_only():
+    doc = json.loads((REPO / "deploy/iam/harness_execution_role.json").read_text())
+    stmts = {s.get("Sid"): s for s in doc["permissionsPolicy"]["Statement"]}
+    s = stmts.get("S3CanonicalCodeReadOnly")
+    assert s, "the code/* read grant is gone -- every launch re-enters codegen roulette"
+    acts = s["Action"] if isinstance(s["Action"], list) else [s["Action"]]
+    assert acts == ["s3:GetObject"], (
+        f"{acts}: an agent that can WRITE the script it trains with can rewrite the "
+        "thing its gate judges")
+
+
+def test_the_launch_bullet_names_the_canonical_trainer_and_the_declared_fallback():
+    doc = json.loads((REPO / "agents/finetune/harness.json").read_text())
+    text = "".join(b.get("text", "") for b in doc["systemPrompt"])
+    m = re.search(r'- "launch":(.*?)(?=\n- "[a-z_]+"|\nRules:)', text, re.S)
+    assert m, "finetune has no launch bullet"
+    b = m.group(1)
+    assert "code/distill/train_qlora.py" in b, (
+        "the launch bullet no longer names the canonical trainer -- the agent is back "
+        "to authoring one per run")
+    assert "FALLBACK" in b and "stage_complete" in b, (
+        "improvising a trainer must remain a DECLARED fallback, not a silent choice")
+
+
+def test_the_prompts_hyperparameter_contract_matches_the_scripts_argparse():
+    """The launch bullet lists the knobs; the script defines them. Two files, two
+    claims -- this derives both sides so a flag added to one cannot silently miss
+    the other (the SDK json.dumps lesson made hyperparameter plumbing load-bearing)."""
+    script = (REPO / "pipeline/training/distill/train_qlora.py").read_text()
+    defined = set(re.findall(r'add_argument\("(--[a-z_]+)"', script))
+    doc = json.loads((REPO / "agents/finetune/harness.json").read_text())
+    text = "".join(b.get("text", "") for b in doc["systemPrompt"])
+    b = re.search(r'- "launch":(.*?)(?=\n- "[a-z_]+"|\nRules:)', text, re.S).group(1)
+    named = set(re.findall(r"(--[a-z_]+)", b))
+    missing = named - defined
+    assert not missing, (
+        f"the launch bullet names {sorted(missing)} but the canonical script's "
+        "argparse does not define them -- the launch will pass hyperparameters the "
+        "trainer silently drops or crashes on")
