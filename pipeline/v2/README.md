@@ -331,7 +331,14 @@ log rather than inferred.
 ## Files
 
 - `augment.py` — augmentation engine (multiprocessing; `--limit` for smoke
-  tests, `--n-variants`, `--workers`)
+  tests, `--n-variants`, `--workers`). The corpus is an argument, not a built-in
+  location: `--source <triplets.jsonl>` (or `$V2_SOURCE_JSONL`) is **required**
+  and names the distill output holding the sandbox-verified `(task_id, prompt,
+  code)` rows — there is no default, because augmenting the wrong corpus yields a
+  zero-noise training set for the wrong task and nothing downstream would notice.
+  `--arc-dir` (or `$V2_ARC_TRAINING_DIR`, default `/tmp/arc/data/training`) is an
+  optional speedup only; without it the train pairs are parsed back out of the
+  prompt text.
 - `verify_sandbox.py` — sandboxed exec + exact grid compare (also reusable
   for eval)
 - `make_splits.py` — deterministic task-level split, TRL + raw formats
