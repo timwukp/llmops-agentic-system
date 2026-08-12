@@ -694,8 +694,9 @@ IMMUTABLE_MANIFEST_KEYS = frozenset({"models", "plan", "approval", "params",
                                      "run_id", "created_at", "trigger_source"})
 
 
-def _save_manifest(s3, manifest_uri: str, manifest: dict,
-                   history_record: dict | None = None) -> None:
+def _save_manifest(s3, manifest_uri: str, manifest: Optional[dict],
+                   history_record: dict | None = None,
+                   escalation: dict | None = None) -> None:
     """Persist the run's stage results, re-reading first so a concurrent write survives.
 
     Read-modify-write rather than a blind put, and only the `stages` block is taken from
@@ -722,7 +723,14 @@ def _save_manifest(s3, manifest_uri: str, manifest: dict,
     append to the fresh list cannot lose a record that landed while the caller was working.
     The list is append-only on purpose -- it is the only place a per-iteration result
     survives, since `stages[<stage>]` keeps exactly one entry per stage name and iteration
-    1 overwrites iteration 0 there.
+    1 overwrites iteration 0 there. `escalations` is the same mechanism for the escalation
+    path.
+
+    `manifest=None` means APPEND ONLY: leave `stages` exactly as S3 has it. That is not a
+    convenience, it is the whole safety property of the escalation caller -- an escalation
+    has no stage results to persist, so letting it pass a copy of `stages` would give the
+    escalation path the power to restate a stage record it did not produce, and to lose a
+    stage entry written between its own load and this re-read. The narrower call cannot.
     """
     bucket, _, key = manifest_uri[5:].partition("/")
     current = _load_manifest(s3, manifest_uri)
@@ -744,17 +752,18 @@ def _save_manifest(s3, manifest_uri: str, manifest: dict,
     # both are invisible afterwards because the value that reaches downstream is correct.
     # Recorded rather than raised -- the stage results below are still worth persisting, and
     # withholding them to protest a field we are not writing would trade one loss for two.
-    tampered = sorted(k for k in IMMUTABLE_MANIFEST_KEYS
-                      if k in current and k in manifest and current[k] != manifest[k])
-    if tampered:
-        print(f"[driver] signed manifest blocks changed mid-run for {manifest_uri}: "
-              f"{tampered} — keeping the copy on S3, not the driver's")
-
-    current["stages"] = manifest.get("stages", {})
-    if history_record:
-        history = current.get("stage_history")
-        current["stage_history"] = ([*history, history_record]
-                                    if isinstance(history, list) else [history_record])
+    if manifest is not None:
+        tampered = sorted(k for k in IMMUTABLE_MANIFEST_KEYS
+                          if k in current and k in manifest and current[k] != manifest[k])
+        if tampered:
+            print(f"[driver] signed manifest blocks changed mid-run for {manifest_uri}: "
+                  f"{tampered} — keeping the copy on S3, not the driver's")
+        current["stages"] = manifest.get("stages", {})
+    for field, record in (("stage_history", history_record), ("escalations", escalation)):
+        if record:
+            existing = current.get(field)
+            current[field] = ([*existing, record] if isinstance(existing, list)
+                              else [record])
     s3.put_object(Bucket=bucket, Key=key,
                   Body=json.dumps(current, indent=2, default=str).encode(),
                   ContentType="application/json")
@@ -1310,6 +1319,49 @@ def _is_condition_failure(exc) -> bool:
     return code == "ConditionalCheckFailedException"
 
 
+def _record_manifest_escalation(c, event, args) -> bool:
+    """Land the escalation in the run's own manifest, so its report carries a finding.
+
+    `build_run_report` raises a critical finding for a stage whose status is "escalated" --
+    and NOTHING has ever written that status into `manifest["stages"]`. handle_escalate's
+    durable record was runs.status plus (since #52) a DDB stage event, neither of which the
+    report reads. So r5 (run-20260811T101948Z-f9d34d27) escalated to a human at its
+    iteration-1 gate and published `"findings": []`: the one run that needed a person to
+    look at it produced the report of a run with nothing to say. A branch no writer can
+    reach is not coverage.
+
+    Recorded as an append to `escalations` rather than as `stages[stage]["status"]`, because
+    the escalating stage usually HAS a completed entry -- r5's eval stage holds the scoring
+    task's judge counts -- and overwriting it would trade a missing finding for a destroyed
+    measurement.
+
+    Returns whether a record was written, for the caller's log line. Never raises: the
+    guarantee this function sits inside is that no bookkeeping may withhold the alert.
+    """
+    uri = str(event.get("manifest_uri") or "")
+    run_id = str(event.get("run_id") or "")
+    if not uri or not run_id or f"/runs/{run_id}/" not in uri:
+        # Derived from the URI rather than from _is_triage/_is_finops on purpose. A triage's
+        # manifest_uri names the SUBJECT run while its run_id is the conductor's own (see
+        # ESCALATION_SUBJECT above), and a scheduled sweep has no manifest at all -- so the
+        # condition that actually matters is "this escalation belongs to the run whose
+        # manifest this is". Checking that directly means a future non-run caller cannot
+        # start writing its escalations into somebody else's run just by not being named
+        # here.
+        return False
+    try:
+        _save_manifest(c["s3"], uri, None, escalation={
+            "stage": event.get("stage", ""), "task": event.get("task", ""),
+            "iteration": event.get("iteration"),
+            "reason": str(args.get("reason", ""))[:2000],
+            "escalated_at": datetime.now(timezone.utc).isoformat()})
+        return True
+    except Exception as exc:  # noqa: BLE001 — an alert must not wait on its own filing
+        print(f"[driver] could not record the escalation of {run_id} in its manifest: "
+              f"{type(exc).__name__}: {exc}")
+        return False
+
+
 def handle_escalate(c, event, args) -> dict:
     """Raise a stage's escalation to a human, on every channel that still works.
 
@@ -1362,6 +1414,10 @@ def handle_escalate(c, event, args) -> dict:
                              "task": event.get("task", ""), "run_row": run_row})
     except Exception as exc:  # noqa: BLE001 — never withhold an escalation for a log
         print(f"[driver] could not record the escalation of {run_id}: {exc}")
+    # The second durable record, and the only one the run's own report can read. Same rule
+    # as the stage event above: bookkeeping, so it swallows its own failures internally and
+    # cannot reach the emit or the settle below.
+    _record_manifest_escalation(c, event, args)
     try:
         ev.emit_event(os.environ["EVENT_BUS"], ev.ESCALATED_TO_HUMAN,
                       {"run_id": run_id, "stage": event["stage"],

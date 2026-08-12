@@ -205,6 +205,23 @@ def build_run_report(manifest: dict) -> dict:
                 "detail": entry.get("evidence") or "see SNS notification / DDB stage events",
             })
 
+    # The escalation path's own record. The `status == "escalated"` branch above reads
+    # manifest["stages"], and nothing writes that status there -- handle_escalate's durable
+    # record was runs.status plus a DDB stage event, neither of which this function can see.
+    # So r5 escalated to a human at its iteration-1 gate and published "findings": [], the
+    # report of a run with nothing to say. The stage branch is kept (a stage entry that DOES
+    # say "escalated" still deserves the finding) and this reads the list the driver now
+    # appends to, which is why the two do not duplicate: they have different sources.
+    escalations = list(manifest.get("escalations") or [])
+    for esc in escalations:
+        esc = esc or {}
+        findings.append({
+            "severity": "critical",
+            "stage": esc.get("stage", "unknown"),
+            "title": f"Stage {esc.get('stage', 'unknown')} escalated to human",
+            "detail": esc.get("reason") or "see SNS notification / DDB stage events",
+        })
+
     return {
         "generated_at": now,
         "run_id": manifest.get("run_id", "unknown"),
@@ -232,6 +249,9 @@ def build_run_report(manifest: dict) -> dict:
         # iteration-1 metrics for both `finetune` and `eval`. Carried through to the report
         # because the report is the artifact a human opens.
         "stage_history": list(manifest.get("stage_history") or []),
+        # Carried verbatim as well as summarised into `findings`: the finding says a human
+        # was called, the record says which iteration called them and why.
+        "escalations": escalations,
     }
 
 
