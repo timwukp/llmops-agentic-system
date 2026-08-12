@@ -497,6 +497,17 @@ wake belongs to resume_pipeline. The claim is conditional on the beat the sweep 
 (no double-resurrection), capped per run (past the cap it escalates: a driver that dies
 every turn has a defect revival only re-runs).
 
+Triages get the same protection through a different door (#37): they deliberately have
+no run row, so the refused runs-table heartbeat routes into the events table's dedicated
+`__liveness__` partition instead — payload including `params`, because a triage's work
+order exists nowhere else. The resurrector reads that one partition with a Query and
+applies the same stale/cap/claim contract; a terminal return **deletes** the item (an
+ending is not a death, and a delete leaves no immortal history and no inherited
+resurrection count), while a cap-exhausted item escalates against the run the triage was
+*about* — never its own `triage-` id — and is deleted with the escalation. Scheduled
+jobs (sweep, finops) are deliberately **not** revivable: a crashed schedule waits for
+its next schedule rather than re-running non-idempotent work.
+
 The last exposure that pair does *not* cover is the session's own clock. AgentCore
 reclaims a runtime session at `maxLifetime` = **28800 s (8 h)** — a hard cap that
 activity does not reset and no setting raises. A distillation stage runs 8–12 h in one

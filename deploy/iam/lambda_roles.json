@@ -61,6 +61,18 @@
             ]
           },
           {
+            "_comment": "DeleteItem on EXACTLY the __liveness__ partition (dynamodb:LeadingKeys): _settle_liveness deletes the beat item at the terminal-return choke point -- the review found a done_at mark makes items immortal and leaks the resurrection count into the subject's next incarnation. LeadingKeys keeps the delete away from real stage events: audit rows stay append-only.",
+            "Sid": "DeleteOwnLivenessBeat",
+            "Effect": "Allow",
+            "Action": "dynamodb:DeleteItem",
+            "Resource": "arn:aws:dynamodb:<REGION>:<ACCOUNT_ID>:table/llmops-stage-events",
+            "Condition": {
+              "ForAllValues:StringEquals": {
+                "dynamodb:LeadingKeys": ["__liveness__"]
+              }
+            }
+          },
+          {
             "Sid": "PipelineTablesReadWrite",
             "Effect": "Allow",
             "Action": [
@@ -253,6 +265,18 @@
               "dynamodb:UpdateItem"
             ],
             "Resource": "arn:aws:dynamodb:<REGION>:<ACCOUNT_ID>:table/llmops-pipeline-runs"
+          },
+          {
+            "_comment": "DeleteItem on EXACTLY the __liveness__ partition (dynamodb:LeadingKeys): a cap-exhausted item is deleted with its escalation, or the 15-minute sweep re-escalates it forever -- 96 billed triages a day was the review finding's arithmetic. LeadingKeys keeps the delete away from real stage events: audit rows stay append-only.",
+            "Sid": "DeleteOwnLivenessBeat",
+            "Effect": "Allow",
+            "Action": "dynamodb:DeleteItem",
+            "Resource": "arn:aws:dynamodb:<REGION>:<ACCOUNT_ID>:table/llmops-stage-events",
+            "Condition": {
+              "ForAllValues:StringEquals": {
+                "dynamodb:LeadingKeys": ["__liveness__"]
+              }
+            }
           },
           {
             "_comment": "The non-run half (#37): triages beat into the events table's __liveness__ partition because the runs table must not hold rows for invocations that are not runs (a minted row carrying driver_beat_at is a resurrectable ghost). Query, not Scan -- the sweep reads exactly one partition key and must never pay for (or depend on) the shape of real stage events; UpdateItem is the same conditional claim the runs half makes.",
