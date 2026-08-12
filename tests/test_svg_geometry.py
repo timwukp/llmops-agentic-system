@@ -500,6 +500,31 @@ def test_the_svgs_match_their_generator():
                 f"`python3 docs/gen_architecture_svg.py`, do not hand-edit")
 
 
+def test_the_training_card_links_the_trainer_the_deploy_actually_mirrors():
+    """A diagram may not point at a trainer no run can reach.
+
+    It did, for months: the SageMaker Training card deep-linked
+    pipeline/training/train_qlora.py while deploy/03_storage.py mirrored a different copy
+    under distill/, which is what every run downloaded. A reader auditing the trainer read
+    the wrong file and found three deliverability rules that were not in the deployed one.
+    Derived from ensure_code()'s own literal path parts rather than written down here, for
+    the same reason the deliverability tests are: a hardcoded expectation is how the drift
+    survived a full suite in the first place.
+    """
+    repo = os.path.dirname(DOCS)
+    body = (open(os.path.join(repo, "deploy/03_storage.py")).read()
+            .split("def ensure_code(")[1].split("\ndef ")[0])
+    parts = re.findall(r'"([a-z_0-9]+)"', body.split("src_dir =")[1].split("\n")[0])
+    assert parts, "ensure_code no longer builds its source dir from literal path parts"
+    mirrored = "/".join(parts) + "/train_qlora.py"
+    svg = open(os.path.join(DOCS, "architecture-high-level.svg")).read()
+    assert f"blob/main/{mirrored}" in svg, (
+        f"the training card must link {mirrored} -- the file ensure_code() uploads and every "
+        "run downloads. Fix docs/gen_architecture_svg.py and regenerate")
+    assert "blob/main/pipeline/training/train_qlora.py" not in svg, (
+        "the diagram still links the non-mirrored copy of the trainer")
+
+
 def test_no_account_id_leaks_into_a_diagram():
     """This repo is public; the diagrams must not carry a 12-digit account id."""
     for p in default_targets():

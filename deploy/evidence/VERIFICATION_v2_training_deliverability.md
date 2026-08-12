@@ -1,7 +1,17 @@
 # Verification — training-job deliverability fixes
 
-Evidence that the fixes in `pipeline/training/train_qlora.py` (PR #6) actually work,
-gathered from real SageMaker training jobs before relaunching the 9-hour v2 run.
+Evidence that the fixes in the canonical QLoRA trainer (PR #6) actually work, gathered from
+real SageMaker training jobs before relaunching the 9-hour v2 run.
+
+> **Paths in this document are historical.** The trainer and the preflight verified below
+> were at `pipeline/training/train_qlora.py` and `pipeline/training/validate_job_config.py`
+> when this evidence was gathered. Both now live in `pipeline/training/distill/` — the one
+> directory `deploy/03_storage.py ensure_code()` mirrors to `s3://<bucket>/code/distill/`
+> and the only one a training job can read. The move is the whole point of the fix that
+> followed: for months these bytes were verified, unit-tested, and mirrored NOWHERE, while
+> a second copy under `distill/` — the one every run actually downloaded — carried
+> `save_strategy="no"` and none of the three rules below. The verification results are
+> unchanged; the file that carries them is now the file that runs.
 
 ## Why these fixes existed
 
@@ -130,12 +140,16 @@ Measured on g5.2xlarge: **~26.6 s/it** over 11 steps.
 | `max_train_seconds` | 40,500 (11.25 h) | 45 min headroom for save + eval + merge + upload |
 | `save_steps` | 50 | ~25 checkpoints per epoch; worst-case loss is 50 steps |
 
-This arithmetic is no longer done by hand. `pipeline/training/validate_job_config.py` runs
-it against the `CreateTrainingJob` payload and exits non-zero on any FAIL, so a launcher —
-agent or human — can gate on it:
+This arithmetic is no longer done by hand. `validate_job_config.py` (now
+`pipeline/training/distill/`, mirrored to `code/distill/` beside the trainer) runs it against
+the `CreateTrainingJob` payload and exits non-zero on any FAIL, so a launcher — agent or
+human — can gate on it. Measured after the fact: for its entire life at the old path it had
+**zero callers**, and 4 of 4 real jobs launched with `save_steps`, `max_train_seconds` and
+`CheckpointConfig.S3Uri` all unset — both of its hard FAILs, on every job. The
+`agents/finetune` launch bullet now names it and forbids launching a FAILing payload.
 
 ```
-$ python pipeline/training/validate_job_config.py real_job.json --sec-per-it 26.6 --rows 20225
+$ python validate_job_config.py real_job.json --sec-per-it 26.6 --rows 20225
 job: llmops-qlora-run-v2-code-distill-0001-e2
   fact  headroom after training budget: 45 min
   fact  ~1264 steps at 26.6s/it needs 9.3h; limit 11.2h reaches step ~1522 (120% of the run)

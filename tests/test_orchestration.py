@@ -10412,7 +10412,14 @@ def test_the_canonical_trainer_mirror_verifies_what_it_uploads(storage_mod, tmp_
     out = storage_mod.ensure_code(s3, "bkt", dry=False)
     assert "code/distill/train_qlora.py" in s3.objects
     assert "code/distill/requirements.txt" in s3.objects
-    assert set(out["uploaded_and_verified"]) == {"train_qlora.py", "requirements.txt"}
+    # The preflight ships in the same sourcedir as the trainer it gates. It used to live
+    # in pipeline/training/, which ensure_code does not read, so the one script written to
+    # stop a job from burning GPU hours and delivering nothing had no deploy path at all --
+    # no prompt could name it because no bucket ever had it. A file nothing uploads is not
+    # a component, however good its arithmetic.
+    assert "code/distill/validate_job_config.py" in s3.objects
+    assert set(out["uploaded_and_verified"]) == {"train_qlora.py", "requirements.txt",
+                                                 "validate_job_config.py"}
 
 
 def test_the_canonical_trainer_grant_is_read_only():
@@ -10439,21 +10446,62 @@ def test_the_launch_bullet_names_the_canonical_trainer_and_the_declared_fallback
         "improvising a trainer must remain a DECLARED fallback, not a silent choice")
 
 
+#: Filled in by SageMaker's own environment (SM_CHANNEL_*, SM_MODEL_DIR, SM_OUTPUT_DATA_DIR),
+#: so the launch bullet has no business naming them as hyperparameters even though the script
+#: declares them. Every OTHER declared knob must appear in the contract the prompt states.
+_SM_PROVIDED = {"--train_dir", "--val_dir", "--model_dir", "--output_data_dir"}
+
+
 def test_the_prompts_hyperparameter_contract_matches_the_scripts_argparse():
     """The launch bullet lists the knobs; the script defines them. Two files, two
     claims -- this derives both sides so a flag added to one cannot silently miss
-    the other (the SDK json.dumps lesson made hyperparameter plumbing load-bearing)."""
-    script = (REPO / "pipeline/training/distill/train_qlora.py").read_text()
+    the other (the SDK json.dumps lesson made hyperparameter plumbing load-bearing).
+
+    BOTH directions, and the one that was missing is the one that cost something: the
+    contract listed 12 knobs while the deliverability trio (--save_steps,
+    --max_train_seconds, --checkpoint_dir) sat undeclared in the prompt, so no launch ever
+    passed them and every real job ran with no checkpoint config and no time budget --
+    4/4 measured on live jobs. A knob a script accepts and a prompt never mentions is a
+    knob nothing sets, which is indistinguishable from a knob that does not exist.
+
+    Flags are read from the parenthesised contract, not the whole bullet, because the
+    bullet also quotes the preflight's OWN command line (--sec-per-it, --rows). Those are
+    not silently exempted: every flag anywhere in the bullet has to be defined by one of
+    the two scripts the bullet tells the agent to download, and both sides of that are
+    derived from the scripts themselves.
+    """
+    mirrored = REPO / "pipeline/training/distill"
+    script = (mirrored / "train_qlora.py").read_text()
     defined = set(re.findall(r'add_argument\("(--[a-z_]+)"', script))
     doc = json.loads((REPO / "agents/finetune/harness.json").read_text())
     text = "".join(b.get("text", "") for b in doc["systemPrompt"])
     b = re.search(r'- "launch":(.*?)(?=\n- "[a-z_]+"|\nRules:)', text, re.S).group(1)
-    named = set(re.findall(r"(--[a-z_]+)", b))
-    missing = named - defined
-    assert not missing, (
-        f"the launch bullet names {sorted(missing)} but the canonical script's "
+
+    contract = re.search(r"argparse contract:(.*?)\)", b, re.S)
+    assert contract, "the launch bullet no longer states an argparse contract at all"
+    named = set(re.findall(r"(--[a-z_]+)", contract.group(1)))
+
+    assert not named - defined, (
+        f"the launch bullet names {sorted(named - defined)} but the canonical script's "
         "argparse does not define them -- the launch will pass hyperparameters the "
-        "trainer silently drops or crashes on")
+        "trainer crashes on before a single step runs")
+    assert not defined - named - _SM_PROVIDED, (
+        f"the canonical script accepts {sorted(defined - named - _SM_PROVIDED)} and the "
+        "launch bullet never names them, so no run will ever set them; if a knob is "
+        "deliberately left at its default, say so in the bullet rather than omitting it")
+
+    # Every other flag the bullet mentions must belong to a script the agent downloads.
+    # Hyphens are allowed here (the preflight has --sec-per-it) and underscores are not,
+    # so a contract flag re-matches truncated (--checkpoint_dir -> --checkpoint); anything
+    # that is a prefix of a contract flag was already checked above.
+    other = {f for f in re.findall(r"(--[a-z-]+)", b)
+             if not any(n.startswith(f) for n in named)}
+    preflight = set(re.findall(r'add_argument\("(--[a-z-]+)"',
+                               (mirrored / "validate_job_config.py").read_text()))
+    for flag in sorted(other):
+        assert any(flag.startswith(p) for p in defined | preflight), (
+            f"the launch bullet names {flag}, which neither the canonical trainer nor the "
+            "preflight it tells the agent to run declares")
 
 
 # ── the alarms: who notices, and how long the silence may last ──────────────────────

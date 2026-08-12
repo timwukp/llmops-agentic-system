@@ -107,7 +107,7 @@ ALLOWED = (b"6833" + b"13688378", b"7631" + b"04351884", b"1234" + b"56789012")
 #: this laptop, single-threaded CPython does 3.1M sha256/s, so the whole 1e12 space falls in
 #: about 4 days -- and a GPU does it in roughly 100 seconds. So the KDF is iterated. At 200k
 #: iterations a candidate costs ~16 ms, which makes the same sweep ~500 GPU-years, while the
-#: scan stays cheap because only 12-digit runs are ever hashed: measured across all 175
+#: scan stays cheap because only 12-digit runs are ever hashed: measured across all 176
 #: tracked files there are 63 such runs, 9 distinct, and hashing the distinct set takes 0.16 s
 #: for the entire repo. (Re-measured whenever either number moves, and they move
 #: INDEPENDENTLY, which is why both are derived and neither is inferred from the other, and
@@ -130,8 +130,13 @@ ALLOWED = (b"6833" + b"13688378", b"7631" + b"04351884", b"1234" + b"56789012")
 #: only numbers are byte and line counts), and the #37 liveness probe moved
 #: 171 -> 172 (a probe script whose only numbers are check counts and a
 #: STALE_MINUTES). Then the landed detector moved three at once:
-#: 172 files became 175 -- the tool, its tests, and a CI workflow, none of which
-#: carries a 12-digit run -- while the run count held again. SEVEN commits
+#: 172 went to 175 -- the tool, its tests, and a CI workflow, none of which
+#: carries a 12-digit run -- while the run count held again. Then the one-trainer fix
+#: moved one more: 175 files became 176, the deliverability preflight now shipping in the
+#: directory the deploy actually mirrors, and its numbers are seconds, rows and
+#: percentages. (The "became" phrasing is the one the guard reads, so it names the
+#: LATEST movement -- the earlier ones are history and keep their own past tense.)
+#: EIGHT commits
 #: running, the file count moved and the run count did not move once --
 #: which is the whole reason these are two derived numbers and not one. The CI-only detection
 #: has now repeated FOUR times: `git ls-files` reads the INDEX, so on this push-via-API

@@ -4046,6 +4046,152 @@ case("approval: every record links to genesis, so the audit chain records no ord
      _CT, m216, [f"{_T}test_hash_chain_links_successive_records"])
 
 
+#: ---------------------------------------------------------------------------------------
+#: The trainer that actually runs. Every control below existed as a guard that was GREEN
+#: while the thing it guarded could not deliver, which is the only reason they are worth
+#: registering: tests/test_training_deliverability.py asserted three deliverability rules,
+#: 15 of them passed, and the file it read was mirrored nowhere and named by no prompt --
+#: the trainer every run downloaded was a second copy carrying save_strategy="no". So the
+#: mutants here are not hypothetical regressions, they are the state the repo was in.
+#: Mutating the MIRRORED path only: a control that patches the abandoned copy would be
+#: caught by nothing, which is precisely the finding.
+_TR = "pipeline/training/distill/train_qlora.py"
+_TD = "tests/test_training_deliverability.py::"
+_FT = "agents/finetune/harness.json"
+
+
+def m217(t):
+    old = 'dict(save_strategy="steps", save_steps=args.save_steps, save_total_limit=2)'
+    assert t.count(old) == 1, f"the periodic-save kwargs have moved; found {t.count(old)}"
+    return t.replace(old, 'dict(save_strategy="no")', 1)
+
+
+case("trainer: the deployed trainer stops saving on a step schedule (the e1g6 defect, "
+     "verbatim -- 43 GPU-minutes, zero artifacts, nothing crashed)",
+     _TR, m217, [f"{_TD}test_rule_1_the_mirrored_trainer_checkpoints_periodically_to_the_synced_dir"])
+
+
+def m218(t):
+    old = "        output_dir=args.checkpoint_dir,"
+    assert t.count(old) == 1, f"the trainer's output_dir has moved; found {t.count(old)}"
+    return t.replace(old, '        output_dir="/opt/ml/model/train_out",', 1)
+
+
+case("trainer: checkpoints are written outside the dir SageMaker syncs to S3, so they die "
+     "with the container while every save still looks successful",
+     _TR, m218, [f"{_TD}test_rule_1_the_mirrored_trainer_checkpoints_periodically_to_the_synced_dir"])
+
+
+def m219(t):
+    old = "    if args.max_train_seconds:\n"
+    assert t.count(old) == 1, f"the budget guard has moved; found {t.count(old)}"
+    return t.replace(old, "    if False:\n", 1)
+
+
+case("trainer: the wall-clock budget is accepted and never armed, so MaxRuntime kills the "
+     "job mid-step instead of it stopping at a save point",
+     _TR, m219, [f"{_TD}test_rule_2_the_mirrored_trainer_stops_gracefully_on_a_wall_clock_budget"])
+
+
+def m220(t):
+    old = "                control.should_training_stop = True"
+    assert t.count(old) == 1, f"the graceful-stop line has moved; found {t.count(old)}"
+    # Raising is the plausible wrong fix: it does stop the run, and it skips save/merge.
+    return t.replace(old, '                raise RuntimeError("time budget exhausted")', 1)
+
+
+case("trainer: the budget raises instead of asking the Trainer to stop, so it skips the "
+     "save path it exists to reach",
+     _TR, m220, [f"{_TD}test_rule_2_the_mirrored_trainer_stops_gracefully_on_a_wall_clock_budget"])
+
+
+def m221(t):
+    old = "trainer.train(resume_from_checkpoint=resume)"
+    assert t.count(old) == 1, f"the resume call has moved; found {t.count(old)}"
+    return t.replace(old, "trainer.train()", 1)
+
+
+case("trainer: a resumable checkpoint is found and ignored, so a restart retrains from zero",
+     _TR, m221, [f"{_TD}test_rule_3_the_mirrored_trainer_resumes_from_the_newest_checkpoint"])
+
+
+def m222(t):
+    """Drop the download AND the run command -- two lines, one coherent defect.
+
+    Mutating either alone survives, and the reason is the finding: the first version of this
+    control removed only the download key and the guard stayed green off the "run the
+    preflight" sentence, i.e. it was asserting that the prompt MENTIONS a file the agent
+    would not have. A preflight is called or it is not; half a call is not a weaker call.
+    """
+    dl, run = "code/distill/validate_job_config.py", "python validate_job_config.py"
+    assert t.count(dl) == 1 and t.count(run) == 1, (
+        f"the preflight download/run pair has moved; found {t.count(dl)}/{t.count(run)}")
+    return t.replace(dl, "code/distill/requirements.txt", 1).replace(run, "python -V", 1)
+
+
+case("prompt: the launch bullet stops naming the preflight, returning it to the zero "
+     "callers it had while 4 of 4 real jobs launched with both of its hard FAILs",
+     _FT, m222, [f"{_TD}test_the_preflight_ships_in_the_same_directory_the_trainer_is_mirrored_from"])
+
+
+def m223(t):
+    old = "--model_revision --epochs"
+    assert t.count(old) == 1, f"the prompt's contract list has moved; found {t.count(old)}"
+    return t.replace(old, "--epochs", 1)
+
+
+case("prompt: a knob the trainer declares drops out of the contract the agent is given, so "
+     "nothing ever sets it and the default silently decides the run",
+     _FT, m223,
+     ["tests/test_orchestration.py::"
+      "test_the_prompts_hyperparameter_contract_matches_the_scripts_argparse"])
+
+
+def m224(t):
+    old = "--drop_overlong --max_val_rows"
+    assert t.count(old) == 1, f"the prompt's contract list has moved; found {t.count(old)}"
+    # argparse rejects what it does not declare, so this kills the job after the container
+    # is already up -- ~2 minutes of billed GPU for a typo the prompt invited.
+    return t.replace(old, "--drop_overlong --gradient_checkpointing --max_val_rows", 1)
+
+
+case("prompt: the contract names a flag the trainer does not declare, so argparse kills the "
+     "job after the GPU is already billing",
+     _FT, m224,
+     ["tests/test_orchestration.py::"
+      "test_the_prompts_hyperparameter_contract_matches_the_scripts_argparse"])
+
+
+def m225(t):
+    old = '"pipeline" / "training" / "distill"'
+    assert t.count(old) == 1, f"ensure_code's src_dir has moved; found {t.count(old)}"
+    # The exact drift that hid for months, in the other direction: mirror the abandoned
+    # copy. Everything reading the trainer follows ensure_code, so the deliverability
+    # tests stay GREEN on this mutant -- it is the diagram and the prompt contract that
+    # notice, which is why those two guards derive the path instead of hardcoding it.
+    return t.replace(old, '"pipeline" / "training"', 1)
+
+
+case("deploy: the mirror points at the abandoned copy of the trainer, and only the derived "
+     "guards notice (the deliverability suite follows it and stays green)",
+     "deploy/03_storage.py", m225,
+     ["tests/test_svg_geometry.py::"
+      "test_the_training_card_links_the_trainer_the_deploy_actually_mirrors"])
+
+
+def m226(t):
+    old = "pipeline/training/distill/train_qlora.py"
+    assert t.count(old) == 1, f"the diagram's trainer link has moved; found {t.count(old)}"
+    return t.replace(old, "pipeline/training/train_qlora.py", 1)
+
+
+case("docs: the architecture diagram deep-links a trainer no run can reach, so an auditor "
+     "reads three deliverability rules that are not in the deployed file",
+     "docs/architecture-high-level.svg", m226,
+     ["tests/test_svg_geometry.py::"
+      "test_the_training_card_links_the_trainer_the_deploy_actually_mirrors"])
+
+
 #: Where the pristine text of the file currently mutated is parked, so a kill -9 -- which
 #: no handler can intercept -- still leaves the original recoverable. Under the repo root
 #: rather than /tmp because it must be obvious to whoever finds the tree dirty, and
