@@ -2614,6 +2614,77 @@ class TestResumePipeline:
         # The settle still happened -- the pipeline moved on; only bookkeeping failed.
         assert c["sfn"].successes, "the token was not settled before the clear was tried"
 
+    # -- the audit emit must never be able to abort the settle ------------------
+    #
+    # run-20260811T040003Z-3548116f: this Lambda's role shipped without
+    # events:PutEvents, emit_event(MODEL_TRAINED) raised AccessDeniedException, and
+    # because the emit sat BEFORE send_task_success inside the same try, describing the
+    # training killed settling it -- EventBridge retried twice into the same wall and
+    # the third delivery became an AsyncEventsDropped. A successful training job whose
+    # stage never learned it had finished. The grant is fixed; these pin the ordering,
+    # the way #52's test_a_failed_bus_emit_still_settles_the_task_token pins the
+    # driver's four settle sites.
+
+    @pytest.mark.parametrize("event,outcome,settled", [
+        (sm_event("Completed", ModelArtifacts={"S3ModelArtifacts": "s3://b/m.tar.gz"}),
+         "resumed", "successes"),
+        (sm_event("Stopped", BillingSecondsUsed=0), "capacity-relaunch", "failures"),
+        (sm_event("Failed", FailureReason="OOM"), "failed", "failures"),
+    ])
+    def test_a_dead_bus_still_settles_every_branch_and_clears_the_token(
+            self, event, outcome, settled):
+        """All three branches, because all three emit before their settle and any one of
+        them stranding a token costs the stage's full 86400 s timeout."""
+        c = self._clients({"run_id": "run-1", "task_token": "tok-9"})
+
+        def boom(**kw):
+            raise RuntimeError("AccessDeniedException: events:PutEvents")
+        c["events"].put_events = boom
+
+        out = resume_pipeline.handler(event, clients=c)
+        assert out["outcome"] == outcome
+        assert getattr(c["sfn"], settled), (
+            f"a failed audit emit aborted the {outcome} settle")
+        updates = c["ddb"].Table(ENV["RUNS_TABLE"]).updates
+        assert updates and "REMOVE task_token" in updates[0]["UpdateExpression"], \
+            "the token stayed parked because an audit event failed"
+
+    def test_the_skipped_audit_event_says_so(self, capsys):
+        """The trade this makes is a lost bus event for a settled token, and nothing
+        consumes those three events today (one bus rule, EscalatedToHuman, which this
+        handler never emits; no archive; the driver writes llmops-stage-events itself).
+        So the print IS the record -- and llmops-resume-pipeline-errors no longer needs
+        it to be a traceback to notice."""
+        c = self._clients({"run_id": "run-1", "task_token": "tok-9"})
+
+        def boom(**kw):
+            raise RuntimeError("bus unreachable")
+        c["events"].put_events = boom
+        resume_pipeline.handler(sm_event("Completed"), clients=c)
+        out = capsys.readouterr().out
+        assert ev.MODEL_TRAINED in out and "FAILED" in out, \
+            f"a dropped audit event left no trace: {out!r}"
+
+    def test_no_bus_emit_in_this_handler_bypasses_the_audit_wrapper(self):
+        """Derived, not enumerated: the defect was one unwrapped emit, so a future
+        fourth emit written the old way must red here rather than wait for the next
+        stranded token. _audit is the only legal caller of ev.emit_event in this file."""
+        tree = ast.parse((REPO / "orchestration/resume_pipeline/handler.py").read_text())
+        offenders = []
+        for fn in [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]:
+            if fn.name == "_audit":
+                continue
+            for node in ast.walk(fn):
+                if (isinstance(node, ast.Call)
+                        and isinstance(node.func, ast.Attribute)
+                        and node.func.attr == "emit_event"):
+                    offenders.append(f"{fn.name}:{node.lineno}")
+        assert not offenders, (
+            f"bus emit outside _audit, so a PutEvents failure can abort a settle again: "
+            f"{offenders}")
+        assert "_audit(" in (REPO / "orchestration/resume_pipeline/handler.py").read_text(), \
+            "the wrapper is unused -- this guard would pass on a handler that emits nothing"
+
 
 # ---------------------------------------------------------------------------
 # webhook

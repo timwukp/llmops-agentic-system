@@ -622,6 +622,24 @@ defined by neither, because two constants in two files agree only until someone 
 The discrimination is unchanged and is the whole point: a throttle or 5xx still raises, so
 the settle can be retried rather than stranding the token for its full `TimeoutSeconds`.
 
+**Describing the work must not be able to cancel it.** Both settle paths above assume the
+settle is *reached*. On 2026-08-11 at 04:22 UTC one was not: `llmops-resume-pipeline` had
+shipped without `events:PutEvents`, so `emit_event(ModelTrained)` — which sat immediately
+*before* `send_task_success`, inside the same `try` — raised `AccessDeniedException`, and a
+successfully-finished training job's stage never learned it had finished. EventBridge
+retried into the same wall twice and the third delivery became an `AsyncEventsDropped`: 6
+errors, 2 drops, `run-20260811T040003Z-3548116f` left with a parked token for the
+resurrector to find. The grant is fixed, but a grant is not the lesson — **the ordering
+that let a missing grant do that is.** The driver has had the opposite rule since #52
+(`test_a_failed_bus_emit_still_settles_the_task_token`); resume's three emits now go
+through the same wrapper, and a source-derived test fails on a fourth emit written the old
+way, so the rule cannot be forgotten one call site at a time. The trade is explicit and
+cheap here: the bus carries exactly one rule (`EscalatedToHuman`, which this Lambda never
+emits), has no archive, and the stage-events table is written by the driver directly — so
+nothing consumes these three events today, while the settle releases a paid-for stage. A
+skipped emit prints, and `llmops-resume-pipeline-errors` (§ alarms) no longer needs that
+print to be a traceback in order to notice.
+
 Live-verified in Phase 3 (two resume-Lambda invocations observed: one on an early failure,
 one on the successful completion; 1.5 s duration, 0 errors) and again hands-off, twice, in
 Phase 5.
