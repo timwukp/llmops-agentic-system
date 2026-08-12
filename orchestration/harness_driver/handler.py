@@ -801,6 +801,36 @@ STAGE_FACT_PARAMS = {
 }
 
 
+def signed_plan_params(manifest: dict) -> dict:
+    """`manifest["params"]` — the settings start-pipeline merged out of the signed plan.
+
+    THE SAME OMISSION AS #20/#21/#22, one level up: both halves exist and were never
+    connected. start-pipeline merges DEFAULT_PARAMS < trigger params < signed plan into
+    `manifest.params` (19 keys on the r5 run) and the prompts read 29 distinct
+    `params.X` names -- but the payload this driver hands the agent carried SIX of them
+    (task, iteration, the three model roles, student_endpoint). The other 23 lived only
+    in the manifest, under a key that is also spelled `params`.
+
+    It worked anyway, which is the part worth being precise about. The eval prompt's
+    first line is "the S3 manifest is the single source of truth; read it first", so the
+    agent read the manifest, found a `params` object there, and used it -- r5's
+    gate-i1.json records it in as many words: "invocation params carried no gates key,
+    manifest is source of truth". The bar a human signed was applied correctly.
+
+    But the same prompt also says "if params.gates is absent entirely, do NOT invent a
+    threshold: escalate_human", and by the payload's literal `params` that condition was
+    TRUE. What stood between a correctly signed plan and a spurious escalation was the
+    agent noticing that two different dicts share one name. That is a correctness
+    property resting on model judgment, and it must not be load-bearing.
+
+    Merged at the LOWEST precedence in `_run_stage`, so nothing that resolves today
+    resolves differently: the signed models, the run's own discovered facts and the
+    dispatching caller all still win. Purely additive, by construction.
+    """
+    params = manifest.get("params")
+    return dict(params) if isinstance(params, dict) else {}
+
+
 def stage_fact_params(manifest: dict) -> dict:
     """`{student_endpoint: ...}` for facts an earlier stage of THIS run reported.
 
@@ -1784,11 +1814,19 @@ def _run_stage(event, context=None, c=None):
     # collide (a signed model role is not a runtime endpoint), so their order between
     # themselves is unobservable, and putting the dispatch event last preserves the
     # remediation override that `model_params_from_manifest` was written for.
+    #
+    # `signed` goes FIRST -- lowest precedence -- because it is the only one of the four
+    # that a later step may legitimately refine: the plan names a training_instance, the
+    # remediation iteration may override it, and the run's own endpoint is not a plan
+    # setting at all. Being last would let a static plan value overwrite a fact the run
+    # discovered. Being first makes the merge purely additive: every key that resolved
+    # before this line existed still resolves to the same value. See signed_plan_params.
     try:
         manifest = _load_manifest(c["s3"], event["manifest_uri"])
+        signed = signed_plan_params(manifest)
         approved = model_params_from_manifest(manifest)
         facts = stage_fact_params(manifest)
-        payload["params"] = {**approved, **facts, **payload["params"]}
+        payload["params"] = {**signed, **approved, **facts, **payload["params"]}
     except Exception as exc:  # noqa: BLE001
         # Not fatal: stages that need no model (deploy smoke tests, monitor sweeps) must
         # not be blocked by a manifest read. The stage that DOES need one will fail on

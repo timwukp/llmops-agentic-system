@@ -4311,6 +4311,95 @@ class TestConductorDispatch:
             "with the event silent the manifest's approved model must be supplied — "
             "otherwise the agent falls back to whatever its prompt names")
 
+    #: Params a prompt reads that something OTHER than the signed plan supplies, so the
+    #: derivation below does not demand the manifest carry them. Each is delivered by a
+    #: mechanism with its own test above: the task and iteration by the dispatching
+    #: event, the model roles by MODEL_PARAM_FOR_ROLE, the endpoint by STAGE_FACT_PARAMS,
+    #: and the conductor's two triage keys by the bus event that wakes it.
+    _NOT_FROM_THE_PLAN = frozenset({"task", "iteration", "escalation", "approval_context"})
+
+    @classmethod
+    def _plan_only_params(cls) -> set:
+        """Params the prompts read that ONLY `manifest["params"]` can supply."""
+        read = set()
+        for cfg in sorted((REPO / "agents").glob("*/harness.json")):
+            text = json.loads(cfg.read_text())["systemPrompt"][0]["text"]
+            read |= set(re.findall(r"params\.([a-z_][a-z_0-9]*)", text))
+        assert read, "parsed no params at all -- the derivation is broken, not the code"
+        out = (read - cls._NOT_FROM_THE_PLAN
+               - set(driver.MODEL_PARAM_FOR_ROLE.values())
+               - set(driver.STAGE_FACT_PARAMS))
+        assert len(out) > 10, f"only {sorted(out)} left; the exclusions have eaten the set"
+        return out
+
+    def test_the_settings_a_human_signed_reach_the_agent_that_reads_them(self):
+        """#20/#21/#22 one level up, and the reason it hid for so long.
+
+        start-pipeline merges DEFAULT_PARAMS < trigger params < signed plan into
+        `manifest.params` -- 19 keys on the r5 run. The payload the driver handed the
+        agent carried SIX. The other 23 existed only in the manifest, under a key ALSO
+        spelled `params`, so `params.gates` meant two different things depending on which
+        document you were holding.
+
+        It worked anyway: the eval prompt orders the agent to read the manifest first, so
+        it found the other `params` and used it -- r5's gate-i1.json says so outright
+        ("invocation params carried no gates key, manifest is source of truth") and
+        applied the signed 0.55. But the same prompt also says "if params.gates is absent
+        entirely, do NOT invent a threshold: escalate_human", and by the payload's literal
+        `params` that was TRUE. The only thing between a correctly signed plan and a
+        spurious escalation was the agent noticing the collision for us.
+
+        Derived from the prompts, so a `params.X` added to a prompt tomorrow is covered
+        without editing this test -- the failure mode being guarded is precisely a prompt
+        promising a param that no half of the system delivers.
+        """
+        wanted = sorted(self._plan_only_params())
+        signed = {p: f"signed-value-for-{p}" for p in wanted}
+        delivered = self._stage_params(
+            {"run_id": "run-x", "stage": "eval", "task": "gate",
+             "harness_id": "llmops_eval",
+             "manifest_uri": "s3://b/runs/run-x/manifest.json"},
+            {}, manifest={"params": signed})
+        missing = [p for p in wanted if delivered.get(p) != signed[p]]
+        assert not missing, (
+            f"the prompts read params.{{{','.join(missing)}}} and the payload the agent "
+            f"receives does not carry them, so every one of those sentences describes a "
+            f"key that is absent. Delivered: {sorted(delivered)}")
+
+    def test_a_signed_plan_setting_never_overwrites_a_fact_the_run_discovered(self):
+        """The merge is additive BY CONSTRUCTION or it is a regression.
+
+        `manifest.params` is merged at the lowest precedence, so every key that resolved
+        before it was merged at all must still resolve the same way. Asserted on the three
+        sources that can collide with it -- a stale plan value silently replacing the
+        endpoint the deploy stage actually created is the failure this ordering prevents,
+        and it would look exactly like a monitor sweep reporting metrics for the wrong
+        model: evidence, not an error."""
+        base = {"run_id": "run-x", "stage": "eval", "task": "score",
+                "harness_id": "llmops_eval",
+                "manifest_uri": "s3://b/runs/run-x/manifest.json"}
+        stale = {"teacher_model_id": "plan-stale-teacher",
+                 "student_endpoint": "plan-stale-endpoint",
+                 "task": "plan-stale-task"}
+        params = self._stage_params(
+            {**base, "params": {"teacher_model_id": "caller-override"}},
+            {"teacher": "signed-teacher"},
+            manifest={"params": stale,
+                      "stages": {"deploy": {"metrics": {"endpoint_name": "real-ep"}}}})
+        assert params["teacher_model_id"] == "caller-override", (
+            "the dispatching caller's override must still win over both the manifest's "
+            f"models and its params -> {params}")
+        assert params["student_endpoint"] == "real-ep", (
+            "the endpoint the deploy stage REPORTED must win over a plan setting of the "
+            f"same name; no plan can be signed with an endpoint that did not exist -> {params}")
+        assert params["task"] == "score", (
+            f"the dispatched task must survive a plan param of the same name -> {params}")
+        silent = self._stage_params(base, {"teacher": "signed-teacher"},
+                                   manifest={"params": stale})
+        assert silent["teacher_model_id"] == "signed-teacher", (
+            "with the caller silent, the SIGNED model must still beat a params entry of "
+            f"the same name -- model consent does not come from a settings dict -> {silent}")
+
     def test_no_prompt_hardcodes_a_model_id_as_the_one_to_use(self):
         """Every prompt's persona line used to name DeepSeek-R1 and Qwen3-1.7B, which is
         what an agent falls back to when its model param is absent. The platform has to
