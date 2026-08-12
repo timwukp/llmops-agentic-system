@@ -1087,6 +1087,30 @@ OOD 集、而一個已完成的 eval 沒有帶回來」時會顯示 **NOT REPORT
 分數，而這個頁面是唯一能抓到「宣稱核對過、實際算錯了」的那份報告的讀者。分母核對不上會拿到它自己的
 判決，因為記帳錯誤與 student 沒過標準，要做的事完全不同。
 
+**當門檻距離指標的天花板不到一個 band 的寬度時，用絕對距離量的 borderline band 會把整個通過區間吞
+掉。** Gate 改革給「有回報區間」的指標一條 Wilson 規則，但它並沒有刪掉原本那句 prose band —— 它只是
+**縮小了 band 的適用範圍**，於是每一道**不是** `judge_score` 的 gate 仍然由「距門檻 0.05 之內就算
+borderline，附上數字上報」來判定。三份 r6 plan 草案的 gate 都是
+`{"judge_score": 0.45, "format_validity": 0.95}`，而 `format_validity` 是一個比例:它的天花板是
+1.0，所以 `bar + band` = 1.00，**整個通過區間 [0.95, 1.00] 都落在 borderline band 裡面。** 97 題裡有
+一題格式不合 —— 0.9897，一道明明過關的 gate —— 會變成 `escalate_human`；而任何帶著這道 gate 的 run
+**根本不可能拿到決定性的 gate 通過**，因此沒有一個 run 能在沒有人類判決的情況下走到 `Complete`。這件
+事目前只是被遮住了,因為 `judge_score` 會先決定性地失敗;等 student 開始及格,遮罩就消失。而滿分的
+情況比模糊更糟:`1.0 - 0.95` 是 `0.050000000000000044`,所以「它有沒有在 0.05 之內」是由二進位浮點
+決定的 —— 而那正是操作者最常看到的那一個值。修法**沒有動任何一道門檻**。`format_validity` 是「可數
+分母上的計數」,所以 score bullet 現在要求它回報 `format_validity_ci_low` / `_ci_high` 與
+`format_n`,這會讓它走進**既有**的 bounds 分支 —— 那條分支是以 `<name>_ci_low` 是否存在為判準、並用
+`name.rsplit("_", 1)[0]` 推導出 family 的,設計初衷正是「下一個帶區間的指標不該被降級成點估計」——
+於是 97/97 以下界 0.9619 成為決定性通過,96/97 則成為誠實的 [0.9439, 0.9982] borderline。band 只留給
+「沒有分母可以算區間」的指標當 fallback,並補上它原本缺的那道檢查:如果 `bar + band` 觸到指標的天花
+板,agent 要把算術講出來、**上報一次**、並指名那個門檻本身就是缺陷,而不是每一次跑都當成新的意外
+escalation 重新發現一遍。Console 在「第二次推導」修法沒有碰到的那條分支上有鏡像的缺陷 —— 完全沒有
+band,所以它把整個 band 都畫成 PASS,**連剛好落在門檻上那一點也是**:距離是 0、按規則是最 borderline
+的位置 —— 而且有兩條既有的斷言把這個行為釘成「正確」。現在兩邊都從同一個句子讀出那個數字:
+`test_the_scalar_band_is_the_one_the_eval_prompt_states` 用 regex 把 band 從 eval prompt 裡取出來,
+讓 console 的 band 與 prompt 的 band 不可能在「沒人會重看的那些 run」上悄悄分岔。一道把「現在的行為」
+寫進斷言裡的 guard,並不是「這個行為是對的」的證據。
+
 **一個 run 自己發現的事實，和它被簽署時的同意一樣會被傳遞下去。** `MODEL_PARAM_FOR_ROLE` 把人
 **簽署**的內容帶給必須服從它的 stage；`STAGE_FACT_PARAMS` 把 run 自己**產出**的內容帶給必須量測
 它的 stage。`params.student_endpoint` —— eval 與 monitor 都會讀 —— 就是命名這個模式的那個案例：

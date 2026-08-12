@@ -732,6 +732,17 @@ GATE_UNREADABLE = "unreadable"
 #: a number that does not reconcile is worse than a missing one because it looks measured.
 GATE_UNRECONCILED = "unreconciled"
 
+#: The band the eval gate bullet applies to a scalar gate that reports NO interval: "borderline
+#: means AT or within 0.05 of the threshold". Not a console policy -- a literal read out of the
+#: prompt, and `test_the_scalar_band_is_the_one_the_eval_prompt_states` derives it from that
+#: sentence so the two cannot drift apart.
+GATE_SCALAR_BAND = 0.05
+#: `1.0 - 0.95` is `0.050000000000000044` in IEEE-754, so a PERFECT rate against a 0.95 bar lands
+#: outside a bare `<= 0.05` by one representation error -- decisive or borderline decided by
+#: binary floating point, on the one value an operator is most likely to see. A human reading
+#: "at or within 0.05" means the closed interval, so compare inside a tolerance.
+_BAND_EPS = 1e-9
+
 
 def _wilson(score, n, z=1.96):
     """Wilson interval for `score` over `n`, the same instrument the eval report carries.
@@ -828,6 +839,17 @@ def gate_row(name, threshold, metrics, eval_reported):
     survivors-only bound alone, so near the bar it could paint PASS on a run the pipeline
     escalated -- and it displayed `n=94` for a 97-row layer with the 3 missing items nowhere on
     the page, which is the one place a human would ever see them.
+
+    A fourth (D11), in the branch defect 1 did not touch: **a scalar gate with no interval had no
+    band.** The gate bullet decides such a metric by a fixed band -- borderline AT or within 0.05
+    of the threshold -- and this returned `actual >= bar`, so it painted PASS across the whole
+    band and even AT the bar, where the distance is 0 and the rule is maximally borderline. The
+    live plan's `format_validity: 0.95` is the pathological case: the metric is capped at 1.0, so
+    bar + band reaches the ceiling and the ENTIRE passing region is borderline. 96 of 97 valid
+    answers escalated in the pipeline and read PASS here. That gate's real fix is upstream -- the
+    score bullet now requires a proportion to report its own Wilson interval, which routes it
+    through the bounds rule above, where 97/97 is a decisive pass at a lower bound of 0.9619 --
+    but the band had to become real for the two derivations to agree at all.
     """
     actual = metrics.get(name)
     row = {"name": name, "threshold": threshold, "actual": actual}
@@ -881,10 +903,22 @@ def gate_row(name, threshold, metrics, eval_reported):
             if imputed is None or len(imputed) > 1:
                 return GATE_BORDERLINE
             return imputed.pop() if imputed else verdict
+        # No interval reported, so the gate bullet's fixed band decides. The console had NO band
+        # here (D11), which is D7's defect surviving in the branch D7 did not touch: the eval
+        # agent escalates every scalar inside the band, and `actual >= bar` painted PASS across
+        # the whole of it -- including AT the bar, where the distance is 0 and the rule is
+        # maximally borderline. Measured on the live plan's own gates: `format_validity: 0.95`
+        # on a rate capped at 1.0 puts the ENTIRE passing region inside the band, so 96 of 97
+        # valid answers is an escalation the page called a pass. The fix for that gate is the
+        # interval the score bullet now mandates, which routes it above; the band stays for a
+        # metric with no denominator to compute one over.
         try:
-            return GATE_PASSED if float(actual) >= bar else GATE_FAILED
+            value = float(actual)
         except (TypeError, ValueError):
             return GATE_UNREADABLE
+        if abs(value - bar) <= GATE_SCALAR_BAND + _BAND_EPS:
+            return GATE_BORDERLINE
+        return GATE_PASSED if value > bar else GATE_FAILED
 
     row["status"] = _decide()
     # `passed` is kept because the frontend and the /api/status rollup already read it, and
