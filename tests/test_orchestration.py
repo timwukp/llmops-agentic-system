@@ -13,6 +13,7 @@ from __future__ import annotations
 import datetime
 import fnmatch
 import importlib.util
+import inspect
 import io
 import json
 import math
@@ -5539,7 +5540,63 @@ def _driver_written_keys() -> list:
                     keys.add(re.sub(r"\{[a-z_]+\}", run, u))
                 continue
             keys.add(re.sub(r"\{[a-z_]+\}", run, raw))
+    keys.update(_dispatched_manifest_keys())
     return sorted(keys)
+
+
+#: Every Lambda that hands the driver a `manifest_uri`, and the harness that dispatch
+#: targets. `_save_manifest` writes whichever key it is GIVEN, so the set of keys the
+#: driver can write is not knowable from the driver's own source -- the f-string scrape
+#: above only ever sees `runs/<run_id>/manifest.json`, which is why the scheduled sweep's
+#: manifest was ungranted for two live sweeps after bug #25 was declared fixed.
+_MANIFEST_DISPATCHERS = (
+    ("monitor_sweep", "orchestration/monitor_sweep/handler.py"),
+    ("finops_reconcile", "orchestration/finops_reconcile/handler.py"),
+)
+
+
+def _harness_reaches_stage_complete(harness_id: str) -> bool:
+    """Whether that harness's prompt can call the tool that triggers the manifest write.
+
+    The filter matters in BOTH directions. finops_reconcile builds
+    `finops/manifests/<period>.json` exactly like the sweep does, but the finops prompt has
+    no `stage_complete` -- it ends at `publish_cost_report` -- so the driver never writes
+    that key, and demanding a grant for it would push this file's other half (no granted
+    pattern nothing writes) into failing. Read from the harness JSON rather than listed
+    here, so adding `stage_complete` to a prompt demands the grant in the same PR.
+    """
+    for path in (REPO / "agents").glob("*/harness.json"):
+        spec = json.loads(path.read_text())
+        if spec.get("harnessName") == harness_id:
+            return "stage_complete" in json.dumps(spec)
+    raise AssertionError(f"no harness declares harnessName {harness_id!r}")
+
+
+def _dispatched_manifest_keys() -> set:
+    """Manifest keys the dispatchers name, obtained by CALLING their payload builders.
+
+    Not by pattern-matching their source: monitor_sweep interpolates a module constant
+    (`{SWEEP_PREFIX}`) into its URI, so the f-string scrape used above would have derived
+    the literal key `{SWEEP_PREFIX}/manifests/...`, matched it against no grant, and failed
+    for a reason that has nothing to do with IAM. A key built by a function is only knowable
+    by running it.
+    """
+    keys = set()
+    for name, rel in _MANIFEST_DISPATCHERS:
+        mod = _load(name, rel)
+        args = {"project": "llmops-agentic-system", "bucket": "llmops-data-test",
+                "region": "us-east-1", "run_id": "sweep-2026-08-12",
+                "task": "reconcile", "period": "2026-08-11", "runs": []}
+        params = inspect.signature(mod.build_payload).parameters
+        payload = mod.build_payload(**{k: v for k, v in args.items() if k in params})
+        assert payload.get("manifest_uri", "").startswith("s3://"), \
+            f"{name}.build_payload no longer names a manifest_uri; the derivation is blind"
+        if not _harness_reaches_stage_complete(payload["harness_id"]):
+            continue
+        keys.add(payload["manifest_uri"][5:].partition("/")[2])
+    assert keys, ("no dispatcher contributed a manifest key -- either every scheduled "
+                  "harness lost stage_complete or this derivation stopped seeing them")
+    return keys
 
 
 def _driver_write_patterns() -> list:

@@ -153,6 +153,13 @@
             "Resource": "arn:aws:s3:::<DATA_BUCKET>/runs/*/manifest.json"
           },
           {
+            "_comment": "Bug #25 again, for the manifests that are NOT under runs/. The driver writes whichever manifest_uri its DISPATCHER handed it, and a scheduled dispatcher has no run to sit under: monitor_sweep names s3://<bucket>/monitoring/manifests/sweep-<date>.json (SWEEP_PREFIX, chosen so an account-level finding is not buried inside whichever run happened to look). The statement above grants runs/*/manifest.json only, so every scheduled sweep since _save_manifest shipped completed its work and then logged report_write_failed -- measured live, sweep-2026-08-11 and sweep-2026-08-12, both after a sweep that had already found 4 orphan endpoint configs, 10 orphan models and an incomplete teardown. The prefix-level guard could not see it because the grant it checked matched every key the DRIVER's own source builds; the key came from another Lambda. Scoped to monitoring/manifests/*, not monitoring/*: the sweep AGENT writes monitoring/sweeps/ under the harness execution role, and the driver's job there is to verify that object, not to author it. finops_reconcile builds finops/manifests/<period>.json the same way and is deliberately NOT granted here -- the finops harness has no stage_complete tool, so the driver never writes that key, and a grant nothing writes is the widening this file's other comments warn about.",
+            "Sid": "WriteStageResultsToScheduledManifest",
+            "Effect": "Allow",
+            "Action": "s3:PutObject",
+            "Resource": "arn:aws:s3:::<DATA_BUCKET>/monitoring/manifests/*"
+          },
+          {
             "_comment": "Servicing the conductor's launch_run: the driver invokes start-pipeline on the orchestrator's behalf. Without this, an orchestrator run with params.task=plan reaches the dispatch moment and dies on AccessDenied \u2014 the exact defect that made launch_run 'unsupported' for five phases.",
             "Sid": "ConductorDispatch",
             "Effect": "Allow",
