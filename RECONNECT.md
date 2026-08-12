@@ -311,9 +311,14 @@ the wiring needed its own test.
    design. `keep_endpoint`, `latency_p50_target_ms`, `sample_size` and `hf_token_secret` are
    plan-supplied and reachable since bug #21 (`PLAN_META_KEYS` does not exclude them), and
    `test_every_param_a_prompt_reads_has_something_that_writes_it` now pins all 25 so this
-   list can never again be a set of unverified suspects. Still open:
-   `pipeline/v2/augment.py:53` hardcodes `/Users/tmwu/Downloads/kaggle-arc-agi-2/...` in a
-   module nothing invokes.
+   list can never again be a set of unverified suspects. The last entry — `augment.py`
+   hardcoding a path under one laptop's home directory, in a module nothing invokes — is
+   now closed: the corpus is `--source` / `$V2_SOURCE_JSONL` with **no default** (a wrong
+   default augments the wrong corpus into a plausible-looking zero-noise training set),
+   the ARC scratch dir is an optional speedup passed through the worker payload, and
+   `test_no_tracked_code_file_hardcodes_a_home_directory` now scans every tracked `.py`
+   `.sh` `.json` `.yml` `.js` so the class cannot return. Verified by running the module:
+   3 tasks × 3 variants through the pool, all sandbox-verified, 0 rejected.
 4. **Autonomy, in the user's own terms, now that #22 unblocks it.** The stated goal is a
    platform that runs itself, reflects on problems, self-learns and self-iterates. Persisting
    stage results was the precondition — before it, an agent had nothing to reflect ON. The

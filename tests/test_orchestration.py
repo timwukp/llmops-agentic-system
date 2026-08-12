@@ -10,9 +10,12 @@ Run: .venv/bin/python -m pytest tests/test_orchestration.py -q
 """
 from __future__ import annotations
 
+import ast
 import datetime
 import fnmatch
+import hashlib
 import importlib.util
+import inspect
 import io
 import json
 import math
@@ -2611,6 +2614,77 @@ class TestResumePipeline:
         # The settle still happened -- the pipeline moved on; only bookkeeping failed.
         assert c["sfn"].successes, "the token was not settled before the clear was tried"
 
+    # -- the audit emit must never be able to abort the settle ------------------
+    #
+    # run-20260811T040003Z-3548116f: this Lambda's role shipped without
+    # events:PutEvents, emit_event(MODEL_TRAINED) raised AccessDeniedException, and
+    # because the emit sat BEFORE send_task_success inside the same try, describing the
+    # training killed settling it -- EventBridge retried twice into the same wall and
+    # the third delivery became an AsyncEventsDropped. A successful training job whose
+    # stage never learned it had finished. The grant is fixed; these pin the ordering,
+    # the way #52's test_a_failed_bus_emit_still_settles_the_task_token pins the
+    # driver's four settle sites.
+
+    @pytest.mark.parametrize("event,outcome,settled", [
+        (sm_event("Completed", ModelArtifacts={"S3ModelArtifacts": "s3://b/m.tar.gz"}),
+         "resumed", "successes"),
+        (sm_event("Stopped", BillingSecondsUsed=0), "capacity-relaunch", "failures"),
+        (sm_event("Failed", FailureReason="OOM"), "failed", "failures"),
+    ])
+    def test_a_dead_bus_still_settles_every_branch_and_clears_the_token(
+            self, event, outcome, settled):
+        """All three branches, because all three emit before their settle and any one of
+        them stranding a token costs the stage's full 86400 s timeout."""
+        c = self._clients({"run_id": "run-1", "task_token": "tok-9"})
+
+        def boom(**kw):
+            raise RuntimeError("AccessDeniedException: events:PutEvents")
+        c["events"].put_events = boom
+
+        out = resume_pipeline.handler(event, clients=c)
+        assert out["outcome"] == outcome
+        assert getattr(c["sfn"], settled), (
+            f"a failed audit emit aborted the {outcome} settle")
+        updates = c["ddb"].Table(ENV["RUNS_TABLE"]).updates
+        assert updates and "REMOVE task_token" in updates[0]["UpdateExpression"], \
+            "the token stayed parked because an audit event failed"
+
+    def test_the_skipped_audit_event_says_so(self, capsys):
+        """The trade this makes is a lost bus event for a settled token, and nothing
+        consumes those three events today (one bus rule, EscalatedToHuman, which this
+        handler never emits; no archive; the driver writes llmops-stage-events itself).
+        So the print IS the record -- and llmops-resume-pipeline-errors no longer needs
+        it to be a traceback to notice."""
+        c = self._clients({"run_id": "run-1", "task_token": "tok-9"})
+
+        def boom(**kw):
+            raise RuntimeError("bus unreachable")
+        c["events"].put_events = boom
+        resume_pipeline.handler(sm_event("Completed"), clients=c)
+        out = capsys.readouterr().out
+        assert ev.MODEL_TRAINED in out and "FAILED" in out, \
+            f"a dropped audit event left no trace: {out!r}"
+
+    def test_no_bus_emit_in_this_handler_bypasses_the_audit_wrapper(self):
+        """Derived, not enumerated: the defect was one unwrapped emit, so a future
+        fourth emit written the old way must red here rather than wait for the next
+        stranded token. _audit is the only legal caller of ev.emit_event in this file."""
+        tree = ast.parse((REPO / "orchestration/resume_pipeline/handler.py").read_text())
+        offenders = []
+        for fn in [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]:
+            if fn.name == "_audit":
+                continue
+            for node in ast.walk(fn):
+                if (isinstance(node, ast.Call)
+                        and isinstance(node.func, ast.Attribute)
+                        and node.func.attr == "emit_event"):
+                    offenders.append(f"{fn.name}:{node.lineno}")
+        assert not offenders, (
+            f"bus emit outside _audit, so a PutEvents failure can abort a settle again: "
+            f"{offenders}")
+        assert "_audit(" in (REPO / "orchestration/resume_pipeline/handler.py").read_text(), \
+            "the wrapper is unused -- this guard would pass on a handler that emits nothing"
+
 
 # ---------------------------------------------------------------------------
 # webhook
@@ -4031,13 +4105,36 @@ class TestConductorDispatch:
 
         Derived in the direction that matters: every `params.*_model_id` any prompt
         reads must be a key the driver actually injects.
+
+        The match is deliberately wider than `*_model_id` so a prompt reading
+        `params.judge_model` cannot slip past it, which means it also catches model params
+        that are legitimately NOT the driver's to inject. Those are named one at a time
+        below with the authority that supplies them -- an exception list, not a loosened
+        pattern, and each entry is checked to be real in both directions.
         """
+        # A model param a SIGNED PLAN supplies. `model_artifact_uri` is not a model
+        # identity `manifest.models` could resolve: it is the S3 location of an artifact a
+        # PREVIOUS run already produced and paid for, and the only authority that can name
+        # WHICH artifact a re-judge re-scores is the plan authorising that re-judge. The
+        # driver injecting it would be the bug #20 shape inverted -- execution-path
+        # boilerplate standing in for a human's choice of what is being measured.
+        plan_supplied = {"model_artifact_uri"}
+        for name in sorted(plan_supplied):
+            assert name not in start_pipeline.PLAN_META_KEYS, (
+                f"{name} is exempted here as plan-supplied but PLAN_META_KEYS strips it "
+                "out of a plan's params, so nothing would reach the agent")
+            assert any(f"params.{name}" in
+                       json.loads(cfg.read_text())["systemPrompt"][0]["text"]
+                       for cfg in (REPO / "agents").glob("*/harness.json")), (
+                f"{name} is exempted here but no prompt reads it -- drop the exemption "
+                "rather than leaving a hole shaped like a param that no longer exists")
+
         supplied = set(driver.MODEL_PARAM_FOR_ROLE.values())
         assert supplied, "the driver no longer injects any approved model param"
         for cfg in sorted((REPO / "agents").glob("*/harness.json")):
             text = json.loads(cfg.read_text())["systemPrompt"][0]["text"]
             read = set(re.findall(r"params\.([a-z_]*model[a-z_]*)", text))
-            unsupplied = sorted(read - supplied)
+            unsupplied = sorted(read - supplied - plan_supplied)
             assert not unsupplied, (
                 f"{cfg.parent.name}: the prompt reads {unsupplied} but the driver "
                 f"supplies only {sorted(supplied)}. An agent that reads an absent model "
@@ -4228,6 +4325,12 @@ class TestConductorDispatch:
             "latency_p50_target_ms": "plan",
             "pipeline_mode": "plan",
             "variance_threshold_pct": "plan",
+            # eval_only's two prerequisites. Only a plan can name WHICH artifact a re-judge
+            # re-scores, and start-pipeline refuses the dispatch outright when either is
+            # missing (MODE_REQUIRED_PARAMS) rather than starting a run whose only legal
+            # ending is an escalation.
+            "model_artifact_uri": "plan",
+            "source_run_id": "plan",
         }
         read = {}
         for cfg in sorted((REPO / "agents").glob("*/harness.json")):
@@ -4925,6 +5028,173 @@ class TestConductorDispatch:
         # the audit run must complete WITHOUT reaching any GPU stage
         assert audit["Next"] == "Complete"
 
+    def test_state_machine_eval_only_re_judges_without_reaching_a_training_stage(self):
+        """eval_only exists to re-score an artifact an earlier run already paid for.
+
+        Its whole value is that it spends no GPU on training, so the guard has to be
+        mode-aware: a plain reachability walk from the eval entry sees BOTH branches of
+        every Choice and therefore reaches RemediateFinetune, which is exactly the state
+        this mode must not be able to enter. So Choice states that test `$.pipeline_mode`
+        are resolved for this mode and the rest are left open -- meaning the walk still
+        explores a gate pass and a gate fail, and only the mode conditions are honoured.
+
+        Red without `EvalOnlyStopChoice`: a gate fail falls into RemediationChoice ->
+        IncrementIteration -> RemediateFinetune, launching a training job in a mode whose
+        entry deliberately skipped training, against a manifest with no finetune stage in
+        it to remediate. A gate pass falls into Deploy, standing up an endpoint off a
+        re-measurement nobody approved as a deployment.
+        """
+        asl = json.loads((REPO / "orchestration/state_machine.asl.json").read_text())
+        states = asl["States"]
+
+        def reachable_in_mode(mode, start=None, seen=None):
+            """Reachability with `$.pipeline_mode`-testing Choices resolved to `mode`."""
+            if seen is None:
+                seen = set()
+            if start is None:
+                start = asl["StartAt"]
+            if start in seen:
+                return seen
+            seen.add(start)
+            st = states[start]
+            exits = _exits(st)
+            if st.get("Type") == "Choice":
+                mode_branches = [c for c in st.get("Choices", [])
+                                 if _tests_pipeline_mode(c)]
+                if mode_branches:
+                    taken = [c["Next"] for c in mode_branches if _mode_of(c) == mode]
+                    exits = taken or ([st["Default"]] if "Default" in st else [])
+            for nxt in exits:
+                reachable_in_mode(mode, nxt, seen)
+            return seen
+
+        def _tests_pipeline_mode(choice):
+            return any(r.get("Variable") == "$.pipeline_mode"
+                       for r in choice.get("And", [choice]))
+
+        def _mode_of(choice):
+            for r in choice.get("And", [choice]):
+                if r.get("Variable") == "$.pipeline_mode" and "StringEquals" in r:
+                    return r["StringEquals"]
+            return None
+
+        eval_only = reachable_in_mode("eval_only")
+        # The guard is only meaningful if the mode is actually routed somewhere distinct.
+        assert "EvalGenerate" in eval_only, "eval_only never reaches the eval stage"
+        full = reachable_in_mode("full")
+        assert "DataPrepGenerate" in full and "RemediateFinetune" in full, (
+            "the mode-resolving walk lost the full path, so it proves nothing about "
+            "eval_only being narrower")
+        # The line above is NOT sufficient, and a mutation proved it: pointing this new
+        # Choice's Default at Complete stops the FULL pipeline at the gate -- never
+        # deploying, never remediating -- and the assertion still passed, because
+        # RemediateFinetune stays reachable through FinetuneLaunch's Catch. A sanity check
+        # satisfied by an unrelated path is not a sanity check. What must survive is the
+        # GATE's own routing, so name the states only a gate verdict leads to.
+        assert "QualityGateChoice" in full, (
+            "in full mode the gate verdict is no longer consulted: EvalOnlyStopChoice's "
+            "Default must fall through to it, or every run ends at the report regardless "
+            "of whether it passed")
+        assert "Deploy" in full, "a passing full run can no longer reach Deploy"
+
+        def harnesses(names):
+            return {((states[n].get("Parameters") or {}).get("Payload") or {})
+                    .get("harness_id")
+                    for n in names} - {None}
+
+        forbidden = {"llmops_data_prep", "llmops_finetune"} & harnesses(eval_only)
+        assert not forbidden, (
+            f"eval_only can reach {sorted(forbidden)}: this mode is dispatched with no "
+            "corpus and no training stage in its manifest, so a GPU stage here spends "
+            "money on a run that cannot use the result")
+        assert "Deploy" not in eval_only, (
+            "a passing re-judge reaches Deploy -- re-measuring an artifact is not "
+            "approval to serve it, and the plan a human signed in this mode bought a "
+            "number, not an endpoint")
+        # and it must still be able to finish: a mode that cannot succeed is not a mode
+        assert _reaches(states, "EvalGenerate", "Succeed")
+
+    def test_every_pipeline_mode_the_machine_routes_on_is_one_the_dispatcher_knows(self):
+        """The ASL's modes and start-pipeline's knowledge of them must not drift apart.
+
+        The machine routes on a string it reads out of the execution input; the dispatcher
+        is the only thing that puts it there and the only place that can refuse a mode
+        whose inputs are missing. A mode in one and not the other is the `data_audit`
+        regression again -- that key was dropped on the way in while the Choice still
+        branched on it, so a customer who bought a cheap audit had GPUs provisioned.
+        """
+        asl = json.loads((REPO / "orchestration/state_machine.asl.json").read_text())
+        routed = set()
+        for st in asl["States"].values():
+            for c in st.get("Choices", []):
+                for rule in c.get("And", [c]):
+                    if rule.get("Variable") == "$.pipeline_mode" and "StringEquals" in rule:
+                        routed.add(rule["StringEquals"])
+        assert routed, "no state routes on pipeline_mode at all"
+        known = set(start_pipeline.MODE_REQUIRED_PARAMS) | {"full", "data_audit"}
+        assert routed <= known, (
+            f"the state machine routes on {sorted(routed - known)}, which start-pipeline "
+            "does not know: nothing validates that mode's inputs, and nothing documents "
+            "what it needs")
+        # every mode with prerequisites must be one the machine actually routes on
+        assert set(start_pipeline.MODE_REQUIRED_PARAMS) <= routed, (
+            f"{sorted(set(start_pipeline.MODE_REQUIRED_PARAMS) - routed)} has "
+            "prerequisites declared but no Choice branches on it, so the dispatcher "
+            "gatekeeps a mode that would run the default full pipeline anyway")
+
+    def test_eval_only_is_refused_without_the_artifact_it_would_re_judge(self):
+        """A mode that can only escalate must be refused before it becomes a run.
+
+        eval_only skips data-prep and finetune, so the eval agent has neither a fallback
+        val split (curate writes it) nor a finetune stage entry naming the model artifact.
+        Starting anyway produces a manifest, a runs-table row and a PipelineStarted event
+        that all assert work is under way that the pipeline cannot do -- and the failure
+        surfaces inside an agent turn, where it reads as an agent defect.
+        """
+        good = {"pipeline_mode": "eval_only",
+                "model_artifact_uri": "s3://b/runs/run-x/finetune/model.tar.gz",
+                "customer_eval_uri": "s3://b/customer-data/t/eval.jsonl"}
+        m = start_pipeline.seed_manifest("run-y", "conductor", {}, good)
+        assert m["params"]["model_artifact_uri"] == good["model_artifact_uri"]
+
+        for drop in ("model_artifact_uri", "customer_eval_uri"):
+            plan = {k: v for k, v in good.items() if k != drop}
+            with pytest.raises(ValueError) as e:
+                start_pipeline.seed_manifest("run-y", "conductor", {}, plan)
+            msg = str(e.value)
+            assert drop in msg and "eval_only" in msg, (
+                f"the refusal for a missing {drop} must name both the param and the "
+                f"mode, got: {msg}")
+        # an empty string is the same absence: a plan template with the key left blank
+        blank = {**good, "model_artifact_uri": ""}
+        with pytest.raises(ValueError):
+            start_pipeline.seed_manifest("run-y", "conductor", {}, blank)
+        # and the prerequisites must not leak onto the modes that do not declare them
+        for mode in ("full", "data_audit"):
+            start_pipeline.seed_manifest("run-y", "conductor", {},
+                                         {"pipeline_mode": mode, "source_uri": "s3://b/d"})
+
+    def test_the_eval_prompt_is_told_where_the_artifact_comes_from_in_eval_only(self):
+        """The mode is only real if the agent knows what changes about its inputs.
+
+        The prompt normally finds the model through this run's own finetune stage. In
+        eval_only that stage does not exist, and the failure mode if the prompt is silent
+        is the worst kind of plausible: the agent picks the newest artifact in the bucket
+        and reports a score that looks like a re-measurement of the artifact the plan
+        named. So the prompt must name the param, and must forbid the fallback.
+        """
+        text = json.loads((REPO / "agents/eval/harness.json").read_text())
+        text = text["systemPrompt"][0]["text"]
+        assert "eval_only" in text and "params.model_artifact_uri" in text, (
+            "the eval prompt does not mention the mode or the param it depends on")
+        # the sentence that forbids guessing, and the one that says the run stops here
+        low = text.lower()
+        for phrase, why in (("escalate", "an absent artifact uri must escalate"),
+                            ("never fall back", "guessing an artifact must be forbidden"),
+                            ("neither deploys", "the prompt must say the run stops at the "
+                                                "verdict, so the report IS the deliverable")):
+            assert phrase in low, f"{why}: {phrase!r} is missing from the eval prompt"
+
     def test_the_signed_plan_outranks_the_boilerplate_model_defaults(self):
         """Model consent is model-specific: approving a Fable-5 teacher is not approving
         a DeepSeek-R1 one. So the plan a human SIGNED has to beat DEFAULT_MODELS.
@@ -5539,7 +5809,63 @@ def _driver_written_keys() -> list:
                     keys.add(re.sub(r"\{[a-z_]+\}", run, u))
                 continue
             keys.add(re.sub(r"\{[a-z_]+\}", run, raw))
+    keys.update(_dispatched_manifest_keys())
     return sorted(keys)
+
+
+#: Every Lambda that hands the driver a `manifest_uri`, and the harness that dispatch
+#: targets. `_save_manifest` writes whichever key it is GIVEN, so the set of keys the
+#: driver can write is not knowable from the driver's own source -- the f-string scrape
+#: above only ever sees `runs/<run_id>/manifest.json`, which is why the scheduled sweep's
+#: manifest was ungranted for two live sweeps after bug #25 was declared fixed.
+_MANIFEST_DISPATCHERS = (
+    ("monitor_sweep", "orchestration/monitor_sweep/handler.py"),
+    ("finops_reconcile", "orchestration/finops_reconcile/handler.py"),
+)
+
+
+def _harness_reaches_stage_complete(harness_id: str) -> bool:
+    """Whether that harness's prompt can call the tool that triggers the manifest write.
+
+    The filter matters in BOTH directions. finops_reconcile builds
+    `finops/manifests/<period>.json` exactly like the sweep does, but the finops prompt has
+    no `stage_complete` -- it ends at `publish_cost_report` -- so the driver never writes
+    that key, and demanding a grant for it would push this file's other half (no granted
+    pattern nothing writes) into failing. Read from the harness JSON rather than listed
+    here, so adding `stage_complete` to a prompt demands the grant in the same PR.
+    """
+    for path in (REPO / "agents").glob("*/harness.json"):
+        spec = json.loads(path.read_text())
+        if spec.get("harnessName") == harness_id:
+            return "stage_complete" in json.dumps(spec)
+    raise AssertionError(f"no harness declares harnessName {harness_id!r}")
+
+
+def _dispatched_manifest_keys() -> set:
+    """Manifest keys the dispatchers name, obtained by CALLING their payload builders.
+
+    Not by pattern-matching their source: monitor_sweep interpolates a module constant
+    (`{SWEEP_PREFIX}`) into its URI, so the f-string scrape used above would have derived
+    the literal key `{SWEEP_PREFIX}/manifests/...`, matched it against no grant, and failed
+    for a reason that has nothing to do with IAM. A key built by a function is only knowable
+    by running it.
+    """
+    keys = set()
+    for name, rel in _MANIFEST_DISPATCHERS:
+        mod = _load(name, rel)
+        args = {"project": "llmops-agentic-system", "bucket": "llmops-data-test",
+                "region": "us-east-1", "run_id": "sweep-2026-08-12",
+                "task": "reconcile", "period": "2026-08-11", "runs": []}
+        params = inspect.signature(mod.build_payload).parameters
+        payload = mod.build_payload(**{k: v for k, v in args.items() if k in params})
+        assert payload.get("manifest_uri", "").startswith("s3://"), \
+            f"{name}.build_payload no longer names a manifest_uri; the derivation is blind"
+        if not _harness_reaches_stage_complete(payload["harness_id"]):
+            continue
+        keys.add(payload["manifest_uri"][5:].partition("/")[2])
+    assert keys, ("no dispatcher contributed a manifest key -- either every scheduled "
+                  "harness lost stage_complete or this derivation stopped seeing them")
+    return keys
 
 
 def _driver_write_patterns() -> list:
@@ -8886,6 +9212,310 @@ def test_the_power_analysis_numbers_are_recomputable():
         "the observed-zero upper bounds drifted"
 
 
+def test_the_scaling_diagnosis_numbers_reconcile_with_each_other():
+    """The r6c 8B diagnosis is the document that says "stop buying bigger students", so
+    every number in it is recomputed from another number in it rather than trusted.
+
+    Same rule as the power analysis above, one step stricter: the raw judgments live
+    outside the repo (137 items x 2 positions, judged offline against surviving S3
+    artifacts), so what CAN be checked here is internal consistency -- and that is exactly
+    what caught this analysis's real bugs. The first aggregate said 57 items in a 97-item
+    layer, and the tell was not a bad score, it was two counts that would not reconcile.
+    A doc whose parts agree only in prose has the same defect at rest.
+    """
+    doc = (REPO / "deploy/evidence/SCALING_DIAGNOSIS_r6c_8B.md").read_text()
+
+    # 1. The headline table: n must be the outcomes it is made of, judge_score must be the
+    #    tie-credited formula the gate uses, and the interval must be the Wilson interval
+    #    the reformed gate decides by -- read out of the table, not restated here.
+    rows = re.findall(r"^\| (?:in|out-of)-distribution \(`(\w+)`\) \| (\d+) \| (\d+) \| (\d+) \| "
+                      r"(\d+) \| \*\*([0-9.]+)\*\* \| \[([0-9.]+), ([0-9.]+)\]",
+                      doc, re.M)
+    assert len(rows) == 2, "the diagnosis' headline table no longer parses; nothing below is checked"
+    judged = {}
+    for layer, n, w, t, l, score, lo, hi in rows:
+        n, w, t, l = int(n), int(w), int(t), int(l)
+        assert w + t + l == n, f"{layer}: {w}+{t}+{l} outcomes reported under n={n}"
+        successes = w + 0.5 * t
+        assert f"{successes / n:.4f}" == score, (
+            f"{layer}: judge_score {score} is not (wins + 0.5*ties)/n = {successes / n:.4f} "
+            "-- the doc reports a quantity the gate does not compute")
+        z, p = 1.96, successes / n
+        d = 1 + z * z / n
+        centre = (p + z * z / (2 * n)) / d
+        half = (z / d) * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n))
+        assert f"{centre - half:.3f}" == lo and f"{centre + half:.3f}" == hi, (
+            f"{layer}: interval [{lo}, {hi}] is not Wilson 95% at ({successes}, {n}) = "
+            f"[{centre - half:.3f}, {centre + half:.3f}]")
+        judged[layer] = n
+        if layer == "id":
+            assert centre + half < 0.45, (
+                "the ID upper bound no longer clears the 0.45 bar, so the doc's decisive "
+                "FAIL is not what its own numbers say")
+
+    # 2. Judged + unscorable must equal the layer. This is the count that caught the
+    #    idx-collision bug, so it is the one a reader is owed: the acceptance set is
+    #    97 ID + 40 OOD = the 137 answers the run produced, and the four items no judge
+    #    could settle are named individually rather than subtracted silently.
+    unscorable = re.search(r"Unscorable and reported, not scored: (.+?) \(see", doc).group(1)
+    named = re.findall(r"`(id|ood)#\d+`", unscorable)
+    assert "137 student answers" in doc and "97-row ID" in doc
+    for layer, size in (("id", 97), ("ood", 40)):
+        assert judged[layer] + named.count(layer) == size, (
+            f"{layer}: {judged[layer]} judged + {named.count(layer)} unscorable != {size} "
+            "in the layer -- items are vanishing between the table and the set")
+    assert judged["id"] + judged["ood"] + len(named) == 97 + 40 == 137
+
+    # 3. The decontamination chain, arithmetic and all: this is the doc's actual argument,
+    #    and "41%" is the number the four options are ranked against.
+    chain = [int(x) for x in re.findall(r"^ ?-?(\d+) (?:input rows|exact|near|dropped|quality)",
+                                        doc, re.M)]
+    assert chain[:5] == [300, 39, 33, 94, 13], f"the chain no longer reads as stated: {chain}"
+    start, ex, near, decon, qual = chain[:5]
+    assert f"-> {start - ex - near}" in doc and f"-> {start - ex - near - decon}" in doc
+    assert f"{start - ex - near - decon - qual} output rows" in doc
+    train, val = (int(x) for x in re.search(r"\((\d+) train / (\d+) val\)", doc).groups())
+    assert train + val == start - ex - near - decon - qual, (
+        f"{train} train + {val} val != the {start - ex - near - decon - qual} rows curated")
+    assert f"{decon} of the {start - ex - near} surviving rows — " \
+           f"{round(decon / (start - ex - near) * 100)}%" in doc, \
+        "the share deleted for resembling the acceptance set drifted from its own operands"
+
+    # 4. The guardrail-refusal rate, and the cost. A judged item costs two calls, so the
+    #    slot count is derivable; the cost is derivable from the token counts and Opus 5
+    #    list price, which is what makes "I estimated $5 and spent $9.08" auditable rather
+    #    than an apology.
+    slots, pct = re.search(r"\*\*(\d+) of the (?:\d+) \(item, position\) slots — ([0-9.]+)%",
+                           doc).groups()
+    assert f"of the {137 * 2} (item, position) slots" in doc, \
+        "274 slots is 137 items judged in both positions; the doc no longer says so"
+    assert f"{int(slots) / (137 * 2) * 100:.1f}" == pct, "the content_filtered rate drifted"
+    tin, tout = (int(x.replace(",", "")) for x in
+                 re.search(r"\(([\d,]+) input \+ ([\d,]+) output tokens", doc).groups())
+    assert f"${tin * 15 / 1e6 + tout * 75 / 1e6:.2f} of judge" in doc, (
+        "the stated cost is not the token counts at Opus 5 list price ($15/$75 per Mtok) "
+        "-- a cost claim nobody can rederive is the estimate all over again")
+
+
+# ── the measuring instrument itself is pinned, and n stops shrinking silently ─────────
+# Two defects the 8B diagnosis surfaced, both about the ruler rather than the student.
+# (1) The pairwise judge prompt had no home: the eval prompt said "fixed judge prompts"
+# and fixed none, and the mirrored llm-evaluation skill implements only a 1-5 absolute
+# score, so the instrument was re-authored every run. r5's `judge_ties: 0` was read as a
+# fact about the student and was a fact about that run's A-or-B-only prompt. (2) A judge
+# call that is content-filtered, unparseable or truncated produced no verdict, and
+# nothing said what happens to the item -- so `n` shrank and the report still looked
+# complete. Both are now prompt-shape guards, because the prompt is where the
+# methodology lives.
+
+def _eval_instrument_mirror():
+    """The S3 URI the deploy actually uploads the instrument to, derived from the deploy.
+
+    Read out of `ensure_eval_instrument`'s own dry-run rather than restated, so a prompt
+    naming a key nothing mirrors fails here. That failure mode is not hypothetical in this
+    repo: the finetune agent authored its own trainer on every run because the canonical
+    script it was told to download was unreachable, and the prompt and the deploy each
+    looked correct in isolation.
+    """
+    storage = _load("llmops_03_storage_for_eval", "deploy/03_storage.py")
+    got = storage.ensure_eval_instrument(None, "<bucket>", dry=True)
+    files = sorted(p.name for p in (REPO / "pipeline/eval").glob("*") if p.is_file())
+    assert files, "pipeline/eval/ is empty, so there is no instrument to pin"
+    assert len(files) == 1, (
+        f"pipeline/eval/ holds {files}; this guard pins ONE canonical instrument and the "
+        "eval prompt names it by name -- decide which is canonical or teach both sides")
+
+    # The DRY report is not evidence about the upload. Both branches had their own
+    # f-string at first and a mutation proved they could disagree with every guard green:
+    # --dry-run promising code/eval/ while the real PutObject wrote elsewhere is a deploy
+    # path that lies, which is worse than none. So run the real branch against a fake
+    # client and assert the key it actually writes is the one the dry report named.
+    class _FakeS3:
+        def __init__(self):
+            self.written = {}
+
+        def upload_file(self, local, bucket, key):
+            self.written[key] = pathlib.Path(local).read_bytes()
+
+        def get_object(self, Bucket, Key):  # noqa: N803 - boto3's own spelling
+            return {"Body": io.BytesIO(self.written[Key])}
+
+    fake = _FakeS3()
+    real = storage.ensure_eval_instrument(fake, "<bucket>", dry=False)
+    assert sorted(fake.written) == [f"code/eval/{n}" for n in files], (
+        f"the upload branch wrote {sorted(fake.written)}, the dry branch promised "
+        f"{got['to']} -- the two spellings have diverged")
+    for key in fake.written:
+        assert got["to"] + key.rsplit("/", 1)[1] == f"s3://<bucket>/{key}", (
+            f"dry-run reports {got['to']}, the upload writes {key}")
+    # Every field a human reads out of either branch, not just the one this helper returns.
+    # `to` and the file count are what the deploy log shows and what a reviewer checks the
+    # mirror against; both survived a mutation while the upload itself stayed correct, which
+    # is a deploy that did the right thing and reported a different one.
+    assert real["to"] == got["to"], (
+        f"the upload branch reports {real['to']}, the dry branch {got['to']} -- the deploy "
+        "log would name a prefix the deploy did not write")
+    assert got["would"] == f"upload {len(files)} eval instrument files", (
+        f"--dry-run says {got['would']!r} for {len(files)} file(s) in pipeline/eval/")
+    # The digests, recomputed -- not just present. `verified[name] = ""` survived the first
+    # version of this assertion, which checked the KEYS only: a deploy log full of empty
+    # digests would then have read as "instrument pinned, digest recorded".
+    assert set(real["uploaded_and_verified"]) == set(files), \
+        "the deploy no longer reports a digest per instrument file"
+    for name, digest in real["uploaded_and_verified"].items():
+        want = hashlib.sha256((REPO / "pipeline/eval" / name).read_bytes()).hexdigest()
+        assert digest == want, (
+            f"the deploy reports {digest!r} for {name}, its bytes hash to {want} -- "
+            "report.json's judge_prompt_sha256 comes from here, so a wrong or empty digest "
+            "makes 'the same ruler' unfalsifiable")
+    return got["to"] + files[0]
+
+
+def test_the_score_bullet_reads_the_canonical_judge_prompt_instead_of_writing_one():
+    b = _eval_prompt_bullet("score")
+    uri = _eval_instrument_mirror()
+    assert uri in b, (
+        f"the score bullet no longer names {uri} -- the pairwise instrument is then "
+        "re-authored every run and two runs' judge_score are not comparable (r5 reported "
+        "judge_ties: 0 from a prompt that offered no tie)")
+    assert "judge_prompt_sha256" in b, (
+        "the report must carry the instrument's digest; without it 'same ruler' is a claim "
+        "about the past rather than a check a reader can run")
+    assert "do NOT fall back to authoring your own judge prompt" in b, (
+        "an unreadable instrument must stop the stage. Falling back is worse than failing: "
+        "the run continues and emits a number that looks like the last one")
+
+
+def test_the_score_bullet_will_not_let_an_unjudgeable_item_vanish():
+    b = _eval_prompt_bullet("score")
+    for field in ("judge_unscorable", "judge_unscorable_ids"):
+        assert field in b, f"the score bullet no longer requires {field}"
+    assert "counts SCORED items only" in b, (
+        "judge_n must exclude unscorable items explicitly -- the harm here is a silently "
+        "shrinking denominator, and a report that does not say so cannot be audited")
+    assert "never counted as a tie, a win or a loss" in b, (
+        "an unscorable item folded into any verdict is a made-up measurement")
+    assert "stop reason" in b and "maxTokens" in b, (
+        "a reasoning judge bills reasoning as output tokens: at 400 it returns an EMPTY "
+        "text block with stopReason max_tokens, which is not a tie. The prompt must make "
+        "that visible rather than leave it to be inferred")
+
+
+def test_the_gate_bullet_asks_whether_the_unscored_items_could_change_its_answer():
+    b = _eval_prompt_bullet("gate")
+    for imputation in ("as a win", "as a loss", "as a tie"):
+        assert imputation in b, (
+            f"the gate bullet no longer imputes unscorable items {imputation} -- a fixed "
+            "tolerance cannot answer whether the missing items matter, and the missingness "
+            "is not random (the filter clusters on credential and access content)")
+    assert "identical under all three" in b and "escalate_human" in b, (
+        "the rule must be decision-relevance: proceed when the verdict cannot move, "
+        "escalate when it can")
+
+
+def test_the_deploy_refuses_an_instrument_that_did_not_land_intact():
+    """A read-back that is never allowed to differ is not a verification.
+
+    `_eval_instrument_mirror`'s fake client echoes back exactly what it stored, so its
+    `got != body` branch is unreachable there -- defanging that check to `got is None`
+    survived a mutation with the whole eval suite green. This is the other half: a client
+    whose GetObject returns something else must stop the deploy, because the point of the
+    read-back is the case where S3 holds bytes the repo does not.
+    """
+    storage = _load("llmops_03_storage_readback", "deploy/03_storage.py")
+
+    class _LyingS3:
+        def upload_file(self, local, bucket, key):
+            pass
+
+        def get_object(self, Bucket, Key):  # noqa: N803 - boto3's own spelling
+            return {"Body": io.BytesIO(b"not what the repo holds")}
+
+    with pytest.raises(SystemExit) as e:
+        storage.ensure_eval_instrument(_LyingS3(), "<bucket>", dry=False)
+    assert "read-back mismatch" in str(e.value), (
+        f"the deploy exited with {e.value!r} instead of naming the mismatch -- the judge "
+        "prompt's digest is recorded from local bytes, so an upload that silently did not "
+        "land makes every run's judge_prompt_sha256 a claim about the wrong file")
+
+
+def test_the_deploy_refuses_to_mirror_an_empty_instrument_directory(tmp_path):
+    """An empty mirror is the failure this whole file exists to prevent, so it must be loud.
+
+    The eval prompt is told to escalate rather than author its own judge prompt, so a
+    successful deploy that uploaded nothing would stall every scoring stage with a message
+    about S3 rather than about the deploy. Exercised by loading the deploy module beside an
+    empty pipeline/eval/, since the source directory is derived from the module's own path.
+    """
+    d = tmp_path / "deploy"
+    d.mkdir()
+    (tmp_path / "pipeline" / "eval").mkdir(parents=True)
+    copy = d / "03_storage.py"
+    copy.write_bytes((REPO / "deploy/03_storage.py").read_bytes())
+    storage = _load("llmops_03_storage_empty_eval", str(copy))
+
+    for dry in (True, False):
+        with pytest.raises(SystemExit) as e:
+            storage.ensure_eval_instrument(None, "<bucket>", dry=dry)
+        assert "pipeline/eval/ is empty" in str(e.value), (
+            f"dry={dry} exited with {e.value!r}; the refusal must name the empty directory")
+
+
+def test_the_canonical_judge_instrument_is_internally_consistent():
+    """The instrument file's own numbers, recomputed. Same rule as the diagnosis doc it
+    was extracted from: a worked example nobody derives is prose, and this one exists to
+    let a reader calibrate a rule that deliberately did NOT fire on the run that motivated
+    it -- so the rows must genuinely all reach the same verdict."""
+    doc = (REPO / "pipeline/eval/judge_prompt_pairwise.md").read_text()
+
+    # The four substitutions, and only those four: anything else varying between runs is
+    # the drift this file exists to stop.
+    assert re.search(r"there are exactly four", doc)
+    placeholders = set(re.findall(r"\{(\w+)\}", doc))
+    assert placeholders == {"task_description", "prompt", "a", "b"}, (
+        f"the instrument's substitution set is {sorted(placeholders)}; the prompt body and "
+        "the rule above it must agree on exactly which four vary")
+    assert '"winner": "A" | "B" | "tie"' in doc, (
+        "the verdict set is the whole finding: an A-or-B-only instrument produced r5's "
+        "judge_ties: 0 and a 38-point shift in the reported tie rate")
+
+    rows = re.findall(r"^\| (ID|OOD) \| ([a-z= ]+) \| (\d+) \| (\d+) \| (\d+) \| (\d+) \| "
+                      r"([0-9.]+) \| \[([0-9.]+), ([0-9.]+)\] \| (\w+) \|", doc, re.M)
+    assert len(rows) == 8, (
+        f"the worked example parses as {len(rows)} rows, not 8 (2 layers x as-scored plus "
+        "three imputations); nothing below is checked otherwise")
+    verdicts = {}
+    for layer, imputation, n, w, t, l, score, lo, hi, verdict in rows:
+        n, w, t, l = int(n), int(w), int(t), int(l)
+        assert w + t + l == n, f"{layer}/{imputation}: {w}+{t}+{l} outcomes under n={n}"
+        successes = w + 0.5 * t
+        assert f"{successes / n:.4f}" == score, (
+            f"{layer}/{imputation}: {score} is not (wins + 0.5*ties)/n = {successes / n:.4f}")
+        z, p = 1.96, successes / n
+        d = 1 + z * z / n
+        centre = (p + z * z / (2 * n)) / d
+        half = (z / d) * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n))
+        assert f"{centre - half:.3f}" == lo and f"{centre + half:.3f}" == hi, (
+            f"{layer}/{imputation}: [{lo}, {hi}] is not Wilson 95% at ({successes}, {n}) = "
+            f"[{centre - half:.3f}, {centre + half:.3f}]")
+        # The verdict column must be what the gate's own rule returns at the 0.45 bar,
+        # not a label. This is the assertion that makes the table an example of the RULE
+        # rather than a table that happens to sit under it.
+        expect = "PASS" if centre - half >= 0.45 else \
+                 ("FAIL" if centre + half < 0.45 else "BORDERLINE")
+        assert verdict == expect, (
+            f"{layer}/{imputation}: the row says {verdict}, the Wilson rule at bar 0.45 "
+            f"says {expect}")
+        verdicts.setdefault(layer, set()).add(verdict)
+    for layer, seen in verdicts.items():
+        assert len(seen) == 1, (
+            f"{layer}: the imputations disagree ({sorted(seen)}), so this run WOULD have "
+            "escalated and the doc's claim that the rule stayed quiet is false")
+    assert "would NOT have fired" in doc, (
+        "the calibration point is that the rule was silent here; if the numbers ever say "
+        "otherwise, the prose has to change with them")
+
+
 # ── the non-run heartbeat and its resurrection (#37) ─────────────────────────────────
 # A triage runs under `triage-<subject>` and deliberately has no run row, so for as
 # long as the resurrector's only eye was the runs table, a dead triage was unrevivable:
@@ -9039,6 +9669,32 @@ class TestNonRunResurrection:
         assert not left, (
             "the cap-exhausted item survived its escalation -- every 15-minute sweep "
             "re-escalates it forever")
+
+    def test_the_sweep_reports_what_it_checked_because_nothing_reads_its_return(
+            self, capsys):
+        """Verified live on 2026-08-12: 23 post-deploy invocations, 0 errors -- which
+        proves the Query is PERMITTED, and nothing more. The schedule invokes this
+        Lambda asynchronously, so the returned counts are discarded, and an idle sweep
+        was indistinguishable in CloudWatch from a Query against the wrong partition:
+        both are START/END/REPORT and silence. The non-run half's healthy state is
+        `0 beats` on every day no triage is dead, so a count nobody can read is the
+        whole audit trail missing."""
+        self._run([_liveness_item(minutes_old=5)])
+        line = [l for l in capsys.readouterr().out.splitlines()
+                if l.startswith("[resurrector] ")]
+        assert len(line) == 1, f"expected exactly one summary line, got {line}"
+        got = json.loads(line[0][len("[resurrector] "):])
+        assert got["checked_liveness"] == 1, (
+            "the printed count must be the number of beats the Query actually returned; "
+            f"got {got}")
+        assert got["acted"] == [], "a fresh beat is not an action"
+
+    def test_the_summary_line_names_the_beat_it_revived(self, capsys):
+        """The counts alone would let a resurrection go unlogged, which is the one event
+        in this Lambda worth reconstructing after the fact."""
+        self._run([_liveness_item()])
+        out = capsys.readouterr().out
+        assert "triage-run-x" in out and "resurrected" in out, out
 
 
 # ── a platform outage is not the agent's answer ──────────────────────────────────────
@@ -9214,3 +9870,273 @@ def test_the_prompts_hyperparameter_contract_matches_the_scripts_argparse():
         f"the launch bullet names {sorted(missing)} but the canonical script's "
         "argparse does not define them -- the launch will pass hyperparameters the "
         "trainer silently drops or crashes on")
+
+
+# ── the alarms: who notices, and how long the silence may last ──────────────────────
+# Measured before any of this was written: between 2026-07-29 and 2026-08-12 Lambda
+# DROPPED 19 async invocations (llmops-harness-driver 11, llmops-resume-pipeline 8) and
+# there was not one CloudWatch alarm on any function in this system. Every failure was
+# found by a human reading logs -- the 2026-08-08 drop nine hours later, the 2026-08-11
+# PutEvents AccessDenied a day later. These guards pin the three things the alarm deploy
+# must not get wrong: coverage, the silence rule, and where the message goes.
+
+def _obs_mod():
+    return _load("deploy_observability", "deploy/06_observability.py")
+
+
+def _alarm_plans(topic="arn:aws:sns:us-east-1:TESTACCTID00:llmops-escalations"):
+    """The exact kwargs the deploy would hand CloudWatch (dry=False, fake client)."""
+    class _CW:
+        def __init__(self):
+            self.puts = []
+
+        def put_metric_alarm(self, **kw):
+            self.puts.append(kw)
+
+    cw = _CW()
+    _obs_mod().alarms(cw, topic, dry=False)
+    return cw.puts
+
+
+def _default_enabled_schedules():
+    """The schedules 08_triggers.py creates ENABLED when run with no flags.
+
+    Derived from the call sites, not copied from them: a schedule passed
+    `not args.no_*` (a store_true defaulting False) ships enabled, while one passed
+    `args.enable_schedule` ships DISABLED and has to be opted into. Flipping either
+    default in the deploy script therefore reds this file instead of silently
+    changing what the alarms mean.
+    """
+    tree = ast.parse(_deploy_src_orch("08_triggers.py"))
+    consts = {n.targets[0].id: n.value.value for n in ast.walk(tree)
+              if isinstance(n, ast.Assign) and isinstance(n.value, ast.Constant)
+              and isinstance(n.targets[0], ast.Name)
+              and n.targets[0].id.endswith("SCHEDULE_NAME")}
+    named = {}
+    for fn in [n for n in ast.walk(tree)
+               if isinstance(n, ast.FunctionDef) and n.name.startswith("ensure_")
+               and "schedule" in n.name]:
+        used = [consts[x.id] for x in ast.walk(fn)
+                if isinstance(x, ast.Name) and x.id in consts]
+        if used:
+            named[fn.name] = used[0]
+    assert len(named) == 4, f"expected 4 schedule creators in 08_triggers.py, got {named}"
+    enabled = set()
+    for call in [n for n in ast.walk(tree) if isinstance(n, ast.Call)]:
+        fname = getattr(call.func, "id", "")
+        if fname in named and len(call.args) >= 4:
+            if ast.unparse(call.args[3]).startswith("not args."):
+                enabled.add(named[fname])
+    return enabled
+
+
+#: Every deploy script that creates a Lambda, and how to read the names out of it. Two
+#: entries because the system has two deployers, which is the finding: the alarm census
+#: was derived from 07_lambdas.py alone and the console's function -- created by a shell
+#: script, 17,007 invocations in three days -- was the eighth Lambda nobody watched. The
+#: patterns deliberately differ from the deployer's own parse routes (ast for LAMBDAS, a
+#: shell variable for the console) so a parser that quietly returns a short list is
+#: caught by a second reader rather than agreed with.
+_LAMBDA_DEPLOYERS = {
+    "07_lambdas.py": r'"fn":\s*"([^"]+)"',
+    "console/deploy.sh": r"^FN=([A-Za-z0-9_.-]+)\s*$",
+}
+
+
+def _all_deployed_lambda_names():
+    found = {}
+    for path, pattern in _LAMBDA_DEPLOYERS.items():
+        names = set(re.findall(pattern, _deploy_src_orch(path), re.M))
+        assert names, f"{path}: /{pattern}/ matched no function name -- the regex broke"
+        found[path] = names
+    return found
+
+
+def test_every_lambda_any_deploy_script_creates_has_an_errors_alarm():
+    """Coverage is DERIVED from every deployer, not from the biggest one.
+
+    A hand-kept alarm list is how the eighth Lambda becomes the one nobody watches: the
+    function ships, the list is not touched, and nothing anywhere says a name is
+    missing. Deriving the list fixed the hand-keeping and left the eighth Lambda
+    unwatched anyway, because the derivation read ONE deploy script: measured
+    2026-08-12, the account ran 8 llmops functions against 7 alarms, and the missing one
+    was llmops-admin -- the console every plan signature and human verdict goes through,
+    17,007 invocations in three days, no alarm of any family. "What 07_lambdas.py
+    deploys" was never a wrong answer; it was an answer to a narrower question than the
+    one the docstring claimed.
+    """
+    per_file = _all_deployed_lambda_names()
+    assert len(per_file["07_lambdas.py"]) >= 7, per_file["07_lambdas.py"]
+    fns = set().union(*per_file.values())
+    assert len(fns) >= 8, f"expected at least 8 deployed functions, found {sorted(fns)}"
+    alarmed = {p["Dimensions"][0]["Value"] for p in _alarm_plans()
+               if p["MetricName"] == "Errors"}
+    assert alarmed == fns, (
+        f"Lambdas with no errors alarm: {sorted(fns - alarmed)}; alarms for functions "
+        f"the deploy does not create: {sorted(alarmed - fns)}")
+
+
+def test_no_third_deploy_script_creates_a_lambda_the_census_cannot_see():
+    """The guard against the NINTH Lambda, which is the same bug one deployer later.
+
+    _LAMBDA_DEPLOYERS is two entries of knowledge about where Lambdas come from, and
+    knowledge like that goes stale silently -- a new deployer means a new function with
+    no alarm, and nothing in the census can notice a file it was never told to read. So
+    the set of files that create Lambdas is derived from the deploy tree itself: any file
+    calling create-function / create_function must be a file the census knows how to
+    read. Adding a deployer therefore reds here instead of shipping an unwatched
+    function, which is exactly what happened the first time.
+    """
+    creators = set()
+    for path in sorted((REPO / "deploy").rglob("*")):
+        if not path.is_file() or path.suffix not in (".py", ".sh"):
+            continue
+        if "evidence" in path.parts:      # write-ups quote commands, they run nothing
+            continue
+        text = path.read_text(errors="ignore")
+        if "create-function" in text or "create_function" in text:
+            creators.add(str(path.relative_to(REPO / "deploy")))
+    assert creators == set(_LAMBDA_DEPLOYERS), (
+        f"deploy scripts that create Lambdas: {sorted(creators)}; the alarm census "
+        f"knows: {sorted(_LAMBDA_DEPLOYERS)}. Teach _LAMBDA_DEPLOYERS and "
+        "06_observability.py how to read the new one, or its function ships unwatched")
+
+
+def test_the_console_lambda_gets_the_errors_family_only():
+    """It is neither scheduled nor async-invoked, and both of the other families lie.
+
+    A `-silent` alarm on the console would sit in ALARM on any night nobody signs a
+    plan, and an `-async-dropped` alarm would sit in INSUFFICIENT_DATA forever because
+    API Gateway invokes it synchronously -- there is no async queue to drop from. Both
+    failure modes teach an operator to ignore the set, which is what the silence family's
+    own comment says about llmops-start-pipeline.
+    """
+    obs = _obs_mod()
+    console = obs.console_function()
+    assert console == "llmops-admin", console
+    families = {p["AlarmName"].removeprefix(console + "-")
+                for p in _alarm_plans()
+                if p["Dimensions"][0]["Value"] == console}
+    assert families == {"errors"}, (
+        f"the console Lambda has alarm families {sorted(families)}; only `errors` can "
+        "ever report on a synchronously-invoked, unscheduled function")
+
+
+#: How each ARCHITECTURE variant states the alarm count, and the words to read it with.
+#: Both write it as a WORD, so the check is a lookup rather than a `\d+` search -- and the
+#: sentence is pinned by the prose around it because that paragraph also names 19 drops,
+#: three families and 17,007 invocations: any number found loose in it proves nothing.
+_ALARM_COUNT_CLAIMS = {
+    "docs/ARCHITECTURE.md": (r"--alarms` now creates (\w+), in three families", "en"),
+    "docs/ARCHITECTURE.zh-TW.md": (r"--alarms` 現在建立([一二三四五六七八九十]+)個 alarm",
+                                   "zh"),
+}
+_ALARM_COUNT_WORDS = {
+    11: {"en": "eleven", "zh": "十一"}, 12: {"en": "twelve", "zh": "十二"},
+    13: {"en": "thirteen", "zh": "十三"}, 14: {"en": "fourteen", "zh": "十四"},
+    15: {"en": "fifteen", "zh": "十五"}, 16: {"en": "sixteen", "zh": "十六"},
+}
+
+
+def test_the_documented_alarm_count_matches_the_alarms_the_deploy_creates():
+    """The count in the prose is the one number in this section nothing derived.
+
+    It was written as twelve when the deploy created twelve, and the eighth Lambda's
+    errors alarm made it thirteen -- a sentence that was measured once reads as measured
+    forever, and this paragraph is where a reader goes to learn what is watched. Both
+    languages, in the same commit: a count fixed in one is worse than one stale in both,
+    because it reads as verified in whichever the reader happens to open.
+    """
+    n = len(_alarm_plans())
+    assert n in _ALARM_COUNT_WORDS, f"{n} alarms: extend _ALARM_COUNT_WORDS in this guard"
+    for name, (pattern, lang) in _ALARM_COUNT_CLAIMS.items():
+        m = re.search(pattern, (REPO / name).read_text())
+        assert m, f"{name}: no alarm-count sentence for /{pattern}/ to read"
+        assert m.group(1) == _ALARM_COUNT_WORDS[n][lang], (
+            f"{name} says the deploy creates {m.group(1)!r} alarms; alarms() plans {n} "
+            f"({_ALARM_COUNT_WORDS[n][lang]})")
+
+
+def test_the_silence_alarms_are_exactly_the_schedules_that_ship_enabled():
+    """An alarm that is always ALARM trains the operator to ignore all of them.
+
+    `llmops-nightly` ships DISABLED on purpose (--enable-schedule opts in), so
+    llmops-start-pipeline is invoked zero times a day BY DESIGN. A silence alarm on it
+    would go to ALARM at deploy and stay there, and the first thing anyone learns from
+    a permanently red alarm is not to look at this account's alarms at all.
+    """
+    obs = _obs_mod()
+    assert set(obs.SILENCE_ALARMS) == _default_enabled_schedules(), (
+        f"silence alarms {sorted(obs.SILENCE_ALARMS)} vs schedules that actually ship "
+        f"enabled {sorted(_default_enabled_schedules())}")
+    silent = {p["Dimensions"][0]["Value"] for p in _alarm_plans()
+              if p["AlarmName"].endswith("-silent")}
+    assert "llmops-start-pipeline" not in silent, (
+        "a silence alarm on the nightly's target would sit in ALARM forever")
+    assert silent == {s["fn"] for s in obs.SILENCE_ALARMS.values()}
+
+
+def test_a_silence_alarm_treats_missing_data_as_breaching():
+    """The one setting this family cannot get wrong.
+
+    A Lambda nobody invoked publishes NO `Invocations` datapoint -- not a zero. With
+    the ordinary `notBreaching`, "no data" reads as "fine", the alarm never leaves
+    INSUFFICIENT_DATA, and the exact condition it exists to detect (the schedule
+    stopped firing) is the condition it cannot see. `breaching` is what makes absence
+    the signal.
+    """
+    for p in _alarm_plans():
+        want = "breaching" if p["AlarmName"].endswith("-silent") else "notBreaching"
+        assert p["TreatMissingData"] == want, (
+            f"{p['AlarmName']} treats missing data as {p['TreatMissingData']!r}, "
+            f"expected {want!r}")
+        if p["AlarmName"].endswith("-silent"):
+            assert p["ComparisonOperator"] == "LessThanThreshold", (
+                f"{p['AlarmName']} alarms on {p['ComparisonOperator']} -- a silence "
+                "alarm fires when invocations fall BELOW one")
+
+
+def test_every_alarm_notifies_the_escalation_topic_and_nothing_on_recovery():
+    """An alarm with no action is a dashboard nobody opens.
+
+    Same SNS topic as the pipeline's own ESCALATED_TO_HUMAN path, resolved from the
+    parameter 03_storage.py writes -- one place an operator watches. AlarmActions only:
+    OKActions on a five-minute error alarm turns one flapping invocation into two
+    messages, and the recovery of a stage that already lost its work is not news.
+    """
+    obs = _obs_mod()
+    storage = _deploy_src_orch("03_storage.py")
+    prefix = re.search(r'Name=f"([^"{]*)\{k\}"', storage)
+    assert prefix, "03_storage.py no longer writes its params under an f-string prefix"
+    assert '"escalations_topic_arn"' in storage, (
+        "03_storage.py does not publish an escalations_topic_arn parameter")
+    assert obs.TOPIC_PARAM == prefix.group(1) + "escalations_topic_arn", (
+        f"{obs.TOPIC_PARAM} is not the parameter 03_storage.py publishes "
+        f"({prefix.group(1)}escalations_topic_arn) -- the alarms would notify nothing")
+    topic = "arn:aws:sns:us-east-1:TESTACCTID00:llmops-escalations"
+    plans = _alarm_plans(topic)
+    assert plans, "the alarm deploy planned nothing at all"
+    for p in plans:
+        assert p["AlarmActions"] == [topic], f"{p['AlarmName']} notifies {p['AlarmActions']}"
+        assert p["ActionsEnabled"] is True, f"{p['AlarmName']} has actions disabled"
+        assert "OKActions" not in p, f"{p['AlarmName']} pages on recovery too"
+        assert p["AlarmDescription"].strip(), f"{p['AlarmName']} has no description"
+
+
+def test_the_async_dropped_alarms_name_functions_that_exist():
+    """AsyncEventsDropped only exists for a function something invokes ASYNCHRONOUSLY.
+
+    Both of these are async-delivered (the driver's own turn handoff and the
+    resurrector's re-invoke; EventBridge's job-state delivery to resume), and both are
+    where all 19 observed drops landed. A rename that leaves this list behind gives an
+    alarm on a dimension that never reports -- INSUFFICIENT_DATA forever, which looks
+    exactly like healthy.
+    """
+    obs = _obs_mod()
+    fns = set(re.findall(r'"fn":\s*"([^"]+)"', _deploy_src_orch("07_lambdas.py")))
+    assert set(obs.ASYNC_DELIVERED) <= fns, (
+        f"{sorted(set(obs.ASYNC_DELIVERED) - fns)} is not a function 07_lambdas.py "
+        "deploys")
+    dropped = {p["Dimensions"][0]["Value"] for p in _alarm_plans()
+               if p["MetricName"] == "AsyncEventsDropped"}
+    assert dropped == set(obs.ASYNC_DELIVERED)

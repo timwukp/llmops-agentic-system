@@ -57,7 +57,8 @@ from having none.
 
 The state machine (`orchestration/state_machine.asl.json`) has **12 harness-task states
 on the happy path** — each a `waitForTaskToken` Lambda invocation of the harness driver
-— plus the loop-only `RemediateFinetune` and the audit-only `DataAudit`:
+— plus the loop-only `RemediateFinetune`, the audit-only `DataAudit`, and (in `eval_only`
+mode) an entry that starts partway down this same path, at the eval stage:
 
 ```
 DataPrepGenerate → DataPrepCurate → FinetuneLaunch → FinetuneAnalyze → EvalGenerate → EvalScore → EvalGate
@@ -65,6 +66,25 @@ DataPrepGenerate → DataPrepCurate → FinetuneLaunch → FinetuneAnalyze → E
                               RemediateFinetune ←───────┘   … then, on gate pass:
              Deploy → SmokeTest → MonitorHealth → Teardown → MonitorReport
 ```
+
+**Three entry modes, decided by one `Choice` at `StartAt`** reading `pipeline_mode` out of
+the execution input (it cannot read the manifest from S3, which is why the mode rides in the
+input at all). `full` is the `Default` above. `data_audit` is the conductor's cheap starter:
+audit the customer's data and stop before any GPU exists. **`eval_only`** enters at
+`EvalGenerate` to re-judge an artifact an earlier run already produced and paid for, and
+`EvalOnlyStopChoice` stops it at the gate verdict — a pass does **not** reach `Deploy` and a
+fail does **not** reach `RemediateFinetune`. Both halves of that are deliberate: re-measuring
+an artifact is not approval to serve it, and there is no finetune stage in this manifest to
+remediate, so the remediation path would launch GPU training in the one mode whose entry
+exists to avoid it. The mode is refused at dispatch unless the plan names both
+`model_artifact_uri` (nothing in this run can produce one) and `customer_eval_uri` (the 10%
+val split the eval agent normally falls back to is written by the `curate` task this mode
+skips) — `MODE_REQUIRED_PARAMS` in start-pipeline, because a run that can only escalate
+should never get a run id, a manifest and a `PipelineStarted` event first.
+
+It exists because of r6c: an 8B run produced a 12.2 GiB model, the reformed judge metric had
+to re-score it, and with only `full` and `data_audit` the only way to do that was a script in
+someone's working directory — unversioned, unaudited, and invisible to the runs table.
 
 The two monitor states are placed by the shape of their work, not by taste.
 **`MonitorHealth`** must read CloudWatch *while the endpoint exists*, and `Teardown`
@@ -508,6 +528,41 @@ resurrection count), while a cap-exhausted item escalates against the run the tr
 jobs (sweep, finops) are deliberately **not** revivable: a crashed schedule waits for
 its next schedule rather than re-running non-idempotent work.
 
+That whole loop is now **live-verified against the deployed bundles**, not just unit-tested: `tools/probe_liveness_resurrection.py` downloads what Lambda is serving, drives a synthetic triage through beat → sweep → claim → revive → cap-escalate → terminal delete against the real events table, and passed **18/18** on 2026-08-12. It exists because this is the one path whose healthy state and broken state read identically — a triage dies about once a month, so `checked_liveness: 0` is normal on almost every day, and a Query on the wrong partition, a missing `dynamodb:Query`, or two separately-bundled copies disagreeing about the string `__liveness__` all produce that same reading. See TEST_RESULTS for the six mutants it kills.
+
+Both halves end by **printing** what they checked, because the schedule's invoke is
+asynchronous and the counts the handler returns are read by nobody. That matters most
+for the non-run half, whose healthy state is *zero* beats on any day no triage is dead:
+without the line, a sweep working perfectly and a Query aimed at the wrong partition
+left identical traces — start, end, silence. The printed counts are the standing evidence
+that the partition is read at all.
+
+Printing is not noticing, though, and for a long time nothing did. Between 2026-07-29 and
+2026-08-12 Lambda **dropped 19 async invocations** (driver 11, resume 8) — each one a
+stage that stopped with its token parked — and there was not one CloudWatch alarm on any
+function in this system: the nine-hour death was found by a human reading an execution
+history, the resume Lambda's missing `events:PutEvents` grant by a human reading logs a
+day later. `deploy/06_observability.py --alarms` now creates thirteen, in three families
+that each detect something the others cannot. **`<fn>-errors`** (every function *any*
+deploy script creates, derived from each of them so a new Lambda cannot ship unwatched)
+is the primary detector: every one of those 19 drops landed on a day that also had function
+errors, and resume's ratio is exactly 3 — one attempt plus the two default retries — so
+this family fires first, always. Derived from *each* deploy script rather than one, because
+one was measurably not enough: the census read only `07_lambdas.py`, and the eighth
+function this account runs — `llmops-admin`, the console API every plan signature and every
+human verdict goes through, 17,007 invocations in three days — was created by
+`deploy/console/deploy.sh` and therefore had no alarm of any family until 2026-08-12.
+**`<fn>-silent`** covers the three scheduled functions
+whose *silence* is the failure; `TreatMissingData` must be `breaching` there, because an
+uninvoked Lambda publishes no datapoint rather than a zero, and with the ordinary
+`notBreaching` the alarm would sit in INSUFFICIENT_DATA forever and detect precisely
+nothing. `llmops-start-pipeline` deliberately has none: its nightly schedule ships
+disabled, and a permanently-red alarm teaches an operator to ignore the whole set.
+**`<fn>-async-dropped`** is kept not as an earlier warning but as a different *meaning* —
+an error that retried is self-healed, while a drop is work that is gone. There is no
+`ExecutionsFailed` alarm on the state machine: a run that honestly fails its quality gate
+is this pipeline working, not an incident.
+
 The last exposure that pair does *not* cover is the session's own clock. AgentCore
 reclaims a runtime session at `maxLifetime` = **28800 s (8 h)** — a hard cap that
 activity does not reset and no setting raises. A distillation stage runs 8–12 h in one
@@ -573,6 +628,24 @@ what "gone" means lives in `pipeline/contracts/task_tokens.py` — imported by b
 defined by neither, because two constants in two files agree only until someone edits one.
 The discrimination is unchanged and is the whole point: a throttle or 5xx still raises, so
 the settle can be retried rather than stranding the token for its full `TimeoutSeconds`.
+
+**Describing the work must not be able to cancel it.** Both settle paths above assume the
+settle is *reached*. On 2026-08-11 at 04:22 UTC one was not: `llmops-resume-pipeline` had
+shipped without `events:PutEvents`, so `emit_event(ModelTrained)` — which sat immediately
+*before* `send_task_success`, inside the same `try` — raised `AccessDeniedException`, and a
+successfully-finished training job's stage never learned it had finished. EventBridge
+retried into the same wall twice and the third delivery became an `AsyncEventsDropped`: 6
+errors, 2 drops, `run-20260811T040003Z-3548116f` left with a parked token for the
+resurrector to find. The grant is fixed, but a grant is not the lesson — **the ordering
+that let a missing grant do that is.** The driver has had the opposite rule since #52
+(`test_a_failed_bus_emit_still_settles_the_task_token`); resume's three emits now go
+through the same wrapper, and a source-derived test fails on a fourth emit written the old
+way, so the rule cannot be forgotten one call site at a time. The trade is explicit and
+cheap here: the bus carries exactly one rule (`EscalatedToHuman`, which this Lambda never
+emits), has no archive, and the stage-events table is written by the driver directly — so
+nothing consumes these three events today, while the settle releases a paid-for stage. A
+skipped emit prints, and `llmops-resume-pipeline-errors` (§ alarms) no longer needs that
+print to be a traceback in order to notice.
 
 Live-verified in Phase 3 (two resume-Lambda invocations observed: one on an early failure,
 one on the successful completion; 1.5 s duration, 0 errors) and again hands-off, twice, in

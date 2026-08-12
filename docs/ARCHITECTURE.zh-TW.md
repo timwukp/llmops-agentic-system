@@ -51,7 +51,8 @@ LLM 判斷。因此編排採用 **Step Functions Standard 狀態機**，智能�
 
 狀態機（`orchestration/state_machine.asl.json`）在正常路徑上有 **12 個 harness 任務狀態**
 —— 每個都是帶 `waitForTaskToken` 的 harness driver Lambda 調用 —— 外加只在迴路中出現的
-`RemediateFinetune`，以及只在審計模式出現的 `DataAudit`：
+`RemediateFinetune`、只在審計模式出現的 `DataAudit`，以及（在 `eval_only` 模式下）
+一個從這同一條路徑中途、也就是 eval 階段進場的入口：
 
 ```
 DataPrepGenerate → DataPrepCurate → FinetuneLaunch → FinetuneAnalyze → EvalGenerate → EvalScore → EvalGate
@@ -59,6 +60,22 @@ DataPrepGenerate → DataPrepCurate → FinetuneLaunch → FinetuneAnalyze → E
                               RemediateFinetune ←───────┘   …門檻通過則：
              Deploy → SmokeTest → MonitorHealth → Teardown → MonitorReport
 ```
+
+**三種入口模式，由 `StartAt` 的一個 `Choice` 讀執行輸入裡的 `pipeline_mode` 決定**（它讀不到
+S3 上的 manifest，這正是模式必須搭在輸入裡的原因）。`full` 就是上面那條 `Default`。
+`data_audit` 是指揮家最便宜的開胃菜：稽核客戶資料，然後在任何 GPU 出現之前停下。
+**`eval_only`** 從 `EvalGenerate` 進場，重新評判一個先前 run 已經產出、也已經付過錢的 artifact，
+並由 `EvalOnlyStopChoice` 停在門檻判決上 —— 通過**不會**走到 `Deploy`，失敗也**不會**走到
+`RemediateFinetune`。這兩半都是刻意的：重新量測一個 artifact 不等於批准把它上線；而這份
+manifest 裡根本沒有 finetune 階段可供補救，所以補救路徑只會在「唯一刻意跳過訓練的模式」裡
+開起 GPU 訓練。這個模式在派發時就會被拒絕，除非 plan 同時指名 `model_artifact_uri`（這個 run
+裡沒有任何東西能產出它）與 `customer_eval_uri`（eval agent 平常退回去用的 10% val split，
+是由這個模式跳過的 `curate` 任務寫出來的）—— 見 start-pipeline 的 `MODE_REQUIRED_PARAMS`：
+一個只能走向升級的 run，不該先拿到 run id、manifest 和 `PipelineStarted` 事件。
+
+它的存在來自 r6c：一次 8B 的 run 產出了 12.2 GiB 的模型，改良後的裁決指標必須重算它的分數，
+而在只有 `full` 和 `data_audit` 的時候，唯一的做法是某人工作目錄裡的一支腳本 —— 沒有版本、
+沒有稽核紀錄，在 runs 表裡也看不見。
 
 兩個 monitor 狀態的位置是由工作本身的形狀決定的，不是喜好問題。**`MonitorHealth`** 必須在
 端點還存在時讀 CloudWatch，而 `Teardown` 在每條路徑上都會刪掉它（包含 `SmokeTest` 的
@@ -428,6 +445,35 @@ stale/cap/claim 契約；正常終結會**刪除** item（結束不是死亡，�
 —— 絕不用它自己的 `triage-` id —— 並隨升級一併刪除。排程作業（sweep、finops）刻意
 **不可復活**：崩潰的排程等下一次排程，而不是重跑非冪等的工作。
 
+這整條迴圈現在是**對已部署 bundle 的實測驗證**，不再只是單元測試：`tools/probe_liveness_resurrection.py` 下載 Lambda 現在真正在跑的程式碼，用一個合成 triage 對著真實的 events 表把 beat → sweep → 認領 → 復活 → 上限升級 → 終態刪除整條走完，2026-08-12 **18/18 通過**。它之所以存在，是因為這是唯一一條「健康」與「壞掉」讀起來一模一樣的路徑 —— triage 大約一個月才死一次，所以`checked_liveness: 0` 在幾乎每一天都正常，而「Query 打錯分區」、「少了 `dynamodb:Query`」、「兩個各自打包的副本對 `__liveness__` 這個字串不一致」，會產生完全相同的讀數。它殺掉的六個 mutant 見 TEST_RESULTS。
+
+兩半都會在結束時把「檢查了什麼」**印出來**，因為排程的 invoke 是非同步的，handler
+回傳的計數沒有任何人讀。這對非 run 的那一半尤其重要：只要當天沒有 triage 死掉，它
+的健康狀態就是 *零* 個 beat —— 沒有那行 log，一次完美運作的掃描和一次瞄錯分區的
+Query 留下的痕跡一模一樣：開始、結束、寂靜。印出的計數是「那個分區確實有被讀」的
+唯一常設證據。
+
+不過「印出來」不等於「有人發現」，而很長一段時間裡沒有任何東西發現。2026-07-29 到
+2026-08-12 之間，Lambda **丟掉了 19 次非同步 invoke**（driver 11、resume 8）——每一次
+都是一個 stage 停住、token 還被 park 著——而這個系統的所有函式上，CloudWatch alarm
+一個都沒有：那次九小時的死亡是人翻執行歷史發現的，resume 少掉 `events:PutEvents` 授權
+是人隔了一天翻 log 發現的。`deploy/06_observability.py --alarms` 現在建立十三個 alarm，
+分三族，每一族偵測的東西另外兩族看不到。**`<fn>-errors`**（*任何一支* deploy script 建立
+的每一個函式，而且是從每一支推導出來的，所以新增一個 Lambda 不可能沒人看）是主偵測器：
+那 19 次丟棄全部落在當天也有 function error 的日子，而 resume 的比例正好是 3——一次嘗試
+加上兩次預設重試——所以這一族永遠先響。之所以是從*每一支* deploy script 推導、而不是從
+一支：一支已經被實測證明不夠——原本這份普查只讀 `07_lambdas.py`，於是這個帳號實際跑的
+第八支函式（`llmops-admin`，每一次 plan 簽名與每一次人工裁決都走過的 console API，三天內
+17,007 次 invoke）因為是 `deploy/console/deploy.sh` 建立的，直到 2026-08-12 之前三族
+alarm 一個都沒有。**`<fn>-silent`** 蓋的是三個「沉默本身就是故障」的排程函式；
+那裡的 `TreatMissingData` 必須是 `breaching`，因為沒被 invoke 的 Lambda 送出的是**沒有
+資料點**而不是 0，用平常的 `notBreaching` 這個 alarm 會永遠停在 INSUFFICIENT_DATA，剛好
+偵測不到它存在的唯一理由。`llmops-start-pipeline` 刻意沒有：它的 nightly 排程出廠是關閉
+的，而一個永遠紅著的 alarm 只會教會維運的人忽略整組。**`<fn>-async-dropped`** 留下來不是
+因為它更早，而是因為它的**意義不同**——重試成功的 error 是自己好了，被丟棄則是工作沒了。
+狀態機上沒有 `ExecutionsFailed` alarm：一個誠實地沒過品質門檻的 run，是這條 pipeline 正常
+運作，不是事故。
+
 這對機制唯一蓋不住的，是 session 自己的時鐘。AgentCore 會在 `maxLifetime` =
 **28800 秒（8 小時）**收回 runtime session —— 這是硬上限，活動不會重置它，也沒有設定
 能調高。蒸餾 stage 在單一確定性 session 裡跑 8–12 小時，於是活得比 session 久；跨過
@@ -485,6 +531,22 @@ finetune agent 發起 SageMaker 訓練作業 —— eval agent 的學生推論�
 都不各自定義，因為兩份常數放在兩個檔案裡，只會一致到有人改動其中一份為止。
 那個區分本身沒變，而且正是重點所在：限流或 5xx 依然拋出，讓結算可以被重試，
 而不是把 token 擱置到它完整的 `TimeoutSeconds`。
+
+**「描述這件工作」不該有能力取消這件工作。** 上面兩條結算路徑都預設結算**被執行到**。
+2026-08-11 04:22 UTC 有一次沒有：`llmops-resume-pipeline` 出廠時少了
+`events:PutEvents`，於是 `emit_event(ModelTrained)` —— 它就排在 `send_task_success`
+**前面**、同一個 `try` 裡 —— 拋出 `AccessDeniedException`，一個**成功完成**的訓練作業，
+它的階段從此不知道自己已經完成。EventBridge 對著同一面牆重試兩次，第三次投遞變成
+`AsyncEventsDropped`：6 次錯誤、2 次丟棄，`run-20260811T040003Z-3548116f` 留著一個停放的
+token 等 resurrector 來找。授權已經補上，但授權不是這件事的教訓 ——
+**讓一個缺失的授權能造成這種後果的「順序」才是。** Driver 從 #52 起就有相反的規則
+（`test_a_failed_bus_emit_still_settles_the_task_token`）；resume 的三個 emit 現在走同一個
+包裝函式，而一個從原始碼推導的測試會在「第四個用舊寫法寫的 emit」上失敗 ——
+這條規則無法再被一個呼叫點一個呼叫點地遺忘。這裡的取捨是明講的，而且很便宜：事件匯流排
+上只有一條規則（`EscalatedToHuman`，而這個 Lambda 從不發它）、沒有 archive，
+stage-events 表由 driver 自己寫 —— 所以這三個事件今天沒有任何消費者，而結算釋放的是一個
+已經付過錢的階段。被跳過的 emit 會印出來，而 `llmops-resume-pipeline-errors`
+（見警報一節）不再需要那行輸出是一個 traceback 才能注意到。
 
 Phase 3 實測驗證（觀察到兩次 resume Lambda 調用：一次在早期失敗、一次在成功完成；
 時長 1.5 秒、0 錯誤），Phase 5 又兩次全程無人驗證。

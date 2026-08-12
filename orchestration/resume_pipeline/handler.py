@@ -71,6 +71,35 @@ def find_run_by_job(ddb, job_name: str) -> dict | None:
     return items[0] if items else None
 
 
+def _audit(events_client, detail_type: str, detail: dict) -> None:
+    """Put a bus event whose failure must NOT abort the settle that follows it.
+
+    The driver has had this rule since #52 (its
+    test_a_failed_bus_emit_still_settles_the_task_token): the settle is what releases
+    the state machine, so skipping it because a *description* of the work failed parks
+    a live token until the stage's own 86400 s timeout. This function was the one
+    settle path still missing the rule, and the omission cost
+    run-20260811T040003Z-3548116f: emit_event(MODEL_TRAINED) raised
+    AccessDeniedException (the role shipped without events:PutEvents), the exception
+    aborted send_task_success before it happened, EventBridge retried twice into the
+    same wall, and the third failure became an AsyncEventsDropped — a training job that
+    finished successfully, and a stage that never learned it had. The grant is fixed;
+    what is fixed here is the ordering that let a grant do that at all.
+
+    The trade is explicit: an audit line for a stranded run. Nothing consumes these
+    three events today — the bus carries exactly one rule (EscalatedToHuman, which this
+    function never emits), it has no archive, and the stage-events table holds no
+    MODEL_TRAINED / CAPACITY_STOPPED / PipelineFailed row, because the driver writes
+    that table directly. And the miss is no longer silent: it prints, and
+    llmops-resume-pipeline-errors watches this function.
+    """
+    try:
+        ev.emit_event(os.environ["EVENT_BUS"], detail_type, detail, client=events_client)
+    except Exception as exc:  # noqa: BLE001 — an audit event is never worth the settle
+        print(f"[resume] audit emit {detail_type} FAILED, settling anyway: "
+              f"{type(exc).__name__}: {exc}")
+
+
 def handler(event, context=None, clients=None):
     """event: the EventBridge SageMaker Training Job State Change envelope."""
     c = clients or _clients()
@@ -110,9 +139,9 @@ def handler(event, context=None, clients=None):
             # eval score task emits MODEL_EVALUATED moments later, so eval jobs get
             # no bus event here at all.
             if run.get("current_stage") != "eval":
-                ev.emit_event(os.environ["EVENT_BUS"], ev.MODEL_TRAINED,
-                              {"run_id": run_id, "job_name": job_name,
-                               "model_artifacts": model_uri}, client=c["events"])
+                _audit(c["events"], ev.MODEL_TRAINED,
+                       {"run_id": run_id, "job_name": job_name,
+                        "model_artifacts": model_uri})
             c["sfn"].send_task_success(taskToken=token, output=json.dumps({
                 "run_id": run_id, "job_name": job_name, "status": "trained",
                 "model_artifacts": model_uri}))
@@ -124,9 +153,9 @@ def handler(event, context=None, clients=None):
             # guard; the (CAPACITY_RETRY_CAP+1)th stop falls through to the real
             # failure branch and spends an iteration like any other failure.
             n = int(run.get("capacity_retries") or 0) + 1
-            ev.emit_event(os.environ["EVENT_BUS"], ev.CAPACITY_STOPPED,
-                          {"run_id": run_id, "job_name": job_name,
-                           "capacity_retries": n}, client=c["events"])
+            _audit(c["events"], ev.CAPACITY_STOPPED,
+                   {"run_id": run_id, "job_name": job_name,
+                    "capacity_retries": n})
             c["sfn"].send_task_failure(
                 taskToken=token, error="CapacityStopped",
                 cause=f"job stopped with $0 billed (capacity), free relaunch "
@@ -134,9 +163,9 @@ def handler(event, context=None, clients=None):
             outcome = "capacity-relaunch"
         else:
             reason = detail.get("FailureReason", status)
-            ev.emit_event(os.environ["EVENT_BUS"], ev.PIPELINE_FAILED,
-                          {"run_id": run_id, "job_name": job_name,
-                           "reason": reason}, client=c["events"])
+            _audit(c["events"], ev.PIPELINE_FAILED,
+                   {"run_id": run_id, "job_name": job_name,
+                    "reason": reason})
             c["sfn"].send_task_failure(taskToken=token,
                                        error="TrainingJobFailed", cause=str(reason)[:250])
             outcome = "failed"

@@ -4,7 +4,7 @@
   "States": {
     "PipelineModeChoice": {
       "Type": "Choice",
-      "Comment": "data_audit is the conductor's starter: audit the customer's data and stop — no GPU stage may run. Default full pipeline otherwise.",
+      "Comment": "data_audit is the conductor's starter: audit the customer's data and stop -- no GPU stage may run. eval_only re-enters an artifact a PREVIOUS run already paid for and re-judges it: no data-prep, no training, and it stops at the gate verdict without deploying, because re-measuring is not re-approving. It exists because r6c's 8B run produced a 12.2 GiB model and a gate the reformed metric had to re-score, and with only full/data_audit the only way to re-judge was a script in someone's working directory -- unversioned, unaudited, and invisible to the run table. Default full pipeline otherwise.",
       "Choices": [
         {
           "And": [
@@ -18,6 +18,19 @@
             }
           ],
           "Next": "DataAudit"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.pipeline_mode",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.pipeline_mode",
+              "StringEquals": "eval_only"
+            }
+          ],
+          "Next": "EvalGenerate"
         }
       ],
       "Default": "DataPrepGenerate"
@@ -302,7 +315,27 @@
           "Next": "EscalateFail"
         }
       ],
-      "Next": "QualityGateChoice"
+      "Next": "EvalOnlyStopChoice"
+    },
+    "EvalOnlyStopChoice": {
+      "Type": "Choice",
+      "Comment": "In eval_only BOTH verdicts end the run at the report. A pass must not reach Deploy: the plan a human signed in this mode bought a measurement of an existing artifact, not an endpoint, and an autonomous deploy off a re-judge is a spend nobody approved. A fail must not reach RemediationChoice either: IncrementIteration leads to RemediateFinetune, which would launch GPU training in a mode whose entry deliberately skipped it -- and there is no finetune stage in this manifest for it to remediate. The gate verdict is in gate.json either way, exactly as data_audit's readiness verdict is in its report.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.pipeline_mode",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.pipeline_mode",
+              "StringEquals": "eval_only"
+            }
+          ],
+          "Next": "Complete"
+        }
+      ],
+      "Default": "QualityGateChoice"
     },
     "QualityGateChoice": {
       "Type": "Choice",

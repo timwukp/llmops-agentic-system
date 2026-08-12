@@ -21,12 +21,41 @@
 
 | 檢查 | 結果 | 復現方式 |
 |---|---|---|
-| 單元測試（契約、成本模型、driver 迴圈、Lambda、狀態機文檔） | **1127/1127 通過** | `.venv/bin/python -m pytest tests/ -q --ignore=tests/golden` |
+| 單元測試（契約、成本模型、driver 迴圈、Lambda、狀態機文檔） | **1167/1167 通過** | `.venv/bin/python -m pytest tests/ -q --ignore=tests/golden` |
 | Shell 測試套件 —— N 路 capacity race guard（`tests/test_capacity_race_guard.sh`） | **10/10 斷言** | `bash tests/test_capacity_race_guard.sh` |
 | 反向控制 —— 逐一破壞每道 guard，確認它會失敗 | **242/242 反向控制** | `.venv/bin/python tests/negative_controls/monitor_dispatch.py` |
 | Harness 配置驗證（5 個專家 + 指揮家 + 審計員） | **7/7 `RESULT: OK`** | `python deploy/validate_config.py --config agents/<a>/harness.json` |
 | 架構 SVG 幾何檢查（虛線零交叉、零穿框） | **CLEAN** | `python tests/test_svg_geometry.py docs/architecture-*.svg` |
 | 遮蔽掃描（帳號 ID、憑證、帶帳號的 ARN） | CLEAN | `.github/workflows/redaction-check.yml` |
+
+### 實測探針 —— triage 生命跡象迴圈（#37），打的是 Lambda 現在真正在跑的東西
+
+刻意不做成 CI 也不做成單元測試：resurrector 的「非 run」那一半，是整個系統裡**健康狀態
+與壞掉的狀態長得一模一樣**的唯一一條路徑。一個 triage 大概一個月才死一次，所以
+`checked_liveness: 0` 在幾乎每一天都是正常讀數 —— 而「Query 打錯 partition」、「少了
+`dynamodb:Query` 授權」、「兩個各自打包的副本對 `__liveness__` 這個字串不一致」，這三種
+壞法會產生**完全相同**的讀數。所以這支探針下載**已部署**的 driver 與 resurrector bundle，
+對著**真實**的 `llmops-stage-events` 表把整條迴圈跑一遍。
+
+| 檢查 | 結果 | 復現方式 |
+|---|---|---|
+| 非 run（triage）生命跡象 beat → sweep → 認領 → 復活 → 上限升級 → 終態刪除 | 對已部署 bundle **18/18 項檢查通過**（2026-08-12），對本 checkout 亦 18/18 | `python tools/probe_liveness_resurrection.py --region us-east-1` |
+
+沒有任何 agent turn（假的 AgentCore client 在第一次 invoke 前就拋錯，所以真正的心跳會跑，
+計費的那半根本沒開始）、沒有真的 `lambda:invoke`、沒有真的 `events:PutEvents`；
+resurrector 處理 run row 的那一半被餵一個空的 stub，因為把 `STALE_MINUTES` 壓成 0
+（探針要讓自己剛寫的 beat 看起來過期，這是必要的）否則會去認領並復活帳號裡每一個活的 run。
+唯一一筆真實寫入，是專用 `__liveness__` partition 裡一個合成 subject 的項目，離開前刪掉。
+
+**Mutation 檢查，6/6 全殺**：resurrector 讀錯 partition（11/18）· beat 把 `params`
+從 payload 裡漏掉，而那正是復活後 triage 唯一的工作依據（15/18）· 終態時用「標記」取代
+「刪除」（17/18）· 上限路徑對 triage 自己升級、而不是對它原本在調查的那個 run（17/18）·
+beat 失去 `attribute_exists(run_id)` 條件、於是鑄出一個幽靈 run row（4/6）·
+sweep 失去新鮮度守衛、把活著的 triage 也復活（16/18）。
+
+第五個 mutant 正是探針為什麼「不只報告、還要刪掉」幽靈 row 的原因：它留下的那一行
+**把下一次探針整個反轉了** —— runs 表裡有那一行時，帶條件的 beat 會**成功**，於是往
+`__liveness__` 的交接根本不會發生，底下每一項檢查都以完全錯誤的理由失敗。
 
 ## 各階段的真實調用
 
@@ -92,7 +121,7 @@ endpoint、五輪 e2e 迭代 —— 花費比這個帳戶單日花在一個沒�
 
 | 檢查 | 結果 | 重現方式 |
 |---|---|---|
-| 單元測試(全部套件,含 `test_cost_model.py` + `test_finops.py`) | **1127 passed** | `.venv/bin/python -m pytest tests/ -q` |
+| 單元測試(全部套件,含 `test_cost_model.py` + `test_finops.py`) | **1167 passed** | `.venv/bin/python -m pytest tests/ -q` |
 | Harness 配置驗證,7 個 agent | **`RESULT: OK`** | `python deploy/validate_config.py --config agents/finops/harness.json` |
 | 線上艦隊 | **7 個 harness READY** | 用 repo 內建 boto3 呼叫 `list_harnesses` |
 | 正典模組有散佈路徑 | 印出 `would upload 4 contract files` | `python deploy/03_storage.py --region us-east-1 --account-id 123456789012 --dry-run` |

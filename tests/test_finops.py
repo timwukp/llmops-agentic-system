@@ -896,13 +896,22 @@ def _readable_prefixes():
     """Prefixes the role can GET: the read/write set plus every read-only statement.
 
     Each read-only Sid is named rather than globbed, so adding a new one is a deliberate
-    edit here. Both exist because their prefix must NOT be writable: customer-data/ holds
-    the held-out set the gates are judged on, and skills/ holds the instructions the agent
-    itself is judged against.
+    edit here. All three exist because their prefix must NOT be writable: customer-data/
+    holds the held-out set the gates are judged on, skills/ holds the instructions the agent
+    itself is judged against, and code/ holds the canonical trainer and the canonical judge
+    prompt -- an agent that could overwrite its own measuring instrument is not measured.
+
+    code/ was MISSING from this set until the eval prompt named it, and the omission was
+    invisible for a different reason than it looks: the finetune prompt has cited
+    `code/distill/train_qlora.py` since the canonical-trainer fix, but in the bare spelling,
+    which the caller's `s3://<bucket>/...` regex does not match -- and `code` was absent from
+    this set, so the bare-form branch (`known`) did not look for it either. Two independent
+    misses cancelling out is why this returned green while granting nothing.
     """
     return (_prefixes("S3PipelineObjects")
             | _prefixes("S3CustomerDataReadOnly")
-            | _prefixes("S3SkillsReadOnly"))
+            | _prefixes("S3SkillsReadOnly")
+            | _prefixes("S3CanonicalCodeReadOnly"))
 
 
 def test_every_s3_prefix_the_auditor_writes_is_one_its_role_can_write():
@@ -956,6 +965,22 @@ def test_the_list_prefixes_match_the_object_prefixes():
     listed = {p.rstrip("/*") for p in
               _harness_s3("S3PipelineList")["Condition"]["StringLike"]["s3:prefix"]}
     assert objects == listed, f"asymmetric: objects={objects} list={listed}"
+
+
+def test_the_agents_cannot_rewrite_the_instrument_they_are_measured_by():
+    """`code/` holds the canonical trainer and the canonical pairwise judge prompt. Both
+    are artifacts an agent is told to READ instead of composing its own, which only means
+    something if it cannot write them: an eval agent that can PutObject over
+    code/eval/judge_prompt_pairwise.md can move its own bar and every run after it silently
+    measures something else. Same argument as skills/ and customer-data/ one test down;
+    stated separately because `code/` arrived later and was granted GetObject with no
+    guard saying the Put half must stay absent.
+    """
+    ro = _harness_s3("S3CanonicalCodeReadOnly")
+    assert set(ro["Action"]) == {"s3:GetObject"}, "the canonical code prefix must not be writable"
+    assert "code" in _prefixes("S3CanonicalCodeReadOnly")
+    assert "code" not in _prefixes("S3PipelineObjects"), \
+        "code/ leaked into the read/write statement -- the instrument is now self-editable"
 
 
 def test_the_customers_own_data_is_readable_but_never_writable():
