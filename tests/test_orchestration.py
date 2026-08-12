@@ -8977,3 +8977,52 @@ class TestNonRunResurrection:
         assert not c["lambda"].calls
         assert any(e["DetailType"] == ev.ESCALATED_TO_HUMAN
                    for e in c["events"].entries)
+
+
+# ── a platform outage is not the agent's answer ──────────────────────────────────────
+# r6c's EvalScore met a Bedrock ServiceUnavailable storm (02:18-02:36Z, 2026-08-12)
+# after its one salvage retry was spent: every further dead-stream turn was billed to
+# the PROSE budget (re_asks 0->1->2, text_chars=0, error= on every log line) and the
+# stage died MissingStageComplete with its inference outputs already in S3; the triage
+# then suffocated in the same storm. Same disease as content_filtered, same cure.
+
+class TestModelOutageBudget:
+    def test_a_dead_stream_turn_does_not_spend_the_prose_budget(self, monkeypatch):
+        monkeypatch.setattr(driver.time, "sleep", lambda s: None)
+        uri = "s3://llmops-data-test/runs/run-test-1/raw/data.jsonl"
+        ac = FakeAgentCore([
+            text_stream("narrating instead of calling"),   # re_ask 1
+            text_stream("still narrating"),                # re_ask 2 (cap)
+            DyingStream(),                                 # salvage retry
+            DyingStream(),                                 # outage budget, not prose
+            tool_use_stream("stage_complete", {"outputs": [uri]}),
+            text_stream("ack")])
+        c = clients(ac, FakeS3(existing=[uri]))
+        out = driver.handler(driver_event(), clients=c)
+        assert out["status"] == "completed", (
+            "a dead-stream turn was billed to the prose budget and killed a stage "
+            "whose very next turn completed the protocol")
+        assert not c["sfn"].failures
+
+    def test_a_sustained_outage_settles_as_model_unavailable(self, monkeypatch):
+        monkeypatch.setattr(driver.time, "sleep", lambda s: None)
+        ac = FakeAgentCore([DyingStream() for _ in range(6)])
+        c = clients(ac)
+        out = driver.handler(driver_event(), clients=c)
+        assert out == {"status": "failed", "reason": "model_unavailable"}
+        assert c["sfn"].failures[0]["error"] == "ModelUnavailable", (
+            "a vendor outage must not be labelled MissingStageComplete -- one sends "
+            "the operator to the AWS status page, the other into a transcript that "
+            "never existed")
+        assert any(e["DetailType"] == ev.PIPELINE_FAILED for e in c["events"].entries)
+
+    def test_the_outage_budget_survives_a_self_reinvoke(self):
+        """Same argument as _re_asks and _filtered_turns: the live failure spanned
+        several invocations' worth of wall clock, so a counter that resets on handoff
+        can never exhaust and the stage hangs in retry forever."""
+        src = (REPO / "orchestration/harness_driver/handler.py").read_text()
+        body = src[src.index("def _run_stage"):]
+        assert '"_infra_error_turns": infra_error_turns' in body, \
+            "_self_reinvoke stopped carrying the outage counter"
+        assert 'int(event.get("_infra_error_turns", 0))' in body, \
+            "a continuation no longer restores the outage counter"

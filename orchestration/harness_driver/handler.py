@@ -1810,11 +1810,13 @@ def _run_stage(event, context=None, c=None):
         stream_retried = bool(event.get("_stream_retried"))
         re_asks = int(event.get("_re_asks", 0))
         filtered_turns = int(event.get("_filtered_turns", 0))
+        infra_error_turns = int(event.get("_infra_error_turns", 0))
     else:
         messages = _user_text(json.dumps(payload, default=str))
         stream_retried = False
         re_asks = 0  # up to 2 CONSECUTIVE: nudge, final demand; any serviced tool call re-arms it
         filtered_turns = 0  # consecutive platform-suppressed turns; see the filtered branch
+        infra_error_turns = 0  # consecutive dead-stream turns; see the outage branch
 
     def _out_of_time() -> bool:
         return bool(context) and context.get_remaining_time_in_millis() < 850_000
@@ -1826,6 +1828,7 @@ def _run_stage(event, context=None, c=None):
                                 "_stream_retried": stream_retried,
                                 "_re_asks": re_asks,
                                 "_filtered_turns": filtered_turns,
+                                "_infra_error_turns": infra_error_turns,
                                 "_session_epoch": epoch,
                                 "_session_started_at": session_started_at},
                                default=str))
@@ -1842,9 +1845,10 @@ def _run_stage(event, context=None, c=None):
         in S3, not in the transcript.
         """
         nonlocal epoch, session_started_at, sess, messages, re_asks, stream_retried, \
-            filtered_turns
+            filtered_turns, infra_error_turns
         epoch += 1
         filtered_turns = 0
+        infra_error_turns = 0
         session_started_at = time.time()
         sess = session_id(event["run_id"], event["stage"], event["task"], epoch)
         re_asks = 0
@@ -2007,6 +2011,43 @@ def _run_stage(event, context=None, c=None):
             messages = _user_text("The stream was interrupted. Continue from where "
                                   "you left off; call your pending inline function.")
             continue
+
+        # A platform outage is not the agent's answer. Live: r6c's EvalScore met a
+        # Bedrock ServiceUnavailable storm (02:18-02:36Z, 2026-08-12) AFTER its one
+        # salvage retry was spent; every subsequent dead-stream turn fell through to
+        # the prose branch, was billed to the re-ask budget (re_asks 0->1->2 with
+        # text_chars=0 and error= on every line), and the stage died
+        # MissingStageComplete -- the agent blamed for silence while the MODEL API was
+        # down. Its triage then suffocated in the same storm. Same disease as
+        # stop_reason=content_filtered, same cure: an own bounded budget that rides
+        # the continuation payload, a backoff (storms last minutes, not seconds), and
+        # an exhaustion that settles under its real name -- ModelUnavailable tells the
+        # operator to check the vendor, MissingStageComplete sends them hunting a
+        # transcript that never existed.
+        if out["error"]:
+            if infra_error_turns < 4:
+                infra_error_turns += 1
+                if _is_model_5xx(out["error"]):
+                    _maybe_failover_model(c, event)
+                wait_s = min(20 * infra_error_turns, 60)
+                print(f"[driver] stream died again ({infra_error_turns}/4), backing "
+                      f"off {wait_s}s before the retry (re_asks untouched): "
+                      f"{out['error']}")
+                time.sleep(wait_s)
+                messages = _user_text("The stream was interrupted. Continue from "
+                                      "where you left off; call your pending inline "
+                                      "function.")
+                continue
+            if event.get("task_token"):
+                settle_token(c["sfn"], event["task_token"],
+                             error="ModelUnavailable",
+                             cause=f"{infra_error_turns + 1} consecutive turns died "
+                                   f"on stream errors; last: {str(out['error'])[:180]}")
+            ev.emit_event(os.environ["EVENT_BUS"], ev.PIPELINE_FAILED,
+                          {"run_id": event["run_id"], "stage": event["stage"],
+                           "reason": "model unavailable"}, client=c["events"])
+            return {"status": "failed", "reason": "model_unavailable"}
+        infra_error_turns = 0
 
         tu = out["tool_use"]
         # One line per turn, because without it a failed stage is undiagnosable. Live:
