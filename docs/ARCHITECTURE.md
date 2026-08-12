@@ -542,12 +542,17 @@ Printing is not noticing, though, and for a long time nothing did. Between 2026-
 stage that stopped with its token parked — and there was not one CloudWatch alarm on any
 function in this system: the nine-hour death was found by a human reading an execution
 history, the resume Lambda's missing `events:PutEvents` grant by a human reading logs a
-day later. `deploy/06_observability.py --alarms` now creates twelve, in three families
-that each detect something the others cannot. **`<fn>-errors`** (every function
-`07_lambdas.py` deploys, derived from it so a new Lambda cannot ship unwatched) is the
-primary detector: every one of those 19 drops landed on a day that also had function
+day later. `deploy/06_observability.py --alarms` now creates thirteen, in three families
+that each detect something the others cannot. **`<fn>-errors`** (every function *any*
+deploy script creates, derived from each of them so a new Lambda cannot ship unwatched)
+is the primary detector: every one of those 19 drops landed on a day that also had function
 errors, and resume's ratio is exactly 3 — one attempt plus the two default retries — so
-this family fires first, always. **`<fn>-silent`** covers the three scheduled functions
+this family fires first, always. Derived from *each* deploy script rather than one, because
+one was measurably not enough: the census read only `07_lambdas.py`, and the eighth
+function this account runs — `llmops-admin`, the console API every plan signature and every
+human verdict goes through, 17,007 invocations in three days — was created by
+`deploy/console/deploy.sh` and therefore had no alarm of any family until 2026-08-12.
+**`<fn>-silent`** covers the three scheduled functions
 whose *silence* is the failure; `TreatMissingData` must be `breaching` there, because an
 uninvoked Lambda publishes no datapoint rather than a zero, and with the ordinary
 `notBreaching` the alarm would sit in INSUFFICIENT_DATA forever and detect precisely

@@ -457,11 +457,15 @@ Query 留下的痕跡一模一樣：開始、結束、寂靜。印出的計數�
 2026-08-12 之間，Lambda **丟掉了 19 次非同步 invoke**（driver 11、resume 8）——每一次
 都是一個 stage 停住、token 還被 park 著——而這個系統的所有函式上，CloudWatch alarm
 一個都沒有：那次九小時的死亡是人翻執行歷史發現的，resume 少掉 `events:PutEvents` 授權
-是人隔了一天翻 log 發現的。`deploy/06_observability.py --alarms` 現在建立十二個 alarm，
-分三族，每一族偵測的東西另外兩族看不到。**`<fn>-errors`**（`07_lambdas.py` 部署的每一個
-函式，而且是從它推導出來的，所以新增一個 Lambda 不可能沒人看）是主偵測器：那 19 次丟棄
-全部落在當天也有 function error 的日子，而 resume 的比例正好是 3——一次嘗試加上兩次預設
-重試——所以這一族永遠先響。**`<fn>-silent`** 蓋的是三個「沉默本身就是故障」的排程函式；
+是人隔了一天翻 log 發現的。`deploy/06_observability.py --alarms` 現在建立十三個 alarm，
+分三族，每一族偵測的東西另外兩族看不到。**`<fn>-errors`**（*任何一支* deploy script 建立
+的每一個函式，而且是從每一支推導出來的，所以新增一個 Lambda 不可能沒人看）是主偵測器：
+那 19 次丟棄全部落在當天也有 function error 的日子，而 resume 的比例正好是 3——一次嘗試
+加上兩次預設重試——所以這一族永遠先響。之所以是從*每一支* deploy script 推導、而不是從
+一支：一支已經被實測證明不夠——原本這份普查只讀 `07_lambdas.py`，於是這個帳號實際跑的
+第八支函式（`llmops-admin`，每一次 plan 簽名與每一次人工裁決都走過的 console API，三天內
+17,007 次 invoke）因為是 `deploy/console/deploy.sh` 建立的，直到 2026-08-12 之前三族
+alarm 一個都沒有。**`<fn>-silent`** 蓋的是三個「沉默本身就是故障」的排程函式；
 那裡的 `TreatMissingData` 必須是 `breaching`，因為沒被 invoke 的 Lambda 送出的是**沒有
 資料點**而不是 0，用平常的 `notBreaching` 這個 alarm 會永遠停在 INSUFFICIENT_DATA，剛好
 偵測不到它存在的唯一理由。`llmops-start-pipeline` 刻意沒有：它的 nightly 排程出廠是關閉

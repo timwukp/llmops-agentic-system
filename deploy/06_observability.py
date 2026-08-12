@@ -28,6 +28,7 @@ import argparse
 import ast
 import json
 import pathlib
+import re
 import secrets
 import subprocess
 import sys
@@ -127,29 +128,64 @@ def online_eval(ctl, region, harness, role_arn, dry):
             "arn_field": "created"}
 
 
+#: The admin console's API Lambda is created by deploy/console/deploy.sh, not by
+#: 07_lambdas.py, and reading its name from that script is the whole point of this
+#: constant: deriving the census from ONE deploy script produced exactly the outcome
+#: derivation was supposed to prevent. Measured 2026-08-12: the account runs EIGHT
+#: llmops functions, the seven in 07_lambdas.py were the entire alarm list, and the
+#: eighth -- llmops-admin, 17,007 invocations in three days, the surface every plan
+#: signature and every human verdict goes through -- had no alarm of any kind. The
+#: derivation was never wrong about what 07_lambdas.py deploys; the CLAIM was, because
+#: "what one deploy script creates" is not "what this system runs".
+CONSOLE_DEPLOY = "console/deploy.sh"
+
+
+def console_function() -> str:
+    """The console Lambda's name, read from the variable deploy.sh creates it with.
+
+    A shell variable rather than an ast walk because that is what the file has, and the
+    same rule applies as for LAMBDAS: a missing assignment is a hard stop, not an empty
+    census. Silently returning nothing here would restore the exact defect this fixes.
+    """
+    m = re.search(r"^FN=([A-Za-z0-9_.-]+)\s*$", (REPO / CONSOLE_DEPLOY).read_text(),
+                  re.M)
+    if not m:
+        raise SystemExit(f"{CONSOLE_DEPLOY} has no FN= assignment — alarm list unknown")
+    return m.group(1)
+
+
 def deployed_functions() -> list:
-    """The function names 07_lambdas.py deploys, read from its LAMBDAS literal.
+    """Every llmops Lambda the deploy scripts create, derived from each of them.
 
     Derived, not listed: a hand-kept copy of this list is how the eighth Lambda ends
-    up as the one nobody alarms on. Parsed with ast rather than imported because the
-    module name starts with a digit (and importing it would need boto3 credentials).
+    up as the one nobody alarms on. 07_lambdas.py is parsed with ast rather than
+    imported because the module name starts with a digit (and importing it would need
+    boto3 credentials); the console's is read from its shell variable. See
+    CONSOLE_DEPLOY for why one script was not enough -- the eighth Lambda was real.
     """
     tree = ast.parse((REPO / "07_lambdas.py").read_text())
+    fns = None
     for node in ast.walk(tree):
         if (isinstance(node, ast.Assign)
                 and any(getattr(t, "id", "") == "LAMBDAS" for t in node.targets)):
-            return [v.value for k, spec in zip(node.value.keys, node.value.values)
-                    for kk, v in zip(spec.keys, spec.values)
-                    if getattr(kk, "value", "") == "fn"]
-    raise SystemExit("07_lambdas.py has no LAMBDAS assignment — alarm list unknown")
+            fns = [v.value for k, spec in zip(node.value.keys, node.value.values)
+                   for kk, v in zip(spec.keys, spec.values)
+                   if getattr(kk, "value", "") == "fn"]
+            break
+    if fns is None:
+        raise SystemExit("07_lambdas.py has no LAMBDAS assignment — alarm list unknown")
+    console = console_function()
+    return fns + ([console] if console not in fns else [])
 
 
 def alarms(cw, topic_arn, dry):
     """Three families, each detecting something the other two cannot.
 
-    `<fn>-errors` (every deployed Lambda): the primary detector. Sum(Errors) >= 1 over
-    five minutes. `notBreaching` on missing data because a Lambda nobody invoked has no
-    error to report.
+    `<fn>-errors` (every deployed Lambda, from BOTH deploy scripts -- see
+    CONSOLE_DEPLOY): the primary detector. Sum(Errors) >= 1 over five minutes.
+    `notBreaching` on missing data because a Lambda nobody invoked has no error to
+    report. The console Lambda is in this family only: nothing schedules it, so silence
+    is normal, and nothing invokes it asynchronously, so it cannot drop an event.
 
     `<fn>-silent` (the scheduled Lambdas only): Sum(Invocations) < 1. TreatMissingData
     MUST be `breaching` here -- an uninvoked function publishes NO datapoint rather than

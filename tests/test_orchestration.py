@@ -9930,21 +9930,131 @@ def _default_enabled_schedules():
     return enabled
 
 
-def test_every_lambda_the_deploy_creates_has_an_errors_alarm():
-    """Coverage is DERIVED from 07_lambdas.py, not listed beside it.
+#: Every deploy script that creates a Lambda, and how to read the names out of it. Two
+#: entries because the system has two deployers, which is the finding: the alarm census
+#: was derived from 07_lambdas.py alone and the console's function -- created by a shell
+#: script, 17,007 invocations in three days -- was the eighth Lambda nobody watched. The
+#: patterns deliberately differ from the deployer's own parse routes (ast for LAMBDAS, a
+#: shell variable for the console) so a parser that quietly returns a short list is
+#: caught by a second reader rather than agreed with.
+_LAMBDA_DEPLOYERS = {
+    "07_lambdas.py": r'"fn":\s*"([^"]+)"',
+    "console/deploy.sh": r"^FN=([A-Za-z0-9_.-]+)\s*$",
+}
 
-    A hand-kept alarm list is how the eighth Lambda becomes the one nobody watches:
-    the function ships, the list is not touched, and nothing anywhere says a name is
-    missing. The regex here reads the same file by a different route than the
-    deployer's ast walk, so a parser that quietly returns a short list fails too.
+
+def _all_deployed_lambda_names():
+    found = {}
+    for path, pattern in _LAMBDA_DEPLOYERS.items():
+        names = set(re.findall(pattern, _deploy_src_orch(path), re.M))
+        assert names, f"{path}: /{pattern}/ matched no function name -- the regex broke"
+        found[path] = names
+    return found
+
+
+def test_every_lambda_any_deploy_script_creates_has_an_errors_alarm():
+    """Coverage is DERIVED from every deployer, not from the biggest one.
+
+    A hand-kept alarm list is how the eighth Lambda becomes the one nobody watches: the
+    function ships, the list is not touched, and nothing anywhere says a name is
+    missing. Deriving the list fixed the hand-keeping and left the eighth Lambda
+    unwatched anyway, because the derivation read ONE deploy script: measured
+    2026-08-12, the account ran 8 llmops functions against 7 alarms, and the missing one
+    was llmops-admin -- the console every plan signature and human verdict goes through,
+    17,007 invocations in three days, no alarm of any family. "What 07_lambdas.py
+    deploys" was never a wrong answer; it was an answer to a narrower question than the
+    one the docstring claimed.
     """
-    fns = set(re.findall(r'"fn":\s*"([^"]+)"', _deploy_src_orch("07_lambdas.py")))
-    assert len(fns) >= 7, f"only found {fns} in 07_lambdas.py -- the regex broke"
+    per_file = _all_deployed_lambda_names()
+    assert len(per_file["07_lambdas.py"]) >= 7, per_file["07_lambdas.py"]
+    fns = set().union(*per_file.values())
+    assert len(fns) >= 8, f"expected at least 8 deployed functions, found {sorted(fns)}"
     alarmed = {p["Dimensions"][0]["Value"] for p in _alarm_plans()
                if p["MetricName"] == "Errors"}
     assert alarmed == fns, (
         f"Lambdas with no errors alarm: {sorted(fns - alarmed)}; alarms for functions "
         f"the deploy does not create: {sorted(alarmed - fns)}")
+
+
+def test_no_third_deploy_script_creates_a_lambda_the_census_cannot_see():
+    """The guard against the NINTH Lambda, which is the same bug one deployer later.
+
+    _LAMBDA_DEPLOYERS is two entries of knowledge about where Lambdas come from, and
+    knowledge like that goes stale silently -- a new deployer means a new function with
+    no alarm, and nothing in the census can notice a file it was never told to read. So
+    the set of files that create Lambdas is derived from the deploy tree itself: any file
+    calling create-function / create_function must be a file the census knows how to
+    read. Adding a deployer therefore reds here instead of shipping an unwatched
+    function, which is exactly what happened the first time.
+    """
+    creators = set()
+    for path in sorted((REPO / "deploy").rglob("*")):
+        if not path.is_file() or path.suffix not in (".py", ".sh"):
+            continue
+        if "evidence" in path.parts:      # write-ups quote commands, they run nothing
+            continue
+        text = path.read_text(errors="ignore")
+        if "create-function" in text or "create_function" in text:
+            creators.add(str(path.relative_to(REPO / "deploy")))
+    assert creators == set(_LAMBDA_DEPLOYERS), (
+        f"deploy scripts that create Lambdas: {sorted(creators)}; the alarm census "
+        f"knows: {sorted(_LAMBDA_DEPLOYERS)}. Teach _LAMBDA_DEPLOYERS and "
+        "06_observability.py how to read the new one, or its function ships unwatched")
+
+
+def test_the_console_lambda_gets_the_errors_family_only():
+    """It is neither scheduled nor async-invoked, and both of the other families lie.
+
+    A `-silent` alarm on the console would sit in ALARM on any night nobody signs a
+    plan, and an `-async-dropped` alarm would sit in INSUFFICIENT_DATA forever because
+    API Gateway invokes it synchronously -- there is no async queue to drop from. Both
+    failure modes teach an operator to ignore the set, which is what the silence family's
+    own comment says about llmops-start-pipeline.
+    """
+    obs = _obs_mod()
+    console = obs.console_function()
+    assert console == "llmops-admin", console
+    families = {p["AlarmName"].removeprefix(console + "-")
+                for p in _alarm_plans()
+                if p["Dimensions"][0]["Value"] == console}
+    assert families == {"errors"}, (
+        f"the console Lambda has alarm families {sorted(families)}; only `errors` can "
+        "ever report on a synchronously-invoked, unscheduled function")
+
+
+#: How each ARCHITECTURE variant states the alarm count, and the words to read it with.
+#: Both write it as a WORD, so the check is a lookup rather than a `\d+` search -- and the
+#: sentence is pinned by the prose around it because that paragraph also names 19 drops,
+#: three families and 17,007 invocations: any number found loose in it proves nothing.
+_ALARM_COUNT_CLAIMS = {
+    "docs/ARCHITECTURE.md": (r"--alarms` now creates (\w+), in three families", "en"),
+    "docs/ARCHITECTURE.zh-TW.md": (r"--alarms` 現在建立([一二三四五六七八九十]+)個 alarm",
+                                   "zh"),
+}
+_ALARM_COUNT_WORDS = {
+    11: {"en": "eleven", "zh": "十一"}, 12: {"en": "twelve", "zh": "十二"},
+    13: {"en": "thirteen", "zh": "十三"}, 14: {"en": "fourteen", "zh": "十四"},
+    15: {"en": "fifteen", "zh": "十五"}, 16: {"en": "sixteen", "zh": "十六"},
+}
+
+
+def test_the_documented_alarm_count_matches_the_alarms_the_deploy_creates():
+    """The count in the prose is the one number in this section nothing derived.
+
+    It was written as twelve when the deploy created twelve, and the eighth Lambda's
+    errors alarm made it thirteen -- a sentence that was measured once reads as measured
+    forever, and this paragraph is where a reader goes to learn what is watched. Both
+    languages, in the same commit: a count fixed in one is worse than one stale in both,
+    because it reads as verified in whichever the reader happens to open.
+    """
+    n = len(_alarm_plans())
+    assert n in _ALARM_COUNT_WORDS, f"{n} alarms: extend _ALARM_COUNT_WORDS in this guard"
+    for name, (pattern, lang) in _ALARM_COUNT_CLAIMS.items():
+        m = re.search(pattern, (REPO / name).read_text())
+        assert m, f"{name}: no alarm-count sentence for /{pattern}/ to read"
+        assert m.group(1) == _ALARM_COUNT_WORDS[n][lang], (
+            f"{name} says the deploy creates {m.group(1)!r} alarms; alarms() plans {n} "
+            f"({_ALARM_COUNT_WORDS[n][lang]})")
 
 
 def test_the_silence_alarms_are_exactly_the_schedules_that_ship_enabled():
