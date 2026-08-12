@@ -474,6 +474,18 @@ alarm 一個都沒有。**`<fn>-silent`** 蓋的是三個「沉默本身就是�
 狀態機上沒有 `ExecutionsFailed` alarm：一個誠實地沒過品質門檻的 run，是這條 pipeline 正常
 運作，不是事故。
 
+Log 的問題正好是鏡像：保留政策**存在**，但被套在沒有流量的那個面上。`setup_observability.py`
+從一開始接 delivery 就把它建的 log group 壓在 30 天——但實測到 2026-08-12 的七天裡，那些
+group 收到 **0 bytes**，而這個系統吃進去的 1236 MB 裡有 **1225 MB** 落在
+`/aws/bedrock-agentcore/runtimes/<id>-DEFAULT` 和 `/aws/lambda/llmops-*` 這些**永不過期**的
+group 上。這兩種都是 AWS 自己建的、不是這個 repo 建的，所以這裡從來沒有任何東西對它們設過
+政策。`--retention` 把同樣的 30 天套到這個系統會寫入的每一個 group，來源是兩個、因為建立者
+是兩個：Lambda 的 group **從 repo 推導**（跟 alarm 用同一份普查，所以一個函式不可能「有人看
+但沒有期限」），AgentCore 的 group **從帳號探索**——它們的名字帶著這個 repo 從來看不到的
+harness id 與 runtime id，改用 `HARNESSES` 拼名字只會在有流量的那些 group 旁邊多建五個空的，
+這是試過、量過、然後丟掉的做法。同前綴但不屬於我們的 log group 一律不動：這個帳號是共用的，
+別的專案的資料保留期不是我們該決定的。
+
 這對機制唯一蓋不住的，是 session 自己的時鐘。AgentCore 會在 `maxLifetime` =
 **28800 秒（8 小時）**收回 runtime session —— 這是硬上限，活動不會重置它，也沒有設定
 能調高。蒸餾 stage 在單一確定性 session 裡跑 8–12 小時，於是活得比 session 久；跨過

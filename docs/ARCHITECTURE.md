@@ -563,6 +563,21 @@ an error that retried is self-healed, while a drop is work that is gone. There i
 `ExecutionsFailed` alarm on the state machine: a run that honestly fails its quality gate
 is this pipeline working, not an incident.
 
+Logs had the mirror-image problem: a retention policy that existed and was pointed at the
+wrong surface. `setup_observability.py` has capped its delivery log group at 30 days since
+the deliveries were first wired — but measured over the seven days to 2026-08-12, those
+groups received **0 bytes**, while **1225 of the 1236 MB** this system ingested landed in
+`/aws/bedrock-agentcore/runtimes/<id>-DEFAULT` groups and `/aws/lambda/llmops-*` groups that
+**never expire**. Both are created by AWS, not by this repo, which is why nothing here had
+ever set a policy on them. `--retention` applies the same 30 days to every group this system
+fills, from two sources for two creators: the Lambda groups are **repo-derived** (the same
+census the alarms use, so a function cannot be watched-but-unbounded), and the AgentCore
+groups are **discovered from the account**, because their names carry harness and runtime ids
+this repo never sees — building them from `HARNESSES` instead produces five empty groups
+beside the ones holding the traffic, which was tried, measured and discarded. Foreign log
+groups sharing the prefix are left alone: this account is shared, and another project's
+retention is not ours to set.
+
 The last exposure that pair does *not* cover is the session's own clock. AgentCore
 reclaims a runtime session at `maxLifetime` = **28800 s (8 h)** — a hard cap that
 activity does not reset and no setting raises. A distillation stage runs 8–12 h in one
