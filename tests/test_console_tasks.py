@@ -4607,7 +4607,7 @@ def test_the_gate_row_carries_the_interval_it_is_decided_by(console, monkeypatch
            "stages": {"eval": {"metrics": {
                "judge_score": 0.48, "judge_score_ci_low": 0.40,
                "judge_score_ci_high": 0.56, "judge_n": 150,
-               "format_validity": 1.0, "gate_passed": False,
+               "format_validity": 1.0, "format_n": 150, "gate_passed": False,
                "ood": {"judge_score": 0.02, "judge_n": 40}}}}}
     s3f = FakeS3()
     s3f.put_object(Bucket="b", Key="runs/run-x/manifest.json",
@@ -4620,10 +4620,145 @@ def test_the_gate_row_carries_the_interval_it_is_decided_by(console, monkeypatch
     js = next(g for g in out["gates"] if g["name"] == "judge_score")
     assert (js["judge_score_ci_low"], js["judge_score_ci_high"], js["judge_n"]) == \
         (0.40, 0.56, 150)
+    # ...and the row must be DECIDED by them. This fixture is the D6 defect verbatim: the
+    # point estimate 0.48 clears the 0.45 bar while the lower bound 0.40 does not, and the
+    # console painted PASS on a row whose run was escalated as borderline (gate_passed False).
+    assert (js["status"], js["passed"]) == ("borderline", None), (
+        f"the console re-derived the verdict from the point estimate: {js!r}")
     fv = next(g for g in out["gates"] if g["name"] == "format_validity")
     assert "judge_score_ci_low" not in fv, "the CI fields leaked onto a scalar gate row"
+    # `format_n` IS in the fixture's metrics, on purpose: an assertion that a key is absent
+    # from the row is satisfied for free when the key is absent from the source, and the
+    # denominator's absence is the thing being tested.
+    assert "format_n" in man["stages"]["eval"]["metrics"], "the leak has nothing to leak"
+    assert "format_n" not in fv, "a denominator rode a row with no interval to divide"
+    assert (fv["status"], fv["passed"]) == ("passed", True), f"{fv!r}"
     assert out["oodReport"] == {"judge_score": 0.02, "judge_n": 40}
     code = _strip_comments(_front())
     assert "d.oodReport" in code, "run_detail serves an OOD report nothing renders"
     assert "never gated" in code, "the OOD block does not say it is not a gate"
-    assert "judge_score_ci_low" in code, "the CI bounds are served and never painted"
+    # Derived from the row's own metric name now, so the literal is gone on purpose -- the
+    # next interval-bearing gate metric must paint its bounds without an edit here.
+    assert '_ci_low' in code, "the CI bounds are served and never painted"
+    assert 'g.name+"_ci_low"' in code, (
+        "the bounds are painted from a hardcoded metric name, so a second interval-bearing "
+        "gate would serve bounds nothing renders")
+    # ...and the literal is gone from EVERY site, not just from one of the three the row
+    # template reads. Asserting only the derived form is present passes while a hardcoded key
+    # sits beside it -- which is how a partly-converted template renders judge_score's bounds
+    # and no other metric's.
+    assert "judge_score_ci_low" not in code, (
+        "a hardcoded metric key survives in the frontend beside the derived one")
+
+
+# ── D6: the gate table's five situations ─────────────────────────────────────
+#
+# `passed` was a tri-state boolean derived from `actual >= threshold`, and the frontend
+# painted PASS / FAIL / n/a. Three different situations shared that n/a: a borderline the
+# pipeline escalated rather than decide, a gated metric the eval report never carried --
+# which `agents/eval/harness.json` defines as a FAILED gate, not an undecided one -- and a
+# run that died before eval ran at all. Measured across the 34 gated runs in this account:
+# 30 never reached eval, and run-phase2-main-0001 reports `gate_passed: false` with BOTH of
+# its gate metrics absent, so the console shows "gate failed" above a table of blanks and
+# cannot answer the one question the table exists for.
+def _gate(console, name, threshold, metrics, eval_reported=True):
+    return console.gate_row(name, threshold, metrics, eval_reported)
+
+
+def test_a_gated_metric_the_report_omits_is_a_failed_gate_not_a_blank(console):
+    """agents/eval/harness.json: "If params.gates names a metric your report does not
+    contain, that is a failed gate, not a passed one." The console rendered it as n/a."""
+    row = _gate(console, "relative_solve_rate", 0.80, {"gate_passed": False})
+    assert (row["status"], row["passed"]) == ("not_measured", False), f"{row!r}"
+
+
+def test_a_run_that_never_reached_eval_is_not_a_failed_gate(console):
+    """The other half of the same distinction, and the reason `not_measured` could not just
+    be folded into `failed`: 30 of 34 gated runs in this account died in data-prep or
+    finetune. Painting their gates red claims a measurement that never happened."""
+    row = _gate(console, "relative_solve_rate", 0.80, {}, eval_reported=False)
+    assert (row["status"], row["passed"]) == ("not_evaluated", None), f"{row!r}"
+
+
+def test_an_eval_stage_still_running_has_not_failed_its_gates(console, monkeypatch):
+    """The third shape of the same distinction, and the one a stage-entry existence check
+    gets wrong. Two writers put entries under `stages.eval`: the driver on completion,
+    always with a metrics mapping, and the agents mid-stage, without one.
+    run-20260811T165529Z-ce628817 is the second kind on S3 right now -- `status:
+    inference_in_progress`, an `inference_job` block, no metrics -- so deriving "the eval
+    stage reported" from `bool(eval_entry)` paints both of its gates FAILED while the
+    inference job is still launching."""
+    man = {"params": {"gates": {"judge_score": 0.45, "format_validity": 0.95}},
+           "stages": {"eval": {"status": "inference_in_progress", "task": "evaluate",
+                               "iteration": 0, "inference_job": {"job_name": "j"}}}}
+    s3f = FakeS3()
+    s3f.put_object(Bucket="b", Key="runs/run-y/manifest.json",
+                   Body=json.dumps(man).encode())
+    monkeypatch.setattr(console, "s3", s3f)
+    monkeypatch.setattr(console, "data_bucket", lambda: "b")
+    monkeypatch.setattr(console, "events_tbl", None)
+    monkeypatch.setattr(console, "runs_tbl", None)
+    for row in console.run_detail("run-y")["gates"]:
+        assert (row["status"], row["passed"]) == ("not_evaluated", None), (
+            f"a gate was decided against an eval stage that had not reported yet: {row!r}")
+    # The other direction: a report that arrived carrying nothing is a report, and the eval
+    # gate bullet makes a gated metric it omits a failed gate.
+    man["stages"]["eval"] = {"status": "completed", "metrics": {}}
+    s3f.put_object(Bucket="b", Key="runs/run-y/manifest.json",
+                   Body=json.dumps(man).encode())
+    for row in console.run_detail("run-y")["gates"]:
+        assert (row["status"], row["passed"]) == ("not_measured", False), (
+            f"an empty eval report read as never having been measured: {row!r}")
+
+
+def test_an_interval_that_straddles_the_bar_is_borderline_not_a_pass(console):
+    """The gate bullet passes on the LOWER bound and fails on the UPPER; anything else it
+    escalates with the numbers. A console that decides it anyway publishes a verdict the
+    pipeline refused to reach."""
+    m = {"judge_score": 0.48, "judge_score_ci_low": 0.40, "judge_score_ci_high": 0.56,
+         "judge_n": 150}
+    assert _gate(console, "judge_score", 0.45, m)["status"] == "borderline"
+    m2 = {**m, "judge_score_ci_low": 0.46}
+    assert (_gate(console, "judge_score", 0.45, m2)["status"],
+            _gate(console, "judge_score", 0.45, m2)["passed"]) == ("passed", True)
+    m3 = {**m, "judge_score_ci_high": 0.44, "judge_score": 0.43}
+    assert _gate(console, "judge_score", 0.45, m3)["status"] == "failed"
+
+
+def test_the_point_estimate_alone_still_decides_a_gate_that_reports_no_interval(console):
+    """format_validity has no bounds and never will; the interval rule must not turn every
+    scalar gate into an undecidable one."""
+    assert _gate(console, "format_validity", 0.95, {"format_validity": 1.0})["status"] == "passed"
+    assert _gate(console, "format_validity", 0.95, {"format_validity": 0.90})["status"] == "failed"
+
+
+def test_the_interval_rule_is_keyed_off_the_bounds_and_not_off_a_metric_name(console):
+    """Whether a metric is decided by an interval is a property of what the report carries
+    about it. A name list ("judge_score") would silently drop the next interval-bearing
+    metric back to its point estimate -- which is the defect being fixed, one metric later."""
+    m = {"map50": 0.78, "map50_ci_low": 0.71, "map50_ci_high": 0.84}
+    assert _gate(console, "map50", 0.75, m)["status"] == "borderline", (
+        "an interval-bearing gate that is not judge_score was decided on its point estimate")
+
+
+def test_a_value_a_threshold_cannot_be_compared_against_is_not_a_pass(console):
+    """Fail closed. The old code caught the ValueError and left `passed` None, which the
+    frontend painted as the same n/a a never-evaluated run gets."""
+    row = _gate(console, "format_validity", 0.95, {"format_validity": "n/a"})
+    assert (row["status"], row["passed"]) == ("unreadable", False), f"{row!r}"
+
+
+def test_every_gate_status_the_server_can_send_has_a_pill_that_renders_it(console):
+    """Derived from the module's own constants, so adding a sixth status without a pill is a
+    red test rather than a blank cell. The `||` fallback in the row template covers an old
+    cached bundle, not a status this server can produce."""
+    statuses = {v for k, v in vars(console).items()
+                if k.startswith("GATE_") and isinstance(v, str)}
+    # A derived census that finds nothing agrees with any frontend at all, so the count is
+    # pinned: the six are passed/failed/borderline/not_measured/not_evaluated/unreadable.
+    assert len(statuses) == 6, f"the status vocabulary changed: {sorted(statuses)}"
+    code = _strip_comments(_front())
+    pills = code[code.index("const GATE_PILL"):]
+    pills = pills[:pills.index("};")]
+    for st in sorted(statuses):
+        assert f'"{st}"' in pills, f"run_detail can send status {st!r} and nothing paints it"

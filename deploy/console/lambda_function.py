@@ -704,6 +704,93 @@ def _timeline(run_id, limit=100):
     return evs, dirs
 
 
+#: Gate row verdicts. `passed` stays a tri-state boolean for whoever already reads it; this
+#: says WHY, which is the whole content of D6 -- three different situations were all painting
+#: the same `n/a` pill, and one of them was a gate the run had actually failed.
+GATE_PASSED = "passed"
+GATE_FAILED = "failed"
+#: Decided by an interval that straddles the bar. The eval gate bullet does not let the agent
+#: decide this one either -- it escalates with the numbers -- so the console must not paint a
+#: verdict the pipeline refused to reach.
+GATE_BORDERLINE = "borderline"
+#: The eval stage reported, and did not carry this metric. `agents/eval/harness.json`: "If
+#: params.gates names a metric your report does not contain, that is a failed gate, not a
+#: passed one." So this is a FAILURE, not a blank.
+GATE_NOT_MEASURED = "not_measured"
+#: No eval stage entry at all -- the run died before it was measured. Distinct from the row
+#: above and NOT a failure: painting an unmeasured gate red claims a measurement that never
+#: happened. 30 of the 34 gated runs in this account are in this state, because they failed
+#: in data-prep or finetune.
+GATE_NOT_EVALUATED = "not_evaluated"
+#: A value is there and is not a number a threshold can be compared against.
+GATE_UNREADABLE = "unreadable"
+
+
+def gate_row(name, threshold, metrics, eval_reported):
+    """One quality-gate row, with the verdict derived the way the PIPELINE derives it.
+
+    Two defects, both measurable on runs in this account:
+
+    1. **The console re-derived the verdict from the point estimate.** `agents/eval`'s gate
+       bullet decides an interval-bearing metric on its bounds -- pass only if the Wilson
+       LOWER bound is at or above the bar, fail only if the UPPER bound is below it, escalate
+       otherwise -- and the console compared `actual >= threshold`. The repo's own console
+       fixture is the demonstration: judge_score 0.48 against a 0.45 bar with CI [0.40, 0.56]
+       painted **PASS**, on a run whose `gate_passed` was False because the agent escalated it
+       as borderline. A second derivation of one verdict is a second verdict.
+    2. **A missing metric painted the same `n/a` as a run that never got to eval.** On
+       run-phase2-main-0001 the verdict is `failed` and every gate row is blank, so the
+       console cannot say WHICH gate failed -- the one question the table exists to answer.
+
+    The interval rule is keyed off `<name>_ci_low` / `<name>_ci_high` rather than off the
+    string "judge_score": whether a metric is decided by an interval is a property of what
+    the report carries about it, and a name list would silently drop back to point estimates
+    for the next metric that reports bounds.
+    """
+    actual = metrics.get(name)
+    row = {"name": name, "threshold": threshold, "actual": actual}
+    low, high = metrics.get(f"{name}_ci_low"), metrics.get(f"{name}_ci_high")
+    # The sample size an interval was computed over, under the metric FAMILY's name: the
+    # report carries judge_score / judge_score_ci_low / judge_n, so the family is the metric
+    # name minus its last component. Carried only alongside the bounds, since a denominator
+    # next to a point estimate invites reading a width into it that was never computed.
+    extras = [f"{name}_ci_low", f"{name}_ci_high"]
+    if low is not None and high is not None:
+        extras.append(f"{name.rsplit('_', 1)[0]}_n")
+    for extra in extras:
+        if metrics.get(extra) is not None:
+            row[extra] = metrics[extra]
+
+    def _decide():
+        if actual is None:
+            return GATE_NOT_MEASURED if eval_reported else GATE_NOT_EVALUATED
+        try:
+            bar = float(threshold)
+        except (TypeError, ValueError):
+            return GATE_UNREADABLE
+        if low is not None and high is not None:
+            try:
+                if float(low) >= bar:
+                    return GATE_PASSED
+                return GATE_FAILED if float(high) < bar else GATE_BORDERLINE
+            except (TypeError, ValueError):
+                return GATE_UNREADABLE
+        try:
+            return GATE_PASSED if float(actual) >= bar else GATE_FAILED
+        except (TypeError, ValueError):
+            return GATE_UNREADABLE
+
+    row["status"] = _decide()
+    # `passed` is kept because the frontend and the /api/status rollup already read it, and
+    # is fail-CLOSED for everything except the row nobody measured: a gate whose metric the
+    # report omits, or whose value cannot be read, is not a passed gate. Only
+    # GATE_NOT_EVALUATED is None, because there is genuinely no verdict to give.
+    row["passed"] = (True if row["status"] == GATE_PASSED
+                     else None if row["status"] in (GATE_NOT_EVALUATED, GATE_BORDERLINE)
+                     else False)
+    return row
+
+
 # ── /api/run: manifest + stage events + training job + gate verdict ──────────
 def run_detail(run_id):
     out = {"runId": run_id, "manifest": None, "events": [], "directives": [], "gates": [],
@@ -725,25 +812,23 @@ def run_detail(run_id):
     # gate verdict: thresholds from params.gates vs eval stage metrics
     man = out["manifest"] or {}
     gates_cfg = (man.get("params") or {}).get("gates") or {}
-    eval_metrics = ((man.get("stages") or {}).get("eval") or {}).get("metrics") or {}
+    eval_entry = (man.get("stages") or {}).get("eval") or {}
+    eval_metrics = eval_entry.get("metrics") or {}
+    # Whether the eval stage reported AT ALL is what separates "this gate failed because the
+    # report does not carry its metric" from "this run never got as far as being measured".
+    #
+    # Keyed on the presence of the `metrics` KEY, and not on the stage entry, and not on the
+    # dict being non-empty. Two writers put entries under this name: the driver, on completion,
+    # always with a metrics mapping (`"metrics": norm.get("metrics", {})` --
+    # harness_driver/handler.py), and the agents themselves, mid-stage, without one.
+    # run-20260811T165529Z-ce628817 is the second kind live: `stages.eval` exists with
+    # `status: inference_in_progress` and no metrics, so `bool(eval_entry)` would call both of
+    # its gates FAILED while the inference job was still running. `bool(eval_metrics)` fails
+    # the other way -- an eval that completed reporting nothing would read as never measured,
+    # when the eval gate bullet makes an empty report a failed gate.
+    eval_reported = isinstance(eval_entry.get("metrics"), dict)
     for gname, threshold in gates_cfg.items():
-        actual = eval_metrics.get(gname)
-        passed = None
-        try:
-            if actual is not None:
-                passed = float(actual) >= float(threshold)
-        except Exception:
-            pass
-        row = {"name": gname, "threshold": threshold,
-               "actual": actual, "passed": passed}
-        # judge_score is decided by its Wilson interval, not the point estimate
-        # (agents/eval gate bullet) -- surface the bounds so a "passed: None"
-        # borderline row is legible as an escalation, not a rendering gap.
-        if gname == "judge_score":
-            for b in ("judge_score_ci_low", "judge_score_ci_high", "judge_n"):
-                if eval_metrics.get(b) is not None:
-                    row[b] = eval_metrics[b]
-        out["gates"].append(row)
+        out["gates"].append(gate_row(gname, threshold, eval_metrics, eval_reported))
     gp = eval_metrics.get("gate_passed")
     out["gateVerdict"] = ("passed" if gp is True else "failed" if gp is False else None)
     # OOD layer: measured and reported, never gated -- rendered as its own
