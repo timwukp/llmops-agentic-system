@@ -51,7 +51,8 @@ LLM 判斷。因此編排採用 **Step Functions Standard 狀態機**，智能�
 
 狀態機（`orchestration/state_machine.asl.json`）在正常路徑上有 **12 個 harness 任務狀態**
 —— 每個都是帶 `waitForTaskToken` 的 harness driver Lambda 調用 —— 外加只在迴路中出現的
-`RemediateFinetune`，以及只在審計模式出現的 `DataAudit`：
+`RemediateFinetune`、只在審計模式出現的 `DataAudit`，以及（在 `eval_only` 模式下）
+一個從這同一條路徑中途、也就是 eval 階段進場的入口：
 
 ```
 DataPrepGenerate → DataPrepCurate → FinetuneLaunch → FinetuneAnalyze → EvalGenerate → EvalScore → EvalGate
@@ -59,6 +60,22 @@ DataPrepGenerate → DataPrepCurate → FinetuneLaunch → FinetuneAnalyze → E
                               RemediateFinetune ←───────┘   …門檻通過則：
              Deploy → SmokeTest → MonitorHealth → Teardown → MonitorReport
 ```
+
+**三種入口模式，由 `StartAt` 的一個 `Choice` 讀執行輸入裡的 `pipeline_mode` 決定**（它讀不到
+S3 上的 manifest，這正是模式必須搭在輸入裡的原因）。`full` 就是上面那條 `Default`。
+`data_audit` 是指揮家最便宜的開胃菜：稽核客戶資料，然後在任何 GPU 出現之前停下。
+**`eval_only`** 從 `EvalGenerate` 進場，重新評判一個先前 run 已經產出、也已經付過錢的 artifact，
+並由 `EvalOnlyStopChoice` 停在門檻判決上 —— 通過**不會**走到 `Deploy`，失敗也**不會**走到
+`RemediateFinetune`。這兩半都是刻意的：重新量測一個 artifact 不等於批准把它上線；而這份
+manifest 裡根本沒有 finetune 階段可供補救，所以補救路徑只會在「唯一刻意跳過訓練的模式」裡
+開起 GPU 訓練。這個模式在派發時就會被拒絕，除非 plan 同時指名 `model_artifact_uri`（這個 run
+裡沒有任何東西能產出它）與 `customer_eval_uri`（eval agent 平常退回去用的 10% val split，
+是由這個模式跳過的 `curate` 任務寫出來的）—— 見 start-pipeline 的 `MODE_REQUIRED_PARAMS`：
+一個只能走向升級的 run，不該先拿到 run id、manifest 和 `PipelineStarted` 事件。
+
+它的存在來自 r6c：一次 8B 的 run 產出了 12.2 GiB 的模型，改良後的裁決指標必須重算它的分數，
+而在只有 `full` 和 `data_audit` 的時候，唯一的做法是某人工作目錄裡的一支腳本 —— 沒有版本、
+沒有稽核紀錄，在 runs 表裡也看不見。
 
 兩個 monitor 狀態的位置是由工作本身的形狀決定的，不是喜好問題。**`MonitorHealth`** 必須在
 端點還存在時讀 CloudWatch，而 `Teardown` 在每條路徑上都會刪掉它（包含 `SmokeTest` 的

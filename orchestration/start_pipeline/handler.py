@@ -301,12 +301,49 @@ def _merge_params(params: dict, plan: dict) -> dict:
     return {**DEFAULT_PARAMS, **params, **plan_params}
 
 
+#: What each pipeline_mode a run may declare needs in params before it is legal to start.
+#
+# The state machine's entry Choice can route on the mode, but it cannot tell whether the
+# inputs that mode depends on are present -- so a mode whose prerequisites are missing
+# fails INSIDE an agent turn, after the run row, the manifest and the events all exist and
+# claim a run is under way. eval_only is the mode where that matters most: it skips
+# data-prep and finetune, so neither `distillation/curated.jsonl` (the eval agent's fallback
+# prompt set) nor a finetune stage entry (where it normally reads the model artifact) exists
+# in its manifest. Missing either one, the eval agent's only correct move is to escalate,
+# which costs a run row and a human's attention to learn something knowable here for free.
+MODE_REQUIRED_PARAMS = {
+    "eval_only": (
+        ("model_artifact_uri",
+         "the model.tar.gz to re-judge; there is no finetune stage in an eval_only run to "
+         "produce one, so nothing downstream can infer it"),
+        ("customer_eval_uri",
+         "the prompt set to judge against; the 10% val split the eval agent falls back to "
+         "is written by data-prep's curate task, which this mode skips"),
+    ),
+}
+
+
+def _check_mode_prerequisites(merged: dict) -> None:
+    """Refuse a mode whose inputs are absent, before a run_id exists to blame it on."""
+    mode = merged.get("pipeline_mode", "full")
+    missing = [(k, why) for k, why in MODE_REQUIRED_PARAMS.get(mode, ())
+               if not merged.get(k)]
+    if missing:
+        detail = "; ".join(f"params.{k} ({why})" for k, why in missing)
+        raise ValueError(
+            f"pipeline_mode={mode!r} requires {detail}. Refusing at dispatch rather than "
+            "starting a run that can only escalate: a half-specified mode produces a "
+            "manifest, a run row and a PipelineStarted event that all describe work the "
+            "pipeline cannot do.")
+
+
 def seed_manifest(run_id: str, trigger_source: str, params, plan,
                   approval=None) -> dict:
     params = _as_obj(params, "params")
     plan = _as_obj(plan, "plan")
     approval = _as_obj(approval, "approval")
     merged = _merge_params(params or {}, plan or {})
+    _check_mode_prerequisites(merged)
     return {
         "run_id": run_id,
         "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -357,7 +394,10 @@ def handler(event, context=None, clients=None):
         # pipeline_mode rides in the execution input because the Choice state at
         # the top of the machine cannot read the manifest from S3 — "full" runs
         # every stage; "data_audit" is the conductor's cheap starter (audit the
-        # customer's data, report, stop before any GPU is provisioned).
+        # customer's data, report, stop before any GPU is provisioned);
+        # "eval_only" re-judges an artifact an earlier run already paid for
+        # (params.model_artifact_uri) and stops at the gate verdict without
+        # deploying — see MODE_REQUIRED_PARAMS for what it must be given.
         input=json.dumps({"run_id": run_id, "manifest_uri": manifest_uri,
                           "iteration": 0,
                           "pipeline_mode": manifest["params"].get("pipeline_mode", "full"),
