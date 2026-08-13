@@ -3192,24 +3192,29 @@ _TRAILER_KEYS = ("plan_uri", "plan_summary", "cost_estimate_usd")
 
 
 def _parse_plan_trailer(text):
-    """The consult protocol ends a proposal with one fenced json block. Tolerant
-    parse: last {...} span inside the last fence, else the last {...} in the text."""
-    candidate = text
+    """The consult protocol ends a proposal with one fenced json block — but not
+    necessarily the LAST one. Step 3b of the same protocol lets the agent append a
+    separate fenced {"choices": [...]} block AFTER the trailer (and forbids putting
+    them in one fence), so "take the last fence with a brace" reads the choices,
+    finds no trailer keys, and reports no plan at all: the r6d consult produced a
+    complete priced plan that sat in `drafting` because its buttons parsed instead
+    of its trailer. Every fenced candidate is tried, newest first, and the first
+    one carrying ALL trailer keys wins; a choices block is skipped, not fatal."""
+    candidates = []
     if "```" in text:
         parts = text.split("```")
-        for part in reversed(parts):
-            if "{" in part:
-                candidate = part
-                break
-    try:
-        start = candidate.index("{")
-        end = candidate.rindex("}") + 1
-        obj = json.loads(candidate[start:end])
-    except Exception:
-        return None
-    if not isinstance(obj, dict) or not all(k in obj for k in _TRAILER_KEYS):
-        return None
-    return {k: obj[k] for k in _TRAILER_KEYS}
+        candidates = [p for p in reversed(parts) if "{" in p]
+    candidates.append(text)  # fence-less fallback, as before
+    for candidate in candidates:
+        try:
+            start = candidate.index("{")
+            end = candidate.rindex("}") + 1
+            obj = json.loads(candidate[start:end])
+        except Exception:
+            continue
+        if isinstance(obj, dict) and all(k in obj for k in _TRAILER_KEYS):
+            return {k: obj[k] for k in _TRAILER_KEYS}
+    return None
 
 
 def _replay_context(task):
