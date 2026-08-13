@@ -3063,12 +3063,24 @@ case("console: the signed form posts a field nothing prices or dispatches",
      [f"{_D}::test_the_console_form_field_name_is_the_one_consent_is_read_from"])
 
 
+# The stage-payload merge line, DERIVED. m164/m165/m183 below all patch it, and all
+# three went dead the moment it correctly gained a fourth source (`signed`, the settings
+# the plan a human signed carries -- see signed_plan_params). A control pinned to a
+# literal expires when that literal is legitimately corrected, and the expiry is SILENT:
+# the mutation raises its own assert, the runner counts a "catch", and the guard it
+# claimed to verify goes unverified. So the anchor is a shape, not a string.
+def _payload_merge_line(t: str) -> str:
+    m = re.search(r'^ +payload\["params"\] = \{\*\*.*\}$', t, re.M)
+    assert m, "the stage-payload params merge no longer matches; re-anchor these controls"
+    return m.group(0)
+
+
 # 164. The driver stops injecting the manifest's approved models -- the consumer half of
 #      the bug. The resolver stays correct and every prompt still reads
 #      params.teacher_model_id, so agents fall back to whatever model their persona line
 #      names. Two correct halves, never connected: this repo's recurring bug shape.
 def m164(t):
-    old = '        payload["params"] = {**approved, **facts, **payload["params"]}'
+    old = _payload_merge_line(t)
     assert t.count(old) == 1, f"the driver's model injection has moved; found {t.count(old)}"
     return t.replace(old, "        pass  # injection removed", 1)
 
@@ -3086,7 +3098,7 @@ case("driver: the approved models never reach the agent turn", _DRIVER, m164,
 #      own body, and a merge order restated in a test is satisfied by any order in the
 #      code. The guard now drives the real `_run_stage`.
 def m165(t):
-    old = '        payload["params"] = {**approved, **facts, **payload["params"]}'
+    old = _payload_merge_line(t)
     assert t.count(old) == 1, f"the driver's model merge has moved; found {t.count(old)}"
     return t.replace(
         old, '        payload["params"] = {**payload["params"], **approved, **facts}', 1)
@@ -3391,9 +3403,10 @@ case("driver: a stage write manufactures a manifest for a run nobody planned",
 #      deploy stage created and named; nothing else can supply it, since no plan can be
 #      signed with an endpoint name that does not exist yet.
 def m183(t):
-    old = '        payload["params"] = {**approved, **facts, **payload["params"]}'
+    old = _payload_merge_line(t)
     assert t.count(old) == 1, f"the params injection has moved; found {t.count(old)}"
-    return t.replace(old, '        payload["params"] = {**approved, **payload["params"]}', 1)
+    return t.replace(old, '        payload["params"] = {**signed, **approved, '
+                          '**payload["params"]}', 1)
 
 
 # The derived guard is NOT named here: it checks the `STAGE_FACT_PARAMS` declaration, and
