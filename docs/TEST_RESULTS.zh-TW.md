@@ -21,9 +21,9 @@
 
 | 檢查 | 結果 | 復現方式 |
 |---|---|---|
-| 單元測試（契約、成本模型、driver 迴圈、Lambda、狀態機文檔） | **1308/1308 通過** | `.venv/bin/python -m pytest tests/ -q --ignore=tests/golden` |
+| 單元測試（契約、成本模型、driver 迴圈、Lambda、狀態機文檔） | **1319/1319 通過** | `.venv/bin/python -m pytest tests/ -q --ignore=tests/golden` |
 | Shell 測試套件 —— N 路 capacity race guard（`tests/test_capacity_race_guard.sh`） | **10/10 斷言** | `bash tests/test_capacity_race_guard.sh` |
-| 反向控制 —— 逐一破壞每道 guard，確認它會失敗 | **333/333 反向控制** | `.venv/bin/python tests/negative_controls/monitor_dispatch.py` |
+| 反向控制 —— 逐一破壞每道 guard，確認它會失敗 | **338/338 反向控制** | `.venv/bin/python tests/negative_controls/monitor_dispatch.py` |
 | Harness 配置驗證（5 個專家 + 指揮家 + 審計員） | **7/7 `RESULT: OK`** | `python deploy/validate_config.py --config agents/<a>/harness.json` |
 | 架構 SVG 幾何檢查（虛線零交叉、零穿框） | **CLEAN** | `python tests/test_svg_geometry.py docs/architecture-*.svg` |
 | 遮蔽掃描（帳號 ID、憑證、帶帳號的 ARN） | CLEAN | `.github/workflows/redaction-check.yml` |
@@ -121,13 +121,13 @@ endpoint、五輪 e2e 迭代 —— 花費比這個帳戶單日花在一個沒�
 
 | 檢查 | 結果 | 重現方式 |
 |---|---|---|
-| 單元測試(全部套件,含 `test_cost_model.py` + `test_finops.py`) | **1308 passed** | `.venv/bin/python -m pytest tests/ -q` |
+| 單元測試(全部套件,含 `test_cost_model.py` + `test_finops.py`) | **1319 passed** | `.venv/bin/python -m pytest tests/ -q` |
 | Harness 配置驗證,7 個 agent | **`RESULT: OK`** | `python deploy/validate_config.py --config agents/finops/harness.json` |
 | 線上艦隊 | **7 個 harness READY** | 用 repo 內建 boto3 呼叫 `list_harnesses` |
 | 正典模組有散佈路徑 | 印出 `would upload 4 contract files` | `python deploy/03_storage.py --region us-east-1 --account-id 123456789012 --dry-run` |
 
 本次新增的每一道 guard 都做過 **mutation check**:逐一還原被斷言的行為,確認測試會
-失敗 —— **333/333 反向控制**,284 個 mutation 斷言 333 組（guard, mutation）配對,runner 各印
+失敗 —— **338/338 反向控制**,289 個 mutation 斷言 338 組（guard, mutation）配對,runner 各印
 一行 PASS。一個「有這行為也過、沒這行為也過」的測試,不是測試。
 
 這個數字是刻意寫進句子裡的。「做過 mutation check」是一個形容詞,而形容詞不會過期:
@@ -198,7 +198,8 @@ stage invocation 12 列），所以**是上一個修正把真實事件數推過�
 的路上丟掉一個截斷標記。一個不說自己被封頂的列表讀起來就是完整的，那是同一個缺陷往上一層。
 
 **D14 —— 一個只到達七個 harness 中五個的修正、它「顯而易見」的修法會燒掉的 43 條記憶，
-以及更早一次部署其實已經燒掉的 63 條（十七個控制，m267-m283）。** 共享 BYO memory 由 `deploy/04_wire_memory.py` 接線，而它的
+更早一次部署其實已經燒掉的 63 條，以及 9 條這個 repo 擁有的任何拼法都叫不出名字的
+（二十二個控制，m267-m288）。** 共享 BYO memory 由 `deploy/04_wire_memory.py` 接線，而它的
 harness 名單是手寫的：五個管線 worker。有兩個 harness 接在同一份 memory 上、卻不在名單裡，
 於是 #83 的提取收緊 —— semantic `topK` 10 → 5、`relevanceScore` 0.2 → 0.6，也就是那個讓
 「另一個 run 的事後檢討」不再以裸事實注入的修正 —— **從未到達它們**。2026-08-13 線上實測：
@@ -258,6 +259,28 @@ harness ID（對七個裡的六個都對，正好在值得抓的那個案例上�
 repartition 時才跑 —— 而那五個已經丟掉記錄的 harness 永遠不會有人去 repartition，m283 只數
 第一頁，而 m280 把一個**沒被讀過**的分區重新變回看起來是空的，也正是這個等價讓 63 條記錄在
 沒有任何一次失敗呼叫的情況下離開。
+
+**而那道檢查還是少了一個假設。** 它比對的是**這個 repo 產得出來的**兩種拼法 —— 裸 harness
+名字，和完整 harness ID。這份 memory 上 `ListActors` 回了 **16** 個 actor，其中兩個兩者都不是：
+`monitor` 有 **3** 條 semantic 記錄、`monitor-agent` 有 **6** 條，而這兩個 `actorId` 在這個 repo
+的任何檔案裡都找不到（較舊的 `deploy/wire_memory.py` 的 `--actor-id` 吃的是自由文字）。所以有
+9 條記錄，對一道**自己的 docstring 聲稱涵蓋了「一個兩者都不是的 `actorId`」**的 guard 而言是
+看不見的 —— 它涵蓋的是「**已上線的** id 是第三種拼法」，不是「存在第三個**分區**」。一份從某個
+repo 的命名慣例寫出來的候選清單，不可能包含這個 repo 從來沒有過的拼法，所以這份掃描現在改成從
+data plane 自己的列舉推導，每次執行一次：
+
+| 檢查 | 推導來源 | 線上結果 |
+|---|---|---|
+| 逐 harness 的 `stranded_partitions` | 這個 repo 的兩種拼法 | 63 條 semantic + 105 條 episodic，可歸屬到某個 harness |
+| memory 層級的 `unreachable_actors` | `ListActors` | **9 個孤兒 actor，72 條 semantic + 108 條 episodic = 180 條** |
+
+兩者是重疊的、**不能相加** —— 前者說的是**哪一個 harness** 掉了分區，後者說的是這份 memory 上
+到底有沒有東西成了孤兒。五個控制盯住它：m284 用這次執行自己的 attach 清單去建可達集合，於是
+`--harness llmops_eval` 會把另外六個 harness 健康的分區宣告成掉了（七次裡有六次在喊狼來了的
+警告，就是沒有人會讀的警告）；m285 對一份還不存在的 memory 回報孤兒數為零；m286 只數 semantic
+通道，於是 actor `finops` —— 0 條 facts、1 條 episodic —— 讀起來是乾淨的；m287 只讀第一頁
+actor，正好只在 memory 還小的時候是對的；m288 直接把呼叫從 `main()` 拿掉，也就是一道 guard
+存在於 repo 裡、卻不在部署路徑上的那種情況。
 
 ### 兩次失敗比通過更有價值
 

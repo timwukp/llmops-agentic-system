@@ -610,6 +610,15 @@ floors-only requirements + torch-2.6 DLC 配方 —— 那個配方當初花了 
   搬動，所以這是一份回報、不是一次修復；它換到的是「一個被拋棄的分區」和「一個空的分區」不再
   印出同一個樣子。兩種候選拼法都會被檢查，兩個通道都會被計數，而一個讀不到的分區會被回報成
   「沒讀到」，不是「是空的」。
+- **而且每次執行會掃一次：這份 memory 上沒有任何 harness 指著的 actor。** 上面那道檢查比對的是
+  **這個 repo 產得出來的**兩種拼法；線上 `ListActors` 回了 16 個 actor，其中兩個兩者都不是 ——
+  `monitor`（3 條 semantic 記錄）與 `monitor-agent`（6 條），由較舊的 `deploy/wire_memory.py`
+  寫入，它的 `--actor-id` 吃自由文字。一份從某個 repo 的命名慣例推導出來的候選清單，不可能包含
+  這個 repo 從來沒有過的拼法，所以 memory 層級的掃描改成從 data plane 自己的列舉推導：實測是
+  **9 個孤兒 actor、共 72 條 semantic + 108 條 episodic 記錄**。兩道檢查回答的是不同問題 ——
+  哪一個 harness 掉了分區，對比這份 memory 上到底有沒有東西成了孤兒 —— 所以它們的數字重疊、
+  不能相加。可達集合是對這個 repo 定義的每一個 harness 讀的，不只是這次執行接線的那些，否則
+  `--harness <某一個>` 就會把另外六個健康的分區全部宣告成掉了。
 
 Semantic 通道是刻意比 episodic **更緊**的（`topK` 5 / `relevanceScore` 0.6 對 10 / 0.2）。
 這兩者並不矛盾：`/episodes/{actorId}/{sessionId}` 把 episodic 回憶限制在 agent 自己的

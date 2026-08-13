@@ -16,6 +16,9 @@ Wraps the agentcore-harness-builder skill's wire_memory.py three-step wiring
   - every attach reports the records held under the OTHER spelling of actorId, so a
     partition an earlier deploy walked away from stops looking like an empty one
     (see `stranded_partitions` — 63 records are in that state right now)
+  - and once per run, every actor on the memory that no harness points at, enumerated
+    from ListActors rather than from this repo's two naming conventions, because 9 of
+    those records sit under actorIds this repo never had (see `unreachable_actors`)
   - publishes the memory id/arn to SSM /llmops/memory/*
 
 Usage:
@@ -112,12 +115,19 @@ def strategy_ids(ctl, memory_id, dry):
     return out
 
 
-def resolve_harness_id(ctl, name):
+def resolve_harness_id(ctl, name, required=True):
     """UpdateHarness rejects the bare name (live: ValidationException, pattern
-    `[a-zA-Z][a-zA-Z0-9_]{0,39}-[a-zA-Z0-9]{10}`) — same resolution 05_harnesses.py does."""
+    `[a-zA-Z][a-zA-Z0-9_]{0,39}-[a-zA-Z0-9]{10}`) — same resolution 05_harnesses.py does.
+
+    `required=False` returns None instead of exiting, for the memory-level sweep: a harness
+    this repo defines but has not created yet must not abort a report about OTHER harnesses'
+    records.
+    """
     for h in ctl.list_harnesses().get("harnesses", []):
         if h.get("name") == name or h.get("harnessId", "").rsplit("-", 1)[0] == name:
             return h["harnessId"]
+    if not required:
+        return None
     raise SystemExit(f"harness '{name}' not found — run 05_harnesses.py first")
 
 
@@ -186,6 +196,62 @@ def stranded_partitions(dp, memory_id, harness_id, harness_name, actor_id):
             if n:
                 found[ns] = n
     return found
+
+
+def reachable_actor_ids(ctl, harnesses, repartition):
+    """The actorId each harness will be reachable at AFTER this run.
+
+    Read for EVERY harness this repo defines, not only the ones this invocation wires:
+    with `--harness llmops_eval`, a set built from the wired list alone would call the
+    other six harnesses' own partitions unreachable, and a sweep that cries wolf on six
+    healthy partitions is a sweep nobody reads.
+    """
+    out = {}
+    for name in harnesses:
+        harness_id = resolve_harness_id(ctl, name, required=False)
+        if harness_id is None:
+            out[name] = name  # not created yet; the bare name is what it will be given
+            continue
+        out[name] = resolve_actor_id(ctl, harness_id, name, repartition)[0]
+    return out
+
+
+def unreachable_actors(dp, memory_id, reachable):
+    """Every actor holding records on this memory that no harness will be pointing at.
+
+    `stranded_partitions` asks a narrower question -- it compares the two spellings THIS
+    repo can produce (bare name, full harness id). That candidate list cannot contain a
+    spelling this repo never had, and the memory has some: measured live 2026-08-13,
+    `monitor` holds 3 semantic records and `monitor-agent` holds 6, actorIds that appear in
+    no file in this repo (they came from deploy/wire_memory.py's free-form --actor-id). So
+    9 records were invisible to a check whose own docstring claimed to cover "an actorId
+    that is neither". The list is therefore derived from ListActors -- the data plane's own
+    enumeration of who has written -- and the two checks answer different questions: the
+    per-harness one says WHICH harness lost a partition, this one says whether anything at
+    all on the memory is orphaned. Their counts overlap; they are not additive.
+
+    Same reporting contract as `stranded_partitions`: no API moves a record between
+    namespaces, so this is a report. What it buys is that an actorId typo, a rename, or a
+    hand-set --actor-id stops being indistinguishable from an empty memory.
+    """
+    found, tok = {}, None
+    while True:
+        kw = {"memoryId": memory_id, "maxResults": 100}
+        if tok:
+            kw["nextToken"] = tok
+        resp = dp.list_actors(**kw)
+        for summary in resp.get("actorSummaries", []):
+            actor = summary.get("actorId")
+            if not actor or actor in reachable:
+                continue
+            counts = {ns: count_records(dp, memory_id, ns)
+                      for ns in (f"/users/{actor}/facts", f"/episodes/{actor}")}
+            counts = {ns: n for ns, n in counts.items() if n}
+            if counts:
+                found[actor] = counts
+        tok = resp.get("nextToken")
+        if not tok:
+            return found
 
 
 def resolve_actor_id(ctl, harness_id, harness_name, repartition):
@@ -333,13 +399,28 @@ def main():
                                   memory_id=mem_id, repartition=args.repartition)
                 for h in harnesses]
 
+    # The memory-level half of the same question: not "did THIS harness lose a partition"
+    # but "is anything on this memory orphaned at all", derived from ListActors so a
+    # spelling this repo never produced cannot hide.
+    if mem_id == "MEMORY-DRYRUN":
+        sweep = {"unreachable_check": "SKIPPED: no memory yet -- unknown is not zero"}
+    else:
+        reachable = set(reachable_actor_ids(ctl, harness_names(), args.repartition).values())
+        orphans = unreachable_actors(dp, mem_id, reachable)
+        sweep = {"unreachable_actors": orphans,
+                 "unreachable_records": sum(sum(v.values()) for v in orphans.values())}
+        if orphans:
+            print(f"WARNING {sweep['unreachable_records']} memory records on {mem_id} are "
+                  f"held by actorIds no harness points at: "
+                  f"{json.dumps(orphans, sort_keys=True)}", file=sys.stderr)
+
     if not args.dry_run:
         ssm.put_parameter(Name="/llmops/memory/id", Value=mem_id, Type="String", Overwrite=True)
         ssm.put_parameter(Name="/llmops/memory/arn", Value=mem_arn, Type="String", Overwrite=True)
 
     print(json.dumps({"memory_id": mem_id, "created": created,
                       "strategies": sids, "iam": grant,
-                      "attached": attached, "dry_run": args.dry_run}, indent=2))
+                      "attached": attached, "dry_run": args.dry_run, **sweep}, indent=2))
 
 
 if __name__ == "__main__":

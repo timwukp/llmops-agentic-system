@@ -721,6 +721,17 @@ fleet rather than reading this repo (the measurements are in
   a report rather than a repair; what it buys is that an abandoned partition and an empty one
   stop printing the same. Both candidate spellings are checked, both channels are counted, and
   a partition that could not be read is reported as unread rather than as empty.
+- **And once per run, every actor on the memory that no harness points at.** The check above
+  compares the two spellings *this repo produces*; `ListActors` returns 16 actors on the live
+  memory and two are neither — `monitor` (3 semantic records) and `monitor-agent` (6), written
+  by the older `deploy/wire_memory.py`, whose `--actor-id` is free-form. A candidate list
+  derived from a repo's naming conventions cannot contain a spelling the repo never had, so the
+  memory-level sweep is derived from the data plane's own enumeration: live, **9 orphaned
+  actors holding 72 semantic + 108 episodic records**. The two checks answer different
+  questions — which harness lost a partition, versus whether anything on the memory is orphaned
+  at all — so their counts overlap and are not additive. The reachable set is read for every
+  harness the repo defines, not only the ones a given run wires, or `--harness <one>` would
+  denounce the other six healthy partitions.
 
 The semantic channel is deliberately **tighter** than the episodic one (`topK` 5 /
 `relevanceScore` 0.6 versus 10 / 0.2). They are not inconsistent: `/episodes/{actorId}/{sessionId}`

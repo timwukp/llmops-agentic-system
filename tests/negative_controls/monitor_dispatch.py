@@ -5108,6 +5108,90 @@ case("wire memory: the stranded count reads one page, so the biggest abandoned p
      [f"{_TO}test_the_stranded_count_reads_past_the_first_page"])
 
 
+# ── D14 (cont.): the 9 records neither candidate spelling could name ─────────────────
+# The check above enumerates the two spellings this repo produces. Live 2026-08-13,
+# ListActors returns 16 actors, and `monitor` (3 semantic records) and `monitor-agent` (6)
+# are neither -- they came from deploy/wire_memory.py, whose --actor-id is free-form. A
+# candidate list written from a repo's naming conventions cannot contain a spelling the repo
+# never had, so the memory-level sweep derives its list from the data plane's own
+# enumeration: 9 orphaned actors, 72 semantic + 108 episodic records.
+
+
+def m284(t):
+    old = "        reachable = set(reachable_actor_ids(ctl, harness_names(), args.repartition).values())"
+    assert t.count(old) == 1, "the reachable-set derivation has moved"
+    # Only the harnesses THIS invocation wires count as reachable, so
+    # `--harness llmops_eval` reports the other six healthy partitions as orphaned. A sweep
+    # that cries wolf on six of seven is a sweep nobody reads -- the failure mode is the
+    # warning being ignored, not the warning being absent.
+    return t.replace(old, "        reachable = set(a['actorId'] for a in attached)", 1)
+
+
+case("wire memory: the orphan sweep treats every harness this run is not wiring as "
+     "unreachable, drowning the real finding in six false ones",
+     _WM, m284,
+     [f"{_TO}test_wiring_one_harness_does_not_report_the_others_partition_as_orphaned"])
+
+
+def m285(t):
+    old = '        sweep = {"unreachable_check": "SKIPPED: no memory yet -- unknown is not zero"}'
+    assert t.count(old) == 1, "the skipped-sweep marker has moved"
+    # A memory that does not exist yet, reported as a memory with nothing orphaned on it --
+    # the same unknown-is-zero equivalence that made 63 records vanish quietly.
+    return t.replace(old, '        sweep = {"unreachable_actors": {}, "unreachable_records": 0}', 1)
+
+
+case("wire memory: a run that could not read any partition reports zero orphans instead of "
+     "saying it did not look",
+     _WM, m285,
+     [f"{_TO}test_a_memory_that_does_not_exist_yet_reports_skipped_not_zero"])
+
+
+def m286(t):
+    old = """            counts = {ns: count_records(dp, memory_id, ns)
+                      for ns in (f"/users/{actor}/facts", f"/episodes/{actor}")}"""
+    assert t.count(old) == 1, "the orphan channel sweep has moved"
+    # Semantic only. Live, the actor `finops` holds 0 facts and 1 episodic record, so it
+    # reports as clean -- and 108 episodic records go unmentioned.
+    return t.replace(old, """            counts = {ns: count_records(dp, memory_id, ns)
+                      for ns in (f"/users/{actor}/facts",)}""", 1)
+
+
+case("wire memory: the orphan sweep counts only the semantic channel, so an actor whose "
+     "loss is entirely episodic reports as clean",
+     _WM, m286,
+     [f"{_TO}test_the_sweep_counts_the_episodic_channel_of_an_orphan_too"])
+
+
+def m287(t):
+    old = """        resp = dp.list_actors(**kw)"""
+    assert t.count(old) == 1, "the actor enumeration has moved"
+    # First page only. 16 actors fit one page today, which is exactly why an unpaginated
+    # sweep would look correct until the memory grew past it.
+    return t.replace(old, """        resp = dp.list_actors(memoryId=memory_id, maxResults=100)
+        resp.pop("nextToken", None)""", 1)
+
+
+case("wire memory: the orphan sweep reads only the first page of actors, so it is correct "
+     "only while the memory is small",
+     _WM, m287,
+     [f"{_TO}test_the_sweep_reads_every_page_of_actors"])
+
+
+def m288(t):
+    old = """    if mem_id == "MEMORY-DRYRUN":"""
+    assert t.count(old) == 1, "the sweep's dry-run gate has moved"
+    # The sweep never runs. Both halves of the finding are then reported by a function
+    # nothing calls -- the failure mode where a guard exists in the repo and not on the
+    # deploy path.
+    return t.replace(old, "    if True:", 1)
+
+
+case("wire memory: nothing on the deploy path calls the memory-level orphan sweep",
+     _WM, m288,
+     [f"{_TO}test_the_run_reports_the_orphans_once_for_the_whole_memory"])
+
+
 #: Where the pristine text of the file currently mutated is parked, so a kill -9 -- which
 #: no handler can intercept -- still leaves the original recoverable. Under the repo root
 #: rather than /tmp because it must be obvious to whoever finds the tree dirty, and
