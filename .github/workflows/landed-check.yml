@@ -1,0 +1,52 @@
+name: Landed check
+
+# "MERGED" is not "on main". On 2026-08-12 twelve PRs read MERGED and one landed;
+# on 2026-08-11 the same thing happened to four and nobody noticed for a day.
+# Neither the test suite nor CI could see it, because both run on a branch and
+# the defect is a property of the graph AFTER the merge. So it is checked here.
+#
+# Runs on merge (push to the default branch), on every PR close -- which is the
+# earliest moment a collapsing stack is visible, since merging a child into a
+# side branch never pushes to main -- and daily, so a miss cannot survive a day.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [closed]
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  landed:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # actions/checkout is depth 1 by default, where `git cat-file` sees no
+          # commit and every ancestry question falls through to the compare API,
+          # one request per PR. And the default branch must exist LOCALLY as a
+          # branch for `merge-base --is-ancestor <sha> main` to resolve at all --
+          # on a pull_request event the checkout is a detached merge ref.
+          fetch-depth: 0
+          ref: ${{ github.event.repository.default_branch }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Audit that every merged PR reached the default branch
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python tools/audit_landed.py --days 30 --json landed-audit.json
+      - name: Keep the audit as evidence
+        # if: always() so the artifact survives the red run, which is the only
+        # one anybody needs to read.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: landed-audit
+          path: landed-audit.json
+          if-no-files-found: warn

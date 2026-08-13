@@ -218,8 +218,15 @@ def test_binary_classification_matches_git_for_every_tracked_file():
     purpose -- the finding is that a skip count nobody reads is where a guard goes to hide, and
     that finding does not expire when the arithmetic changes.) A guard whose name says "for every
     tracked file" was checking zero of them on the only machine that gates the merge, and
-    reported green for it. Against `4b825dc…` the diff is the whole index -- 172 files, 35 of
+    reported green for it. Against `4b825dc…` the diff is the whole index -- 175 files, 35 of
     them binary -- so it can never be empty and there is nothing left to skip on.
+
+    One trap in the staging cure below: `git add -N` is NOT enough for this test. It records the
+    path, so `git ls-files` counts it and test_an_unstaged_new_file_is_a_lying_census goes green,
+    but it stores no blob -- `git show :path` exits non-zero and the loop `continue`s past the
+    file, so `checked` stays behind `len(tracked)` and THIS guard reds instead. Measured while
+    adding the landed detector: 172 classified of 175 tracked. A new file needs a real
+    `git add`.
     """
     out = subprocess.run(["git", "diff", "--cached", "--numstat", _EMPTY_TREE],
                          capture_output=True, text=True, cwd=REPO).stdout
@@ -237,7 +244,7 @@ def test_binary_classification_matches_git_for_every_tracked_file():
             f"{path}: git says binary={git_says_binary}, is_binary() disagrees")
         checked += 1
     # EVERY tracked file, which is what the name promises -- not "at least one". `assert checked`
-    # was the old floor, and it is satisfied by checking a single file out of 172: a diff against
+    # was the old floor, and it is satisfied by checking a single file out of 175: a diff against
     # HEAD covers only what this branch happens to touch, so the coverage of this guard silently
     # tracked the size of the working change. Comparing against `git ls-files` makes the promise
     # in the name falsifiable, and is what fails if the diff base is ever narrowed again.
