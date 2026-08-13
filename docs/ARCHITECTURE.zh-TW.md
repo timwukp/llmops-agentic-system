@@ -930,6 +930,39 @@ plan、沒有核准、沒有 models，在下游讀起來就是「一個沒有人
 報告寫入一樣降級成一則被回報的警告 —— task token 是 pipeline 唯一能得知「一個已經付了錢的 stage
 成功了」的途徑，任何事情都不得扣住它。
 
+**一個 stage 名字只留一筆，就是少了一筆。** `stages` 以 stage **名字**為 key，所以 driver 在
+`stage_complete` 寫下的那一筆就是該 stage 唯一的紀錄 —— 同一個 stage 的下一個 task、或下一個
+iteration 的同一個 stage，會直接把它蓋掉。r5（`run-20260811T101948Z-f9d34d27`，remediation
+迴圈，2 個 iteration）實測：留下來的 manifest 裡 `stages.finetune.metrics.iteration == 1`，而
+`eval` 那筆帶著 `delta_judge_win_rate_vs_i0`，卻已經沒有 iteration-0 那一列可以相減。driver 驗證
+過的 i0 training loss 與 judge 計數全部消失；它們之所以還在 S3 上，純粹因為 eval agent 剛好自己
+手動 archive 了 `report-i0.json`。一個存在目的就是回答「這一個針對性的改動有沒有效」的迴圈，讀
+自己的 manifest 答不出來。修法是**只增不改的 `stage_history`**，而不是換 key：`stage_fact_params`
+和每一份專家 prompt 都用裸 stage 名讀 `stages[<stage>]`，而 agents 本來就在同一張表裡寫自己那種
+比較單薄的 `"<stage>.<task>.i<n>"` 條目 —— driver 去寫同一個 key 會跟 agent 搶，每次 run 輸贏
+不定。這個 append 落在 `_save_manifest` **剛重讀回來**的那份 list 上，而不是呼叫者的快照上 ——
+`stages` 是整包覆寫、本來就可能弄丟一次在該輪期間抵達的寫入，而 `stage_history` 不能繼承那個縫，
+因為在那裡弄丟一筆是永久性的，而在 `stages` 弄丟一筆只是弄丟最新那筆的副本。
+
+**只有告警通道知道的升級，對報告來說是不存在的。** `build_run_report` 會為狀態是 `escalated` 的
+stage 提出一個 critical finding，而從來沒有任何寫入者把那個狀態寫進 `stages`：`handle_escalate`
+的持久紀錄是 `runs.status` 加上（自 #52 起）一筆 DDB stage event，而報告兩個都讀不到。所以 r5 在
+iteration-1 的 gate 升級給人處理，發佈出來的卻是 `"findings": []` —— 唯一那次真的需要人來看的
+run，產出的是一份「無事可報」的報告。現在 driver 會附加到第二個只增不改的 list `escalations`，報告
+從它推導出 critical findings。用附加而不是寫進 `stages[<stage>]["status"]`，是因為升級的那個 stage
+通常**有**一筆已完成的紀錄 —— r5 的 `eval` 裡放著 scoring task 的 judge 計數 —— 覆寫它等於用一個
+消失的 finding 換一個被摧毀的量測。升級的呼叫端傳 `manifest=None`，讓 `_save_manifest` 變成只增
+不改：一條自己沒有 stage 結果的路徑，就不該**有能力**去重述任何一筆。它同時以「URI 指名的 run 是否
+就是 `run_id`」為守衛，因為一個 triage 的 `manifest_uri` 指的是**被處理的那個** run，而它的
+`run_id` 是 conductor 自己的。
+
+**報告讀不懂一個狀態時要說出來，而不是把它算成失敗。** `stages` 有兩個寫入者、兩套詞彙 —— driver
+寫 `completed`，agents 寫 `complete` / `launched` —— 而只有 driver 那套被計數。r5 對一次每個 stage
+都成功的 run 發佈了 `{"total": 14, "passed": 3, "failed": 0}`：14 個裡有 11 個被算成「什麼都不
+是」，在 console 上就呈現為一次大半沒過的 run。現在兩套詞彙都會讀，`launched` 的 job 算
+`in_flight`（不是 pass 也不是 fail —— 那個結果還不存在），並且發佈 `unrecognized`，讓四個子項加起來
+等於 `total`。`total` 與 `passed + failed` 之間那道縫，正是這件事藏了 14 次 run 的地方。
+
 **一個 run 自己發現的事實，和它被簽署時的同意一樣會被傳遞下去。** `MODEL_PARAM_FOR_ROLE` 把人
 **簽署**的內容帶給必須服從它的 stage；`STAGE_FACT_PARAMS` 把 run 自己**產出**的內容帶給必須量測
 它的 stage。`params.student_endpoint` —— eval 與 monitor 都會讀 —— 就是命名這個模式的那個案例：

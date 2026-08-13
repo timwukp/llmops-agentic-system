@@ -1095,6 +1095,49 @@ document has no plan, no approval and no models, which reads downstream as a run
 The refusal degrades to a reported warning like the report write above it — the task token is the
 pipeline's only way to learn a paid-for stage succeeded, and nothing may withhold it.
 
+**One entry per stage name is one entry too few.** `stages` is keyed by stage *name*, so the
+entry the driver writes on `stage_complete` is the only record of that stage — and the next
+task of the same stage, or the same stage in the next iteration, replaces it. Measured on
+r5 (`run-20260811T101948Z-f9d34d27`, remediation loop, 2 iterations): the surviving manifest
+holds `stages.finetune.metrics.iteration == 1` and an `eval` entry carrying
+`delta_judge_win_rate_vs_i0` with no iteration-0 row left to subtract from. The
+driver-verified i0 training losses and judge counts were gone; they survived on S3 only
+because the eval agent happened to archive `report-i0.json` by hand. A loop whose entire
+purpose is *"did the one targeted change help?"* could not answer that from its own manifest.
+The fix is an **append-only `stage_history`**, not a re-keying: `stage_fact_params` and every
+specialist prompt read `stages[<stage>]` by bare stage name, and the agents already write
+their own thin `"<stage>.<task>.i<n>"` entries into the same map, so a driver writing that key
+would race an agent for it and win or lose per run. The append lands on the list
+`_save_manifest` just *re-read* from S3 rather than on the caller's snapshot — `stages` is
+replaced wholesale and can lose a write that arrives during the turn, and `stage_history` must
+not inherit that gap, because losing a record there loses it permanently while losing a
+`stages` entry loses a duplicate of the latest one.
+
+**An escalation that only the alert channel knows about is invisible to the report.**
+`build_run_report` raises a critical finding for a stage whose status is `escalated`, and
+nothing ever wrote that status into `stages`: `handle_escalate`'s durable records are
+`runs.status` and (since #52) a DDB stage event, neither of which the report reads. So r5
+escalated to a human at its iteration-1 gate and published `"findings": []` — the one run
+that needed a person to look at it produced the report of a run with nothing to say. The
+driver now appends to a second append-only list, `escalations`, and the report derives its
+critical findings from it. Appended rather than written onto `stages[<stage>]["status"]`
+because the escalating stage usually *has* a completed entry — r5's `eval` holds the scoring
+task's judge counts — and overwriting it would trade a missing finding for a destroyed
+measurement. The escalation caller passes `manifest=None`, which makes `_save_manifest`
+append-only: a path with no stage results of its own must not be *able* to restate any. It is
+also guarded on the URI naming the same run as `run_id`, because a triage's `manifest_uri`
+names the **subject** run while its `run_id` is the conductor's own.
+
+**A report that cannot read a status must say so, not count it as a failure.** `stages` has
+two writers with two vocabularies — the driver writes `completed`, the agents write
+`complete` / `launched` — and only the driver's was counted. r5 published
+`{"total": 14, "passed": 3, "failed": 0}` for a run in which every stage succeeded: 11 of 14
+counted as nothing at all, which the console renders as a run that mostly did not pass. Both
+vocabularies are now read, a `launched` job counts as `in_flight` (not a pass and not a
+failure — that outcome does not exist yet), and `unrecognized` is published so the four
+sub-counts reconcile to `total`. The gap between `total` and `passed + failed` is exactly
+what hid this for 14 runs.
+
 **The facts a run discovers travel like the consent it was signed with.** `MODEL_PARAM_FOR_ROLE`
 carries what a human *signed* into the stages that must obey it; `STAGE_FACT_PARAMS` carries what
 the run itself *produced* into the stages that must measure it. `params.student_endpoint` — read

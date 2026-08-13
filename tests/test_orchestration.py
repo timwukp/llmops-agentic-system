@@ -1048,6 +1048,109 @@ class TestDriver:
             "the event has to say whether a run row was closed too, or a reader cannot "
             "tell an escalated run from an escalating non-run")
 
+    # ---- the escalation must reach the run's own report (#D3c) ------------------
+    #
+    # build_run_report raises a critical finding for a stage whose status is "escalated",
+    # and NOTHING wrote that status into manifest["stages"]. handle_escalate's durable
+    # record was runs.status plus a DDB stage event, neither of which the report reads. So
+    # r5 (run-20260811T101948Z-f9d34d27) escalated to a human at its iteration-1 gate and
+    # published "findings": [] -- the one run that needed a person to look at it produced
+    # the report of a run with nothing to say.
+
+    URI = "s3://llmops-data-test/runs/run-real-1/manifest.json"
+
+    @classmethod
+    def _seeded(cls, manifest):
+        s3 = FakeS3()
+        s3.objects[cls.URI] = json.dumps(manifest).encode()
+        return s3
+
+    def test_an_escalation_becomes_a_finding_in_the_runs_own_report(self):
+        """The report is what a human opens; the escalation has to be in it."""
+        s3 = self._seeded({"run_id": "run-real-1", "stages": {
+            "eval": {"status": "completed", "metrics": {"judge_win_rate": 0.0}}}})
+        c = clients(s3=s3)
+        out = driver.handle_escalate(
+            c, driver_event(run_id="run-real-1", stage="eval", task="gate", iteration=1,
+                            manifest_uri=self.URI),
+            {"reason": "judge_win_rate 0.0 is below the 0.55 bar and iteration 1 did not "
+                       "move it"})
+        assert out == {"escalated": True}
+        saved = json.loads(s3.objects[self.URI])
+        assert saved.get("escalations"), (
+            "the escalation left no record the report can read: the DDB stage event and "
+            "runs.status are both invisible to build_run_report")
+        report = build_run_report(saved)
+        crit = [f for f in report["findings"] if f["severity"] == "critical"]
+        assert len(crit) == 1, f"escalated run, findings={report['findings']!r}"
+        assert crit[0]["stage"] == "eval"
+        assert "0.55 bar" in crit[0]["detail"], (
+            "a finding that does not carry the reason sends the reader back to their email")
+        assert report["escalations"][0]["iteration"] == 1, (
+            "which iteration called the human is the whole question in a remediation loop")
+
+    def test_an_escalation_does_not_overwrite_the_stage_it_escalated_from(self):
+        """Recorded as an append, not as stages[stage]["status"] = "escalated".
+
+        The escalating stage usually HAS a completed entry -- r5's `eval` holds the scoring
+        task's judge counts -- so writing the status onto it would trade a missing finding
+        for a destroyed measurement. This is also why the escalation path passes
+        `manifest=None`: it has no stage results, so it must not be able to restate any.
+        """
+        s3 = self._seeded({"run_id": "run-real-1", "stages": {
+            "eval": {"status": "completed", "metrics": {"judge_win_rate": 0.0},
+                     "evidence": "40-row acceptance set"}}})
+        driver.handle_escalate(clients(s3=s3),
+                              driver_event(run_id="run-real-1", stage="eval", task="gate",
+                                           manifest_uri=self.URI),
+                              {"reason": "below bar"})
+        saved = json.loads(s3.objects[self.URI])
+        assert saved["stages"]["eval"] == {
+            "status": "completed", "metrics": {"judge_win_rate": 0.0},
+            "evidence": "40-row acceptance set"}, (
+            f"the escalation rewrote the stage's measured result: {saved['stages']['eval']!r}")
+
+    def test_a_triage_does_not_file_its_escalation_in_the_subject_run(self):
+        """A triage's manifest_uri names the SUBJECT run while its run_id is the
+        conductor's own, so "write into event['manifest_uri']" would file the conductor's
+        escalation inside somebody else's run record, under a run_id that names neither.
+
+        The guard is derived from the URI rather than from _is_triage, so a future non-run
+        caller cannot start doing this just by not being named in a list.
+        """
+        s3 = self._seeded({"run_id": "run-real-1", "stages": {}})
+        driver.handle_escalate(
+            clients(s3=s3),
+            driver_event(run_id="triage-abc", stage="conductor", task="triage",
+                         task_token="", manifest_uri=self.URI),
+            {"reason": "cannot resolve run-real-1"})
+        saved = json.loads(s3.objects[self.URI])
+        assert "escalations" not in saved, (
+            f"a triage wrote into the subject run's manifest: {saved.get('escalations')!r}")
+
+    def test_an_unwritable_manifest_does_not_withhold_the_escalation(self):
+        """Same law as every other channel here: bookkeeping cannot silence the alert.
+
+        The manifest write is the newest of the four records and the only one that touches
+        S3, so it is the one most likely to fail on an IAM change -- exactly how #25 turned
+        one refused PutObject into a second, permitted artifact's disappearance.
+        """
+        class _Refuses(FakeS3):
+            def get_object(self, Bucket, Key):
+                raise RuntimeError("AccessDenied")
+
+        c = clients(s3=_Refuses())
+        out = driver.handle_escalate(
+            c, driver_event(run_id="run-real-1", manifest_uri=self.URI),
+            {"reason": "budget exhausted"})
+        assert out == {"escalated": True}
+        assert c["sns"].published, "the alert itself was withheld"
+        assert c["sfn"].failures[0]["error"] == "EscalatedToHuman", \
+            "the task token was left parked, which is the zombie #52 exists to prevent"
+        assert any(i["sk"].endswith("#escalated")
+                   for i in c["ddb"].Table(ENV["EVENTS_TABLE"]).items), \
+            "the DDB trace went down with the S3 write"
+
     # ---- one dead escalation channel must not close the others -----------------
     #
     # The channels are independent by design and the ordering used to say otherwise:
