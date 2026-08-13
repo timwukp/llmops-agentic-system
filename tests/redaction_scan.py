@@ -107,7 +107,7 @@ ALLOWED = (b"6833" + b"13688378", b"7631" + b"04351884", b"1234" + b"56789012")
 #: this laptop, single-threaded CPython does 3.1M sha256/s, so the whole 1e12 space falls in
 #: about 4 days -- and a GPU does it in roughly 100 seconds. So the KDF is iterated. At 200k
 #: iterations a candidate costs ~16 ms, which makes the same sweep ~500 GPU-years, while the
-#: scan stays cheap because only 12-digit runs are ever hashed: measured across all 178
+#: scan stays cheap because only 12-digit runs are ever hashed: measured across all 179
 #: tracked files there are 69 such runs, 10 distinct, and hashing the distinct set takes 0.16 s
 #: for the entire repo. (Re-measured whenever either number moves, and they move
 #: INDEPENDENTLY, which is why both are derived and neither is inferred from the other, and
@@ -134,11 +134,13 @@ ALLOWED = (b"6833" + b"13688378", b"7631" + b"04351884", b"1234" + b"56789012")
 #: carries a 12-digit run -- while the run count held again. Then the one-trainer fix
 #: moved one more: 175 files went to 176, the deliverability preflight now shipping in the
 #: directory the deploy actually mirrors, and its numbers are seconds, rows and
-#: percentages. Then the r6d retrieval substrate moved two at once: 176 files became 178
+#: percentages. Then the r6d retrieval substrate moved two at once: 176 files went to 178
 #: -- the KB deploy script (whose numbers are OCU rates, dimensions and poll counts) and
 #: the deep-research evidence doc behind it (percentages and win rates), neither carrying
-#: a 12-digit run. (The "became" phrasing is the one the guard reads, so it names the
-#: LATEST movement -- the earlier ones are history and keep their own past tense.)
+#: a 12-digit run. Then the canonical RAFT context format moved one more:
+#: 178 files became 179, a markdown template whose only numbers are fractions and a bar. (The
+#: "became" phrasing is the one the guard reads, so it names the LATEST movement -- the
+#: earlier ones are history and keep their own past tense.)
 #: EIGHT commits
 #: running, the file count moved and the run count did not move once --
 #: which is the whole reason these are two derived numbers and not one. The CI-only detection
