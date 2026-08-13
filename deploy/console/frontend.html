@@ -625,6 +625,27 @@ function renderExecPicker(){
   if (cur && _execs.some(e=>e.arn===cur)) $("execPick").value = cur;
 }
 
+// ── quality-gate row verdicts ────────────────────────────────────────────────
+// One pill per situation run_detail can report, because they call for different actions:
+// BORDERLINE means the pipeline escalated rather than decide (Wilson interval straddles the
+// bar), NOT MEASURED means the eval report omitted a gated metric -- which the eval prompt
+// defines as a FAILED gate, so it is red -- and NOT EVALUATED means the run died before it
+// was measured, which is the only one of the five that is genuinely no verdict.
+const GATE_PILL = {
+  "passed":        `<span class="pill ok">PASS</span>`,
+  "failed":        `<span class="pill err">FAIL</span>`,
+  "borderline":    `<span class="pill warn">BORDERLINE</span>`,
+  "not_measured":  `<span class="pill err">NOT MEASURED</span>`,
+  "not_evaluated": `<span class="pill idle">not evaluated</span>`,
+  "unreadable":    `<span class="pill err">UNREADABLE</span>`,
+};
+// The denominator an interval was computed over, under the metric FAMILY's name -- the row
+// carries judge_score plus judge_n, so the family is the metric name minus its last
+// component. Derived rather than spelled "judge_n", so the next interval-bearing gate metric
+// shows its n instead of silently showing an interval with no sample size behind it.
+function gateN(g){ const v = g[String(g.name||"").split("_").slice(0,-1).join("_")+"_n"];
+  return v==null ? null : v; }
+
 // ── stage-flow diagram: 9 logical stages + remediation loop ──────────────────
 const STAGE_SUBS = {"data-prep-generate":"teacher generates","data-prep-curate":"curate + split",
   "finetune-launch":"QLoRA on SageMaker","finetune-analyze":"loss curves","eval-gate":"quality gates",
@@ -790,8 +811,13 @@ async function loadRun(runId){
       html += `<h2 style="margin-top:12px">Quality gates</h2><table><tr><th>Gate</th><th>Threshold</th><th>Actual</th><th>Verdict</th></tr>`+
         d.gates.map(g=>`<tr><td>${esc(g.name)}</td><td class="mono">${esc(g.threshold)}</td>`+
           `<td class="mono">${g.actual!=null?esc(g.actual):"–"}</td>`+
-          `<td>${g.passed==null?`<span class="pill idle">n/a</span>`:`<span class="pill ${g.passed?"ok":"err"}">${g.passed?"PASS":"FAIL"}</span>`}`+
-          `${g.judge_score_ci_low!=null?` <span class="sub mono">CI [${esc(g.judge_score_ci_low)}, ${esc(g.judge_score_ci_high)}] n=${esc(g.judge_n!=null?g.judge_n:"?")}</span>`:""}</td></tr>`).join("")+`</table>`;
+          // Five situations, five labels. They used to be three pills -- PASS / FAIL / n/a --
+          // and the n/a covered a borderline the pipeline escalated, a gate whose metric the
+          // report omits (a FAILED gate), and a run that never reached eval. Painting those
+          // three the same is how run-phase2-main-0001 shows "gate failed" over a table of
+          // blanks with no way to tell which gate failed.
+          `<td>${GATE_PILL[g.status]||GATE_PILL[g.passed==null?"not_evaluated":(g.passed?"passed":"failed")]}`+
+          `${g[g.name+"_ci_low"]!=null?` <span class="sub mono">CI [${esc(g[g.name+"_ci_low"])}, ${esc(g[g.name+"_ci_high"])}]${gateN(g)!=null?` n=${esc(gateN(g))}`:""}</span>`:""}</td></tr>`).join("")+`</table>`;
     }
     if (d.oodReport) {
       html += `<h2 style="margin-top:12px">OOD layer (measured, never gated)</h2><table><tr><th>Metric</th><th>Value</th></tr>`+

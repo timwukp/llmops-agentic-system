@@ -978,6 +978,24 @@ eval prompt 說「固定的評審 prompt」而其實一個都沒固定，那個 
 評分，而一份名單會安靜地停止檢查走了那條路的 run。driver 絕不用正典摘要去替補一個缺失的聲稱：那會把
 一份不存在的證明變成一份假的證明。
 
+**同一個判定被推導第二次，就是第二個判定。** console 的 gate 表格用 `actual >= threshold` 重算每一列，
+而 `agents/eval` 的 gate bullet 對帶區間的指標是用它的 Wilson 界限來判——只有下界超過門檻才算通過、
+只有上界低於門檻才算失敗、其餘一律上報人類。repo 自己的 console fixture 就是實證：`judge_score` 0.48
+對 0.45 的門檻、CI [0.40, 0.56]，畫出來是 **PASS**，而那個 run 的 `gate_passed` 是 `false`，因為
+agent 把它當邊界情形上報了。現在 `gate_row` 用跟 pipeline 相同的方式推導判定，而且是以
+`<name>_ci_low` / `<name>_ci_high` 為鍵，不是以字串 `judge_score` 為鍵——一個指標該不該用區間來判，
+是「報告對它帶了什麼」的性質，而一份名單會讓下一個帶區間的指標安靜地退回用點估計來判。它同時發佈一個
+`status`，而不是單一個三態布林，因為原本有三種完全不同的情況共用同一個空白格：pipeline 拒絕自己下判定的
+**邊界情形**（`passed: null`）、eval 報告從來沒帶的受管指標——eval prompt 定義這是**失敗**的 gate，
+不是未定的 gate（`not_measured`、`passed: false`）——以及根本還沒跑到 eval 就死掉的 run
+（`not_evaluated`、`passed: null`）。門檻無法拿來比較的值是 `unreadable`，並且往失敗方向收斂。在
+`run-phase2-main-0001` 上，舊表格在兩列空白之上寫著「gate failed」，於是說不出**哪一個** gate 失敗——
+而那正是這張表存在的唯一理由。「eval 有沒有回報」是以 stage 條目裡 `metrics` 這個鍵是否存在為準，不是以
+條目本身、也不是以那個 dict 非空為準：driver 在完成時一定會寫這個鍵，而 agent 在 stage 進行中寫的條目
+沒有這個鍵，所以在 `run-20260811T165529Z-ce628817`（`status: inference_in_progress`）上，用條目存在
+來判會在推論工作還在啟動時就把兩個 gate 都判失敗，而用非空來判則會把一份「到了但什麼都沒帶」的報告讀成
+從未被量測過。
+
 **一個 run 自己發現的事實，和它被簽署時的同意一樣會被傳遞下去。** `MODEL_PARAM_FOR_ROLE` 把人
 **簽署**的內容帶給必須服從它的 stage；`STAGE_FACT_PARAMS` 把 run 自己**產出**的內容帶給必須量測
 它的 stage。`params.student_endpoint` —— eval 與 monitor 都會讀 —— 就是命名這個模式的那個案例：

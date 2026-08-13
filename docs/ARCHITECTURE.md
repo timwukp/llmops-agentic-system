@@ -1158,6 +1158,29 @@ scored inside `evaluate` instead of `score` and a name list would quietly stop c
 run. The driver never substitutes the canonical digest for a missing claim: that converts an
 absent attestation into a false one.
 
+**A second derivation of one verdict is a second verdict.** The console's gate table recomputed
+each row as `actual >= threshold` while `agents/eval`'s gate bullet decides an interval-bearing
+metric on its Wilson bounds — pass only if the lower bound clears the bar, fail only if the upper
+bound is below it, escalate otherwise. The repo's own console fixture is the demonstration:
+`judge_score` 0.48 against a 0.45 bar with CI [0.40, 0.56] rendered **PASS**, on a run whose
+`gate_passed` was `false` because the agent escalated it as borderline. `gate_row` now derives
+the verdict the way the pipeline does, keyed off `<name>_ci_low` / `<name>_ci_high` rather than
+off the string `judge_score` — whether a metric is decided by an interval is a property of what
+the report carries about it, and a name list would drop the next interval-bearing metric back to
+its point estimate. It also publishes a `status` instead of one tri-state boolean, because three
+different situations were sharing a blank cell: a **borderline** the pipeline refused to decide
+(`passed: null`), a gated metric the eval report never carried — which the eval prompt defines as
+a **failed** gate, not an undecided one (`not_measured`, `passed: false`) — and a run that died
+before eval ran at all (`not_evaluated`, `passed: null`). A value no threshold can be compared
+against is `unreadable` and fails closed. On `run-phase2-main-0001` the old table said "gate
+failed" above two blank rows and so could not say *which* gate failed, the one question the table
+exists to answer. Whether eval reported is keyed on the presence of the stage entry's `metrics`
+key, not on the entry and not on the dict being non-empty: the driver always writes that key on
+completion and the agents write mid-stage entries without it, so on
+`run-20260811T165529Z-ce628817` (`status: inference_in_progress`) an entry check would fail both
+gates while the inference job was still launching, and an emptiness check would read a report
+that arrived carrying nothing as never having been measured.
+
 **The facts a run discovers travel like the consent it was signed with.** `MODEL_PARAM_FOR_ROLE`
 carries what a human *signed* into the stages that must obey it; `STAGE_FACT_PARAMS` carries what
 the run itself *produced* into the stages that must measure it. `params.student_endpoint` — read
