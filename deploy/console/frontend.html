@@ -582,7 +582,7 @@ async function refresh(){
     $("kpiExec").textContent = running;
     $("kpiExecSub").textContent = running ? "running now" : "none running · "+_execs.length+" recent";
     renderFleet(_fleet);
-    renderRuns(o.runs||[]);
+    renderRuns(o.runs||[], o.runsTruncated, o.runsRead||0);
     renderExecPicker();
     const t = localStorage.getItem("adminTab")||"pipeline";
     if (t==="pipeline") loadPipe().catch(console.error);
@@ -607,8 +607,16 @@ function renderFleet(hs){
   });
 }
 
-function renderRuns(runs){
-  $("runsList").innerHTML = runs.length ? `<table><tr><th>Run</th><th>Status</th><th>Stage</th><th>Trigger</th><th>Created</th></tr>`+
+// `truncated` says the reader hit its page cap, so this list is the newest of what it
+// COULD read rather than of what exists. Rendered rather than logged: an operator who
+// cannot find the run they just started will start it again, and a second GPU run is a
+// real bill. See D13 -- the old list was an arbitrary hash-ordered window with no marker
+// of any kind, which is the version of this that reads as complete.
+// The page count is NOT repeated here -- the payload carries how many rows were read, so
+// the marker cannot drift away from the backend cap it describes.
+function renderRuns(runs, truncated, read){
+  const more = truncated ? `<div class="sub">⚠ newest ${runs.length} of ${read} runs READ — the table holds more than the reader's page cap</div>` : "";
+  $("runsList").innerHTML = runs.length ? more+`<table><tr><th>Run</th><th>Status</th><th>Stage</th><th>Trigger</th><th>Created</th></tr>`+
     runs.map(r=>`<tr style="cursor:pointer" onclick="loadRun(${jstr(r.run_id)})">`+
       `<td class="mono">${esc(r.run_id)}</td>`+
       `<td><span class="pill ${badge(r.status)}">${esc(r.status||"?")}</span></td>`+
@@ -921,7 +929,14 @@ async function loadRun(runId){
     // stage events
     const evs = d.events||[];
     if (evs.length) {
-      html += `<h2 style="margin-top:12px">Stage events (${evs.length})</h2><table><tr><th>When · stage · event</th><th>Detail</th></tr>`+
+      // The heading says which END of the run this is. The rows served are the NEWEST the
+      // reader could fetch (D13: they used to be the oldest, under this same heading), and
+      // `slice(-25)` trims from the old end of that window, so the count in the heading is
+      // the count of what is PAINTED plus an explicit note when the run has more history.
+      const shown = Math.min(evs.length, 25);
+      html += `<h2 style="margin-top:12px">Stage events · newest ${shown}`+
+        `${evs.length>shown?` of ${evs.length} read`:""}${d.olderEventsExist?", older history not read":""}</h2>`+
+        `<table><tr><th>When · stage · event</th><th>Detail</th></tr>`+
         evs.slice(-25).map(e=>{
           let det = e.detail; if (typeof det!=="string") det = JSON.stringify(det);
           return `<tr><td class="mono">${esc(e.sk)}</td><td class="sub mono">${esc(String(det||"").slice(0,180))}</td></tr>`;}).join("")+`</table>`;
@@ -1891,7 +1906,13 @@ async function loadTasks(){
     if (d.denied) { tasksPoll(false); $("taskList").innerHTML =
       `<span class="sub">${esc(d.denied)}</span>`; return; }
     const items = d.tasks||[];
-    $("taskList").innerHTML = items.length ? items.map(t=>
+    // "Newest N of M" rather than a bare list: the old reader showed an arbitrary window
+    // of the table, so six live consultations -- one of them in `error`, one awaiting a
+    // signature -- were absent with nothing on screen to say so (D13).
+    const hdr = (d.truncated || (d.total||0) > items.length)
+      ? `<div class="sub" style="padding:4px 2px">newest ${items.length} of ${d.total||items.length}`+
+        `${d.truncated?" read — the table holds more than the reader's page cap":""}</div>` : "";
+    $("taskList").innerHTML = items.length ? hdr+items.map(t=>
       `<div class="th${t.id===TASK_SEL?" sel":""}" onclick="selectTask('${esc(t.id)}')">`+
       `<div class="thgoal">${esc(t.goal||t.id)}</div>`+
       `<div class="sub" style="display:flex;justify-content:space-between;gap:6px;margin-top:3px">`+

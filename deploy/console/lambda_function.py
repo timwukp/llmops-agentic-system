@@ -276,15 +276,64 @@ def list_fleet():
     return out
 
 
-def recent_runs(limit=10):
+#: How many 1 MB scan pages a list reader pulls before it stops and SAYS it stopped.
+#:
+#: D13: every list here took its window BEFORE ordering -- `scan(Limit=60)` and then
+#: `sort(created_at)`. A Scan's item order is *unspecified*: it is neither newest- nor
+#: oldest-first, so `Limit` does not trim the oldest rows, it trims whatever hashed past
+#: the page boundary. "The 25 most recent" was therefore an arbitrary subset re-sorted to
+#: LOOK newest-first, which is worse than an obviously short list: it reads as complete.
+#: Measured on the live tasks table (35 items, `Limit=25`): **6 of the 25 newest tasks
+#: were absent**, among them one in status `error` and one `drafting` consultation
+#: waiting on a human signature, while 6 older ones were shown in their place.
+#:
+#: So the readers below read the WHOLE table and order afterwards. This cap exists only
+#: so an unbounded table cannot hang the console, and when it bites the caller gets
+#: `truncated=True` to render -- a silently capped list is the defect, not the cure.
+#: Both tables are one page today (llmops-pipeline-runs 17 KB/36 items, llmops-tasks
+#: 238 KB/35 items); at ~7 KB an item a page holds ~150, so 8 pages is >1000 tasks.
+SCAN_PAGE_CAP = 8
+
+
+def _scan_ordered(tbl, key, reverse=True, page_cap=SCAN_PAGE_CAP):
+    """(rows ordered by `key`, whether rows were left unread).
+
+    Ordering AFTER the read is the whole point: a window taken before the ordering is a
+    window on hash order. `truncated` is returned rather than logged because the operator
+    is the one who needs to know that "recent" is missing rows -- see D9, where a layer
+    nobody could see was a layer nobody measured.
+    """
+    items, kw, pages = [], {}, 0
+    while pages < int(page_cap):
+        r = tbl.scan(**kw)
+        items += r.get("Items", [])
+        pages += 1
+        start = r.get("LastEvaluatedKey")
+        if not start:
+            return sorted(items, key=key, reverse=reverse), False
+        kw["ExclusiveStartKey"] = start
+    return sorted(items, key=key, reverse=reverse), True
+
+
+def _runs_ordered():
+    """(every run newest-first, truncated). The list `recent_runs` slices."""
     if not runs_tbl:
-        return []
+        return [], False
     try:
-        items = runs_tbl.scan(Limit=60).get("Items", [])
-        items.sort(key=lambda x: str(x.get("created_at", "")), reverse=True)
-        return items[:limit]
+        return _scan_ordered(runs_tbl, lambda x: str(x.get("created_at", "")))
     except Exception:
-        return []
+        return [], False
+
+
+def recent_runs(limit=10):
+    """The `limit` NEWEST runs -- newest by `created_at`, not by hash order.
+
+    `_recent_session_ids` reads this too, so the old arbitrary window did not only
+    mis-paint a list: the eval-span reconstruction fanned out session ids for an
+    arbitrary subset of runs, and a run the scan happened not to return had no spans
+    requested for it at all.
+    """
+    return _runs_ordered()[0][:limit]
 
 
 def list_executions():
@@ -308,7 +357,9 @@ def list_executions():
 
 
 def overview():
-    return {"harnesses": list_fleet(), "runs": recent_runs(10), "executions": list_executions()}
+    runs, truncated = _runs_ordered()
+    return {"harnesses": list_fleet(), "runs": runs[:10], "runsTruncated": truncated,
+            "runsRead": len(runs), "executions": list_executions()}
 
 
 # ── /api/pipeline: SFN execution history → logical stage flow ─────────────────
@@ -692,17 +743,33 @@ def _timeline(run_id, limit=100):
     Directives are RETURNED, not discarded -- a verdict is the audit record of what was
     decided, and #16 is the case study in what unread records cost. They are just kept
     out of the stage timeline so a reader can tell an event from an answer.
+
+    D13: the events half spent its budget FORWARDS while the directives half already ran
+    reverse -- one function, two directions. A forward `Limit` keeps the OLDEST rows, and
+    the frontend paints `evs.slice(-25)` under a heading that reads "Stage events", so a
+    run past the limit showed its first minutes where its last belong: the escalation, the
+    gate verdict and the failure that ENDED it are all at the end. `task_detail` feeds the
+    lifecycle diagram from the same call, so a long task rendered as stuck at the stage it
+    started in. Latent until D12, which is what makes it worth fixing now: WAIT_ROW_CAP is
+    12 waiting rows per stage invocation, so twelve harness stages reach ~150 rows on the
+    happy path -- the previous fix pushed the real ceiling past this one's window.
+
+    Reads `limit + 1` so "there are older rows" is a fact rather than an inference from
+    `len == limit`, then hands the window back in TIME order, which is what a timeline is.
     """
     if not events_tbl:
-        return [], []
+        return [], [], False
     evs = events_tbl.query(
         KeyConditionExpression=Key("run_id").eq(run_id) & Key("sk").lt(TIMELINE_SK_MAX),
-        Limit=int(limit)).get("Items", [])
+        ScanIndexForward=False, Limit=int(limit) + 1).get("Items", [])
+    older = len(evs) > int(limit)
+    evs = evs[:int(limit)]
+    evs.sort(key=lambda e: str(e.get("sk", "")))
     dirs = events_tbl.query(
         KeyConditionExpression=(Key("run_id").eq(run_id)
                                 & Key("sk").begins_with(DIRECTIVE_SK)),
         ScanIndexForward=False, Limit=int(limit)).get("Items", [])
-    return evs, dirs
+    return evs, dirs, older
 
 
 #: The two stage-event names the driver files when an agent asks a human for a decision
@@ -1045,8 +1112,10 @@ def run_detail(run_id):
         out["manifestError"] = str(e)[:150]
     if events_tbl:
         try:
-            evs, dirs = _timeline(run_id)
+            evs, dirs, older = _timeline(run_id)
             out["events"] = evs
+            out["eventsAreNewest"] = True
+            out["olderEventsExist"] = older
             out["directives"] = [_directive_view(d) for d in dirs]
         except Exception as e:
             out["eventsError"] = str(e)[:150]
@@ -1559,13 +1628,18 @@ def apply_native_recommendation(rec_id, harness=None):
 
 
 def list_optimizations():
+    """The 10 newest prompt-optimization drafts.
+
+    D13, third shape: the window came before the FILTER as well as before the ordering.
+    This table is shared (`opt-` drafts live beside other console rows), so `Limit=50`
+    then `startswith("opt-")` returns nothing at all once 50 non-draft rows exist -- and
+    an empty list here reads as "no optimization has ever been drafted".
+    """
     if not console_tbl:
         return []
     try:
-        items = [i for i in console_tbl.scan(Limit=50).get("Items", [])
-                 if str(i.get("id", "")).startswith("opt-")]
-        items.sort(key=lambda x: x.get("startedAt", ""), reverse=True)
-        return items[:10]
+        items, _ = _scan_ordered(console_tbl, lambda x: str(x.get("startedAt", "")))
+        return [i for i in items if str(i.get("id", "")).startswith("opt-")][:10]
     except Exception:
         return []
 
@@ -2154,7 +2228,12 @@ def cost_estimates(limit=50):
             # "nothing awaiting approval".
             print(f"[finops] GSI query failed, falling back to scan: {e}")
             try:
-                items = estimates_tbl.scan(Limit=int(limit)).get("Items", [])
+                # Ordered, then windowed. The GSI branch above is reverse-ordered by
+                # created_at, and this branch promised the same thing in the docstring
+                # while returning hash order -- so the fallback quietly showed a
+                # different, arbitrary 50 estimates than the primary path (D13).
+                items = _scan_ordered(estimates_tbl,
+                                      lambda i: str(i.get("created_at", "")))[0][:int(limit)]
             except Exception as e2:
                 print(f"[finops] estimates scan failed: {e2}")
     out = []
@@ -2776,13 +2855,21 @@ def _enqueue_task_turn(task_id, accept=False):
 
 
 def list_tasks(limit=25):
-    items = []
+    """The `limit` most recently updated consultations -- ordered before the window.
+
+    D13's measured instance: `scan(Limit=25)` returned an arbitrary 25 of 35 live tasks
+    and the sort then dressed them up as "most recent". Six of the true newest 25 were
+    invisible, including a task in status `error` and a `drafting` consultation waiting on
+    a signature. A consultation nobody can see is a decision nobody can make.
+    """
+    items, truncated = ([], False)
     if tasks_tbl:
-        items = tasks_tbl.scan(Limit=int(limit)).get("Items", [])
-    items.sort(key=lambda i: str(i.get("updated_at", "")), reverse=True)
+        items, truncated = _scan_ordered(tasks_tbl,
+                                         lambda i: str(i.get("updated_at", "")))
     return {"tasks": [{k: i.get(k, "") for k in
                        ("id", "status", "goal", "created_by", "cost_estimate_usd",
-                        "run_id", "updated_at", "plan_summary")} for i in items]}
+                        "run_id", "updated_at", "plan_summary")} for i in items[:int(limit)]],
+            "truncated": truncated, "total": len(items)}
 
 
 def get_task(task_id):
@@ -2794,13 +2881,15 @@ def get_task(task_id):
     # own key for the same reason as in run_detail: they sort after every event, so
     # left in the list they render as blank rows and push real events out of view.
     try:
-        evs, dirs = _timeline(task_id)
+        evs, dirs, older = _timeline(task_id)
         out["events"] = [{"sk": str(e.get("sk", "")),
                           "event_name": str(e.get("event_name", "")),
                           "detail": str(e.get("detail", ""))[:500]} for e in evs]
+        out["olderEventsExist"] = older
         out["directives"] = [_directive_view(d) for d in dirs]
     except Exception:
         out["events"] = []
+        out["olderEventsExist"] = False
         out["directives"] = []
     return out
 

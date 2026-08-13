@@ -4687,6 +4687,160 @@ case("console page: a waiting count past the driver's row cap is painted as exac
      [f"{_TC}test_the_run_view_paints_the_wait_it_is_served"])
 
 
+# ── D13: a window taken before the ordering (m255-m266) ───────────────────────
+def m255(t):
+    old = "    while pages < int(page_cap):"
+    assert t.count(old) == 1, "the pagination loop has moved"
+    # One page, which is what every list here used to read. The rows left behind are not
+    # the oldest -- a Scan's order is unspecified -- so this is the original defect
+    # restored: an arbitrary subset re-sorted to LOOK newest-first.
+    return t.replace(old, "    while pages < 1:", 1)
+
+
+case("console lists: the reader takes one page and the sort dresses an arbitrary subset up "
+     "as the newest rows",
+     _CN, m255,
+     [f"{_TC}test_the_newest_runs_are_newest_by_time_not_by_hash_order",
+      f"{_TC}test_no_live_consultation_is_invisible_to_the_task_list"])
+
+
+def m256(t):
+    old = "    return sorted(items, key=key, reverse=reverse), True"
+    assert t.count(old) == 1, "the truncated return has moved"
+    # Hits its page cap and reports a complete list -- the silent cap this whole finding
+    # is about, one level down.
+    return t.replace(old, "    return sorted(items, key=key, reverse=reverse), False", 1)
+
+
+case("console lists: a reader that stopped at its page cap reports a complete list",
+     _CN, m256, [f"{_TC}test_a_reader_that_stopped_short_says_it_stopped"])
+
+
+def m257(t):
+    old = '"runs": runs[:10], "runsTruncated": truncated,'
+    assert t.count(old) == 1, "the overview payload has moved"
+    return t.replace(old, '"runs": runs[:10], "runsTruncated": False,', 1)
+
+
+case("console overview: the truncation flag is computed and then dropped before the payload",
+     _CN, m257, [f"{_TC}test_the_overview_carries_the_run_lists_own_limits"])
+
+
+def m258(t):
+    old = """        items, truncated = _scan_ordered(tasks_tbl,
+                                         lambda i: str(i.get("updated_at", "")))"""
+    assert t.count(old) == 1, "the task-list read has moved"
+    # The exact live defect: 6 of the 35 real tasks vanished, one of them in status error.
+    return t.replace(old, '        items = tasks_tbl.scan(Limit=int(limit)).get("Items", [])', 1)
+
+
+case("console tasks: the list windows its scan in DynamoDB again, so an errored "
+     "consultation past the page boundary is invisible",
+     _CN, m258,
+     [f"{_TC}test_no_live_consultation_is_invisible_to_the_task_list",
+      f"{_TC}test_no_reader_windows_a_scan_inside_dynamodb"])
+
+
+def m259(t):
+    old = '        items, _ = _scan_ordered(console_tbl, lambda x: str(x.get("startedAt", "")))'
+    assert t.count(old) == 1, "the optimization read has moved"
+    return t.replace(old, '        items = console_tbl.scan(Limit=50).get("Items", [])', 1)
+
+
+case("console optimizations: the window comes before the opt- filter, so drafts read as "
+     "never having existed once the shared table fills",
+     _CN, m259, [f"{_TC}test_a_draft_is_not_hidden_by_the_rows_that_share_its_table"])
+
+
+def m260(t):
+    old = """        ScanIndexForward=False, Limit=int(limit) + 1).get("Items", [])"""
+    assert t.count(old) == 1, "the events query has moved"
+    # Forward again: the oldest rows under a heading that says "Stage events", while the
+    # escalation and the failure that ended the run sit at the other end.
+    return t.replace(old, '        Limit=int(limit) + 1).get("Items", [])', 1)
+
+
+case("console timeline: the events half reads the oldest rows while the directives half "
+     "reads the newest -- one function, two directions",
+     _CN, m260,
+     [f"{_TC}test_the_stage_timeline_serves_the_newest_events_in_time_order",
+      f"{_TC}test_both_halves_of_the_timeline_read_the_same_end_of_the_run",
+      f"{_TC}test_a_bounded_query_always_states_which_end_it_reads"])
+
+
+def m261(t):
+    old = "    older = len(evs) > int(limit)"
+    assert t.count(old) == 1, "the older-history test has moved"
+    # `>=` cannot tell a full window from a truncated one, which is exactly why the reader
+    # asks for limit + 1 rows instead of inferring.
+    return t.replace(old, "    older = len(evs) >= int(limit)", 1)
+
+
+case("console timeline: a run with exactly `limit` events is reported as having history "
+     "nobody read",
+     _CN, m261, [f"{_TC}test_older_history_is_reported_only_when_there_is_some"])
+
+
+def m262(t):
+    old = '    evs.sort(key=lambda e: str(e.get("sk", "")))'
+    assert t.count(old) == 1, "the time-order restore has moved"
+    # Served newest-first, so the frontend's slice(-25) paints the OLDEST 25 of the newest
+    # 100 -- a window that is right at neither end.
+    return t.replace(old, '    evs.sort(key=lambda e: str(e.get("sk", "")), reverse=True)', 1)
+
+
+case("console timeline: the reverse window is served without being put back in time order, "
+     "so slice(-25) paints the wrong 25",
+     _CN, m262, [f"{_TC}test_the_stage_timeline_serves_the_newest_events_in_time_order"])
+
+
+def m263(t):
+    old = '        out["olderEventsExist"] = older\n        out["directives"]'
+    assert t.count(old) == 1, "the task-detail flag has moved"
+    return t.replace(old, '        out["olderEventsExist"] = False\n        out["directives"]', 1)
+
+
+case("console task detail: a truncated lifecycle diagram claims to be the whole lifecycle",
+     _CN, m263, [f"{_TC}test_the_lifecycle_diagram_is_fed_the_latest_transitions"])
+
+
+def m264(t):
+    old = '${d.olderEventsExist?", older history not read":""}'
+    assert t.count(old) == 1, "the older-history marker has moved"
+    return t.replace(old, "", 1)
+
+
+case("console page: the run view stops saying that history exists beyond what it read",
+     "deploy/console/frontend.html", m264,
+     [f"{_TC}test_the_lists_say_on_screen_what_they_could_not_read"])
+
+
+def m265(t):
+    old = "renderRuns(o.runs||[], o.runsTruncated, o.runsRead||0);"
+    assert t.count(old) == 1, "the renderRuns call has moved"
+    return t.replace(old, "renderRuns(o.runs||[]);", 1)
+
+
+case("console page: the run list's truncation flag is dropped between the payload and the "
+     "renderer",
+     "deploy/console/frontend.html", m265,
+     [f"{_TC}test_the_lists_say_on_screen_what_they_could_not_read"])
+
+
+def m266(t):
+    old = """                items = _scan_ordered(estimates_tbl,
+                                      lambda i: str(i.get("created_at", "")))[0][:int(limit)]"""
+    assert t.count(old) == 1, "the estimates fallback has moved"
+    # The fallback path promised newest-first in its docstring and served hash order, so
+    # the same console showed two different arbitrary sets of estimates.
+    return t.replace(old, '                items = estimates_tbl.scan(Limit=int(limit)).get("Items", [])', 1)
+
+
+case("console cost: the GSI fallback windows its scan, so the estimate list silently "
+     "disagrees with the primary path",
+     _CN, m266, [f"{_TC}test_no_reader_windows_a_scan_inside_dynamodb"])
+
+
 #: Where the pristine text of the file currently mutated is parked, so a kill -9 -- which
 #: no handler can intercept -- still leaves the original recoverable. Under the repo root
 #: rather than /tmp because it must be obvious to whoever finds the tree dirty, and

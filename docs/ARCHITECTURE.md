@@ -750,8 +750,10 @@ the true one. Two bounds matter: the driver stops writing waiting rows at `WAIT_
 (twice the prompt's 6-checkpoint cap, since a prompt is a request and `maxIterations` is 100),
 so the console reads each row's own `waiting_turn` field — a floor — and renders `12+` rather
 than counting rows, which past the cap is not even a floor; and the derivation runs its own
-**reverse** query, because `_timeline`'s forward window returns the *oldest* rows and a paged
-run is by definition read at its newest end.
+**reverse** query rather than reusing `_timeline`, because a paged run is by definition read at
+its newest end and the derivation must not inherit whichever end a shared reader happens to
+prefer — a coupling that was a live defect when this was written and is now merely avoided
+(§13).
 
 Scoped deliberately: `data_prep` and `finetune` keep `{checkpoint, escalate_human}` until
 each gets protocol wording of its own. A tool declared without a protocol naming when to
@@ -1396,6 +1398,32 @@ events under `sk < "A"`, parked verdicts under `sk begins_with "directive#"` —
 verdicts in their own panel labelled *delivered* / *parked* / *never delivered*. §3 has the
 reasoning: a prefix is not a filter, and a verdict that could never be read must not look like
 one an agent acted on.
+
+**A window taken before the ordering is a window on hash order.** Every list on the read plane
+used to `scan(Limit=N)` and *then* sort by time, which reads as "the newest N" and is not: a
+Scan's item order is documented as unspecified, so `Limit` trimmed whatever fell past the page
+boundary and the sort merely arranged the survivors. Measured on the live `llmops-tasks` table
+(35 rows, `Limit=25`): **6 of the 25 newest consultations were missing**, one of them in status
+`error` and one a `drafting` plan waiting on a human signature, while 6 older threads occupied
+their places. The reader now pages the whole table, orders in Python, and windows **last** —
+correct because these tables are small (tens of rows, ~240 KB) and because neither runs nor
+tasks has a time-sorted GSI to query instead; a full Scan is the cheapest honest read available
+and the alternative would be a schema change to serve a page that already fits in one.
+
+The bound that replaces `Limit` is `SCAN_PAGE_CAP = 8` pages, and the part that makes it safe is
+that **the cap is rendered**. A list silently capped at N looks exactly like a list that
+contains N, so `truncated` and the rows-read count travel to the frontend and the page says
+*"newest 25 of 35 read"* — the same defect one level up, and the one this repo keeps paying for.
+`_timeline` reads `limit + 1` rows in reverse so *"older history exists"* is a fact rather than
+an inference from `len == limit`, which cannot tell a table holding exactly `limit` rows from
+one holding more; it then re-sorts ascending, because the frontend paints `evs.slice(-25)` and a
+reverse window handed over unsorted would paint the **oldest** 25 of the newest 100 — a window
+right at neither end. Its two halves also disagreed about direction: the events half read
+forward while the directives half already read backward, in one function. That was harmless
+while a run held ~16 events and stopped being harmless when §7's `WAIT_ROW_CAP = 12` rows per
+stage invocation raised the ceiling to ~150 across a harness — **the previous fix pushed the
+real count past this one's window**, which is the kind of interaction no single-change review
+sees.
 
 The layout of all three diagrams in this document is enforced, not eyeballed:
 `tests/test_svg_geometry.py` fails the build if any two wires cross, if two wires share a
