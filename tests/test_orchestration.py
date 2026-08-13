@@ -4940,6 +4940,11 @@ class TestConductorDispatch:
             "goal": "dispatch",            # the human's request, for a conductor task
             "plan_uri": "dispatch",        # where to write (or read) this task's plan
             "rate_card": "dispatch",       # read fresh at invoke; a stale card misquotes
+            "intake": "dispatch",          # console-verified intake (facts + form
+                                           # fields), built by run_task_turn's
+                                           # _run_intake and injected into the consult
+                                           # envelope each turn — "when present" in the
+                                           # prompt, absent on pipeline-side dispatches
             "report_uri": "dispatch",      # where an ops report is to be written
             "sweep_uri": "dispatch",       # monitor_sweep's own dispatch writes it
             "budget_usd": "dispatch",      # advisory and explicitly optional ("if given"):
