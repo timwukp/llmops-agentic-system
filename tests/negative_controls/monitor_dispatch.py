@@ -3356,8 +3356,15 @@ def _manifest_writeback_line(t: str) -> str:
     runner counts as neither caught nor uncaught. Matched on the call's opening rather than
     its argument list: the arguments are what evolves, the statement's position between the
     `try` and the manifest `except` is what these mutations depend on.
+
+    Spans continuation lines: the call outgrew one line the first time a second append-only
+    field was passed to it, and a single-line pattern then matched nothing at all -- which is
+    the "anchor drifted" outcome again, one keyword argument later. The closing paren is
+    anchored to column 8 + a non-`(` continuation indent so the match ends at the statement
+    rather than at the first `)` inside the arguments.
     """
-    m = re.search(r'^ {8}_save_manifest\(c\["s3"\], event\["manifest_uri"\], .*\)$',
+    m = re.search(r'^ {8}_save_manifest\(c\["s3"\], event\["manifest_uri"\], '
+                  r'[^\n]*(?:\n {23,}[^\n]*)*\)$',
                   t, re.M)
     assert m, "the manifest write-back has moved; re-anchor these controls"
     return m.group(0)

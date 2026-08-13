@@ -672,6 +672,59 @@ def verify_outputs(s3, outputs: list) -> list:
     return missing
 
 
+#: The canonical pairwise judge prompt, as deploy/03_storage.py mirrors it. Spelled here
+#: because this module must be able to name the instrument WITHOUT asking the agent where
+#: it is: a digest checked against a path the claimant chose is not a check.
+JUDGE_PROMPT_KEY = "code/eval/judge_prompt_pairwise.md"
+
+#: Metrics keys whose presence means "this stage claims to have judged something", so the
+#: attestation is owed. Derived from the claim rather than from a (stage, task) name list
+#: for the same reason the escalation guard is derived from the URI: the eval prompt lets a
+#: small enough prompt set be scored inside the "evaluate" task instead of "score", and a
+#: name list would quietly stop checking the run that took that branch.
+JUDGE_CLAIM_KEYS = ("judge_prompt_sha256", "judge_score", "judge_wins", "judge_losses",
+                    "judge_ties", "judge_n", "judge_win_rate")
+
+
+def _verify_judge_instrument(s3, bucket: str, metrics: dict) -> dict:
+    """Compare the judge digest a stage CLAIMED against the canonical object's own bytes.
+
+    `report.json carries judge_prompt_sha256, and comparing two runs is then a digest
+    comparison rather than an argument` (deploy/03_storage.py) -- but nothing compared it to
+    anything. The digest was a string the scoring agent wrote next to its own score, which
+    makes it an attestation of the same standing as the score: it cannot corroborate it. The
+    failure it exists to catch is exactly the one r5 hit -- the eval prompt said "fixed judge
+    prompts" and fixed none, so that run authored its own A-or-B-only instrument and reported
+    `judge_ties: 0`, read at the time as a property of the student and actually a property of
+    a prompt that offered no tie. A self-authored instrument produces a number that LOOKS
+    comparable to the previous run's and is not.
+
+    Returns the attestation record, always -- there is no "nothing to say" outcome. The
+    driver deliberately does NOT fall back to stamping the canonical digest when the claim
+    is missing: that would turn an absent attestation into a false one, asserting the
+    canonical instrument for a score that may well have been produced with another.
+
+    `bucket` is the driver's own DATA_BUCKET, not a bucket named in params, for the reason
+    in JUDGE_PROMPT_KEY's comment.
+    """
+    claimed = str(metrics.get("judge_prompt_sha256") or "")
+    att = {"kind": "judge_instrument", "key": JUDGE_PROMPT_KEY,
+           "claimed_sha256": claimed, "canonical_sha256": "", "verified": False,
+           "checked_at": datetime.now(timezone.utc).isoformat()}
+    try:
+        body = s3.get_object(Bucket=bucket, Key=JUDGE_PROMPT_KEY)["Body"].read()
+    except Exception as exc:  # noqa: BLE001 — an unreadable instrument is a finding, not a raise
+        # Today's live state, and worth recording as its own outcome rather than as a
+        # mismatch: the mirror ships in the same change as the prompt clause that reads it,
+        # so until deploy/03_storage.py runs there is nothing to check against. "Could not
+        # check" and "checked and wrong" are different claims about a run.
+        att["error"] = f"{type(exc).__name__}: {exc}"
+        return att
+    att["canonical_sha256"] = hashlib.sha256(body).hexdigest()
+    att["verified"] = bool(claimed) and claimed == att["canonical_sha256"]
+    return att
+
+
 def _load_manifest(s3, manifest_uri: str) -> dict:
     bucket, _, key = manifest_uri[5:].partition("/")
     try:
@@ -696,7 +749,8 @@ IMMUTABLE_MANIFEST_KEYS = frozenset({"models", "plan", "approval", "params",
 
 def _save_manifest(s3, manifest_uri: str, manifest: Optional[dict],
                    history_record: dict | None = None,
-                   escalation: dict | None = None) -> None:
+                   escalation: dict | None = None,
+                   attestation: dict | None = None) -> None:
     """Persist the run's stage results, re-reading first so a concurrent write survives.
 
     Read-modify-write rather than a blind put, and only the `stages` block is taken from
@@ -724,7 +778,10 @@ def _save_manifest(s3, manifest_uri: str, manifest: Optional[dict],
     The list is append-only on purpose -- it is the only place a per-iteration result
     survives, since `stages[<stage>]` keeps exactly one entry per stage name and iteration
     1 overwrites iteration 0 there. `escalations` is the same mechanism for the escalation
-    path.
+    path, and `attestations` the same mechanism for what the DRIVER measured about a
+    stage's claim -- kept out of the stage entry precisely because that entry is the
+    agent's claim space, and a measurement filed inside a claim stops being independent
+    of it.
 
     `manifest=None` means APPEND ONLY: leave `stages` exactly as S3 has it. That is not a
     convenience, it is the whole safety property of the escalation caller -- an escalation
@@ -759,7 +816,8 @@ def _save_manifest(s3, manifest_uri: str, manifest: Optional[dict],
             print(f"[driver] signed manifest blocks changed mid-run for {manifest_uri}: "
                   f"{tampered} — keeping the copy on S3, not the driver's")
         current["stages"] = manifest.get("stages", {})
-    for field, record in (("stage_history", history_record), ("escalations", escalation)):
+    for field, record in (("stage_history", history_record), ("escalations", escalation),
+                          ("attestations", attestation)):
         if record:
             existing = current.get(field)
             current[field] = ([*existing, record] if isinstance(existing, list)
@@ -1169,6 +1227,18 @@ def handle_stage_complete(c, event, args) -> dict:
     # entirely -- it appends `record` to the list it re-reads from S3, so the durable list
     # gains exactly one entry per completion even though two dicts saw the append.
     manifest.setdefault("stage_history", []).append(record)
+    # Trust-but-verify, applied to the INSTRUMENT and not only to the artifacts. Every other
+    # claim in this call is checked against reality -- outputs are head_object'd, the gate
+    # verdict is re-derived strictly, the signed blocks are re-read from S3 -- and the one
+    # claim that decides whether two runs' scores mean the same thing was taken on trust.
+    stage_metrics = norm.get("metrics", {})
+    attestation = None
+    if any(k in stage_metrics for k in JUDGE_CLAIM_KEYS):
+        attestation = {**_verify_judge_instrument(
+            c["s3"], os.environ.get("DATA_BUCKET", ""), stage_metrics),
+            "stage": stage, "task": task,
+            "iteration": event.get("iteration", manifest.get("iteration"))}
+        manifest.setdefault("attestations", []).append(attestation)
     try:
         # The manifest goes BACK to S3, which it never used to. Every prompt is told
         # "the S3 manifest at manifest_uri is the single source of truth; read it first,
@@ -1185,7 +1255,8 @@ def handle_stage_complete(c, event, args) -> dict:
         # asked to reflect on a run has only its own turn to reflect on. A pipeline
         # whose stages cannot read each other's results cannot iterate on a run; it can
         # only redo it.
-        _save_manifest(c["s3"], event["manifest_uri"], manifest, history_record=record)
+        _save_manifest(c["s3"], event["manifest_uri"], manifest, history_record=record,
+                       attestation=attestation)
     except Exception as exc:  # noqa: BLE001 — never withhold the token for an artifact
         failures.append(f"manifest {type(exc).__name__}: {exc}")
         print(f"[driver] manifest stage-write FAILED for {run_id}/{stage}: "

@@ -4897,6 +4897,159 @@ class TestConductorDispatch:
             "the report a human opens must show the same history as the manifest; "
             f"report={report.get('stage_history')!r}")
 
+    # ---- the judge instrument is checked, not taken on trust (#D4) ----------------
+    #
+    # deploy/03_storage.py mirrors the canonical pairwise judge prompt and says "report.json
+    # carries judge_prompt_sha256, and comparing two runs is then a digest comparison rather
+    # than an argument" -- and nothing compared it to anything. The digest was a string the
+    # scoring agent wrote beside its own score, so it had exactly the standing of the score
+    # it was supposed to corroborate. r5 is the failure: the eval prompt said "fixed judge
+    # prompts" and fixed none, that run authored its own A-or-B-only instrument, and its
+    # `judge_ties: 0` was read as a property of the student when it was a property of a
+    # prompt that offered no tie.
+
+    #: The canonical instrument's bytes, so a test can compute the digest the driver must
+    #: arrive at rather than hardcoding one -- a pinned digest would turn every future edit
+    #: of pipeline/eval/judge_prompt_pairwise.md into a red test about nothing.
+    INSTRUMENT = b"# Pairwise judge\nAnswer A or B or tie.\n"
+
+    @classmethod
+    def _instrument_store(cls, run_id="run-1", body=None):
+        store = {f"runs/{run_id}/deploy/endpoint.json": b"{}"}
+        if body is not None:
+            store[driver.JUDGE_PROMPT_KEY] = body
+        return store
+
+    def test_a_score_claiming_the_canonical_instrument_is_checked_against_its_bytes(self):
+        digest = hashlib.sha256(self.INSTRUMENT).hexdigest()
+        _, store = self._drive_stage_complete(
+            self._signed_manifest(),
+            {"judge_score": 0.48, "judge_n": 120, "judge_prompt_sha256": digest},
+            store=self._instrument_store(body=self.INSTRUMENT),
+            stage="eval", task="score")
+        saved = json.loads(store["runs/run-1/manifest.json"])
+        att = saved["attestations"]
+        assert len(att) == 1 and att[0]["verified"] is True, f"{att!r}"
+        # The value a human compares two runs on, so it is asserted here even though the
+        # assertion is redundant in THIS case: with a correct claim, a digest derived from
+        # the object and one echoed back from the claim are byte-identical, and `verified is
+        # True` above kills every code mutant either way. Derivation is pinned in
+        # test_a_score_that_names_no_instrument_is_reported_as_such, where `verified` is
+        # False regardless and this is the only line that can tell the two apart.
+        assert att[0]["canonical_sha256"] == digest, f"{att[0]!r}"
+        report = json.loads(store["reports/run-1/test-report.json"])
+        assert report["findings"] == [], f"a verified instrument is not a finding: {report['findings']!r}"
+        assert report["attestations"] == att, (
+            "a PASSED attestation is the digest two runs are compared on, so the report "
+            "must carry it too, not only the failures")
+
+    def test_a_self_authored_instrument_is_a_high_finding_not_a_passing_score(self):
+        """r5's defect, reproduced: a digest that is not the canonical object's."""
+        _, store = self._drive_stage_complete(
+            self._signed_manifest(),
+            {"judge_score": 0.61, "judge_ties": 0, "judge_prompt_sha256": "d" * 64},
+            store=self._instrument_store(body=self.INSTRUMENT),
+            stage="eval", task="score")
+        saved = json.loads(store["runs/run-1/manifest.json"])
+        assert saved["attestations"][0]["verified"] is False
+        report = json.loads(store["reports/run-1/test-report.json"])
+        high = [f for f in report["findings"] if f["severity"] == "high"]
+        assert len(high) == 1, f"{report['findings']!r}"
+        assert "d" * 64 in high[0]["detail"] and \
+               hashlib.sha256(self.INSTRUMENT).hexdigest() in high[0]["detail"], (
+            "the finding must print BOTH digests: 'not comparable' without the two values "
+            "is a claim the reader has to re-derive to act on")
+        assert "not comparable" in high[0]["detail"]
+
+    def test_a_score_that_names_no_instrument_is_reported_as_such(self):
+        """Distinct from a mismatch, and NOT repaired by stamping the canonical digest.
+
+        Stamping would convert an absent attestation into a false one -- asserting the
+        canonical instrument for a score that may have been produced with another.
+        """
+        _, store = self._drive_stage_complete(
+            self._signed_manifest(), {"judge_score": 0.48, "judge_n": 120},
+            store=self._instrument_store(body=self.INSTRUMENT),
+            stage="eval", task="score")
+        saved = json.loads(store["runs/run-1/manifest.json"])
+        assert saved["attestations"][0]["claimed_sha256"] == "", (
+            "the driver filled in the digest the agent did not report, which is a claim "
+            "nobody made")
+        # Where the derivation is actually pinned. In the MATCHING case the same assertion
+        # is redundant -- a record that echoed the claim back is byte-identical to one
+        # derived from the object when the claim is correct -- and `verified is True` kills
+        # every code mutant there anyway. Here `verified` is False either way, so this line
+        # is the only thing that can tell "hashed the object" from "hashed something else".
+        assert saved["attestations"][0]["canonical_sha256"] == \
+            hashlib.sha256(self.INSTRUMENT).hexdigest(), (
+            "the canonical digest must come from the object's bytes; a run whose report "
+            "carries some other hash gives two runs nothing to compare")
+        report = json.loads(store["reports/run-1/test-report.json"])
+        assert [f["severity"] for f in report["findings"]] == ["medium"], \
+            f"{report['findings']!r}"
+        assert "does not name its instrument" in report["findings"][0]["title"]
+
+    def test_an_unmirrored_instrument_says_the_check_did_not_run(self):
+        """Today's live state: `code/eval/` does not exist in the data bucket, because the
+        mirror ships in the same change as the prompt clause that reads it. A check that
+        could not run must not read as a check that passed -- and must not read as a
+        mismatch either, which would blame the run for the deploy's gap.
+        """
+        _, store = self._drive_stage_complete(
+            self._signed_manifest(),
+            {"judge_score": 0.48, "judge_prompt_sha256": "a" * 64},
+            store=self._instrument_store(), stage="eval", task="score")
+        saved = json.loads(store["runs/run-1/manifest.json"])
+        att = saved["attestations"][0]
+        assert att["verified"] is False and att["error"], f"{att!r}"
+        assert att["canonical_sha256"] == "", (
+            "there was nothing to hash, so a digest here would be invented")
+        report = json.loads(store["reports/run-1/test-report.json"])
+        assert [f["severity"] for f in report["findings"]] == ["medium"], \
+            f"{report['findings']!r}"
+        assert "could not be verified" in report["findings"][0]["title"]
+        assert "03_storage" in report["findings"][0]["detail"], (
+            "a finding about a missing deploy artifact should name the deploy step that "
+            "would fix it")
+
+    def test_a_stage_making_no_judge_claim_is_not_asked_to_attest(self):
+        """The attestation is owed by whoever claims to have judged, and a deploy stage
+        does not. An unconditional check would file a failed attestation against every
+        stage of every run, which is how a real finding stops being read."""
+        _, store = self._drive_stage_complete(
+            self._signed_manifest(), {"endpoint_name": "llmops-student-run-1"},
+            store=self._instrument_store(body=self.INSTRUMENT))
+        saved = json.loads(store["runs/run-1/manifest.json"])
+        assert "attestations" not in saved, f"{saved.get('attestations')!r}"
+        report = json.loads(store["reports/run-1/test-report.json"])
+        assert report["findings"] == [], f"{report['findings']!r}"
+
+    def test_the_claim_is_recognised_by_the_judge_numbers_not_by_the_task_name(self):
+        """The eval prompt lets a small enough prompt set be scored inside the "evaluate"
+        task instead of "score", so a (stage, task) name list would quietly stop checking
+        the run that took that branch. Derived from the claim instead."""
+        _, store = self._drive_stage_complete(
+            self._signed_manifest(),
+            {"judge_wins": 12, "judge_losses": 28, "judge_ties": 0},
+            store=self._instrument_store(body=self.INSTRUMENT),
+            stage="eval", task="evaluate")
+        saved = json.loads(store["runs/run-1/manifest.json"])
+        assert saved["attestations"], (
+            "a stage that reported judge counts was not asked which instrument produced "
+            "them, because its task was spelled 'evaluate'")
+
+    def test_one_unverified_instrument_is_one_finding_however_many_stages_echo_it(self):
+        """The gate task reads report.json and can echo the score task's digest. Two records
+        of one claim is still one unverified instrument, and a reader told twice starts
+        discounting the telling."""
+        report = build_run_report({"run_id": "run-1", "stages": {}, "attestations": [
+            {"kind": "judge_instrument", "stage": "eval", "claimed_sha256": "b" * 64,
+             "canonical_sha256": "c" * 64, "verified": False},
+            {"kind": "judge_instrument", "stage": "eval", "claimed_sha256": "b" * 64,
+             "canonical_sha256": "c" * 64, "verified": False},
+        ]})
+        assert len(report["findings"]) == 1, f"{report['findings']!r}"
+
     def test_a_stage_write_cannot_restate_the_signed_blocks(self):
         """The write-back is narrowed to `stages`, so a driver bug cannot rewrite consent.
 
