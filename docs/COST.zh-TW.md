@@ -66,6 +66,22 @@ unpriced: ['agentcore:memory:short-term-events',
 畫面上、列在 `unpriced[]` 裡。否則「因為缺費率而是 $0」和「因為免費額度而是 $0」在畫面
 上長得一模一樣 —— 而這正是一個 teacher 模型會被靜靜地算成不用錢的原因。
 
+### 檢索索引（RAFT run）：唯一的常駐成本
+
+RAFT plan（r6d 起）帶著 `kb_ocu_hours` 與 `kb_embed_ingest_tokens`，估算因此多出
+`retrieval_index` 這個類別：OCU-小時以 AOSS 費率計價（fallback_static **$0.24/OCU-hr**
+—— 有測試把它釘在 `deploy/09_retrieval.py` 的常數上 —— 直到 `pricing_refresh` 從帳單看到
+實際費率為止），加上語料在 ingest 時的一次性 embedding。兩個性質是承重的：
+
+- **它是常駐成本。** collection 只要*存在*就按 OCU 計費（2-OCU 下限 ≈ **$11.52/天**），
+  有沒有人查詢都一樣。估算只計 plan 承認的小時數，而 assumption 會指名唯一能停錶的東西：
+  `deploy/09_retrieval.py --teardown`，eval 結束就執行。
+- **它不可 remediation 重複計價。** remediation 迭代重跑的是訓練與評審，不會重建索引，
+  所以 `worst_case_usd` 只加一次檢索小計，永遠不乘 `max_iterations`。
+
+closed-book plan 上這個類別完全不存在 —— 一條 $0 的檢索線會被讀成「已計價而且免費」，
+正是上面 unpriced-vs-zero 規則要防的那種混淆。
+
 ---
 
 ## 2. 費率從哪裡來，以及為什麼最顯然的那個來源不夠用

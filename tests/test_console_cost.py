@@ -1302,3 +1302,18 @@ def test_frontend_warns_about_unpriced_and_unestimated_rather_than_hiding_them()
     assert "UNPRICED SKU" in FRONTEND
     assert "never estimated" in FRONTEND
     assert "provisional" in FRONTEND
+
+
+def test_the_retrieval_index_keys_are_forwarded_and_priced(wired):
+    """kb_ocu_hours is the project's one STANDING cost: a form that drops it hands the
+    approver an estimate the collection will exceed by $11.52 for every day nobody
+    runs the teardown. Both keys must arrive as floats and produce priced lines."""
+    r = _mk_estimate(wired, {"kb_ocu_hours": "240", "kb_embed_ingest_tokens": "500000"})
+    assert r["ok"], r
+    plan = json.loads(wired.est.puts[0]["plan"])
+    assert plan["kb_ocu_hours"] == 240.0
+    assert plan["kb_embed_ingest_tokens"] == 500000.0
+    est = json.loads(wired.est.puts[0]["estimate"])
+    cats = {i["category"] for i in est["line_items"]}
+    assert "retrieval_index" in cats, (
+        "the keys were forwarded but produced no line — priced-and-invisible")

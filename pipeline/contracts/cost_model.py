@@ -103,7 +103,7 @@ REMEDIABLE_CATEGORIES = frozenset({"sagemaker_training", "agentcore_runtime",
 #: Every category an estimate can carry, in report order.
 CATEGORIES = ("sagemaker_training", "sagemaker_inference", "bedrock_teacher",
               "agentcore_runtime", "agentcore_model", "agentcore_memory",
-              "agentcore_evaluations", "support")
+              "agentcore_evaluations", "retrieval_index", "support")
 
 #: Default budget references (USD). Dual reference: a single expensive run passes the
 #: first, a drip of cheap runs against the same project passes the second.
@@ -273,6 +273,20 @@ SKU_AGENTCORE_GB = "agentcore:runtime:gb-hours"
 SKU_AGENTCORE_MEMORY = "agentcore:memory:short-term-events"
 SKU_AGENTCORE_EVALS = "agentcore:evaluations:builtin-input-tokens"
 SKU_SUPPORT = "support:s3-ddb-lambda-sfn"
+#: The retrieval index a RAFT run (r6d+) retrieves from. An AOSS vector collection bills
+#: per OCU-hour with a 2-OCU floor WHILE IT EXISTS — a standing cost, the project's one
+#: deliberate exception to zero-standing-resources, so it must appear on the estimate the
+#: human approves, not only in the deploy log.
+SKU_AOSS_OCU = "aoss:vector-collection:ocu-hours"
+SKU_EMBED_MODEL = "amazon.titan-embed-text-v2:0"
+#: Static fallbacks, used ONLY when the rate card has no better tier for these SKUs (the
+#: card's ce_realized / price_list entries win once pricing_refresh has seen the bill).
+#: 0.24 must agree with deploy/09_retrieval.py OCU_HOURLY_USD — the deploy log and the
+#: approval estimate quoting two different hourly rates for one collection is the
+#: two-numbers-two-claims bug, so a guard pins them together. Embed rate is the public
+#: on-demand titan-embed-v2 price (USD per 1K tokens), a guess until the bill sees it.
+FALLBACK_AOSS_OCU_USD = 0.24
+FALLBACK_EMBED_USD_PER_1K = 0.00002
 
 
 # ── estimation ────────────────────────────────────────────────────────────────
@@ -436,6 +450,58 @@ def estimate_run(plan: dict, rates: RateCard | dict) -> dict:
             items.append(_line("agentcore_evaluations", SKU_AGENTCORE_EVALS,
                                eval_tok / 1_000_000.0, "1M tokens",
                                f"{eval_tok:,.0f} evaluated input tokens / 1e6",
+                               rates, unpriced, remediable=False))
+
+    # 7b. Retrieval index (RAFT runs only — the plan says so by carrying kb_ocu_hours).
+    #     The OCU line is a STANDING cost: it bills while the collection EXISTS, not
+    #     while a run uses it, so the estimate prices the hours the plan admits to and
+    #     the assumption names the only thing that stops the meter. Not remediable:
+    #     a remediation iteration re-trains and re-judges, it does not re-provision the
+    #     index. Fallback prices are used only when the card has no better tier, and
+    #     they say so — a static guess wearing a measured rate's confidence would make
+    #     the whole estimate's "measured" label a lie (confidence is the WEAKEST source).
+    kb_ocu_hours = float(plan.get("kb_ocu_hours", 0) or 0)
+    if kb_ocu_hours:
+        if rates.get(SKU_AOSS_OCU) is None:
+            item = {"category": "retrieval_index", "sku": SKU_AOSS_OCU,
+                    "quantity": round(kb_ocu_hours, 6), "unit": "OCU-hours",
+                    "unit_price": FALLBACK_AOSS_OCU_USD,
+                    "cost_usd": round(kb_ocu_hours * FALLBACK_AOSS_OCU_USD, 6),
+                    "basis": f"{kb_ocu_hours:g} OCU-hours (min 2 OCU while the "
+                             f"collection exists)",
+                    "rate_source": "fallback_static", "rate_as_of": None,
+                    "remediable": False}
+            items.append(item)
+        else:
+            items.append(_line("retrieval_index", SKU_AOSS_OCU, kb_ocu_hours,
+                               "OCU-hours",
+                               f"{kb_ocu_hours:g} OCU-hours (min 2 OCU while the "
+                               f"collection exists)",
+                               rates, unpriced, remediable=False))
+        assumptions.append(
+            "the KB vector collection bills its OCUs while it EXISTS, queried or not — "
+            f"this estimate covers {kb_ocu_hours:g} OCU-hours and not one more; "
+            "the meter stops only at `deploy/09_retrieval.py --teardown`, run when "
+            "the eval is done")
+    embed_tokens = float(plan.get("kb_embed_ingest_tokens", 0) or 0)
+    if embed_tokens:
+        embed_sku = sku_tokens(SKU_EMBED_MODEL, "input")
+        if rates.get(embed_sku) is None:
+            items.append({"category": "retrieval_index", "sku": embed_sku,
+                          "quantity": round(embed_tokens / 1000.0, 6),
+                          "unit": "1K tokens",
+                          "unit_price": FALLBACK_EMBED_USD_PER_1K,
+                          "cost_usd": round(embed_tokens / 1000.0
+                                            * FALLBACK_EMBED_USD_PER_1K, 6),
+                          "basis": f"{embed_tokens:,.0f} corpus tokens embedded at "
+                                   f"ingest / 1000",
+                          "rate_source": "fallback_static", "rate_as_of": None,
+                          "remediable": False})
+        else:
+            items.append(_line("retrieval_index", embed_sku, embed_tokens / 1000.0,
+                               "1K tokens",
+                               f"{embed_tokens:,.0f} corpus tokens embedded at "
+                               f"ingest / 1000",
                                rates, unpriced, remediable=False))
 
     # 8. Everything else, as one honest lump rather than an implied zero.
@@ -846,7 +912,7 @@ def required_skus_for(plan: dict) -> list[str]:
     teacher = str(plan.get("teacher_model") or (plan.get("models") or {}).get("teacher")
                   or "us.deepseek.r1-v1:0")
     harness_model = str(plan.get("harness_model", "global.anthropic.claude-fable-5"))
-    return [
+    skus = [
         sku_training(str(plan.get("training_instance", "ml.g5.2xlarge"))),
         sku_inference(str(plan.get("inference_instance", "ml.g5.xlarge"))),
         sku_tokens(teacher, "input"), sku_tokens(teacher, "output"),
@@ -854,3 +920,10 @@ def required_skus_for(plan: dict) -> list[str]:
         sku_tokens(harness_model, "input"), sku_tokens(harness_model, "output"),
         SKU_AGENTCORE_MEMORY,
     ]
+    # Only when the plan actually carries a retrieval index: flagging the AOSS SKU as
+    # missing on every closed-book plan would teach operators the health panel cries wolf.
+    if float(plan.get("kb_ocu_hours", 0) or 0):
+        skus.append(SKU_AOSS_OCU)
+    if float(plan.get("kb_embed_ingest_tokens", 0) or 0):
+        skus.append(sku_tokens(SKU_EMBED_MODEL, "input"))
+    return skus

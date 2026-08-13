@@ -70,6 +70,24 @@ Seven SKUs have no rate, so they contribute **$0** to the total. The total is th
 `unpriced[]`. A `$0` line from a missing rate and a `$0` line from a free tier are otherwise
 indistinguishable, which is exactly how a teacher model silently prices at nothing.
 
+### The retrieval index (RAFT runs): the one standing cost
+
+A RAFT plan (r6d+) carries `kb_ocu_hours` and `kb_embed_ingest_tokens`, and the estimate
+gains a `retrieval_index` category: OCU-hours at the AOSS rate (fallback_static **$0.24/OCU-hr**
+— pinned by test to `deploy/09_retrieval.py`'s constant — until `pricing_refresh` sees the
+bill) plus the one-time embedding of the corpus at ingest. Two properties are load-bearing:
+
+- **It is a STANDING cost.** The collection bills its OCUs (2-OCU floor ≈ **$11.52/day**)
+  while it *exists*, queried or not. The estimate prices exactly the hours the plan admits
+  to, and its assumption names the only thing that stops the meter:
+  `deploy/09_retrieval.py --teardown`, run when the eval is done.
+- **It is NOT remediable.** A remediation iteration re-trains and re-judges; it does not
+  re-provision the index, so `worst_case_usd` adds the retrieval subtotal once, never
+  times `max_iterations`.
+
+On a closed-book plan the category is absent entirely — a `$0` retrieval line would read
+as "priced and free", the same confusion the unpriced-vs-zero rule above exists to prevent.
+
 ---
 
 ## 2. Where rates come from, and why the obvious source is not enough

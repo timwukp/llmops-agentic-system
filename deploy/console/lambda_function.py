@@ -1998,7 +1998,12 @@ def create_estimate(body, username, now_iso):
     # Only keys estimate_run actually reads are forwarded, so a typo in the form does
     # not become a silently-ignored field that the operator believes was priced.
     INT_KEYS = ("sample_count", "task_count", "max_iterations", "n_stages")
-    FLOAT_KEYS = ("endpoint_hours", "train_rows", "minutes_per_stage")
+    # kb_ocu_hours / kb_embed_ingest_tokens: the retrieval index a RAFT plan carries.
+    # The OCU line is the project's one standing cost, so it must be PRICEABLE from the
+    # form — an estimate that omits it approves a number the collection will exceed by
+    # $11.52 for every day nobody runs the teardown.
+    FLOAT_KEYS = ("endpoint_hours", "train_rows", "minutes_per_stage",
+                  "kb_ocu_hours", "kb_embed_ingest_tokens")
     STR_KEYS = ("training_instance", "inference_instance", "teacher_model",
                 "harness_model")
     BOOL_KEYS = ("keep_reasoning", "teardown")
