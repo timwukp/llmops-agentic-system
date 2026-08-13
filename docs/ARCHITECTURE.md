@@ -804,6 +804,36 @@ Scoped deliberately: `data_prep` and `finetune` keep `{checkpoint, escalate_huma
 each gets protocol wording of its own. A tool declared without a protocol naming when to
 reach for it is a tool an agent reaches for at random.
 
+### 7b. Retrieval-aware runs (RAFT, r6d): the facts move out of the weights
+
+r6c measured the structural dead end behind every honest gate FAIL to date: correct
+decontamination deletes exactly the org-specific facts the acceptance set demands (41% of
+rows), and no student size fixes facts absent from training data
+(`deploy/evidence/SCALING_DIAGNOSIS_r6c_8B.md`). The exit with production evidence
+(`deploy/evidence/RESEARCH_r6_direction.md`) is RAFT-style retrieval: **the facts live in a
+Bedrock Knowledge Base** (`deploy/09_retrieval.py`, per-run, human-deployed, torn down after
+eval) **and the training rows stay decontaminated.**
+
+The wiring is three activation-gated prompt clauses plus three plan params
+(`retrieval_kb_id`, `retrieval_k`, `retrieval_distractors` — all plan-classified; a
+closed-book plan omits them and runs the classic path untouched):
+
+- **data-prep `curate`**: probes the KB with 3 corpus tickets (zero hits = escalate, never
+  context-free rows that LOOK like a RAFT corpus), then assembles each surviving row's user
+  turn per the canonical format at `code/eval/raft_context_format.md`, recording
+  `raft_format_sha256` in `stats.json`. **Decontamination stays on the bare ticket text** —
+  context passages MAY resemble acceptance questions by design; the acceptance *files* are
+  structurally excluded from the index at ingest (inclusion-prefix refusal + the
+  Retrieve-only IAM fence).
+- **eval `evaluate`**: the student answers open-book — retrieve per acceptance item, same
+  canonical key, digest into `report.json` (equal digests in `stats.json` and `report.json`
+  IS the train/inference format check), per-item evidence in
+  `evaluation/retrieval_details.jsonl`; a failed retrieve is an empty context block, counted
+  and scored, never an unscorable.
+- **eval `score`**: **the judge stays blind to retrieval** — bare ticket, answers alone.
+  The 0.45 bar predates retrieval and must go on measuring the same thing, or r6d's number
+  cannot be compared to r6c's 0.223.
+
 ## 8. The remediation loop (≤ 3 iterations)
 
 `QualityGateChoice` fail → `RemediationChoice`: while `iteration < 3`,
