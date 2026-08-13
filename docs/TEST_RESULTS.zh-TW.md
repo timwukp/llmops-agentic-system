@@ -21,9 +21,9 @@
 
 | 檢查 | 結果 | 復現方式 |
 |---|---|---|
-| 單元測試（契約、成本模型、driver 迴圈、Lambda、狀態機文檔） | **1243/1243 通過** | `.venv/bin/python -m pytest tests/ -q --ignore=tests/golden` |
+| 單元測試（契約、成本模型、driver 迴圈、Lambda、狀態機文檔） | **1249/1249 通過** | `.venv/bin/python -m pytest tests/ -q --ignore=tests/golden` |
 | Shell 測試套件 —— N 路 capacity race guard（`tests/test_capacity_race_guard.sh`） | **10/10 斷言** | `bash tests/test_capacity_race_guard.sh` |
-| 反向控制 —— 逐一破壞每道 guard，確認它會失敗 | **270/270 反向控制** | `.venv/bin/python tests/negative_controls/monitor_dispatch.py` |
+| 反向控制 —— 逐一破壞每道 guard，確認它會失敗 | **274/274 反向控制** | `.venv/bin/python tests/negative_controls/monitor_dispatch.py` |
 | Harness 配置驗證（5 個專家 + 指揮家 + 審計員） | **7/7 `RESULT: OK`** | `python deploy/validate_config.py --config agents/<a>/harness.json` |
 | 架構 SVG 幾何檢查（虛線零交叉、零穿框） | **CLEAN** | `python tests/test_svg_geometry.py docs/architecture-*.svg` |
 | 遮蔽掃描（帳號 ID、憑證、帶帳號的 ARN） | CLEAN | `.github/workflows/redaction-check.yml` |
@@ -121,13 +121,13 @@ endpoint、五輪 e2e 迭代 —— 花費比這個帳戶單日花在一個沒�
 
 | 檢查 | 結果 | 重現方式 |
 |---|---|---|
-| 單元測試(全部套件,含 `test_cost_model.py` + `test_finops.py`) | **1243 passed** | `.venv/bin/python -m pytest tests/ -q` |
+| 單元測試(全部套件,含 `test_cost_model.py` + `test_finops.py`) | **1249 passed** | `.venv/bin/python -m pytest tests/ -q` |
 | Harness 配置驗證,7 個 agent | **`RESULT: OK`** | `python deploy/validate_config.py --config agents/finops/harness.json` |
 | 線上艦隊 | **7 個 harness READY** | 用 repo 內建 boto3 呼叫 `list_harnesses` |
 | 正典模組有散佈路徑 | 印出 `would upload 4 contract files` | `python deploy/03_storage.py --region us-east-1 --account-id 123456789012 --dry-run` |
 
 本次新增的每一道 guard 都做過 **mutation check**:逐一還原被斷言的行為,確認測試會
-失敗 —— **270/270 反向控制**,234 個 mutation 斷言 270 組（guard, mutation）配對,runner 各印
+失敗 —— **274/274 反向控制**,238 個 mutation 斷言 274 組（guard, mutation）配對,runner 各印
 一行 PASS。一個「有這行為也過、沒這行為也過」的測試,不是測試。
 
 這個數字是刻意寫進句子裡的。「做過 mutation check」是一個形容詞,而形容詞不會過期:
@@ -144,6 +144,16 @@ regex 通過。所以先前那個數字被報成全數通過,實際上有一隻 
 guard 都有一個 control」,不是「那個 control 殺得死」。現在 guard 只在提到 val split 的句子裡搜,
 m189 也如它該有的樣子失敗了。任何能被「為別的理由寫下的句子」滿足的東西都不是 guard,而只有完整
 跑一次才知道哪些是。
+
+一個 control 還有第三種「回報 PASS 卻什麼都沒驗到」的方式,而下一次完整跑就在它被寫下的一個 case
+之後抓到了:**m236 是用 `IndentationError` 殺掉它自己的 guard 的。** 它從一個 `try:` 區塊裡刪掉兩
+行、留下空的 body,於是每一個 import console 的測試都在 collection 階段就 error —— 而 pytest 對
+collection error 和斷言失敗回的都是 `1`,所以 runner 自己的檢查(`rc == PYTEST_TESTS_FAILED`)分不
+出這兩者。唯一的痕跡是印出來那一行的殺法(`1 error in 0.28s`,而其他每個 case 都是 `1 failed`),
+而沒有任何東西讀它。現在 runner 與
+`test_every_negative_control_still_matches_the_code_it_mutates` 都會對每一個 `.py` 檔的 mutation 做
+`compile()`,不能 parse 的就拒收 —— 只限 Python 原始碼,因為把 JSON 或 Markdown 的 parser 弄壞,
+常常正是某個 control 要斷言的那個 break。一個 mutation 必須真的走到那段程式碼,才能證明 guard 在看它。
 
 ### 兩次失敗比通過更有價值
 

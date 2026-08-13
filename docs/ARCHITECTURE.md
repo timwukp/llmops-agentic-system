@@ -1271,6 +1271,26 @@ plan named an OOD set and a completed eval carried none — conditioned on the e
 all, because an alarm on every run that is merely mid-inference is how an operator learns to ignore
 the one that is real.
 
+**An `n` is a claim with exceptions, and a page that prints the claim without the exceptions is
+printing the flattering half.** `judge_n` counts *scored* items only. A judge call can fail to return
+a verdict for reasons that have nothing to do with the answers, and that missingness is not random:
+on the 8B run, 9 of 274 (item, position) slots came back `content_filtered`, retrying recovered 5,
+and the 4 that stayed unjudgeable clustered on the credential / MFA / access categories where the
+student scored 0.000. So the interval over the survivors is *narrower and higher* than the interval
+over the layer, and the eval gate bullet answers that by recomputing its verdict with every
+unscorable item imputed as a win, then a loss, then a tie — escalating only if those three disagree,
+which on the 8B run they did not. The console ran two of that rule's three clauses: it decided PASS
+off the survivors-only bound, and it displayed `n=94` for a **97-row** layer with the 3 excluded items
+nowhere on the page. Near the bar those are the same defect twice — survivors at 0.5532 with a lower
+bound of 0.4520 clears a 0.45 gate, and the same rule with the 3 items imputed as losses gives 0.5361
+with a lower bound of 0.4374, which is borderline — so the page painted **PASS** on the one verdict
+the pipeline had escalated rather than reach. The row now runs the third clause, carries
+`judge_unscorable` and `items_in_layer` beside the interval, and re-checks D8's reconciliation
+(`judge_n + judge_unscorable == items_in_layer`) rather than trusting it: the agent is required to
+refuse a score that fails it, and this page is the only reader that can catch a report which asserted
+it and got it wrong. A denominator that does not reconcile gets its own verdict, because a
+bookkeeping failure and a student that missed a bar call for entirely different work.
+
 **The facts a run discovers travel like the consent it was signed with.** `MODEL_PARAM_FOR_ROLE`
 carries what a human *signed* into the stages that must obey it; `STAGE_FACT_PARAMS` carries what
 the run itself *produced* into the stages that must measure it. `params.student_endpoint` — read
