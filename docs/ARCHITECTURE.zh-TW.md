@@ -581,12 +581,50 @@ Phase 3 實測驗證（觀察到兩次 resume Lambda 調用：一次在早期失
 
 一個 AgentCore Memory（`llmops_shared_memory`，策略 **SEMANTIC + EPISODIC**）由七個
 harness 共享，由 `deploy/04_wire_memory.py` 在建立後接線。每個 agent 的 `actorId`
-（= harness 名稱）為 namespace 分區，檢索仍可跨讀共享事實。刻意跳過
+為 namespace 分區，檢索仍可跨讀共享事實。刻意跳過
 USER_PREFERENCE/SUMMARIZATION 策略 —— 迴路中沒有人類用戶。
 
 這就是 run-N 的學習抵達 run-N+1 的機制，且已被證明：Phase 5 的 e2e 運行中，finetune
 agent **首次嘗試即成功**發起訓練作業，用的正是 Phase 3 補救連環戰學到的
 floors-only requirements + torch-2.6 DLC 配方 —— 那個配方當初花了 5 個失敗作業才換來。
+
+接線有兩個承重的性質，而兩個都是量線上艦隊量出來的、不是讀這個 repo 讀出來的
+（實測數字見 [TEST_RESULTS.zh-TW.md](TEST_RESULTS.zh-TW.md) 的 D14）：
+
+- **harness 名單是推導出來的，永遠不手寫。** 它從每一個 `agents/*/harness.json` 讀
+  `harnessName` —— 也就是 `deploy/05_harnesses.py` 部署時用的同一個來源 —— 所以一個新
+  agent 只要存在就會被接上。一份手寫的「五個管線 worker」名單，正是
+  `llmops_finops` 與 `llmops_orchestrator` 從未收到 semantic 提取收緊、在其他地方都已
+  修好的期間裡一直停在修正前的 `topK` 10 / `relevanceScore` 0.2 的原因。接 0 個 harness、
+  或接一個配置裡沒有 `harnessName` 的 harness，都會拒絕，而不是回報一次乾淨的部署。
+- **已經上線的 `actorId` 絕不會被重新部署改掉。** `actorId` 是 `/users/{actorId}/facts`
+  的分區鍵，所以改寫它並不是搬動一份記憶 —— 是拋棄一份，而 `UpdateHarness` 兩種情況都回
+  成功。上面那兩個 harness 是由較舊的 `deploy/wire_memory.py` 用完整 harness ID 接的，而
+  那兩個分區裝著這份 memory 的 43 條記錄。所以要搬動它必須逐一指名（`--repartition
+  <harness>`），並且在 data plane 報得出「即將被拋棄幾條記錄」之前直接拒絕：一個未知的
+  數字讀起來和 0 一模一樣。
+- **每一次 attach 都會回報「另一種 `actorId` 拼法」底下還放著什麼。** 上面那道 guard 守的是
+  *這一次*部署，對「更早一次部署已經走開的那個分區」毫無作用 —— 實測是另外 63 條 semantic
+  記錄（外加 105 條 episodic），躺在五個管線 worker 的完整 harness ID 底下，自從某次重新部署
+  把它們搬到裸名字之後，寫下它們的 agent 就再也拿不到。沒有任何 API 能把記錄在 namespace 之間
+  搬動，所以這是一份回報、不是一次修復；它換到的是「一個被拋棄的分區」和「一個空的分區」不再
+  印出同一個樣子。兩種候選拼法都會被檢查，兩個通道都會被計數，而一個讀不到的分區會被回報成
+  「沒讀到」，不是「是空的」。
+- **而且每次執行會掃一次：這份 memory 上沒有任何 harness 指著的 actor。** 上面那道檢查比對的是
+  **這個 repo 產得出來的**兩種拼法；線上 `ListActors` 回了 16 個 actor，其中兩個兩者都不是 ——
+  `monitor`（3 條 semantic 記錄）與 `monitor-agent`（6 條），由較舊的 `deploy/wire_memory.py`
+  寫入，它的 `--actor-id` 吃自由文字。一份從某個 repo 的命名慣例推導出來的候選清單，不可能包含
+  這個 repo 從來沒有過的拼法，所以 memory 層級的掃描改成從 data plane 自己的列舉推導：實測是
+  **9 個孤兒 actor、共 72 條 semantic + 108 條 episodic 記錄**。兩道檢查回答的是不同問題 ——
+  哪一個 harness 掉了分區，對比這份 memory 上到底有沒有東西成了孤兒 —— 所以它們的數字重疊、
+  不能相加。可達集合是對這個 repo 定義的每一個 harness 讀的，不只是這次執行接線的那些，否則
+  `--harness <某一個>` 就會把另外六個健康的分區全部宣告成掉了。
+
+Semantic 通道是刻意比 episodic **更緊**的（`topK` 5 / `relevanceScore` 0.6 對 10 / 0.2）。
+這兩者並不矛盾：`/episodes/{actorId}/{sessionId}` 把 episodic 回憶限制在 agent 自己的
+session 裡，而 `/users/{actorId}/facts` 是跨 **run** 的通道 —— 在那裡，一個鬆的門檻會把
+另一個 run 的結論當成真相送進來。每一個會收到檢索記憶的提示詞，也都帶著一條把它從屬於
+本次 run 已簽署計劃、以及本次 run 自己量到的數字之下的優先序規則。
 
 ## 7. Fail-closed 門檻
 

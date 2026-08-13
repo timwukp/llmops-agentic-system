@@ -21,9 +21,9 @@
 
 | 檢查 | 結果 | 復現方式 |
 |---|---|---|
-| 單元測試（契約、成本模型、driver 迴圈、Lambda、狀態機文檔） | **1290/1290 通過** | `.venv/bin/python -m pytest tests/ -q --ignore=tests/golden` |
+| 單元測試（契約、成本模型、driver 迴圈、Lambda、狀態機文檔） | **1319/1319 通過** | `.venv/bin/python -m pytest tests/ -q --ignore=tests/golden` |
 | Shell 測試套件 —— N 路 capacity race guard（`tests/test_capacity_race_guard.sh`） | **10/10 斷言** | `bash tests/test_capacity_race_guard.sh` |
-| 反向控制 —— 逐一破壞每道 guard，確認它會失敗 | **309/309 反向控制** | `.venv/bin/python tests/negative_controls/monitor_dispatch.py` |
+| 反向控制 —— 逐一破壞每道 guard，確認它會失敗 | **338/338 反向控制** | `.venv/bin/python tests/negative_controls/monitor_dispatch.py` |
 | Harness 配置驗證（5 個專家 + 指揮家 + 審計員） | **7/7 `RESULT: OK`** | `python deploy/validate_config.py --config agents/<a>/harness.json` |
 | 架構 SVG 幾何檢查（虛線零交叉、零穿框） | **CLEAN** | `python tests/test_svg_geometry.py docs/architecture-*.svg` |
 | 遮蔽掃描（帳號 ID、憑證、帶帳號的 ARN） | CLEAN | `.github/workflows/redaction-check.yml` |
@@ -121,13 +121,13 @@ endpoint、五輪 e2e 迭代 —— 花費比這個帳戶單日花在一個沒�
 
 | 檢查 | 結果 | 重現方式 |
 |---|---|---|
-| 單元測試(全部套件,含 `test_cost_model.py` + `test_finops.py`) | **1290 passed** | `.venv/bin/python -m pytest tests/ -q` |
+| 單元測試(全部套件,含 `test_cost_model.py` + `test_finops.py`) | **1319 passed** | `.venv/bin/python -m pytest tests/ -q` |
 | Harness 配置驗證,7 個 agent | **`RESULT: OK`** | `python deploy/validate_config.py --config agents/finops/harness.json` |
 | 線上艦隊 | **7 個 harness READY** | 用 repo 內建 boto3 呼叫 `list_harnesses` |
 | 正典模組有散佈路徑 | 印出 `would upload 4 contract files` | `python deploy/03_storage.py --region us-east-1 --account-id 123456789012 --dry-run` |
 
 本次新增的每一道 guard 都做過 **mutation check**:逐一還原被斷言的行為,確認測試會
-失敗 —— **309/309 反向控制**,267 個 mutation 斷言 309 組（guard, mutation）配對,runner 各印
+失敗 —— **338/338 反向控制**,289 個 mutation 斷言 338 組（guard, mutation）配對,runner 各印
 一行 PASS。一個「有這行為也過、沒這行為也過」的測試,不是測試。
 
 這個數字是刻意寫進句子裡的。「做過 mutation check」是一個形容詞,而形容詞不會過期:
@@ -196,6 +196,91 @@ stage invocation 12 列），所以**是上一個修正把真實事件數推過�
 件的 run 會聲稱有沒人讀到的歷史），m262 送出反向窗口卻不還原時間順序（於是前端 `slice(-25)` 畫的是
 最新 100 筆裡最舊的 25 筆 —— 兩端都不對的窗口），m256/m257/m263/m264/m265 各自在「從查詢到畫面」
 的路上丟掉一個截斷標記。一個不說自己被封頂的列表讀起來就是完整的，那是同一個缺陷往上一層。
+
+**D14 —— 一個只到達七個 harness 中五個的修正、它「顯而易見」的修法會燒掉的 43 條記憶，
+更早一次部署其實已經燒掉的 63 條，以及 9 條這個 repo 擁有的任何拼法都叫不出名字的
+（二十二個控制，m267-m288）。** 共享 BYO memory 由 `deploy/04_wire_memory.py` 接線，而它的
+harness 名單是手寫的：五個管線 worker。有兩個 harness 接在同一份 memory 上、卻不在名單裡，
+於是 #83 的提取收緊 —— semantic `topK` 10 → 5、`relevanceScore` 0.2 → 0.6，也就是那個讓
+「另一個 run 的事後檢討」不再以裸事實注入的修正 —— **從未到達它們**。2026-08-13 線上實測：
+`llmops_finops` 與 `llmops_orchestrator` 仍停在 **10 / 0.2**，正是修正前那個設定，而名單上
+五個都是 5 / 0.6。什麼都沒有失敗；那條通道只是一直保持它本來的鬆，而且偏偏是在兩個提示詞
+**建立在記憶之上**的 agent 上（finops：「估算準確度只有在每次對帳的發現存活到下一次估算時
+才會提升」；orchestrator：「你的記憶與專家們共享」）。而 `deploy/05_harnesses.py` 早就寫著
+一句正好講這個失敗模式的註解 —— *「磁碟上沒有任何腳本點名的配置，就是一個安靜地從未存在過的
+harness」* —— 這個教訓被寫在一支腳本裡，卻沒有被套用到它的兄弟腳本上。
+
+顯而易見的那個修法是破壞性的，所以它是先被量出來、才被寫下來的。`actorId` 是每個 namespace
+的**分區鍵**（`/users/{actorId}/facts`），而那兩個 harness 是由較舊的 `deploy/wire_memory.py`
+接的，它的 `--actor-id` 吃的是完整 harness ID。線上實測：
+`/users/llmops_finops-eDJtU9PvKh/facts` 有 **13** 條記錄、
+`/users/llmops_orchestrator-GsIqHZ4viJ/facts` 有 **30** 條，而每一個裸名字的分區都是 **0**。
+把名單推導出來、再讓腳本自己偏好的拼法勝出，會在一次呼叫裡拋棄全部 43 條 —— 而
+`UpdateHarness` 兩種情況都回成功，於是那個終於套用提取修正的部署，就會同時是那個丟掉它存在
+目的的部署。所以現在**已經上線的 `actorId` 勝過腳本想選的那一個**，要搬動它必須逐一指名
+（`--repartition <harness>`），而且在 data plane 說得出代價之前那個搬動會直接拒絕 —— 一個
+未知的記錄數讀起來和 0 完全一樣（m272）。控制把這兩半分開盯住：m270 讓重新部署改寫已上線的
+`actorId`，m271 把 `--repartition` 變成全艦隊生效，m273 讓計數停在第一頁（正好對大到有意義的
+分區低報最多），m275 把 semantic 通道鬆回 episodic 的設定 —— 而那個設定只對 episodic 安全，
+因為 `{sessionId}` 把它限制在 agent 自己的 session 裡，而事實那一邊沒有任何東西限制它。本來
+該抓到這一切的那道 guard 斷言的是 `wired == {data-prep, finetune, eval, deploy, monitor}`：
+**它同意了那個遺漏**，和 console 那個 gate band 是同一個形狀。改成從配置推導之後，它立刻失敗，
+並且點名了第三個沒人找過的缺口 —— orchestrator 的提示詞同樣沒有記憶優先序規則，finops 也沒有
+（m276、m277），而這兩個正是會發表 rate card、以及對人類報價的 agent。
+
+**接著，支撐那個修正的量測本身被發現量得太窄，而且窄在要命的方向上。** 當時只數了兩個
+full-harness-ID 分區 —— 13 + 30 —— 因為只有那兩個 harness 還「指著」這樣的分區。把七個
+都數過一遍：
+
+| 分區 | 記錄數 | 已上線的 `actorId` |
+|---|---|---|
+| `/users/llmops_data_prep-KuSKXUaxyP/facts` | 2 | 裸名字 |
+| `/users/llmops_finetune-xXl7jsACZO/facts` | **25** | 裸名字 |
+| `/users/llmops_eval-iuIIs96fFM/facts` | **16** | 裸名字 |
+| `/users/llmops_deploy-nLLNWairTc/facts` | **11** | 裸名字 |
+| `/users/llmops_monitor-YCXC5hcXzu/facts` | **9** | 裸名字 |
+| `/users/llmops_finops-eDJtU9PvKh/facts` | 13 | 就是這個分區 |
+| `/users/llmops_orchestrator-GsIqHZ4viJ/facts` | 30 | 就是這個分區 |
+| `/users/<每一個裸 harness 名字>/facts` | **0** | —— |
+
+**semantic 一共 106 條，其中 63 條寫下它們的那個 agent 現在已經取不回來了** —— 而 episodic
+通道以同樣的方式斷掉，五個 worker 的 `/episodes/<full id>` 底下還有 105 條。`llmops_monitor`
+最新的那條孤兒記錄的日期是 **2026-08-08**，所以這次搬動只發生在幾天前，是這支腳本自己更早
+一次執行做的，機制正好就是上面那一個。那兩個倖存的 harness 之所以倖存，**只**因為手寫名單漏掉
+了它們：缺陷本身就是資料活下來的原因。所以「保留已上線 `actorId`」這道 guard 是真的，但來晚了
+—— 它守住的是那 43 條；而沒有任何 API 能把記錄在 namespace 之間搬動，所以那 63 條是一份回報，
+不是一次修復。
+
+真正缺的東西比接線缺陷更小、更無聊：**從來沒有人去數另一種拼法**，於是「這個 agent 沒有記憶」
+和「這個 agent 的記憶在 25 條之外的另一個分區」在部署日誌裡印出來一模一樣。現在每一次 attach
+都會去讀那些掛在「它沒有被接上的任何 `actorId` 拼法」底下的分區，而控制逐句盯住這件事：m278
+讓這份回報靜音，m279 拿掉 episodic namespace（於是只報損失較小的那一半），m281 只檢查完整
+harness ID（對七個裡的六個都對，正好在值得抓的那個案例上瞎掉），m282 讓檢查只在有人要求
+repartition 時才跑 —— 而那五個已經丟掉記錄的 harness 永遠不會有人去 repartition，m283 只數
+第一頁，而 m280 把一個**沒被讀過**的分區重新變回看起來是空的，也正是這個等價讓 63 條記錄在
+沒有任何一次失敗呼叫的情況下離開。
+
+**而那道檢查還是少了一個假設。** 它比對的是**這個 repo 產得出來的**兩種拼法 —— 裸 harness
+名字，和完整 harness ID。這份 memory 上 `ListActors` 回了 **16** 個 actor，其中兩個兩者都不是：
+`monitor` 有 **3** 條 semantic 記錄、`monitor-agent` 有 **6** 條，而這兩個 `actorId` 在這個 repo
+的任何檔案裡都找不到（較舊的 `deploy/wire_memory.py` 的 `--actor-id` 吃的是自由文字）。所以有
+9 條記錄，對一道**自己的 docstring 聲稱涵蓋了「一個兩者都不是的 `actorId`」**的 guard 而言是
+看不見的 —— 它涵蓋的是「**已上線的** id 是第三種拼法」，不是「存在第三個**分區**」。一份從某個
+repo 的命名慣例寫出來的候選清單，不可能包含這個 repo 從來沒有過的拼法，所以這份掃描現在改成從
+data plane 自己的列舉推導，每次執行一次：
+
+| 檢查 | 推導來源 | 線上結果 |
+|---|---|---|
+| 逐 harness 的 `stranded_partitions` | 這個 repo 的兩種拼法 | 63 條 semantic + 105 條 episodic，可歸屬到某個 harness |
+| memory 層級的 `unreachable_actors` | `ListActors` | **9 個孤兒 actor，72 條 semantic + 108 條 episodic = 180 條** |
+
+兩者是重疊的、**不能相加** —— 前者說的是**哪一個 harness** 掉了分區，後者說的是這份 memory 上
+到底有沒有東西成了孤兒。五個控制盯住它：m284 用這次執行自己的 attach 清單去建可達集合，於是
+`--harness llmops_eval` 會把另外六個 harness 健康的分區宣告成掉了（七次裡有六次在喊狼來了的
+警告，就是沒有人會讀的警告）；m285 對一份還不存在的 memory 回報孤兒數為零；m286 只數 semantic
+通道，於是 actor `finops` —— 0 條 facts、1 條 episodic —— 讀起來是乾淨的；m287 只讀第一頁
+actor，正好只在 memory 還小的時候是對的；m288 直接把呼叫從 `main()` 拿掉，也就是一道 guard
+存在於 repo 裡、卻不在部署路徑上的那種情況。
 
 ### 兩次失敗比通過更有價值
 

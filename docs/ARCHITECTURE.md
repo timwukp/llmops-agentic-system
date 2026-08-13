@@ -686,14 +686,59 @@ append-only. Consequences, all live-proven:
 
 One AgentCore Memory (`llmops_shared_memory`, strategies **SEMANTIC + EPISODIC**) is
 shared by all seven harnesses, wired post-create by `deploy/04_wire_memory.py`. Per-agent
-`actorId` (= harness name) partitions namespaces while retrieval can still cross-read
-shared facts. USER_PREFERENCE/SUMMARIZATION strategies are deliberately skipped — there
-is no human user in the loop.
+`actorId` partitions namespaces while retrieval can still cross-read shared facts.
+USER_PREFERENCE/SUMMARIZATION strategies are deliberately skipped — there is no human user
+in the loop.
 
 This is the mechanism by which run-N learnings reach run-N+1, and it is proven: in
 Phase 5's e2e run, the finetune agent launched its training job **first-try** using the
 floors-only-requirements + torch-2.6-DLC recipe learned in Phase 3's remediation gauntlet
 — a recipe that had cost 5 failed jobs to discover.
+
+Two properties of the wiring are load-bearing, and both were learned by measuring the live
+fleet rather than reading this repo (the measurements are in
+[TEST_RESULTS.md](TEST_RESULTS.md), finding D14):
+
+- **The harness list is derived, never written down.** It reads `harnessName` out of every
+  `agents/*/harness.json` — the same producer `deploy/05_harnesses.py` deploys from — so a
+  new agent is wired by existing. A hand-written list of the five pipeline workers is why
+  `llmops_finops` and `llmops_orchestrator` never received the semantic-retrieval tightening
+  and sat at the pre-fix `topK` 10 / `relevanceScore` 0.2 for as long as it had been fixed
+  everywhere else. Wiring zero harnesses, or one whose config has no `harnessName`, refuses
+  rather than reporting a clean deploy.
+- **An `actorId` already live is never changed by a redeploy.** `actorId` is the partition
+  key of `/users/{actorId}/facts`, so rewriting it does not move a memory — it abandons one,
+  and `UpdateHarness` returns success either way. The two harnesses above are wired under
+  their full harness IDs by the older `deploy/wire_memory.py`, and those partitions hold 43
+  of the memory's records. Moving one is therefore opt-in per harness
+  (`--repartition <harness>`) and refuses unless the data plane can report the record count
+  it is about to abandon: an unknown count reads exactly like a count of zero.
+- **Every attach reports what the other spelling of `actorId` still holds.** The guard above
+  protects a partition from *this* deploy and does nothing about one an earlier deploy already
+  walked away from — live, that is 63 further semantic records (and 105 episodic) sitting under
+  the five pipeline workers' full harness IDs, unreachable by the agents that wrote them since
+  a redeploy moved them to the bare name. No API moves a record between namespaces, so this is
+  a report rather than a repair; what it buys is that an abandoned partition and an empty one
+  stop printing the same. Both candidate spellings are checked, both channels are counted, and
+  a partition that could not be read is reported as unread rather than as empty.
+- **And once per run, every actor on the memory that no harness points at.** The check above
+  compares the two spellings *this repo produces*; `ListActors` returns 16 actors on the live
+  memory and two are neither — `monitor` (3 semantic records) and `monitor-agent` (6), written
+  by the older `deploy/wire_memory.py`, whose `--actor-id` is free-form. A candidate list
+  derived from a repo's naming conventions cannot contain a spelling the repo never had, so the
+  memory-level sweep is derived from the data plane's own enumeration: live, **9 orphaned
+  actors holding 72 semantic + 108 episodic records**. The two checks answer different
+  questions — which harness lost a partition, versus whether anything on the memory is orphaned
+  at all — so their counts overlap and are not additive. The reachable set is read for every
+  harness the repo defines, not only the ones a given run wires, or `--harness <one>` would
+  denounce the other six healthy partitions.
+
+The semantic channel is deliberately **tighter** than the episodic one (`topK` 5 /
+`relevanceScore` 0.6 versus 10 / 0.2). They are not inconsistent: `/episodes/{actorId}/{sessionId}`
+scopes episodic recall to the agent's own session, while `/users/{actorId}/facts` is the
+cross-**run** channel, where a loose threshold delivers another run's conclusions as truth.
+Every prompt that receives retrieved memory also carries a precedence rule subordinating it
+to this run's signed plan and this run's own measurements.
 
 ## 7. Fail-closed gates
 

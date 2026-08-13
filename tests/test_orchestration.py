@@ -3544,14 +3544,15 @@ class TestStateMachine:
         injected another run's MissingStageComplete post-mortem and an unrelated
         dataset's hyperparameters into every finetune invocation as bare "facts". The
         retrieval threshold fix bounds HOW MUCH crosses; this rule governs what the
-        agent DOES with whatever still does. Derived from 04_wire_memory.py's own
-        harness list, so wiring a sixth harness without the rule fails here."""
-        src = (REPO / "deploy/04_wire_memory.py").read_text()
-        m = re.search(r"DEFAULT_HARNESSES = \[([^\]]+)\]", src)
-        wired = {n.strip().strip('"').removeprefix("llmops_").replace("_", "-")
-                 for n in m.group(1).split(",")}
-        assert wired == {"data-prep", "finetune", "eval", "deploy", "monitor"}, wired
-        for d in sorted(wired):
+        agent DOES with whatever still does.
+
+        This assertion used to pin `wired == {data-prep, finetune, eval, deploy, monitor}`
+        -- the five names 04_wire_memory.py listed -- which made the guard AGREE with the
+        omission it should have caught: llmops_finops and llmops_orchestrator are wired to
+        the same memory live, and finops's prompt had no precedence rule at all. A guard
+        that encodes the shipped list is not evidence the list is right. It now derives
+        from every agent config that exists, so an eighth agent fails here by existing."""
+        for d in sorted(p.parent.name for p in (REPO / "agents").glob("*/harness.json")):
             text = json.loads((REPO / f"agents/{d}/harness.json").read_text()
                               )["systemPrompt"][0]["text"]
             assert "Retrieved memory is BACKGROUND" in text and "ALWAYS outrank" in text, (
@@ -9905,6 +9906,12 @@ def test_attach_sends_the_resolved_harness_id_not_the_name(wire_memory_mod):
                 {"harnessId": "llmops_eval-Hj4Kl5Mn6P", "name": "llmops_eval"},
             ]}
 
+        def get_harness(self, harnessId):
+            # never wired: the control plane raises rather than returning an empty block.
+            # Spelled out instead of omitted, so the "not wired yet" branch is reached for
+            # the reason the live API gives and not because the double lacks the method.
+            raise RuntimeError("ResourceNotFoundException")
+
         def update_harness(self, harnessId, **kw):
             if not re.fullmatch(r"[a-zA-Z][a-zA-Z0-9_]{0,39}-[a-zA-Z0-9]{10}", harnessId):
                 raise RuntimeError(f"ValidationException: {harnessId!r}")
@@ -9914,7 +9921,11 @@ def test_attach_sends_the_resolved_harness_id_not_the_name(wire_memory_mod):
     out = wire_memory_mod.attach_to_harness(
         ctl, "llmops_finetune", "arn:aws:bedrock-agentcore:us-east-1:TESTACCTID00:memory/m",
         {"SEMANTIC": "sem-1", "EPISODIC": "epi-1"}, dry=False)
-    assert out == {"harness": "llmops_finetune", "attached": True}
+    assert out == {"harness": "llmops_finetune", "actorId": "llmops_finetune",
+                   "attached": True,
+                   # no data plane was handed in, so the other spelling's partition was
+                   # not read — and an unread partition must not print as an empty one.
+                   "stranded_check": "SKIPPED: no data plane -- unknown is not zero"}
     assert ctl.sent == ["llmops_finetune-Ab1Cd2Ef3G"]
 
 
@@ -9931,6 +9942,530 @@ def test_an_unknown_harness_name_refuses_instead_of_sending_garbage(wire_memory_
             _EmptyCtl(), "llmops_ghost",
             "arn:aws:bedrock-agentcore:us-east-1:TESTACCTID00:memory/m",
             {"SEMANTIC": "sem-1"}, dry=False)
+
+
+# ── the two harnesses the fix could not reach, and the 43 records it would have burned ─
+# 04_wire_memory.py's DEFAULT_HARNESSES was a hand-written list of the five pipeline
+# workers, so #83's retrieval tightening (semantic topK 10/0.2 -> 5/0.6) never reached
+# llmops_finops or llmops_orchestrator: measured live 2026-08-13, both still sat at
+# 10/0.2 — the exact setting that injected another run's post-mortem as a bare fact.
+# The obvious fix (derive the list) is destructive on its own, because those two are
+# wired under their FULL harness IDs and actorId is the partition key of
+# /users/{actorId}/facts: /users/llmops_finops-eDJtU9PvKh/facts holds 13 records,
+# /users/llmops_orchestrator-GsIqHZ4viJ/facts holds 30, and every bare-name partition
+# holds 0. Rewriting actorId to the bare name abandons all 43 and UpdateHarness returns
+# success. So the live actorId wins, and a repartition is opt-in per harness and priced.
+
+
+def _wired_ctl(live_actor_id=None, harness_id="llmops_finops-eDJtU9PvKh"):
+    """A control plane that already carries `live_actor_id` on `harness_id`."""
+    class _Ctl:
+        def __init__(self):
+            self.sent = []
+
+        def list_harnesses(self):
+            return {"harnesses": [{"harnessId": harness_id,
+                                   "name": harness_id.rsplit("-", 1)[0]}]}
+
+        def get_harness(self, harnessId):
+            assert harnessId == harness_id, harnessId
+            if live_actor_id is None:
+                raise RuntimeError("ResourceNotFoundException")
+            return {"harness": {"memory": {"agentCoreMemoryConfiguration": {
+                "actorId": live_actor_id}}}}
+
+        def update_harness(self, harnessId, memory, **kw):
+            self.sent.append((harnessId, memory))
+
+    return _Ctl()
+
+
+def _dp(counts):
+    """A data plane whose /users/<actor>/facts partitions hold `counts[actor]` records."""
+    class _Dp:
+        def __init__(self):
+            self.pages = 0
+
+        def list_memory_records(self, memoryId, namespace, maxResults, nextToken=None):
+            actor = namespace.split("/")[2]
+            recs = [{"memoryRecordId": f"r{i}"} for i in range(counts.get(actor, 0))]
+            start = int(nextToken or 0)
+            page = recs[start:start + maxResults]
+            self.pages += 1
+            out = {"memoryRecordSummaries": page}
+            if start + maxResults < len(recs):
+                out["nextToken"] = str(start + maxResults)
+            return out
+
+    return _Dp()
+
+
+def _dp_ns(counts):
+    """A data plane keyed by NAMESPACE, so the two channels can hold different counts.
+
+    `_dp` keys on the actor segment, which collapses `/users/<a>/facts` and
+    `/episodes/<a>` into one number — fine for the repartition price, useless for
+    asserting that both channels are actually looked at."""
+    class _Dp:
+        def __init__(self):
+            self.pages = 0
+            self.seen = []
+
+        def list_memory_records(self, memoryId, namespace, maxResults, nextToken=None):
+            self.pages += 1
+            if nextToken is None:
+                self.seen.append(namespace)
+            recs = [{"memoryRecordId": f"r{i}"} for i in range(counts.get(namespace, 0))]
+            start = int(nextToken or 0)
+            out = {"memoryRecordSummaries": recs[start:start + maxResults]}
+            if start + maxResults < len(recs):
+                out["nextToken"] = str(start + maxResults)
+            return out
+
+    return _Dp()
+
+
+_MEM_ARN = "arn:aws:bedrock-agentcore:us-east-1:TESTACCTID00:memory/llmops_shared-abc"
+_SIDS = {"SEMANTIC": "sem-1", "EPISODIC": "epi-1"}
+
+
+def test_memory_wires_every_harness_this_repo_defines_not_a_hand_written_five(
+        wire_memory_mod):
+    """The list is derived from the configs, so an eighth agent is wired by existing.
+
+    The two names asserted by name are the two the hand-written list omitted — they are
+    named here because a derived list that happened to be derived from the same wrong
+    producer would still pass a pure count check."""
+    names = wire_memory_mod.harness_names()
+    on_disk = {json.loads(p.read_text())["harnessName"]
+               for p in (REPO / "agents").glob("*/harness.json")}
+    assert set(names) == on_disk, (set(names) ^ on_disk)
+    assert {"llmops_finops", "llmops_orchestrator"} <= set(names), names
+    assert len(names) == len(set(names)) == len(on_disk)
+
+
+def test_a_harness_config_with_no_name_refuses_instead_of_wiring_blind(
+        wire_memory_mod, tmp_path, monkeypatch):
+    (tmp_path / "agents" / "ghost").mkdir(parents=True)
+    (tmp_path / "agents" / "ghost" / "harness.json").write_text('{"systemPrompt": []}')
+    monkeypatch.setattr(wire_memory_mod, "REPO", tmp_path)
+    with pytest.raises(SystemExit):
+        wire_memory_mod.harness_names()
+
+
+def test_no_harness_configs_refuses_instead_of_wiring_nothing(
+        wire_memory_mod, tmp_path, monkeypatch):
+    """Wiring zero harnesses must not read as a successful deploy — the failure mode
+    the whole finding is about is a wiring step that reports success and reaches nobody."""
+    (tmp_path / "agents").mkdir()
+    monkeypatch.setattr(wire_memory_mod, "REPO", tmp_path)
+    with pytest.raises(SystemExit):
+        wire_memory_mod.harness_names()
+
+
+def test_an_actor_id_already_live_survives_a_redeploy(wire_memory_mod):
+    ctl = _wired_ctl(live_actor_id="llmops_finops-eDJtU9PvKh")
+    out = wire_memory_mod.attach_to_harness(ctl, "llmops_finops", _MEM_ARN, _SIDS,
+                                            dry=False, dp=_dp({}), memory_id="m-1")
+    assert out["actorId"] == "llmops_finops-eDJtU9PvKh", out
+    assert out.get("kept_live_actor_id") is True, out
+    assert "repartitioned_from_records" not in out, out
+    sent_actor = ctl.sent[0][1]["optionalValue"]["agentCoreMemoryConfiguration"]["actorId"]
+    assert sent_actor == "llmops_finops-eDJtU9PvKh", sent_actor
+
+
+def test_the_retrieval_config_is_rewritten_even_when_the_actor_id_is_kept(
+        wire_memory_mod):
+    """Keeping the actorId must not turn the whole attach into a no-op.
+
+    This is the finding's entire point: the two harnesses that keep a live actorId are
+    exactly the two whose retrieval thresholds were never tightened, so a fix that
+    preserved their partition but skipped the UpdateHarness would leave them at 10/0.2
+    forever — and would look, from the outside, like a deploy that touched all seven."""
+    ctl = _wired_ctl(live_actor_id="llmops_finops-eDJtU9PvKh")
+    wire_memory_mod.attach_to_harness(ctl, "llmops_finops", _MEM_ARN, _SIDS,
+                                      dry=False, dp=_dp({}), memory_id="m-1")
+    assert len(ctl.sent) == 1, ctl.sent
+    cfg = ctl.sent[0][1]["optionalValue"]["agentCoreMemoryConfiguration"]
+    sem = cfg["retrievalConfig"]["/users/{actorId}/facts"]
+    assert (sem["topK"], sem["relevanceScore"]) == (5, 0.6), sem
+
+
+def test_a_never_wired_harness_gets_the_stable_bare_name(wire_memory_mod):
+    """The bare name is the only spelling that survives a harness recreation (the id
+    suffix is regenerated), so it stays the choice wherever no data is at stake."""
+    ctl = _wired_ctl(live_actor_id=None)
+    out = wire_memory_mod.attach_to_harness(ctl, "llmops_finops", _MEM_ARN, _SIDS,
+                                            dry=False, dp=_dp({}), memory_id="m-1")
+    assert out["actorId"] == "llmops_finops", out
+    assert "kept_live_actor_id" not in out, out
+
+
+def test_moving_an_actor_id_must_be_asked_for_by_name(wire_memory_mod):
+    """--repartition is per harness: naming one must not migrate the other."""
+    ctl = _wired_ctl(live_actor_id="llmops_finops-eDJtU9PvKh")
+    out = wire_memory_mod.attach_to_harness(
+        ctl, "llmops_finops", _MEM_ARN, _SIDS, dry=False,
+        dp=_dp({"llmops_finops-eDJtU9PvKh": 13}), memory_id="m-1",
+        repartition=["llmops_orchestrator"])
+    assert out["actorId"] == "llmops_finops-eDJtU9PvKh", out
+
+
+def test_a_repartition_reports_the_records_it_abandons(wire_memory_mod):
+    ctl = _wired_ctl(live_actor_id="llmops_finops-eDJtU9PvKh")
+    out = wire_memory_mod.attach_to_harness(
+        ctl, "llmops_finops", _MEM_ARN, _SIDS, dry=False,
+        dp=_dp({"llmops_finops-eDJtU9PvKh": 13}), memory_id="m-1",
+        repartition=["llmops_finops"])
+    assert out["actorId"] == "llmops_finops", out
+    assert out["repartitioned_from_records"] == 13, out
+
+
+def test_a_repartition_with_no_data_plane_refuses_to_price_itself_at_zero(
+        wire_memory_mod):
+    """Silence is the one answer a destructive move must not accept: an unknown record
+    count reads exactly like a count of 0."""
+    ctl = _wired_ctl(live_actor_id="llmops_finops-eDJtU9PvKh")
+    with pytest.raises(SystemExit):
+        wire_memory_mod.attach_to_harness(ctl, "llmops_finops", _MEM_ARN, _SIDS,
+                                          dry=False, repartition=["llmops_finops"])
+
+
+def test_the_abandoned_record_count_reads_past_the_first_page(wire_memory_mod):
+    """maxResults caps a page, not the partition — a count that stops at the first page
+    under-reports exactly the partitions large enough to matter."""
+    dp = _dp({"llmops_orchestrator-GsIqHZ4viJ": 250})
+    assert wire_memory_mod.count_facts(dp, "m-1", "llmops_orchestrator-GsIqHZ4viJ") == 250
+    assert dp.pages == 3, dp.pages
+
+
+def test_a_repartition_for_a_harness_not_being_wired_refuses(wire_memory_mod):
+    """`--harness llmops_eval --repartition llmops_finops` would print a clean success
+    having moved nothing — a no-op that reads as done."""
+    wire_memory_mod.check_repartition(["llmops_eval"], None)
+    wire_memory_mod.check_repartition(["llmops_eval"], ["llmops_eval"])
+    with pytest.raises(SystemExit):
+        wire_memory_mod.check_repartition(["llmops_eval"], ["llmops_finops"])
+
+
+def test_the_semantic_channel_stays_tighter_than_the_episodic_one(wire_memory_mod):
+    """Both were 10/0.2; only the semantic one was wrong at that setting, because
+    `/episodes/{actorId}/{sessionId}` scopes episodic recall to the agent's OWN session
+    while `/users/{actorId}/facts` is the cross-RUN channel. A fix that tightened both
+    to look consistent would have cut an agent off from its own history."""
+    ctl = _wired_ctl(live_actor_id=None)
+    out = wire_memory_mod.attach_to_harness(ctl, "llmops_finops", _MEM_ARN, _SIDS,
+                                            dry=True, dp=_dp({}), memory_id="m-1")
+    rc = out["would_attach"]["agentCoreMemoryConfiguration"]["retrievalConfig"]
+    sem = rc["/users/{actorId}/facts"]
+    epi = rc["/episodes/{actorId}/{sessionId}"]
+    assert sem["relevanceScore"] > epi["relevanceScore"], (sem, epi)
+    assert sem["topK"] < epi["topK"], (sem, epi)
+    assert (epi["topK"], epi["relevanceScore"]) == (10, 0.2), epi
+
+
+# ── the 63 records the guard above arrived one deploy too late for ──────────────────
+# The measurement that produced this block was taken AFTER the guard above shipped, and
+# it corrected it. Only two harnesses' full-harness-ID partitions had been counted (13 +
+# 30 = 43) because only those two still POINTED at one. Counting all seven:
+#
+#   /users/llmops_data_prep-KuSKXUaxyP/facts      2      live actorId = bare name
+#   /users/llmops_finetune-xXl7jsACZO/facts      25      live actorId = bare name
+#   /users/llmops_eval-iuIIs96fFM/facts          16      live actorId = bare name
+#   /users/llmops_deploy-nLLNWairTc/facts        11      live actorId = bare name
+#   /users/llmops_monitor-YCXC5hcXzu/facts        9      live actorId = bare name
+#   /users/llmops_finops-eDJtU9PvKh/facts        13      live actorId = that partition
+#   /users/llmops_orchestrator-GsIqHZ4viJ/facts  30      live actorId = that partition
+#   /users/<every bare harness name>/facts        0
+#
+# 106 semantic records, of which 63 are ALREADY unreachable by the agent that wrote them.
+# llmops_monitor's newest orphan is dated 2026-08-08, so the move is days old, done by an
+# earlier run of this very script, with no failed call anywhere. The episodic channel is
+# stranded the same way (105 records under the five workers' /episodes/<full id>).
+#
+# Keeping a live actorId cannot undo that and no API moves a record between namespaces.
+# What was missing is smaller and duller: nobody ever counted the OTHER spelling, so "this
+# agent has no memory" and "this agent's memory is 25 records away from here" printed
+# identically. These tests are the check that would have said so.
+
+
+def test_every_attach_reports_the_records_the_other_spelling_still_holds(
+        wire_memory_mod):
+    """The check that would have caught the 63 — and it runs without --repartition,
+    because the harnesses that lost their records are precisely the ones nobody was
+    repartitioning: their actorId had ALREADY been rewritten."""
+    ctl = _wired_ctl(live_actor_id="llmops_finops", harness_id="llmops_finops-eDJtU9PvKh")
+    dp = _dp_ns({"/users/llmops_finops-eDJtU9PvKh/facts": 25})
+    out = wire_memory_mod.attach_to_harness(ctl, "llmops_finops", _MEM_ARN, _SIDS,
+                                            dry=False, dp=dp, memory_id="m-1")
+    assert out["actorId"] == "llmops_finops", out
+    assert out["stranded"] == {"/users/llmops_finops-eDJtU9PvKh/facts": 25}, out
+
+
+def test_the_stranded_check_reads_the_episodic_partition_too(wire_memory_mod):
+    """`/episodes/{actorId}` is the episodic strategy's reflection namespace and holds
+    real records (live: 105 under the five workers' full ids). A check that only looked
+    at `/users/.../facts` would report the smaller half of the loss."""
+    ctl = _wired_ctl(live_actor_id="llmops_finops", harness_id="llmops_finops-eDJtU9PvKh")
+    dp = _dp_ns({"/episodes/llmops_finops-eDJtU9PvKh": 11})
+    out = wire_memory_mod.attach_to_harness(ctl, "llmops_finops", _MEM_ARN, _SIDS,
+                                            dry=False, dp=dp, memory_id="m-1")
+    assert out["stranded"] == {"/episodes/llmops_finops-eDJtU9PvKh": 11}, out
+    assert "/users/llmops_finops-eDJtU9PvKh/facts" in dp.seen, dp.seen
+
+
+def test_a_partition_with_nothing_in_it_is_not_reported_as_stranded(wire_memory_mod):
+    """A warning on every attach of a fleet with nothing stranded is a warning nobody
+    reads by the third deploy."""
+    ctl = _wired_ctl(live_actor_id="llmops_finops", harness_id="llmops_finops-eDJtU9PvKh")
+    out = wire_memory_mod.attach_to_harness(ctl, "llmops_finops", _MEM_ARN, _SIDS,
+                                           dry=False, dp=_dp_ns({}), memory_id="m-1")
+    assert "stranded" not in out, out
+    assert "stranded_check" not in out, out
+
+
+def test_an_unchecked_partition_does_not_report_as_an_empty_one(wire_memory_mod):
+    """With no data plane the answer is 'not checked', never 'nothing there' — the two
+    reading the same is how 63 records left without a failed call."""
+    ctl = _wired_ctl(live_actor_id="llmops_finops", harness_id="llmops_finops-eDJtU9PvKh")
+    out = wire_memory_mod.attach_to_harness(ctl, "llmops_finops", _MEM_ARN, _SIDS,
+                                            dry=False)
+    assert "stranded" not in out, out
+    assert "SKIPPED" in out["stranded_check"], out
+
+
+def test_the_stranded_count_reads_past_the_first_page(wire_memory_mod):
+    """Same trap as the repartition price, one call further out: a partition big enough
+    to matter is exactly the one a first-page count under-reports."""
+    ctl = _wired_ctl(live_actor_id="llmops_finops", harness_id="llmops_finops-eDJtU9PvKh")
+    dp = _dp_ns({"/users/llmops_finops-eDJtU9PvKh/facts": 250})
+    out = wire_memory_mod.attach_to_harness(ctl, "llmops_finops", _MEM_ARN, _SIDS,
+                                            dry=False, dp=dp, memory_id="m-1")
+    assert out["stranded"] == {"/users/llmops_finops-eDJtU9PvKh/facts": 250}, out
+
+
+def test_both_spellings_are_checked_when_the_live_actor_id_is_neither(wire_memory_mod):
+    """A hand-set or renamed actorId leaves BOTH candidate partitions behind. Checking
+    only the full harness ID assumes the bare name is the one this script chose, which is
+    true in six of seven live harnesses and false in the case worth catching."""
+    ctl = _wired_ctl(live_actor_id="legacy-actor",
+                     harness_id="llmops_finops-eDJtU9PvKh")
+    dp = _dp_ns({"/users/llmops_finops/facts": 4,
+                 "/users/llmops_finops-eDJtU9PvKh/facts": 13})
+    out = wire_memory_mod.attach_to_harness(ctl, "llmops_finops", _MEM_ARN, _SIDS,
+                                            dry=False, dp=dp, memory_id="m-1")
+    assert out["actorId"] == "legacy-actor", out
+    assert out["stranded"] == {"/users/llmops_finops/facts": 4,
+                              "/users/llmops_finops-eDJtU9PvKh/facts": 13}, out
+
+
+# ── the 9 records neither spelling could name ───────────────────────────────────────
+# The check above compares the two spellings THIS repo can produce. Measured live
+# 2026-08-13 on llmops_shared_memory-hbEZ9K8d57, ListActors returns 16 actors and two of
+# them are neither: `monitor` holds 3 semantic records and `monitor-agent` holds 6,
+# actorIds that appear in no file in this repo (deploy/wire_memory.py's --actor-id is
+# free-form prose). So 9 semantic records were invisible to a guard whose own docstring
+# claimed to cover "an actorId that is neither" -- it covered the case where the LIVE id is
+# neither, not the case where a THIRD partition exists. A candidate list written from this
+# repo's naming conventions cannot contain a spelling this repo never had, so the sweep is
+# derived from the data plane's own enumeration instead. Live totals with the derived list:
+# 9 orphaned actors, 72 semantic + 108 episodic = 180 records, against 63 + 105 = 168 for
+# the per-harness check. The two overlap and are not additive.
+
+
+def _dp_actors(counts, actor_pages):
+    """A data plane that can also enumerate its actors, in pages."""
+    class _Dp:
+        def __init__(self):
+            self.pages = 0
+            self.seen = []
+            self.actor_calls = 0
+
+        def list_actors(self, memoryId, maxResults, nextToken=None):
+            self.actor_calls += 1
+            i = int(nextToken or 0)
+            out = {"actorSummaries": [{"actorId": a} for a in actor_pages[i]]}
+            if i + 1 < len(actor_pages):
+                out["nextToken"] = str(i + 1)
+            return out
+
+        def list_memory_records(self, memoryId, namespace, maxResults, nextToken=None):
+            self.pages += 1
+            if nextToken is None:
+                self.seen.append(namespace)
+            recs = [{"memoryRecordId": f"r{i}"} for i in range(counts.get(namespace, 0))]
+            start = int(nextToken or 0)
+            out = {"memoryRecordSummaries": recs[start:start + maxResults]}
+            if start + maxResults < len(recs):
+                out["nextToken"] = str(start + maxResults)
+            return out
+
+    return _Dp()
+
+
+def test_the_sweep_names_an_actor_spelling_this_repo_never_produced(wire_memory_mod):
+    """`monitor-agent` is not a harness name, not a harness ID, and holds 6 records."""
+    dp = _dp_actors({"/users/monitor-agent/facts": 6},
+                    [["llmops_monitor", "monitor-agent"]])
+    out = wire_memory_mod.unreachable_actors(dp, "m-1", {"llmops_monitor"})
+    assert out == {"monitor-agent": {"/users/monitor-agent/facts": 6}}, out
+
+
+def test_the_sweep_leaves_alone_a_partition_a_harness_still_points_at(wire_memory_mod):
+    """The reachable partitions are the ones this deploy exists to serve; reporting them
+    would make the warning noise, and a warning nobody reads is not a guard."""
+    dp = _dp_actors({"/users/llmops_finops-eDJtU9PvKh/facts": 13},
+                    [["llmops_finops-eDJtU9PvKh"]])
+    assert wire_memory_mod.unreachable_actors(
+        dp, "m-1", {"llmops_finops-eDJtU9PvKh"}) == {}
+
+
+def test_the_sweep_counts_the_episodic_channel_of_an_orphan_too(wire_memory_mod):
+    """Live, `finops` holds no facts and one episodic record — semantic-only would
+    report that actor as clean."""
+    dp = _dp_actors({"/episodes/finops": 1}, [["finops"]])
+    out = wire_memory_mod.unreachable_actors(dp, "m-1", set())
+    assert out == {"finops": {"/episodes/finops": 1}}, out
+
+
+def test_an_orphan_actor_holding_nothing_is_not_reported(wire_memory_mod):
+    """Live, `orchestrator` is an actor with 0 records in both channels. An actor that
+    once wrote an event and holds no records is not a lost memory."""
+    dp = _dp_actors({}, [["orchestrator"]])
+    assert wire_memory_mod.unreachable_actors(dp, "m-1", set()) == {}
+
+
+def test_the_sweep_reads_every_page_of_actors(wire_memory_mod):
+    """16 actors fit one page today; an unpaginated sweep is the same bug as an
+    unpaginated record count, one call further out."""
+    dp = _dp_actors({"/users/monitor/facts": 3},
+                    [["a1", "a2"], ["a3"], ["monitor"]])
+    out = wire_memory_mod.unreachable_actors(dp, "m-1", set())
+    assert out == {"monitor": {"/users/monitor/facts": 3}}, out
+    assert dp.actor_calls == 3, dp.actor_calls
+
+
+def test_the_sweep_counts_an_orphan_partition_past_its_first_page(wire_memory_mod):
+    dp = _dp_actors({"/users/monitor/facts": 250}, [["monitor"]])
+    out = wire_memory_mod.unreachable_actors(dp, "m-1", set())
+    assert out == {"monitor": {"/users/monitor/facts": 250}}, out
+
+
+def test_the_reachable_set_covers_harnesses_this_run_is_not_wiring(wire_memory_mod):
+    """`--harness llmops_eval` must not make the other six harnesses' own partitions
+    look orphaned: the set is read for every harness the repo defines."""
+    class _Ctl:
+        def list_harnesses(self):
+            return {"harnesses": [
+                {"harnessId": "llmops_eval-iuIIs96fFM", "name": "llmops_eval"},
+                {"harnessId": "llmops_finops-eDJtU9PvKh", "name": "llmops_finops"}]}
+
+        def get_harness(self, harnessId):
+            live = {"llmops_eval-iuIIs96fFM": "llmops_eval",
+                    "llmops_finops-eDJtU9PvKh": "llmops_finops-eDJtU9PvKh"}[harnessId]
+            return {"harness": {"memory": {"agentCoreMemoryConfiguration":
+                                           {"actorId": live}}}}
+
+    out = wire_memory_mod.reachable_actor_ids(
+        _Ctl(), ["llmops_eval", "llmops_finops"], None)
+    assert out == {"llmops_eval": "llmops_eval",
+                   "llmops_finops": "llmops_finops-eDJtU9PvKh"}, out
+
+
+def test_a_harness_that_does_not_exist_yet_contributes_its_bare_name(wire_memory_mod):
+    """resolve_harness_id exits for an uncreated harness. Letting that abort the sweep
+    would mean one missing harness suppresses the report about all the others."""
+    class _Ctl:
+        def list_harnesses(self):
+            return {"harnesses": []}
+
+    assert wire_memory_mod.reachable_actor_ids(_Ctl(), ["llmops_eval"], None) == {
+        "llmops_eval": "llmops_eval"}
+
+
+def _main_fakes(wire_memory_mod, monkeypatch, tmp_path, memories, actor_pages, counts,
+                argv_extra=(), live=None):
+    """Enough of four AWS clients to run main() end to end in --dry-run."""
+    for name in ("alpha", "beta"):
+        d = tmp_path / "agents" / name
+        d.mkdir(parents=True)
+        (d / "harness.json").write_text(json.dumps({"harnessName": f"llmops_{name}"}))
+    monkeypatch.setattr(wire_memory_mod, "REPO", tmp_path)
+
+    dp = _dp_actors(counts, actor_pages)
+
+    class _Ctl:
+        def list_memories(self):
+            return {"memories": memories}
+
+        def get_memory(self, memoryId):
+            return {"memory": {"status": "ACTIVE", "strategies": []}}
+
+        def list_harnesses(self):
+            return {"harnesses": [{"harnessId": "llmops_alpha-AAAAAAAAAA",
+                                   "name": "llmops_alpha"},
+                                  {"harnessId": "llmops_beta-BBBBBBBBBB",
+                                   "name": "llmops_beta"}]}
+
+        def get_harness(self, harnessId):
+            actor = (live or {}).get(harnessId, harnessId.rsplit("-", 1)[0])
+            return {"harness": {"memory": {"agentCoreMemoryConfiguration":
+                                           {"actorId": actor}}}}
+
+    clients = {"bedrock-agentcore-control": _Ctl(), "bedrock-agentcore": dp,
+               "iam": object(), "ssm": object()}
+    monkeypatch.setattr(wire_memory_mod.boto3, "client",
+                        lambda svc, **kw: clients[svc])
+    monkeypatch.setattr(sys, "argv",
+                        ["04_wire_memory.py", "--region", "us-east-1", "--dry-run",
+                         *argv_extra])
+    return dp
+
+
+def test_the_run_reports_the_orphans_once_for_the_whole_memory(
+        wire_memory_mod, monkeypatch, tmp_path, capsys):
+    """A function nothing calls is not a guard. This is the only test that proves the
+    sweep is on the deploy path at all."""
+    _main_fakes(wire_memory_mod, monkeypatch, tmp_path,
+                memories=[{"id": "llmops_shared_memory-abc", "arn": "arn:m",
+                           "name": "llmops_shared_memory"}],
+                actor_pages=[["llmops_alpha", "monitor-agent"]],
+                counts={"/users/monitor-agent/facts": 6})
+    wire_memory_mod.main()
+    out = json.loads(capsys.readouterr().out)
+    assert out["unreachable_actors"] == {
+        "monitor-agent": {"/users/monitor-agent/facts": 6}}, out
+    assert out["unreachable_records"] == 6, out
+
+
+def test_wiring_one_harness_does_not_report_the_others_partition_as_orphaned(
+        wire_memory_mod, monkeypatch, tmp_path, capsys):
+    """The live case for the sweep's blind spot in reverse: llmops_finops is wired under
+    its FULL harness ID, so a run of `--harness llmops_eval` that built the reachable set
+    from its own attach list would announce finops's 13 healthy records as lost."""
+    _main_fakes(wire_memory_mod, monkeypatch, tmp_path,
+                memories=[{"id": "llmops_shared_memory-abc", "arn": "arn:m",
+                           "name": "llmops_shared_memory"}],
+                actor_pages=[["llmops_alpha", "llmops_beta-BBBBBBBBBB"]],
+                counts={"/users/llmops_beta-BBBBBBBBBB/facts": 30},
+                argv_extra=["--harness", "llmops_alpha"],
+                live={"llmops_beta-BBBBBBBBBB": "llmops_beta-BBBBBBBBBB"})
+    wire_memory_mod.main()
+    out = json.loads(capsys.readouterr().out)
+    assert [a["harness"] for a in out["attached"]] == ["llmops_alpha"], out
+    assert out["unreachable_actors"] == {}, out
+
+
+def test_a_memory_that_does_not_exist_yet_reports_skipped_not_zero(
+        wire_memory_mod, monkeypatch, tmp_path, capsys):
+    """--dry-run before the memory exists cannot read any partition. Printing an empty
+    orphan set there is the same lie the whole finding is about."""
+    _main_fakes(wire_memory_mod, monkeypatch, tmp_path, memories=[],
+                actor_pages=[[]], counts={})
+    wire_memory_mod.main()
+    out = json.loads(capsys.readouterr().out)
+    assert "unreachable_actors" not in out, out
+    assert out["unreachable_check"].startswith("SKIPPED"), out
 
 
 # ── the SECOND spelling of a typed call ─────────────────────────────────────────────

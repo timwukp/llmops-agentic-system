@@ -4841,6 +4841,357 @@ case("console cost: the GSI fallback windows its scan, so the estimate list sile
      _CN, m266, [f"{_TC}test_no_reader_windows_a_scan_inside_dynamodb"])
 
 
+# ── D14: the fix that reached five of seven, and the 43 records it would burn (m267-m275) ─
+_WM = "deploy/04_wire_memory.py"
+_FO = "agents/finops/harness.json"
+_OR = "agents/orchestrator/harness.json"
+_SM = "tests/test_orchestration.py::TestStateMachine::"
+
+
+def m267(t):
+    old = "    for cfg in sorted((REPO / \"agents\").glob(\"*/harness.json\")):"
+    assert t.count(old) == 1, "the config sweep has moved"
+    # The original hand-written list restored. Nothing fails: the five workers get wired,
+    # llmops_finops and llmops_orchestrator keep whatever they were given years-of-deploys
+    # ago, and the retrieval fix reaches five of seven while printing seven kinds of success.
+    return t.replace(old, """    for cfg in [REPO / f"agents/{d}/harness.json" for d in
+                (\"data-prep\", \"finetune\", \"eval\", \"deploy\", \"monitor\")]:""", 1)
+
+
+case("wire memory: the harness list goes back to a hand-written five, so the two harnesses "
+     "wired to the same memory never receive the retrieval fix",
+     _WM, m267, [f"{_TO}test_memory_wires_every_harness_this_repo_defines_not_a_hand_written_five"])
+
+
+def m268(t):
+    old = """    if not names:
+        raise SystemExit("no agents/*/harness.json found -- refusing to wire nothing")"""
+    assert t.count(old) == 1, "the empty-list guard has moved"
+    return t.replace(old, "    pass", 1)
+
+
+case("wire memory: wiring zero harnesses prints a clean success",
+     _WM, m268, [f"{_TO}test_no_harness_configs_refuses_instead_of_wiring_nothing"])
+
+
+def m269(t):
+    old = """        if not name:
+            raise SystemExit(f"{cfg} has no harnessName -- cannot wire memory blind")"""
+    assert t.count(old) == 1, "the nameless-config guard has moved"
+    # A None appended here reaches resolve_harness_id and dies with "harness 'None' not
+    # found" -- after some harnesses were already wired, so the deploy is half applied.
+    return t.replace(old, "        pass", 1)
+
+
+case("wire memory: a config with no harnessName is wired as None, half-applying the deploy",
+     _WM, m269, [f"{_TO}test_a_harness_config_with_no_name_refuses_instead_of_wiring_blind"])
+
+
+def m270(t):
+    old = """    if not live or live == harness_name:
+        return harness_name, False"""
+    assert t.count(old) == 1, "the live-actorId branch has moved"
+    # The destructive fix: this script's preferred spelling always wins, so the redeploy
+    # that applies the retrieval fix is the same call that abandons 13 + 30 = 43 records,
+    # and UpdateHarness returns success.
+    return t.replace(old, "    return harness_name, False", 1)
+
+
+case("wire memory: a redeploy rewrites a live actorId, abandoning the memory partition it "
+     "exists to serve",
+     _WM, m270,
+     [f"{_TO}test_an_actor_id_already_live_survives_a_redeploy",
+      f"{_TO}test_moving_an_actor_id_must_be_asked_for_by_name"])
+
+
+def m271(t):
+    old = """    if harness_name in (repartition or []):
+        return harness_name, True
+    return live, False"""
+    assert t.count(old) == 1, "the repartition branch has moved"
+    # --repartition becomes fleet-wide: naming one harness moves every harness whose
+    # actorId is not already the bare name.
+    return t.replace(old, """    if repartition:
+        return harness_name, True
+    return live, False""", 1)
+
+
+case("wire memory: naming one harness in --repartition moves all of them",
+     _WM, m271, [f"{_TO}test_moving_an_actor_id_must_be_asked_for_by_name"])
+
+
+def m272(t):
+    old = """        if dp is None or memory_id is None:
+            raise SystemExit(
+                f"--repartition {harness_name} needs the data plane to say what it costs")"""
+    assert t.count(old) == 1, "the data-plane requirement has moved"
+    # An unknown count reads exactly like a count of zero, and "abandoned 0 records" is
+    # the one sentence that makes a destructive move look free.
+    return t.replace(old, "        pass", 1)
+
+
+case("wire memory: a repartition with no data plane prices itself at nothing",
+     _WM, m272,
+     [f"{_TO}test_a_repartition_with_no_data_plane_refuses_to_price_itself_at_zero"])
+
+
+def m273(t):
+    old = """        tok = r.get("nextToken")
+        if not tok:
+            return total
+        kw["nextToken"] = tok"""
+    assert t.count(old) == 1, "the pagination of the record count has moved"
+    return t.replace(old, "        return total", 1)
+
+
+case("wire memory: the abandoned-record count stops at the first page, under-reporting "
+     "exactly the partitions big enough to matter",
+     _WM, m273, [f"{_TO}test_the_abandoned_record_count_reads_past_the_first_page"])
+
+
+def m274(t):
+    old = """    unknown = sorted(set(repartition or []) - set(harnesses))
+    if unknown:
+        raise SystemExit(f"--repartition names harnesses not being wired: {unknown}")"""
+    assert t.count(old) == 1, "the repartition cross-check has moved"
+    return t.replace(old, "    pass", 1)
+
+
+case("wire memory: --repartition for a harness this run is not wiring is a no-op that "
+     "reads as done",
+     _WM, m274, [f"{_TO}test_a_repartition_for_a_harness_not_being_wired_refuses"])
+
+
+def m275(t):
+    old = '"topK": 5, "relevanceScore": 0.6}'
+    assert t.count(old) == 1, "the semantic retrieval config has moved"
+    # Both channels at 10/0.2 -- the pre-fix setting the two unlisted harnesses were still
+    # running live, restored for all seven under the appearance of consistency.
+    return t.replace(old, '"topK": 10, "relevanceScore": 0.2}', 1)
+
+
+case("wire memory: the semantic channel is loosened back to the episodic setting, which is "
+     "only safe because {sessionId} scopes episodic recall and nothing scopes facts",
+     _WM, m275,
+     [f"{_TO}test_the_semantic_channel_stays_tighter_than_the_episodic_one",
+      f"{_TO}test_the_retrieval_config_is_rewritten_even_when_the_actor_id_is_kept"])
+
+
+def m276(t):
+    old = "Retrieved memory is BACKGROUND from other months, other accounts and other"
+    assert t.count(old) == 1, "the finops precedence rule has moved"
+    # finops was the one prompt of seven with no precedence rule at all, on the agent that
+    # publishes rate cards -- the loosest retrieval and no prompt-level guard together.
+    return t.replace(old, "Retrieved memory is useful context from other", 1)
+
+
+case("finops prompt: the agent that publishes rate cards loses the rule that this "
+     "reconciliation's own measurements outrank a remembered rate",
+     _FO, m276,
+     [f"{_SM}test_every_memory_wired_prompt_subordinates_memory_to_the_plan"])
+
+
+def m277(t):
+    old = "Retrieved memory is BACKGROUND from OTHER customers, other budgets and other"
+    assert t.count(old) == 1, "the orchestrator precedence rule has moved"
+    # The largest partition of the two (30 records) belongs to the agent that quotes prices
+    # to a human and writes the cross-run report.
+    return t.replace(old, "Retrieved memory is useful context from other", 1)
+
+
+case("orchestrator prompt: the agent that quotes a price to a human loses the rule that "
+     "this consultation outranks a remembered one",
+     _OR, m277,
+     [f"{_SM}test_every_memory_wired_prompt_subordinates_memory_to_the_plan"])
+
+
+# ── D14 (cont.): the 63 records the guard above arrived one deploy too late for ──────
+# Counting all seven full-harness-ID partitions instead of the two that still pointed at
+# one: 106 semantic records, 63 of them already unreachable by the agent that wrote them
+# (the five workers, whose actorId an earlier run of this script rewrote to the bare
+# name). llmops_monitor's newest orphan is dated 2026-08-08. No call failed. What was
+# missing is that nobody ever counted the OTHER spelling, so "no memory" and "25 records
+# away from here" printed identically.
+
+
+def m278(t):
+    old = "        stranded = stranded_partitions(dp, memory_id, harness_id, harness_name, actor_id)"
+    assert t.count(old) == 1, "the stranded-partition check has moved"
+    # The warning goes quiet. Every harness reports a clean attach while its records sit in
+    # a namespace its own retrieval config can no longer name -- which is the live state of
+    # five of seven harnesses, and how it got there unnoticed.
+    return t.replace(old, "        stranded = {}", 1)
+
+
+case("wire memory: nothing counts the records held under the other spelling of actorId, so "
+     "an abandoned partition and an empty one print the same",
+     _WM, m278,
+     [f"{_TO}test_every_attach_reports_the_records_the_other_spelling_still_holds",
+      f"{_TO}test_the_stranded_check_reads_the_episodic_partition_too",
+      f"{_TO}test_the_stranded_count_reads_past_the_first_page",
+      f"{_TO}test_both_spellings_are_checked_when_the_live_actor_id_is_neither"])
+
+
+def m279(t):
+    old = '        for ns in (f"/users/{other}/facts", f"/episodes/{other}"):'
+    assert t.count(old) == 1, "the stranded namespace sweep has moved"
+    # Only the semantic channel is counted, so the report names 63 records and stays silent
+    # about the 105 episodic ones stranded beside them.
+    return t.replace(old, '        for ns in (f"/users/{other}/facts",):', 1)
+
+
+case("wire memory: the stranded report skips the episodic reflection namespace, reporting "
+     "the smaller half of the loss",
+     _WM, m279,
+     [f"{_TO}test_the_stranded_check_reads_the_episodic_partition_too"])
+
+
+def m280(t):
+    old = '        out["stranded_check"] = "SKIPPED: no data plane -- unknown is not zero"'
+    assert t.count(old) == 1, "the unchecked-partition marker has moved"
+    # A partition nobody read, reported as a partition with nothing in it. This exact
+    # equivalence is why the loss was invisible; asserting it back is the sharpest control
+    # in the block.
+    return t.replace(old, '        out["stranded"] = {}', 1)
+
+
+case("wire memory: a partition that was never read reports as an empty one",
+     _WM, m280,
+     [f"{_TO}test_an_unchecked_partition_does_not_report_as_an_empty_one",
+      f"{_TO}test_attach_sends_the_resolved_harness_id_not_the_name"])
+
+
+def m281(t):
+    old = "    for other in [s for s in (harness_name, harness_id) if s != actor_id]:"
+    assert t.count(old) == 1, "the candidate-spelling sweep has moved"
+    # Assumes the bare name is always the spelling in use, which holds for six of the seven
+    # live harnesses -- so a hand-set or renamed actorId hides its bare-name partition
+    # behind the one assumption that made this finding possible.
+    return t.replace(old, "    for other in [harness_id]:", 1)
+
+
+case("wire memory: only the full harness ID is checked for stranded records, so an actorId "
+     "that is neither spelling hides a partition",
+     _WM, m281,
+     [f"{_TO}test_both_spellings_are_checked_when_the_live_actor_id_is_neither"])
+
+
+def m282(t):
+    old = "    if dp is not None and memory_id is not None:"
+    assert t.count(old) == 1, "the stranded-check condition has moved"
+    # The check runs only when a repartition was asked for -- i.e. never for the five
+    # harnesses that had already lost their records, because nobody was repartitioning
+    # them: their actorId had been rewritten a deploy earlier.
+    return t.replace(old, "    if repartitioned:", 1)
+
+
+case("wire memory: the stranded check runs only when a repartition is requested, which is "
+     "never for the harnesses whose actorId was already rewritten",
+     _WM, m282,
+     [f"{_TO}test_a_partition_with_nothing_in_it_is_not_reported_as_stranded",
+      f"{_TO}test_every_attach_reports_the_records_the_other_spelling_still_holds"])
+
+
+def m283(t):
+    old = "            n = count_records(dp, memory_id, ns)"
+    assert t.count(old) == 1, "the stranded count call has moved"
+    # A first-page count, reached by inlining the call instead of using the paginating
+    # helper: 250 stranded records report as 100.
+    return t.replace(old, """            n = len(dp.list_memory_records(
+                memoryId=memory_id, namespace=ns, maxResults=100)
+                .get("memoryRecordSummaries", []))""", 1)
+
+
+case("wire memory: the stranded count reads one page, so the biggest abandoned partition "
+     "is the one most under-reported",
+     _WM, m283,
+     [f"{_TO}test_the_stranded_count_reads_past_the_first_page"])
+
+
+# ── D14 (cont.): the 9 records neither candidate spelling could name ─────────────────
+# The check above enumerates the two spellings this repo produces. Live 2026-08-13,
+# ListActors returns 16 actors, and `monitor` (3 semantic records) and `monitor-agent` (6)
+# are neither -- they came from deploy/wire_memory.py, whose --actor-id is free-form. A
+# candidate list written from a repo's naming conventions cannot contain a spelling the repo
+# never had, so the memory-level sweep derives its list from the data plane's own
+# enumeration: 9 orphaned actors, 72 semantic + 108 episodic records.
+
+
+def m284(t):
+    old = "        reachable = set(reachable_actor_ids(ctl, harness_names(), args.repartition).values())"
+    assert t.count(old) == 1, "the reachable-set derivation has moved"
+    # Only the harnesses THIS invocation wires count as reachable, so
+    # `--harness llmops_eval` reports the other six healthy partitions as orphaned. A sweep
+    # that cries wolf on six of seven is a sweep nobody reads -- the failure mode is the
+    # warning being ignored, not the warning being absent.
+    return t.replace(old, "        reachable = set(a['actorId'] for a in attached)", 1)
+
+
+case("wire memory: the orphan sweep treats every harness this run is not wiring as "
+     "unreachable, drowning the real finding in six false ones",
+     _WM, m284,
+     [f"{_TO}test_wiring_one_harness_does_not_report_the_others_partition_as_orphaned"])
+
+
+def m285(t):
+    old = '        sweep = {"unreachable_check": "SKIPPED: no memory yet -- unknown is not zero"}'
+    assert t.count(old) == 1, "the skipped-sweep marker has moved"
+    # A memory that does not exist yet, reported as a memory with nothing orphaned on it --
+    # the same unknown-is-zero equivalence that made 63 records vanish quietly.
+    return t.replace(old, '        sweep = {"unreachable_actors": {}, "unreachable_records": 0}', 1)
+
+
+case("wire memory: a run that could not read any partition reports zero orphans instead of "
+     "saying it did not look",
+     _WM, m285,
+     [f"{_TO}test_a_memory_that_does_not_exist_yet_reports_skipped_not_zero"])
+
+
+def m286(t):
+    old = """            counts = {ns: count_records(dp, memory_id, ns)
+                      for ns in (f"/users/{actor}/facts", f"/episodes/{actor}")}"""
+    assert t.count(old) == 1, "the orphan channel sweep has moved"
+    # Semantic only. Live, the actor `finops` holds 0 facts and 1 episodic record, so it
+    # reports as clean -- and 108 episodic records go unmentioned.
+    return t.replace(old, """            counts = {ns: count_records(dp, memory_id, ns)
+                      for ns in (f"/users/{actor}/facts",)}""", 1)
+
+
+case("wire memory: the orphan sweep counts only the semantic channel, so an actor whose "
+     "loss is entirely episodic reports as clean",
+     _WM, m286,
+     [f"{_TO}test_the_sweep_counts_the_episodic_channel_of_an_orphan_too"])
+
+
+def m287(t):
+    old = """        resp = dp.list_actors(**kw)"""
+    assert t.count(old) == 1, "the actor enumeration has moved"
+    # First page only. 16 actors fit one page today, which is exactly why an unpaginated
+    # sweep would look correct until the memory grew past it.
+    return t.replace(old, """        resp = dp.list_actors(memoryId=memory_id, maxResults=100)
+        resp.pop("nextToken", None)""", 1)
+
+
+case("wire memory: the orphan sweep reads only the first page of actors, so it is correct "
+     "only while the memory is small",
+     _WM, m287,
+     [f"{_TO}test_the_sweep_reads_every_page_of_actors"])
+
+
+def m288(t):
+    old = """    if mem_id == "MEMORY-DRYRUN":"""
+    assert t.count(old) == 1, "the sweep's dry-run gate has moved"
+    # The sweep never runs. Both halves of the finding are then reported by a function
+    # nothing calls -- the failure mode where a guard exists in the repo and not on the
+    # deploy path.
+    return t.replace(old, "    if True:", 1)
+
+
+case("wire memory: nothing on the deploy path calls the memory-level orphan sweep",
+     _WM, m288,
+     [f"{_TO}test_the_run_reports_the_orphans_once_for_the_whole_memory"])
+
+
 #: Where the pristine text of the file currently mutated is parked, so a kill -9 -- which
 #: no handler can intercept -- still leaves the original recoverable. Under the repo root
 #: rather than /tmp because it must be obvious to whoever finds the tree dirty, and
