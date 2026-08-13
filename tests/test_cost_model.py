@@ -28,8 +28,9 @@ from pipeline.contracts.cost_model import (  # noqa: E402
     MEASURED_INPUT_TOKENS_PER_SAMPLE, MEASURED_NONREASONING_OUTPUT_TOKENS,
     MEASURED_REASONING_MULTIPLIER, MEASURED_REASONING_OUTPUT_TOKENS,
     MEASURED_ROWS_PER_SEC, MEASURED_SETUP_OVERHEAD_S, PROJECT_RESOURCE_PATTERNS,
-    RATE_PRECEDENCE,
+    FALLBACK_AOSS_OCU_USD, RATE_PRECEDENCE,
     REMEDIABLE_CATEGORIES, SKU_AGENTCORE_GB, SKU_AGENTCORE_MEMORY, SKU_AGENTCORE_VCPU,
+    SKU_AOSS_OCU, SKU_EMBED_MODEL,
     RateCard, approval_decision, attribute_actuals, can_launch, check_approval,
     cross_check_tagged_total, estimate_run, is_project_resource, merge_rates,
     rate_card_health, realized_rates, reconcile, required_skus_for,
@@ -916,3 +917,87 @@ def test_pricing_refresh_without_token_rates_marks_them_missing_not_absent():
     assert sku_tokens("us.deepseek.r1-v1:0", "input") in h["missing"]
     est = estimate_run(PLAN, price_list_only)
     assert any(i["category"] == "bedrock_teacher" for i in est["line_items"])
+
+
+# ── the retrieval index (r6d RAFT runs): the one standing cost on the estimate ─────
+def test_a_raft_plan_prices_its_retrieval_index_and_a_closed_book_plan_does_not(rates):
+    """The category exists exactly when the plan carries it. On every closed-book plan
+    it must be ABSENT — a $0 retrieval line on a plan with no index would read as
+    'priced and free', which is the confusion the unpriced-vs-zero rule exists for."""
+    closed = estimate_run(PLAN, rates)
+    assert not [i for i in closed["line_items"] if i["category"] == "retrieval_index"]
+    assert "retrieval_index" not in closed["subtotals"]
+
+    raft = estimate_run(dict(PLAN, kb_ocu_hours=240.0, kb_embed_ingest_tokens=500_000),
+                        rates)
+    lines = [i for i in raft["line_items"] if i["category"] == "retrieval_index"]
+    assert {i["sku"] for i in lines} == {SKU_AOSS_OCU,
+                                         sku_tokens(SKU_EMBED_MODEL, "input")}
+    ocu = next(i for i in lines if i["sku"] == SKU_AOSS_OCU)
+    assert ocu["cost_usd"] == pytest.approx(240.0 * FALLBACK_AOSS_OCU_USD)
+    # 5 days at the 2-OCU floor is $57.60 — the number the run protocol budgets.
+    assert ocu["cost_usd"] == pytest.approx(57.60)
+
+
+def test_the_retrieval_lines_are_not_remediable(rates):
+    """A remediation iteration re-trains and re-judges; it does not re-provision the
+    index. Multiplying the OCU line into worst_case would overstate exactly the way
+    ignoring max_iterations understates."""
+    raft_plan = dict(PLAN, kb_ocu_hours=240.0, kb_embed_ingest_tokens=500_000)
+    est = estimate_run(raft_plan, rates)
+    lines = [i for i in est["line_items"] if i["category"] == "retrieval_index"]
+    assert lines and all(i["remediable"] is False for i in lines)
+    base = estimate_run(PLAN, rates)
+    # worst_case grows by exactly the retrieval subtotal, once — never times iterations.
+    assert est["worst_case_usd"] - base["worst_case_usd"] == pytest.approx(
+        est["subtotals"]["retrieval_index"], abs=0.01)
+
+
+def test_the_fallback_ocu_rate_says_it_is_a_guess_and_loses_to_the_card(rates):
+    """fallback_static must (a) mark the estimate's confidence down to 'guessed' and
+    (b) yield the moment pricing_refresh lands a realized rate — a static guess wearing
+    a measured rate's confidence is how a wrong number inherits credibility."""
+    raft_plan = dict(PLAN, kb_ocu_hours=100.0)
+    est = estimate_run(raft_plan, rates)
+    ocu = next(i for i in est["line_items"] if i["sku"] == SKU_AOSS_OCU)
+    assert ocu["rate_source"] == "fallback_static"
+    assert est["confidence"] == "guessed", (
+        "a guessed OCU rate left the whole estimate claiming better than 'guessed'")
+
+    realized = RateCard(dict(FULL_RATES, **{SKU_AOSS_OCU: {
+        "unit_price": 0.30, "source": "ce_realized", "as_of": NOW}}))
+    est2 = estimate_run(raft_plan, realized)
+    ocu2 = next(i for i in est2["line_items"] if i["sku"] == SKU_AOSS_OCU)
+    assert ocu2["rate_source"] == "ce_realized"
+    assert ocu2["cost_usd"] == pytest.approx(30.0)
+
+
+def test_the_ocu_assumption_names_the_teardown_command(rates):
+    """The estimate covers the hours the plan admits to; only the teardown stops the
+    meter. An assumption that says the first half without the second prices a cost
+    while hiding its off switch."""
+    est = estimate_run(dict(PLAN, kb_ocu_hours=240.0), rates)
+    line = next(a for a in est["assumptions"] if "OCU" in a)
+    assert "EXISTS" in line and "09_retrieval.py --teardown" in line, line
+    # And no such assumption on a closed-book plan.
+    assert not [a for a in estimate_run(PLAN, rates)["assumptions"] if "OCU" in a]
+
+
+def test_the_fallback_ocu_rate_agrees_with_the_deploy_scripts_constant():
+    """Two files quote one collection's hourly rate. The deploy log saying $0.24 while
+    the approval estimate prices $0.30 is the two-numbers-two-claims bug: both look
+    authoritative, neither is checked against the other — except here."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "llmops_09_retrieval_cost", REPO / "deploy/09_retrieval.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    assert FALLBACK_AOSS_OCU_USD == mod.OCU_HOURLY_USD
+
+
+def test_required_skus_include_the_index_only_when_the_plan_carries_one():
+    assert SKU_AOSS_OCU not in required_skus_for(PLAN)
+    req = required_skus_for(dict(PLAN, kb_ocu_hours=240.0,
+                                 kb_embed_ingest_tokens=500_000))
+    assert SKU_AOSS_OCU in req
+    assert sku_tokens(SKU_EMBED_MODEL, "input") in req

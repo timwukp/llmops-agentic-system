@@ -5271,6 +5271,85 @@ case("retrieval deploy: the ingest count reconciliation is skipped, so a partial
      [f"{_TO}test_ingest_reconciles_the_document_count_instead_of_reporting_complete"])
 
 
+# ── cost model: the retrieval index on the estimate a human approves ─────────────────
+_CM = "pipeline/contracts/cost_model.py"
+
+
+def m294(t):
+    old = "    kb_ocu_hours = float(plan.get(\"kb_ocu_hours\", 0) or 0)\n    if kb_ocu_hours:"
+    assert t.count(old) == 1, "the retrieval-index pricing block has moved"
+    # The standing cost silently absent from every estimate: the plan carries the hours,
+    # the approver sees a total without them, the collection bills anyway.
+    return t.replace(old, "    kb_ocu_hours = float(plan.get(\"kb_ocu_hours\", 0) or 0)\n"
+                          "    if False:", 1)
+
+
+case("cost model: a RAFT plan's OCU-hours vanish from the estimate the human approves",
+     _CM, m294,
+     ["tests/test_cost_model.py::test_a_raft_plan_prices_its_retrieval_index_and_a_closed_book_plan_does_not"])
+
+
+def m295(t):
+    # Flip BOTH remediable arms of the OCU/embed block (the fallback dicts and the
+    # card-priced _line calls): a control that flips only one arm lets the other keep
+    # the test green. The block is delimited by its own comment and the support block.
+    lo = t.find("    # 7b. Retrieval index")
+    hi = t.find("    # 8. Everything else")
+    assert 0 < lo < hi, "the retrieval-index block has moved"
+    block = t[lo:hi]
+    flipped = block.replace("\"remediable\": False}", "\"remediable\": True}") \
+                   .replace("remediable=False))", "remediable=True))")
+    assert flipped != block, "no remediable=False arm found in the block"
+    return t[:lo] + flipped + t[hi:]
+
+
+case("cost model: the OCU line becomes remediable, so worst_case multiplies the index by "
+     "max_iterations",
+     _CM, m295,
+     ["tests/test_cost_model.py::test_the_retrieval_lines_are_not_remediable"])
+
+
+def m296(t):
+    old = "FALLBACK_AOSS_OCU_USD = 0.24"
+    assert t.count(old) == 1, "the fallback OCU constant has moved"
+    # The deploy log and the approval estimate now quote different hourly rates for one
+    # collection -- two numbers, two claims, no reconciliation.
+    return t.replace(old, "FALLBACK_AOSS_OCU_USD = 0.30", 1)
+
+
+case("cost model: the fallback OCU rate drifts from the deploy script's constant",
+     _CM, m296,
+     ["tests/test_cost_model.py::test_the_fallback_ocu_rate_agrees_with_the_deploy_scripts_constant"])
+
+
+def m297(t):
+    old = "the meter stops only at `deploy/09_retrieval.py --teardown`"
+    assert t.count(old) == 1, "the teardown assumption has moved"
+    # The cost named, its off switch hidden.
+    return t.replace(old, "the meter stops when the collection is deleted by hand", 1)
+
+
+case("cost model: the OCU assumption prices the cost but hides the teardown command",
+     _CM, m297,
+     ["tests/test_cost_model.py::test_the_ocu_assumption_names_the_teardown_command"])
+
+
+def m298(t):
+    old = ("    FLOAT_KEYS = (\"endpoint_hours\", \"train_rows\", \"minutes_per_stage\",\n"
+           "                  \"kb_ocu_hours\", \"kb_embed_ingest_tokens\")")
+    assert t.count(old) == 1, "the console FLOAT_KEYS allowlist has moved"
+    # The form silently drops the standing-cost key -- the operator typed it, the
+    # estimate never priced it, and "only keys the estimator reads are forwarded" is
+    # exactly the design that makes this failure invisible.
+    return t.replace(old, "    FLOAT_KEYS = (\"endpoint_hours\", \"train_rows\", "
+                          "\"minutes_per_stage\")", 1)
+
+
+case("console: kb_ocu_hours is dropped from the estimate form's allowlist",
+     "deploy/console/lambda_function.py", m298,
+     ["tests/test_console_cost.py::test_the_retrieval_index_keys_are_forwarded_and_priced"])
+
+
 #: Where the pristine text of the file currently mutated is parked, so a kill -9 -- which
 #: no handler can intercept -- still leaves the original recoverable. Under the repo root
 #: rather than /tmp because it must be obvious to whoever finds the tree dirty, and
