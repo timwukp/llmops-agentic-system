@@ -10,7 +10,9 @@ Run: .venv/bin/python -m pytest tests/test_training_deliverability.py -q
 from __future__ import annotations
 
 import importlib.util
+import json
 import pathlib
+import re
 import sys
 
 import pytest
@@ -26,10 +28,34 @@ def _load(name: str, rel: str):
     return mod
 
 
-validator = _load("validate_job_config", "pipeline/training/validate_job_config.py")
+def _mirrored_sourcedir() -> pathlib.Path:
+    """The directory deploy/03_storage.py ensure_code() actually uploads.
+
+    DERIVED, not written down, because writing it down is the bug this whole file was
+    green through. Every test below guarded `pipeline/training/train_qlora.py` while the
+    trainer that ran was a second copy under distill/ -- mirrored to s3://<bucket>/code/
+    distill/, named by the finetune prompt, granted to the harness role -- which carried
+    `save_strategy="no"` and none of the three deliverability rules. A hardcoded path let
+    the guards stay green about a file no run could reach: it was mirrored nowhere and
+    named by no prompt. Reading the path out of the function that does the uploading means
+    a trainer nothing deploys cannot be green, and a future move of the sourcedir breaks
+    this line loudly instead of quietly pointing the tests at an abandoned copy.
+    """
+    src = (REPO / "deploy/03_storage.py").read_text()
+    body = src.split("def ensure_code(")[1].split("\ndef ")[0]
+    parts = re.findall(r'"([a-z_0-9]+)"', body.split("src_dir =")[1].split("\n")[0])
+    assert parts, "ensure_code no longer builds its source dir from literal path parts"
+    d = REPO.joinpath(*parts)
+    assert d.is_dir(), f"ensure_code mirrors {d}, which does not exist"
+    return d
+
+
+MIRRORED = _mirrored_sourcedir()
+validator = _load("validate_job_config", str((MIRRORED / "validate_job_config.py")
+                                             .relative_to(REPO)))
 # train_qlora imports torch/trl at module scope, so pull the two pure helpers out of
 # the source text instead of importing the module (these tests must run without a GPU).
-trainer_src = (REPO / "pipeline/training/train_qlora.py").read_text()
+trainer_src = (MIRRORED / "train_qlora.py").read_text()
 
 
 def _extract(func_name: str):
@@ -153,6 +179,66 @@ def test_newest_checkpoint_returns_none_when_nothing_to_resume(tmp_path):
     assert newest_checkpoint(str(tmp_path / "never-created")) is None
     (tmp_path / "not-a-checkpoint").mkdir()
     assert newest_checkpoint(str(tmp_path)) is None
+
+
+# ------------------------------------------------------- the mirrored trainer's own rules
+#
+# The tests above prove the helpers work. They do NOT prove the trainer that gets deployed
+# still USES them -- and that is exactly the gap the second trainer walked through: it had
+# a truthy `truthy`, a working argparse and `save_strategy="no"`, so a suite full of helper
+# tests stayed green on a trainer that could not deliver. These three read the mechanism at
+# the mirrored path, one per numbered rule in its own docstring, so reverting a rule is a
+# red test rather than a discovery in a post-mortem.
+
+def test_rule_1_the_mirrored_trainer_checkpoints_periodically_to_the_synced_dir():
+    assert 'save_strategy="steps"' in trainer_src, (
+        "the deployed trainer no longer saves on a step schedule -- its only save point is "
+        "then the end of training, which is what produced zero artifacts on run e1g6")
+    assert "save_steps=args.save_steps" in trainer_src, "save_steps is declared but not wired"
+    # SageMaker syncs THIS dir to CheckpointConfig.S3Uri; anywhere else dies with the container.
+    assert '"--checkpoint_dir", type=str, default="/opt/ml/checkpoints"' in trainer_src
+    assert "output_dir=args.checkpoint_dir" in trainer_src, (
+        "checkpoints must be written where SageMaker syncs from, not into a scratch dir")
+
+
+def test_rule_2_the_mirrored_trainer_stops_gracefully_on_a_wall_clock_budget():
+    assert "TimeBudgetCallback" in trainer_src and "if args.max_train_seconds:" in trainer_src, (
+        "without the budget callback the job is killed mid-step at MaxRuntime and never "
+        "reaches save/merge/upload -- an adapter trained on 60% of the data is a deliverable")
+    assert "control.should_training_stop = True" in trainer_src, (
+        "the budget callback must ask the Trainer to stop, not raise: raising skips the "
+        "save path, which is the failure it exists to prevent")
+
+
+def test_rule_3_the_mirrored_trainer_resumes_from_the_newest_checkpoint():
+    assert "resume = newest_checkpoint(args.checkpoint_dir)" in trainer_src
+    assert "trainer.train(resume_from_checkpoint=resume)" in trainer_src, (
+        "a checkpoint nothing resumes from is storage, not deliverability")
+
+
+def test_the_preflight_ships_in_the_same_directory_the_trainer_is_mirrored_from():
+    """The gate above is only reachable if the deploy carries it to where the agent looks.
+
+    Measured before this was true: validate_job_config.py lived in pipeline/training/, which
+    ensure_code() does not read, so it was mirrored nowhere, named by no prompt, and had ZERO
+    callers -- while 4 of 4 real training jobs launched with save_steps unset, max_train_seconds
+    unset and no CheckpointConfig at all, i.e. both of its hard FAILs, on every single one.
+    """
+    assert (MIRRORED / "validate_job_config.py").is_file()
+    assert (MIRRORED / "requirements.txt").is_file(), (
+        "the trainer's pinned floors must travel with it: liger-kernel and trl versions are "
+        "why the fused-kernel path works, and a stale requirements.txt is a silent downgrade")
+    text = json.loads((REPO / "agents/finetune/harness.json").read_text()
+                      )["systemPrompt"][0]["text"]
+    # BOTH halves, because either one alone is still zero callers: a prompt that says "run the
+    # preflight" without naming the object to download tells the agent to run a file it does
+    # not have, and a download nothing runs is a wasted GetObject.
+    assert "code/distill/validate_job_config.py" in text, (
+        "the launch prompt must name the preflight's exact S3 key -- listing is not granted "
+        "to the harness role, so a key it cannot name is a key it cannot fetch")
+    assert re.search(r"python[3]? validate_job_config\.py", text), (
+        "a preflight the launch prompt never tells the agent to RUN is a preflight with no "
+        "callers, which is exactly what it had for the entire life of the previous trainer")
 
 
 if __name__ == "__main__":

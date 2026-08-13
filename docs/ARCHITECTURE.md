@@ -1202,6 +1202,30 @@ because the double was too kind: `FakeKms.verify` returns `{"SignatureValid": fa
 KMS *raises* `KMSInvalidSignatureException`, so `verify_record`'s `except` branch — the branch
 production takes on every tampered record — had never been executed by any test.
 
+**A file nothing deploys is not a component, and a guard that names its path cannot notice.**
+`pipeline/training/train_qlora.py` carried three deliverability rules, a liger-kernel preflight
+and a model-mirror integrity check; 15 unit tests asserted them; a verification doc recorded five
+real `ml.g5.2xlarge` jobs behind them, including a checkpoint reaching S3 mid-run and a wall-clock
+budget trip that ended `Completed`. It was mirrored **nowhere**. `deploy/03_storage.py
+ensure_code()` uploads `pipeline/training/distill/`, and the copy that lived there — authored by
+the FINETUNE agent on one run and promoted to "canonical" because it trained an 8B student in
+929s — carried `save_strategy="no"`, the exact line the other file's docstring names as the cause
+of run `e1g6`'s 43 GPU-minutes for zero artifacts. Every run downloaded the copy with none of the
+rules, and every guard read the copy no run could reach, so the suite was green about a file that
+was not a component. Measured on the four real training jobs the system has launched: `save_steps`,
+`max_train_seconds` and `CheckpointConfig.S3Uri` were **unset on 4 of 4** — both hard FAILs of
+`validate_job_config.py`, which sat in the un-mirrored directory with **zero callers** and was
+named by no prompt. There is one trainer now, at the path `ensure_code()` mirrors, and the preflight
+ships beside it so the deploy carries it; the launch prompt names its S3 key, tells the agent to run
+it, and forbids launching a FAILing payload. The guards no longer write the path down — the
+deliverability tests, the architecture diagram's trainer link, and the prompt↔`argparse` contract
+check all derive it from `ensure_code()`'s own literal path parts, so pointing the mirror at an
+abandoned copy reds the suite instead of quietly retargeting it. The remaining exposure was never
+theoretical: `run-20260812T035446Z-dedaa965-i0` died 386 seconds in on the *same*
+`UnboundLocalError: trainer` that killed r6a — the second time an improvised trainer has cost a run
+— and every job so far survived only because it finished inside a 7200s `MaxRuntime` it had no
+save point behind.
+
 **The facts a run discovers travel like the consent it was signed with.** `MODEL_PARAM_FOR_ROLE`
 carries what a human *signed* into the stages that must obey it; `STAGE_FACT_PARAMS` carries what
 the run itself *produced* into the stages that must measure it. `params.student_endpoint` — read

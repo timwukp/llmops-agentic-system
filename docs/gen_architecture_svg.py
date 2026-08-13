@@ -236,7 +236,10 @@ for i, y in enumerate(h_y):
 
 # Column 4 (x=850): AWS services
 svg.append(card(850, 92, CW, CH, "cAws", "🧠", "Bedrock", "DeepSeek-R1 teacher · Fable 5", "docs/ARCHITECTURE.md"))
-svg.append(card(850, 240, CW, CH, "cAws", "🎓", "SageMaker Training", "Qwen3-1.7B QLoRA job", "pipeline/training/train_qlora.py"))
+# The trainer link must name the file deploy/03_storage.py ensure_code() mirrors -- for
+# months it named a second copy that no run could reach, so the diagram documented a
+# trainer nothing deployed. tests/test_svg_geometry.py derives the path from ensure_code.
+svg.append(card(850, 240, CW, CH, "cAws", "🎓", "SageMaker Training", "Qwen3-1.7B QLoRA job", "pipeline/training/distill/train_qlora.py"))
 svg.append(card(850, 388, CW, CH, "cAws", "🌐", "SageMaker Endpoint", "student inference · g5.xlarge", "docs/ARCHITECTURE.md"))
 
 # harnesses -> AWS (data-prep->bedrock, finetune->training, deploy->endpoint; own corridors)

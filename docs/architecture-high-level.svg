@@ -175,7 +175,7 @@
     </g>
   </a>
 
-  <a href="https://github.com/timwukp/llmops-agentic-system/blob/main/pipeline/training/train_qlora.py" target="_top">
+  <a href="https://github.com/timwukp/llmops-agentic-system/blob/main/pipeline/training/distill/train_qlora.py" target="_top">
     <g>
       <rect class="card cAws" x="850" y="240" width="180" height="56" rx="12"/>
       <text class="title" x="940.0" y="264" text-anchor="middle">🎓 SageMaker Training</text>

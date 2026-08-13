@@ -1013,6 +1013,26 @@ invoke 了 start-pipeline。沒有任何東西依賴這個繞道 —— driver �
 `verify_record` 的 `except` 分支 —— production 在每一份被篡改的紀錄上都會走的那個分支 —— 從來沒有
 被任何測試執行過。
 
+**沒有任何部署路徑會送出去的檔案不算一個元件，而把路徑寫死的 guard 沒有能力發現這件事。**
+`pipeline/training/train_qlora.py` 帶著三條交付性規則、liger-kernel 前置檢查、以及 model mirror 的
+完整性驗證；15 個單元測試在斷言它們；一份驗證文件記錄了五個真實 `ml.g5.2xlarge` job 作為證據，包含
+一次 run 中途成功同步到 S3 的 checkpoint，以及一次以 `Completed` 收場的 wall-clock 預算觸發。而它被
+mirror 到**任何地方都沒有**。`deploy/03_storage.py ensure_code()` 上傳的是
+`pipeline/training/distill/`，而住在那裡的那份副本 —— 由 FINETUNE agent 在某一次 run 自己寫出來、
+因為「929 秒訓完 8B 學生」而被升格為 canonical —— 帶的是 `save_strategy="no"`，正是另一份檔案
+docstring 裡指名為 `e1g6` 那次「43 GPU 分鐘、零產出」肇因的那一行。每一次 run 下載的都是沒有規則的
+那份，每一道 guard 讀的都是沒有任何 run 到得了的那份，所以整個套件是對一個「不算元件的檔案」保持綠燈。
+在系統至今真正發出去的四個訓練 job 上量測：`save_steps`、`max_train_seconds`、
+`CheckpointConfig.S3Uri` **4 個裡有 4 個都沒設** —— 正好是 `validate_job_config.py` 的兩條硬性 FAIL，
+而它本身待在那個沒有被 mirror 的目錄裡、**呼叫者為零**、沒有任何 prompt 提到它。現在只有一個 trainer，
+就在 `ensure_code()` 會 mirror 的那個路徑上，前置檢查也跟著放在它旁邊，讓部署自動把它帶上去；launch
+prompt 指名它的 S3 key、要求 agent 執行它、並禁止在 FAIL 的 payload 上發 job。這些 guard 也不再把路徑
+寫下來 —— 交付性測試、架構圖上 trainer 的連結、以及 prompt↔`argparse` 契約檢查，全部從 `ensure_code()`
+自己的字面路徑片段推導出來，所以把 mirror 指回被棄用的副本會讓套件變紅，而不是靜靜地換了目標。剩下的
+暴露從來不是理論上的：`run-20260812T035446Z-dedaa965-i0` 在第 386 秒死在和 r6a **同一個**
+`UnboundLocalError: trainer` 上 —— 這是即興寫出來的 trainer 第二次讓一次 run 報廢 —— 而目前所有 job
+能活下來，只是因為它們都在一個「背後沒有任何存檔點」的 7200 秒 `MaxRuntime` 之內跑完了。
+
 **一個 run 自己發現的事實，和它被簽署時的同意一樣會被傳遞下去。** `MODEL_PARAM_FOR_ROLE` 把人
 **簽署**的內容帶給必須服從它的 stage；`STAGE_FACT_PARAMS` 把 run 自己**產出**的內容帶給必須量測
 它的 stage。`params.student_endpoint` —— eval 與 monitor 都會讀 —— 就是命名這個模式的那個案例：
