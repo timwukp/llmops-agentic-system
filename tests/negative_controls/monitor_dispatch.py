@@ -5350,6 +5350,51 @@ case("console: kb_ocu_hours is dropped from the estimate form's allowlist",
      ["tests/test_console_cost.py::test_the_retrieval_index_keys_are_forwarded_and_priced"])
 
 
+# ── the canonical RAFT context format (r6d) ──────────────────────────────────────────
+_RF = "pipeline/eval/raft_context_format.md"
+
+
+def m299(t):
+    old = "Oracle fraction 0.8"
+    assert t.count(old) == 1, "the oracle-fraction constant has moved"
+    # A policy constant drifting silently: data-prep builds rows at 0.5 while the
+    # evidence doc and the eval side still believe 0.8 -- the two sides agree on the
+    # template and disagree on the corpus it produces.
+    return t.replace(old, "Oracle fraction 0.5", 1)
+
+
+case("raft format: the oracle fraction drifts silently",
+     _RF, m299,
+     [f"{_TO}test_the_canonical_raft_format_is_internally_consistent"])
+
+
+def m300(t):
+    old = "[doc 1] {passage}"
+    assert t.count(old) == 1, "the template's doc prefix has moved"
+    # The exact RAFT-paper failure this file exists to prevent, introduced INSIDE the
+    # file: a delimiter change after training rows were built means inference prompts
+    # no longer look like training rows.
+    return t.replace(old, "[document 1] {passage}", 1)
+
+
+case("raft format: the template's doc delimiter changes shape",
+     _RF, m300,
+     [f"{_TO}test_the_canonical_raft_format_is_internally_consistent"])
+
+
+def m301(t):
+    # One appended sentence: reasonable-looking, silently moves the digest. r6c's scores
+    # are the baseline r6d is judged against; an unstated instrument edit makes them two
+    # incomparable populations while every other test stays green.
+    assert "## Change protocol" in t
+    return t + "\nJudge quickly.\n"
+
+
+case("judge instrument: an unstated edit moves the digest r6c/r6d comparability rests on",
+     "pipeline/eval/judge_prompt_pairwise.md", m301,
+     [f"{_TO}test_the_judge_instrument_bytes_are_untouched_by_the_raft_work"])
+
+
 #: Where the pristine text of the file currently mutated is parked, so a kill -9 -- which
 #: no handler can intercept -- still leaves the original recoverable. Under the repo root
 #: rather than /tmp because it must be obvious to whoever finds the tree dirty, and

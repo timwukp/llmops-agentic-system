@@ -11091,9 +11091,14 @@ def _eval_instrument_mirror():
     got = storage.ensure_eval_instrument(None, "<bucket>", dry=True)
     files = sorted(p.name for p in (REPO / "pipeline/eval").glob("*") if p.is_file())
     assert files, "pipeline/eval/ is empty, so there is no instrument to pin"
-    assert len(files) == 1, (
-        f"pipeline/eval/ holds {files}; this guard pins ONE canonical instrument and the "
-        "eval prompt names it by name -- decide which is canonical or teach both sides")
+    # The exact SET of canonical instruments, not a count: each file here is named by at
+    # least one prompt and mirrored by the same upload, so an unexpected arrival is a
+    # canonical-looking artifact nobody reads (a component with no consumer), and a
+    # disappearance strands the prompt that names it. The RAFT format joined 2026-08-13
+    # (r6d): the same mirror carries it because data-prep and eval must read ONE key.
+    assert files == ["judge_prompt_pairwise.md", "raft_context_format.md"], (
+        f"pipeline/eval/ holds {files}; this guard pins the canonical instrument set and "
+        "the prompts name each member by name -- teach the prompts and this list together")
 
     # The DRY report is not evidence about the upload. Both branches had their own
     # f-string at first and a mutation proved they could disagree with every guard green:
@@ -11284,6 +11289,70 @@ def test_the_canonical_judge_instrument_is_internally_consistent():
     assert "would NOT have fired" in doc, (
         "the calibration point is that the rule was silent here; if the numbers ever say "
         "otherwise, the prose has to change with them")
+
+
+# ── the canonical RAFT context format (r6d) ──────────────────────────────────────────
+# One file, two consumers: data-prep assembles training rows with it, eval assembles
+# open-book inference prompts with it, both record its sha256. The RAFT paper's own
+# ablation is what it prevents: train-format != inference-format scores WORSE than no
+# retrieval at all (DSF+RAG 4.41 vs DSF 6.38 on HotpotQA).
+
+RAFT_FORMAT = "pipeline/eval/raft_context_format.md"
+
+
+def test_the_canonical_raft_format_is_internally_consistent():
+    doc = (REPO / RAFT_FORMAT).read_text()
+    # Exactly two substitutions: anything else varying between the training and the
+    # inference side is the drift the file exists to stop.
+    assert re.search(r"there are exactly two", doc)
+    placeholders = set(re.findall(r"\{(\w+)\}", doc))
+    assert placeholders == {"passage", "ticket"}, (
+        f"the format's substitution set is {sorted(placeholders)}; the template and the "
+        "rule above it must agree on exactly which two vary")
+    # The template's landmarks, each load-bearing for one consumer behaviour: the
+    # delimiters (empty retrieval renders an empty block, same shape as training), the
+    # numbered doc prefix (shuffled order carries no signal only if numbering is
+    # per-assembly), and the bare-ticket line.
+    assert "<retrieved_context>" in doc and "</retrieved_context>" in doc
+    assert "[doc 1] {passage}" in doc
+    assert "Ticket: {ticket}" in doc
+    # The policy constants both sides must agree on, pinned as numbers not prose.
+    assert "Oracle fraction 0.8" in doc
+    assert "20% carry\n   distractors only" in doc.replace("**", ""), (
+        "the distractor-only fraction is the half of RAFT that teaches 'say what the "
+        "context supports'; if the wording moved, move this anchor with it")
+    assert "params.retrieval_distractors" in doc
+    assert "shuffled per row" in doc
+    # The two digest sites and the blind judge, named from this side too.
+    assert "raft_format_sha256" in doc
+    assert "stats.json" in doc and "report.json" in doc
+    assert "bare\n   ticket" in doc.replace("**", "") or "bare ticket" in doc
+
+
+def test_the_raft_format_is_mirrored_by_the_same_upload_as_the_judge_prompt():
+    """Read out of ensure_eval_instrument's own dry-run: the format file must ride the
+    exact upload the prompts already name (code/eval/), or it is a canonical artifact
+    with no deploy path — a component that does not exist."""
+    storage = _load("llmops_03_storage_raft", "deploy/03_storage.py")
+    got = storage.ensure_eval_instrument(None, "<bucket>", dry=True)
+    n_files = len(list((REPO / "pipeline/eval").glob("*")))
+    assert f"upload {n_files} eval instrument files" in got["would"]
+    assert got["to"].endswith("code/eval/"), got["to"]
+    # And the file is actually in the directory that glob reads.
+    assert (REPO / RAFT_FORMAT).is_file()
+
+
+def test_the_judge_instrument_bytes_are_untouched_by_the_raft_work():
+    """The bar (0.45) predates retrieval and must go on measuring the same thing:
+    r6c's scores are the baseline r6d is judged against, and comparability is digest
+    equality. This pins the judge prompt's digest as of the r6c offline judging —
+    if a deliberate instrument change ever moves it, update this pin IN THE SAME PR
+    as the two-digest statement the change protocol demands."""
+    body = (REPO / "pipeline/eval/judge_prompt_pairwise.md").read_bytes()
+    assert hashlib.sha256(body).hexdigest() == (
+        "9659d4a5ebe6454f7c52024228bdde9fb331e1807f3f3183e9019034a2ef228b"), (
+        "judge_prompt_pairwise.md changed: r6c and r6d are now two incomparable "
+        "populations unless the evidence doc states both digests")
 
 
 # ── the non-run heartbeat and its resurrection (#37) ─────────────────────────────────
