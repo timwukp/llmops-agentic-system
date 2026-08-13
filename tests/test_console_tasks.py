@@ -169,7 +169,14 @@ class FakeS3:
     def head_object(self, Bucket, Key):
         if f"{Bucket}/{Key}" not in self.objects:
             raise KeyError("404")
-        return {}
+        b = self.objects[f"{Bucket}/{Key}"]
+        b = b if isinstance(b, bytes) else str(b).encode()
+        return {"ContentLength": len(b)}
+
+    def list_objects_v2(self, Bucket, Prefix="", MaxKeys=1000, **kw):
+        keys = sorted(k for k in self.objects if k.startswith(f"{Bucket}/{Prefix}"))
+        return {"KeyCount": min(len(keys), MaxKeys),
+                "Contents": [{"Key": k.split("/", 1)[1]} for k in keys[:MaxKeys]]}
 
     def generate_presigned_url(self, ClientMethod, Params=None, ExpiresIn=None):
         """Records the call and returns a URL shaped like the real one.
@@ -5668,3 +5675,411 @@ def test_the_lists_say_on_screen_what_they_could_not_read(console):
         "the heading still counts rows instead of naming which end of the run they are")
     assert "d.truncated || (d.total||0) > items.length" in body, \
         "the task list never says it is showing a subset"
+
+
+# ── task intake: catalog, guided form, console-side verification ─────────────
+# The intake layer is advisory by contract: nothing in it may block a task. These
+# tests pin the three properties that make it safe to trust — typed refusal at
+# create, fail-open verification at turn time, and a registry that is derived from
+# its real consumers rather than hand-copied from them.
+
+class FakeBedrockAgent:
+    def __init__(self, kb_status="ACTIVE", exists=True):
+        self.calls = []
+        self.kb_status, self.exists = kb_status, exists
+
+    def get_knowledge_base(self, knowledgeBaseId):
+        self.calls.append(("get_kb", knowledgeBaseId))
+        if not self.exists:
+            raise KeyError("ResourceNotFoundException (404)")
+        return {"knowledgeBase": {"status": self.kb_status, "name": "kb"}}
+
+    def list_data_sources(self, knowledgeBaseId):
+        return {"dataSourceSummaries": [{"dataSourceId": "ds-1"}]}
+
+    def list_ingestion_jobs(self, **kw):
+        return {"ingestionJobSummaries": [
+            {"status": "COMPLETE",
+             "statistics": {"numberOfDocumentsScanned": 300}}]}
+
+
+class FakeSsm:
+    def __init__(self, kb_id="AB12CD34EF"):
+        self.kb_id = kb_id
+
+    def get_parameter(self, Name):
+        return {"Parameter": {"Value": self.kb_id}}
+
+
+@pytest.fixture
+def intake(wired, monkeypatch):
+    monkeypatch.setattr(wired.console, "bragent", FakeBedrockAgent())
+    monkeypatch.setattr(wired.console, "ssm", FakeSsm())
+    wired.bragent = wired.console.bragent
+    return wired
+
+
+def _private_fields(**over):
+    """A complete, valid finetune-private submission; tests override what they probe."""
+    f = {"source_uri": "s3://test-bucket/customer-data/t/train.jsonl",
+         "customer_eval_uri": "s3://test-bucket/customer-data/t/eval.jsonl",
+         "verification_method": "exact string match against resolved tickets",
+         "datasheet.provenance": "internal helpdesk logs",
+         "datasheet.license": "internal data",
+         "datasheet.pii_disposition": "not scrubbed; redact before teacher",
+         "datasheet.consent": "consented 2026-08-11",
+         "decontamination": "dedup against eval set"}
+    f.update(over)
+    return f
+
+
+# creation: the guided form path
+
+def test_create_task_with_valid_fields_builds_canonical_goal_and_intake(intake):
+    r = intake.console.create_task(
+        {"task_type": "finetune-private", "fields": _private_fields(),
+         "goal": "prefer cheap"}, DS_USER)
+    assert r.get("ok"), r
+    item = r["task"]
+    assert item["task_type"] == "finetune-private"
+    assert item["intake"]["fields"]["source_uri"].startswith("s3://")
+    goal = item["messages"][0]["text"]
+    # canonical names in the goal the model reads — the whole point of the form
+    assert "- source_uri: s3://test-bucket/customer-data/t/train.jsonl" in goal
+    assert "Customer note: prefer cheap" in goal
+
+
+def test_create_task_normalizes_aliased_field_names(intake):
+    fields = _private_fields()
+    fields["eval_uri"] = fields.pop("customer_eval_uri")
+    r = intake.console.create_task(
+        {"task_type": "finetune-private", "fields": fields}, DS_USER)
+    assert r.get("ok"), r
+    assert "customer_eval_uri" in r["task"]["intake"]["fields"]
+
+
+def test_create_task_refuses_bad_types_missing_required_and_unknown_keys(intake):
+    r = intake.console.create_task(
+        {"task_type": "finetune-private",
+         "fields": {"source_uri": "http://not-s3", "retrieval_k": "five",
+                    "totally_made_up": "x"}}, DS_USER)
+    assert r["status_code"] == 400
+    errs = {e["field"]: e["error"] for e in r["field_errors"]}
+    assert "s3://" in errs["source_uri"]
+    assert "number" in errs["retrieval_k"]
+    assert "not a field" in errs["totally_made_up"]
+    # required fields are named individually, with the why — a single blob error
+    # cannot be rendered next to the field that needs fixing
+    assert "customer_eval_uri" in errs and "required" in errs["customer_eval_uri"]
+
+
+def test_raft_params_are_all_or_none(intake):
+    r = intake.console.create_task(
+        {"task_type": "finetune-private",
+         "fields": _private_fields(retrieval_kb_id="AB12CD34EF")}, DS_USER)
+    assert r["status_code"] == 400
+    assert any("all-or-none" in e["error"] for e in r["field_errors"])
+    ok = intake.console.create_task(
+        {"task_type": "finetune-private",
+         "fields": _private_fields(retrieval_kb_id="AB12CD34EF", retrieval_k="5",
+                                   retrieval_distractors="3", kb_ocu_hours="240")},
+        DS_USER)
+    assert ok.get("ok"), ok
+
+
+def test_unknown_task_type_is_a_400(intake):
+    r = intake.console.create_task({"task_type": "mine-bitcoin", "fields": {}},
+                                   DS_USER)
+    assert r["status_code"] == 400
+
+
+def test_plain_goal_path_is_unchanged(intake):
+    """The free-text door stays open: no task_type means exactly the old behavior."""
+    r = intake.console.create_task({"goal": "audit our data first"}, DS_USER)
+    assert r.get("ok"), r
+    assert r["task"]["goal"] == "audit our data first"
+    assert r["task"]["task_type"] == ""
+    assert r["task"]["intake"] == {}
+
+
+# the offline template
+
+def test_template_is_rendered_from_the_registry_for_every_supported_type(console):
+    """Drift guard (v): the template IS the registry serialized — every field param
+    appears in the frontmatter, so there is no second copy to fall behind."""
+    for t in console.TASK_TYPE_REGISTRY:
+        text = console._render_template(t)
+        assert text.startswith("---")
+        for f in t["fields"]:
+            assert f"{f['param']}:" in text, (t["key"], f["param"])
+
+
+def test_uploaded_template_merges_fields_and_reports_missing(intake):
+    c = intake.console
+    tpl = ('---\ntask_type: data-audit\n'
+           'source_uri: "s3://test-bucket/customer-data/t/train.jsonl"\n---\nnotes')
+    intake.s3.objects["test-bucket/customer-data/t/intake-data-audit.txt"] = tpl
+    intake.s3.objects["test-bucket/customer-data/t/train.jsonl"] = b'{"a":1}\n{"b":2}\n'
+    tid = _mk_task(intake, status="thinking")
+    t = intake.tasks.items[tid]
+    t["messages"].append({"role": "user", "at": "t1", "by": "alice",
+                          "text": "data uploaded: s3://test-bucket/customer-data/t/"
+                                  "intake-data-audit.txt"})
+    out = c._run_intake(tid, json.loads(json.dumps(t, default=str)))
+    sysmsgs = [m for m in out["messages"] if m.get("by") == "console"]
+    assert sysmsgs, "the parse result must be announced in the thread"
+    assert "offline intake form (data-audit) parsed" in sysmsgs[-1]["text"]
+    assert out["intake"]["fields"]["source_uri"].endswith("train.jsonl")
+
+
+def test_bad_frontmatter_is_ignored_not_fatal(intake):
+    c = intake.console
+    intake.s3.objects["test-bucket/customer-data/t/intake.txt"] = "not a form at all"
+    tid = _mk_task(intake, status="thinking")
+    t = intake.tasks.items[tid]
+    t["messages"].append({"role": "user", "at": "t1", "by": "alice",
+                          "text": "data uploaded: s3://test-bucket/customer-data/t/"
+                                  "intake.txt"})
+    out = c._run_intake(tid, json.loads(json.dumps(t, default=str)))
+    assert "error" not in out["intake"], out["intake"].get("error")
+
+
+# extraction + verification (fail-open is the contract)
+
+def test_extraction_normalizes_aliases_and_named_uris(console):
+    text = ("Wanted plan: retrieval_kb_id: AB12CD34EF, distractors=3, budget: 200. "
+            "source_uri s3://test-bucket/customer-data/t/x.jsonl and also "
+            "s3://test-bucket/other/y.jsonl")
+    got = dict(console._extract_intake_candidates(text))
+    assert got["retrieval_kb_id"] == "AB12CD34EF"
+    assert got["retrieval_distractors"] == "3"
+    assert got["budget_usd"] == "200"
+    assert got["source_uri"] == "s3://test-bucket/customer-data/t/x.jsonl"
+    assert got["s3_uri"] == "s3://test-bucket/other/y.jsonl"
+
+
+def test_kb_shaped_token_needs_context_or_the_registered_id(intake):
+    c = intake.console
+    # bare token, no KB words anywhere: not a candidate (an order number stays one)
+    assert ("retrieval_kb_id", "XY99ZZ88QQ") not in \
+        c._extract_intake_candidates("ticket XY99ZZ88QQ arrived")
+    # ...unless it IS the registered KB id
+    assert ("retrieval_kb_id", "AB12CD34EF") in \
+        c._extract_intake_candidates("please use AB12CD34EF")
+
+
+def test_s3_verify_counts_jsonl_rows_and_404_is_failed_not_error(intake):
+    c = intake.console
+    intake.s3.objects["test-bucket/customer-data/t/x.jsonl"] = b'{"a":1}\n\n{"b":2}\n'
+    ok = c._verify_s3_uri("source_uri", "s3://test-bucket/customer-data/t/x.jsonl")
+    assert ok["status"] == "verified" and "2 rows" in ok["detail"]
+    gone = c._verify_s3_uri("source_uri", "s3://test-bucket/none/missing.jsonl")
+    assert gone["status"] == "failed"
+
+
+def test_s3_500_is_unverified_and_intake_never_raises(intake, monkeypatch):
+    c = intake.console
+
+    def boom(**kw):
+        raise RuntimeError("500 InternalError")
+    monkeypatch.setattr(intake.s3, "head_object", boom)
+    f = c._verify_s3_uri("source_uri", "s3://test-bucket/x/y.jsonl")
+    assert f["status"] == "unverified" and "500" in f["detail"]
+    tid = _mk_task(intake, status="thinking")
+    t = intake.tasks.items[tid]
+    t["messages"].append({"role": "user", "at": "t1", "by": "alice",
+                          "text": "source_uri s3://test-bucket/x/y.jsonl"})
+    out = c._run_intake(tid, json.loads(json.dumps(t, default=str)))
+    assert isinstance(out, dict), "fail-open: the turn must get its task back"
+
+
+def test_kb_active_matching_ssm_is_verified_and_notfound_is_failed(intake,
+                                                                   monkeypatch):
+    c = intake.console
+    f = c._verify_kb("AB12CD34EF")
+    assert f["status"] == "verified"
+    assert "matches SSM" in f["detail"] and "COMPLETE" in f["detail"]
+    monkeypatch.setattr(c, "bragent", FakeBedrockAgent(exists=False))
+    assert c._verify_kb("NOPE123456")["status"] == "failed"
+
+
+def test_mirror_absent_is_a_failed_fact_naming_the_fix(intake):
+    f = intake.console._verify_mirror("Qwen/Qwen3-8B")
+    assert f["status"] == "failed" and "mirror_model" in f["detail"]
+    intake.s3.objects["test-bucket/models-mirror/Qwen/Qwen3-8B/b1/model.safetensors"] = b"x"
+    assert intake.console._verify_mirror("Qwen/Qwen3-8B")["status"] == "verified"
+
+
+def test_zero_param_goal_produces_no_facts_and_no_message(intake):
+    c = intake.console
+    tid = _mk_task(intake, status="thinking")
+    t = json.loads(json.dumps(intake.tasks.items[tid], default=str))
+    out = c._run_intake(tid, t)
+    assert not (out.get("intake") or {}).get("facts")
+    assert all(m.get("by") != "console" for m in out["messages"])
+
+
+def test_intake_reruns_on_new_uri_without_reverifying_old_facts(intake):
+    c = intake.console
+    intake.s3.objects["test-bucket/customer-data/t/a.jsonl"] = b'{"a":1}\n'
+    intake.s3.objects["test-bucket/customer-data/t/b.jsonl"] = b'{"b":1}\n'
+    tid = _mk_task(intake, status="thinking")
+    t = intake.tasks.items[tid]
+    t["messages"].append({"role": "user", "at": "t1", "by": "alice",
+                          "text": "source_uri s3://test-bucket/customer-data/t/a.jsonl"})
+    out = c._run_intake(tid, json.loads(json.dumps(t, default=str)))
+    n = len(out["intake"]["facts"])
+    out["messages"].append({"role": "user", "at": "t2", "by": "alice",
+                            "text": "eval_uri s3://test-bucket/customer-data/t/b.jsonl"})
+    out2 = c._run_intake(tid, out)
+    names = [(f["name"], f["value"]) for f in out2["intake"]["facts"]]
+    assert len(names) == len(set(names)), "a fact was verified twice"
+    assert len(out2["intake"]["facts"]) == n + 1
+
+
+def test_intake_facts_are_capped_and_the_cap_is_announced(intake):
+    c = intake.console
+    uris = [f"s3://test-bucket/customer-data/t/f{i:03}.jsonl" for i in range(50)]
+    for u in uris:
+        intake.s3.objects["test-bucket/" + u[len("s3://test-bucket/"):]] = b"{}\n"
+    tid = _mk_task(intake, status="thinking")
+    t = intake.tasks.items[tid]
+    t["messages"].append({"role": "user", "at": "t1", "by": "alice",
+                          "text": " ".join(uris)})
+    out = c._run_intake(tid, json.loads(json.dumps(t, default=str)))
+    assert len(out["intake"]["facts"]) <= c.INTAKE_FACTS_MAX
+    sysmsg = [m for m in out["messages"] if m.get("by") == "console"][-1]["text"]
+    assert "cap" in sysmsg and "NOT checked" in sysmsg
+
+
+# delivery: envelope, thread + transcript, readiness
+
+def test_intake_facts_ride_the_consult_envelope(intake, monkeypatch):
+    c = intake.console
+    tid = _mk_task(intake, status="thinking")
+    t = intake.tasks.items[tid]
+    t["task_type"] = "finetune-private"
+    t["intake"] = {"fields": {"source_uri": "s3://test-bucket/x.jsonl"},
+                   "facts": [{"name": "source_uri", "value": "s3://test-bucket/x.jsonl",
+                              "status": "verified", "detail": "exists", "method": "s3",
+                              "checked_at": "t0"}],
+                   "fields_scanned": True, "msgs_seen": 1}
+    captured = {}
+
+    class _AC:
+        def invoke_harness(self, **kw):
+            captured.setdefault("messages", kw["messages"])
+            return _harness_loop_stream("What data do you have?")
+
+    monkeypatch.setattr(c, "agentcore_chat", _AC())
+    monkeypatch.setattr(c, "_resolve_harness_id", lambda x: "llmops_orchestrator-x")
+    c.run_task_turn(tid, accept=False)
+    envelope = json.loads(_last_text(captured["messages"]).split("\n\n")[0])
+    intk = envelope["params"]["intake"]
+    assert intk["task_type"] == "finetune-private"
+    assert intk["facts"][0]["status"] == "verified"
+    assert intk["fields"]["source_uri"] == "s3://test-bucket/x.jsonl"
+
+
+def test_intake_message_lands_in_thread_and_transcript(audited, monkeypatch):
+    w = audited
+    monkeypatch.setattr(w.console, "bragent", FakeBedrockAgent())
+    monkeypatch.setattr(w.console, "ssm", FakeSsm())
+    w.s3.objects["test-bucket/customer-data/t/a.jsonl"] = b'{"a":1}\n'
+    tid = _mk_task(w, status="thinking")
+    t = w.tasks.items[tid]
+    t["messages"].append({"role": "user", "at": "t1", "by": "alice",
+                          "text": "source_uri s3://test-bucket/customer-data/t/a.jsonl"})
+    w.console._run_intake(tid, json.loads(json.dumps(t, default=str)))
+    stored = w.tasks.items[tid]["messages"]
+    assert any("CONSOLE INTAKE" in str(m.get("text")) for m in stored), \
+        "the intake report must be a real message, not only envelope metadata"
+    lines = _transcript_lines(w, tid)
+    assert any("CONSOLE INTAKE" in str(ln.get("text")) for ln in lines), \
+        "the audit copy must hold the same report the customer saw"
+
+
+def test_readiness_shows_console_verified_before_any_plan_exists(intake):
+    c = intake.console
+    tid = _mk_task(intake, status="thinking")
+    t = intake.tasks.items[tid]
+    t["plan_uri"] = ""     # no plan yet — the whole point
+    t["intake"] = {"fields": {"datasheet.consent": "consented 2026-08-11"},
+                   "facts": [{"name": "source_uri", "value": "s3://b/x.jsonl",
+                              "status": "verified", "detail": "exists, 2 rows",
+                              "method": "s3", "checked_at": "t0"}],
+                   "updated_at": "t0"}
+    out = c.task_readiness(tid)
+    rows = {f["field"]: f for f in out["fields"]}
+    assert rows["source_uri"].get("console_verified") is True
+    assert rows["source_uri"]["value"] == "s3://b/x.jsonl"
+    assert rows["datasheet.consent"].get("provided_via_form") is True
+    assert out["intake_updated_at"] == "t0"
+
+
+# drift guards: the registry is derived from its consumers, never hand-copied
+
+def _load_start_pipeline():
+    spec = importlib.util.spec_from_file_location(
+        "start_pipeline_for_intake", REPO / "orchestration/start_pipeline/handler.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_every_supported_form_param_resolves_to_a_real_consumer(console):
+    """Drift guard (i): a field the pipeline does not read is a question the customer
+    answers for nobody. Every supported-type param must be a canonical pipeline
+    parameter (fixed point of INTAKE_ALIASES) or one of the nine readiness paths."""
+    readiness = {p for p, _, _ in console.DATA_READINESS_FIELDS}
+    for t in console.TASK_TYPE_REGISTRY:
+        if not t["supported"]:
+            continue
+        for f in t["fields"]:
+            p = f["param"]
+            assert console._INTAKE_CANON.get(p) == p or p in readiness, \
+                (t["key"], p, "resolves to nothing the pipeline or the panel reads")
+
+
+def test_eval_only_required_fields_equal_mode_required_params(console):
+    """Drift guard (ii): imported from the dispatcher, not restated."""
+    sp = _load_start_pipeline()
+    required = {k for k, _ in sp.MODE_REQUIRED_PARAMS["eval_only"]}
+    t = console._task_type("eval-only")
+    form_required = {f["param"] for f in t["fields"] if f["required"]}
+    assert required <= form_required, (
+        f"the dispatcher refuses eval_only without {required - form_required} — the "
+        "form must ask for it")
+
+
+def test_raft_form_params_match_the_prompt_clause(console):
+    """Drift guard (iii): the all-or-none group is the prompt's own list."""
+    prompt = json.loads(
+        (REPO / "agents/orchestrator/harness.json").read_text()
+    )["systemPrompt"][0]["text"]
+    for p in console._RAFT_PARAMS:
+        assert p in prompt, f"{p} is enforced all-or-none but the prompt never names it"
+    t = console._task_type("finetune-private")
+    form = {f["param"] for f in t["fields"]}
+    assert set(console._RAFT_PARAMS) <= form
+
+
+def test_the_prompt_knows_params_intake(console):
+    """Drift guard (iv): the code cannot ship an envelope block the prompt has never
+    heard of — and the prompt clause cannot outlive the code that feeds it."""
+    prompt = json.loads(
+        (REPO / "agents/orchestrator/harness.json").read_text()
+    )["systemPrompt"][0]["text"]
+    assert "params.intake" in prompt
+    assert "console-verified" in prompt.lower()
+    src = (REPO / "deploy/console/lambda_function.py").read_text()
+    assert 'params["intake"]' in src
+
+
+def test_unsupported_types_are_listed_and_marked(console):
+    """The catalog records needs the pipeline cannot run yet — visibly."""
+    cat = {t["key"]: t for t in console.task_type_catalog()}
+    for key in ("finetune-yolo", "finetune-speech"):
+        assert key in cat and cat[key]["supported"] is False
+    modes = {t["key"]: t["pipeline_mode"] for t in console.TASK_TYPE_REGISTRY}
+    assert modes["eval-only"] == "eval_only" and modes["data-audit"] == "data_audit"
