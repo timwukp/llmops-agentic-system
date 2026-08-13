@@ -48,6 +48,7 @@ Usage:
   python deploy/09_retrieval.py --region us-east-1 --teardown
 """
 import argparse
+import hashlib
 import json
 import sys
 import time
@@ -376,8 +377,15 @@ def _signed_request(method, url, region, body=None):
     session = boto3.Session()
     creds = session.get_credentials().get_frozen_credentials()
     data = json.dumps(body).encode("utf-8") if body is not None else None
+    # AOSS requires the x-amz-content-sha256 HEADER on data-plane requests, and generic
+    # SigV4Auth includes the payload hash in the SIGNATURE but does not emit the header
+    # (only the S3 subclass does). Measured 2026-08-13: GET without it happened to pass,
+    # PUT returned an unconditional 403 Forbidden -- the same opaque error propagation
+    # delay produces, which is exactly why this comment names the second cause.
+    payload_hash = hashlib.sha256(data or b"").hexdigest()
     req = AWSRequest(method=method, url=url, data=data,
-                     headers={"Content-Type": "application/json"})
+                     headers={"Content-Type": "application/json",
+                              "X-Amz-Content-SHA256": payload_hash})
     SigV4Auth(creds, "aoss", region).add_auth(req)
     http_req = urllib.request.Request(url, data=data, method=method,
                                       headers=dict(req.headers))
