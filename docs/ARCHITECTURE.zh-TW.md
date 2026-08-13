@@ -581,12 +581,33 @@ Phase 3 實測驗證（觀察到兩次 resume Lambda 調用：一次在早期失
 
 一個 AgentCore Memory（`llmops_shared_memory`，策略 **SEMANTIC + EPISODIC**）由七個
 harness 共享，由 `deploy/04_wire_memory.py` 在建立後接線。每個 agent 的 `actorId`
-（= harness 名稱）為 namespace 分區，檢索仍可跨讀共享事實。刻意跳過
+為 namespace 分區，檢索仍可跨讀共享事實。刻意跳過
 USER_PREFERENCE/SUMMARIZATION 策略 —— 迴路中沒有人類用戶。
 
 這就是 run-N 的學習抵達 run-N+1 的機制，且已被證明：Phase 5 的 e2e 運行中，finetune
 agent **首次嘗試即成功**發起訓練作業，用的正是 Phase 3 補救連環戰學到的
 floors-only requirements + torch-2.6 DLC 配方 —— 那個配方當初花了 5 個失敗作業才換來。
+
+接線有兩個承重的性質，而兩個都是量線上艦隊量出來的、不是讀這個 repo 讀出來的
+（實測數字見 [TEST_RESULTS.zh-TW.md](TEST_RESULTS.zh-TW.md) 的 D14）：
+
+- **harness 名單是推導出來的，永遠不手寫。** 它從每一個 `agents/*/harness.json` 讀
+  `harnessName` —— 也就是 `deploy/05_harnesses.py` 部署時用的同一個來源 —— 所以一個新
+  agent 只要存在就會被接上。一份手寫的「五個管線 worker」名單，正是
+  `llmops_finops` 與 `llmops_orchestrator` 從未收到 semantic 提取收緊、在其他地方都已
+  修好的期間裡一直停在修正前的 `topK` 10 / `relevanceScore` 0.2 的原因。接 0 個 harness、
+  或接一個配置裡沒有 `harnessName` 的 harness，都會拒絕，而不是回報一次乾淨的部署。
+- **已經上線的 `actorId` 絕不會被重新部署改掉。** `actorId` 是 `/users/{actorId}/facts`
+  的分區鍵，所以改寫它並不是搬動一份記憶 —— 是拋棄一份，而 `UpdateHarness` 兩種情況都回
+  成功。上面那兩個 harness 是由較舊的 `deploy/wire_memory.py` 用完整 harness ID 接的，而
+  那也是唯一有記錄的分區。所以要搬動它必須逐一指名（`--repartition <harness>`），並且在
+  data plane 報得出「即將被拋棄幾條記錄」之前直接拒絕：一個未知的數字讀起來和 0 一模一樣。
+
+Semantic 通道是刻意比 episodic **更緊**的（`topK` 5 / `relevanceScore` 0.6 對 10 / 0.2）。
+這兩者並不矛盾：`/episodes/{actorId}/{sessionId}` 把 episodic 回憶限制在 agent 自己的
+session 裡，而 `/users/{actorId}/facts` 是跨 **run** 的通道 —— 在那裡，一個鬆的門檻會把
+另一個 run 的結論當成真相送進來。每一個會收到檢索記憶的提示詞，也都帶著一條把它從屬於
+本次 run 已簽署計劃、以及本次 run 自己量到的數字之下的優先序規則。
 
 ## 7. Fail-closed 門檻
 

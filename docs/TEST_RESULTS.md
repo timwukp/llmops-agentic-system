@@ -22,9 +22,9 @@ page is its ledger.
 
 | Check | Result | How to reproduce |
 |---|---|---|
-| Unit tests (contracts, cost model, driver loop, Lambdas, state machine document) | **1290/1290 passed** | `.venv/bin/python -m pytest tests/ -q --ignore=tests/golden` |
+| Unit tests (contracts, cost model, driver loop, Lambdas, state machine document) | **1302/1302 passed** | `.venv/bin/python -m pytest tests/ -q --ignore=tests/golden` |
 | Shell suite — N-way capacity race guard (`tests/test_capacity_race_guard.sh`) | **10/10 assertions** | `bash tests/test_capacity_race_guard.sh` |
-| Negative controls — every guard broken in turn, confirmed to fail | **309/309 negative controls** | `.venv/bin/python tests/negative_controls/monitor_dispatch.py` |
+| Negative controls — every guard broken in turn, confirmed to fail | **322/322 negative controls** | `.venv/bin/python tests/negative_controls/monitor_dispatch.py` |
 | Harness config validation (5 specialists + conductor + auditor) | **7/7 `RESULT: OK`** | `python deploy/validate_config.py --config agents/<a>/harness.json` |
 | Architecture SVG geometry (no wire crossings, no wire through a card) | **CLEAN** | `python tests/test_svg_geometry.py docs/architecture-*.svg` |
 | Redaction scan (account IDs, credentials, account-bearing ARNs) | CLEAN | `.github/workflows/redaction-check.yml` |
@@ -133,14 +133,14 @@ Full record: [VERIFICATION_finops.md](../deploy/evidence/VERIFICATION_finops.md)
 
 | Check | Result | How to reproduce |
 |---|---|---|
-| Unit tests (all suites, incl. `test_cost_model.py` + `test_finops.py`) | **1290 passed** | `.venv/bin/python -m pytest tests/ -q` |
+| Unit tests (all suites, incl. `test_cost_model.py` + `test_finops.py`) | **1302 passed** | `.venv/bin/python -m pytest tests/ -q` |
 | Harness config validation, 7 agents | **`RESULT: OK`** | `python deploy/validate_config.py --config agents/finops/harness.json` |
 | Live fleet | **7 harnesses READY** | `list_harnesses` via the repo's vendored boto3 |
 | Canonical module has a distribution path | prints `would upload 4 contract files` | `python deploy/03_storage.py --region us-east-1 --account-id 123456789012 --dry-run` |
 
 Every guard added in this work was **mutation-checked**: the asserted behaviour was
-reverted one at a time and the test confirmed to fail — **309/309 negative controls**, 267
-mutations asserting 309 (guard, mutation) pairs, one printed PASS line each. A test that
+reverted one at a time and the test confirmed to fail — **322/322 negative controls**, 278
+mutations asserting 322 (guard, mutation) pairs, one printed PASS line each. A test that
 passes both with and against the behaviour it names is not a test.
 
 The count is in the sentence on purpose. "Mutation-checked" is an adjective, and an
@@ -229,6 +229,43 @@ restoring time order (so the frontend's `slice(-25)` paints the oldest 25 of the
 window that is right at neither end), and m256/m257/m263/m264/m265 each drop one truncation
 marker on its way from the query to the screen. A capped list that does not say it is capped
 reads as complete, which is the same defect one level up.
+
+**D14 — a fix that reached five of seven harnesses, and whose obvious repair would have burned
+43 memory records (eleven controls, m267-m277).** The shared BYO memory is wired by
+`deploy/04_wire_memory.py`, whose harness list was hand-written: the five pipeline workers.
+Two harnesses are wired to the same memory and were not on it, so #83's retrieval tightening —
+semantic `topK` 10 → 5, `relevanceScore` 0.2 → 0.6, the fix that stopped another run's
+post-mortem being injected as a bare fact — never reached them. Measured live on 2026-08-13:
+`llmops_finops` and `llmops_orchestrator` still sat at **10 / 0.2**, the exact pre-fix setting,
+while all five listed harnesses carried 5 / 0.6. Nothing failed; the channel just stayed as
+loose as it had always been, on the two agents whose prompts are *built* on memory (finops:
+"estimate accuracy improves only if each reconciliation's finding survives into the next
+estimate"; orchestrator: "your memory is shared with the specialists"). And `deploy/05_harnesses.py`
+already carries a comment naming this exact failure mode — *"a config on disk that no script
+names is a harness that silently never exists"* — so the lesson was written down in one script
+and not applied in its sibling.
+
+The obvious repair is destructive, which is why it was measured before it was written.
+`actorId` is the **partition key** of every namespace (`/users/{actorId}/facts`), and those two
+harnesses were wired by the older `deploy/wire_memory.py`, whose `--actor-id` took the full
+harness ID. Live: `/users/llmops_finops-eDJtU9PvKh/facts` holds **13** records,
+`/users/llmops_orchestrator-GsIqHZ4viJ/facts` holds **30**, and every bare-name partition holds
+**0**. Deriving the list and letting the script's preferred spelling win would have abandoned
+all 43 in one call — and `UpdateHarness` returns success either way, so the deploy that finally
+applied the retrieval fix would have been the deploy that threw away the memory it exists to
+serve. So a live `actorId` now wins over the one this script would choose, moving one is
+opt-in per harness (`--repartition <harness>`), and a move refuses to proceed unless the data
+plane can say what it costs — an unknown record count reads exactly like a count of zero
+(m272). The controls hold both halves apart: m270 lets a redeploy rewrite a live `actorId`,
+m271 makes `--repartition` fleet-wide, m273 stops the count at its first page (under-reporting
+exactly the partitions large enough to matter), m275 loosens the semantic channel back to the
+episodic setting — which is only safe for episodic recall because `{sessionId}` scopes it to
+the agent's own session and nothing scopes facts. The guard that should have caught all of this
+asserted `wired == {data-prep, finetune, eval, deploy, monitor}`: **it agreed with the omission**,
+the same shape as the console gate band. Derived from the configs instead, it failed immediately
+and named a third gap nobody had looked for — the orchestrator prompt had no memory-precedence
+rule either, and neither did finops (m276, m277), the two agents that publish a rate card and
+quote a price to a human.
 
 ### Two failures worth more than the passes
 
