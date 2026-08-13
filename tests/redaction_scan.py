@@ -107,7 +107,7 @@ ALLOWED = (b"6833" + b"13688378", b"7631" + b"04351884", b"1234" + b"56789012")
 #: this laptop, single-threaded CPython does 3.1M sha256/s, so the whole 1e12 space falls in
 #: about 4 days -- and a GPU does it in roughly 100 seconds. So the KDF is iterated. At 200k
 #: iterations a candidate costs ~16 ms, which makes the same sweep ~500 GPU-years, while the
-#: scan stays cheap because only 12-digit runs are ever hashed: measured across all 179
+#: scan stays cheap because only 12-digit runs are ever hashed: measured across all 180
 #: tracked files there are 69 such runs, 10 distinct, and hashing the distinct set takes 0.16 s
 #: for the entire repo. (Re-measured whenever either number moves, and they move
 #: INDEPENDENTLY, which is why both are derived and neither is inferred from the other, and
@@ -137,8 +137,9 @@ ALLOWED = (b"6833" + b"13688378", b"7631" + b"04351884", b"1234" + b"56789012")
 #: percentages. Then the r6d retrieval substrate moved two at once: 176 files went to 178
 #: -- the KB deploy script (whose numbers are OCU rates, dimensions and poll counts) and
 #: the deep-research evidence doc behind it (percentages and win rates), neither carrying
-#: a 12-digit run. Then the canonical RAFT context format moved one more:
-#: 178 files became 179, a markdown template whose only numbers are fractions and a bar. (The
+#: a 12-digit run. Then the canonical RAFT context format moved 178 to 179 (a markdown template whose only
+#: numbers are fractions and a bar), and the r6d plan-and-probe evidence doc moved one more:
+#: 179 files became 180, digests, recall fractions and dollar ranges, no 12-digit run. (The
 #: "became" phrasing is the one the guard reads, so it names the LATEST movement -- the
 #: earlier ones are history and keep their own past tense.)
 #: EIGHT commits
