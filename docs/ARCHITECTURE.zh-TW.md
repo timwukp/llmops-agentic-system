@@ -996,6 +996,23 @@ agent 把它當邊界情形上報了。現在 `gate_row` 用跟 pipeline 相同�
 來判會在推論工作還在啟動時就把兩個 gate 都判失敗，而用非空來判則會把一份「到了但什麼都沒帶」的報告讀成
 從未被量測過。
 
+**一道可以被跳過的授權邊界，不是邊界。** `service_launch_run` 在派工之前會驗證核准紀錄上的 KMS
+簽章，而它原本寫的是 `if kms is not None and not verify_record(kms, approval)` —— 也就是說，不傳
+client 進來會**跳過**這道檢查，而不是拒絕這次呼叫。這個繞道是全面的，不是局部的：直接執行過，一份
+**完全沒有簽章**、`approved_by` 隨便填的核准紀錄，回傳了 `{"ok": true, "run_id": ...}` 並且真的
+invoke 了 start-pipeline。沒有任何東西依賴這個繞道 —— driver 傳 `_kms(c)`、console 傳它 module 層級
+的 client —— 所以它唯一的作用，就是讓「偽造的『有人說可以』」與「一個真的 run」之間僅有的那道檢查，
+在驗證器缺席的那一刻同時消失。現在它會回傳一個指名驗證器缺席的拒絕，這和 deploy 讀回、以及評審儀器的
+證明所遵循的是同一條規則：**跑不起來的檢查不是通過的檢查**，而在這道邊界上，這個差別**就是**整道邊界。
+這個檔案同時也是 207 個反向控制裡一個都沒有的檔案，這正是為什麼這個 bug 能在一套認真測試簽章的測試裡
+存活：現在控制會逐一破壞每道 guard —— 還原 fail-open、把沒簽章的紀錄讀成已驗證、相信紀錄裡存的
+`record_sha256` 而不重新推導、把丟出例外的驗證器讀成有效、從 `SIGNED_KEYS` 拿掉一個鍵、讓正規化跟著
+紀錄自己的鍵序、讓摘要吞掉它自己要簽的那個簽章、不再拿被簽署的 plan hash 去比對 S3、以及讓每一筆稽核
+紀錄都連到 genesis。這些控制所驗證的測試裡，有一個純粹是因為替身太寬容才寫的：`FakeKms.verify` 回傳
+`{"SignatureValid": false}`，而真正的 KMS 是**丟出** `KMSInvalidSignatureException`，所以
+`verify_record` 的 `except` 分支 —— production 在每一份被篡改的紀錄上都會走的那個分支 —— 從來沒有
+被任何測試執行過。
+
 **一個 run 自己發現的事實，和它被簽署時的同意一樣會被傳遞下去。** `MODEL_PARAM_FOR_ROLE` 把人
 **簽署**的內容帶給必須服從它的 stage；`STAGE_FACT_PARAMS` 把 run 自己**產出**的內容帶給必須量測
 它的 stage。`params.student_endpoint` —— eval 與 monitor 都會讀 —— 就是命名這個模式的那個案例：

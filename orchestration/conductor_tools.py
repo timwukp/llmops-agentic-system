@@ -149,7 +149,19 @@ def service_launch_run(lam, s3, kms, args: dict, start_fn: str,
     if not approval:
         return {"ok": False, "reason": "no approval record present. A run can only be "
                                        "dispatched after a human accepts the plan."}
-    if kms is not None and not verify_record(kms, approval):
+    # Fail CLOSED on a missing verifier. This was `if kms is not None and not
+    # verify_record(...)`, so calling with kms=None skipped the one check standing between a
+    # forged "a human said yes" and a dispatch: an approval record carrying no signature at
+    # all came back {"ok": True} and invoked start-pipeline. Nothing depended on the bypass —
+    # every call site, production and test, passes a client — so its only effect was that the
+    # boundary disappeared whenever the client did. Same rule the deploy read-back and the
+    # judge-instrument attestation already follow: a check that could not run is not a check
+    # that passed, and on an authorization boundary the difference is the whole boundary.
+    if kms is None:
+        return {"ok": False, "reason": "no KMS client available to verify the approval "
+                                       "signature. A verification that could not run is not "
+                                       "a verification that passed. Refusing to dispatch."}
+    if not verify_record(kms, approval):
         return {"ok": False, "reason": "approval record signature did not verify — the "
                                        "record was tampered with or never signed. Refusing "
                                        "to dispatch."}

@@ -3914,6 +3914,138 @@ case("driver: a typed call in the same turn's text displaces the real tool call"
      [f"{_DRV}::test_a_real_tool_call_always_wins_over_a_typed_one"])
 
 
+# ── the approval signature: the one boundary between an agent and a human's yes ───────
+#
+# conductor_tools.py had ZERO controls among the 207 above, and it holds the only check that
+# distinguishes "a human accepted this plan" from "an agent said a human did". Auditing what
+# to break here found the bug first: `service_launch_run` read `if kms is not None and not
+# verify_record(...)`, so an approval record carrying no signature at all returned
+# {"ok": True} and invoked start-pipeline whenever the client was absent. Every mutation
+# below is therefore a shape this file has already been in, or one line away from it. They
+# come in two kinds and both matter: the verdict-level ones (208, 215, 216) break whether a
+# forgery is refused, and the digest-level ones (209-214) break what the signature is a
+# signature OF -- a record that still verifies while meaning something else is worse than one
+# that fails to verify, because it produces a false attestation instead of an error.
+_CT = "orchestration/conductor_tools.py"
+_T = "tests/test_console_tasks.py::"
+
+
+def m208(t):
+    old = ('    if kms is None:\n'
+           '        return {"ok": False, "reason": "no KMS client available to verify the '
+           'approval "')
+    assert t.count(old) == 1, f"the fail-closed guard has moved; found {t.count(old)}"
+    head, _, tail = t.partition(old)
+    # restore the original fail-open exactly: drop the kms-is-None refusal and fold the
+    # condition back into the verify call, which is what the code said before this PR.
+    tail = tail.split('    if not verify_record(kms, approval):', 1)
+    return head + '    if kms is not None and not verify_record(kms, approval):' + tail[1]
+
+
+case("approval: no verifier means the signature check is skipped instead of refused",
+     _CT, m208,
+     [f"{_T}test_a_dispatch_with_no_verifier_is_refused_rather_than_waved_through"])
+
+
+def m209(t):
+    old = '    if not sig.get("value"):\n        return False'
+    assert t.count(old) == 1, f"the unsigned-record early return has moved; found {t.count(old)}"
+    return t.replace(old, '    if not sig.get("value"):\n        return True', 1)
+
+
+case("approval: a record with no signature at all is read as verified",
+     _CT, m209,
+     [f"{_T}test_an_approval_that_was_never_signed_fails_verification"])
+
+
+def m210(t):
+    old = '    digest_hex = record_sha256(record)\n    try:'
+    assert t.count(old) == 1, f"verify's re-derivation has moved; found {t.count(old)}"
+    return t.replace(
+        old, '    digest_hex = record.get("record_sha256") or record_sha256(record)\n    try:',
+        1)
+
+
+case("approval: verify trusts the digest stored in the record instead of re-deriving it",
+     _CT, m210,
+     [f"{_T}test_changing_any_field_the_signature_claims_to_cover_breaks_it",
+      f"{_T}test_launch_run_with_a_forged_approval_is_rejected"])
+
+
+def m211(t):
+    old = ('        # KMSInvalidSignatureException on tamper; any other failure is also a '
+           '"no".\n        return False')
+    assert t.count(old) == 1, f"verify's except branch has moved; found {t.count(old)}"
+    return t.replace(old, old.replace("return False", "return True"), 1)
+
+
+case("approval: a verifier that raises is read as a valid signature",
+     _CT, m211,
+     [f"{_T}test_a_verifier_that_raises_is_a_no_and_not_an_error"])
+
+
+def m212(t):
+    old = '    "task_id", "plan_uri", "plan_sha256", "cost_estimate_usd", "gate",'
+    assert t.count(old) == 1, f"SIGNED_KEYS has moved; found {t.count(old)}"
+    return t.replace(old, '    "task_id", "plan_uri", "plan_sha256", "gate",', 1)
+
+
+case("approval: a field drops out of SIGNED_KEYS, so the signature stops covering it",
+     _CT, m212,
+     [f"{_T}test_the_signature_covers_every_field_of_the_record_a_human_actually_signs",
+      f"{_T}test_launch_run_with_a_forged_approval_is_rejected"])
+
+
+def m213(t):
+    old = ('    subset = {k: record[k] for k in SIGNED_KEYS if k in record}\n'
+           '    return json.dumps(subset, sort_keys=True, separators=(",", ":"), '
+           'default=str)')
+    assert t.count(old) == 1, f"canonical_json has moved; found {t.count(old)}"
+    # Both halves at once, deliberately: iterating SIGNED_KEYS already normalizes ordering,
+    # so dropping only sort_keys is an equivalent mutant that no test can kill. The defect
+    # this models is one decision -- "canonicalize in the record's own order" -- and it needs
+    # both lines to actually be that defect.
+    return t.replace(
+        old,
+        '    subset = {k: v for k, v in record.items() if k in SIGNED_KEYS}\n'
+        '    return json.dumps(subset, separators=(",", ":"), default=str)', 1)
+
+
+case("approval: canonicalization follows the record's own key order, so the digest is not "
+     "a function of its meaning",
+     _CT, m213, [f"{_T}test_canonical_json_is_order_insensitive"])
+
+
+def m214(t):
+    old = "    subset = {k: record[k] for k in SIGNED_KEYS if k in record}"
+    assert t.count(old) == 1, f"the signed subset has moved; found {t.count(old)}"
+    return t.replace(old, "    subset = dict(record)", 1)
+
+
+case("approval: the digest covers the whole record, so the signature is inside what it signs",
+     _CT, m214, [f"{_T}test_signature_field_is_excluded_from_the_signed_digest"])
+
+
+def m215(t):
+    old = '    if approval.get("plan_sha256") and approval["plan_sha256"] != plan_hash:'
+    assert t.count(old) == 1, f"the plan-hash binding has moved; found {t.count(old)}"
+    return t.replace(old, '    if False:', 1)
+
+
+case("approval: the signed plan hash is no longer compared to the plan on S3",
+     _CT, m215, [f"{_T}test_launch_run_rejects_a_plan_that_changed_after_signing"])
+
+
+def m216(t):
+    old = '    if not prev_record:\n        return "genesis"'
+    assert t.count(old) == 1, f"chain_hash's genesis case has moved; found {t.count(old)}"
+    return t.replace(old, '    if True:\n        return "genesis"', 1)
+
+
+case("approval: every record links to genesis, so the audit chain records no order",
+     _CT, m216, [f"{_T}test_hash_chain_links_successive_records"])
+
+
 #: Where the pristine text of the file currently mutated is parked, so a kill -9 -- which
 #: no handler can intercept -- still leaves the original recoverable. Under the repo root
 #: rather than /tmp because it must be obvious to whoever finds the tree dirty, and

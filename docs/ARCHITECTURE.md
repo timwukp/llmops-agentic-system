@@ -1181,6 +1181,27 @@ completion and the agents write mid-stage entries without it, so on
 gates while the inference job was still launching, and an emptiness check would read a report
 that arrived carrying nothing as never having been measured.
 
+**An authorization boundary that can be skipped is not a boundary.** `service_launch_run` verifies
+the KMS signature on the approval record before a dispatch, and it read
+`if kms is not None and not verify_record(kms, approval)` — so passing no client skipped the check
+rather than refusing the call. The bypass was total, not partial: executed directly, an approval
+record carrying **no signature at all** and a made-up `approved_by` returned `{"ok": true,
+"run_id": ...}` and invoked start-pipeline. Nothing depended on it — the driver passes `_kms(c)`
+and the console passes its module-level client, so its only effect was that the one check standing
+between a forged "a human said yes" and a real run disappeared exactly when the verifier did. It
+now returns a refusal naming the missing verifier, which is the same rule the deploy read-back and
+the judge-instrument attestation already follow: **a check that could not run is not a check that
+passed**, and on this boundary the difference *is* the boundary. The file also had none of the 207
+negative controls, which is why the bug survived a suite that tests the signature thoroughly: the
+controls now break each guard in turn — the fail-open restored, an unsigned record read as
+verified, the stored `record_sha256` trusted instead of re-derived, a raising verifier read as
+valid, a key dropped from `SIGNED_KEYS`, canonicalization following the record's own key order,
+the digest swallowing the signature it signs, the signed plan hash no longer compared to S3, and
+every audit record linking to genesis. The tests those controls verify include one written only
+because the double was too kind: `FakeKms.verify` returns `{"SignatureValid": false}` where real
+KMS *raises* `KMSInvalidSignatureException`, so `verify_record`'s `except` branch — the branch
+production takes on every tampered record — had never been executed by any test.
+
 **The facts a run discovers travel like the consent it was signed with.** `MODEL_PARAM_FOR_ROLE`
 carries what a human *signed* into the stages that must obey it; `STAGE_FACT_PARAMS` carries what
 the run itself *produced* into the stages that must measure it. `params.student_endpoint` — read

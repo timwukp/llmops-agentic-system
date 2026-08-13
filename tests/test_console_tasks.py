@@ -567,6 +567,59 @@ def test_launch_run_without_an_approval_is_rejected():
     assert not lamf.invokes
 
 
+def test_a_dispatch_with_no_verifier_is_refused_rather_than_waved_through():
+    """The authorization boundary must fail CLOSED when the verifier is absent.
+
+    This was `if kms is not None and not verify_record(...)`, and the bypass it opened was
+    total, not partial: with kms=None an approval record carrying **no signature at all**
+    came back `{"ok": True}` and invoked start-pipeline. Nothing depended on it — every call
+    site passes a client (`_kms(c)` in the driver, the module-level `kms` in the console) —
+    so its only effect was that the one check between a forged "a human said yes" and a
+    dispatch disappeared along with the client. A verification that could not run is not a
+    verification that passed, which is the rule the deploy read-back and the judge-instrument
+    attestation already follow; on an authorization boundary the difference IS the boundary.
+    """
+    s3f, lamf = FakeS3(), FakeLambda()
+    plan = b"{}"
+    s3f.objects["test-bucket/tasks/task-abc123/plan.json"] = plan
+    unsigned = {"task_id": "task-abc123",
+                "plan_uri": "s3://test-bucket/tasks/task-abc123/plan.json",
+                "plan_sha256": hashlib.sha256(plan).hexdigest(),
+                "decision": "accepted", "approved_by": "nobody", "approved_at": "t",
+                "prev_event_sha256": "genesis"}
+    assert "signature" not in unsigned, "the fixture has to be genuinely unsigned"
+    r = conductor_tools.service_launch_run(
+        lamf, s3f, None,
+        {"plan_uri": "s3://test-bucket/tasks/task-abc123/plan.json", "approval": unsigned},
+        "llmops-start-pipeline")
+    assert not r["ok"], f"an unsigned approval dispatched a run with no verifier: {r}"
+    assert "could not run" in r["reason"], r["reason"]
+    # The load-bearing half. A rejection that still invoked start-pipeline would be a
+    # rejection of the toolResult only, and the run would already be going.
+    assert not lamf.invokes, "the dispatch happened anyway"
+
+
+def test_an_approval_that_was_never_signed_fails_verification():
+    """The gap between "tampered" and "unsigned". `test_tampered_approval_record_fails_
+    verification` edits a signed record, so the signature is present and simply no longer
+    matches; nothing covered a record with no `signature` block at all — the shape a forged
+    approval would actually arrive in, since a forger has no key to sign with. Both the
+    absent block and an empty value must be refused before any KMS call is attempted.
+    """
+    kmsf = FakeKms()
+    plan = b"{}"
+    signed = _signed_approval(kmsf, plan)
+    assert conductor_tools.verify_record(kmsf, signed) is True, "the fixture must verify"
+    for label, rec in (("no signature block", {k: v for k, v in signed.items()
+                                               if k != "signature"}),
+                       ("empty signature block", {**signed, "signature": {}}),
+                       ("empty signature value", {**signed,
+                                                  "signature": {**signed["signature"],
+                                                                "value": ""}})):
+        assert conductor_tools.verify_record(kmsf, rec) is False, (
+            f"an approval with {label} verified")
+
+
 def test_launch_run_with_a_forged_approval_is_rejected():
     s3f, lamf, kmsf = FakeS3(), FakeLambda(), FakeKms()
     plan = b"{}"
@@ -1639,6 +1692,65 @@ def test_canonical_json_is_order_insensitive():
     a = {"task_id": "t", "plan_uri": "u", "decision": "accepted"}
     b = {"decision": "accepted", "plan_uri": "u", "task_id": "t"}
     assert conductor_tools.canonical_json(a) == conductor_tools.canonical_json(b)
+
+
+def test_the_signature_covers_every_field_of_the_record_a_human_actually_signs(wired):
+    """SIGNED_KEYS is a hand-written tuple, and a key missing from it is invisible: the
+    record still carries the field, the signature still verifies, and the field can be
+    rewritten after signing with nothing to notice. Derived from a record the console
+    actually produced rather than restated here, and asserted as an EQUALITY in both
+    directions -- a subset check passes when a key is dropped from the tuple, which is the
+    exact drift being guarded.
+    """
+    tid = _mk_task(wired, cost="50")
+    wired.console.accept_task(tid, DS_USER)
+    rec = wired.tasks.items[tid]["approvals"][-1]
+    added_after_signing = {"record_sha256", "signature"}
+    meaning = set(rec) - added_after_signing
+    assert meaning == set(conductor_tools.SIGNED_KEYS), (
+        f"uncovered by the signature: {sorted(meaning - set(conductor_tools.SIGNED_KEYS))}; "
+        f"claimed but never in the record: "
+        f"{sorted(set(conductor_tools.SIGNED_KEYS) - meaning)}")
+
+
+def test_changing_any_field_the_signature_claims_to_cover_breaks_it(wired):
+    """The other half: the tuple naming a key proves nothing about whether the digest
+    depends on it. Every key is tampered in turn, so a canonicalization that silently
+    skipped one -- or a digest taken over the wrong subset -- fails here rather than in a
+    forged dispatch. The key list shrinking is caught by the equality test above; this test
+    only proves each listed key is load-bearing.
+    """
+    tid = _mk_task(wired, cost="50")
+    wired.console.accept_task(tid, DS_USER)
+    rec = wired.tasks.items[tid]["approvals"][-1]
+    assert conductor_tools.verify_record(wired.kms, rec) is True, "the fixture must verify"
+    for key in conductor_tools.SIGNED_KEYS:
+        tampered = json.loads(json.dumps(rec))
+        tampered[key] = "tampered-after-signing"
+        assert tampered[key] != rec.get(key), f"{key} was already the tampered value"
+        assert conductor_tools.verify_record(wired.kms, tampered) is False, (
+            f"{key} is named in SIGNED_KEYS and the signature does not depend on it")
+
+
+def test_a_verifier_that_raises_is_a_no_and_not_an_error(wired):
+    """The branch the forgiving double never reaches. Real KMS raises
+    KMSInvalidSignatureException on a bad signature; FakeKms returns
+    {"SignatureValid": False}, so every signature test in this file exercises the RETURN
+    path and none of them the `except`. A double more permissive than production hides
+    exactly the bugs production will have, so the lying double gets written too: whatever
+    the verifier raises -- an invalid signature, a deleted key, an AccessDenied -- the
+    answer is no.
+    """
+    tid = _mk_task(wired, cost="50")
+    wired.console.accept_task(tid, DS_USER)
+    rec = wired.tasks.items[tid]["approvals"][-1]
+
+    class RaisingKms:
+        def verify(self, **_kw):
+            raise RuntimeError("KMSInvalidSignatureException")
+
+    assert conductor_tools.verify_record(RaisingKms(), rec) is False, (
+        "a verifier that raised was read as a valid signature")
 
 
 def test_signature_field_is_excluded_from_the_signed_digest():
