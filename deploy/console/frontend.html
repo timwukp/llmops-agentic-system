@@ -668,6 +668,25 @@ function gateBand(g){
   if (g.status!=="borderline" || g[g.name+"_ci_low"]!=null) return "";
   return `<span class="sub mono">no interval reported · decided by the ±0.05 band</span>`;
 }
+// A run that has asked a human a question and is now checkpointing until it gets an answer.
+// It renders at the TOP of the run view, above the gates, because it is the only thing on the
+// page that is waiting on the reader: a checkpoint writes nothing, so before this the run
+// looked exactly like one doing its work, and the wait ends either with a directive or with
+// the agent giving up and ending the run. `turns` is a floor once the driver stops writing a
+// row per waiting turn, so it prints as `12+` rather than claiming a total it cannot see.
+function waitingBlock(w){
+  if (!w) return "";
+  const turns = w.turns>0 ? `${esc(w.turns)}${w.turnsAreFloor?"+":""} turn${w.turns===1?"":"s"} waiting` : "just paged";
+  return `<div class="row" style="margin-top:12px;border-left:3px solid #f5b342;padding-left:10px">`+
+    `<span><span class="pill warn">WAITING ON YOU</span> `+
+    `<span class="sub mono">since ${esc(w.since)}${w.stage?" · "+esc(w.stage):""} · ${turns}`+
+    `${w.runStatus?"":" · run status unreadable"}</span>`+
+    (w.situation?`<div style="margin-top:4px">${esc(w.situation)}</div>`:"")+
+    ((w.options||[]).length?`<div class="sub">options: ${w.options.map(esc).join(" · ")}</div>`:"")+
+    (w.recommendation?`<div class="sub">the agent recommends: ${esc(w.recommendation)}</div>`:"")+
+    `<div class="sub">answer it with a directive on this run — the agent picks one up at its next checkpoint.</div>`+
+    `</span></div>`;
+}
 
 // ── stage-flow diagram: 9 logical stages + remediation loop ──────────────────
 const STAGE_SUBS = {"data-prep-generate":"teacher generates","data-prep-curate":"curate + split",
@@ -829,6 +848,7 @@ async function loadRun(runId){
     let html = `<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">`+
       `<b class="mono">${esc(runId)}</b>`+
       (d.gateVerdict?`<span class="pill ${d.gateVerdict==="passed"?"ok":"err"}">gate ${esc(d.gateVerdict)}</span>`:"")+`</div>`;
+    html += waitingBlock(d.waitingOnHuman);
     // gates table
     if ((d.gates||[]).length) {
       html += `<h2 style="margin-top:12px">Quality gates</h2><table><tr><th>Gate</th><th>Threshold</th><th>Actual</th><th>Verdict</th></tr>`+

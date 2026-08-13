@@ -295,6 +295,7 @@ calls, which are the sole channel by which an agent affects the pipeline.
 | `job_launched` | long job launched (SageMaker training) | launch-and-release: park the Step Functions task token in DynamoDB keyed by job name; release the session (§4) |
 | `checkpoint` | turn budget nearing, progress persisted, **or blocked on a human decision** | re-invoke the same session to continue (self-reinvoke if the Lambda itself is near its limit). This is the platform's only **live** human-in-the-loop pause: the driver returns any parked `{"status": "directive", ...}` on the next turn, so a blocked agent keeps its run alive by checkpointing, not by escalating. |
 | `escalate_human` | out of budget or out of authority | **terminal**: SNS notification, run marked `escalated`, `EscalatedToHuman` event, task token failed → `EscalateFail` → `Fail`. `escalated` is in `UNREACHABLE_RUN_STATES`, so a directive sent afterwards is recorded for audit and reaches nobody. |
+| `page_human` | a decision a human answer *could* unblock — a borderline gate score above all | **notify without ending anything**: SNS decision brief to the run owner, an `OwnerPaged` event, and a `HumanPaged` row in *this run's own* timeline. It does **not** yield the turn and does **not** pause the stage, so a page is always followed by `checkpoint` — which is the only call a directive can arrive in. Declared on the eval harness (r6) and on the conductor. |
 
 Inside that contract, **which stage and task ran is the driver's fact, not the agent's.**
 Outputs, metrics and evidence are the agent's to report — nobody else knows them. `stage`
@@ -717,6 +718,44 @@ machine task, and because `escalated` is an unreachable run state, `put_directiv
 `checkpoint` is what they wanted: it yields the turn, keeps the run alive, and is the channel
 a directive is delivered on. Escalation is for the case where no human answer could let the
 stage continue.
+
+**A blocked run could be answered, or noticed — never both.** `checkpoint` keeps the run
+answerable and notifies nobody; `escalate_human` notifies and makes the run unanswerable.
+So the eval gate's third CI outcome — *borderline*, the one gate verdict a human answer can
+actually settle — was routed to `escalate_human`, which destroys the run the answer was for:
+the same undeliverable-verdict shape as the three-day data-prep escalation above, arrived at
+from the prompt instead of from the code. And the state that keeps a run answerable wrote
+*nothing anywhere*: a stage paging and then checkpointing until an answer arrived was
+byte-identical to a stage doing its work — same run row, same events, same execution status —
+so **the one state whose entire purpose is to get a human's attention was the one state the
+console could not show** (the third time that lesson has been paid for: §7's escalation
+wording and §5's parked-verdict rendering were the first two).
+
+`page_human` is the third channel, and the half that is easy to get wrong is the turn. A
+triage page IS terminal for the turn — deciding whether to page is a triage's whole job — but
+a *stage* page must not be: the invocation is holding a Step Functions task token, `_ack_terminal`
+does not settle it, and returning would leave `EvalGate` waiting `TimeoutSeconds: 86400` on a
+token nothing is left alive to settle. An agent that did exactly what the new prompt asks
+would hang its run for a day. The discriminator is `event.get("task_token")` — a property of
+the invocation, not of the caller's identity: `triage_event_from_bus` provably omits the key,
+because the state machine already failed the token it had.
+
+**Waiting is derived, never stored.** The console answers "is this run blocked on me right
+now?" from rows two independent writers already produce: the `HumanPaged` row, the
+`WaitingOnHuman` row the driver files on each checkpoint that follows it, and the parked
+`directive#` rows. A directive at or after the page ends the wait *at the moment it is
+parked* — delivery happens inside a live invocation the console cannot see, and asking again
+for a decision somebody already made is the false alarm that teaches an operator to ignore
+the true one. Two bounds matter: the driver stops writing waiting rows at `WAIT_ROW_CAP = 12`
+(twice the prompt's 6-checkpoint cap, since a prompt is a request and `maxIterations` is 100),
+so the console reads each row's own `waiting_turn` field — a floor — and renders `12+` rather
+than counting rows, which past the cap is not even a floor; and the derivation runs its own
+**reverse** query, because `_timeline`'s forward window returns the *oldest* rows and a paged
+run is by definition read at its newest end.
+
+Scoped deliberately: `data_prep` and `finetune` keep `{checkpoint, escalate_human}` until
+each gets protocol wording of its own. A tool declared without a protocol naming when to
+reach for it is a tool an agent reaches for at random.
 
 ## 8. The remediation loop (≤ 3 iterations)
 

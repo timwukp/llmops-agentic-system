@@ -982,6 +982,27 @@ def _record_stage_event(ddb, run_id: str, stage: str, event_name: str, detail: d
     })
 
 
+#: The stage-event name handle_page_human files a decision brief under, and the one the
+#: checkpoint branch files when the agent goes back to waiting after paging. Named
+#: constants because they are now a CONTRACT with a second reader: the console derives
+#: "this run is waiting on a human" from the pair (D12), and a run silently waiting is
+#: the state that fix exists to make visible -- so a renamed event must fail a test, not
+#: a pill. `sk` is `<iso>#<stage>#<name>`, so a reader matches on the suffix.
+PAGE_EVENT = "HumanPaged"
+WAIT_EVENT = "WaitingOnHuman"
+
+#: How many waiting turns get their own timeline row. The eval prompt caps waiting at 6
+#: checkpoints, but a prompt is a request and not an enforcement, and maxIterations is
+#: 100: an agent that ignores its cap would otherwise write a hundred rows into the
+#: timeline an operator opens to find out what happened. Twice the prompt's cap, so an
+#: agent that overshoots slightly is still fully recorded.
+#:
+#: Past the cap the driver writes nothing further, so the newest row's `waiting_turn` is
+#: a FLOOR, not a total -- the console renders it as one (`12+`) instead of counting rows,
+#: because a row count cannot even be a floor once rows stop being written.
+WAIT_ROW_CAP = 12
+
+
 #: A human verdict addressed to a run, parked where the run's own events live. The sk
 #: prefix keeps directives in one contiguous query range and out of the timeline the
 #: console renders.
@@ -1542,11 +1563,26 @@ def handle_page_human(c, event, args: dict) -> dict:
     # kept only as the last resort for an invocation that carries no subject at all,
     # which on the triage path cannot happen.
     subject_run = triage_subject(event) or str(args.get("run_id") or "")
+    # WHO is asking, read off the invocation the same way the subject is. This was the
+    # literal string "orchestrator-triage" and the stage below was the literal
+    # "orchestrator" -- correct while the orchestrator was the only harness that declared
+    # the tool, and a lie the moment a stage agent does (D12: a borderline gate is a
+    # question a human can answer, so eval needs a channel that notifies WITHOUT ending
+    # the run). An eval page would have arrived claiming to be a triage of someone
+    # else's run, been filed in a timeline the operator has no reason to open, and gone
+    # onto the bus as `stage: orchestrator`. The subject was already derived; the AUTHOR
+    # was not, and a brief whose author is wrong is a brief addressed to the wrong reader.
+    #
+    # On the triage path this derives the OLD string byte-for-byte -- TRIAGE_STAGE is
+    # "orchestrator" and TRIAGE_TASK is "triage" -- so nothing about a conductor page
+    # changes, which is why the value can be derived rather than special-cased.
+    stage = str(event.get("stage") or "") or TRIAGE_STAGE
+    task = str(event.get("task") or "")
     brief = {"run_id": subject_run,
              "situation": situation,
              "options": args.get("options") or [],
              "recommendation": recommendation,
-             "paged_by": "orchestrator-triage",
+             "paged_by": f"{stage}-{task}" if task else stage,
              "triaging_run_id": event.get("run_id", "")}
     c["sns"].publish(
         TopicArn=os.environ["LLMOPS_SNS_TOPIC"],
@@ -1568,16 +1604,16 @@ def handle_page_human(c, event, args: dict) -> dict:
     # the bus (triage_event_from_bus raises without a subject); reachable only from a
     # hand-built invocation.
     _record_stage_event(c["ddb"], subject_run or str(event.get("run_id") or ""),
-                        "orchestrator", "HumanPaged", brief)
+                        stage, PAGE_EVENT, brief)
     # OwnerPaged, NOT EscalatedToHuman. A page is what the conductor emits when it has
     # ALREADY triaged and found the decision above its authority; EscalatedToHuman means
     # "a conductor should look at this". Sharing one detail-type made the triage rule
     # feed itself the moment that rule existed -- escalate -> triage -> page -> triage --
     # and every lap is a real harness invocation billed against a decision already made.
     ev.emit_event(os.environ["EVENT_BUS"], ev.OWNER_PAGED,
-                  {"run_id": subject_run, "stage": "orchestrator",
+                  {"run_id": subject_run, "stage": stage,
                    "reason": situation[:500]}, client=c["events"])
-    return {"ok": True, "run_id": subject_run}
+    return {"ok": True, "run_id": subject_run, "stage": stage}
 
 
 def _backstop_page(c, event, outcome: dict) -> dict:
@@ -2018,12 +2054,27 @@ def _run_stage(event, context=None, c=None):
         re_asks = int(event.get("_re_asks", 0))
         filtered_turns = int(event.get("_filtered_turns", 0))
         infra_error_turns = int(event.get("_infra_error_turns", 0))
+        # A run waiting on a human waits across Lambda boundaries -- a paged agent that
+        # checkpoints until an answer arrives will cross several -- so the fact that it
+        # is waiting has to ride the continuation like every other consecutive counter.
+        # `_resumed` is the cautionary tale here: a continuation key nothing reads is a
+        # key that silently means nothing, so both of these are read at the top and used
+        # in the checkpoint branch below.
+        paged_at = str(event.get("_paged_at") or "")
+        wait_turns = int(event.get("_wait_turns", 0))
     else:
         messages = _user_text(json.dumps(payload, default=str))
         stream_retried = False
         re_asks = 0  # up to 2 CONSECUTIVE: nudge, final demand; any serviced tool call re-arms it
         filtered_turns = 0  # consecutive platform-suppressed turns; see the filtered branch
         infra_error_turns = 0  # consecutive dead-stream turns; see the outage branch
+        # Not carried over from a PREVIOUS invocation of this stage on purpose: a fresh
+        # start (resurrector wake, state-machine re-entry) re-sends the stage prompt, so
+        # the agent's own decision to wait is gone with the transcript. The page itself
+        # survives -- it is a row in the run's timeline, which is what the console reads
+        # to draw the waiting pill -- and only the per-turn marker restarts.
+        paged_at = ""
+        wait_turns = 0
 
     def _out_of_time() -> bool:
         return bool(context) and context.get_remaining_time_in_millis() < 850_000
@@ -2036,6 +2087,8 @@ def _run_stage(event, context=None, c=None):
                                 "_re_asks": re_asks,
                                 "_filtered_turns": filtered_turns,
                                 "_infra_error_turns": infra_error_turns,
+                                "_paged_at": paged_at,
+                                "_wait_turns": wait_turns,
                                 "_session_epoch": epoch,
                                 "_session_started_at": session_started_at},
                                default=str))
@@ -2386,6 +2439,28 @@ def _run_stage(event, context=None, c=None):
                 # in the toolResult here. Without this the answer channel was
                 # write-only: the agent could ask and nothing could reply.
                 directive = take_directive(c["ddb"], event["run_id"])
+                # A checkpoint after a page is the ONLY moment this system can tell a
+                # waiting run from a working one: checkpoint writes nothing anywhere, so
+                # before D12 the two were byte-identical to every reader, and "waiting on
+                # a human" was a state the operator could not see -- which is the same
+                # thing as a state the system does not have (D7, D9, twice before).
+                # A row per waiting turn, because what an operator needs is not only THAT
+                # it is waiting but how long it has been paying model tokens to wait.
+                if paged_at and not directive:
+                    wait_turns += 1
+                    if wait_turns <= WAIT_ROW_CAP:
+                        try:
+                            _record_stage_event(
+                                c["ddb"], event["run_id"], event["stage"], WAIT_EVENT,
+                                {"paged_at": paged_at, "waiting_turn": wait_turns,
+                                 "task": event.get("task", "")})
+                        except Exception as exc:  # noqa: BLE001 -- telemetry, not the wait
+                            print("[driver] waiting marker write failed (continuing): "
+                                  f"{type(exc).__name__}: {exc}")
+                elif paged_at and directive:
+                    # The answer arrived. Stop marking, so the next page starts a new
+                    # wait instead of inheriting this one's turn count.
+                    paged_at, wait_turns = "", 0
                 messages = _tool_result_content(tu, {
                     "status": "directive", "directive": directive} if directive
                     else {"status": "continue"})
@@ -2502,6 +2577,30 @@ def _run_stage(event, context=None, c=None):
                 if not result["ok"]:
                     messages = _tool_result_content(tu, {
                         "status": "rejected", "reason": result["reason"]})
+                    continue
+                if event.get("task_token"):
+                    # D12: terminal-for-the-turn is right for a TRIAGE, whose whole job
+                    # was to decide whether to page, and catastrophic for a stage. This
+                    # invocation is holding a state-machine task token; _ack_terminal
+                    # does NOT settle it, so returning here would leave EvalGate waiting
+                    # on a token no live driver will ever settle -- a run that hangs for
+                    # TimeoutSeconds (86400) after successfully asking its question. The
+                    # page is a notification, not an exit: keep the turn, and let the
+                    # agent choose checkpoint (wait, answerable) or escalate_human (give
+                    # up, terminal) with the consequence spelled out.
+                    paged_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                    wait_turns = 0
+                    messages = _tool_result_content(tu, {
+                        "status": "paged",
+                        "delivered": "SNS to the run owner, plus a HumanPaged row in "
+                                     "this run's own timeline",
+                        "next": "this page did NOT pause anything: your invocation is "
+                                "still holding the state machine's task token, and the "
+                                "stage stays in progress. To WAIT for the answer, call "
+                                "checkpoint -- a verdict arrives as the `directive` in a "
+                                "checkpoint result, and only a checkpoint can receive "
+                                "one. Do not call escalate_human to wait: that ends the "
+                                "run and makes the answer undeliverable."})
                     continue
                 _ack_terminal(c, event, sess, tu, {"status": "paged"},
                               "the page was delivered to the run owner")

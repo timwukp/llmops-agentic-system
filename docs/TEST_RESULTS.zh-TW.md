@@ -21,9 +21,9 @@
 
 | 檢查 | 結果 | 復現方式 |
 |---|---|---|
-| 單元測試（契約、成本模型、driver 迴圈、Lambda、狀態機文檔） | **1255/1255 通過** | `.venv/bin/python -m pytest tests/ -q --ignore=tests/golden` |
+| 單元測試（契約、成本模型、driver 迴圈、Lambda、狀態機文檔） | **1278/1278 通過** | `.venv/bin/python -m pytest tests/ -q --ignore=tests/golden` |
 | Shell 測試套件 —— N 路 capacity race guard（`tests/test_capacity_race_guard.sh`） | **10/10 斷言** | `bash tests/test_capacity_race_guard.sh` |
-| 反向控制 —— 逐一破壞每道 guard，確認它會失敗 | **280/280 反向控制** | `.venv/bin/python tests/negative_controls/monitor_dispatch.py` |
+| 反向控制 —— 逐一破壞每道 guard，確認它會失敗 | **293/293 反向控制** | `.venv/bin/python tests/negative_controls/monitor_dispatch.py` |
 | Harness 配置驗證（5 個專家 + 指揮家 + 審計員） | **7/7 `RESULT: OK`** | `python deploy/validate_config.py --config agents/<a>/harness.json` |
 | 架構 SVG 幾何檢查（虛線零交叉、零穿框） | **CLEAN** | `python tests/test_svg_geometry.py docs/architecture-*.svg` |
 | 遮蔽掃描（帳號 ID、憑證、帶帳號的 ARN） | CLEAN | `.github/workflows/redaction-check.yml` |
@@ -121,13 +121,13 @@ endpoint、五輪 e2e 迭代 —— 花費比這個帳戶單日花在一個沒�
 
 | 檢查 | 結果 | 重現方式 |
 |---|---|---|
-| 單元測試(全部套件,含 `test_cost_model.py` + `test_finops.py`) | **1255 passed** | `.venv/bin/python -m pytest tests/ -q` |
+| 單元測試(全部套件,含 `test_cost_model.py` + `test_finops.py`) | **1278 passed** | `.venv/bin/python -m pytest tests/ -q` |
 | Harness 配置驗證,7 個 agent | **`RESULT: OK`** | `python deploy/validate_config.py --config agents/finops/harness.json` |
 | 線上艦隊 | **7 個 harness READY** | 用 repo 內建 boto3 呼叫 `list_harnesses` |
 | 正典模組有散佈路徑 | 印出 `would upload 4 contract files` | `python deploy/03_storage.py --region us-east-1 --account-id 123456789012 --dry-run` |
 
 本次新增的每一道 guard 都做過 **mutation check**:逐一還原被斷言的行為,確認測試會
-失敗 —— **280/280 反向控制**,243 個 mutation 斷言 280 組（guard, mutation）配對,runner 各印
+失敗 —— **293/293 反向控制**,255 個 mutation 斷言 293 組（guard, mutation）配對,runner 各印
 一行 PASS。一個「有這行為也過、沒這行為也過」的測試,不是測試。
 
 這個數字是刻意寫進句子裡的。「做過 mutation check」是一個形容詞,而形容詞不會過期:
@@ -167,6 +167,19 @@ console 那條分支上根本沒有 band,所以它把整個 band 都畫成 PASS,
 每一個它回報的比例都要帶 `<metric>_ci_low/_ci_high` 與 `<family>_n`,band 只留給「沒有分母可以算區間」
 的指標當 fallback —— 並加上一條:當 `bar + band` 觸到指標天花板時,agent 必須把這件算術講出來、上報一次。
 一道把「現在的行為」寫進斷言裡的 guard,並不是「這個行為是對的」的證據。
+
+最新的十二個控制講的是一個**狀態**，而不是一個數字。一個卡住的 run **可以被回答，也可以被看見
+—— 但不能兩者兼得**：`checkpoint` 讓 run 保持可被回答卻不通知任何人，`escalate_human` 會通知卻讓
+run 變成不可回答，而 eval gate 的 *borderline* 判決 —— 唯一一種人類回答能拍板的 gate 結論 —— 被導
+向了後者。修法的一半是第三條通道（`page_human`：通知，同時讓 run 活著），另一半是一個 stage 的
+page **絕對不能**結束這一輪，因為這個 invocation 正握著一個 `_ack_terminal` 不會結清的 task token：
+`EvalGate` 會抱著它等滿 `TimeoutSeconds: 86400`，於是一個完全照 prompt 做事的 agent 會把自己的 run
+掛住一整天。兩半都做過 mutation check，圍繞它們的每一個上下界也都有 —— m245 讓等待輪數在每個
+Lambda 邊界重新計數（真實的等待必然跨好幾個，於是數字永遠讀作 1），m249 改成數存活的列、而不是讀
+每一列自己的 `waiting_turn`（過了 driver 的 12 列上限之後，數列數連下界都不算，而且對最長的等待
+低報最多），m250 讀最舊的列而不是最新的（那個提示就會剛好在等最久的長 run 上消失），m251 把
+console 的前綴比對換成狀態完全相等（一個更詳細的終止狀態會畫出一個「driver 拒絕停放其答案」的提
+示）。**操作者看不到的狀態，就是系統沒有的狀態** —— 這句話這個 repo 已經付了第三次錢。
 
 ### 兩次失敗比通過更有價值
 

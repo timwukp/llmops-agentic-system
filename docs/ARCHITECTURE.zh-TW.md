@@ -252,6 +252,7 @@ Agent 不用自由文本「彙報」—— driver 只信任結構化的 inline-f
 | `job_launched` | 長作業已發起（SageMaker 訓練） | launch-and-release：把 Step Functions task token 按 job name 停放進 DynamoDB，釋放 session（§4） |
 | `checkpoint` | 回合預算將盡、進度已持久化，**或卡在需要人類決策** | 在同一 session 重新調用以繼續（Lambda 本身臨界時自我重調）。這是平台唯一**活著**的 human-in-the-loop 暫停：driver 會在下一回合把停放的 `{"status": "directive", ...}` 回傳給 agent，所以卡住的 agent 要靠 checkpoint 保住運行，而不是靠升級。 |
 | `escalate_human` | 預算或權限耗盡 | **終止**：SNS 通知、運行標記 `escalated`、發 `EscalatedToHuman` 事件、task token 置失敗 → `EscalateFail` → `Fail`。`escalated` 在 `UNREACHABLE_RUN_STATES` 裡，所以事後送出的 directive 只會被記錄供稽核，沒有人收得到。 |
+| `page_human` | 一個人類回答**有可能**解開的決策 —— 首先就是 borderline 的 gate 分數 | **通知，但不結束任何東西**：SNS 決策 brief 給 run owner、發 `OwnerPaged` 事件、在**這個 run 自己的** timeline 上寫一列 `HumanPaged`。它**不**交還這一輪，也**不**暫停 stage，所以一次 page 後面永遠接一次 `checkpoint` —— 那是 directive 唯一能抵達的呼叫。r6 起宣告在 eval harness 上，指揮家也有。 |
 
 在這個契約裡，**跑的是哪個 stage、哪個 task，是 driver 的事實，不是 agent 的**。outputs、
 metrics、evidence 都該由 agent 回報 —— 沒有別人知道。`stage` 和 `task` 剛好相反：driver 自己
@@ -607,6 +608,40 @@ TURN-END INVARIANT 又把 `escalate_human` 寫成「卡住時」該呼叫的那�
 `escalated` 是不可達的運行狀態，`put_directive` 會回 `reachable: False`，console 也會告訴操作者
 他的裁決「CHANGES NOTHING」。他真正想要的是 `checkpoint`：讓出回合、保住運行，而且那才是
 directive 送達的通道。升級只留給「沒有任何人類答案能讓這個階段繼續」的情況。
+
+**一個卡住的 run，可以被回答，也可以被看見 —— 但不能兩者兼得。** `checkpoint` 讓 run 保持
+可被回答，卻不通知任何人；`escalate_human` 會通知，卻讓 run 變成不可回答。於是 eval gate 的
+第三種 CI 結論 —— *borderline*，唯一一種人類回答真的能拍板的 gate 判決 —— 被導向了
+`escalate_human`，而那正是會摧毀「這個答案要用的那個 run」的呼叫：與上面那筆卡了三天的
+data-prep escalation 是同一個「判決送不到」的形狀，只是這次是從 prompt、而不是從程式碼走進來
+的。更糟的是，那個讓 run 保持可被回答的狀態**什麼都沒有寫**：一個 stage 先 page、然後一直
+checkpoint 等答案，與一個正在幹活的 stage 在位元層級上完全相同 —— 一樣的 run 列、一樣的
+events、一樣的 execution 狀態 —— 所以**唯一存在目的就是引起人類注意的那個狀態，恰好是 console
+唯一看不到的狀態**（這個教訓已經付了第三次錢：§7 的 escalation 用語、§5 的已停放判決渲染是前
+兩次）。
+
+`page_human` 就是第三條通道，而最容易做錯的一半是「這一輪」。一次 triage 的 page **是**這一輪
+的終點 —— 判斷該不該 page 就是 triage 的全部工作 —— 但一個 *stage* 的 page 絕對不能是：這個
+invocation 正握著 Step Functions 的 task token，`_ack_terminal` 並不會結清它，直接 return 會讓
+`EvalGate` 抱著一個「已經沒有活著的 driver 會去結清」的 token 等滿 `TimeoutSeconds: 86400`。一個
+完全照新 prompt 做事的 agent，會把自己的 run 掛住一整天。判準是 `event.get("task_token")` ——
+一個關於 invocation 的性質，而不是關於呼叫者身分的性質：`triage_event_from_bus` 可被證明根本不
+帶這個 key，因為狀態機早就把它手上那個 token 判失敗了。
+
+**「正在等人」是推導出來的，從不儲存。** console 回答「這個 run 現在是不是卡在我身上？」，用的
+是兩個各自獨立的寫入者本來就會產生的列：`HumanPaged` 那一列、driver 在 page 之後每次 checkpoint
+寫下的 `WaitingOnHuman` 列，以及已停放的 `directive#` 列。一筆時間在 page 當下或之後的 directive
+**在被停放的那一刻**就結束了等待 —— 真正的投遞發生在 console 看不到的活 invocation 裡面，而對一
+個別人已經做過的決定再問一次，正是那種「教會操作者忽略真警報」的假警報。有兩個上界是關鍵：
+driver 在 `WAIT_ROW_CAP = 12` 就停止寫等待列（是 prompt 那 6 次 checkpoint 上限的兩倍，因為 prompt
+是請求而 `maxIterations` 是 100），所以 console 讀的是每一列自己的 `waiting_turn` 欄位 —— 一個下界
+—— 並畫成 `12+`，而不是去數列數，因為過了上界之後數列數連下界都不算；另外，這個推導跑的是它
+**自己**的反序查詢，因為 `_timeline` 的正序視窗回傳的是**最舊**的列，而一個 page 過的 run 按定義是
+從最新那一端被讀的。
+
+刻意限定範圍：`data_prep` 與 `finetune` 維持 `{checkpoint, escalate_human}`，直到各自有自己的
+protocol 文字。一個被宣告、卻沒有任何 protocol 說明何時該用它的工具，就是一個 agent 會隨機去抓
+的工具。
 
 ## 8. 補救迴路（≤ 3 次迭代）
 

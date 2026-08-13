@@ -5181,3 +5181,232 @@ def test_the_console_reads_the_field_names_the_eval_prompt_mandates(console):
     assert fam == unscorable.split("_", 1)[0], (
         f"{judged!r} and {unscorable!r} no longer share a family, so deriving one from the "
         "metric name no longer finds the other")
+
+
+# ── D12: a run waiting on a human ────────────────────────────────────────────────
+# `checkpoint` keeps a run answerable and notifies nobody; `escalate_human` notifies and
+# makes the run unanswerable. So the one state whose entire purpose is to get a human's
+# attention -- an agent that asked a question and is waiting for the answer -- wrote
+# nothing anywhere and was byte-identical to a stage doing its work. These derive it from
+# rows two independent writers now produce, and never store it.
+
+def _page_row(console, at, stage="eval", run_id="run-x", **brief):
+    """A HumanPaged row exactly as _record_stage_event writes it -- `detail` json.dumps'd,
+    `sk` = `<iso>#<stage>#<name>`."""
+    return {"run_id": run_id, "sk": f"{at}#{stage}#{console.PAGE_EVENT}",
+            "detail": json.dumps(brief)}
+
+
+def _wait_row(console, at, turn, paged_at="2026-08-01T10:00:00Z", stage="eval",
+              run_id="run-x"):
+    return {"run_id": run_id, "sk": f"{at}#{stage}#{console.WAIT_EVENT}",
+            "detail": json.dumps({"paged_at": paged_at, "waiting_turn": turn,
+                                  "task": "gate"})}
+
+
+_BRIEF = {"situation": "judge_score 0.46, Wilson CI [0.40, 0.53], n=97, bar 0.45",
+          "options": ["accept at this score", "collect more items", "re-train"],
+          "recommendation": "collect more items", "paged_by": "eval-gate"}
+
+
+def test_a_run_waiting_on_a_human_stops_looking_like_one_doing_its_work(console):
+    """The defect, stated as what the operator could not tell apart.
+
+    An eval agent that pages and then checkpoints until an answer arrives produced the
+    same run row, the same execution status and the same event stream as one running
+    inference: the checkpoint branch wrote nothing at all. D7 and D9 were this same
+    lesson -- a status the operator cannot see is a status the system does not have.
+    """
+    working = [{"run_id": "run-x", "sk": "2026-08-01T09:00:00Z#eval#stage_complete",
+                "detail": json.dumps({"i": 1})}]
+    assert console.waiting_on_human(working, [], "running") is None, \
+        "a run doing its work is being painted as waiting on somebody"
+    rows = working + [_page_row(console, "2026-08-01T10:00:00Z", **_BRIEF),
+                      _wait_row(console, "2026-08-01T10:05:00Z", 1),
+                      _wait_row(console, "2026-08-01T10:11:00Z", 2)]
+    w = console.waiting_on_human(rows, [], "running")
+    assert w, "a run that paged and went back to waiting still reads as working"
+    assert (w["since"], w["stage"], w["turns"]) == ("2026-08-01T10:00:00Z", "eval", 2), f"{w!r}"
+    assert w["turnsAreFloor"] is False, "two turns is an exact count, not a floor"
+    # The brief is the whole point: a pill saying "waiting" without the numbers and the
+    # options hands the operator back the problem and none of the analysis.
+    assert "0.46" in w["situation"] and "n=97" in w["situation"], f"{w['situation']!r}"
+    assert w["options"] == _BRIEF["options"], f"{w['options']!r}"
+    assert w["recommendation"] == "collect more items", f"{w!r}"
+    assert w["pagedBy"] == "eval-gate", (
+        f"the page does not say which stage-task asked: {w['pagedBy']!r}")
+
+
+def test_a_page_that_has_been_answered_stops_asking(console):
+    """A directive parked at or after the page IS the answer, and the wait is over at the
+    moment it is parked -- not when the agent picks it up. The console cannot see delivery
+    (take_directive runs inside a live driver invocation), and asking again for a decision
+    somebody already made is the false alarm that teaches an operator to ignore the pill.
+    """
+    rows = [_page_row(console, "2026-08-01T10:00:00Z", **_BRIEF),
+            _wait_row(console, "2026-08-01T10:05:00Z", 1)]
+    stale = [{"sk": console.DIRECTIVE_SK + "2026-08-01T09:00:00Z"}]
+    assert console.waiting_on_human(rows, stale, "running"), \
+        "a verdict parked BEFORE the page answered a question nobody had asked yet"
+    answer = [{"sk": console.DIRECTIVE_SK + "2026-08-01T10:07:00Z"}]
+    assert console.waiting_on_human(rows, stale + answer, "running") is None, \
+        "the pill keeps asking for a decision that has already been parked"
+
+
+def test_the_page_being_waited_on_is_the_newest_one(console):
+    """A stage can be answered and then blocked again on a different question. The wait is
+    a property of the LAST page, so an answered first page must not shadow a live second
+    one -- and the brief on screen must be the live question's, not the settled one's."""
+    rows = [_page_row(console, "2026-08-01T10:00:00Z", situation="first", recommendation="a"),
+            _wait_row(console, "2026-08-01T10:05:00Z", 1),
+            _page_row(console, "2026-08-01T11:00:00Z", situation="second", recommendation="b"),
+            _wait_row(console, "2026-08-01T11:05:00Z", 1, paged_at="2026-08-01T11:00:00Z")]
+    answered_first = [{"sk": console.DIRECTIVE_SK + "2026-08-01T10:30:00Z"}]
+    w = console.waiting_on_human(rows, answered_first, "running")
+    assert w, "the answer to the FIRST question closed a wait belonging to the second"
+    assert (w["since"], w["situation"]) == ("2026-08-01T11:00:00Z", "second"), f"{w!r}"
+    # ...and the older page's waiting rows do not inflate the newer page's turn count.
+    assert w["turns"] == 1, f"turns counted rows from before the page it reports: {w!r}"
+
+
+def test_a_page_on_a_run_that_has_since_ended_is_history_not_a_request(console):
+    """Nobody is waiting on a run nothing is listening for. `startswith`, matching the
+    driver's run_can_hear_a_directive exactly: the two readers disagreeing on a richer
+    terminal status means the pill solicits a decision the driver would refuse to
+    deliver. An UNREADABLE status is the opposite case and still draws the pill -- the
+    defect being closed is a run waiting in silence, and a DynamoDB miss must not
+    reinstate it."""
+    rows = [_page_row(console, "2026-08-01T10:00:00Z", **_BRIEF)]
+    for dead in console.UNREACHABLE_RUN_STATES:
+        assert console.waiting_on_human(rows, [], dead) is None, dead
+    assert console.waiting_on_human(rows, [], "escalated_by_eval") is None, \
+        "a richer terminal status reads as still-waiting here and as unreachable in the driver"
+    assert console.waiting_on_human(rows, [], "running"), "a live run's page vanished"
+    live = console.waiting_on_human(rows, [], "")
+    assert live and live["runStatus"] == "", \
+        "an unreadable run status silently withdrew the pill (and says nothing about why)"
+
+
+def test_the_waiting_turn_count_is_read_off_the_rows_not_counted_from_them(console):
+    """The driver stops writing waiting rows at WAIT_ROW_CAP, because maxIterations is 100
+    and a prompt's 6-turn cap is a request, not an enforcement. Past the cap the rows stop
+    while the wait continues -- so a count of rows is not even a floor, while the newest
+    row's own `waiting_turn` field is one. `12+`, never `12`."""
+    cap = console.WAIT_ROW_CAP
+    page = _page_row(console, "2026-08-01T10:00:00Z", **_BRIEF)
+    rows = [page] + [_wait_row(console, f"2026-08-01T10:{i * 4:02d}:00Z", i)
+                     for i in range(1, cap + 1)]
+    w = console.waiting_on_human(rows, [], "running")
+    assert (w["turns"], w["turnsAreFloor"]) == (cap, True), f"{w!r}"
+    # Rows lost to the lookback window must not shrink the number: one surviving row
+    # carries the count, where counting rows would have said 1.
+    w2 = console.waiting_on_human([page, rows[-1]], [], "running")
+    assert (w2["turns"], w2["turnsAreFloor"]) == (cap, True), (
+        f"the turn count is being counted from rows, not read from them: {w2!r}")
+    # One turn short of the cap is an exact count, so the pill must not claim a floor.
+    below = console.waiting_on_human(rows[:-1], [], "running")
+    assert (below["turns"], below["turnsAreFloor"]) == (cap - 1, False), f"{below!r}"
+
+
+def test_the_wait_derivation_reads_the_newest_rows_not_the_oldest(console, monkeypatch):
+    """_timeline's window is a FORWARD query -- its Limit=100 keeps the OLDEST 100 rows
+    (that is D13's own finding). A paged run is by definition being read at its newest
+    end, so sharing that window would drop the pill on exactly the long-running runs that
+    wait longest. Its own reverse query, with the ScanIndexForward=False asserted through
+    the table fake rather than by reading the source."""
+    tbl = _RangeTable()
+    for i in range(console.WAITING_LOOKBACK * 3):
+        tbl.put_item({"run_id": "run-x",
+                      "sk": f"2026-08-01T{i // 60:02d}:{i % 60:02d}:00Z#eval#stage_complete",
+                      "detail": json.dumps({"i": i})})
+    tbl.put_item(_page_row(console, "2026-08-01T09:00:00Z", **_BRIEF))
+    monkeypatch.setattr(console, "events_tbl", tbl)
+    rows = console._page_rows("run-x")
+    assert len(rows) == console.WAITING_LOOKBACK, f"the lookback window is not bounded: {len(rows)}"
+    assert console.waiting_on_human(rows, [], "running"), \
+        "the newest page fell outside the window the derivation reads"
+    # The same budget spent forwards -- what reusing _timeline would have given it.
+    fwd, _ = console._timeline("run-x", limit=console.WAITING_LOOKBACK)
+    assert console.waiting_on_human(fwd, [], "running") is None, (
+        "this test no longer distinguishes the two query directions, so it cannot fail "
+        "when the reverse query is lost")
+
+
+def test_the_waiting_contract_has_not_drifted_from_the_driver(console):
+    """Four constants re-declared across a bundle boundary, like DIRECTIVE_SK: the driver
+    writes the rows and the console derives the pill from them, so a rename must fail here
+    rather than silently empty the pill. Read out of the driver's SOURCE -- importing it
+    pulls in the AgentCore SDK and its env, which a guard about four literals must not
+    depend on."""
+    src = (REPO / "orchestration/harness_driver/handler.py").read_text()
+    for name in ("PAGE_EVENT", "WAIT_EVENT"):
+        m = re.search(rf'^{name}\s*=\s*"([^"]+)"', src, re.M)
+        assert m, f"the driver no longer declares {name}"
+        assert getattr(console, name) == m.group(1), (
+            f"driver files {m.group(1)!r}, console looks for {getattr(console, name)!r}")
+    m = re.search(r"^WAIT_ROW_CAP\s*=\s*(\d+)", src, re.M)
+    assert m, "the driver no longer caps its waiting rows"
+    assert console.WAIT_ROW_CAP == int(m.group(1)), (
+        f"driver stops writing at {m.group(1)}, console calls {console.WAIT_ROW_CAP} a floor")
+    m = re.search(r"^UNREACHABLE_RUN_STATES\s*=\s*\(([^)]*)\)", src, re.M)
+    assert m, "the driver no longer declares UNREACHABLE_RUN_STATES"
+    assert tuple(re.findall(r'"([^"]+)"', m.group(1))) == console.UNREACHABLE_RUN_STATES, (
+        f"the two readers disagree on which runs can hear an answer: {m.group(1)!r}")
+    # The PREDICATE too, not only the tuple: exact membership here against startswith in
+    # the driver would put the pill on a run the driver refuses to deliver to.
+    cons = (REPO / "deploy/console/lambda_function.py").read_text()
+    for who, body in (("driver", src), ("console", cons)):
+        assert "startswith(UNREACHABLE_RUN_STATES)" in body, (
+            f"the {who} no longer prefix-matches the unreachable states")
+
+
+def test_the_run_view_paints_the_wait_it_is_served(console):
+    """Serving `waitingOnHuman` and rendering nothing would repeat the defect one layer up:
+    the state exists, and nobody sees it."""
+    code = _strip_comments(_front())
+    assert "d.waitingOnHuman" in code, "run_detail serves a wait that nothing renders"
+    assert code.index("waitingBlock(d.waitingOnHuman)") < code.index("d.gates"), (
+        "the wait is painted below the gate table -- a request for a decision belongs at "
+        "the top of the run, where an operator looks first")
+    body = code[code.index("function waitingBlock"):]
+    body = body[:body.index("\nfunction ", 1)]
+    assert "if (!w) return" in body, (
+        "waitingBlock renders something when the API says the run is not waiting")
+    for want in ("WAITING ON YOU", "w.situation", "w.options", "w.recommendation",
+                 "directive"):
+        assert want in body, f"the waiting block never shows {want}"
+    assert 'w.turnsAreFloor?"+"' in body, (
+        "the turn count is painted as exact past the cap, where it is a floor")
+    assert "just paged" in body, "a page with no waiting turns yet renders as '0 turns'"
+    assert 'w.runStatus?"":' in body, (
+        "a pill drawn over an unreadable run status does not say the status was unreadable")
+    assert body.count("esc(") >= 5, "the brief is interpolated into HTML unescaped"
+
+
+def test_run_detail_serves_the_wait_beside_the_gate_rows(console, monkeypatch):
+    """End to end, through the real query: a paged run's own page must reach the payload,
+    and a run whose status says nobody is listening must not."""
+    tbl = _seed_timeline(_RangeTable(), "run-x", n_events=5, n_directives=0)
+    tbl.put_item(_page_row(console, "2026-08-09T10:00:00Z", **_BRIEF))
+    monkeypatch.setattr(console, "events_tbl", tbl)
+    monkeypatch.setattr(console, "s3", FakeS3())
+    monkeypatch.setattr(console, "data_bucket", lambda: "b")
+    monkeypatch.setattr(console, "runs_tbl", None)
+    out = console.run_detail("run-x")
+    assert "waitingError" not in out, out.get("waitingError")
+    assert out["waitingOnHuman"], "the payload does not carry the wait"
+    assert out["waitingOnHuman"]["since"] == "2026-08-09T10:00:00Z", f"{out['waitingOnHuman']!r}"
+
+    class _Runs:
+        def __init__(self, status):
+            self.status = status
+
+        def get_item(self, Key):
+            return {"Item": {"run_id": Key["run_id"], "status": self.status}}
+
+    monkeypatch.setattr(console, "runs_tbl", _Runs("failed"))
+    assert console.run_detail("run-x")["waitingOnHuman"] is None, \
+        "a page on a run that has since failed is being served as a live request"
+    monkeypatch.setattr(console, "runs_tbl", _Runs("running"))
+    live = console.run_detail("run-x")["waitingOnHuman"]
+    assert live and live["runStatus"] == "running", f"{live!r}"

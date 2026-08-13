@@ -4434,20 +4434,19 @@ case("console: the band excludes a perfect rate by one IEEE-754 representation e
 
 
 def m240(t):
-    old = (" That band is a fallback for a metric with no denominator to compute an interval"
-           " over, and it has a failure mode you must check BEFORE you apply it: if threshold"
-           " + 0.05 reaches or exceeds the highest value the metric can attain, then every"
-           " value that clears the bar is inside the band and the gate can NEVER return a"
-           " decisive pass. Say so with the arithmetic and escalate_human once, naming the bar"
-           " as the defect -- that is a property of the number the plan signed, not of this"
-           " run, and passing it silently would be inventing a decisiveness the rule does not"
-           " give you. A rate capped at 1.0 with a bar of 0.95 is exactly that case, which is"
-           " why a proportion gate must report its interval rather than lean on the band.")
-    assert t.count(old) == 1, f"the ceiling clause has moved; found {t.count(old)}"
+    # Cut the span between two SHORT anchors rather than quoting the whole clause. The first
+    # version quoted all ten lines of it and expired one PR later, when D12 rewrote the
+    # sentence in the middle to say why this escalation is the terminal one -- a control
+    # naming a literal expires the moment that literal is correctly updated, which is the
+    # assertion this file's own drift guard makes.
+    head = " That band is a fallback for a metric with no denominator"
+    tail = "lean on the band."
+    i, j = t.find(head), t.find(tail)
+    assert i > 0 and j > i, f"the ceiling clause has moved; found {i}, {j}"
     # Leaves the band and removes the check on it. The agent applies a band whose borderline
     # region contains the whole passing region and never says so, so the operator sees an
     # escalation on a met gate and no reason for it.
-    return t.replace(old, "", 1)
+    return t[:i] + t[j + len(tail):]
 
 
 case("prompt: the band is stated with no check that it leaves a passing region at all, so a "
@@ -4488,6 +4487,204 @@ case("console: a bounds-decided borderline row is captioned as decided by the ba
      "page names a rule that did not run on the numbers printed beside it",
      "deploy/console/frontend.html", m242,
      [f"{_TC}test_a_scalar_borderline_says_which_rule_produced_it"])
+
+
+# ── D12: a blocked run could be answered, or noticed, never both ──────────────────────
+# Twelve controls over the third channel. The defect they protect against is not a wrong
+# number -- it is a run that asks a human a question and then looks exactly like a run
+# doing its work, which is how a waiting stage burned model tokens invisibly and how a
+# borderline gate verdict got routed through the one call that destroys the run the answer
+# was for.
+
+def m243(t):
+    old = '                if event.get("task_token"):'
+    assert t.count(old) == 1, f"the page branch's token guard has moved; found {t.count(old)}"
+    # Makes every page terminal-for-the-turn again -- correct for a triage, catastrophic for
+    # a stage: _ack_terminal does NOT settle the task token, so EvalGate waits its full
+    # TimeoutSeconds (86400) on a token no live driver will ever settle. The agent did
+    # exactly what the new prompt asks and hung the run for a day.
+    return t.replace(old, "                if False:  # every page ends the turn", 1)
+
+
+case("driver: a page from an invocation holding a task token ends the turn, so EvalGate "
+     "waits 86400s on a token nothing is left alive to settle",
+     _DRIVER, m243,
+     [f"{_DRV}::test_a_stage_page_does_not_end_a_turn_that_is_holding_a_task_token"])
+
+
+def m244(t):
+    old = "                if paged_at and not directive:"
+    assert t.count(old) == 1, f"the waiting-marker branch has moved; found {t.count(old)}"
+    # Back to a checkpoint that writes NOTHING. A stage waiting on a human and a stage doing
+    # its work become byte-identical again -- same run row, same events, same execution
+    # status -- and the console's pill has no rows to derive from.
+    return t.replace(old, "                if False:  # a checkpoint records nothing", 1)
+
+
+case("driver: a checkpoint after a page leaves no trace, so a run waiting on a human is "
+     "indistinguishable from one doing its work",
+     _DRIVER, m244,
+     [f"{_DRV}::test_a_checkpoint_after_a_page_records_that_the_run_is_waiting"])
+
+
+def m245(t):
+    old = '        wait_turns = int(event.get("_wait_turns", 0))'
+    assert t.count(old) == 1, f"the continuation's wait counter has moved; found {t.count(old)}"
+    # Refills the counter on every self-reinvoke. A human answer takes minutes and one
+    # invocation is 900s, so a real wait crosses boundaries by construction: the count would
+    # read 1 forever, which is precisely the number that makes a long wait look like a fresh
+    # one. Same shape as the re_asks budget that silently refilled.
+    return t.replace(old, "        wait_turns = 0  # restart the count each invocation", 1)
+
+
+case("driver: the waiting-turn count restarts at every Lambda boundary, so a wait that has "
+     "crossed six invocations reports its first turn",
+     _DRIVER, m245,
+     [f"{_DRV}::test_the_wait_survives_the_lambda_boundary_it_will_certainly_cross"])
+
+
+def m246(t):
+    old = "                elif paged_at and directive:"
+    assert t.count(old) == 1, f"the answered-page reset has moved; found {t.count(old)}"
+    # The answer arrives and the run keeps recording itself as waiting for it, so the console
+    # keeps asking the operator for a decision they already made -- the false alarm that
+    # teaches them to ignore the true one.
+    return t.replace(old, "                elif False:  # the answer changes nothing", 1)
+
+
+case("driver: a delivered verdict does not end the wait, so the run keeps asking for a "
+     "decision the operator already made",
+     _DRIVER, m246,
+     [f"{_DRV}::test_the_answer_arriving_ends_the_wait"])
+
+
+def m247(t):
+    old = '"paged_by": f"{stage}-{task}" if task else stage,'
+    assert t.count(old) == 1, f"the paged_by derivation has moved; found {t.count(old)}"
+    # Back to the hardcoded triage label. Every page from any stage claims to come from the
+    # conductor's triage, so the one field that says who is blocked names the wrong thing --
+    # on the eval gate, the case the whole channel was built for.
+    return t.replace(old, '"paged_by": "orchestrator-triage",', 1)
+
+
+case("driver: every page is credited to the conductor's triage, so an eval gate's page names "
+     "a stage that was never involved",
+     _DRIVER, m247,
+     [f"{_DRV}::test_a_stage_page_is_filed_on_its_own_run_under_the_stage_that_asked"])
+
+
+def m248(t):
+    old = "    for d in directives:"
+    assert t.count(old) == 1, f"the answered-page check has moved; found {t.count(old)}"
+    # The pill never stops asking. A verdict parked at 13:45 leaves the run soliciting the
+    # same decision for the rest of its life, which is how an operator learns that the amber
+    # block means nothing.
+    return t.replace(old, "    for d in []:", 1)
+
+
+case("console: a page that has already been answered keeps asking, so the pill outlives the "
+     "verdict that settled it",
+     _CN, m248,
+     [f"{_TC}test_a_page_that_has_been_answered_stops_asking"])
+
+
+def m249(t):
+    old = '            turns = max(turns, int(_detail_of(e).get("waiting_turn") or 0))'
+    assert t.count(old) == 1, f"the turn read has moved; found {t.count(old)}"
+    # Counts rows instead of reading the field. The driver stops writing rows at
+    # WAIT_ROW_CAP and the lookback window is 40 rows, so a count is not even a FLOOR: a run
+    # that has waited 30 turns reports whatever survived, and the longest waits under-report
+    # the worst.
+    return t.replace(old, "            turns += 1", 1)
+
+
+case("console: waiting turns are counted from surviving rows rather than read off them, so a "
+     "wait past the driver's row cap under-reports itself",
+     _CN, m249,
+     [f"{_TC}test_the_waiting_turn_count_is_read_off_the_rows_not_counted_from_them"])
+
+
+def m250(t):
+    old = '        ScanIndexForward=False, Limit=WAITING_LOOKBACK).get("Items", [])'
+    assert t.count(old) == 1, f"the page-row query has moved; found {t.count(old)}"
+    # Reads the OLDEST 40 rows, which is the defect _timeline still has. A page is by
+    # definition at the newest end of the timeline, so the pill disappears on exactly the
+    # long-running runs that wait longest -- and a run with no page at all looks identical.
+    return t.replace(old, '        Limit=WAITING_LOOKBACK).get("Items", [])', 1)
+
+
+case("console: the wait derivation reads the oldest rows, so the pill vanishes on precisely "
+     "the long runs whose waits cost the most",
+     _CN, m250,
+     [f"{_TC}test_the_wait_derivation_reads_the_newest_rows_not_the_oldest"])
+
+
+def m251(t):
+    old = "    if str(run_status).startswith(UNREACHABLE_RUN_STATES):"
+    assert t.count(old) == 1, f"the reachability check has moved; found {t.count(old)}"
+    # Exact membership instead of the driver's prefix match. A richer terminal status
+    # ("escalated_by_eval") reads as still-waiting here and as undeliverable in
+    # run_can_hear_a_directive, so the console solicits a verdict the driver will refuse to
+    # park -- the undeliverable-verdict shape of #16, one layer up.
+    return t.replace(old, "    if str(run_status) in UNREACHABLE_RUN_STATES:", 1)
+
+
+case("console: reachability is decided by exact status match while the driver prefix-matches, "
+     "so a richer terminal status draws a pill whose answer cannot be delivered",
+     _CN, m251,
+     [f"{_TC}test_a_page_on_a_run_that_has_since_ended_is_history_not_a_request",
+      f"{_TC}test_the_waiting_contract_has_not_drifted_from_the_driver"])
+
+
+def m252(t):
+    # Short spans, not the paragraph: the protocol wording will be edited again, and a control
+    # that quotes all of it expires the moment it is correctly reworded.
+    head = "and do NOT reach for escalate_human"
+    tail = "an unbounded wait is a cost with no owner."
+    i, j = t.find(head), t.find(tail)
+    assert i > 0 and j > i, f"the borderline protocol has moved; found {i}, {j}"
+    # Restores the original routing verbatim. escalate_human ENDS the run: `escalated` is in
+    # UNREACHABLE_RUN_STATES, so resolve_escalation refuses to park a verdict for it and no
+    # checkpoint will ever run again to receive one. The gate asks its question through the
+    # door it just locked.
+    return t[:i] + ("and call escalate_human with judge_score, both bounds, judge_n, and the "
+                    "threshold.") + t[j + len(tail):]
+
+
+case("prompt: a borderline gate score is routed to escalate_human again, which ends the run "
+     "the human answer was for",
+     _EV, m252,
+     [f"{_TO}test_a_borderline_gate_score_no_longer_routes_to_the_call_that_ends_the_run"])
+
+
+def m253(t):
+    old = '    "escalate_human",\n    "page_human"\n  ],'
+    assert t.count(old) == 1, f"the allowedTools tail has moved; found {t.count(old)}"
+    # Declared and not allowed -- the exact half-wiring page_human shipped with on the triage
+    # path, where every call answered "unsupported" and the owner was never told. The prompt
+    # still instructs the agent to page, so it burns turns on a tool that cannot fire.
+    return t.replace(old, '    "escalate_human"\n  ],', 1)
+
+
+case("prompt: page_human is described in the protocol and left out of allowedTools, so every "
+     "page answers 'unsupported' and nobody is told",
+     _EV, m253,
+     [f"{_TO}test_the_eval_agent_can_ask_a_question_that_can_still_be_answered"])
+
+
+def m254(t):
+    old = '${w.turnsAreFloor?"+":""}'
+    assert t.count(old) == 1, f"the floor marker has moved; found {t.count(old)}"
+    # Prints the cap as an exact count. "12 turns waiting" on a run that has waited 40 is a
+    # number in no row, and it is wrong in the flattering direction -- the longer the wait,
+    # the more the page under-states it.
+    return t.replace(old, "", 1)
+
+
+case("console page: a waiting count past the driver's row cap is painted as exact, so the "
+     "longest waits are the most under-stated",
+     "deploy/console/frontend.html", m254,
+     [f"{_TC}test_the_run_view_paints_the_wait_it_is_served"])
 
 
 #: Where the pristine text of the file currently mutated is parked, so a kill -9 -- which

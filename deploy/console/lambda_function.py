@@ -705,6 +705,106 @@ def _timeline(run_id, limit=100):
     return evs, dirs
 
 
+#: The two stage-event names the driver files when an agent asks a human for a decision
+#: and then goes back to waiting for it (its PAGE_EVENT / WAIT_EVENT). Re-declared here
+#: for the same reason as DIRECTIVE_SK -- separate bundles, with a test pinning them to
+#: the driver's constants, so a rename fails a test instead of silently emptying the
+#: pill below. `sk` is `<iso>#<stage>#<name>`, so the match is on the suffix.
+PAGE_EVENT = "HumanPaged"
+WAIT_EVENT = "WaitingOnHuman"
+
+#: The driver's WAIT_ROW_CAP: past this many waiting turns it stops writing rows, so the
+#: newest `waiting_turn` is a floor and the pill says `12+` rather than `12`.
+WAIT_ROW_CAP = 12
+
+#: A run in one of these states is not waiting for anybody -- the driver's
+#: UNREACHABLE_RUN_STATES, pinned to it by a test. A page on a run that has since ended
+#: is history, and painting "waiting on you" over it is the false alarm that teaches an
+#: operator to ignore the true one.
+UNREACHABLE_RUN_STATES = ("escalated", "failed", "completed", "stopped")
+
+#: How many of the NEWEST timeline rows the waiting derivation reads. Its own query,
+#: reverse-ordered, rather than reusing _timeline's forward window: that window is the
+#: OLDEST rows and a paged run is by definition being read at its newest end, so sharing
+#: it would drop the pill exactly on the long runs that wait longest.
+WAITING_LOOKBACK = 40
+
+
+def _page_rows(run_id):
+    """The newest timeline rows for `run_id`, for the waiting derivation only."""
+    if not events_tbl:
+        return []
+    return events_tbl.query(
+        KeyConditionExpression=Key("run_id").eq(run_id) & Key("sk").lt(TIMELINE_SK_MAX),
+        ScanIndexForward=False, Limit=WAITING_LOOKBACK).get("Items", [])
+
+
+def _detail_of(row):
+    """A stage event's `detail`, which _record_stage_event json.dumps but the console's
+    own writers store as a mapping. Either shape, never an exception."""
+    d = row.get("detail")
+    if isinstance(d, str):
+        try:
+            d = json.loads(d)
+        except Exception:  # noqa: BLE001 -- a malformed detail is not a reason to hide a page
+            return {}
+    return d if isinstance(d, dict) else {}
+
+
+def waiting_on_human(events, directives, run_status=""):
+    """Is this run blocked on a human decision right now? -> brief, or None.
+
+    D12: `checkpoint` (the only channel that keeps a run answerable) writes NOTHING
+    anywhere, and `escalate_human` (the only channel that notified) ends the run. A stage
+    that pages and then checkpoints until an answer arrives was therefore byte-identical
+    to a stage doing its work -- same events, same run row, same execution status -- so
+    the one state whose whole purpose is to get a human's attention was the one state the
+    console could not show. D7 and D9 were the same lesson twice: a status the operator
+    cannot see is a status the system does not have.
+
+    Derived, never stored. The inputs are rows two independent writers already produce:
+    a HumanPaged row (handle_page_human), the WaitingOnHuman rows the driver files on each
+    checkpoint that follows it, and the directive rows put_directive parks. A directive
+    parked at or after the page is the answer arriving -- take_directive delivers it in
+    the agent's next checkpoint result -- so the wait is over even before delivery, and
+    the pill must not keep asking for a decision somebody already made.
+
+    `turns` counts waiting turns from the rows' own `waiting_turn` field rather than by
+    counting rows, because the driver stops writing rows at WAIT_ROW_CAP: a count of rows
+    is not even a floor once rows stop, while the last field value is one.
+    """
+    # `startswith`, not `in`, to match run_can_hear_a_directive exactly: the driver treats
+    # a RICHER terminal status ("escalated_by_eval") as unreachable, and the two readers
+    # disagreeing means the pill asks for a decision on a run the driver has already
+    # declared undeliverable. An unreadable status is "" -- which starts with none of them,
+    # so a DynamoDB miss still draws the pill.
+    if str(run_status).startswith(UNREACHABLE_RUN_STATES):
+        return None
+    pages = [e for e in events if str(e.get("sk", "")).endswith("#" + PAGE_EVENT)]
+    if not pages:
+        return None
+    sk = str(max(pages, key=lambda e: str(e.get("sk", "")))["sk"])
+    page = next(e for e in pages if str(e.get("sk", "")) == sk)
+    parts = sk.split("#")
+    since, stage = parts[0], (parts[1] if len(parts) > 2 else "")
+    for d in directives:
+        if str(d.get("sk", ""))[len(DIRECTIVE_SK):] >= since:
+            return None
+    turns = 0
+    for e in events:
+        if (str(e.get("sk", "")).endswith("#" + WAIT_EVENT)
+                and str(e.get("sk", "")).split("#")[0] >= since):
+            turns = max(turns, int(_detail_of(e).get("waiting_turn") or 0))
+    brief = _detail_of(page)
+    return {"since": since, "stage": stage, "turns": turns,
+            "turnsAreFloor": turns >= WAIT_ROW_CAP,
+            "situation": str(brief.get("situation", ""))[:600],
+            "recommendation": str(brief.get("recommendation", ""))[:400],
+            "options": [str(o)[:200] for o in (brief.get("options") or [])][:6],
+            "pagedBy": str(brief.get("paged_by", "")),
+            "runStatus": str(run_status)}
+
+
 #: Gate row verdicts. `passed` stays a tri-state boolean for whoever already reads it; this
 #: says WHY, which is the whole content of D6 -- three different situations were all painting
 #: the same `n/a` pill, and one of them was a gate the run had actually failed.
@@ -935,7 +1035,7 @@ def gate_row(name, threshold, metrics, eval_reported):
 # ── /api/run: manifest + stage events + training job + gate verdict ──────────
 def run_detail(run_id):
     out = {"runId": run_id, "manifest": None, "events": [], "directives": [], "gates": [],
-           "gateVerdict": None, "trainingJob": None}
+           "gateVerdict": None, "trainingJob": None, "waitingOnHuman": None}
     if not run_id:
         return {"error": "run_id required"}
     try:
@@ -990,12 +1090,27 @@ def run_detail(run_id):
     elif eval_reported and (man.get("params") or {}).get("ood_eval_uri"):
         out["oodMissing"] = str((man["params"])["ood_eval_uri"])
     # training job (tolerate missing): job_name lives on the runs-table item
-    job_name = ""
+    job_name, run_status = "", ""
     if runs_tbl:
         try:
-            job_name = str(runs_tbl.get_item(Key={"run_id": run_id}).get("Item", {}).get("job_name", ""))
+            row = runs_tbl.get_item(Key={"run_id": run_id}).get("Item", {})
+            job_name = str(row.get("job_name", ""))
+            run_status = str(row.get("status", ""))
         except Exception:
             pass
+    # Waiting on a human (D12) -- derived from rows already on file, so it costs one
+    # reverse query and stores nothing. An UNREADABLE status still draws the pill: the
+    # defect this closes is a run waiting in silence, and a DynamoDB miss must not put it
+    # back. `runStatus` rides along so the frontend can say what it knew.
+    if events_tbl:
+        try:
+            # The projected directive views, not a fresh query: _directive_view carries
+            # `sk`, which is the only field this needs, and re-querying the same partition
+            # for the same rows is a second chance to disagree with the list on screen.
+            out["waitingOnHuman"] = waiting_on_human(
+                _page_rows(run_id), out["directives"], run_status)
+        except Exception as e:
+            out["waitingError"] = str(e)[:150]
     if job_name:
         try:
             tj = sm.describe_training_job(TrainingJobName=job_name)
