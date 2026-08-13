@@ -4192,6 +4192,46 @@ case("docs: the architecture diagram deep-links a trainer no run can reach, so a
       "test_the_training_card_links_the_trainer_the_deploy_actually_mirrors"])
 
 
+#: The measurement instrument's own bookkeeping. Both of these were REAL defects in the
+#: offline analysis that produced deploy/evidence/SCALING_DIAGNOSIS_r6c_8B.md, under exactly
+#: the two-layer conditions the score bullet now asks an in-run agent to reproduce -- so they
+#: are registered as controls for the same reason the trainer ones are: they are not
+#: hypothetical regressions, they are the state the work was in when nothing looked wrong.
+_EV = "agents/eval/harness.json"
+_TO = "tests/test_orchestration.py::"
+
+
+def m227(t):
+    old = ("and every join you do -- pairing an item's A-position verdict with its B-position "
+           "verdict, aggregating a layer -- MUST key on layer plus item_id, never on a row "
+           "number or a per-file index.")
+    assert t.count(old) == 1, f"the layer-keying rule has moved; found {t.count(old)}"
+    # The plausible weakening, not a deletion: keep the fields, drop the rule about the key.
+    # Fields nothing is required to JOIN on are decoration -- the offline run had the layer
+    # in every row too, and still cross-paired 40 items.
+    return t.replace(old, "", 1)
+
+
+case("eval: judge rows carry a layer nothing is required to key on, so an ID item's "
+     "A-position verdict pairs with an OOD item's B-position verdict (40 of 137 offline)",
+     _EV, m227,
+     [f"{_TO}test_the_score_bullet_keys_two_layers_apart_and_reconciles_each_denominator"])
+
+
+def m228(t):
+    old = "assert judge_n + judge_unscorable == items_in_layer"
+    assert t.count(old) == 1, f"the reconciliation rule has moved; found {t.count(old)}"
+    # "report it" instead of "check it": the number is present, unchecked, and the interval
+    # is computed anyway -- narrower, around a sample nobody chose.
+    return t.replace(old, "report judge_n and judge_unscorable", 1)
+
+
+case("eval: the per-layer denominator is reported and never reconciled, so losing items "
+     "TIGHTENS the Wilson interval and the gate decides on a set nobody chose",
+     _EV, m228,
+     [f"{_TO}test_the_score_bullet_keys_two_layers_apart_and_reconciles_each_denominator"])
+
+
 #: Where the pristine text of the file currently mutated is parked, so a kill -9 -- which
 #: no handler can intercept -- still leaves the original recoverable. Under the repo root
 #: rather than /tmp because it must be obvious to whoever finds the tree dirty, and
