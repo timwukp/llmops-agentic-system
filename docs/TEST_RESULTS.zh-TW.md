@@ -21,9 +21,9 @@
 
 | 檢查 | 結果 | 復現方式 |
 |---|---|---|
-| 單元測試（契約、成本模型、driver 迴圈、Lambda、狀態機文檔） | **1278/1278 通過** | `.venv/bin/python -m pytest tests/ -q --ignore=tests/golden` |
+| 單元測試（契約、成本模型、driver 迴圈、Lambda、狀態機文檔） | **1290/1290 通過** | `.venv/bin/python -m pytest tests/ -q --ignore=tests/golden` |
 | Shell 測試套件 —— N 路 capacity race guard（`tests/test_capacity_race_guard.sh`） | **10/10 斷言** | `bash tests/test_capacity_race_guard.sh` |
-| 反向控制 —— 逐一破壞每道 guard，確認它會失敗 | **293/293 反向控制** | `.venv/bin/python tests/negative_controls/monitor_dispatch.py` |
+| 反向控制 —— 逐一破壞每道 guard，確認它會失敗 | **309/309 反向控制** | `.venv/bin/python tests/negative_controls/monitor_dispatch.py` |
 | Harness 配置驗證（5 個專家 + 指揮家 + 審計員） | **7/7 `RESULT: OK`** | `python deploy/validate_config.py --config agents/<a>/harness.json` |
 | 架構 SVG 幾何檢查（虛線零交叉、零穿框） | **CLEAN** | `python tests/test_svg_geometry.py docs/architecture-*.svg` |
 | 遮蔽掃描（帳號 ID、憑證、帶帳號的 ARN） | CLEAN | `.github/workflows/redaction-check.yml` |
@@ -121,13 +121,13 @@ endpoint、五輪 e2e 迭代 —— 花費比這個帳戶單日花在一個沒�
 
 | 檢查 | 結果 | 重現方式 |
 |---|---|---|
-| 單元測試(全部套件,含 `test_cost_model.py` + `test_finops.py`) | **1278 passed** | `.venv/bin/python -m pytest tests/ -q` |
+| 單元測試(全部套件,含 `test_cost_model.py` + `test_finops.py`) | **1290 passed** | `.venv/bin/python -m pytest tests/ -q` |
 | Harness 配置驗證,7 個 agent | **`RESULT: OK`** | `python deploy/validate_config.py --config agents/finops/harness.json` |
 | 線上艦隊 | **7 個 harness READY** | 用 repo 內建 boto3 呼叫 `list_harnesses` |
 | 正典模組有散佈路徑 | 印出 `would upload 4 contract files` | `python deploy/03_storage.py --region us-east-1 --account-id 123456789012 --dry-run` |
 
 本次新增的每一道 guard 都做過 **mutation check**:逐一還原被斷言的行為,確認測試會
-失敗 —— **293/293 反向控制**,255 個 mutation 斷言 293 組（guard, mutation）配對,runner 各印
+失敗 —— **309/309 反向控制**,267 個 mutation 斷言 309 組（guard, mutation）配對,runner 各印
 一行 PASS。一個「有這行為也過、沒這行為也過」的測試,不是測試。
 
 這個數字是刻意寫進句子裡的。「做過 mutation check」是一個形容詞,而形容詞不會過期:
@@ -180,6 +180,22 @@ Lambda 邊界重新計數（真實的等待必然跨好幾個，於是數字永�
 低報最多），m250 讀最舊的列而不是最新的（那個提示就會剛好在等最久的長 run 上消失），m251 把
 console 的前綴比對換成狀態完全相等（一個更詳細的終止狀態會畫出一個「driver 拒絕停放其答案」的提
 示）。**操作者看不到的狀態，就是系統沒有的狀態** —— 這句話這個 repo 已經付了第三次錢。
+
+**D13 —— 在排序之前取的窗口，就是雜湊順序上的窗口（十二個控制，m255-m266）。** console 裡每一個
+列表都是先 `scan(Limit=N)` 再按時間排序，於是 `Limit` 砍掉的並不是最舊的列：Scan 的項目順序在文件
+上就是未定義的，它砍掉的是剛好落在分頁邊界之後的那些。在 live `llmops-tasks` 表上量到（35 列，
+`Limit=25`）：**最新的 25 個 consultation 有 6 個不在列表上**，其中一個狀態是 `error`，另一個是等
+待人類簽名的 `drafting`，而 6 個更舊的被擺在它們的位置上。同一形狀還有四處，其中三處目前仍是潛伏
+的：run 列表（超過 60 個 run 之後是任意窗口 —— 操作者剛啟動的那個 run 可能不在裡面，而找不到的 run
+會被再啟動一次），`list_optimizations`（窗口取在 `opt-` 過濾之前，於是草稿讀起來像從未存在），成本
+估算的 GSI fallback（docstring 承諾 newest-first，實際給雜湊順序），以及 `_timeline` —— 它的 events
+那一半把預算花在**正向**，而 directives 那一半早就是反向的：同一個函式，兩個方向。最後這一項是值得
+點名的交互作用：在 run 只有約 16 個事件時它無害，而 D12 把上限抬到約 150（`WAIT_ROW_CAP` 是每個
+stage invocation 12 列），所以**是上一個修正把真實事件數推過了這一個的窗口**。控制盯住的正是「一個
+數字」與「一個錯的數字」之間的差別：m261 用 `len == limit` 推斷截斷、而不是多讀一列（剛好 100 個事
+件的 run 會聲稱有沒人讀到的歷史），m262 送出反向窗口卻不還原時間順序（於是前端 `slice(-25)` 畫的是
+最新 100 筆裡最舊的 25 筆 —— 兩端都不對的窗口），m256/m257/m263/m264/m265 各自在「從查詢到畫面」
+的路上丟掉一個截斷標記。一個不說自己被封頂的列表讀起來就是完整的，那是同一個缺陷往上一層。
 
 ### 兩次失敗比通過更有價值
 

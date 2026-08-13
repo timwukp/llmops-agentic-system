@@ -22,9 +22,9 @@ page is its ledger.
 
 | Check | Result | How to reproduce |
 |---|---|---|
-| Unit tests (contracts, cost model, driver loop, Lambdas, state machine document) | **1278/1278 passed** | `.venv/bin/python -m pytest tests/ -q --ignore=tests/golden` |
+| Unit tests (contracts, cost model, driver loop, Lambdas, state machine document) | **1290/1290 passed** | `.venv/bin/python -m pytest tests/ -q --ignore=tests/golden` |
 | Shell suite — N-way capacity race guard (`tests/test_capacity_race_guard.sh`) | **10/10 assertions** | `bash tests/test_capacity_race_guard.sh` |
-| Negative controls — every guard broken in turn, confirmed to fail | **293/293 negative controls** | `.venv/bin/python tests/negative_controls/monitor_dispatch.py` |
+| Negative controls — every guard broken in turn, confirmed to fail | **309/309 negative controls** | `.venv/bin/python tests/negative_controls/monitor_dispatch.py` |
 | Harness config validation (5 specialists + conductor + auditor) | **7/7 `RESULT: OK`** | `python deploy/validate_config.py --config agents/<a>/harness.json` |
 | Architecture SVG geometry (no wire crossings, no wire through a card) | **CLEAN** | `python tests/test_svg_geometry.py docs/architecture-*.svg` |
 | Redaction scan (account IDs, credentials, account-bearing ARNs) | CLEAN | `.github/workflows/redaction-check.yml` |
@@ -133,14 +133,14 @@ Full record: [VERIFICATION_finops.md](../deploy/evidence/VERIFICATION_finops.md)
 
 | Check | Result | How to reproduce |
 |---|---|---|
-| Unit tests (all suites, incl. `test_cost_model.py` + `test_finops.py`) | **1278 passed** | `.venv/bin/python -m pytest tests/ -q` |
+| Unit tests (all suites, incl. `test_cost_model.py` + `test_finops.py`) | **1290 passed** | `.venv/bin/python -m pytest tests/ -q` |
 | Harness config validation, 7 agents | **`RESULT: OK`** | `python deploy/validate_config.py --config agents/finops/harness.json` |
 | Live fleet | **7 harnesses READY** | `list_harnesses` via the repo's vendored boto3 |
 | Canonical module has a distribution path | prints `would upload 4 contract files` | `python deploy/03_storage.py --region us-east-1 --account-id 123456789012 --dry-run` |
 
 Every guard added in this work was **mutation-checked**: the asserted behaviour was
-reverted one at a time and the test confirmed to fail — **293/293 negative controls**, 255
-mutations asserting 293 (guard, mutation) pairs, one printed PASS line each. A test that
+reverted one at a time and the test confirmed to fail — **309/309 negative controls**, 267
+mutations asserting 309 (guard, mutation) pairs, one printed PASS line each. A test that
 passes both with and against the behaviour it names is not a test.
 
 The count is in the sentence on purpose. "Mutation-checked" is an adjective, and an
@@ -206,6 +206,29 @@ long runs that wait longest), and m251 swaps the console's prefix match for exac
 equality (a richer terminal status would draw a pill whose answer the driver refuses to park).
 A state the operator cannot see is a state the system does not have — the third time this
 repo has paid for that sentence.
+
+**D13 — a window taken before the ordering is a window on hash order (twelve controls,
+m255-m266).** Every list in the console read `scan(Limit=N)` and *then* sorted by time, so
+`Limit` did not trim the oldest rows: a Scan's item order is documented as unspecified, and
+what it trimmed was whatever fell past the page boundary. Measured on the live `llmops-tasks`
+table (35 rows, `Limit=25`): **6 of the 25 newest consultations were absent from the list**,
+among them one in status `error` and one `drafting` consultation waiting on a human signature,
+while 6 older ones were shown in their place. The same shape sat in four more places, three of
+them still latent: the run list (arbitrary window past 60 runs — so the run an operator just
+started can be missing, and a run that cannot be found is a run that gets started again),
+`list_optimizations` (the window came before the `opt-` filter, so drafts read as never having
+existed), the estimates GSI fallback (hash order under a docstring promising newest-first), and
+`_timeline`, whose events half spent its budget FORWARDS while its directives half already read
+in reverse — one function, two directions. That last one is the interaction worth naming: it was
+harmless while runs held ~16 events, and D12 raised the ceiling to ~150 (`WAIT_ROW_CAP` is 12
+rows per stage invocation), so **the previous fix pushed the real event count past this one's
+window**. The controls pin the parts that make the difference between a number and a wrong
+number: m261 infers truncation from `len == limit` instead of reading one extra row (a run with
+exactly 100 events would claim history nobody read), m262 serves the reverse window without
+restoring time order (so the frontend's `slice(-25)` paints the oldest 25 of the newest 100 — a
+window that is right at neither end), and m256/m257/m263/m264/m265 each drop one truncation
+marker on its way from the query to the screen. A capped list that does not say it is capped
+reads as complete, which is the same defect one level up.
 
 ### Two failures worth more than the passes
 

@@ -4554,6 +4554,7 @@ class _RangeTable:
         self.name = name
         self.rows = []
         self.queries = []          # every KeyConditionExpression seen, in order
+        self.query_kw = []         # and every kwarg set, so direction is assertable
 
     def put_item(self, Item):
         self.rows.append(dict(Item))
@@ -4582,6 +4583,7 @@ class _RangeTable:
     def query(self, **kw):
         cond = kw["KeyConditionExpression"]
         self.queries.append(cond)
+        self.query_kw.append(dict(kw))   # so a test can ask which END was read
         preds = self._preds(cond)
         hits = [dict(r) for r in self.rows if all(p(r) for p in preds)]
         hits.sort(key=lambda r: str(r.get("sk", "")),
@@ -4615,10 +4617,10 @@ def test_a_parked_verdict_never_displaces_a_stage_event(console, monkeypatch):
     """
     tbl = _seed_timeline(_RangeTable(), "run-x")
     monkeypatch.setattr(console, "events_tbl", tbl)
-    evs, dirs = console._timeline("run-x")
+    evs, dirs, older = console._timeline("run-x")
     assert [e for e in evs if str(e["sk"]).startswith("directive#")] == [], \
         "a verdict is being served as a stage event"
-    assert len(evs) == 30 and len(dirs) == 10
+    assert len(evs) == 30 and len(dirs) == 10 and older is False
     # the window the frontend actually paints must be all real events
     assert all(not str(e["sk"]).startswith("directive#") for e in evs[-25:])
 
@@ -4633,9 +4635,10 @@ def test_the_events_query_is_bounded_in_dynamodb_not_in_python(console, monkeypa
     """
     tbl = _seed_timeline(_RangeTable(), "run-x")
     monkeypatch.setattr(console, "events_tbl", tbl)
-    evs, dirs = console._timeline("run-x", limit=10)
+    evs, dirs, older = console._timeline("run-x", limit=10)
     assert len(evs) == 10, "the Limit was spent on rows that are not stage events"
     assert len(tbl.queries) == 2, "the split must happen in DynamoDB, not after"
+    assert older is True, "30 events served 10 deep must report that older ones exist"
 
 
 def test_an_unknown_sk_prefix_cannot_displace_an_event_either(console, monkeypatch):
@@ -4656,7 +4659,7 @@ def test_an_unknown_sk_prefix_cannot_displace_an_event_either(console, monkeypat
                "finding#2026-08-01T09:00:00Z", "note#2026-08-01T09:00:00Z"):
         tbl.put_item({"run_id": "run-x", "sk": sk, "detail": "not a stage event"})
     monkeypatch.setattr(console, "events_tbl", tbl)
-    evs, _ = console._timeline("run-x")
+    evs, _, _ = console._timeline("run-x")
     assert len(evs) == 5, f"a non-event row reached the stage timeline: {[e['sk'] for e in evs]}"
 
 
@@ -5309,11 +5312,16 @@ def test_the_waiting_turn_count_is_read_off_the_rows_not_counted_from_them(conso
 
 
 def test_the_wait_derivation_reads_the_newest_rows_not_the_oldest(console, monkeypatch):
-    """_timeline's window is a FORWARD query -- its Limit=100 keeps the OLDEST 100 rows
-    (that is D13's own finding). A paged run is by definition being read at its newest
-    end, so sharing that window would drop the pill on exactly the long-running runs that
-    wait longest. Its own reverse query, with the ScanIndexForward=False asserted through
-    the table fake rather than by reading the source."""
+    """A paged run is by definition being read at its newest end, so a forward window
+    would drop the pill on exactly the long-running runs that wait longest. Its own
+    reverse query, with the ScanIndexForward=False asserted through the table fake rather
+    than by reading the source.
+
+    The discriminating half is built by querying the fake table FORWARDS directly, not by
+    calling `_timeline`: _timeline read forwards when this test was written (that was
+    D13's finding) and now reads backwards, so routing the comparison through it would
+    have made this assertion pass for a reason that has nothing to do with `_page_rows`.
+    A guard that survives the fix of an unrelated defect only by luck is not a guard."""
     tbl = _RangeTable()
     for i in range(console.WAITING_LOOKBACK * 3):
         tbl.put_item({"run_id": "run-x",
@@ -5325,8 +5333,11 @@ def test_the_wait_derivation_reads_the_newest_rows_not_the_oldest(console, monke
     assert len(rows) == console.WAITING_LOOKBACK, f"the lookback window is not bounded: {len(rows)}"
     assert console.waiting_on_human(rows, [], "running"), \
         "the newest page fell outside the window the derivation reads"
-    # The same budget spent forwards -- what reusing _timeline would have given it.
-    fwd, _ = console._timeline("run-x", limit=console.WAITING_LOOKBACK)
+    # The same budget spent forwards -- what a shared forward window would have given it.
+    fwd = tbl.query(KeyConditionExpression=console.Key("run_id").eq("run-x")
+                    & console.Key("sk").lt(console.TIMELINE_SK_MAX),
+                    Limit=console.WAITING_LOOKBACK)["Items"]
+    assert len(fwd) == console.WAITING_LOOKBACK, "the forward comparison window is empty"
     assert console.waiting_on_human(fwd, [], "running") is None, (
         "this test no longer distinguishes the two query directions, so it cannot fail "
         "when the reverse query is lost")
@@ -5410,3 +5421,250 @@ def test_run_detail_serves_the_wait_beside_the_gate_rows(console, monkeypatch):
     monkeypatch.setattr(console, "runs_tbl", _Runs("running"))
     live = console.run_detail("run-x")["waitingOnHuman"]
     assert live and live["runStatus"] == "running", f"{live!r}"
+
+
+# ── D13: a window taken before the ordering is a window on hash order ──────────
+class _PagedTable:
+    """A Scan that pages, and whose page order is deliberately NOT the sort order.
+
+    That is not a contrived stub: DynamoDB documents Scan order as *unspecified*. It is
+    neither newest- nor oldest-first, so a `Limit` does not trim the oldest rows -- it
+    trims whatever fell past the page boundary. This fake pins one such order (scan order
+    == oldest first, i.e. the newest rows arrive LAST) so the difference between "ordered
+    then windowed" and "windowed then ordered" is visible instead of luck.
+
+    `Limit` is honoured, because the defect being guarded is a caller passing one.
+    """
+
+    def __init__(self, items, page=25, key="id"):
+        self.items = [dict(i) for i in items]
+        self.page = int(page)
+        self.key = key
+        self.scans = []            # every kwarg set, so page-cap behaviour is assertable
+
+    def _index_after(self, start_key):
+        for i, it in enumerate(self.items):
+            if it[self.key] == start_key[self.key]:
+                return i + 1
+        raise AssertionError(f"ExclusiveStartKey {start_key!r} is not a row in this table")
+
+    def scan(self, **kw):
+        self.scans.append(dict(kw))
+        start = self._index_after(kw["ExclusiveStartKey"]) if "ExclusiveStartKey" in kw else 0
+        size = min(self.page, int(kw["Limit"])) if kw.get("Limit") else self.page
+        chunk = self.items[start:start + size]
+        out = {"Items": [dict(c) for c in chunk]}
+        if start + len(chunk) < len(self.items):
+            out["LastEvaluatedKey"] = {self.key: chunk[-1][self.key]}
+        return out
+
+
+def _runs(n, page=25):
+    """`n` runs, oldest first in scan order -- so the NEWEST are the ones a Limit drops."""
+    return _PagedTable([{"run_id": f"run-{i:03d}", "created_at": f"2026-08-{1 + i // 24:02d}"
+                                                                f"T{i % 24:02d}:00:00Z",
+                         "status": "completed"} for i in range(n)],
+                       page=page, key="run_id")
+
+
+def test_the_newest_runs_are_newest_by_time_not_by_hash_order(console, monkeypatch):
+    """The defect, as the operator meets it.
+
+    `scan(Limit=60)` then `sort(created_at)` sorted an ARBITRARY 60 rows and presented the
+    result as "recent runs". Past the window the run an operator is looking for -- the one
+    they started thirty seconds ago -- can be absent, and the list still reads as complete.
+    A run that cannot be found is a run that gets started again, and a second GPU run is a
+    real bill.
+    """
+    tbl = _runs(70)
+    monkeypatch.setattr(console, "runs_tbl", tbl)
+    got = [r["run_id"] for r in console.recent_runs(10)]
+    assert got == [f"run-{i:03d}" for i in range(69, 59, -1)], (
+        f"the list is not the ten newest runs: {got}")
+    # And the whole table was read, not one window of it.
+    assert len(tbl.scans) == 3, f"pagination stopped early: {tbl.scans}"
+    assert all("Limit" not in s for s in tbl.scans), (
+        "a Limit is still being spent in DynamoDB, where it cuts by hash order")
+
+
+def test_a_reader_that_stopped_short_says_it_stopped(console, monkeypatch):
+    """A silent cap is the defect, not the cure.
+
+    The page cap exists so an unbounded table cannot hang the console, and the moment it
+    bites, "the newest 10 runs" becomes "the newest 10 of what I managed to read". That
+    difference has to reach the payload -- D9's whole lesson was that a fact only the
+    Lambda knows is a fact the system does not have.
+    """
+    over = console.SCAN_PAGE_CAP * 25 + 1
+    monkeypatch.setattr(console, "runs_tbl", _runs(over, page=25))
+    items, truncated = console._runs_ordered()
+    assert truncated is True, "the reader hit its cap and reported a complete list"
+    assert len(items) == console.SCAN_PAGE_CAP * 25, f"read {len(items)} rows"
+    monkeypatch.setattr(console, "runs_tbl", _runs(20, page=25))
+    assert console._runs_ordered()[1] is False, (
+        "a table that fits in one page is being reported as truncated")
+
+
+def test_the_overview_carries_the_run_lists_own_limits(console, monkeypatch):
+    """The flag is useless if it stops at the function that computed it."""
+    monkeypatch.setattr(console, "runs_tbl", _runs(console.SCAN_PAGE_CAP * 25 + 1))
+    monkeypatch.setattr(console, "list_fleet", lambda: [])
+    monkeypatch.setattr(console, "list_executions", lambda: [])
+    out = console.overview()
+    assert out["runsTruncated"] is True and out["runsRead"] == console.SCAN_PAGE_CAP * 25, \
+        f"{ {k: out[k] for k in ('runsTruncated', 'runsRead')} }"
+    assert len(out["runs"]) == 10, "the overview still serves the newest ten"
+
+
+def test_no_live_consultation_is_invisible_to_the_task_list(console, monkeypatch):
+    """The live measurement this finding came from, replayed as a shape.
+
+    `llmops-tasks` held 35 rows and `list_tasks(25)` did `scan(Limit=25)`: SIX of the true
+    newest 25 were absent -- among them `task-fb74cde81fc748d5` in status `error` and
+    `task-04f86f519b27a706`, a `drafting` consultation waiting on a human signature --
+    while six older ones were shown in their place. A consultation nobody can see is a
+    decision nobody can make.
+    """
+    items = [{"id": f"task-{i:03d}", "status": "drafting", "goal": f"g{i}",
+              "updated_at": f"2026-08-{1 + i // 24:02d}T{i % 24:02d}:00:00Z"}
+             for i in range(35)]
+    items[-1]["status"] = "error"           # newest, and last in scan order
+    monkeypatch.setattr(console, "tasks_tbl", _PagedTable(items, page=25))
+    out = console.list_tasks(25)
+    served = [t["id"] for t in out["tasks"]]
+    assert served == [f"task-{i:03d}" for i in range(34, 9, -1)], f"{served}"
+    assert out["tasks"][0]["status"] == "error", (
+        "the newest task is the one the old window dropped; it must be first now")
+    assert (out["total"], out["truncated"]) == (35, False), f"{out!r}"
+
+
+def test_a_draft_is_not_hidden_by_the_rows_that_share_its_table(console, monkeypatch):
+    """Third shape: the window came before the FILTER too.
+
+    `opt-` drafts live in a shared console table, so `scan(Limit=50)` then
+    `startswith("opt-")` returns NOTHING once fifty other rows exist -- and an empty list
+    here reads as "no optimization has ever been drafted", which is a different claim.
+    """
+    rows = [{"id": f"other-{i:03d}", "startedAt": "2026-07-01T00:00:00Z"} for i in range(60)]
+    rows.append({"id": "opt-abc", "startedAt": "2026-08-12T00:00:00Z", "status": "ready"})
+    monkeypatch.setattr(console, "console_tbl", _PagedTable(rows, page=25))
+    got = [o["id"] for o in console.list_optimizations()]
+    assert got == ["opt-abc"], f"the only draft in the table is not in the list: {got}"
+
+
+def test_no_reader_windows_a_scan_inside_dynamodb(console):
+    """Derived, so the NEXT list added is guarded too.
+
+    Read off the AST rather than by grepping: this module's own prose quotes
+    `scan(Limit=25)` when explaining the bug, and a guard that its own explanation can
+    satisfy proves nothing. `.scan(Limit=...)` is the defect's signature -- ordering can
+    only happen after the read, so a Limit spent in DynamoDB is always a hash-order cut.
+    """
+    import ast
+    src = (REPO / "deploy/console/lambda_function.py").read_text()
+    bad = [n.lineno for n in ast.walk(ast.parse(src))
+           if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+           and n.func.attr == "scan" and any(k.arg == "Limit" for k in n.keywords)]
+    assert not bad, f"a scan is being windowed in DynamoDB at line(s) {bad}"
+
+
+def test_a_bounded_query_always_states_which_end_it_reads(console):
+    """The other half of the same defect, and the reason it survived review.
+
+    `_timeline` ran its directives half reverse and its events half FORWARD -- one
+    function, two directions, no marker. A `Limit` without `ScanIndexForward` is a silent
+    choice of the oldest rows, so every bounded query must say which end it means.
+    """
+    import ast
+    src = (REPO / "deploy/console/lambda_function.py").read_text()
+    bad = []
+    for n in ast.walk(ast.parse(src)):
+        if (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                and n.func.attr == "query"
+                and any(k.arg == "Limit" for k in n.keywords)
+                and not any(k.arg == "ScanIndexForward" for k in n.keywords)):
+            bad.append(n.lineno)
+    assert not bad, f"a bounded query does not say which end it reads: line(s) {bad}"
+
+
+def test_the_stage_timeline_serves_the_newest_events_in_time_order(console, monkeypatch):
+    """A run's last minutes are the ones an operator opens it for.
+
+    The escalation, the gate verdict and the failure that ENDED the run all sit at its
+    newest end, and the frontend paints `evs.slice(-25)` under a heading that says "Stage
+    events". A forward `Limit` therefore showed a long run's FIRST minutes where its last
+    belong. Latent until D12 raised the ceiling: WAIT_ROW_CAP is 12 rows per stage
+    invocation, so twelve harness stages reach ~150 rows on the happy path.
+    """
+    tbl = _RangeTable()
+    for i in range(130):
+        tbl.put_item({"run_id": "run-x", "detail": json.dumps({"i": i}),
+                      "sk": f"2026-08-{1 + i // 24:02d}T{i % 24:02d}:00:00Z#gate#ev{i:03d}"})
+    monkeypatch.setattr(console, "events_tbl", tbl)
+    evs, _, older = console._timeline("run-x", limit=100)
+    assert len(evs) == 100 and older is True, f"{len(evs)} rows, older={older}"
+    sks = [e["sk"] for e in evs]
+    assert sks == sorted(sks), "the timeline is not in time order, so slice(-25) lies"
+    assert "#ev129" in sks[-1], f"the newest event is not in the window: {sks[-1]}"
+    assert not any("#ev000" in s for s in sks), "the window still starts at the oldest row"
+    # The 25 the frontend paints must be the newest 25 of the run.
+    assert [s.split("#ev")[1] for s in sks[-25:]] == [f"{i:03d}" for i in range(105, 130)]
+
+
+def test_older_history_is_reported_only_when_there_is_some(console, monkeypatch):
+    """`len(rows) == limit` cannot tell a full window from a truncated one, so the reader
+    asks for one extra row and the flag is a fact rather than an inference. Exactly-at-the
+    -limit is the case that separates the two, and it is the case a `>=` would get wrong.
+    """
+    tbl = _RangeTable()
+    for i in range(10):
+        tbl.put_item({"run_id": "run-x", "detail": "{}",
+                      "sk": f"2026-08-01T{i:02d}:00:00Z#eval#ev{i}"})
+    monkeypatch.setattr(console, "events_tbl", tbl)
+    assert console._timeline("run-x", limit=10)[2] is False, \
+        "a run with exactly `limit` events is being reported as having older history"
+    assert console._timeline("run-x", limit=9)[2] is True
+    assert len(console._timeline("run-x", limit=9)[0]) == 9, "the extra row was served"
+
+
+def test_both_halves_of_the_timeline_read_the_same_end_of_the_run(console, monkeypatch):
+    """One function must not hold two opinions about which end matters. Asserted through
+    the table fake -- the direction that reached DynamoDB -- not by reading the source."""
+    tbl = _seed_timeline(_RangeTable(), "run-x")
+    monkeypatch.setattr(console, "events_tbl", tbl)
+    console._timeline("run-x")
+    assert len(tbl.query_kw) == 2, f"{len(tbl.query_kw)} queries, expected two ranges"
+    assert [kw.get("ScanIndexForward") for kw in tbl.query_kw] == [False, False], (
+        "the two halves of the timeline read opposite ends of the run")
+
+
+def test_the_lifecycle_diagram_is_fed_the_latest_transitions(console, monkeypatch):
+    """`task_detail` builds the lifecycle flow from the same call, so the forward window
+    made a long consultation render as stuck at the stage it STARTED in."""
+    tbl = _RangeTable()
+    for i in range(130):
+        tbl.put_item({"run_id": "task-1", "event_name": f"ev{i:03d}", "detail": "{}",
+                      "sk": f"2026-08-{1 + i // 24:02d}T{i % 24:02d}:00:00Z#orchestrator#ev{i:03d}"})
+    monkeypatch.setattr(console, "events_tbl", tbl)
+    monkeypatch.setattr(console, "_task_get", lambda tid: {"id": tid, "status": "dispatched"})
+    out = console.get_task("task-1")
+    assert out["events"], "the task detail serves no events at all"
+    assert out["events"][-1]["event_name"] == "ev129", (
+        f"the diagram's last transition is {out['events'][-1]['event_name']}, not the run's")
+    assert out["olderEventsExist"] is True, "a truncated lifecycle claims to be complete"
+
+
+def test_the_lists_say_on_screen_what_they_could_not_read(console):
+    """The markers, in the frontend. A truncation the payload carries and the page never
+    paints is the same silence with more steps."""
+    body = (REPO / "deploy/console/frontend.html").read_text()
+    assert "function renderRuns(runs, truncated, read)" in body, \
+        "renderRuns cannot render what it is not given"
+    assert "renderRuns(o.runs||[], o.runsTruncated, o.runsRead||0)" in body, \
+        "the overview's truncation flag is dropped on the way to the renderer"
+    assert "runs READ" in body, "the runs list never says its list is short"
+    assert "d.olderEventsExist" in body, "the event heading never mentions older history"
+    assert "Stage events · newest" in body, (
+        "the heading still counts rows instead of naming which end of the run they are")
+    assert "d.truncated || (d.total||0) > items.length" in body, \
+        "the task list never says it is showing a subset"
