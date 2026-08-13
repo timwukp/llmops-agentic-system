@@ -535,8 +535,57 @@ class TestContracts:
             "data-prep": {"status": "completed"},
             "eval": {"status": "failed", "evidence": "gate 0.6 < 0.8"}}}
         report = build_run_report(manifest)
-        assert report["pass_counts"] == {"total": 2, "passed": 1, "failed": 1}
+        assert report["pass_counts"] == {"total": 2, "passed": 1, "failed": 1,
+                                        "in_flight": 0, "unrecognized": 0}
         assert report["findings"][0]["stage"] == "eval"
+
+    def test_a_report_counts_the_stages_the_agents_wrote_not_only_the_drivers(self):
+        """r5's report said 3 of 14 passed for a run in which every stage succeeded.
+
+        `manifest["stages"]` has TWO writers. The driver writes `status: "completed"` under
+        the bare stage name; the specialist agents are told to append their own results to
+        the same manifest and they write `"complete"` / `"launched"` under
+        `"<stage>.<task>[.i<n>]"`. Only the driver's spelling was counted, so on
+        run-20260811T101948Z-f9d34d27 the published pass_counts were
+        {"total": 14, "passed": 3, "failed": 0} against an actual mix of 3 "completed",
+        7 "complete" and 4 "launched" -- 11 stages counted as nothing at all, and the
+        console renders that as a run that mostly did not pass.
+
+        The exact r5 mix is reproduced here rather than a synthetic one, so this test fails
+        against the code that published that number.
+        """
+        stages = {}
+        for i in range(3):
+            stages[f"driver-{i}"] = {"status": "completed"}
+        for i in range(7):
+            stages[f"agent.task.i{i}"] = {"status": "complete"}
+        for i in range(4):
+            stages[f"agent.launch.i{i}"] = {"status": "launched"}
+        counts = build_run_report({"run_id": "r5", "stages": stages})["pass_counts"]
+        assert counts["total"] == 14
+        assert counts["passed"] == 10, (
+            f"3 driver + 7 agent completions is 10 finished stages, report says "
+            f"{counts['passed']}")
+        assert counts["in_flight"] == 4, (
+            "a launched training job has not passed and has not failed; counting it either "
+            "way states an outcome that does not exist yet")
+        assert counts["failed"] == 0
+
+    def test_a_status_neither_writer_uses_is_reported_not_absorbed(self):
+        """The gap between `total` and the sub-counts is what hid the bug.
+
+        With only `passed` and `failed` published, 11 unreadable statuses were
+        indistinguishable from 11 genuinely-not-passing stages. The four sub-counts must
+        reconcile to `total`, so the next vocabulary drift shows up as a number instead of
+        as a silently pessimistic pass rate.
+        """
+        counts = build_run_report({"run_id": "r", "stages": {
+            "a": {"status": "completed"}, "b": {"status": "finished-ish"},
+            "c": {}}})["pass_counts"]
+        assert counts["unrecognized"] == 2, (
+            f"'finished-ish' and a status-less entry are both unreadable: {counts!r}")
+        assert (counts["passed"] + counts["failed"] + counts["in_flight"]
+                + counts["unrecognized"] == counts["total"]), counts
 
     def test_write_run_report_targets_console_key(self):
         s3 = FakeS3()
@@ -4549,7 +4598,9 @@ class TestConductorDispatch:
                 assert kind == "dispatch", f"unknown writer kind {kind!r}"
 
     @staticmethod
-    def _drive_stage_complete(manifest, metrics, *, store=None, run_id="run-1", s3=None):
+    def _drive_stage_complete(manifest, metrics, *, store=None, run_id="run-1", s3=None,
+                              stage="deploy", task="deploy", iteration=None,
+                              evidence="InService"):
         """Drive the REAL `handle_stage_complete` and return (result, S3 store).
 
         The whole content of bug #22 is whether the assembled `stages` entry reaches S3, so
@@ -4595,13 +4646,16 @@ class TestConductorDispatch:
         for k, v in {"DATA_BUCKET": "b", "RUNS_TABLE": "r", "EVENT_BUS": "e",
                      "EVENTS_TABLE": "ev"}.items():
             os.environ[k] = v
+        event = {"run_id": run_id, "stage": stage, "task": task,
+                 "manifest_uri": f"s3://b/{key}"}
+        if iteration is not None:
+            event["iteration"] = iteration
         res = driver.handle_stage_complete(
             {"s3": s3 or _S3(), "ddb": _DDB(), "events": _EV(), "sfn": None},
-            {"run_id": run_id, "stage": "deploy", "task": "deploy",
-             "manifest_uri": f"s3://b/{key}"},
-            {"stage": "deploy",
+            event,
+            {"stage": stage,
              "outputs": [f"s3://b/runs/{run_id}/deploy/endpoint.json"],
-             "metrics": metrics, "evidence": "InService"})
+             "metrics": metrics, "evidence": evidence})
         return res, out
 
     @staticmethod
@@ -4638,6 +4692,107 @@ class TestConductorDispatch:
         assert entry["status"] == "completed"
         assert entry["metrics"]["endpoint_name"] == "llmops-student-run-1", entry
         assert entry["outputs"] == ["s3://b/runs/run-1/deploy/endpoint.json"], entry
+
+    def test_both_iterations_of_a_remediated_stage_survive_in_the_manifest(self):
+        """The remediation loop was overwriting the "before" half of its own answer.
+
+        `stages` is keyed by STAGE NAME, so the second iteration's finetune entry replaces
+        the first's -- and the loop exists precisely to answer "did the one targeted change
+        help?". Measured on r5 (run-20260811T101948Z-f9d34d27, 2 iterations): the surviving
+        manifest holds `stages.finetune.metrics.iteration == 1` and an `eval` entry carrying
+        `delta_judge_win_rate_vs_i0` with no iteration-0 row left to subtract from. The i0
+        training losses and judge counts existed nowhere in the manifest; they survived only
+        because the eval agent happened to archive report-i0.json by hand.
+
+        Asserted on the bytes a fake S3 was handed, across two REAL invocations sharing one
+        store, because a lost update is only visible in the second write's result.
+        """
+        store = {"runs/run-1/deploy/endpoint.json": b"{}"}
+        _, store = self._drive_stage_complete(
+            self._signed_manifest(), {"final_eval_loss": 1.5, "iteration": 0},
+            store=store, stage="finetune", task="analyze", iteration=0,
+            evidence="baseline run")
+        res, store = self._drive_stage_complete(
+            None, {"final_eval_loss": 0.9, "iteration": 1},
+            store=store, stage="finetune", task="analyze", iteration=1,
+            evidence="post-remediation")
+        assert res["ok"] and not res.get("report_error"), res
+        saved = json.loads(store["runs/run-1/manifest.json"])
+
+        # The stage pointer still holds the LATEST entry -- unchanged on purpose, because
+        # stage_fact_params and every specialist prompt read manifest.stages[<stage>] by
+        # bare stage name and must keep seeing the current result.
+        assert saved["stages"]["finetune"]["metrics"]["final_eval_loss"] == 0.9
+
+        history = saved.get("stage_history")
+        assert isinstance(history, list), (
+            "the manifest carries no stage_history, so the only record of a stage is the "
+            "one entry under its own name and iteration 1 has erased iteration 0")
+        losses = [(h.get("iteration"), h["metrics"].get("final_eval_loss"))
+                  for h in history if h.get("stage") == "finetune"]
+        assert losses == [(0, 1.5), (1, 0.9)], (
+            f"both iterations of finetune must be recoverable in order, got {losses!r}. "
+            "Without the i0 row nothing can say whether the remediation helped.")
+        assert [h["evidence"] for h in history] == ["baseline run", "post-remediation"], \
+            "each iteration keeps its OWN evidence text, not the last one twice"
+        assert all(h.get("recorded_at") for h in history), \
+            "an append-only record with no timestamp cannot be ordered against the run's log"
+
+    def test_the_durable_history_is_appended_to_the_copy_on_s3(self):
+        """A record that landed while the driver was working must not be dropped.
+
+        `stages` is replaced wholesale from the caller's snapshot, so anything written into
+        it during the turn is lost -- a real but bounded gap this function's docstring
+        already admits. `stage_history` must not inherit that gap, because it is the ONLY
+        place a per-iteration result survives: losing a record there loses it permanently,
+        while losing a `stages` entry loses a duplicate of the latest one.
+
+        So the append goes onto the list just re-read from S3. Simulated by handing
+        `_save_manifest` a caller snapshot that does not contain a record the S3 copy does.
+        """
+        landed = {"stage": "eval", "task": "score", "iteration": 0, "status": "completed",
+                  "metrics": {"judge_win_rate": 0.0}, "recorded_at": "2026-08-11T10:00:00Z"}
+        on_s3 = self._signed_manifest()
+        on_s3["stage_history"] = [landed]
+        store = {"runs/run-1/manifest.json": json.dumps(on_s3).encode()}
+        snapshot = self._signed_manifest()          # loaded BEFORE `landed` was written
+        assert "stage_history" not in snapshot
+
+        class _S3:
+            def get_object(self, Bucket, Key):
+                return {"Body": io.BytesIO(store[Key])}
+
+            def put_object(self, Bucket, Key, Body, **kw):
+                store[Key] = Body
+
+        record = {"stage": "eval", "task": "gate", "iteration": 1, "status": "completed",
+                  "metrics": {"gate_passed": False}, "recorded_at": "2026-08-11T12:00:00Z"}
+        driver._save_manifest(_S3(), "s3://b/runs/run-1/manifest.json", snapshot,
+                              history_record=record)
+        saved = json.loads(store["runs/run-1/manifest.json"])
+        assert saved["stage_history"] == [landed, record], (
+            "the record on S3 was overwritten by the driver's stale snapshot: "
+            f"{saved.get('stage_history')!r}")
+
+    def test_a_completion_appends_exactly_one_history_record(self):
+        """The record is appended to two dicts and must reach S3 once.
+
+        `handle_stage_complete` appends to its own copy (that copy is what
+        `write_run_report` reads) and ALSO hands the record to `_save_manifest`, which
+        appends to the copy it re-reads. Both are needed -- the report would otherwise omit
+        the stage that just finished, and the durable list would otherwise inherit the
+        snapshot race -- so the one thing that must be checked is that the two appends do
+        not become two rows.
+        """
+        _, store = self._drive_stage_complete(
+            self._signed_manifest(), {"endpoint_name": "llmops-student-run-1"})
+        saved = json.loads(store["runs/run-1/manifest.json"])
+        history = saved["stage_history"]
+        assert len(history) == 1, f"one completion, {len(history)} rows: {history!r}"
+        report = json.loads(store["reports/run-1/test-report.json"])
+        assert report["stage_history"] == history, (
+            "the report a human opens must show the same history as the manifest; "
+            f"report={report.get('stage_history')!r}")
 
     def test_a_stage_write_cannot_restate_the_signed_blocks(self):
         """The write-back is narrowed to `stages`, so a driver bug cannot rewrite consent.

@@ -3348,13 +3348,28 @@ case("prompt: eval gates on a remembered bar, not the one the plan named",
 #      `stages[stage]`, hands it to write_run_report, and drops it. Measured before the fix:
 #      `manifest.stages` was still `{}` after a deploy stage reported an endpoint_name, so
 #      the report humans read carried every metric and the manifest AGENTS read carried none.
+def _manifest_writeback_line(t: str) -> str:
+    """The driver's `_save_manifest(...)` call inside handle_stage_complete, derived.
+
+    Two controls need this exact line and both used to spell it out, so adding one keyword
+    argument to the call retired both at once -- each reporting "anchor drifted", which the
+    runner counts as neither caught nor uncaught. Matched on the call's opening rather than
+    its argument list: the arguments are what evolves, the statement's position between the
+    `try` and the manifest `except` is what these mutations depend on.
+    """
+    m = re.search(r'^ {8}_save_manifest\(c\["s3"\], event\["manifest_uri"\], .*\)$',
+                  t, re.M)
+    assert m, "the manifest write-back has moved; re-anchor these controls"
+    return m.group(0)
+
+
 def m180(t):
     # `pass`, not deletion: since #25 split the two artifact writes, _save_manifest is the
     # only statement in its own try block, so removing the line leaves an IndentationError
     # and pytest exits 4 (collection error) instead of 1 (test failed). A control that
     # cannot even import the module under test verifies nothing -- it reports the guard as
     # UNCAUGHT while the mutation it claims to make was never really applied.
-    old = '        _save_manifest(c["s3"], event["manifest_uri"], manifest)\n'
+    old = _manifest_writeback_line(t) + "\n"
     assert t.count(old) == 1, f"the manifest write-back has moved; found {t.count(old)}"
     return t.replace(old, "        pass  # write-back removed\n", 1)
 
@@ -3658,14 +3673,15 @@ def m195(t):
     # (collection error) rather than 1, and the runner reports the guard as uncaught while
     # the mutation it claims to have made was never really applied. A mutation that cannot
     # produce importable code proves nothing about the guard.
+    writeback = _manifest_writeback_line(t)
     old = re.search(
-        r'        _save_manifest\(c\["s3"\], event\["manifest_uri"\], manifest\)\n'
+        re.escape(writeback) + '\n'
         r'    except Exception.*?'
         r'\n        print\(f"\[driver\] report SKIPPED for \{run_id\}/\{stage\}: '
         r'\{failures\[-1\]\}"\)\n', t, re.S)
     assert old, "the split stage-artifact writes no longer match; re-anchor this mutation"
     return t.replace(old.group(0), (
-        '        _save_manifest(c["s3"], event["manifest_uri"], manifest)\n'
+        writeback + '\n'
         '        write_run_report(c["s3"], os.environ["DATA_BUCKET"], manifest)\n'
         '    except Exception as exc:  # noqa: BLE001\n'
         '        failures.append(f"{type(exc).__name__}: {exc}")\n'
