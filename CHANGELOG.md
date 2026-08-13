@@ -5,6 +5,26 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
 ## [Unreleased]
 
+### r6d: the facts move out of the weights (RAFT retrieval, #122–#125)
+
+r6c's diagnosis closed the closed-book road: decontamination correctly deletes exactly
+the org facts the acceptance set demands, and no student size restores information the
+training set does not contain. r6d moves those facts into a per-run Bedrock Knowledge
+Base and teaches the pipeline to use it — `deploy/09_retrieval.py` (substrate, one object
+per corpus row, acceptance files refused at ingest, teardown that polls the OCU bill to
+GONE), a `retrieval_index` cost category (the standing cost reaches the estimate a human
+approves, non-remediable, fallback rate pinned to the deploy script's constant), the
+canonical `raft_context_format.md` (one format for training rows and inference prompts,
+provable by `raft_format_sha256` recorded from BOTH sides), and three activation-gated
+prompt clauses (data-prep probes then assembles; eval retrieves per acceptance item and
+records `retrieval_details.jsonl`; the judge stays blind — bar 0.45 unchanged, judge
+instrument bytes pinned to r6c's digest). Closed-book plans omit `retrieval_kb_id` and
+run untouched. Pre-measured before any spend: ID recall@5 = 1.00 (the corpus states
+every ID fact — in near-verbatim canned resolutions, so the ID gate under RAFT measures
+faithful reproduction of known fixes, stated plainly in `RAFT_PLAN_r6d.md`), OOD recall
+0.00 (report-only layer stays honest), assembled prompts fit the 8192 window with 7×
+margin. 23 new guards, 19 negative controls (m289–m307), suite 1327→1342.
+
 ### Teardown was asymmetric by permission, and the sweep could not see what it orphaned
 
 The deploy prompt has always commanded "delete the student endpoint and endpoint config"
