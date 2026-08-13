@@ -1246,6 +1246,31 @@ theoretical: `run-20260812T035446Z-dedaa965-i0` died 386 seconds in on the *same
 — and every job so far survived only because it finished inside a 7200s `MaxRuntime` it had no
 save point behind.
 
+**A layer nothing gates needs its floor written down twice, because nothing else will notice.**
+The dual-layer gate blocks a deploy on the in-distribution layer *alone*; the OOD layer is measured
+and reported and never gates. That trade is honest only while the layer is really being measured,
+and neither end of it was enforced. On the way in, data-prep's `curate` decontaminated the training
+corpus against `params.customer_eval_uri` and named `params.ood_eval_uri` nowhere — while
+`_plan_params()` flattens all of `plan.data`, so the param arrived at data-prep on every run and no
+task read it. The gated layer is the one that needs the protection least: overlap there inflates a
+number something checks, while overlap in the report-only layer fails nothing at all and simply
+reads **higher**, which is the evidence anyone would cite to say the student generalises — and
+"bigger student" and "synthesis closes the OOD gap" were both refuted 0-3 in this system's own
+research pass, so the OOD number is the object of the experiment, not a decoration. Measured with
+`curate`'s own rule (prompt trigram-Jaccard ≥ 0.6) against the two live files: **0 of 40** OOD rows
+overlap the 300-row source, max 0.1882, 23 OOD categories against 12 with an empty intersection.
+Clean — by hand, and recorded nowhere, which is the other half of the gap: a 0 that was *written*
+is a different fact from a 0 nobody computed. On the way out, `params.ood_eval_uri` set with no
+`report.json.ood` was byte-identical to a run that never asked for the layer — the driver reads only
+`gate_passed`, and the console drew the block on presence alone, six lines under a comment that
+draws exactly that distinction for the gate rows. So `curate` now decontaminates every acceptance
+layer `CUSTOMER_DATA_PARAMS` names and records one drop count per URI; the `score` bullet makes an
+absent `ood` object illegal and gives the failure path something to write (`items_in_layer`,
+`judge_n`, `ood_error`) instead of silence; and the run view says **NOT REPORTED** when a signed
+plan named an OOD set and a completed eval carried none — conditioned on the eval having reported at
+all, because an alarm on every run that is merely mid-inference is how an operator learns to ignore
+the one that is real.
+
 **The facts a run discovers travel like the consent it was signed with.** `MODEL_PARAM_FOR_ROLE`
 carries what a human *signed* into the stages that must obey it; `STAGE_FACT_PARAMS` carries what
 the run itself *produced* into the stages that must measure it. `params.student_endpoint` — read

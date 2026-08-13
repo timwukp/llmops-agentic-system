@@ -4763,6 +4763,70 @@ def test_the_gate_row_carries_the_interval_it_is_decided_by(console, monkeypatch
         "a hardcoded metric key survives in the frontend beside the derived one")
 
 
+def _detail_with(console, monkeypatch, man):
+    """run_detail over a manifest fixture, with S3 the only backing store."""
+    s3f = FakeS3()
+    s3f.put_object(Bucket="b", Key="runs/run-x/manifest.json",
+                   Body=json.dumps(man).encode())
+    monkeypatch.setattr(console, "s3", s3f)
+    monkeypatch.setattr(console, "data_bucket", lambda: "b")
+    monkeypatch.setattr(console, "events_tbl", None)
+    monkeypatch.setattr(console, "runs_tbl", None)
+    return console.run_detail("run-x")
+
+
+#: A signed plan that asks for the report-only layer. No account id anywhere in it: the
+#: redaction guard reads added lines, and a plausible bucket name is the easiest way in.
+_OOD_URI = "s3://BUCKETNAME/customer-data/helpdesk-demo/ood_acceptance.jsonl"
+
+
+def test_an_ood_layer_the_plan_asked_for_and_the_report_omits_is_not_silence(
+        console, monkeypatch):
+    """D9: the report-only layer had no floor, so it could vanish and read as absent.
+
+    The OOD layer never blocks a deploy on purpose. That trade is only honest while the
+    layer is actually measured, and nothing enforced it: `params.ood_eval_uri` set with no
+    `report.json.ood` produced exactly the page a run without an OOD layer produces. The
+    driver reads only `gate_passed`, and this function drew the block on presence alone --
+    six lines under a comment that draws precisely this distinction for the gate rows.
+    """
+    man = {"params": {"gates": {"judge_score": 0.45}, "ood_eval_uri": _OOD_URI},
+           "stages": {"eval": {"metrics": {"judge_score": 0.48, "judge_score_ci_low": 0.46,
+                                           "judge_score_ci_high": 0.56, "judge_n": 150,
+                                           "gate_passed": True}}}}
+    out = _detail_with(console, monkeypatch, man)
+    assert "oodReport" not in out, "the fixture has no ood object to serve"
+    assert out.get("oodMissing") == _OOD_URI, (
+        "the plan names an OOD set and the eval report carries no `ood` object, and the "
+        f"run view says nothing about it: {out.get('oodMissing')!r}. A gate PASS is rendered "
+        "over a missing half of the design, on the same page, with no way to tell.")
+    code = _strip_comments(_front())
+    assert "d.oodMissing" in code, "run_detail serves the omission and nothing renders it"
+    assert "NOT REPORTED" in code, "the omission renders without saying what it is"
+
+
+def test_a_plan_with_no_ood_layer_is_not_accused_of_omitting_one(console, monkeypatch):
+    """The other side: `oodMissing` has to mean the PLAN asked. Deriving it from the
+    report's shape alone would flag every single-layer run, which is most of them."""
+    man = {"params": {"gates": {"judge_score": 0.45}},
+           "stages": {"eval": {"metrics": {"judge_score": 0.48, "gate_passed": True}}}}
+    out = _detail_with(console, monkeypatch, man)
+    assert "oodMissing" not in out, f"a run with no OOD layer was flagged: {out['oodMissing']!r}"
+
+
+def test_an_eval_stage_still_running_has_not_omitted_its_ood_layer(console, monkeypatch):
+    """Same false alarm the gate rows avoid via `eval_reported`, one block down. Before
+    eval writes metrics there is nothing to have omitted, and an alarm on every run that
+    is merely mid-inference is the one that teaches an operator to ignore the real one.
+    Keyed on the `metrics` KEY, not on truthiness: run-20260811T165529Z-ce628817 has a
+    `stages.eval` entry with `status: inference_in_progress` and no metrics at all."""
+    man = {"params": {"gates": {"judge_score": 0.45}, "ood_eval_uri": _OOD_URI},
+           "stages": {"eval": {"status": "inference_in_progress"}}}
+    out = _detail_with(console, monkeypatch, man)
+    assert "oodMissing" not in out, (
+        "a run still generating answers was reported as having omitted its OOD layer")
+
+
 # ── D6: the gate table's five situations ─────────────────────────────────────
 #
 # `passed` was a tri-state boolean derived from `actual >= threshold`, and the frontend

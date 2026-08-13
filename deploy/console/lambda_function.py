@@ -833,8 +833,21 @@ def run_detail(run_id):
     out["gateVerdict"] = ("passed" if gp is True else "failed" if gp is False else None)
     # OOD layer: measured and reported, never gated -- rendered as its own
     # read-only block so it cannot be mistaken for a gate row.
+    #
+    # `requested` is the same distinction the gate rows draw six lines up, applied to the
+    # layer that has no gate to draw it: rendering only on presence makes an OOD layer the
+    # plan ASKED for and the eval agent omitted byte-identical to a run that never had one --
+    # nothing else notices either, because the gate reads only `gate_passed`. This gate blocks
+    # deploy on the ID layer ALONE, and that is honest only while the other layer is really
+    # being measured, so a silent omission withdraws the half of the design traded away for it.
+    #
+    # Conditioned on `eval_reported` for the same reason the gate rows are: before eval writes
+    # metrics there is nothing to have omitted, and "the OOD layer is missing" on a run still
+    # running inference is the false alarm that teaches an operator to ignore the true one.
     if isinstance(eval_metrics.get("ood"), dict):
         out["oodReport"] = eval_metrics["ood"]
+    elif eval_reported and (man.get("params") or {}).get("ood_eval_uri"):
+        out["oodMissing"] = str((man["params"])["ood_eval_uri"])
     # training job (tolerate missing): job_name lives on the runs-table item
     job_name = ""
     if runs_tbl:

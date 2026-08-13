@@ -22,9 +22,9 @@ page is its ledger.
 
 | Check | Result | How to reproduce |
 |---|---|---|
-| Unit tests (contracts, cost model, driver loop, Lambdas, state machine document) | **1238/1238 passed** | `.venv/bin/python -m pytest tests/ -q --ignore=tests/golden` |
+| Unit tests (contracts, cost model, driver loop, Lambdas, state machine document) | **1243/1243 passed** | `.venv/bin/python -m pytest tests/ -q --ignore=tests/golden` |
 | Shell suite — N-way capacity race guard (`tests/test_capacity_race_guard.sh`) | **10/10 assertions** | `bash tests/test_capacity_race_guard.sh` |
-| Negative controls — every guard broken in turn, confirmed to fail | **265/265 negative controls** | `.venv/bin/python tests/negative_controls/monitor_dispatch.py` |
+| Negative controls — every guard broken in turn, confirmed to fail | **270/270 negative controls** | `.venv/bin/python tests/negative_controls/monitor_dispatch.py` |
 | Harness config validation (5 specialists + conductor + auditor) | **7/7 `RESULT: OK`** | `python deploy/validate_config.py --config agents/<a>/harness.json` |
 | Architecture SVG geometry (no wire crossings, no wire through a card) | **CLEAN** | `python tests/test_svg_geometry.py docs/architecture-*.svg` |
 | Redaction scan (account IDs, credentials, account-bearing ARNs) | CLEAN | `.github/workflows/redaction-check.yml` |
@@ -133,14 +133,14 @@ Full record: [VERIFICATION_finops.md](../deploy/evidence/VERIFICATION_finops.md)
 
 | Check | Result | How to reproduce |
 |---|---|---|
-| Unit tests (all suites, incl. `test_cost_model.py` + `test_finops.py`) | **1238 passed** | `.venv/bin/python -m pytest tests/ -q` |
+| Unit tests (all suites, incl. `test_cost_model.py` + `test_finops.py`) | **1243 passed** | `.venv/bin/python -m pytest tests/ -q` |
 | Harness config validation, 7 agents | **`RESULT: OK`** | `python deploy/validate_config.py --config agents/finops/harness.json` |
 | Live fleet | **7 harnesses READY** | `list_harnesses` via the repo's vendored boto3 |
 | Canonical module has a distribution path | prints `would upload 4 contract files` | `python deploy/03_storage.py --region us-east-1 --account-id 123456789012 --dry-run` |
 
 Every guard added in this work was **mutation-checked**: the asserted behaviour was
-reverted one at a time and the test confirmed to fail — **265/265 negative controls**, 229
-mutations asserting 265 (guard, mutation) pairs, one printed PASS line each. A test that
+reverted one at a time and the test confirmed to fail — **270/270 negative controls**, 234
+mutations asserting 270 (guard, mutation) pairs, one printed PASS line each. A test that
 passes both with and against the behaviour it names is not a test.
 
 The count is in the sentence on purpose. "Mutation-checked" is an adjective, and an
@@ -148,6 +148,18 @@ adjective cannot go stale: a control deleted, or a guard added with no control a
 left that sentence still reading true.
 `tests/test_docs_claims.py::test_the_documented_negative_control_count_matches_the_runner`
 now derives both numbers from the runner's own `case(...)` registrations.
+
+A derived count is still only a count, and one of these controls was not passing. A full run
+found **m189 UNCAUGHT** — the control that strips the ranking out of the eval prompt's
+val-split sentence, leaving the customer's acceptance set and the 10% val split reading as
+equally eligible. Its guard searched the whole bullet for `/fall back/`, and the same bullet
+says *"never fall back to the newest artifact you can find in the bucket"* about `eval_only`'s
+`model_artifact_uri` — an unrelated sentence that satisfied the regex whatever the prompt said
+about the two evaluation sets. So the previous count was reported as all-passing while a
+mutant survived: what the number proves is that a control EXISTS per guard, not that it kills.
+The guard now scopes the search to the sentences that name the val split, and m189 fails as it
+should. Anything that can be satisfied by a sentence written for another reason is not a
+guard, and only a full run says which ones those are.
 
 ### Two failures worth more than the passes
 

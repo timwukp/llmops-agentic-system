@@ -21,9 +21,9 @@
 
 | 檢查 | 結果 | 復現方式 |
 |---|---|---|
-| 單元測試（契約、成本模型、driver 迴圈、Lambda、狀態機文檔） | **1238/1238 通過** | `.venv/bin/python -m pytest tests/ -q --ignore=tests/golden` |
+| 單元測試（契約、成本模型、driver 迴圈、Lambda、狀態機文檔） | **1243/1243 通過** | `.venv/bin/python -m pytest tests/ -q --ignore=tests/golden` |
 | Shell 測試套件 —— N 路 capacity race guard（`tests/test_capacity_race_guard.sh`） | **10/10 斷言** | `bash tests/test_capacity_race_guard.sh` |
-| 反向控制 —— 逐一破壞每道 guard，確認它會失敗 | **265/265 反向控制** | `.venv/bin/python tests/negative_controls/monitor_dispatch.py` |
+| 反向控制 —— 逐一破壞每道 guard，確認它會失敗 | **270/270 反向控制** | `.venv/bin/python tests/negative_controls/monitor_dispatch.py` |
 | Harness 配置驗證（5 個專家 + 指揮家 + 審計員） | **7/7 `RESULT: OK`** | `python deploy/validate_config.py --config agents/<a>/harness.json` |
 | 架構 SVG 幾何檢查（虛線零交叉、零穿框） | **CLEAN** | `python tests/test_svg_geometry.py docs/architecture-*.svg` |
 | 遮蔽掃描（帳號 ID、憑證、帶帳號的 ARN） | CLEAN | `.github/workflows/redaction-check.yml` |
@@ -121,19 +121,29 @@ endpoint、五輪 e2e 迭代 —— 花費比這個帳戶單日花在一個沒�
 
 | 檢查 | 結果 | 重現方式 |
 |---|---|---|
-| 單元測試(全部套件,含 `test_cost_model.py` + `test_finops.py`) | **1238 passed** | `.venv/bin/python -m pytest tests/ -q` |
+| 單元測試(全部套件,含 `test_cost_model.py` + `test_finops.py`) | **1243 passed** | `.venv/bin/python -m pytest tests/ -q` |
 | Harness 配置驗證,7 個 agent | **`RESULT: OK`** | `python deploy/validate_config.py --config agents/finops/harness.json` |
 | 線上艦隊 | **7 個 harness READY** | 用 repo 內建 boto3 呼叫 `list_harnesses` |
 | 正典模組有散佈路徑 | 印出 `would upload 4 contract files` | `python deploy/03_storage.py --region us-east-1 --account-id 123456789012 --dry-run` |
 
 本次新增的每一道 guard 都做過 **mutation check**:逐一還原被斷言的行為,確認測試會
-失敗 —— **265/265 反向控制**,229 個 mutation 斷言 265 組（guard, mutation）配對,runner 各印
+失敗 —— **270/270 反向控制**,234 個 mutation 斷言 270 組（guard, mutation）配對,runner 各印
 一行 PASS。一個「有這行為也過、沒這行為也過」的測試,不是測試。
 
 這個數字是刻意寫進句子裡的。「做過 mutation check」是一個形容詞,而形容詞不會過期:
 刪掉一個 control、或是加了一道 guard 卻沒配 control,這句話照樣讀起來是真的。
 `tests/test_docs_claims.py::test_the_documented_negative_control_count_matches_the_runner`
 現在從 runner 自己的 `case(...)` 註冊推導出這兩個數字。
+
+但推導出來的數字仍然只是一個數字,而這些 control 裡有一個並沒有通過。一次完整跑完的結果發現
+**m189 UNCAUGHT** —— 那個 control 會把 eval prompt 裡 val split 那句話的優先順序拿掉,讓客戶
+的驗收集和 10% val split 讀起來一樣有資格被評分。它的 guard 是在整個 bullet 裡搜 `/fall back/`,
+而同一個 bullet 為了 `eval_only` 的 `model_artifact_uri` 寫著*「never fall back to the newest
+artifact you can find in the bucket」* —— 一句和評分集完全無關的話,不管 prompt 怎麼寫都能讓那條
+regex 通過。所以先前那個數字被報成全數通過,實際上有一隻 mutant 活著:這個數字能證明的是「每道
+guard 都有一個 control」,不是「那個 control 殺得死」。現在 guard 只在提到 val split 的句子裡搜,
+m189 也如它該有的樣子失敗了。任何能被「為別的理由寫下的句子」滿足的東西都不是 guard,而只有完整
+跑一次才知道哪些是。
 
 ### 兩次失敗比通過更有價值
 

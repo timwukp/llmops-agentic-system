@@ -822,6 +822,16 @@ async function loadRun(runId){
     if (d.oodReport) {
       html += `<h2 style="margin-top:12px">OOD layer (measured, never gated)</h2><table><tr><th>Metric</th><th>Value</th></tr>`+
         Object.entries(d.oodReport).map(([k,v])=>`<tr><td>${esc(k)}</td><td class="mono">${esc(typeof v==="object"?JSON.stringify(v):v)}</td></tr>`).join("")+`</table>`;
+    } else if (d.oodMissing) {
+      // The plan asked for the OOD layer and the eval report came back without it. Painting
+      // nothing here is what made that indistinguishable from a run that never asked: the gate
+      // blocks on the ID layer alone, so nothing else in this page would have said a word.
+      html += `<h2 style="margin-top:12px">OOD layer (measured, never gated)</h2>`+
+        // Its own pill and not a GATE_PILL entry: this layer has no gate, and borrowing a
+        // gate verdict is how a report-only miss starts reading as a gate failure.
+        `<div class="sub"><span class="pill err">NOT REPORTED</span> the signed plan names an OOD set `+
+        `(<span class="mono">${esc(d.oodMissing)}</span>) and the eval report carries no `+
+        `<span class="mono">ood</span> object. Not gated, and not measured either.</div>`;
     }
     // per-stage manifest: status / metrics / evidence
     const sk = Object.keys(stages);
