@@ -51,6 +51,12 @@ Next: v2 experiments — code-as-reasoning distillation + augmentation; Kimi K3 
 | Admin console | `agent-cicd-admin` stack (Lambda+APIGW+DDB+Cognito) | ops-console deploy.sh | login secret `agent-admin/dashboard-login`; monitors orchestrator + finetune |
 | Online evals | one config per harness (Correctness/GoalSuccessRate/ToolSelectionAccuracy, 100% sampling) | deploy/06_observability.py --evals | role llmops-eval-execution |
 
+_Not deployed: retrieval Knowledge Base (deploy/09_retrieval.py, added for the r6d RAFT
+run) — an AOSS vector collection bills ~$11.52/day (min 2 OCU) while it EXISTS, so it is
+created per-run under explicit human authorization and torn down (`--teardown`) when the
+run's eval is done. This is the project's one deliberate, disclosed exception to the
+zero-standing-resources posture; nothing is standing right now._
+
 _Not deployed: VPC + endpoints (deploy/02_network.py) — confirmed 2026-08-10 by
 `describe-vpcs` and `describe-vpc-endpoints` on `tag:project=llmops-agentic-system` in
 us-east-1, both `[]`, so $0/day is being billed for it. Not built at all: VPC-mode

@@ -5192,6 +5192,85 @@ case("wire memory: nothing on the deploy path calls the memory-level orphan swee
      [f"{_TO}test_the_run_reports_the_orphans_once_for_the_whole_memory"])
 
 
+# ── deploy/09_retrieval.py: the KB the RAFT runs retrieve from ───────────────────────
+_RT = "deploy/09_retrieval.py"
+
+
+def m289(t):
+    old = "        if key.startswith(CORPUS_PREFIX):"
+    assert t.count(old) == 1, "the eval-key refusal has moved"
+    # The refusal neutered but still parsing: an operator parks id_acceptance.jsonl under
+    # kb-corpus/, the script warns nothing, and the acceptance answers get INGESTED into
+    # the index the student retrieves from. Every judge_score after that looks legitimate.
+    return t.replace(old, "        if False and key.startswith(CORPUS_PREFIX):", 1)
+
+
+case("retrieval deploy: the eval-key refusal is neutered, so the answer sheet can be "
+     "ingested into the index the student retrieves from",
+     _RT, m289,
+     [f"{_TO}test_an_eval_key_under_the_inclusion_prefix_is_refused_not_warned"])
+
+
+def m290(t):
+    old = "        aoss.delete_collection(id=existing[0][\"id\"])"
+    assert t.count(old) == 1, "the collection delete has moved"
+    # The teardown that forgets the ONE hourly-billed resource while reporting cleanup
+    # done. `existing` is still consumed so the replacement parses and the wait loop
+    # below still runs -- the mutation is a missing delete, not a crash.
+    return t.replace(old, "        _unused = existing[0][\"id\"]", 1)
+
+
+case("retrieval deploy: teardown loses the collection delete, so the OCU bill keeps "
+     "running while the cleanup reports done",
+     _RT, m290,
+     [f"{_TO}test_teardown_covers_every_billable_and_every_created_thing"])
+
+
+def m291(t):
+    d = json.loads(t)
+    for st in d["permissionsPolicy"]["Statement"]:
+        if st.get("Sid") == "BedrockKBRetrieveReadOnly":
+            # The convenient widening: "the agent could re-ingest after a corpus fix
+            # itself". An agent that can ingest can put the acceptance answers into the
+            # index it retrieves from -- the fence's second half removed.
+            st["Action"].append("bedrock:StartIngestionJob")
+    return json.dumps(d, indent=2)
+
+
+case("IAM: the harness KB grant widens beyond bedrock:Retrieve",
+     "deploy/iam/harness_execution_role.json", m291,
+     [f"{_TO}test_the_harness_kb_grant_is_exactly_retrieve"])
+
+
+def m292(t):
+    old = "${MIN_OCUS * OCU_HOURLY_USD * 24:.2f}/day"
+    assert t.count(old) == 1, "the derived standing-cost figure has moved"
+    # The 02_network cost-note bug re-created: a restated dollar figure (here the 1-OCU
+    # number, exactly half) instead of arithmetic over the same constants the create
+    # path uses.
+    return t.replace(old, "$5.76/day", 1)
+
+
+case("retrieval deploy: the standing-cost note restates half the real number instead of "
+     "deriving it",
+     _RT, m292,
+     [f"{_TO}test_the_standing_cost_is_derived_from_the_constants_and_names_the_exit"])
+
+
+def m293(t):
+    old = "            if scanned != expected_rows or failed:"
+    assert t.count(old) == 1, "the ingest reconciliation has moved"
+    # COMPLETE taken at face value: a KB that indexed 214 of 300 tickets reports success
+    # and the missing 86 surface as unexplained judge losses.
+    return t.replace(old, "            if False:", 1)
+
+
+case("retrieval deploy: the ingest count reconciliation is skipped, so a partial index "
+     "reports COMPLETE",
+     _RT, m293,
+     [f"{_TO}test_ingest_reconciles_the_document_count_instead_of_reporting_complete"])
+
+
 #: Where the pristine text of the file currently mutated is parked, so a kill -9 -- which
 #: no handler can intercept -- still leaves the original recoverable. Under the repo root
 #: rather than /tmp because it must be obvious to whoever finds the tree dirty, and
