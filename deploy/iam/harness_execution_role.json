@@ -77,6 +77,15 @@
         ]
       },
       {
+        "Sid": "BedrockKBRetrieveReadOnly",
+        "_comment": "bedrock:Retrieve and NOTHING else, on this account's knowledge bases. This is what lets the data-prep curate task assemble RAFT training rows and the eval evaluate task run the acceptance items open-book (both prompts condition on params.retrieval_kb_id). Deliberately NOT RetrieveAndGenerate: generation is the student's job, and an agent that can have the KB answer for it is grading a different system than the one being shipped. Deliberately NOT StartIngestionJob/CreateDataSource/any bedrock-agent write: embedding is per-token billed work and index CONTENT is gate integrity -- an agent that can ingest can put the acceptance answers into the index it retrieves from; deploy/09_retrieval.py refuses eval keys under the inclusion prefix for exactly that reason, and this action list is the second half of that fence. Knowledge-base wildcard rather than one id because the kb id is minted at deploy time and lands in SSM /llmops/retrieval/kb_id; the narrowing is the action.",
+        "Effect": "Allow",
+        "Action": [
+          "bedrock:Retrieve"
+        ],
+        "Resource": "arn:aws:bedrock:<REGION>:<ACCOUNT_ID>:knowledge-base/*"
+      },
+      {
         "Sid": "BuiltinBrowserSessions",
         "Effect": "Allow",
         "Action": [

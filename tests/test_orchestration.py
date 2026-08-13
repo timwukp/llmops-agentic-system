@@ -9574,6 +9574,191 @@ def test_the_consumer_check_reads_the_files_a_deploy_reads(network_mod, tmp_path
     assert len(broken) == 1 and "unreadable" in broken[0], broken
 
 
+# ── deploy/09_retrieval.py: the KB the RAFT runs retrieve from ──────────────────────
+# Two properties carry the whole design and both are cheap to lose silently. (1) Gate
+# integrity: the data source ingests exactly CORPUS_PREFIX, so the acceptance sets can
+# never enter the index the student retrieves from — unless someone parks an eval file
+# under the prefix, which must be a REFUSAL, not a log line. (2) The collection is this
+# project's only standing billable resource, so the teardown must actually delete it and
+# the cost must be derived from the same constants the create path uses, never restated.
+
+@pytest.fixture(scope="module")
+def retrieval_mod():
+    """deploy/09_retrieval.py as a module (name starts with a digit). Import-time safe."""
+    return _load("llmops_09_retrieval", "deploy/09_retrieval.py")
+
+
+class _FakeKbS3:
+    """get/put/list/delete over a dict, byte-faithful — the read-back check needs real
+    bytes, and the stale-removal check needs a listing that reflects prior state."""
+
+    def __init__(self, objects=None):
+        self.objects = dict(objects or {})
+        self.deleted = []
+
+    def get_object(self, Bucket, Key):
+        body = self.objects[f"{Bucket}/{Key}"]
+        return {"Body": io.BytesIO(body)}
+
+    def put_object(self, Bucket, Key, Body):
+        self.objects[f"{Bucket}/{Key}"] = Body if isinstance(Body, bytes) else Body.encode()
+
+    def delete_object(self, Bucket, Key):
+        self.deleted.append(Key)
+        self.objects.pop(f"{Bucket}/{Key}", None)
+
+    def get_paginator(self, name):
+        assert name == "list_objects_v2"
+        objects = self.objects
+
+        class _P:
+            def paginate(self, Bucket, Prefix):
+                keys = sorted(k.split("/", 1)[1] for k in objects
+                              if k.startswith(f"{Bucket}/") and
+                              k.split("/", 1)[1].startswith(Prefix))
+                yield {"Contents": [{"Key": k} for k in keys]}
+        return _P()
+
+
+def test_an_eval_key_under_the_inclusion_prefix_is_refused_not_warned(retrieval_mod):
+    """An acceptance file inside the corpus prefix would be INGESTED — the open-book exam
+    with the answer sheet stapled on. Every judge_score after that still looks legit."""
+    pfx = retrieval_mod.CORPUS_PREFIX
+    with pytest.raises(SystemExit, match="answer sheet"):
+        retrieval_mod.refuse_eval_keys_under_prefix(f"{pfx}id.jsonl", "safe/ood.jsonl")
+    with pytest.raises(SystemExit, match="answer sheet"):
+        retrieval_mod.refuse_eval_keys_under_prefix("safe/id.jsonl", f"{pfx}ood.jsonl")
+    ok = retrieval_mod.refuse_eval_keys_under_prefix(
+        "customer-data/demo/id.jsonl", "customer-data/demo/ood.jsonl")
+    assert pfx in ok  # the pass path names what was checked, not just "ok"
+
+
+def test_the_corpus_explode_writes_one_verified_object_per_row_under_the_prefix(
+        retrieval_mod):
+    rows = [{"id": "T-1", "ticket": "vpn drops", "resolution": "renew the cert"},
+            {"ticket": "no id on this row", "resolution": "falls back to index"}]
+    src = "\n".join(json.dumps(r) for r in rows).encode()
+    pfx = retrieval_mod.CORPUS_PREFIX
+    s3 = _FakeKbS3({"cust/corpus.jsonl": src,
+                    # A leftover from a previous, larger corpus: must be deleted, or the
+                    # ingest reconciliation compares against a count that is a lie.
+                    f"data/{pfx}stale-row.txt": b"old"})
+    out = retrieval_mod.ensure_corpus_objects(s3, "data", "s3://cust/corpus.jsonl",
+                                              dry=False)
+    assert out["rows"] == 2 and out["stale_removed"] == 1, out
+    written = [k.split("/", 1)[1] for k in s3.objects if k.startswith("data/")]
+    assert written and all(k.startswith(pfx) for k in written), written
+    # Every field of the row is in the document: oracle recall needs the resolution text
+    # IN the index without this script guessing the customer's schema.
+    body = s3.objects[f"data/{pfx}T-1.txt"].decode()
+    assert "renew the cert" in body and "vpn drops" in body
+    assert s3.deleted == [f"{pfx}stale-row.txt"], s3.deleted
+
+
+def test_the_dry_run_names_the_same_prefix_the_real_path_writes(retrieval_mod):
+    """The EVAL_PREFIX lesson from 03_storage: two hand-spelled copies of one prefix can
+    disagree while every guard stays green, if the guard only ever reads one branch."""
+    dry = retrieval_mod.ensure_corpus_objects(None, "data", "s3://cust/c.jsonl", dry=True)
+    s3 = _FakeKbS3({"cust/c.jsonl": json.dumps({"id": "a", "t": "x"}).encode()})
+    retrieval_mod.ensure_corpus_objects(s3, "data", "s3://cust/c.jsonl", dry=False)
+    real_keys = [k.split("/", 1)[1] for k in s3.objects if k.startswith("data/")]
+    assert all(k.startswith(retrieval_mod.CORPUS_PREFIX) for k in real_keys)
+    assert retrieval_mod.CORPUS_PREFIX in dry["to"], (
+        f"--dry-run promises {dry['to']} but the real path writes {real_keys}")
+
+
+def test_an_unusable_corpus_row_is_a_refusal_not_a_thinner_index(retrieval_mod):
+    """A silently skipped row surfaces weeks later as 'the student is bad at those
+    categories' in judge output — the least debuggable place this error could land."""
+    with pytest.raises(SystemExit, match="not a JSON object"):
+        retrieval_mod.render_row(["a", "list"], 3)
+    with pytest.raises(SystemExit, match="no non-empty fields"):
+        retrieval_mod.render_row({"ticket": "   "}, 7)
+    # Two rows rendering to one doc id: the second would overwrite the first in-place.
+    dup = "\n".join(json.dumps({"id": "same", "t": str(i)}) for i in range(2)).encode()
+    s3 = _FakeKbS3({"cust/c.jsonl": dup})
+    with pytest.raises(SystemExit, match="silently overwrite"):
+        retrieval_mod.ensure_corpus_objects(s3, "data", "s3://cust/c.jsonl", dry=False)
+
+
+class _FakeIngestClient:
+    def __init__(self, scanned, failed):
+        self.stats = {"numberOfDocumentsScanned": scanned,
+                      "numberOfDocumentsFailed": failed,
+                      "numberOfNewDocumentsIndexed": scanned - failed}
+
+    def start_ingestion_job(self, **kw):
+        return {"ingestionJob": {"ingestionJobId": "job-1"}}
+
+    def get_ingestion_job(self, **kw):
+        return {"ingestionJob": {"status": "COMPLETE", "statistics": self.stats}}
+
+
+def test_ingest_reconciles_the_document_count_instead_of_reporting_complete(
+        retrieval_mod):
+    ok = retrieval_mod.ingest(_FakeIngestClient(3, 0), "kb", "ds", 3, dry=False)
+    assert ok["status"] == "COMPLETE" and ok["reconciled_against"] == 3
+    with pytest.raises(SystemExit, match="count mismatch"):
+        retrieval_mod.ingest(_FakeIngestClient(2, 0), "kb", "ds", 3, dry=False)
+    with pytest.raises(SystemExit, match="count mismatch"):
+        retrieval_mod.ingest(_FakeIngestClient(3, 1), "kb", "ds", 3, dry=False)
+
+
+def test_teardown_covers_every_billable_and_every_created_thing(retrieval_mod):
+    """The teardown that forgets the collection leaves the ONE hourly-billed resource
+    standing while reporting cleanup done. Source-scoped to the function body, with a
+    registered control that strips the delete — a landmark check cannot see `if False:`
+    on its own, so the control is what makes this guard honest."""
+    src = (REPO / "deploy/09_retrieval.py").read_text()
+    body = src.split("def teardown", 1)[1].split("\ndef ", 1)[0]
+    for landmark in ("delete_data_source", "delete_knowledge_base", "delete_collection",
+                     "delete_access_policy", "delete_security_policy",
+                     "delete_parameter", "delete_role_policy", "delete_role"):
+        assert landmark in body, f"teardown lost its {landmark} step"
+    # "Delete requested" is not "bill stopped": the collection delete must be POLLED to
+    # gone, and the wait must sit after the delete call inside the real branch.
+    after_delete = body.split("delete_collection", 1)[1]
+    assert "batch_get_collection" in after_delete, (
+        "the teardown no longer confirms the collection is GONE — an async delete that "
+        "errors after acknowledgement leaves the OCU bill running")
+
+
+def test_the_standing_cost_is_derived_from_the_constants_and_names_the_exit(
+        retrieval_mod):
+    """A restated dollar figure is the 02_network cost-note bug again: the note said half
+    the real number because it was prose, not arithmetic."""
+    per_day = retrieval_mod.MIN_OCUS * retrieval_mod.OCU_HOURLY_USD * 24
+    assert f"${per_day:.2f}/day" in retrieval_mod.STANDING_COST
+    assert "--teardown" in retrieval_mod.STANDING_COST, (
+        "the disclosure names the cost but not the way to stop it")
+    dry = retrieval_mod.ensure_collection(None, dry=True)
+    assert dry["standing_cost"] == retrieval_mod.STANDING_COST
+
+
+def test_the_harness_kb_grant_is_exactly_retrieve(retrieval_mod):
+    """bedrock:Retrieve and nothing else. RetrieveAndGenerate would grade a different
+    system than the one being shipped; any bedrock-agent WRITE would let an agent put the
+    acceptance answers into the index it retrieves from — the second half of the fence
+    whose first half is the inclusion-prefix refusal."""
+    doc = json.loads((REPO / "deploy/iam/harness_execution_role.json").read_text())
+    stmts = doc["permissionsPolicy"]["Statement"]
+    kb = [s for s in stmts if s.get("Sid") == "BedrockKBRetrieveReadOnly"]
+    assert len(kb) == 1, "the KB retrieve statement is missing (or duplicated)"
+    assert kb[0]["Action"] == ["bedrock:Retrieve"], kb[0]["Action"]
+    assert ":knowledge-base/" in kb[0]["Resource"], kb[0]["Resource"]
+    # Scan the ACTION lists, not the serialized document: the _comment fields argue about
+    # these very action names, and a guard that reads its own rationale as a violation is
+    # the self-scanning trap — while one that reads prose at all could be satisfied BY
+    # prose. Only an Action entry grants anything.
+    granted = {a for s in stmts
+               for a in ([s["Action"]] if isinstance(s["Action"], str) else s["Action"])}
+    for forbidden in ("bedrock:RetrieveAndGenerate", "bedrock:StartIngestionJob",
+                      "bedrock:CreateDataSource", "bedrock:UpdateKnowledgeBase",
+                      "bedrock:DeleteKnowledgeBase"):
+        assert forbidden not in granted, (
+            f"{forbidden} crept into the harness role — index content is gate integrity")
+
+
 # ── a global name with a regional body: the second-region deploy ───────────────────
 # IAM roles are global and these names are constants, but their policies are not: 71
 # resource ARNs across deploy/iam/*.json carry <REGION>. put_role_policy REPLACES by
