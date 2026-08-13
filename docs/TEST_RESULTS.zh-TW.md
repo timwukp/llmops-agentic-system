@@ -21,9 +21,9 @@
 
 | 檢查 | 結果 | 復現方式 |
 |---|---|---|
-| 單元測試（契約、成本模型、driver 迴圈、Lambda、狀態機文檔） | **1302/1302 通過** | `.venv/bin/python -m pytest tests/ -q --ignore=tests/golden` |
+| 單元測試（契約、成本模型、driver 迴圈、Lambda、狀態機文檔） | **1308/1308 通過** | `.venv/bin/python -m pytest tests/ -q --ignore=tests/golden` |
 | Shell 測試套件 —— N 路 capacity race guard（`tests/test_capacity_race_guard.sh`） | **10/10 斷言** | `bash tests/test_capacity_race_guard.sh` |
-| 反向控制 —— 逐一破壞每道 guard，確認它會失敗 | **322/322 反向控制** | `.venv/bin/python tests/negative_controls/monitor_dispatch.py` |
+| 反向控制 —— 逐一破壞每道 guard，確認它會失敗 | **333/333 反向控制** | `.venv/bin/python tests/negative_controls/monitor_dispatch.py` |
 | Harness 配置驗證（5 個專家 + 指揮家 + 審計員） | **7/7 `RESULT: OK`** | `python deploy/validate_config.py --config agents/<a>/harness.json` |
 | 架構 SVG 幾何檢查（虛線零交叉、零穿框） | **CLEAN** | `python tests/test_svg_geometry.py docs/architecture-*.svg` |
 | 遮蔽掃描（帳號 ID、憑證、帶帳號的 ARN） | CLEAN | `.github/workflows/redaction-check.yml` |
@@ -121,13 +121,13 @@ endpoint、五輪 e2e 迭代 —— 花費比這個帳戶單日花在一個沒�
 
 | 檢查 | 結果 | 重現方式 |
 |---|---|---|
-| 單元測試(全部套件,含 `test_cost_model.py` + `test_finops.py`) | **1302 passed** | `.venv/bin/python -m pytest tests/ -q` |
+| 單元測試(全部套件,含 `test_cost_model.py` + `test_finops.py`) | **1308 passed** | `.venv/bin/python -m pytest tests/ -q` |
 | Harness 配置驗證,7 個 agent | **`RESULT: OK`** | `python deploy/validate_config.py --config agents/finops/harness.json` |
 | 線上艦隊 | **7 個 harness READY** | 用 repo 內建 boto3 呼叫 `list_harnesses` |
 | 正典模組有散佈路徑 | 印出 `would upload 4 contract files` | `python deploy/03_storage.py --region us-east-1 --account-id 123456789012 --dry-run` |
 
 本次新增的每一道 guard 都做過 **mutation check**:逐一還原被斷言的行為,確認測試會
-失敗 —— **322/322 反向控制**,278 個 mutation 斷言 322 組（guard, mutation）配對,runner 各印
+失敗 —— **333/333 反向控制**,284 個 mutation 斷言 333 組（guard, mutation）配對,runner 各印
 一行 PASS。一個「有這行為也過、沒這行為也過」的測試,不是測試。
 
 這個數字是刻意寫進句子裡的。「做過 mutation check」是一個形容詞,而形容詞不會過期:
@@ -197,8 +197,8 @@ stage invocation 12 列），所以**是上一個修正把真實事件數推過�
 最新 100 筆裡最舊的 25 筆 —— 兩端都不對的窗口），m256/m257/m263/m264/m265 各自在「從查詢到畫面」
 的路上丟掉一個截斷標記。一個不說自己被封頂的列表讀起來就是完整的，那是同一個缺陷往上一層。
 
-**D14 —— 一個只到達七個 harness 中五個的修正，而它「顯而易見」的修法會燒掉 43 條記憶
-（十一個控制，m267-m277）。** 共享 BYO memory 由 `deploy/04_wire_memory.py` 接線，而它的
+**D14 —— 一個只到達七個 harness 中五個的修正、它「顯而易見」的修法會燒掉的 43 條記憶，
+以及更早一次部署其實已經燒掉的 63 條（十七個控制，m267-m283）。** 共享 BYO memory 由 `deploy/04_wire_memory.py` 接線，而它的
 harness 名單是手寫的：五個管線 worker。有兩個 harness 接在同一份 memory 上、卻不在名單裡，
 於是 #83 的提取收緊 —— semantic `topK` 10 → 5、`relevanceScore` 0.2 → 0.6，也就是那個讓
 「另一個 run 的事後檢討」不再以裸事實注入的修正 —— **從未到達它們**。2026-08-13 線上實測：
@@ -226,6 +226,38 @@ harness」* —— 這個教訓被寫在一支腳本裡，卻沒有被套用到�
 **它同意了那個遺漏**，和 console 那個 gate band 是同一個形狀。改成從配置推導之後，它立刻失敗，
 並且點名了第三個沒人找過的缺口 —— orchestrator 的提示詞同樣沒有記憶優先序規則，finops 也沒有
 （m276、m277），而這兩個正是會發表 rate card、以及對人類報價的 agent。
+
+**接著，支撐那個修正的量測本身被發現量得太窄，而且窄在要命的方向上。** 當時只數了兩個
+full-harness-ID 分區 —— 13 + 30 —— 因為只有那兩個 harness 還「指著」這樣的分區。把七個
+都數過一遍：
+
+| 分區 | 記錄數 | 已上線的 `actorId` |
+|---|---|---|
+| `/users/llmops_data_prep-KuSKXUaxyP/facts` | 2 | 裸名字 |
+| `/users/llmops_finetune-xXl7jsACZO/facts` | **25** | 裸名字 |
+| `/users/llmops_eval-iuIIs96fFM/facts` | **16** | 裸名字 |
+| `/users/llmops_deploy-nLLNWairTc/facts` | **11** | 裸名字 |
+| `/users/llmops_monitor-YCXC5hcXzu/facts` | **9** | 裸名字 |
+| `/users/llmops_finops-eDJtU9PvKh/facts` | 13 | 就是這個分區 |
+| `/users/llmops_orchestrator-GsIqHZ4viJ/facts` | 30 | 就是這個分區 |
+| `/users/<每一個裸 harness 名字>/facts` | **0** | —— |
+
+**semantic 一共 106 條，其中 63 條寫下它們的那個 agent 現在已經取不回來了** —— 而 episodic
+通道以同樣的方式斷掉，五個 worker 的 `/episodes/<full id>` 底下還有 105 條。`llmops_monitor`
+最新的那條孤兒記錄的日期是 **2026-08-08**，所以這次搬動只發生在幾天前，是這支腳本自己更早
+一次執行做的，機制正好就是上面那一個。那兩個倖存的 harness 之所以倖存，**只**因為手寫名單漏掉
+了它們：缺陷本身就是資料活下來的原因。所以「保留已上線 `actorId`」這道 guard 是真的，但來晚了
+—— 它守住的是那 43 條；而沒有任何 API 能把記錄在 namespace 之間搬動，所以那 63 條是一份回報，
+不是一次修復。
+
+真正缺的東西比接線缺陷更小、更無聊：**從來沒有人去數另一種拼法**，於是「這個 agent 沒有記憶」
+和「這個 agent 的記憶在 25 條之外的另一個分區」在部署日誌裡印出來一模一樣。現在每一次 attach
+都會去讀那些掛在「它沒有被接上的任何 `actorId` 拼法」底下的分區，而控制逐句盯住這件事：m278
+讓這份回報靜音，m279 拿掉 episodic namespace（於是只報損失較小的那一半），m281 只檢查完整
+harness ID（對七個裡的六個都對，正好在值得抓的那個案例上瞎掉），m282 讓檢查只在有人要求
+repartition 時才跑 —— 而那五個已經丟掉記錄的 harness 永遠不會有人去 repartition，m283 只數
+第一頁，而 m280 把一個**沒被讀過**的分區重新變回看起來是空的，也正是這個等價讓 63 條記錄在
+沒有任何一次失敗呼叫的情況下離開。
 
 ### 兩次失敗比通過更有價值
 

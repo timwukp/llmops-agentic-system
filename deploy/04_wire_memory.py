@@ -13,6 +13,9 @@ Wraps the agentcore-harness-builder skill's wire_memory.py three-step wiring
     USER_PREFERENCE/SUMMARIZATION — there is no human user in the loop)
   - actorId per-agent partitions the namespaces by agent, and an actorId already
     live is NEVER changed by a redeploy (see `resolve_actor_id`)
+  - every attach reports the records held under the OTHER spelling of actorId, so a
+    partition an earlier deploy walked away from stops looking like an empty one
+    (see `stranded_partitions` — 63 records are in that state right now)
   - publishes the memory id/arn to SSM /llmops/memory/*
 
 Usage:
@@ -125,15 +128,14 @@ def check_repartition(harnesses, repartition):
         raise SystemExit(f"--repartition names harnesses not being wired: {unknown}")
 
 
-def count_facts(dp, memory_id, actor_id):
-    """How many semantic records live in one actor's partition.
+def count_records(dp, memory_id, namespace):
+    """How many memory records live in one namespace, every page of it.
 
     Read from the data plane rather than assumed, because it is the number that decides
     whether a repartition is free or destructive, and it is not derivable from anything
     in this repo.
     """
-    ns = f"/users/{actor_id}/facts"
-    total, kw = 0, {"memoryId": memory_id, "namespace": ns, "maxResults": 100}
+    total, kw = 0, {"memoryId": memory_id, "namespace": namespace, "maxResults": 100}
     while True:
         r = dp.list_memory_records(**kw)
         total += len(r.get("memoryRecordSummaries", []))
@@ -141,6 +143,49 @@ def count_facts(dp, memory_id, actor_id):
         if not tok:
             return total
         kw["nextToken"] = tok
+
+
+def count_facts(dp, memory_id, actor_id):
+    """The semantic partition of one actor."""
+    return count_records(dp, memory_id, f"/users/{actor_id}/facts")
+
+
+def stranded_partitions(dp, memory_id, harness_id, harness_name, actor_id):
+    """Records this harness holds under a spelling of actorId it is NOT being wired with.
+
+    Keeping a live actorId (see `resolve_actor_id`) protects a partition from THIS
+    deploy; it does nothing about a partition an EARLIER deploy already walked away from,
+    and that is not hypothetical. Measured live 2026-08-13, memory
+    llmops_shared_memory-hbEZ9K8d57: all seven harnesses hold semantic records under
+    their FULL harness ID -- 2 / 25 / 16 / 11 / 9 for the five pipeline workers, 13 and
+    30 for finops and the orchestrator, 106 in total -- while every bare-name semantic
+    partition holds 0. The five workers' live actorId is the bare name, so 63 of those
+    106 are already unreachable by the agents that wrote them, and llmops_monitor's
+    newest orphaned record is dated 2026-08-08: the move happened days ago, silently,
+    by exactly the mechanism this finding is about. The two that were spared were spared
+    only because the hand-written list omitted them.
+
+    Nothing in the control plane can report this -- UpdateHarness succeeded, and a
+    harness wired to the wrong partition looks identical to one whose memory is simply
+    empty. So the count is read on every attach, not only when --repartition is asked
+    for, and BOTH candidate spellings are checked rather than the one this script would
+    have chosen: an actorId that is neither (a hand-set value, a rename) otherwise hides
+    a partition behind an assumption about which spelling went stale.
+
+    There is no API that moves a record between namespaces, so this is a report, not a
+    repair. What it buys is that "the memory is empty" and "the memory is 25 records away
+    from here" stop looking the same in a deploy log.
+    """
+    found = {}
+    for other in [s for s in (harness_name, harness_id) if s != actor_id]:
+        # /episodes/{actorId} is the episodic strategy's reflection namespace, and it is
+        # a real namespace holding real records (live-verified) -- the episodic channel
+        # strands the same way the semantic one does.
+        for ns in (f"/users/{other}/facts", f"/episodes/{other}"):
+            n = count_records(dp, memory_id, ns)
+            if n:
+                found[ns] = n
+    return found
 
 
 def resolve_actor_id(ctl, harness_id, harness_name, repartition):
@@ -153,11 +198,16 @@ def resolve_actor_id(ctl, harness_id, harness_name, repartition):
     `llmops_finops-eDJtU9PvKh` / `llmops_orchestrator-GsIqHZ4viJ`, and those two
     partitions hold 13 and 30 semantic records while every bare-name partition holds 0.
     So this script's own preferred value -- the bare name, the only spelling stable
-    across a harness recreation -- would have discarded all 43 in one call, and the
+    across a harness recreation -- would have discarded those 43 in one call, and the
     redeploy that applies the retrieval fix is exactly when it would have happened. A
     fix that silently destroys the data it exists to serve is worse than the defect.
 
     A repartition is therefore opt-in per harness AND announced with the count it costs.
+
+    43 is what THIS guard still protects, not the size of the problem: the other five
+    harnesses hold 63 more semantic records under their full harness IDs and have already
+    been moved to the bare name by an earlier run of this script. Keeping a live actorId
+    cannot bring those back -- see `stranded_partitions`, which reports them.
     """
     try:
         cur = ctl.get_harness(harnessId=harness_id)["harness"]
@@ -212,6 +262,16 @@ def attach_to_harness(ctl, harness_name, memory_arn, sids, dry, dp=None,
         out["kept_live_actor_id"] = True
     if repartitioned:
         out["repartitioned_from_records"] = abandoning
+    if dp is not None and memory_id is not None:
+        stranded = stranded_partitions(dp, memory_id, harness_id, harness_name, actor_id)
+        if stranded:
+            out["stranded"] = stranded
+            print(f"WARNING {harness_name}: {sum(stranded.values())} memory records are "
+                  f"NOT reachable with actorId={actor_id}: {stranded}", file=sys.stderr)
+    else:
+        # An unchecked partition must not print as an empty one; that equivalence is the
+        # whole reason 63 records went missing without a single failed call.
+        out["stranded_check"] = "SKIPPED: no data plane -- unknown is not zero"
     if dry:
         out["would_attach"] = block
         return out

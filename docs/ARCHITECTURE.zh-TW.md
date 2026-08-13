@@ -600,8 +600,16 @@ floors-only requirements + torch-2.6 DLC 配方 —— 那個配方當初花了 
 - **已經上線的 `actorId` 絕不會被重新部署改掉。** `actorId` 是 `/users/{actorId}/facts`
   的分區鍵，所以改寫它並不是搬動一份記憶 —— 是拋棄一份，而 `UpdateHarness` 兩種情況都回
   成功。上面那兩個 harness 是由較舊的 `deploy/wire_memory.py` 用完整 harness ID 接的，而
-  那也是唯一有記錄的分區。所以要搬動它必須逐一指名（`--repartition <harness>`），並且在
-  data plane 報得出「即將被拋棄幾條記錄」之前直接拒絕：一個未知的數字讀起來和 0 一模一樣。
+  那兩個分區裝著這份 memory 的 43 條記錄。所以要搬動它必須逐一指名（`--repartition
+  <harness>`），並且在 data plane 報得出「即將被拋棄幾條記錄」之前直接拒絕：一個未知的
+  數字讀起來和 0 一模一樣。
+- **每一次 attach 都會回報「另一種 `actorId` 拼法」底下還放著什麼。** 上面那道 guard 守的是
+  *這一次*部署，對「更早一次部署已經走開的那個分區」毫無作用 —— 實測是另外 63 條 semantic
+  記錄（外加 105 條 episodic），躺在五個管線 worker 的完整 harness ID 底下，自從某次重新部署
+  把它們搬到裸名字之後，寫下它們的 agent 就再也拿不到。沒有任何 API 能把記錄在 namespace 之間
+  搬動，所以這是一份回報、不是一次修復；它換到的是「一個被拋棄的分區」和「一個空的分區」不再
+  印出同一個樣子。兩種候選拼法都會被檢查，兩個通道都會被計數，而一個讀不到的分區會被回報成
+  「沒讀到」，不是「是空的」。
 
 Semantic 通道是刻意比 episodic **更緊**的（`topK` 5 / `relevanceScore` 0.6 對 10 / 0.2）。
 這兩者並不矛盾：`/episodes/{actorId}/{sessionId}` 把 episodic 回憶限制在 agent 自己的

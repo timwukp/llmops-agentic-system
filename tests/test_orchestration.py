@@ -9922,7 +9922,10 @@ def test_attach_sends_the_resolved_harness_id_not_the_name(wire_memory_mod):
         ctl, "llmops_finetune", "arn:aws:bedrock-agentcore:us-east-1:TESTACCTID00:memory/m",
         {"SEMANTIC": "sem-1", "EPISODIC": "epi-1"}, dry=False)
     assert out == {"harness": "llmops_finetune", "actorId": "llmops_finetune",
-                   "attached": True}
+                   "attached": True,
+                   # no data plane was handed in, so the other spelling's partition was
+                   # not read — and an unread partition must not print as an empty one.
+                   "stranded_check": "SKIPPED: no data plane -- unknown is not zero"}
     assert ctl.sent == ["llmops_finetune-Ab1Cd2Ef3G"]
 
 
@@ -9990,6 +9993,31 @@ def _dp(counts):
             page = recs[start:start + maxResults]
             self.pages += 1
             out = {"memoryRecordSummaries": page}
+            if start + maxResults < len(recs):
+                out["nextToken"] = str(start + maxResults)
+            return out
+
+    return _Dp()
+
+
+def _dp_ns(counts):
+    """A data plane keyed by NAMESPACE, so the two channels can hold different counts.
+
+    `_dp` keys on the actor segment, which collapses `/users/<a>/facts` and
+    `/episodes/<a>` into one number — fine for the repartition price, useless for
+    asserting that both channels are actually looked at."""
+    class _Dp:
+        def __init__(self):
+            self.pages = 0
+            self.seen = []
+
+        def list_memory_records(self, memoryId, namespace, maxResults, nextToken=None):
+            self.pages += 1
+            if nextToken is None:
+                self.seen.append(namespace)
+            recs = [{"memoryRecordId": f"r{i}"} for i in range(counts.get(namespace, 0))]
+            start = int(nextToken or 0)
+            out = {"memoryRecordSummaries": recs[start:start + maxResults]}
             if start + maxResults < len(recs):
                 out["nextToken"] = str(start + maxResults)
             return out
@@ -10134,6 +10162,101 @@ def test_the_semantic_channel_stays_tighter_than_the_episodic_one(wire_memory_mo
     assert sem["relevanceScore"] > epi["relevanceScore"], (sem, epi)
     assert sem["topK"] < epi["topK"], (sem, epi)
     assert (epi["topK"], epi["relevanceScore"]) == (10, 0.2), epi
+
+
+# ── the 63 records the guard above arrived one deploy too late for ──────────────────
+# The measurement that produced this block was taken AFTER the guard above shipped, and
+# it corrected it. Only two harnesses' full-harness-ID partitions had been counted (13 +
+# 30 = 43) because only those two still POINTED at one. Counting all seven:
+#
+#   /users/llmops_data_prep-KuSKXUaxyP/facts      2      live actorId = bare name
+#   /users/llmops_finetune-xXl7jsACZO/facts      25      live actorId = bare name
+#   /users/llmops_eval-iuIIs96fFM/facts          16      live actorId = bare name
+#   /users/llmops_deploy-nLLNWairTc/facts        11      live actorId = bare name
+#   /users/llmops_monitor-YCXC5hcXzu/facts        9      live actorId = bare name
+#   /users/llmops_finops-eDJtU9PvKh/facts        13      live actorId = that partition
+#   /users/llmops_orchestrator-GsIqHZ4viJ/facts  30      live actorId = that partition
+#   /users/<every bare harness name>/facts        0
+#
+# 106 semantic records, of which 63 are ALREADY unreachable by the agent that wrote them.
+# llmops_monitor's newest orphan is dated 2026-08-08, so the move is days old, done by an
+# earlier run of this very script, with no failed call anywhere. The episodic channel is
+# stranded the same way (105 records under the five workers' /episodes/<full id>).
+#
+# Keeping a live actorId cannot undo that and no API moves a record between namespaces.
+# What was missing is smaller and duller: nobody ever counted the OTHER spelling, so "this
+# agent has no memory" and "this agent's memory is 25 records away from here" printed
+# identically. These tests are the check that would have said so.
+
+
+def test_every_attach_reports_the_records_the_other_spelling_still_holds(
+        wire_memory_mod):
+    """The check that would have caught the 63 — and it runs without --repartition,
+    because the harnesses that lost their records are precisely the ones nobody was
+    repartitioning: their actorId had ALREADY been rewritten."""
+    ctl = _wired_ctl(live_actor_id="llmops_finops", harness_id="llmops_finops-eDJtU9PvKh")
+    dp = _dp_ns({"/users/llmops_finops-eDJtU9PvKh/facts": 25})
+    out = wire_memory_mod.attach_to_harness(ctl, "llmops_finops", _MEM_ARN, _SIDS,
+                                            dry=False, dp=dp, memory_id="m-1")
+    assert out["actorId"] == "llmops_finops", out
+    assert out["stranded"] == {"/users/llmops_finops-eDJtU9PvKh/facts": 25}, out
+
+
+def test_the_stranded_check_reads_the_episodic_partition_too(wire_memory_mod):
+    """`/episodes/{actorId}` is the episodic strategy's reflection namespace and holds
+    real records (live: 105 under the five workers' full ids). A check that only looked
+    at `/users/.../facts` would report the smaller half of the loss."""
+    ctl = _wired_ctl(live_actor_id="llmops_finops", harness_id="llmops_finops-eDJtU9PvKh")
+    dp = _dp_ns({"/episodes/llmops_finops-eDJtU9PvKh": 11})
+    out = wire_memory_mod.attach_to_harness(ctl, "llmops_finops", _MEM_ARN, _SIDS,
+                                            dry=False, dp=dp, memory_id="m-1")
+    assert out["stranded"] == {"/episodes/llmops_finops-eDJtU9PvKh": 11}, out
+    assert "/users/llmops_finops-eDJtU9PvKh/facts" in dp.seen, dp.seen
+
+
+def test_a_partition_with_nothing_in_it_is_not_reported_as_stranded(wire_memory_mod):
+    """A warning on every attach of a fleet with nothing stranded is a warning nobody
+    reads by the third deploy."""
+    ctl = _wired_ctl(live_actor_id="llmops_finops", harness_id="llmops_finops-eDJtU9PvKh")
+    out = wire_memory_mod.attach_to_harness(ctl, "llmops_finops", _MEM_ARN, _SIDS,
+                                           dry=False, dp=_dp_ns({}), memory_id="m-1")
+    assert "stranded" not in out, out
+    assert "stranded_check" not in out, out
+
+
+def test_an_unchecked_partition_does_not_report_as_an_empty_one(wire_memory_mod):
+    """With no data plane the answer is 'not checked', never 'nothing there' — the two
+    reading the same is how 63 records left without a failed call."""
+    ctl = _wired_ctl(live_actor_id="llmops_finops", harness_id="llmops_finops-eDJtU9PvKh")
+    out = wire_memory_mod.attach_to_harness(ctl, "llmops_finops", _MEM_ARN, _SIDS,
+                                            dry=False)
+    assert "stranded" not in out, out
+    assert "SKIPPED" in out["stranded_check"], out
+
+
+def test_the_stranded_count_reads_past_the_first_page(wire_memory_mod):
+    """Same trap as the repartition price, one call further out: a partition big enough
+    to matter is exactly the one a first-page count under-reports."""
+    ctl = _wired_ctl(live_actor_id="llmops_finops", harness_id="llmops_finops-eDJtU9PvKh")
+    dp = _dp_ns({"/users/llmops_finops-eDJtU9PvKh/facts": 250})
+    out = wire_memory_mod.attach_to_harness(ctl, "llmops_finops", _MEM_ARN, _SIDS,
+                                            dry=False, dp=dp, memory_id="m-1")
+    assert out["stranded"] == {"/users/llmops_finops-eDJtU9PvKh/facts": 250}, out
+
+
+def test_both_spellings_are_checked_when_the_live_actor_id_is_neither(wire_memory_mod):
+    """A hand-set or renamed actorId leaves BOTH candidate partitions behind. Checking
+    only the full harness ID assumes the bare name is the one this script chose, which is
+    true in six of seven live harnesses and false in the case worth catching."""
+    ctl = _wired_ctl(live_actor_id="legacy-actor",
+                     harness_id="llmops_finops-eDJtU9PvKh")
+    dp = _dp_ns({"/users/llmops_finops/facts": 4,
+                 "/users/llmops_finops-eDJtU9PvKh/facts": 13})
+    out = wire_memory_mod.attach_to_harness(ctl, "llmops_finops", _MEM_ARN, _SIDS,
+                                            dry=False, dp=dp, memory_id="m-1")
+    assert out["actorId"] == "legacy-actor", out
+    assert out["stranded"] == {"/users/llmops_finops/facts": 4,
+                              "/users/llmops_finops-eDJtU9PvKh/facts": 13}, out
 
 
 # ── the SECOND spelling of a typed call ─────────────────────────────────────────────

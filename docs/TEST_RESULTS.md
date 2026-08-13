@@ -22,9 +22,9 @@ page is its ledger.
 
 | Check | Result | How to reproduce |
 |---|---|---|
-| Unit tests (contracts, cost model, driver loop, Lambdas, state machine document) | **1302/1302 passed** | `.venv/bin/python -m pytest tests/ -q --ignore=tests/golden` |
+| Unit tests (contracts, cost model, driver loop, Lambdas, state machine document) | **1308/1308 passed** | `.venv/bin/python -m pytest tests/ -q --ignore=tests/golden` |
 | Shell suite — N-way capacity race guard (`tests/test_capacity_race_guard.sh`) | **10/10 assertions** | `bash tests/test_capacity_race_guard.sh` |
-| Negative controls — every guard broken in turn, confirmed to fail | **322/322 negative controls** | `.venv/bin/python tests/negative_controls/monitor_dispatch.py` |
+| Negative controls — every guard broken in turn, confirmed to fail | **333/333 negative controls** | `.venv/bin/python tests/negative_controls/monitor_dispatch.py` |
 | Harness config validation (5 specialists + conductor + auditor) | **7/7 `RESULT: OK`** | `python deploy/validate_config.py --config agents/<a>/harness.json` |
 | Architecture SVG geometry (no wire crossings, no wire through a card) | **CLEAN** | `python tests/test_svg_geometry.py docs/architecture-*.svg` |
 | Redaction scan (account IDs, credentials, account-bearing ARNs) | CLEAN | `.github/workflows/redaction-check.yml` |
@@ -133,14 +133,14 @@ Full record: [VERIFICATION_finops.md](../deploy/evidence/VERIFICATION_finops.md)
 
 | Check | Result | How to reproduce |
 |---|---|---|
-| Unit tests (all suites, incl. `test_cost_model.py` + `test_finops.py`) | **1302 passed** | `.venv/bin/python -m pytest tests/ -q` |
+| Unit tests (all suites, incl. `test_cost_model.py` + `test_finops.py`) | **1308 passed** | `.venv/bin/python -m pytest tests/ -q` |
 | Harness config validation, 7 agents | **`RESULT: OK`** | `python deploy/validate_config.py --config agents/finops/harness.json` |
 | Live fleet | **7 harnesses READY** | `list_harnesses` via the repo's vendored boto3 |
 | Canonical module has a distribution path | prints `would upload 4 contract files` | `python deploy/03_storage.py --region us-east-1 --account-id 123456789012 --dry-run` |
 
 Every guard added in this work was **mutation-checked**: the asserted behaviour was
-reverted one at a time and the test confirmed to fail — **322/322 negative controls**, 278
-mutations asserting 322 (guard, mutation) pairs, one printed PASS line each. A test that
+reverted one at a time and the test confirmed to fail — **333/333 negative controls**, 284
+mutations asserting 333 (guard, mutation) pairs, one printed PASS line each. A test that
 passes both with and against the behaviour it names is not a test.
 
 The count is in the sentence on purpose. "Mutation-checked" is an adjective, and an
@@ -230,8 +230,8 @@ window that is right at neither end), and m256/m257/m263/m264/m265 each drop one
 marker on its way from the query to the screen. A capped list that does not say it is capped
 reads as complete, which is the same defect one level up.
 
-**D14 — a fix that reached five of seven harnesses, and whose obvious repair would have burned
-43 memory records (eleven controls, m267-m277).** The shared BYO memory is wired by
+**D14 — a fix that reached five of seven harnesses, 43 memory records its obvious repair would
+have burned, and 63 an earlier deploy already had (seventeen controls, m267-m283).** The shared BYO memory is wired by
 `deploy/04_wire_memory.py`, whose harness list was hand-written: the five pipeline workers.
 Two harnesses are wired to the same memory and were not on it, so #83's retrieval tightening —
 semantic `topK` 10 → 5, `relevanceScore` 0.2 → 0.6, the fix that stopped another run's
@@ -266,6 +266,41 @@ the same shape as the console gate band. Derived from the configs instead, it fa
 and named a third gap nobody had looked for — the orchestrator prompt had no memory-precedence
 rule either, and neither did finops (m276, m277), the two agents that publish a rate card and
 quote a price to a human.
+
+**And then the measurement behind that fix turned out to be too narrow, in the direction that
+mattered.** Only two full-harness-ID partitions had been counted — 13 + 30 — because only those
+two harnesses still *pointed* at one. Counting all seven:
+
+| partition | records | live `actorId` |
+|---|---|---|
+| `/users/llmops_data_prep-KuSKXUaxyP/facts` | 2 | the bare name |
+| `/users/llmops_finetune-xXl7jsACZO/facts` | **25** | the bare name |
+| `/users/llmops_eval-iuIIs96fFM/facts` | **16** | the bare name |
+| `/users/llmops_deploy-nLLNWairTc/facts` | **11** | the bare name |
+| `/users/llmops_monitor-YCXC5hcXzu/facts` | **9** | the bare name |
+| `/users/llmops_finops-eDJtU9PvKh/facts` | 13 | that partition |
+| `/users/llmops_orchestrator-GsIqHZ4viJ/facts` | 30 | that partition |
+| `/users/<every bare harness name>/facts` | **0** | — |
+
+**106 semantic records, of which 63 are already unreachable by the agent that wrote them** — and
+the episodic channel is stranded the same way, 105 more records under the five workers'
+`/episodes/<full id>`. `llmops_monitor`'s newest orphaned record is dated **2026-08-08**, so the
+move is days old, made by an earlier run of this very script, by exactly the mechanism above.
+The two harnesses that were spared were spared *only* because the hand-written list omitted
+them: the defect was the reason the data survived. The guard that keeps a live `actorId` is
+therefore real but late — it protects the 43, and no API moves a record between namespaces, so
+the 63 are a report rather than a repair.
+
+What was actually missing is smaller and duller than the wiring bug: **nobody ever counted the
+other spelling**, so "this agent has no memory" and "this agent's memory is 25 records away from
+here" printed identically in a deploy log. Every attach now reads the partitions held under any
+spelling of `actorId` it is *not* being wired with, and the controls hold each part of that
+sentence: m278 silences the report, m279 drops the episodic namespace (reporting the smaller
+half of the loss), m281 checks only the full harness ID (fine for six of seven live harnesses,
+blind in the case worth catching), m282 runs the check only when a repartition is requested —
+which is never for the five that had already lost theirs — m283 counts one page, and m280 turns
+an *unread* partition back into an empty-looking one, the equivalence that let 63 records leave
+without a single failed call.
 
 ### Two failures worth more than the passes
 

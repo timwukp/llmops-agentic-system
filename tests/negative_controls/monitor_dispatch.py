@@ -5005,6 +5005,109 @@ case("orchestrator prompt: the agent that quotes a price to a human loses the ru
      [f"{_SM}test_every_memory_wired_prompt_subordinates_memory_to_the_plan"])
 
 
+# ── D14 (cont.): the 63 records the guard above arrived one deploy too late for ──────
+# Counting all seven full-harness-ID partitions instead of the two that still pointed at
+# one: 106 semantic records, 63 of them already unreachable by the agent that wrote them
+# (the five workers, whose actorId an earlier run of this script rewrote to the bare
+# name). llmops_monitor's newest orphan is dated 2026-08-08. No call failed. What was
+# missing is that nobody ever counted the OTHER spelling, so "no memory" and "25 records
+# away from here" printed identically.
+
+
+def m278(t):
+    old = "        stranded = stranded_partitions(dp, memory_id, harness_id, harness_name, actor_id)"
+    assert t.count(old) == 1, "the stranded-partition check has moved"
+    # The warning goes quiet. Every harness reports a clean attach while its records sit in
+    # a namespace its own retrieval config can no longer name -- which is the live state of
+    # five of seven harnesses, and how it got there unnoticed.
+    return t.replace(old, "        stranded = {}", 1)
+
+
+case("wire memory: nothing counts the records held under the other spelling of actorId, so "
+     "an abandoned partition and an empty one print the same",
+     _WM, m278,
+     [f"{_TO}test_every_attach_reports_the_records_the_other_spelling_still_holds",
+      f"{_TO}test_the_stranded_check_reads_the_episodic_partition_too",
+      f"{_TO}test_the_stranded_count_reads_past_the_first_page",
+      f"{_TO}test_both_spellings_are_checked_when_the_live_actor_id_is_neither"])
+
+
+def m279(t):
+    old = '        for ns in (f"/users/{other}/facts", f"/episodes/{other}"):'
+    assert t.count(old) == 1, "the stranded namespace sweep has moved"
+    # Only the semantic channel is counted, so the report names 63 records and stays silent
+    # about the 105 episodic ones stranded beside them.
+    return t.replace(old, '        for ns in (f"/users/{other}/facts",):', 1)
+
+
+case("wire memory: the stranded report skips the episodic reflection namespace, reporting "
+     "the smaller half of the loss",
+     _WM, m279,
+     [f"{_TO}test_the_stranded_check_reads_the_episodic_partition_too"])
+
+
+def m280(t):
+    old = '        out["stranded_check"] = "SKIPPED: no data plane -- unknown is not zero"'
+    assert t.count(old) == 1, "the unchecked-partition marker has moved"
+    # A partition nobody read, reported as a partition with nothing in it. This exact
+    # equivalence is why the loss was invisible; asserting it back is the sharpest control
+    # in the block.
+    return t.replace(old, '        out["stranded"] = {}', 1)
+
+
+case("wire memory: a partition that was never read reports as an empty one",
+     _WM, m280,
+     [f"{_TO}test_an_unchecked_partition_does_not_report_as_an_empty_one",
+      f"{_TO}test_attach_sends_the_resolved_harness_id_not_the_name"])
+
+
+def m281(t):
+    old = "    for other in [s for s in (harness_name, harness_id) if s != actor_id]:"
+    assert t.count(old) == 1, "the candidate-spelling sweep has moved"
+    # Assumes the bare name is always the spelling in use, which holds for six of the seven
+    # live harnesses -- so a hand-set or renamed actorId hides its bare-name partition
+    # behind the one assumption that made this finding possible.
+    return t.replace(old, "    for other in [harness_id]:", 1)
+
+
+case("wire memory: only the full harness ID is checked for stranded records, so an actorId "
+     "that is neither spelling hides a partition",
+     _WM, m281,
+     [f"{_TO}test_both_spellings_are_checked_when_the_live_actor_id_is_neither"])
+
+
+def m282(t):
+    old = "    if dp is not None and memory_id is not None:"
+    assert t.count(old) == 1, "the stranded-check condition has moved"
+    # The check runs only when a repartition was asked for -- i.e. never for the five
+    # harnesses that had already lost their records, because nobody was repartitioning
+    # them: their actorId had been rewritten a deploy earlier.
+    return t.replace(old, "    if repartitioned:", 1)
+
+
+case("wire memory: the stranded check runs only when a repartition is requested, which is "
+     "never for the harnesses whose actorId was already rewritten",
+     _WM, m282,
+     [f"{_TO}test_a_partition_with_nothing_in_it_is_not_reported_as_stranded",
+      f"{_TO}test_every_attach_reports_the_records_the_other_spelling_still_holds"])
+
+
+def m283(t):
+    old = "            n = count_records(dp, memory_id, ns)"
+    assert t.count(old) == 1, "the stranded count call has moved"
+    # A first-page count, reached by inlining the call instead of using the paginating
+    # helper: 250 stranded records report as 100.
+    return t.replace(old, """            n = len(dp.list_memory_records(
+                memoryId=memory_id, namespace=ns, maxResults=100)
+                .get("memoryRecordSummaries", []))""", 1)
+
+
+case("wire memory: the stranded count reads one page, so the biggest abandoned partition "
+     "is the one most under-reported",
+     _WM, m283,
+     [f"{_TO}test_the_stranded_count_reads_past_the_first_page"])
+
+
 #: Where the pristine text of the file currently mutated is parked, so a kill -9 -- which
 #: no handler can intercept -- still leaves the original recoverable. Under the repo root
 #: rather than /tmp because it must be obvious to whoever finds the tree dirty, and

@@ -709,10 +709,18 @@ fleet rather than reading this repo (the measurements are in
 - **An `actorId` already live is never changed by a redeploy.** `actorId` is the partition
   key of `/users/{actorId}/facts`, so rewriting it does not move a memory — it abandons one,
   and `UpdateHarness` returns success either way. The two harnesses above are wired under
-  their full harness IDs by the older `deploy/wire_memory.py`, and those are the only
-  partitions holding records. Moving one is therefore opt-in per harness
+  their full harness IDs by the older `deploy/wire_memory.py`, and those partitions hold 43
+  of the memory's records. Moving one is therefore opt-in per harness
   (`--repartition <harness>`) and refuses unless the data plane can report the record count
   it is about to abandon: an unknown count reads exactly like a count of zero.
+- **Every attach reports what the other spelling of `actorId` still holds.** The guard above
+  protects a partition from *this* deploy and does nothing about one an earlier deploy already
+  walked away from — live, that is 63 further semantic records (and 105 episodic) sitting under
+  the five pipeline workers' full harness IDs, unreachable by the agents that wrote them since
+  a redeploy moved them to the bare name. No API moves a record between namespaces, so this is
+  a report rather than a repair; what it buys is that an abandoned partition and an empty one
+  stop printing the same. Both candidate spellings are checked, both channels are counted, and
+  a partition that could not be read is reported as unread rather than as empty.
 
 The semantic channel is deliberately **tighter** than the episodic one (`topK` 5 /
 `relevanceScore` 0.6 versus 10 / 0.2). They are not inconsistent: `/episodes/{actorId}/{sessionId}`
