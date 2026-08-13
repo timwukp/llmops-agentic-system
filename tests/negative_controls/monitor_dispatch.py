@@ -4396,6 +4396,100 @@ case("console: the row shows its denominator and hides the items excluded from i
      [f"{_TC}test_the_row_shows_the_items_its_denominator_leaves_out"])
 
 
+#: D11: the band that swallowed its own pass region. Two of these mutate the console back to
+#: the code it shipped with, and two delete the prompt clauses that are the actual fix -- the
+#: console cannot invent bounds the report does not carry, so a prompt that stops mandating the
+#: interval puts `format_validity` back on a band whose borderline region CONTAINS its passing
+#: region, and no run carrying that gate can ever reach a decisive pass.
+def m238(t):
+    old = ("        if abs(value - bar) <= GATE_SCALAR_BAND + _BAND_EPS:\n"
+           "            return GATE_BORDERLINE\n"
+           "        return GATE_PASSED if value > bar else GATE_FAILED\n")
+    assert t.count(old) == 1, f"the scalar band has moved; found {t.count(old)}"
+    # The pre-D11 console verbatim. The eval agent escalates every scalar inside the band; this
+    # paints PASS across the whole of it, including AT the bar where the distance is 0.
+    return t.replace(old, "        return GATE_PASSED if value >= bar else GATE_FAILED\n", 1)
+
+
+case("console: a scalar gate is decided without the band the eval prompt states, so every "
+     "value the pipeline escalates over -- the bar itself included -- is painted as a pass",
+     _CN, m238,
+     [f"{_TC}test_a_scalar_gate_inside_the_band_is_the_escalation_the_pipeline_makes",
+      f"{_TC}test_a_proportion_gate_with_no_interval_cannot_pass_a_bar_this_close_to_its_ceiling"])
+
+
+def m239(t):
+    old = "        if abs(value - bar) <= GATE_SCALAR_BAND + _BAND_EPS:"
+    assert t.count(old) == 1, f"the band comparison has moved; found {t.count(old)}"
+    # Drops the tolerance. `1.0 - 0.95` is 0.050000000000000044, so a PERFECT rate falls out of
+    # the band by one representation error: decisive or borderline decided by binary floating
+    # point, on the single value an operator is most likely to see.
+    return t.replace(old, "        if abs(value - bar) <= GATE_SCALAR_BAND:", 1)
+
+
+case("console: the band excludes a perfect rate by one IEEE-754 representation error, so the "
+     "one value an operator sees most is decided by binary floating point",
+     _CN, m239,
+     [f"{_TC}test_a_perfect_rate_is_not_decided_by_a_floating_point_representation"])
+
+
+def m240(t):
+    old = (" That band is a fallback for a metric with no denominator to compute an interval"
+           " over, and it has a failure mode you must check BEFORE you apply it: if threshold"
+           " + 0.05 reaches or exceeds the highest value the metric can attain, then every"
+           " value that clears the bar is inside the band and the gate can NEVER return a"
+           " decisive pass. Say so with the arithmetic and escalate_human once, naming the bar"
+           " as the defect -- that is a property of the number the plan signed, not of this"
+           " run, and passing it silently would be inventing a decisiveness the rule does not"
+           " give you. A rate capped at 1.0 with a bar of 0.95 is exactly that case, which is"
+           " why a proportion gate must report its interval rather than lean on the band.")
+    assert t.count(old) == 1, f"the ceiling clause has moved; found {t.count(old)}"
+    # Leaves the band and removes the check on it. The agent applies a band whose borderline
+    # region contains the whole passing region and never says so, so the operator sees an
+    # escalation on a met gate and no reason for it.
+    return t.replace(old, "", 1)
+
+
+case("prompt: the band is stated with no check that it leaves a passing region at all, so a "
+     "bar within the band of its ceiling escalates forever and nothing names the bar",
+     _EV, m240,
+     [f"{_TC}test_the_scalar_band_is_the_one_the_eval_prompt_states"])
+
+
+def m241(t):
+    old = (" judge_score is not the only PROPORTION you report: any metric that is a count over"
+           " a countable denominator -- format_validity above all, which is valid answers over"
+           " items evaluated -- must carry its own Wilson 95% interval as <metric>_ci_low /"
+           " <metric>_ci_high and its denominator as <family>_n")
+    assert t.count(old) == 1, f"the proportion-interval mandate has moved; found {t.count(old)}"
+    # The whole fix, deleted. The console's bounds branch is keyed off `<name>_ci_low` presence,
+    # so a report that stops carrying the interval silently falls back to the band -- and for
+    # format_validity the band has no decisive pass in it at all.
+    return t.replace(old, " judge_score is the only proportion you report", 1)
+
+
+case("prompt: only judge_score reports an interval, so format_validity falls back to a band "
+     "whose borderline region contains its entire passing region",
+     _EV, m241,
+     [f"{_TC}test_the_score_bullet_requires_a_proportion_to_report_its_interval"])
+
+
+def m242(t):
+    old = ("function gateBand(g){\n"
+           "  if (g.status!==\"borderline\" || g[g.name+\"_ci_low\"]!=null) return \"\";\n")
+    assert t.count(old) == 1, f"gateBand has moved; found {t.count(old)}"
+    # Annotates every borderline row, bounds or not. The row that HAS bounds already prints
+    # them and they are what decided it, so this tells the operator the wrong rule ran.
+    return t.replace(old, "function gateBand(g){\n"
+                          "  if (g.status!==\"borderline\") return \"\";\n", 1)
+
+
+case("console: a bounds-decided borderline row is captioned as decided by the band, so the "
+     "page names a rule that did not run on the numbers printed beside it",
+     "deploy/console/frontend.html", m242,
+     [f"{_TC}test_a_scalar_borderline_says_which_rule_produced_it"])
+
+
 #: Where the pristine text of the file currently mutated is parked, so a kill -9 -- which
 #: no handler can intercept -- still leaves the original recoverable. Under the repo root
 #: rather than /tmp because it must be obvious to whoever finds the tree dirty, and

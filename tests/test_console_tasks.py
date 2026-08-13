@@ -4744,7 +4744,11 @@ def test_the_gate_row_carries_the_interval_it_is_decided_by(console, monkeypatch
     # denominator's absence is the thing being tested.
     assert "format_n" in man["stages"]["eval"]["metrics"], "the leak has nothing to leak"
     assert "format_n" not in fv, "a denominator rode a row with no interval to divide"
-    assert (fv["status"], fv["passed"]) == ("passed", True), f"{fv!r}"
+    # D11: a bare 1.0 against a 0.95 bar is INSIDE the gate bullet's +/-0.05 band, so the
+    # pipeline escalates it and this row may not paint a pass. The way this gate becomes a
+    # decisive pass is the interval the score bullet now mandates, not a wider comparator --
+    # see test_a_proportion_gate_with_no_interval_cannot_pass_a_bar_this_close_to_its_ceiling.
+    assert (fv["status"], fv["passed"]) == ("borderline", None), f"{fv!r}"
     assert out["oodReport"] == {"judge_score": 0.02, "judge_n": 40}
     code = _strip_comments(_front())
     assert "d.oodReport" in code, "run_detail serves an OOD report nothing renders"
@@ -4841,6 +4845,15 @@ def _gate(console, name, threshold, metrics, eval_reported=True):
     return console.gate_row(name, threshold, metrics, eval_reported)
 
 
+def _eval_prompt():
+    """The eval agent's system prompt, joined. The console's gate verdicts are a SECOND
+    derivation of a rule this prompt is the first statement of, so the tests below read the
+    rule out of the prompt rather than restating it -- two spellings of one rule drift, and
+    the drift shows up only on the runs nobody re-reads."""
+    h = json.loads((REPO / "agents/eval/harness.json").read_text())
+    return "\n".join(b.get("text", "") for b in h["systemPrompt"])
+
+
 def test_a_gated_metric_the_report_omits_is_a_failed_gate_not_a_blank(console):
     """agents/eval/harness.json: "If params.gates names a metric your report does not
     contain, that is a failed gate, not a passed one." The console rendered it as n/a."""
@@ -4901,11 +4914,114 @@ def test_an_interval_that_straddles_the_bar_is_borderline_not_a_pass(console):
     assert _gate(console, "judge_score", 0.45, m3)["status"] == "failed"
 
 
-def test_the_point_estimate_alone_still_decides_a_gate_that_reports_no_interval(console):
-    """format_validity has no bounds and never will; the interval rule must not turn every
-    scalar gate into an undecidable one."""
-    assert _gate(console, "format_validity", 0.95, {"format_validity": 1.0})["status"] == "passed"
-    assert _gate(console, "format_validity", 0.95, {"format_validity": 0.90})["status"] == "failed"
+def test_the_fixed_band_decides_a_gate_that_reports_no_interval(console):
+    """A metric with no bounds is decided by the gate bullet's fixed band, not by the interval
+    rule -- the interval rule must not turn a scalar gate into an undecidable one, and the band
+    must not turn it into an unconditional pass either. Values well clear of the band decide."""
+    assert _gate(console, "relative_solve_rate", 0.80,
+                 {"relative_solve_rate": 0.95})["status"] == "passed"
+    assert _gate(console, "relative_solve_rate", 0.80,
+                 {"relative_solve_rate": 0.60})["status"] == "failed"
+
+
+def test_a_scalar_gate_inside_the_band_is_the_escalation_the_pipeline_makes(console):
+    """D11, the disagreement itself. `agents/eval/harness.json`'s gate bullet: a scalar gate with
+    no interval is borderline AT or within 0.05 of the threshold, and the agent escalates rather
+    than deciding. This branch returned `actual >= bar`, so it painted PASS across the whole band
+    -- including AT the bar, where the distance is 0 and the rule is maximally borderline. That is
+    D7's defect ("a second derivation of one verdict is a second verdict") surviving in the branch
+    D7 did not touch."""
+    bar = 0.80
+    for value in (bar, 0.82, 0.85, 0.78, 0.75):
+        row = _gate(console, "relative_solve_rate", bar, {"relative_solve_rate": value})
+        assert (row["status"], row["passed"]) == ("borderline", None), (
+            f"{value} is within 0.05 of {bar} and the pipeline escalates it: {row!r}")
+
+
+def test_a_perfect_rate_is_not_decided_by_a_floating_point_representation(console):
+    """`1.0 - 0.95` is 0.050000000000000044 in IEEE-754, so a bare `<= 0.05` puts a PERFECT rate
+    OUTSIDE the band by one representation error -- decisive or borderline decided by binary
+    floating point, on the single value an operator is most likely to see. "At or within 0.05"
+    means the closed interval to a human, so the comparison carries a tolerance."""
+    assert 1.0 - 0.95 > 0.05, "the premise of this test stopped being true"
+    row = _gate(console, "format_validity", 0.95, {"format_validity": 1.0})
+    assert (row["status"], row["passed"]) == ("borderline", None), (
+        f"a perfect rate fell out of the band on a representation error: {row!r}")
+
+
+def test_a_proportion_gate_with_no_interval_cannot_pass_a_bar_this_close_to_its_ceiling(console):
+    """The finding, in arithmetic, on the gate the live plans actually carry
+    (~/Downloads/r6-plans/plan-r6{a,b,c}.json: `{"judge_score": 0.45, "format_validity": 0.95}`).
+
+    format_validity is a proportion, so 1.0 is its ceiling. bar + band = 1.00, which means the
+    ENTIRE passing region [0.95, 1.00] lies inside the borderline band: no value that clears this
+    bar can ever pass decisively while the report carries only a point estimate. 96 of 97 valid
+    answers -- one malformed answer -- is an escalation the page used to call a pass.
+
+    The fix is upstream, and it is the reason this test exists next to the one below: the score
+    bullet now requires a proportion to report its own Wilson interval, and with bounds the SAME
+    row is decided by the bounds rule, where 97/97 clears the bar at a lower bound of 0.9619.
+    """
+    bar = 0.95
+    for k in (97, 96, 93):
+        row = _gate(console, "format_validity", bar, {"format_validity": k / 97})
+        assert row["status"] == "borderline", f"{k}/97 = {k/97:.4f}: {row!r}"
+    # With the interval the score bullet mandates, the same 97/97 is a decisive pass.
+    low, high = console._wilson(1.0, 97)
+    assert round(low, 4) == 0.9619, f"the documented lower bound moved: {low}"
+    row = _gate(console, "format_validity", bar, {"format_validity": 1.0, "format_n": 97,
+                                                  "format_validity_ci_low": round(low, 4),
+                                                  "format_validity_ci_high": round(high, 4)})
+    assert (row["status"], row["passed"]) == ("passed", True), (
+        f"a proportion that reports its interval is still not decidable: {row!r}")
+    # ...and one malformed answer out of 97 is an honest borderline, not a silent pass.
+    low96, high96 = console._wilson(96 / 97, 97)
+    assert (round(low96, 4), round(high96, 4)) == (0.9439, 0.9982), f"{low96}, {high96}"
+    row96 = _gate(console, "format_validity", bar,
+                  {"format_validity": 96 / 97, "format_n": 97,
+                   "format_validity_ci_low": round(low96, 4),
+                   "format_validity_ci_high": round(high96, 4)})
+    assert row96["status"] == "borderline", f"{row96!r}"
+
+
+def test_the_scalar_band_is_the_one_the_eval_prompt_states(console):
+    """The band is the PROMPT's number, not the console's. Two spellings of one rule drift, and
+    the drift is invisible: a console band of 0.02 against a prompt band of 0.05 disagrees only
+    on the runs nobody looks at twice. So read it out of the sentence that states it."""
+    prompt = _eval_prompt()
+    m = re.search(r"borderline means AT or within ([0-9.]+) of the threshold", prompt)
+    assert m, "the eval gate bullet no longer states a scalar band in a form the console can read"
+    assert console.GATE_SCALAR_BAND == float(m.group(1)), (
+        f"console band {console.GATE_SCALAR_BAND} != prompt band {m.group(1)}")
+    # And the prompt must still warn that a bar within a band of the ceiling can never pass.
+    assert "can NEVER return a decisive pass" in prompt, (
+        "the gate bullet no longer names the band's own failure mode")
+
+
+def test_the_score_bullet_requires_a_proportion_to_report_its_interval(console):
+    """The console cannot invent bounds the report does not carry, so the fix for a proportion
+    gate lives in the eval prompt. Derived from the prompt rather than pinned as prose: the
+    console's family derivation (`name.rsplit("_", 1)[0]`) is what makes `format_n` the right
+    name, so the prompt and the console must agree on that spelling too."""
+    prompt = _eval_prompt()
+    for needed in ("<metric>_ci_low", "<family>_n", "format_n", "format_validity"):
+        assert needed in prompt, f"the score bullet does not mandate {needed}"
+    assert "format_validity".rsplit("_", 1)[0] + "_n" == "format_n", (
+        "the console's family derivation no longer yields the name the prompt mandates")
+
+
+def test_a_scalar_borderline_says_which_rule_produced_it(console):
+    """A BORDERLINE pill beside a value that plainly clears its bar is the "inexplicable n/a"
+    this table was fixed for, one status along. The row has no bounds to show, so it must say
+    what decided it -- and only then: a row WITH bounds already prints them."""
+    code = _strip_comments(_front())
+    assert "function gateBand(" in code, "no annotation for a band-decided row"
+    assert "decided by the ±0.05 band" in code, "the annotation does not name the rule"
+    assert "gateBand(g)" in code, "gateBand is defined and never called"
+    band = code[code.index("function gateBand("):]
+    band = band[:band.index("\n}")]
+    assert '_ci_low"]!=null' in band, (
+        "the annotation is not suppressed on a row whose bounds already explain it")
 
 
 def test_the_interval_rule_is_keyed_off_the_bounds_and_not_off_a_metric_name(console):

@@ -108,7 +108,7 @@ ALLOWED = (b"6833" + b"13688378", b"7631" + b"04351884", b"1234" + b"56789012")
 #: about 4 days -- and a GPU does it in roughly 100 seconds. So the KDF is iterated. At 200k
 #: iterations a candidate costs ~16 ms, which makes the same sweep ~500 GPU-years, while the
 #: scan stays cheap because only 12-digit runs are ever hashed: measured across all 176
-#: tracked files there are 63 such runs, 9 distinct, and hashing the distinct set takes 0.16 s
+#: tracked files there are 69 such runs, 10 distinct, and hashing the distinct set takes 0.16 s
 #: for the entire repo. (Re-measured whenever either number moves, and they move
 #: INDEPENDENTLY, which is why both are derived and neither is inferred from the other, and
 #: this branch is the proof in both directions. Its parent moved BOTH at once from DISJOINT
@@ -150,9 +150,17 @@ ALLOWED = (b"6833" + b"13688378", b"7631" + b"04351884", b"1234" + b"56789012")
 #: Earlier: the task_tokens
 #: contract moved 162 -> 163 while the run count held at 52, and the env_keys derivation then
 #: held the file count at 163 while adding 2 runs -- two `env_values`
-#: tests passing the placeholder account id. What never moves is the DISTINCT count: every run
-#: in a test is the same published placeholder, so the KDF cost is bounded by 9 no matter how
-#: many tests cite it. That is the half of the sentence the cheapness claim actually rests on.)
+#: tests passing the placeholder account id. The DISTINCT count held at 9 for a long time,
+#: because every run in a test was the same published placeholder -- the KDF cost was bounded
+#: by 9 no matter how many tests cited it, and that is the half of the sentence the cheapness
+#: claim rests on. D11 moved it to 10 for a reason worth naming -- and this file may not SPELL
+#: the new value, per test_no_credential_shaped_literal_survives_in_either_file, which is itself
+#: the point: it is not an id at all. It is the leading digits of the IEEE-754 value of
+#: `1.0 - 0.95` (0.05, then thirteen more zeros, then 44), which the console's `_BAND_EPS`
+#: comment and its test both quote because that representation error is what makes a perfect
+#: rate fall outside a bare `<= 0.05`. So a 12-digit run is NOT evidence of an id -- a decimal
+#: expansion produces one, and the digest is what tells the two apart. The bound is the distinct
+#: count, not the placeholder's uniqueness, which is why it is derived.)
 #:
 #: The salt is a constant in this file on purpose -- it is not a secret and pretending
 #: otherwise would be theatre. Its job is to stop this digest being looked up in a rainbow

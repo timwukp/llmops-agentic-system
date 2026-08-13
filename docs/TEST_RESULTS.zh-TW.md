@@ -21,9 +21,9 @@
 
 | 檢查 | 結果 | 復現方式 |
 |---|---|---|
-| 單元測試（契約、成本模型、driver 迴圈、Lambda、狀態機文檔） | **1249/1249 通過** | `.venv/bin/python -m pytest tests/ -q --ignore=tests/golden` |
+| 單元測試（契約、成本模型、driver 迴圈、Lambda、狀態機文檔） | **1255/1255 通過** | `.venv/bin/python -m pytest tests/ -q --ignore=tests/golden` |
 | Shell 測試套件 —— N 路 capacity race guard（`tests/test_capacity_race_guard.sh`） | **10/10 斷言** | `bash tests/test_capacity_race_guard.sh` |
-| 反向控制 —— 逐一破壞每道 guard，確認它會失敗 | **274/274 反向控制** | `.venv/bin/python tests/negative_controls/monitor_dispatch.py` |
+| 反向控制 —— 逐一破壞每道 guard，確認它會失敗 | **280/280 反向控制** | `.venv/bin/python tests/negative_controls/monitor_dispatch.py` |
 | Harness 配置驗證（5 個專家 + 指揮家 + 審計員） | **7/7 `RESULT: OK`** | `python deploy/validate_config.py --config agents/<a>/harness.json` |
 | 架構 SVG 幾何檢查（虛線零交叉、零穿框） | **CLEAN** | `python tests/test_svg_geometry.py docs/architecture-*.svg` |
 | 遮蔽掃描（帳號 ID、憑證、帶帳號的 ARN） | CLEAN | `.github/workflows/redaction-check.yml` |
@@ -121,13 +121,13 @@ endpoint、五輪 e2e 迭代 —— 花費比這個帳戶單日花在一個沒�
 
 | 檢查 | 結果 | 重現方式 |
 |---|---|---|
-| 單元測試(全部套件,含 `test_cost_model.py` + `test_finops.py`) | **1249 passed** | `.venv/bin/python -m pytest tests/ -q` |
+| 單元測試(全部套件,含 `test_cost_model.py` + `test_finops.py`) | **1255 passed** | `.venv/bin/python -m pytest tests/ -q` |
 | Harness 配置驗證,7 個 agent | **`RESULT: OK`** | `python deploy/validate_config.py --config agents/finops/harness.json` |
 | 線上艦隊 | **7 個 harness READY** | 用 repo 內建 boto3 呼叫 `list_harnesses` |
 | 正典模組有散佈路徑 | 印出 `would upload 4 contract files` | `python deploy/03_storage.py --region us-east-1 --account-id 123456789012 --dry-run` |
 
 本次新增的每一道 guard 都做過 **mutation check**:逐一還原被斷言的行為,確認測試會
-失敗 —— **274/274 反向控制**,238 個 mutation 斷言 274 組（guard, mutation）配對,runner 各印
+失敗 —— **280/280 反向控制**,243 個 mutation 斷言 280 組（guard, mutation）配對,runner 各印
 一行 PASS。一個「有這行為也過、沒這行為也過」的測試,不是測試。
 
 這個數字是刻意寫進句子裡的。「做過 mutation check」是一個形容詞,而形容詞不會過期:
@@ -154,6 +154,19 @@ collection error 和斷言失敗回的都是 `1`,所以 runner 自己的檢查(`
 `test_every_negative_control_still_matches_the_code_it_mutates` 都會對每一個 `.py` 檔的 mutation 做
 `compile()`,不能 parse 的就拒收 —— 只限 Python 原始碼,因為把 JSON 或 Markdown 的 parser 弄壞,
 常常正是某個 control 要斷言的那個 break。一個 mutation 必須真的走到那段程式碼,才能證明 guard 在看它。
+
+上面那些數字這次往上走,理由值得單獨說,因為它和平常的理由相反:**最新這幾個 control 裡有兩個之所以
+存在,是因為原本的 guard 在替一個 bug 站崗。** eval prompt 對「沒有報區間的純量 gate」是用固定的
+±0.05 band 判定的 —— 距門檻在這個距離之內(含剛好在門檻上)就算 borderline,要上報而不是自己下判斷。
+console 那條分支上根本沒有 band,所以它把整個 band 都畫成 PASS,**包含剛好落在門檻上**那一點 ——
+距離是 0、按規則是最 borderline 的位置;而且有兩條既有的斷言說這是對的。更關鍵的是:對線上 plan 真正
+帶著的那道 gate 來說,band 本來就是錯的量尺 —— `format_validity ≥ 0.95` 的天花板是 1.0,於是**整個**
+通過區間都落在 borderline band 裡面,任何過了門檻的值都不可能拿到決定性通過 —— 97 題裡 96 題合格,
+是一次該上報的 escalation,而頁面把它畫成通過。正確的修法是給這個比例它應得的區間(97/97 → Wilson
+下界 0.9619,決定性通過;96/97 → [0.9439, 0.9982],誠實的 borderline),所以 eval prompt 現在要求
+每一個它回報的比例都要帶 `<metric>_ci_low/_ci_high` 與 `<family>_n`,band 只留給「沒有分母可以算區間」
+的指標當 fallback —— 並加上一條:當 `bar + band` 觸到指標天花板時,agent 必須把這件算術講出來、上報一次。
+一道把「現在的行為」寫進斷言裡的 guard,並不是「這個行為是對的」的證據。
 
 ### 兩次失敗比通過更有價值
 

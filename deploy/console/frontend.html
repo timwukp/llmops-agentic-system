@@ -660,6 +660,14 @@ function gateDenom(g){
   return ` n=${esc(n)}`+(u!=null&&Number(u)>0?` · ${esc(u)} unscorable`:"")
     +(layer!=null?` of ${esc(layer)}`:"");
 }
+// A scalar gate with no interval is decided by a fixed band, so a BORDERLINE pill beside a value
+// that plainly clears its bar is the "inexplicable n/a" this table was fixed for, one status
+// along. Say which rule produced it. Only for rows with no bounds: a row that HAS bounds already
+// prints them, and they are what decided it.
+function gateBand(g){
+  if (g.status!=="borderline" || g[g.name+"_ci_low"]!=null) return "";
+  return `<span class="sub mono">no interval reported · decided by the ±0.05 band</span>`;
+}
 
 // ── stage-flow diagram: 9 logical stages + remediation loop ──────────────────
 const STAGE_SUBS = {"data-prep-generate":"teacher generates","data-prep-curate":"curate + split",
@@ -832,7 +840,7 @@ async function loadRun(runId){
           // three the same is how run-phase2-main-0001 shows "gate failed" over a table of
           // blanks with no way to tell which gate failed.
           `<td>${GATE_PILL[g.status]||GATE_PILL[g.passed==null?"not_evaluated":(g.passed?"passed":"failed")]}`+
-          `${g[g.name+"_ci_low"]!=null?` <span class="sub mono">CI [${esc(g[g.name+"_ci_low"])}, ${esc(g[g.name+"_ci_high"])}]${gateDenom(g)}</span>`:""}</td></tr>`).join("")+`</table>`;
+          `${g[g.name+"_ci_low"]!=null?` <span class="sub mono">CI [${esc(g[g.name+"_ci_low"])}, ${esc(g[g.name+"_ci_high"])}]${gateDenom(g)}</span>`:` ${gateBand(g)}`}</td></tr>`).join("")+`</table>`;
     }
     if (d.oodReport) {
       html += `<h2 style="margin-top:12px">OOD layer (measured, never gated)</h2><table><tr><th>Metric</th><th>Value</th></tr>`+

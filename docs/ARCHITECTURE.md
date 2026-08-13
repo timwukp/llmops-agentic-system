@@ -1291,6 +1291,35 @@ refuse a score that fails it, and this page is the only reader that can catch a 
 it and got it wrong. A denominator that does not reconcile gets its own verdict, because a
 bookkeeping failure and a student that missed a bar call for entirely different work.
 
+**A borderline band measured in absolute distance swallows the pass region when the bar sits within
+the band's width of the metric's ceiling.** The gate reform gave interval-bearing metrics a Wilson
+rule, but it did not delete the prose band — it narrowed its scope, so every gate that is *not*
+`judge_score` was still decided by "borderline means within 0.05 of the threshold, escalate with the
+numbers." All three r6 plan drafts gate on `{"judge_score": 0.45, "format_validity": 0.95}`, and
+`format_validity` is a proportion: its ceiling is 1.0, so `bar + band` = 1.00 and the **entire
+passing region [0.95, 1.00] lies inside the borderline band.** One malformed answer out of 97 —
+0.9897, a gate comfortably met — is an `escalate_human`, and no run carrying that gate can reach a
+*decisive* gate pass at all, so none can reach `Complete` without a human verdict. It is masked
+only because `judge_score` fails decisively first; it stops being masked exactly when the student
+starts passing. A perfect rate is worse than ambiguous: `1.0 - 0.95` is `0.050000000000000044`, so
+whether it is "within 0.05" is decided by binary floating point on the one value an operator is
+most likely to see. The fix moves no bar. `format_validity` is a count over a countable
+denominator, so the score bullet now requires it to report `format_validity_ci_low` / `_ci_high`
+and `format_n`, which routes it through the *existing* bounds branch — that branch is keyed off
+`<name>_ci_low` presence and derives the family as `name.rsplit("_", 1)[0]`, precisely so the next
+interval-bearing metric is not dropped to a point estimate — and 97/97 becomes a decisive pass at a
+lower bound of 0.9619 while 96/97 becomes an honest [0.9439, 0.9982] borderline. The band survives
+as the fallback for a metric with no denominator, with the check it was missing: if `bar + band`
+reaches the metric's ceiling, the agent says so with the arithmetic and escalates **once**, naming
+the bar as the defect, rather than rediscovering it as a surprise escalation every run. The console
+had the mirror-image defect in the branch the second-derivation fix did not touch — no band at all,
+so it painted PASS across the whole band *and at the bar itself*, where the distance is 0 and the
+rule is maximally borderline — and two existing assertions pinned that behaviour as correct. Both
+sides now read the number out of one sentence:
+`test_the_scalar_band_is_the_one_the_eval_prompt_states` regexes the band out of the eval prompt, so
+a console band and a prompt band cannot drift apart on the runs nobody re-reads. A guard whose
+assertion encodes the shipped behaviour is not evidence that the behaviour is right.
+
 **The facts a run discovers travel like the consent it was signed with.** `MODEL_PARAM_FOR_ROLE`
 carries what a human *signed* into the stages that must obey it; `STAGE_FACT_PARAMS` carries what
 the run itself *produced* into the stages that must measure it. `params.student_endpoint` — read
