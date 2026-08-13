@@ -4976,6 +4976,14 @@ class TestConductorDispatch:
             # ending is an escalation.
             "model_artifact_uri": "plan",
             "source_run_id": "plan",
+            # the r6d retrieval index (RAFT). Plan-only and activation-gating: every
+            # clause that reads them is conditioned on retrieval_kb_id's PRESENCE, so a
+            # closed-book plan runs the classic path untouched. The kb id itself is
+            # minted by deploy/09_retrieval.py and read out of SSM by the human writing
+            # the plan -- no stage produces it, so it is not a stage_fact.
+            "retrieval_kb_id": "plan",
+            "retrieval_k": "plan",
+            "retrieval_distractors": "plan",
         }
         read = {}
         for cfg in sorted((REPO / "agents").glob("*/harness.json")):
@@ -7384,6 +7392,10 @@ def test_the_state_machine_only_dispatches_tasks_the_prompts_declare():
 #: of truth for the AWS API surface and would rot faster than the prompts do.
 _CLI_TO_IAM = {
     ("sts", "get-caller-identity"): None,  # implicitly allowed for any principal
+    # The r6d RAFT clauses (curate + evaluate): retrieval from the org-facts KB.
+    # Retrieve and ONLY Retrieve -- the grant's own _comment argues why no
+    # RetrieveAndGenerate and no bedrock-agent writes.
+    ("bedrock-agent-runtime", "retrieve"): "bedrock:Retrieve",
     # `aws s3 cp` from the bucket is s3:GetObject on the exact key (downloads only in
     # any prompt today -- the canonical-trainer fetch; an upload spelling would need
     # PutObject and should fail here first).
@@ -11340,6 +11352,84 @@ def test_the_raft_format_is_mirrored_by_the_same_upload_as_the_judge_prompt():
     assert got["to"].endswith("code/eval/"), got["to"]
     # And the file is actually in the directory that glob reads.
     assert (REPO / RAFT_FORMAT).is_file()
+
+
+def _prompt_text(agent):
+    cfg = json.loads((REPO / "agents" / agent / "harness.json").read_text())
+    return cfg["systemPrompt"][0]["text"]
+
+
+def _bullet(text, name):
+    i = text.find(f'- "{name}":')
+    assert i >= 0, f'no "- \\"{name}\\":" bullet found'
+    j = text.find('\n- "', i + 1)
+    return text[i:j if j > 0 else len(text)]
+
+
+def test_both_raft_consumers_name_the_same_canonical_key():
+    """The whole point of PR #124's file is that data-prep (training rows) and eval
+    (inference prompts) read ONE key. Two spellings that drift is the RAFT-paper
+    failure with an S3 flavour: both agents follow their own prompt faithfully and
+    the student trains on one format and infers on another."""
+    keys = {}
+    for agent, bullet in (("data-prep", "curate"), ("eval", "evaluate")):
+        found = re.findall(r"s3://<bucket>/(\S*raft_context_format\.md)",
+                           _bullet(_prompt_text(agent), bullet))
+        assert len(found) == 1, (
+            f"{agent}'s {bullet} bullet names the canonical format {len(found)} times")
+        keys[agent] = found[0]
+    assert keys["data-prep"] == keys["eval"], keys
+    # And the key is the one the mirror actually writes: code/eval/ + the tracked file.
+    assert keys["eval"] == "code/eval/raft_context_format.md", keys["eval"]
+    assert (REPO / "pipeline/eval/raft_context_format.md").is_file()
+
+
+def test_the_raft_clauses_are_conditioned_on_the_kb_params_presence():
+    """A closed-book plan must run the classic path untouched: every retrieval clause
+    activates on params.retrieval_kb_id's PRESENCE. An unconditional clause would send
+    every run to a KB that only exists while a human keeps one deployed."""
+    for agent, bullet in (("data-prep", "curate"), ("eval", "evaluate")):
+        b = _bullet(_prompt_text(agent), bullet)
+        assert "If params.retrieval_kb_id is given" in b, (
+            f"{agent}'s {bullet} bullet lost the presence condition")
+
+
+def test_decontamination_reads_the_bare_ticket_not_the_assembled_turn():
+    """Context passages are the org's own corpus and MAY resemble acceptance questions
+    -- that is the design (the facts live in the index, excluded from it are only the
+    acceptance FILES). Decontamination computed on the assembled turn would re-drop
+    every well-covered row and reproduce r6c's missing-facts corpus with retrieval
+    bolted on."""
+    b = _bullet(_prompt_text("data-prep"), "curate")
+    assert "Decontamination is computed on the BARE ticket text" in b
+    # The original decontamination clause survives verbatim alongside (guard :4490's
+    # subject): the RAFT clause is additive, not a rewrite.
+    assert "decontamination_dropped" in b
+
+
+def test_the_score_bullet_keeps_the_judge_blind_to_retrieval():
+    """The bar (0.45) predates retrieval and must go on measuring the same thing. The
+    moment retrieved context enters a judge substitution, r6d's judge_score measures
+    'how good is the context' and its comparison to r6c's 0.223 is void."""
+    b = _bullet(_prompt_text("eval"), "score")
+    assert "The judge is blind to retrieval" in b
+    assert "never enters any judge substitution" in b
+    # The instrument side of the same promise: still exactly four substitutions.
+    doc = (REPO / "pipeline/eval/judge_prompt_pairwise.md").read_text()
+    assert set(re.findall(r"\{(\w+)\}", doc)) == {"task_description", "prompt", "a", "b"}
+
+
+def test_both_sides_record_the_format_digest_in_their_own_artifact():
+    """Equal digests in stats.json and report.json IS the train/inference format check;
+    a side that stops recording makes the identity unverifiable, which reads as fine."""
+    curate = _bullet(_prompt_text("data-prep"), "curate")
+    evaluate = _bullet(_prompt_text("eval"), "evaluate")
+    assert re.search(r"stats\.json[^.]*\bas raft_format_sha256", curate), (
+        "curate no longer records raft_format_sha256 in stats.json")
+    assert re.search(r"report\.json as\s+raft_format_sha256", evaluate), (
+        "evaluate no longer records raft_format_sha256 in report.json")
+    # The eval side must also keep the per-item evidence trail.
+    assert "retrieval_details.jsonl" in evaluate
 
 
 def test_the_judge_instrument_bytes_are_untouched_by_the_raft_work():

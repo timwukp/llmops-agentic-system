@@ -5395,6 +5395,101 @@ case("judge instrument: an unstated edit moves the digest r6c/r6d comparability 
      [f"{_TO}test_the_judge_instrument_bytes_are_untouched_by_the_raft_work"])
 
 
+# ── the RAFT prompt wiring (r6d): both consumers, one format, a blind judge ──────────
+_DP = "agents/data-prep/harness.json"
+_EV = "agents/eval/harness.json"
+
+
+def _edit_prompt(t, old, new):
+    d = json.loads(t)
+    p = d["systemPrompt"][0]["text"]
+    assert p.count(old) == 1, f"prompt anchor moved: {old[:60]!r}"
+    d["systemPrompt"][0]["text"] = p.replace(old, new, 1)
+    return json.dumps(d, indent=2, ensure_ascii=False)
+
+
+def m302(t):
+    # The presence condition dropped: every run -- including closed-book plans with no
+    # KB deployed -- is now told to retrieve, and the classic path ceases to exist.
+    return _edit_prompt(
+        t, "If params.retrieval_kb_id is given, this is a retrieval-aware (RAFT) run",
+        "This is a retrieval-aware (RAFT) run (params.retrieval_kb_id names the index)")
+
+
+case("prompt: the curate RAFT clause loses its presence condition",
+     _DP, m302,
+     [f"{_TO}test_the_raft_clauses_are_conditioned_on_the_kb_params_presence"])
+
+
+def m303(t):
+    # The eval side quietly reads a DIFFERENT canonical key than data-prep writes rows
+    # from -- the RAFT-paper format-mismatch failure, introduced as a one-character-ish
+    # spelling drift between two prompts that are each fine alone.
+    return _edit_prompt(
+        t, "assemble the inference prompt per s3://<bucket>/code/eval/raft_context_format.md",
+        "assemble the inference prompt per s3://<bucket>/code/eval/raft_context_format_v2.md")
+
+
+case("prompt: eval's canonical format key drifts from data-prep's",
+     _EV, m303,
+     [f"{_TO}test_both_raft_consumers_name_the_same_canonical_key"])
+
+
+def m304(t):
+    # Decontamination widened onto the assembled turn: every well-covered row now
+    # resembles an acceptance question through its CONTEXT and gets dropped -- r6c's
+    # missing-facts corpus rebuilt, with retrieval bolted on.
+    return _edit_prompt(
+        t, "Decontamination is computed on the BARE ticket text, never on the assembled turn",
+        "Decontamination is computed on the assembled turn, context included")
+
+
+case("prompt: decontamination widens onto the assembled turn",
+     _DP, m304,
+     [f"{_TO}test_decontamination_reads_the_bare_ticket_not_the_assembled_turn"])
+
+
+def m305(t):
+    # The helpful inversion: show the judge the context "so it can check the facts".
+    # judge_score now measures the retrieval quality too, and the 0.45 bar stops
+    # measuring what it measured on r6c.
+    return _edit_prompt(
+        t, "The judge is blind to retrieval: {prompt} is the bare ticket and {a}/{b} "
+           "are the answers alone -- retrieved context never enters any judge substitution",
+        "Include the retrieved context in {prompt} so the judge can verify the facts")
+
+
+case("prompt: the judge is shown the retrieved context",
+     _EV, m305,
+     [f"{_TO}test_the_score_bullet_keeps_the_judge_blind_to_retrieval"])
+
+
+def m306(t):
+    # One side stops recording the digest: format identity becomes unverifiable, and
+    # unverifiable reads as fine on every green run until the formats actually differ.
+    return _edit_prompt(
+        t, "record its sha256 in report.json as raft_format_sha256",
+        "record that the canonical format was used in report.json")
+
+
+case("prompt: eval stops recording the format digest",
+     _EV, m306,
+     [f"{_TO}test_both_sides_record_the_format_digest_in_their_own_artifact"])
+
+
+def m307(t):
+    # A prompt starts reading a param nothing writes -- bugs #20/#21/#22's shape, in
+    # the retrieval family. The WRITER guard must name it, not wave it through.
+    return _edit_prompt(
+        t, "the distractor count from params.retrieval_distractors",
+        "the distractor count from params.retrieval_distractors scaled by params.retrieval_oracle_p")
+
+
+case("prompt: curate reads params.retrieval_oracle_p, which nothing writes",
+     _DP, m307,
+     [f"{_TO}TestConductorDispatch::test_every_param_a_prompt_reads_has_something_that_writes_it"])
+
+
 #: Where the pristine text of the file currently mutated is parked, so a kill -9 -- which
 #: no handler can intercept -- still leaves the original recoverable. Under the repo root
 #: rather than /tmp because it must be obvious to whoever finds the tree dirty, and

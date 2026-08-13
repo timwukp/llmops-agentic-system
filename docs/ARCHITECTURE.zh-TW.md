@@ -682,6 +682,32 @@ driver 在 `WAIT_ROW_CAP = 12` 就停止寫等待列（是 prompt 那 6 次 chec
 protocol 文字。一個被宣告、卻沒有任何 protocol 說明何時該用它的工具，就是一個 agent 會隨機去抓
 的工具。
 
+### 7b. 檢索感知 run（RAFT，r6d）：事實搬出權重
+
+r6c 量測出歷來每次誠實 gate FAIL 背後的結構性死路：正確的 decontamination 恰好刪掉
+acceptance set 要考的組織特定事實（41% 的列），而訓練集裡不存在的資訊，任何 student
+尺寸都補不回來（`deploy/evidence/SCALING_DIAGNOSIS_r6c_8B.md`）。有生產級證據的出口
+（`deploy/evidence/RESEARCH_r6_direction.md`）是 RAFT 式檢索：**事實住進 Bedrock
+Knowledge Base**（`deploy/09_retrieval.py`，逐 run、由人部署、eval 結束即拆），
+**訓練列維持 decontaminated。**
+
+佈線是三段以參數存在與否觸發的 prompt 子句，加三個 plan 參數（`retrieval_kb_id`、
+`retrieval_k`、`retrieval_distractors` —— 全部 plan 級；closed-book plan 全部省略，
+走原路不受影響）：
+
+- **data-prep `curate`**：先拿 3 張語料工單探測 KB（全零命中＝escalate，絕不產出
+  「看起來像 RAFT 語料」的無上下文列），然後按 `code/eval/raft_context_format.md`
+  的正典格式組裝每個存活列的 user turn，把 `raft_format_sha256` 記進 `stats.json`。
+  **Decontamination 只算裸工單文字**——上下文段落本來就可能像 acceptance 題目，這是
+  設計；被結構性排除在索引外的是 acceptance「檔案」（inclusion-prefix 拒絕 +
+  只有 Retrieve 的 IAM 圍欄）。
+- **eval `evaluate`**：student 開卷作答——逐 acceptance 題檢索、同一個正典 key、
+  digest 記進 `report.json`（`stats.json` 與 `report.json` 的 digest 相等**就是**
+  訓練/推理格式一致性的檢查），逐題證據寫 `evaluation/retrieval_details.jsonl`；
+  檢索失敗＝空上下文區塊，計數且照常評分，永不算 unscorable。
+- **eval `score`**：**judge 對檢索全盲**——裸工單、只有答案。0.45 的 bar 先於檢索
+  存在，必須繼續量同一件事，否則 r6d 的數字無法與 r6c 的 0.223 比較。
+
 ## 8. 補救迴路（≤ 3 次迭代）
 
 `QualityGateChoice` 失敗 → `RemediationChoice`：只要 `iteration < 3`，就
