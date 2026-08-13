@@ -833,8 +833,21 @@ class TestDriver:
         body = src[src.index("def _run_stage") if "def _run_stage" in src else 0:]
         # the resume branch reads exactly one key; nothing may hand off via another
         assert body.count('event.get("_continuation")') == 1
-        assert "_resumed" not in body.split("# reinvoke. This branch used to")[0], \
-            "a reinvoke is carrying a key the resume branch does not read"
+        # DERIVED from the payload _self_reinvoke actually sends, rather than blacklisting
+        # the name of the one key that got this wrong. The blacklist version searched the
+        # whole body for "_resumed" after slicing it at a COMMENT string, so it reddened on
+        # the day a comment explained the bug (D12 added two handoff keys and said why the
+        # old one meant nothing) and would never have caught a THIRD key by another name.
+        # What the guard is for is the contract: every key a reinvoke sends is a key the
+        # resume path reads, or the next invocation silently drops it.
+        rein = body[body.index("def _self_reinvoke"):]
+        rein = rein[:rein.index("\n\n")]
+        sent = set(re.findall(r'"(_[a-z_]+)":', rein))
+        assert len(sent) >= 3, f"the handoff payload shape moved: {sent}"
+        for key in sorted(sent):
+            assert f'event.get("{key}"' in body, (
+                f"_self_reinvoke sends {key!r} and nothing reads it back off the event, "
+                "so the resumed invocation drops it -- the _resumed bug, again")
         # every self-invoke of this same function goes through the one closure
         self_invokes = re.findall(r"FunctionName=context\.function_name", body)
         assert len(self_invokes) == 1, (
@@ -1631,8 +1644,13 @@ class TestDriver:
                              "recommendation": "raise the cap, preserve coverage"}),
             text_stream("ack")])
         c = clients(ac)
+        # task_token=None because a triage HAS none -- triage_event_from_bus builds the
+        # only real triage invocation and omits the key entirely (asserted below in
+        # test_a_triage_invocation_carries_no_task_token). It matters to this test: a page
+        # from an invocation that IS holding a token must not end the turn, since nothing
+        # would settle it, so the default fixture token would send this down the stage path.
         out = driver.handler(driver_event(stage="orchestrator", task="triage",
-                                         run_id="run-orch-1"), clients=c)
+                                         run_id="run-orch-1", task_token=None), clients=c)
         assert out["status"] == "paged", \
             "page_human fell through to the unknown-tool branch; the owner was never told"
         assert c["sns"].published, "an above-authority decision reached no human at all"
@@ -1771,7 +1789,7 @@ class TestDriver:
             text_stream("ack")])
         c = clients(ac)
         out = driver.handler(driver_event(stage="orchestrator", task="triage",
-                                         run_id="run-orch-1"), clients=c)
+                                         run_id="run-orch-1", task_token=None), clients=c)
         first = json.loads(
             ac.calls[1]["messages"][-1]["content"][0]["toolResult"]["content"][0]["text"])
         assert first["status"] == "rejected"
@@ -1779,6 +1797,245 @@ class TestDriver:
         assert out["status"] == "paged", "the corrected page never went out"
         assert len(c["sns"].published) == 1, \
             "the incomplete page was sent anyway, then sent again"
+
+    # --- D12: a blocked run could be answered, or noticed, never both ----------
+    #
+    # escalate_human notified (SNS + bus + stage event) and made the run UNANSWERABLE:
+    # `escalated` is in UNREACHABLE_RUN_STATES, the token settles with
+    # error="EscalatedToHuman", and EvalGate's Catch drives the execution to FAILED.
+    # checkpoint kept the run answerable (take_directive) and notified NOBODY. So the eval
+    # agent's borderline verdict -- the ONE gate outcome a human answer can actually
+    # unblock -- had no channel: the prompt sent it to escalate_human, which destroys the
+    # run the answer was for. page_human is notify-without-ending, and these pin the half
+    # that is easy to get wrong: a page must NOT end a turn that is holding a task token.
+
+    def test_a_triage_invocation_carries_no_task_token(self):
+        """The discriminator the page branch keys on, pinned to the only builder of a real
+        triage invocation. An EscalatedToHuman event has no token to forward -- the state
+        machine already failed the one it had -- so `event.get("task_token")` separates
+        "the conductor decided to page and is done" from "a stage asked a question and is
+        still holding the state machine open". Two page tests above pass task_token=None
+        for this reason and forward-reference this assertion."""
+        built = driver.triage_event_from_bus(
+            {"detail-type": ev.ESCALATED_TO_HUMAN,
+             "detail": {"run_id": "run-stuck-9", "stage": "eval", "reason": "gate failed"}},
+            "llmops-data-test")
+        assert "task_token" not in built, (
+            f"a bus triage now carries a task_token ({sorted(built)}): every triage page "
+            "just stopped being terminal-for-the-turn")
+
+    def test_a_stage_page_does_not_end_a_turn_that_is_holding_a_task_token(self):
+        """The second-order defect, and the expensive one.
+
+        _ack_terminal does NOT settle the task token -- it acks the tool call and closes
+        the session -- so returning after a page would leave EvalGate waiting on a token
+        no live driver will ever settle. TimeoutSeconds is 86400, so an eval agent that
+        successfully asked its question would hang the run for 24h and then fail it: the
+        worst possible outcome of doing exactly what the new prompt asks for.
+        """
+        ac = FakeAgentCore([
+            tool_use_stream("page_human",
+                            {"situation": "judge_score 0.46, CI [0.40, 0.53], n=97, bar 0.45",
+                             "options": ["accept", "collect more items", "re-train"],
+                             "recommendation": "collect more items"}),
+            tool_use_stream("checkpoint", {"next_action": "wait for the verdict"}),
+            tool_use_stream("stage_complete", {"outputs": []}),
+            text_stream("ack")])
+        c = clients(ac)
+        out = driver.handler(driver_event(stage="eval", task="gate",
+                                         harness_id="llmops_eval"), clients=c)
+        assert c["sns"].published, "the eval agent's question reached no human"
+        assert out["status"] == "completed", (
+            f"a page ended the turn while holding a task token ({out!r}); EvalGate would "
+            "wait 86400s for a token nothing is left alive to settle")
+        assert len(c["sfn"].successes) == 1 and not c["sfn"].failures, (
+            f"the task token was not settled exactly once: {c['sfn'].successes!r} "
+            f"{c['sfn'].failures!r}")
+        answer = json.loads(
+            ac.calls[1]["messages"][-1]["content"][0]["toolResult"]["content"][0]["text"])
+        assert answer["status"] == "paged", f"{answer!r}"
+        # The agent has to be TOLD the page did not pause anything, or it reasonably
+        # assumes it is now waiting and ends its turn -- which is the same hang.
+        assert "checkpoint" in answer["next"], (
+            f"the page result never names the call that receives the answer: {answer!r}")
+        assert "escalate_human" in answer["next"], (
+            "the result does not warn that escalating to wait makes the answer "
+            f"undeliverable: {answer!r}")
+
+    def test_a_stage_page_is_filed_on_its_own_run_under_the_stage_that_asked(self):
+        """A page is only visible if it lands where the console looks. For a stage there is
+        no escalation envelope and no separate subject: the run it is about is the run it
+        was invoked for, which is why page_human is declared on the eval harness WITHOUT a
+        run_id field."""
+        ac = FakeAgentCore([
+            tool_use_stream("page_human", {"situation": "borderline", "recommendation": "wait"}),
+            tool_use_stream("stage_complete", {"outputs": []}),
+            text_stream("ack")])
+        c = clients(ac)
+        driver.handler(driver_event(stage="eval", task="gate", harness_id="llmops_eval"),
+                       clients=c)
+        paged = [r for r in c["ddb"].Table("llmops-stage-events").items
+                 if str(r.get("sk", "")).endswith("#" + driver.PAGE_EVENT)]
+        assert len(paged) == 1, f"{paged!r}"
+        assert paged[0]["run_id"] == "run-test-1", f"filed on {paged[0]['run_id']!r}"
+        assert "#eval#" in str(paged[0]["sk"]), (
+            f"the row does not say which stage asked: {paged[0]['sk']!r}")
+        brief = json.loads(paged[0]["detail"])
+        assert brief["paged_by"] == "eval-gate", (
+            f"the brief credits the page to {brief['paged_by']!r}; the console prints this")
+        emitted = [e for e in c["events"].entries if e["DetailType"] == ev.OWNER_PAGED]
+        assert emitted and json.loads(emitted[0]["Detail"])["stage"] == "eval", (
+            f"OwnerPaged does not carry the paging stage: {emitted!r}")
+
+    def test_the_triage_label_is_unchanged_by_being_derived(self):
+        """`paged_by` was the literal "orchestrator-triage". Deriving it from the invocation
+        has to REPRODUCE that on the triage path, or every stored page's label and the new
+        ones stop being comparable -- and the 12 live HumanPaged rows are the evidence base
+        for the addressing fix above."""
+        ac = FakeAgentCore([
+            tool_use_stream("page_human", {"run_id": "run-stuck-9", "situation": "s",
+                                           "recommendation": "r"}),
+            text_stream("ack")])
+        c = clients(ac)
+        driver.handler(driver_event(stage="orchestrator", task="triage",
+                                    run_id="run-orch-1", task_token=None), clients=c)
+        paged = [r for r in c["ddb"].Table("llmops-stage-events").items
+                 if str(r.get("sk", "")).endswith("#" + driver.PAGE_EVENT)]
+        assert json.loads(paged[0]["detail"])["paged_by"] == "orchestrator-triage", (
+            f"the derivation changed the label the old code hardcoded: {paged[0]['detail']}")
+
+    def test_a_checkpoint_after_a_page_records_that_the_run_is_waiting(self):
+        """The row that did not exist. checkpoint wrote nothing anywhere, so a stage waiting
+        for a human and a stage doing its work were byte-identical to every reader -- and
+        the state whose whole purpose is to get attention was the one the console could not
+        show. One row per waiting turn, because an operator needs not only THAT it is
+        waiting but how long it has been paying model tokens to wait."""
+        ac = FakeAgentCore([
+            tool_use_stream("page_human", {"situation": "borderline", "recommendation": "wait"}),
+            tool_use_stream("checkpoint", {"next_action": "waiting"}),
+            tool_use_stream("checkpoint", {"next_action": "still waiting"}),
+            tool_use_stream("checkpoint", {"next_action": "still waiting"}),
+            tool_use_stream("stage_complete", {"outputs": []}),
+            text_stream("ack")])
+        c = clients(ac)
+        driver.handler(driver_event(stage="eval", task="gate", harness_id="llmops_eval"),
+                       clients=c)
+        waits = [r for r in c["ddb"].Table("llmops-stage-events").items
+                 if str(r.get("sk", "")).endswith("#" + driver.WAIT_EVENT)]
+        assert len(waits) == 3, f"three waiting checkpoints left {len(waits)} rows"
+        turns = sorted(json.loads(r["detail"])["waiting_turn"] for r in waits)
+        assert turns == [1, 2, 3], f"the turn counter does not advance: {turns}"
+        detail = json.loads(waits[0]["detail"])
+        assert detail["paged_at"], "a waiting row that does not say which page it waits on"
+        assert detail["task"] == "gate", f"{detail!r}"
+        assert "#eval#" in str(waits[0]["sk"]), f"{waits[0]['sk']!r}"
+
+    def test_a_checkpoint_with_no_page_behind_it_records_nothing(self):
+        """The common case stays free of ceremony: a working agent checkpoints for another
+        turn, and a row per checkpoint would drown the timeline an operator opens to find
+        out what happened. Waiting is a property of having ASKED."""
+        ac = FakeAgentCore([
+            tool_use_stream("checkpoint", {"next_action": "keep going"}),
+            tool_use_stream("checkpoint", {"next_action": "keep going"}),
+            tool_use_stream("stage_complete", {"outputs": []}),
+            text_stream("ack")])
+        c = clients(ac)
+        driver.handler(driver_event(stage="eval", task="gate", harness_id="llmops_eval"),
+                       clients=c)
+        assert not [r for r in c["ddb"].Table("llmops-stage-events").items
+                    if str(r.get("sk", "")).endswith("#" + driver.WAIT_EVENT)], \
+            "a run that never asked anybody anything is recorded as waiting on them"
+
+    def test_the_answer_arriving_ends_the_wait(self):
+        """A directive delivered in a checkpoint result IS the answer, so the marking stops
+        -- otherwise a run reads as waiting forever after being unblocked, and the next
+        page inherits this one's turn count instead of starting its own."""
+        ac = FakeAgentCore([
+            tool_use_stream("page_human", {"situation": "borderline", "recommendation": "wait"}),
+            tool_use_stream("checkpoint", {"next_action": "waiting"}),
+            tool_use_stream("checkpoint", {"next_action": "acting on the verdict"}),
+            tool_use_stream("stage_complete", {"outputs": []}),
+            text_stream("ack")])
+        c = clients(ac)
+        driver.put_directive(c["ddb"], "run-test-1", decision="accept_at_this_score",
+                             rationale="0.46 with n=97 is good enough for a pilot",
+                             actor="tmwu")
+        driver.handler(driver_event(stage="eval", task="gate", harness_id="llmops_eval"),
+                       clients=c)
+        answer = json.loads(
+            ac.calls[2]["messages"][-1]["content"][0]["toolResult"]["content"][0]["text"])
+        assert answer["status"] == "directive", (
+            f"the paged agent's checkpoint did not deliver the parked verdict: {answer!r}")
+        assert not [r for r in c["ddb"].Table("llmops-stage-events").items
+                    if str(r.get("sk", "")).endswith("#" + driver.WAIT_EVENT)], \
+            "the run is still being recorded as waiting after its answer was delivered"
+
+    def test_the_wait_survives_the_lambda_boundary_it_will_certainly_cross(self):
+        """A human answer takes minutes at best; one invocation is 900s. So a waiting run
+        crosses Lambda boundaries by construction, and if the marker restarted at each one
+        the turn count would reset to 1 forever -- exactly the number that makes a long
+        wait look like a fresh one. Behavioural, through the continuation the reinvoke
+        sends, rather than a source string: `_resumed` is the cautionary tale for keys that
+        are written and never read."""
+        ac = FakeAgentCore([
+            tool_use_stream("checkpoint", {"next_action": "still waiting"}),
+            tool_use_stream("stage_complete", {"outputs": []}),
+            text_stream("ack")])
+        c = clients(ac)
+        driver.handler(driver_event(
+            stage="eval", task="gate", harness_id="llmops_eval",
+            _continuation=[{"role": "user", "content": [{"text": "carry on"}]}],
+            _paged_at="2026-08-09T10:00:00Z", _wait_turns=4), clients=c)
+        waits = [r for r in c["ddb"].Table("llmops-stage-events").items
+                 if str(r.get("sk", "")).endswith("#" + driver.WAIT_EVENT)]
+        assert len(waits) == 1, f"{waits!r}"
+        detail = json.loads(waits[0]["detail"])
+        assert detail["waiting_turn"] == 5, (
+            f"the wait restarted across the boundary: turn {detail['waiting_turn']}, not 5")
+        assert detail["paged_at"] == "2026-08-09T10:00:00Z", (
+            f"the resumed invocation lost which page it is waiting on: {detail!r}")
+
+    def test_a_fresh_start_does_not_inherit_a_wait_it_cannot_remember(self):
+        """A resurrector wake or a state-machine re-entry re-sends the stage prompt, so the
+        agent's own decision to wait is gone with the transcript: continuing to mark
+        waiting turns would attribute them to an agent that no longer knows it asked
+        anything. The page itself survives as a row in the run's timeline, which is what
+        the console reads -- only the per-turn marker restarts."""
+        ac = FakeAgentCore([
+            tool_use_stream("checkpoint", {"next_action": "starting over"}),
+            tool_use_stream("stage_complete", {"outputs": []}),
+            text_stream("ack")])
+        c = clients(ac)
+        driver.handler(driver_event(stage="eval", task="gate", harness_id="llmops_eval",
+                                    _paged_at="2026-08-09T10:00:00Z", _wait_turns=4),
+                       clients=c)
+        assert not [r for r in c["ddb"].Table("llmops-stage-events").items
+                    if str(r.get("sk", "")).endswith("#" + driver.WAIT_EVENT)], \
+            "a fresh invocation resumed a wait whose transcript it does not have"
+
+    def test_the_waiting_rows_are_bounded_and_the_last_one_is_a_floor(self):
+        """maxIterations is 100 and the eval prompt's 6-checkpoint cap is a request, not an
+        enforcement: an agent that ignores it would write a row per turn into the timeline
+        an operator opens to find out what happened. The rows stop at WAIT_ROW_CAP while
+        the WAIT does not, which is why the console reads each row's own `waiting_turn`
+        field (a floor) instead of counting rows (not even a floor)."""
+        cap = driver.WAIT_ROW_CAP
+        assert cap >= 12, f"the cap is below twice the prompt's 6 checkpoints: {cap}"
+        ac = FakeAgentCore(
+            [tool_use_stream("page_human", {"situation": "b", "recommendation": "wait"})]
+            + [tool_use_stream("checkpoint", {"next_action": f"waiting {i}"})
+               for i in range(cap + 3)]
+            + [tool_use_stream("stage_complete", {"outputs": []}), text_stream("ack")])
+        c = clients(ac)
+        out = driver.handler(driver_event(stage="eval", task="gate",
+                                         harness_id="llmops_eval"), clients=c)
+        assert out["status"] == "completed", (
+            f"the cap ended the stage instead of only the rows: {out!r}")
+        waits = [json.loads(r["detail"])["waiting_turn"]
+                 for r in c["ddb"].Table("llmops-stage-events").items
+                 if str(r.get("sk", "")).endswith("#" + driver.WAIT_EVENT)]
+        assert len(waits) == cap, f"{cap + 3} waiting checkpoints wrote {len(waits)} rows"
+        assert max(waits) == cap, f"the newest row is not the floor the console prints: {waits}"
 
     def test_every_triage_tool_is_serviced_on_the_driver_path(self):
         """The existing drift guard asks whether a declared tool is serviced ANYWHERE,
@@ -9890,6 +10147,96 @@ def test_the_gate_bullet_decides_by_the_wilson_interval():
     assert "escalate_human" in b
     assert "no plan signed" in b, (
         "the gate bullet no longer forbids gating on the OOD report")
+
+
+# ── D12: the gate's borderline verdict had nowhere to go ──────────────────────────────
+# The CI rule above produces three outcomes, and the third one -- borderline -- was routed
+# to `escalate_human`, which is the ONE call that makes a human answer undeliverable:
+# `escalated` is in the driver's UNREACHABLE_RUN_STATES, so resolve_escalation refuses to
+# park a verdict for it and no checkpoint will ever run again to receive one. The only
+# other channel, `checkpoint`, notifies nobody. So the design asked a question through the
+# door it had just locked. These pin the third channel and the protocol that uses it.
+
+def test_the_eval_agent_can_ask_a_question_that_can_still_be_answered():
+    """A protocol naming a tool the harness does not declare is a protocol the agent cannot
+    follow -- it reaches for the nearest declared thing instead, which here is the call that
+    ends the run."""
+    doc = json.loads((REPO / "agents/eval/harness.json").read_text())
+    tools = {t["name"]: t for t in doc["tools"] if t.get("type") == "inline_function"}
+    assert "page_human" in tools, "the eval harness declares no way to notify a human"
+    assert "page_human" in doc["allowedTools"], (
+        "page_human is declared and not allowed, so every call answers 'unsupported'")
+    schema = tools["page_human"]["config"]["inlineFunction"]["inputSchema"]
+    assert set(schema["required"]) == {"situation", "recommendation"}, (
+        f"a page must carry the analysis the agent already did: {schema['required']}")
+    assert "run_id" not in schema["properties"], (
+        "the eval page declares run_id, so a model can address a page at a run it was not "
+        "invoked for -- the mis-addressing the triage path already paid for; the driver "
+        "reads the subject off the invocation")
+    driver_src = (REPO / "orchestration/harness_driver/handler.py").read_text()
+    assert 'name == "page_human"' in driver_src, (
+        "the eval prompt tells the agent to page and the driver does not service it")
+
+
+def test_a_borderline_gate_score_no_longer_routes_to_the_call_that_ends_the_run():
+    """The defect, in one sentence: escalate_human ENDS the run, and a borderline score is
+    the one gate outcome a human answer can unblock. Sending it there destroyed the run the
+    answer was for, so the operator's verdict had nowhere to land -- the same
+    undeliverable-verdict shape as #16, arrived at from the prompt instead of the code."""
+    b = _eval_prompt_bullet("gate")
+    # The third outcome of the CI rule, not the first mention of the word: the missing-gates
+    # sentence above says "NOT the borderline protocol below", and slicing from there would
+    # read the terminal case as the borderline one.
+    proto = b[b.index("statistically borderline"):]
+    assert "page_human" in proto and "checkpoint" in proto, (
+        f"the borderline branch still has no way to be answered: {proto[:300]}")
+    assert "do NOT reach for escalate_human" in proto, (
+        "the borderline branch no longer rules out the call that makes the answer "
+        f"undeliverable: {proto[:300]}")
+    assert proto.index("page_human") < proto.index("after 6 checkpoints"), (
+        "the unanswered-page fallback is offered before the page itself, which reads as "
+        "the primary choice")
+    # ...and the wait is BOUNDED. Every waiting turn bills real model tokens against this
+    # run, so an unbounded wait is a cost with no owner -- and a page nobody answers has to
+    # end somewhere.
+    assert "6 checkpoints" in b, (
+        "the borderline protocol does not bound the wait, so an unanswered page waits "
+        "until maxIterations at model-token cost")
+    # The two terminal cases stay terminal, and say why -- a directive must not be able to
+    # supply a bar the signed plan does not carry, and a bar inside its own ceiling band is
+    # a defect in the signed number, which is re-signed rather than directed.
+    assert b.count("terminal on purpose") == 2, (
+        f"the two deliberately-terminal gate exits no longer say so: {b.count('terminal on purpose')}")
+
+
+def test_the_escalation_tool_no_longer_advertises_the_verdict_it_cannot_deliver():
+    """Its own description claimed borderline gate scores -- 'including borderline gate
+    scores' -- which is exactly the case it cannot serve. A tool description is the shortest
+    path an agent has to a wrong choice."""
+    doc = json.loads((REPO / "agents/eval/harness.json").read_text())
+    esc = [t for t in doc["tools"] if t.get("name") == "escalate_human"][0]
+    desc = json.dumps(esc["config"]["inlineFunction"])
+    assert "borderline gate scores" not in desc, (
+        "escalate_human still advertises itself for borderline gate scores")
+    assert "page_human" in desc, (
+        "escalate_human's description does not point at the channel that CAN be answered, "
+        "so an agent reading only this tool has no alternative to reach for")
+
+
+def test_the_turn_end_invariant_lists_the_third_channel():
+    """The invariant is the sentence an agent re-reads when it does not know how to end a
+    turn. A channel missing from it is a channel that gets used by accident, if at all."""
+    doc = json.loads((REPO / "agents/eval/harness.json").read_text())
+    text = "".join(b.get("text", "") for b in doc["systemPrompt"])
+    assert text.count("TURN-END INVARIANT") == 1
+    sentence = text.split("TURN-END INVARIANT")[1].split("\n- ")[0]
+    for call in ("stage_complete", "checkpoint", "escalate_human", "page_human"):
+        assert call in sentence, f"the turn-end invariant does not mention {call}"
+    # A page is NOT a way to end a turn -- the driver keeps the turn precisely because the
+    # invocation still holds the task token -- so the invariant has to say what follows it.
+    assert "followed by a checkpoint" in sentence, (
+        f"the invariant lists page_human without saying a page does not end a turn: "
+        f"{sentence[:400]}")
 
 
 def test_the_power_analysis_numbers_are_recomputable():

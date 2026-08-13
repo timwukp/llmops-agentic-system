@@ -22,9 +22,9 @@ page is its ledger.
 
 | Check | Result | How to reproduce |
 |---|---|---|
-| Unit tests (contracts, cost model, driver loop, Lambdas, state machine document) | **1255/1255 passed** | `.venv/bin/python -m pytest tests/ -q --ignore=tests/golden` |
+| Unit tests (contracts, cost model, driver loop, Lambdas, state machine document) | **1278/1278 passed** | `.venv/bin/python -m pytest tests/ -q --ignore=tests/golden` |
 | Shell suite — N-way capacity race guard (`tests/test_capacity_race_guard.sh`) | **10/10 assertions** | `bash tests/test_capacity_race_guard.sh` |
-| Negative controls — every guard broken in turn, confirmed to fail | **280/280 negative controls** | `.venv/bin/python tests/negative_controls/monitor_dispatch.py` |
+| Negative controls — every guard broken in turn, confirmed to fail | **293/293 negative controls** | `.venv/bin/python tests/negative_controls/monitor_dispatch.py` |
 | Harness config validation (5 specialists + conductor + auditor) | **7/7 `RESULT: OK`** | `python deploy/validate_config.py --config agents/<a>/harness.json` |
 | Architecture SVG geometry (no wire crossings, no wire through a card) | **CLEAN** | `python tests/test_svg_geometry.py docs/architecture-*.svg` |
 | Redaction scan (account IDs, credentials, account-bearing ARNs) | CLEAN | `.github/workflows/redaction-check.yml` |
@@ -133,14 +133,14 @@ Full record: [VERIFICATION_finops.md](../deploy/evidence/VERIFICATION_finops.md)
 
 | Check | Result | How to reproduce |
 |---|---|---|
-| Unit tests (all suites, incl. `test_cost_model.py` + `test_finops.py`) | **1255 passed** | `.venv/bin/python -m pytest tests/ -q` |
+| Unit tests (all suites, incl. `test_cost_model.py` + `test_finops.py`) | **1278 passed** | `.venv/bin/python -m pytest tests/ -q` |
 | Harness config validation, 7 agents | **`RESULT: OK`** | `python deploy/validate_config.py --config agents/finops/harness.json` |
 | Live fleet | **7 harnesses READY** | `list_harnesses` via the repo's vendored boto3 |
 | Canonical module has a distribution path | prints `would upload 4 contract files` | `python deploy/03_storage.py --region us-east-1 --account-id 123456789012 --dry-run` |
 
 Every guard added in this work was **mutation-checked**: the asserted behaviour was
-reverted one at a time and the test confirmed to fail — **280/280 negative controls**, 243
-mutations asserting 280 (guard, mutation) pairs, one printed PASS line each. A test that
+reverted one at a time and the test confirmed to fail — **293/293 negative controls**, 255
+mutations asserting 293 (guard, mutation) pairs, one printed PASS line each. A test that
 passes both with and against the behaviour it names is not a test.
 
 The count is in the sentence on purpose. "Mutation-checked" is an adjective, and an
@@ -188,6 +188,24 @@ prompt now mandates `<metric>_ci_low/_ci_high` and `<family>_n` for every propor
 and the band survives only as the fallback for a metric with no denominator — with a clause
 requiring the agent to say so, once, when `bar + band` reaches the metric's ceiling. A guard whose
 assertion encodes the shipped behaviour is not evidence that the behaviour is right.
+
+The newest twelve controls are about a state rather than a number. A blocked run **could be
+answered, or noticed — never both**: `checkpoint` keeps a run answerable and notifies nobody,
+`escalate_human` notifies and makes the run unanswerable, and the eval gate's *borderline*
+verdict — the one gate outcome a human answer can settle — was routed to the second. Half the
+fix is a third channel (`page_human`: notify, keep the run alive), and half is that a stage's
+page must **not** end the turn, because the invocation is holding a task token `_ack_terminal`
+does not settle: `EvalGate` would wait its full `TimeoutSeconds: 86400` on a token nothing is
+left alive to settle, so an agent doing exactly what the prompt asks would hang its own run for
+a day. Both halves are mutation-checked, and so is every bound around them — m245 refills the
+waiting-turn counter at each Lambda boundary (a real wait crosses several, so the count would
+read 1 forever), m249 counts surviving rows instead of reading each row's own `waiting_turn`
+(past the driver's 12-row cap a count is not even a floor, and it under-reports the longest
+waits), m250 reads the oldest rows instead of the newest (the pill would vanish on exactly the
+long runs that wait longest), and m251 swaps the console's prefix match for exact status
+equality (a richer terminal status would draw a pill whose answer the driver refuses to park).
+A state the operator cannot see is a state the system does not have — the third time this
+repo has paid for that sentence.
 
 ### Two failures worth more than the passes
 
