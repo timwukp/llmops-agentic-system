@@ -6083,3 +6083,29 @@ def test_unsupported_types_are_listed_and_marked(console):
         assert key in cat and cat[key]["supported"] is False
     modes = {t["key"]: t["pipeline_mode"] for t in console.TASK_TYPE_REGISTRY}
     assert modes["eval-only"] == "eval_only" and modes["data-audit"] == "data_audit"
+
+
+def test_presigned_upload_host_matches_the_csp_upload_origin(wired, monkeypatch):
+    """The page's CSP names ONE S3 origin and the presigner must emit exactly that
+    host. In us-east-1 boto3's default presigned host is the GLOBAL endpoint
+    (bucket.s3.amazonaws.com) while _upload_origin() names the regional one -- live
+    (2026-08-14) every drop-zone upload died in xhr.onerror, blocked by our own
+    connect-src before the request left the page, and the bucket's (correct) CORS
+    rule was never consulted. This builds a REAL botocore client with the module's
+    own _S3_PRESIGN_CONFIG, so the pin is on the config the Lambda actually ships,
+    not on a restatement of it."""
+    import boto3 as real_boto3   # the real module: the fake lives only inside the
+    # console's import, and URL presigning is pure local computation (no network)
+    real = real_boto3.client(
+        "s3", region_name="us-east-1",
+        aws_access_key_id="test", aws_secret_access_key="test",
+        config=wired.console._S3_PRESIGN_CONFIG)
+    url = real.generate_presigned_url(
+        "put_object",
+        Params={"Bucket": "test-bucket", "Key": "customer-data/t/x.jsonl"},
+        ExpiresIn=60)
+    origin = wired.console._upload_origin()
+    assert origin and url.startswith(origin + "/"), (
+        f"presigned URL host and CSP connect-src origin disagree: the browser will "
+        f"block the PUT before it leaves.\n  presigned: {url.split('?')[0]}\n  "
+        f"CSP names: {origin}")
