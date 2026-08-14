@@ -84,9 +84,21 @@ DS_GROUP = os.environ.get("DS_GROUP", "llmops-datascience")            # may cre
 APPROVAL_KEY = os.environ.get("APPROVAL_KEY", "alias/llmops-approval") # KMS signing key
 LLMOPS_SNS_TOPIC = os.environ.get("LLMOPS_SNS_TOPIC", "")
 
+from botocore.config import Config as _BotoConfig
+
 ctl = boto3.client("bedrock-agentcore-control", region_name=REGION)
 data = boto3.client("bedrock-agentcore", region_name=REGION)
-s3 = boto3.client("s3", region_name=REGION)
+# The presigned upload URL must carry the SAME host _upload_origin() names in the
+# page's CSP connect-src, or the browser blocks the PUT before it ever leaves and the
+# failure reads as a bucket CORS problem (live, 2026-08-14: every drop-zone upload
+# died in xhr.onerror; the bucket's CORS rule was correct and never consulted). In
+# us-east-1 boto3's DEFAULT presigned host is the GLOBAL endpoint
+# (bucket.s3.amazonaws.com) while the CSP names the regional one
+# (bucket.s3.us-east-1.amazonaws.com) -- one config away from agreeing. Pinned
+# regional here, and a test holds this config and _upload_origin() to the same host.
+_S3_PRESIGN_CONFIG = _BotoConfig(s3={"us_east_1_regional_endpoint": "regional",
+                                     "addressing_style": "virtual"})
+s3 = boto3.client("s3", region_name=REGION, config=_S3_PRESIGN_CONFIG)
 lam = boto3.client("lambda", region_name=REGION)
 sfn = boto3.client("stepfunctions", region_name=REGION)
 sm = boto3.client("sagemaker", region_name=REGION)
@@ -110,7 +122,6 @@ kms = boto3.client("kms", region_name=REGION)
 sns = boto3.client("sns", region_name=REGION)
 # Chat turns stream for minutes; the default 60s read timeout kills them and an
 # auto-retry silently re-runs a whole turn — same hard-won config as the driver's.
-from botocore.config import Config as _BotoConfig
 agentcore_chat = boto3.client(
     "bedrock-agentcore", region_name=REGION,
     config=_BotoConfig(read_timeout=870, connect_timeout=30, retries={"max_attempts": 0}))
