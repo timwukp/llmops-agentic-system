@@ -1898,6 +1898,30 @@ RE_ASK = ("Your turn ended without an inline-function call. If your task is "
           "is already done, call stage_complete now (outputs may be an empty "
           "list if nothing was produced).")
 
+#: The last resort before ContentFiltered: a fresh session whose first turn is told to
+#: attest WITHOUT prose. Appended to the re-seeded task payload by the filtered branch.
+#: Why a fresh session works when re-asking does not: the filter acts on what the model
+#: writes, and a model re-asked in the SAME session keeps trying to restate the gagged
+#: summary sitting in its context (live, EvalScore of run-9d995076: the eval agent had
+#: already written report.json, then had three summary turns suppressed in a row — the
+#: stage died with its work complete on S3). A fresh session has no gagged summary to
+#: restate, and the instruction forecloses writing a new one: verify your own outputs,
+#: claim them through the tool channel — URIs and numbers, which no filter acts on — or
+#: escalate. The attestation protocol is intact either way: the agent still claims, the
+#: driver still head-checks every claimed URI.
+CF_RECOVERY = (
+    "\n\nRECOVERY in a fresh runtime session: the platform content filter suppressed "
+    "your previous session's replies repeatedly — nothing you wrote in chat was "
+    "delivered, but everything you wrote to S3 is intact. Re-read your manifest and "
+    "your own S3 outputs to see what is already done. Do NOT redo finished work, and "
+    "do NOT summarize, quote or restate ANY data content in this session — no ticket "
+    "text, no examples, no personal data; URIs and numbers only. If the task's outputs "
+    "are complete, END YOUR FIRST TURN with stage_complete carrying the output URIs "
+    "and numeric metrics (one neutral sentence of summary at most). If they are not "
+    "complete, call escalate_human and say which output is missing, by URI alone. "
+    "Prose will be filtered again; the inline-function call is the only channel that "
+    "survives.")
+
 
 #: The EVENTS_TABLE partition for non-run driver heartbeats (#37). The resurrector
 #: duplicates this constant (separate bundles); a test pins the two spellings together.
@@ -2062,12 +2086,14 @@ def _run_stage(event, context=None, c=None):
         # in the checkpoint branch below.
         paged_at = str(event.get("_paged_at") or "")
         wait_turns = int(event.get("_wait_turns", 0))
+        cf_recovery = int(event.get("_cf_recovery", 0))
     else:
         messages = _user_text(json.dumps(payload, default=str))
         stream_retried = False
         re_asks = 0  # up to 2 CONSECUTIVE: nudge, final demand; any serviced tool call re-arms it
         filtered_turns = 0  # consecutive platform-suppressed turns; see the filtered branch
         infra_error_turns = 0  # consecutive dead-stream turns; see the outage branch
+        cf_recovery = 0  # 1 once the fresh-session filter recovery has been spent
         # Not carried over from a PREVIOUS invocation of this stage on purpose: a fresh
         # start (resurrector wake, state-machine re-entry) re-sends the stage prompt, so
         # the agent's own decision to wait is gone with the transcript. The page itself
@@ -2087,6 +2113,7 @@ def _run_stage(event, context=None, c=None):
                                 "_re_asks": re_asks,
                                 "_filtered_turns": filtered_turns,
                                 "_infra_error_turns": infra_error_turns,
+                                "_cf_recovery": cf_recovery,
                                 "_paged_at": paged_at,
                                 "_wait_turns": wait_turns,
                                 "_session_epoch": epoch,
@@ -2683,13 +2710,32 @@ def _run_stage(event, context=None, c=None):
                     "conclusion plainly, without quoting raw data, and end this "
                     "turn with the required inline-function call.")
                 continue
+            # Re-asking in THIS session has failed twice: the model keeps trying to
+            # restate the gagged text sitting in its own context, and the filter
+            # keeps acting on it. Live (EvalScore, run-9d995076): the agent had
+            # already WRITTEN report.json and every artifact — three suppressed
+            # summary turns killed a stage whose work was complete on S3. So before
+            # settling, spend one fresh session (no gagged context to restate) whose
+            # first turn must attest through the tool channel — URIs and numbers —
+            # or escalate. See CF_RECOVERY for why this works and why it does not
+            # weaken attestation: the claims it produces still go through
+            # handle_stage_complete's head-check like any other.
+            if not cf_recovery:
+                cf_recovery = 1
+                print(f"[driver] {filtered_turns + 1} consecutive suppressed turns "
+                      "-- rolling to a fresh session for a tool-channel-only "
+                      "recovery attempt")
+                _roll_session()
+                messages = _user_text(json.dumps(payload, default=str) + CF_RECOVERY)
+                continue
             if event.get("task_token"):
                 settle_token(c["sfn"], event["task_token"],
                              error="ContentFiltered",
                              cause=f"{filtered_turns + 1} consecutive turns were "
                                    f"suppressed by the platform "
-                                   f"({out['stop_reason']}); no agent output was "
-                                   "delivered")
+                                   f"({out['stop_reason']}), and a fresh-session "
+                                   "recovery attempt was also suppressed; no agent "
+                                   "output was delivered")
             ev.emit_event(os.environ["EVENT_BUS"], ev.PIPELINE_FAILED,
                           {"run_id": event["run_id"], "stage": event["stage"],
                            "reason": "content filtered"}, client=c["events"])

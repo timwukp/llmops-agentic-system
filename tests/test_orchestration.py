@@ -10764,27 +10764,74 @@ def test_a_filtered_turn_does_not_spend_the_prose_budget():
     assert "suppressed" in nudge and "NEVER delivered" in nudge
 
 
-def test_three_consecutive_filtered_turns_settle_as_content_filtered():
-    ac = FakeAgentCore([filtered_stream(), filtered_stream(), filtered_stream()])
+def test_three_filtered_turns_roll_a_fresh_recovery_session_not_a_failure():
+    """EvalScore of run-20260813T144852Z-9d995076: the eval agent wrote report.json
+    and every artifact, then had three summary turns suppressed in a row -- and the
+    stage settled ContentFiltered with its work complete on S3. Re-asking in the same
+    session cannot work: the model keeps restating the gagged text in its own context
+    and the filter keeps acting on it. The third suppression must therefore roll a
+    FRESH session (no gagged context to restate) whose first turn is told to attest
+    through the tool channel only -- and a stage_complete there completes the stage
+    through the normal head-check, no failure recorded anywhere."""
+    uri = "s3://llmops-data-test/runs/run-test-1/evaluation/report.json"
+    ac = FakeAgentCore([
+        filtered_stream(), filtered_stream(), filtered_stream(),   # original session
+        tool_use_stream("stage_complete", {"outputs": [uri]}),     # recovery session
+        text_stream("ack")])
+    c = clients(ac, FakeS3(existing=[uri]))
+    out = driver.handler(driver_event(), clients=c)
+    assert out["status"] == "completed", (
+        "three suppressed turns killed a stage whose work was already on S3 -- the "
+        "recovery session never ran")
+    assert not c["sfn"].failures
+    # the recovery really is a NEW session: same-session re-asks are what already
+    # failed twice by the time it fires
+    assert ac.calls[3]["runtimeSessionId"] != ac.calls[2]["runtimeSessionId"], (
+        "the recovery attempt reused the gagged session, so the filter will act on "
+        "the same restated context again")
+    seed = ac.calls[3]["messages"][-1]["content"][0]["text"]
+    assert "RECOVERY in a fresh runtime session" in seed
+    assert "URIs and numbers only" in seed, (
+        "the recovery seed no longer forecloses prose -- the one thing the filter "
+        "acts on")
+
+
+def test_a_suppressed_recovery_session_settles_as_content_filtered():
+    """The recovery is ONE session, bounded like everything else: if the platform
+    gags that session too, the stage settles ContentFiltered -- and the cause says
+    the recovery was attempted, so the operator knows both channels are exhausted."""
+    ac = FakeAgentCore([filtered_stream()] * 6)   # 3 original + 3 in recovery
     c = clients(ac)
     out = driver.handler(driver_event(), clients=c)
     assert out == {"status": "failed", "reason": "content_filtered"}
     assert c["sfn"].failures[0]["error"] == "ContentFiltered", (
         "a run killed by the platform filter must not be labelled "
         "MissingStageComplete -- the two need different operator responses")
+    assert "recovery" in c["sfn"].failures[0]["cause"], (
+        "the cause must say the fresh-session recovery was spent, or the operator "
+        "re-tries by hand exactly what the driver already tried")
     assert any(e["DetailType"] == ev.PIPELINE_FAILED for e in c["events"].entries)
+    sessions = {call["runtimeSessionId"] for call in ac.calls}
+    assert len(sessions) == 2, (
+        f"expected exactly one original + one recovery session, got {len(sessions)}")
 
 
 def test_the_filtered_budget_survives_a_self_reinvoke():
     """Same argument as _re_asks: 'consecutive' is counted across Lambda invocations,
     and the live failure happened ON a resumed invocation -- if the counter does not
-    ride the continuation payload, every handoff refills it."""
+    ride the continuation payload, every handoff refills it. The recovery budget
+    rides for the same reason: a recovery session that self-reinvokes between turns
+    must not be granted a second recovery on resume."""
     src = (REPO / "orchestration/harness_driver/handler.py").read_text()
     body = src[src.index("def _run_stage"):]
     assert '"_filtered_turns": filtered_turns' in body, \
         "_self_reinvoke stopped carrying the filtered-turn counter"
     assert 'int(event.get("_filtered_turns", 0))' in body, \
         "a continuation no longer restores the filtered-turn counter"
+    assert '"_cf_recovery": cf_recovery' in body, \
+        "_self_reinvoke stopped carrying the recovery budget"
+    assert 'int(event.get("_cf_recovery", 0))' in body, \
+        "a continuation no longer restores the recovery budget"
 
 
 # ── the gate is decided by an interval, not a point ─────────────────────────────────
