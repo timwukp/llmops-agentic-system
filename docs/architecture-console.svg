@@ -72,7 +72,7 @@
     <g>
       <rect class="card cSpine" x="286" y="196" width="200" height="56" rx="12"/>
       <text class="title" x="386.0" y="220" text-anchor="middle">🖥️ llmops-admin λ</text>
-      <text class="sub" x="386.0" y="238" text-anchor="middle">frontend + 30 route handlers in one λ</text>
+      <text class="sub" x="386.0" y="238" text-anchor="middle">frontend + 32 route handlers in one λ</text>
     </g>
   </a>
 

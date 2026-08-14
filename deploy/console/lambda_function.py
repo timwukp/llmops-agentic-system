@@ -27,6 +27,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import secrets
 import time
 from datetime import datetime, timedelta, timezone
@@ -93,6 +94,10 @@ ssm = boto3.client("ssm", region_name=REGION)
 cw = boto3.client("cloudwatch", region_name=REGION)
 logsc = boto3.client("logs", region_name=REGION)
 brt = boto3.client("bedrock-runtime", region_name=REGION)
+# The intake verifier's client. Deliberately the CONSOLE's: the orchestrator role is
+# denied GetKnowledgeBase/SSM on purpose, which is why its plans mark the KB
+# "customer-asserted" — this console checks what the agent cannot, and says so.
+bragent = boto3.client("bedrock-agent", region_name=REGION)
 cognito = boto3.client("cognito-idp", region_name=REGION)
 _ddb = boto3.resource("dynamodb", region_name=REGION)
 console_tbl = _ddb.Table(CONSOLE_TABLE) if CONSOLE_TABLE else None
@@ -2711,6 +2716,22 @@ def create_task(body, user):
         return {"error": f"membership in {DS_GROUP} or {APPROVER_GROUP} required",
                 "status_code": 403}
     goal = str(body.get("goal", "")).strip()
+    ttype_key = str(body.get("task_type", "")).strip()
+    intake_fields = {}
+    if ttype_key:
+        ttype = _task_type(ttype_key)
+        if ttype is None:
+            return {"error": f"unknown task_type {ttype_key[:40]}",
+                    "status_code": 400}
+        clean, errors = _validate_fields(ttype, body.get("fields") or {})
+        if errors:
+            # Per-field errors, not one blob: the form highlights exactly what to fix.
+            return {"error": "intake validation failed", "field_errors": errors,
+                    "status_code": 400}
+        intake_fields = clean
+        # The canonical goal is composed server-side; the customer's own words ride
+        # along as a note rather than being the only copy of the parameters.
+        goal = _compose_goal(ttype, clean, goal)
     if not goal:
         return {"error": "goal is required", "status_code": 400}
     task_id = "task-" + secrets.token_hex(8)
@@ -2720,7 +2741,8 @@ def create_task(body, user):
             "created_at": now, "updated_at": now, "goal": goal[:500],
             "messages": [{**first, "text": goal[:MSG_TEXT_MAX]}], "plan_uri": "",
             "plan_summary": "", "cost_estimate_usd": "", "run_id": "", "session_seq": 0,
-            "error_msg": ""}
+            "error_msg": "", "task_type": ttype_key,
+            "intake": ({"fields": intake_fields} if intake_fields else {})}
     tasks_tbl.put_item(Item=item)
     # Wrapped, and after the put_item: an audit write that fails must not cost the
     # customer the task they just created (nor the _enqueue_task_turn below it).
@@ -3112,6 +3134,569 @@ def _dig(obj, dotted):
     return obj
 
 
+# ── Task intake: type catalog, guided-form validation, console-side verification ──
+#
+# Before this section existed, POST /api/tasks took one free-text goal and every
+# structured parameter the pipeline needs was read out of that prose BY THE MODEL ONLY.
+# The intake layer is three things, all advisory:
+#   1. a task-type catalog + per-type field spec (the guided form and the offline
+#      template are both rendered from it — one source, no second copy to drift),
+#   2. alias normalization of parameter names (retrieval_kb -> retrieval_kb_id), the
+#      same move start_pipeline's ROLE_ALIASES makes for model roles,
+#   3. console-side verification of machine-checkable claims. The orchestrator's role
+#      is DENIED GetKnowledgeBase and SSM by design, so its plans can only mark the KB
+#      "customer-asserted"; this console holds those permissions, checks the claim, and
+#      hands the consult a fact with a timestamp instead of an assertion.
+# Nothing here can fail a task: a check that errors becomes a fact with
+# status="unverified" and the reason, and the consult always proceeds — the point is
+# honest disclosure earlier, never a gate that bounces a vague customer.
+
+#: canonical parameter -> the spellings customers actually type. Guarded by tests
+#: against the real consumers (MODE_REQUIRED_PARAMS, the prompt's RAFT clause) rather
+#: than maintained by memory.
+INTAKE_ALIASES = {
+    "source_uri": ("source_uri", "source", "data_uri", "dataset_uri",
+                   "training_data_uri", "training_data"),
+    "customer_eval_uri": ("customer_eval_uri", "eval_uri", "acceptance_uri",
+                          "eval_set_uri", "acceptance_set"),
+    "ood_eval_uri": ("ood_eval_uri", "ood_uri", "ood_set"),
+    "model_artifact_uri": ("model_artifact_uri", "model_uri", "artifact_uri"),
+    "readiness_report_uri": ("readiness_report_uri", "audit_report_uri"),
+    "retrieval_kb_id": ("retrieval_kb_id", "kb_id", "knowledge_base_id",
+                        "retrieval_kb", "knowledge_base"),
+    "retrieval_k": ("retrieval_k",),
+    "retrieval_distractors": ("retrieval_distractors", "distractors"),
+    "kb_ocu_hours": ("kb_ocu_hours", "ocu_hours"),
+    "pipeline_mode": ("pipeline_mode", "mode"),
+    "hf_repo": ("hf_repo", "student_model", "student"),
+    "teacher_model": ("teacher_model", "teacher", "teacher_model_id"),
+    "budget_usd": ("budget_usd", "budget", "budget_reference"),
+    "max_iterations": ("max_iterations", "iterations"),
+    "training_instance": ("training_instance",),
+    "keep_endpoint": ("keep_endpoint",),
+    "sample_count": ("sample_count", "samples"),
+}
+_INTAKE_CANON = {a: c for c, al in INTAKE_ALIASES.items() for a in al}
+_INTAKE_URI_PARAMS = {"source_uri", "customer_eval_uri", "ood_eval_uri",
+                      "model_artifact_uri", "readiness_report_uri"}
+_INTAKE_NUM_PARAMS = {"retrieval_k", "retrieval_distractors", "kb_ocu_hours",
+                      "budget_usd", "max_iterations", "sample_count"}
+#: the prompt's RAFT clause: name all of these at plan top level, or none of them.
+_RAFT_PARAMS = ("retrieval_kb_id", "retrieval_k", "retrieval_distractors",
+                "kb_ocu_hours")
+
+_READINESS_META = {p: (label, why) for p, label, why in DATA_READINESS_FIELDS}
+
+
+def _rf(path, required=True, ftype="text"):
+    """A form field built FROM DATA_READINESS_FIELDS — label and why are the panel's
+    own words, so the form, the panel and the consult prompt ask one question, not
+    three paraphrases of it."""
+    label, why = _READINESS_META[path]
+    return {"param": path, "label": label, "type": ftype, "required": required,
+            "why": why}
+
+
+def _pf(param, label, ftype, required, why, **kw):
+    return {"param": param, "label": label, "type": ftype, "required": required,
+            "why": why, **kw}
+
+
+def _llm_common_fields(teacher_required):
+    return (
+        _rf("source_uri", ftype="uri"),
+        _rf("customer_eval_uri", ftype="uri"),
+        _pf("ood_eval_uri", "Out-of-distribution eval set (S3 URI)", "uri", False,
+            "report-only scores on data unlike training; small sets never gate"),
+        _pf("teacher_model", "Teacher model id", "string", teacher_required,
+            "the model whose outputs are distilled; data is sent to it only after "
+            "redaction, per your consent answer below"),
+        _pf("hf_repo", "Student model (Hugging Face repo)", "string", False,
+            "open-weight student to mirror, pin and fine-tune; the console checks "
+            "models-mirror/ so the plan knows whether a mirror step is needed"),
+        _pf("budget_usd", "Budget reference (USD)", "number", False,
+            "a reference, not a ceiling — the plan is priced against it"),
+        _pf("training_instance", "Training instance", "string", False,
+            "e.g. ml.g5.2xlarge; leave blank to let the plan choose"),
+        _pf("max_iterations", "Max training iterations", "number", False,
+            "remediation retries before the run stops trying"),
+        _pf("keep_endpoint", "Keep the smoke endpoint", "bool", False,
+            "false tears the endpoint down after the smoke hour — the safe default"),
+        _rf("verification_method"),
+        _rf("datasheet.provenance"),
+        _rf("datasheet.license"),
+        _rf("datasheet.pii_disposition"),
+        _rf("datasheet.consent"),
+        _rf("decontamination"),
+    )
+
+
+#: The catalog the console offers before free text. Unsupported entries are listed on
+#: purpose: a need the pipeline cannot run yet should be recorded in a consult, not
+#: hidden — but supported=False tells the orchestrator to say so in its FIRST reply
+#: and never to write a plan it cannot dispatch.
+TASK_TYPE_REGISTRY = (
+    {"key": "distill-llm",
+     "label": "Distill an open-weight LLM into a small model",
+     "description": "A large teacher (MoE or dense, e.g. DeepSeek-R1) generates "
+                    "training data for a small open-weight student on your tasks "
+                    "(e.g. ARC-2-style datasets).",
+     "supported": True, "pipeline_mode": "full",
+     "fields": _llm_common_fields(teacher_required=True)},
+    {"key": "finetune-private",
+     "label": "Fine-tune a small open model on private data",
+     "description": "Your enterprise data fine-tunes an open-weight small model; "
+                    "optionally retrieval-augmented (RAFT) against a Knowledge Base.",
+     "supported": True, "pipeline_mode": "full",
+     "fields": _llm_common_fields(teacher_required=False) + (
+         _pf("retrieval_kb_id", "Knowledge Base id", "string", False,
+             "enables RAFT; the console verifies the KB is live and ingested",
+             group="raft"),
+         _pf("retrieval_k", "Passages retrieved per query (k)", "number", False,
+             "RAFT retrieval depth", group="raft"),
+         _pf("retrieval_distractors", "Distractor passages", "number", False,
+             "hard negatives mixed into each RAFT row", group="raft"),
+         _pf("kb_ocu_hours", "KB standing hours (OCU-hours)", "number", False,
+             "the index's standing cost — priced or explicitly UNPRICED, never "
+             "omitted", group="raft"),
+     )},
+    {"key": "data-audit",
+     "label": "Data readiness audit (audit first, commit later)",
+     "description": "The pipeline samples your data, checks contamination against "
+                    "your eval set, scans for PII, and reports ready / not-ready "
+                    "before any training budget is spent.",
+     "supported": True, "pipeline_mode": "data_audit",
+     "fields": (
+         _rf("source_uri", ftype="uri"),
+         _rf("customer_eval_uri", required=False, ftype="uri"),
+         _rf("datasheet.provenance", required=False),
+         _rf("datasheet.license", required=False),
+     )},
+    {"key": "eval-only",
+     "label": "Re-judge an existing model (eval only)",
+     "description": "No training: an existing model artifact is evaluated against "
+                    "your held-out acceptance set.",
+     "supported": True, "pipeline_mode": "eval_only",
+     "fields": (
+         _pf("model_artifact_uri", "Model artifact (S3 URI)", "uri", True,
+             "the trained model to judge — eval_only refuses to dispatch without it"),
+         _rf("customer_eval_uri", ftype="uri"),
+         _pf("budget_usd", "Budget reference (USD)", "number", False,
+             "a reference, not a ceiling"),
+     )},
+    {"key": "finetune-yolo",
+     "label": "Fine-tune an open-source YOLO vision model",
+     "description": "Object detection / vision fine-tuning. The pipeline cannot run "
+                    "this yet — the consult records your requirements for the "
+                    "roadmap and scopes what support would need.",
+     "supported": False, "pipeline_mode": "",
+     "fields": (
+         _pf("requirements", "Describe the vision task and your data", "text", True,
+             "classes, image volume, labeling format, latency target — recorded "
+             "verbatim for the roadmap"),
+         _pf("source_uri", "Labeled dataset (S3 URI), if already uploaded", "uri",
+             False, "the console verifies it exists so the record starts from fact"),
+     )},
+    {"key": "finetune-speech",
+     "label": "Fine-tune a human-like speech model (local language)",
+     "description": "Voice/TTS fine-tuning. The pipeline cannot run this yet — the "
+                    "consult records your requirements for the roadmap and scopes "
+                    "what support would need.",
+     "supported": False, "pipeline_mode": "",
+     "fields": (
+         _pf("requirements", "Describe the voice task and your data", "text", True,
+             "language/dialect, hours of audio, speaker consent status, target "
+             "quality — recorded verbatim for the roadmap"),
+         _pf("source_uri", "Audio dataset (S3 URI), if already uploaded", "uri",
+             False, "the console verifies it exists so the record starts from fact"),
+     )},
+)
+
+
+def _task_type(key):
+    for t in TASK_TYPE_REGISTRY:
+        if t["key"] == str(key):
+            return t
+    return None
+
+
+def task_type_catalog():
+    return [{"key": t["key"], "label": t["label"], "description": t["description"],
+             "supported": bool(t["supported"]),
+             "fields": [dict(f) for f in t["fields"]],
+             "template_path": f"/api/task-types/{t['key']}/template"}
+            for t in TASK_TYPE_REGISTRY]
+
+
+def _validate_fields(ttype, fields):
+    """Typed validation of a guided-form (or template) submission.
+
+    Same posture as the cost-estimate form: unknown keys are refused rather than
+    dropped, because a typo that is silently ignored becomes a field the customer
+    believes was recorded. Values come back as STRINGS uniformly — DynamoDB rejects
+    floats, and the consumer of these values is a prompt, not arithmetic.
+    """
+    spec = {f["param"]: f for f in ttype["fields"]}
+    clean, errors, invalid = {}, [], set()
+    for k, v in (fields or {}).items():
+        canon = _INTAKE_CANON.get(str(k).strip().lower(), str(k).strip())
+        f = spec.get(canon)
+        if f is None:
+            errors.append({"field": str(k)[:80],
+                           "error": "not a field of this task type"})
+            continue
+        sv = str(v).strip()
+        if not sv:
+            continue
+        if f["type"] == "uri" and not sv.startswith("s3://"):
+            errors.append({"field": canon, "error": "must be an s3:// URI"})
+            invalid.add(canon)
+            continue
+        if f["type"] == "number":
+            try:
+                float(sv)
+            except Exception:
+                errors.append({"field": canon, "error": "must be a number"})
+                invalid.add(canon)
+                continue
+        if f["type"] == "bool":
+            if sv.lower() not in ("true", "false", "yes", "no"):
+                errors.append({"field": canon, "error": "must be true or false"})
+                invalid.add(canon)
+                continue
+            sv = "true" if sv.lower() in ("true", "yes") else "false"
+        clean[canon] = sv[:2000]
+    for f in ttype["fields"]:
+        # A field that was provided but invalid already has its error; adding
+        # "required" on top would tell the customer they left blank a box they filled.
+        if f["required"] and not clean.get(f["param"]) and f["param"] not in invalid:
+            errors.append({"field": f["param"],
+                           "error": "required — " + str(f["why"])[:140]})
+    named_raft = [p for p in _RAFT_PARAMS if clean.get(p)]
+    if named_raft and len(named_raft) != len(_RAFT_PARAMS):
+        missing = [p for p in _RAFT_PARAMS if not clean.get(p)]
+        errors.append({"field": "retrieval",
+                       "error": "RAFT parameters are all-or-none (the prompt's rule "
+                                "for the plan's top level); missing " + ", ".join(missing)})
+    return clean, errors
+
+
+def _compose_goal(ttype, clean, note):
+    """The canonical goal text a form submission becomes. Written server-side so the
+    parameter names the orchestrator reads are the canonical ones — the model stops
+    guessing spellings out of prose."""
+    lines = [f"[{ttype['key']}] {ttype['label']}.",
+             "Structured intake (validated by the console; names are canonical):"]
+    for f in ttype["fields"]:
+        v = clean.get(f["param"])
+        if v:
+            lines.append(f"- {f['param']}: {v}")
+    if note:
+        lines.append("Customer note: " + note)
+    if not ttype["supported"]:
+        lines.append("NOTE: the catalog marks this task type consult-only — the "
+                     "pipeline cannot execute it yet.")
+    return "\n".join(lines)
+
+
+def _render_template(ttype):
+    """The offline intake form, rendered from the SAME registry entry as the online
+    one. Flat key: value frontmatter only — every field is a scalar, and a 20-line
+    parser we own beats shipping PyYAML in the bundle."""
+    front = ["---", f"task_type: {ttype['key']}"]
+    for f in ttype["fields"]:
+        front.append(f"{f['param']}: \"\"")
+    front.append("---")
+    body = ["", f"# Intake form — {ttype['label']}", "",
+            "Fill values between the quotes in the block above (flat key: value only,",
+            "no nesting). Keep the .txt extension and upload the file to your task's",
+            "drop zone in the console — the console parses it, reports anything",
+            "missing, and verifies what it can (S3 URIs, Knowledge Base status).", ""]
+    for f in ttype["fields"]:
+        req = "required" if f["required"] else "optional"
+        body.append(f"- **{f['param']}** ({f['type']}, {req}): {f['why']}")
+    return "\n".join(front + body) + "\n"
+
+
+def _parse_template_frontmatter(text):
+    t = str(text or "").lstrip("﻿").strip()
+    if not t.startswith("---"):
+        return None
+    end = t.find("\n---", 3)
+    if end < 0:
+        return None
+    out = {}
+    for line in t[3:end].splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or ":" not in line:
+            continue
+        k, _, v = line.partition(":")
+        v = v.strip().strip('"').strip("'")
+        if v:
+            out[k.strip()] = v
+    return out if out.get("task_type") else None
+
+
+#: 32 MiB: big enough that every eval set we have seen gets a row count, small enough
+#: that counting cannot become the turn's latency. Larger files still verify existence.
+INTAKE_LINECOUNT_MAX_BYTES = 32 * 1024 * 1024
+#: DynamoDB items cap at 400 KB and facts ride the task item. Hitting the cap emits an
+#: explicit cap fact — a silently truncated list reads as "covered everything".
+INTAKE_FACTS_MAX = 40
+_INTAKE_TEMPLATE_MAX_BYTES = 64 * 1024
+
+_S3_URI_RE = re.compile(r"s3://[A-Za-z0-9._\-]+/[^\s\"'`,)\]}]*")
+_NAMED_URI_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]{2,30})[:=\s]\s*(s3://[^\s\"'`,)\]}]+)")
+_KV_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]{2,30})\s*[:=]\s*([^\s,;]+)")
+#: a KB id is 10 uppercase alphanumerics — so is an order number. Context words or an
+#: exact match against the registered SSM value gate the guess.
+_KB_TOKEN_RE = re.compile(r"\b[A-Z0-9]{10}\b")
+_KB_CONTEXT_WORDS = ("kb", "knowledge base", "knowledge_base", "retrieval", "ingest")
+
+
+def _registered_kb_id():
+    try:
+        return ssm.get_parameter(Name="/llmops/retrieval/kb_id")["Parameter"]["Value"]
+    except Exception:
+        return ""
+
+
+def _extract_intake_candidates(text):
+    """CANDIDATES only — verification decides truth. Returns [(canonical_name, value)].
+    An s3:// URI with no recognizable name nearby is still worth an existence check;
+    it comes back named "s3_uri" and role assignment stays with the conversation."""
+    t = str(text or "")
+    out, claimed_uris = [], set()
+    for m in _NAMED_URI_RE.finditer(t):
+        canon = _INTAKE_CANON.get(m.group(1).lower())
+        if canon in _INTAKE_URI_PARAMS:
+            uri = m.group(2).rstrip(".,;")
+            out.append((canon, uri))
+            claimed_uris.add(uri)
+    for m in _KV_RE.finditer(t):
+        canon = _INTAKE_CANON.get(m.group(1).lower())
+        val = m.group(2).strip().strip('"').strip("'").rstrip(".,;")
+        if canon and not val.startswith("s3://") and canon not in _INTAKE_URI_PARAMS:
+            out.append((canon, val))
+    for m in _S3_URI_RE.finditer(t):
+        uri = m.group(0).rstrip(".,;")
+        if uri not in claimed_uris:
+            out.append(("s3_uri", uri))
+            claimed_uris.add(uri)
+    low = t.lower()
+    kb_context = any(w in low for w in _KB_CONTEXT_WORDS)
+    seen_vals = {v for _, v in out}
+    for m in _KB_TOKEN_RE.finditer(t):
+        tok = m.group(0)
+        if tok in seen_vals:
+            continue
+        if kb_context or tok == _registered_kb_id():
+            out.append(("retrieval_kb_id", tok))
+            seen_vals.add(tok)
+    return out
+
+
+def _fact(name, value, status, detail, method):
+    return {"name": str(name)[:80], "value": str(value)[:300], "status": status,
+            "detail": str(detail)[:300], "method": method, "checked_at": _now_iso()}
+
+
+def _verify_s3_uri(name, uri):
+    try:
+        bucket, _, key = str(uri)[5:].partition("/")
+        if not bucket or not key:
+            return _fact(name, uri, "failed", "not a bucket/key S3 URI", "s3")
+        if key.endswith("/"):
+            r = s3.list_objects_v2(Bucket=bucket, Prefix=key, MaxKeys=1)
+            if r.get("KeyCount"):
+                return _fact(name, uri, "verified", "prefix exists (non-empty)", "s3")
+            return _fact(name, uri, "failed", "prefix empty or missing", "s3")
+        h = s3.head_object(Bucket=bucket, Key=key)
+        size = int(h.get("ContentLength") or 0)
+        detail = f"exists, {size:,} bytes"
+        if key.endswith(".jsonl") and size <= INTAKE_LINECOUNT_MAX_BYTES:
+            body = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+            rows = sum(1 for ln in body.splitlines() if ln.strip())
+            detail += f", {rows:,} rows"
+        elif key.endswith(".jsonl"):
+            detail += ", row count skipped (size)"
+        return _fact(name, uri, "verified", detail, "s3")
+    except Exception as e:
+        msg = str(e)
+        if "404" in msg or "NoSuchKey" in msg or "Not Found" in msg:
+            return _fact(name, uri, "failed", "object not found", "s3")
+        return _fact(name, uri, "unverified", msg, "s3")
+
+
+def _verify_kb(kb_id):
+    try:
+        kb = bragent.get_knowledge_base(knowledgeBaseId=str(kb_id))["knowledgeBase"]
+        detail = f"status {kb.get('status')}"
+        registered = _registered_kb_id()
+        if registered:
+            detail += (", matches SSM /llmops/retrieval/kb_id" if registered == kb_id
+                       else f", NOT the registered KB ({registered})")
+        try:
+            dss = bragent.list_data_sources(
+                knowledgeBaseId=str(kb_id)).get("dataSourceSummaries") or []
+            if dss:
+                jobs = bragent.list_ingestion_jobs(
+                    knowledgeBaseId=str(kb_id), dataSourceId=dss[0]["dataSourceId"],
+                    sortBy={"attribute": "STARTED_AT", "order": "DESCENDING"},
+                    maxResults=1).get("ingestionJobSummaries") or []
+                if jobs:
+                    stats = jobs[0].get("statistics") or {}
+                    detail += (f", last ingestion {jobs[0].get('status', '?')} "
+                               f"({stats.get('numberOfDocumentsScanned', '?')} docs)")
+        except Exception as e:
+            detail += f", ingestion unreadable ({str(e)[:60]})"
+        status = "verified" if kb.get("status") == "ACTIVE" else "failed"
+        return _fact("retrieval_kb_id", kb_id, status, detail, "bedrock-agent")
+    except Exception as e:
+        msg = str(e)
+        if "ResourceNotFound" in msg or "404" in msg:
+            return _fact("retrieval_kb_id", kb_id, "failed",
+                         "knowledge base not found", "bedrock-agent")
+        return _fact("retrieval_kb_id", kb_id, "unverified", msg, "bedrock-agent")
+
+
+def _verify_mirror(hf_repo):
+    try:
+        prefix = f"models-mirror/{str(hf_repo).strip().strip('/')}/"
+        r = s3.list_objects_v2(Bucket=data_bucket(), Prefix=prefix, MaxKeys=1)
+        if r.get("KeyCount"):
+            return _fact("hf_repo", hf_repo, "verified",
+                         f"mirror present under {prefix}", "s3")
+        return _fact("hf_repo", hf_repo, "failed",
+                     f"no mirror under {prefix} — the plan must include a "
+                     "mirror_model step", "s3")
+    except Exception as e:
+        return _fact("hf_repo", hf_repo, "unverified", str(e), "s3")
+
+
+def _verify_candidate(name, value):
+    if name in _INTAKE_URI_PARAMS or name == "s3_uri":
+        return _verify_s3_uri(name, value)
+    if name == "retrieval_kb_id":
+        return _verify_kb(value)
+    if name == "hf_repo":
+        return _verify_mirror(value)
+    return _fact(name, value, "asserted",
+                 "recorded from customer input (not machine-checkable)", "none")
+
+
+_UPLOAD_MSG_RE = re.compile(r"data uploaded:\s*(s3://\S+)", re.I)
+
+
+def _maybe_template_upload(text):
+    """The drop zone auto-posts "data uploaded: s3://…". A small .txt/.md whose body
+    opens with our frontmatter is an offline intake form coming home."""
+    m = _UPLOAD_MSG_RE.search(str(text or ""))
+    if not m:
+        return None
+    uri = m.group(1).rstrip(".,;")
+    if not uri.lower().endswith((".txt", ".md")):
+        return None
+    try:
+        bucket, _, key = uri[5:].partition("/")
+        h = s3.head_object(Bucket=bucket, Key=key)
+        if int(h.get("ContentLength") or 0) > _INTAKE_TEMPLATE_MAX_BYTES:
+            return None
+        body = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+        return _parse_template_frontmatter(body.decode("utf-8", "replace"))
+    except Exception:
+        return None
+
+
+def _intake_system_message(changed, template_report):
+    lines = ["CONSOLE INTAKE — facts checked by the console with its own IAM. "
+             "verified = exists/active as claimed; failed = checked and NOT as "
+             "claimed; unverified = the check errored; asserted = recorded, not "
+             "machine-checkable."]
+    if template_report:
+        lines.append("- " + template_report)
+    for f in changed:
+        lines.append(f"- [{f['status']}] {f['name']} = {f['value']} — {f['detail']}")
+    return "\n".join(lines)
+
+
+def _run_intake(task_id, task):
+    """Normalize + verify intake at the top of every consult turn. Advisory and
+    fail-open by contract: nothing here may block the turn — an unexpected crash is
+    recorded on intake.error and the untouched task returned."""
+    try:
+        intake = task.get("intake") if isinstance(task.get("intake"), dict) else {}
+        msgs = task.get("messages") or []
+        seen = int(intake.get("msgs_seen") or 0)
+        facts = [f for f in (intake.get("facts") or []) if isinstance(f, dict)]
+        known = {(str(f.get("name")), str(f.get("value"))) for f in facts}
+        fields = {str(k): str(v) for k, v in (intake.get("fields") or {}).items()}
+        if len(msgs) <= seen and intake.get("fields_scanned"):
+            return task  # nothing new — no checks, no write
+        candidates = []
+        if not intake.get("fields_scanned"):
+            candidates += list(fields.items())
+        template_report = ""
+        for m in msgs[seen:]:
+            if str(m.get("role")) != "user":
+                continue
+            text = str(m.get("text") or "")
+            tpl = _maybe_template_upload(text)
+            if tpl is not None:
+                tt = _task_type(tpl.pop("task_type", ""))
+                if tt is None:
+                    template_report = ("uploaded intake form names an unknown "
+                                       "task_type — ignored")
+                else:
+                    clean, errs = _validate_fields(tt, tpl)
+                    fields.update(clean)
+                    candidates += list(clean.items())
+                    template_report = (f"offline intake form ({tt['key']}) parsed: "
+                                       f"{len(clean)} field(s) accepted")
+                    if errs:
+                        template_report += "; open items: " + "; ".join(
+                            f"{e['field']} — {e['error']}" for e in errs[:6])
+            candidates += _extract_intake_candidates(text)
+        changed = []
+        for name, value in candidates:
+            if (str(name), str(value)) in known:
+                continue
+            if len(facts) >= INTAKE_FACTS_MAX:
+                changed.append(_fact("intake", "cap", "unverified",
+                                     f"fact cap {INTAKE_FACTS_MAX} reached — later "
+                                     "candidates were NOT checked", "none"))
+                break
+            f = _verify_candidate(name, value)
+            facts.append(f)
+            known.add((str(name), str(value)))
+            changed.append(f)
+        intake.update({"fields": fields, "facts": facts[:INTAKE_FACTS_MAX],
+                       "msgs_seen": len(msgs), "fields_scanned": True,
+                       "updated_at": _now_iso()})
+        if changed or template_report:
+            new_msg = {"role": "system",
+                       "text": _intake_system_message(changed, template_report),
+                       "at": _now_iso(), "by": "console"}
+            # BEFORE the caller computes its pending slice — the message must ride
+            # into this turn's pending_text, and into the transcript audit copy.
+            _append_messages(task_id, [new_msg], "intake = :i", {}, {":i": intake})
+            task["messages"] = msgs + [new_msg]
+        else:
+            tasks_tbl.update_item(Key={"id": task_id},
+                                  UpdateExpression="SET intake = :i, updated_at = :t",
+                                  ExpressionAttributeValues={":i": intake,
+                                                             ":t": _now_iso()})
+        task["intake"] = intake
+    except Exception as e:
+        try:
+            if not isinstance(task.get("intake"), dict):
+                task["intake"] = {}
+            task["intake"]["error"] = str(e)[:300]
+        except Exception:
+            pass
+    return task
+
+
 def task_readiness(task_id):
     """What the plan actually says about the customer's data, and what it does not.
 
@@ -3162,9 +3747,29 @@ def task_readiness(task_id):
         fields.append({"field": path, "label": label, "why": why,
                        "answered": bool(answered),
                        "value": str(val)[:300] if answered else ""})
+    # Intake overlays: a question the plan has not answered yet may already be
+    # console-verified (a checked fact) or form-provided (the customer's own typed
+    # answer). Shown BEFORE a plan exists — that is the whole point of asking early.
+    intake = task.get("intake") if isinstance(task.get("intake"), dict) else {}
+    facts_by = {}
+    for f in (intake.get("facts") or []):
+        if isinstance(f, dict):
+            facts_by.setdefault(str(f.get("name")), f)
+    form = intake.get("fields") or {}
+    for row in fields:
+        fact = facts_by.get(row["field"])
+        if fact and str(fact.get("status")) == "verified":
+            row["console_verified"] = True
+            row["console_detail"] = str(fact.get("detail"))[:200]
+            if not row["answered"]:
+                row["value"] = str(fact.get("value"))[:300]
+        elif form.get(row["field"]) and not row["answered"]:
+            row["provided_via_form"] = True
+            row["value"] = str(form[row["field"]])[:300]
     return {"task_id": task_id, "plan_uri": uri, "note": note,
             "answered": sum(1 for f in fields if f["answered"]),
-            "total": len(fields), "fields": fields}
+            "total": len(fields), "fields": fields,
+            "intake_updated_at": str(intake.get("updated_at") or "")}
 
 
 def task_approval(task_id):
@@ -3292,6 +3897,9 @@ def run_task_turn(task_id, accept=False):
     task = _task_get(task_id)
     if not task:
         return
+    # Intake normalization runs BEFORE the pending slice below: a CONSOLE INTAKE
+    # system message it appends must ride into this very turn's pending_text.
+    task = _run_intake(task_id, task)
     b = data_bucket()
     hid = _resolve_harness_id(OPTIMIZE_HARNESS)
     msgs = json.loads(json.dumps(task.get("messages") or [], default=str))
@@ -3326,6 +3934,14 @@ def run_task_turn(task_id, accept=False):
     card = rate_card_for_prompt()
     if card:
         params["rate_card"] = card
+    # Console-verified intake rides the envelope so the agent starts from checked
+    # fact. json round-trip first: Decimals from DynamoDB do not serialize.
+    intake = task.get("intake") if isinstance(task.get("intake"), dict) else {}
+    if intake.get("facts") or intake.get("fields") or task.get("task_type"):
+        params["intake"] = json.loads(json.dumps(
+            {"task_type": str(task.get("task_type") or ""),
+             "fields": intake.get("fields") or {},
+             "facts": intake.get("facts") or []}, default=str))
     envelope = json.dumps({"run_id": f"task-{task_id}", "stage": "consult",
                            "manifest_uri": "", "params": params}, default=str)
     if approval_ctx:
@@ -4130,6 +4746,17 @@ def handler(event, context):
             out["variance"] = cost_variance(estimates=out["estimates"],
                                             overview=cost_overview())
             return _resp(200, out)
+        # The task-type catalog is registry data, not customer data: the same class of
+        # already-public fact as /api/overview. The template is the catalog rendered
+        # as a file.
+        if method == "GET" and path == "/api/task-types":
+            return _resp(200, {"taskTypes": task_type_catalog()})
+        if (method == "GET" and path.startswith("/api/task-types/")
+                and path.endswith("/template")):
+            tt = _task_type(path[len("/api/task-types/"):-len("/template")])
+            if tt is None:
+                return _resp(404, {"error": "unknown task type"})
+            return _resp(200, _render_template(tt), ctype="text/markdown; charset=utf-8")
         # The consult plane's READS are authenticated too, gated by PREFIX rather than by
         # a list of paths. Every route above this line is aggregated operational fact --
         # what ran, what it scored, what it cost -- and is public on purpose. Everything

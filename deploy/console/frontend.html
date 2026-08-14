@@ -127,6 +127,22 @@
   .readiness td.rdlabel { color:var(--muted); width:190px; }
   .readiness .rdno { color:var(--amber); }
   .readiness .rdwhy { color:var(--muted); font-size:11px; display:block; margin-top:2px; }
+  /* Task-type catalog + guided intake form (new-consultation state only). */
+  .ttgrid { display:grid; grid-template-columns:repeat(auto-fill,minmax(260px,1fr));
+            gap:8px; margin-bottom:10px; }
+  .ttcard { border:1px solid var(--line); border-radius:10px; background:var(--panel2);
+            padding:10px 12px; cursor:pointer; font-size:12.5px; }
+  .ttcard:hover { border-color:var(--accent, #7aa2f7); }
+  .ttcard .sub { margin-top:4px; }
+  .ttcard.ttoff { opacity:.75; }
+  .intakeform { border:1px solid var(--line); border-radius:10px; background:var(--panel2);
+                padding:10px 12px; margin-bottom:10px; font-size:12.5px; }
+  .intakeform .ifrow { margin-top:8px; }
+  .intakeform label { display:block; margin-bottom:2px; }
+  .intakeform label .req { color:var(--amber); }
+  .intakeform input, .intakeform textarea, .intakeform select {
+    width:100%; box-sizing:border-box; }
+  .intakeform .iferr { color:var(--amber); font-size:11px; min-height:1px; }
   .flex { display:flex; gap:8px; align-items:center; }
   .stat { font-size:26px; font-weight:700; } .stat small { font-size:12px; color:var(--muted); font-weight:400; }
   nav.tabs { display:flex; gap:6px; padding:10px 24px 0; background:var(--panel);
@@ -218,6 +234,11 @@
 
   <div data-tab-panel="tasks" class="card col-9"><h2 id="taskThreadTitle">Consultation &middot; llmops_orchestrator</h2>
     <div id="taskStrip" class="stagestrip"><span class="sub">new consultation &mdash; describe your goal below</span></div>
+    <!-- Task-type catalog + guided intake form. Shown only when no consultation is
+         selected: picking a card renders a typed form whose fields come from the
+         server's registry, so what the form asks and what the pipeline needs cannot
+         drift apart in this file. Free text below remains a first-class path. -->
+    <div id="taskCatalog"></div>
     <div id="taskReadiness"></div>
     <div id="taskChat" class="chat"></div>
     <div id="taskChoices" class="chips" style="margin-top:10px"></div>
@@ -1126,7 +1147,9 @@ async function postApi(path, payload){
     let d=null; try { d = JSON.parse(body); } catch(_){}
     return {ok:false, msg:"denied: "+((d&&d.error)||"forbidden").slice(0,200)}; }
   let data = null; try { data = JSON.parse(body); } catch(_){}
-  if (!resp.ok) return {ok:false, msg:"HTTP "+resp.status+": "+((data&&(data.error||data.message))||body||resp.statusText||"request failed").slice(0,160)};
+  // data rides along on failure too: a 400 from intake validation carries
+  // field_errors the form renders next to the exact fields to fix.
+  if (!resp.ok) return {ok:false, msg:"HTTP "+resp.status+": "+((data&&(data.error||data.message))||body||resp.statusText||"request failed").slice(0,160), data: data||{}};
   return {ok:true, data: data||{}};
 }
 // Renders the fan-out {started:[{stage,id,status}], errors:[{stage,error}]} shape
@@ -1685,7 +1708,10 @@ async function loadReadiness(t){
   // polls every 3s while a turn is in flight; re-reading plan.json from S3 on every
   // one of those would be a GET per 3 seconds per open browser tab for a file that
   // changes once per proposal.
-  const key = t ? [t.id, t.plan_uri||"", t.status||""].join("|") : null;
+  // intake_updated_at is part of the key: console verification can answer a
+  // readiness row long before any plan exists, and that change must repaint.
+  const key = t ? [t.id, t.plan_uri||"", t.status||"",
+                   (t.intake&&t.intake.updated_at)||""].join("|") : null;
   if (!t) { READY_KEY = null; $("taskReadiness").innerHTML = ""; return; }
   if (key === READY_KEY) return;
   READY_KEY = key;
@@ -1707,8 +1733,19 @@ function renderReadiness(t){
       `<tr><td class="rdlabel">${esc(f.label)}</td><td>`+
       (f.answered
         ? `<span class="mono">${esc(String(f.value).slice(0,200))}</span>`
-        // "— not answered yet" spelled out, with WHY it matters. A blank cell reads
-        // as "fine", and the customer signs a plan whose data questions are open.
+          + (f.console_verified ? ` <span class="pill ok">console-verified</span>` : "")
+        // Not in the plan yet, but the console may already know something: a checked
+        // fact ("console-verified") or the customer's own form answer. Only then does
+        // the row fall through to "— not answered yet", spelled out with WHY it
+        // matters — a blank cell reads as "fine", and the customer signs a plan
+        // whose data questions are open.
+        : f.console_verified
+        ? `<span class="mono">${esc(String(f.value).slice(0,200))}</span>`
+          + ` <span class="pill ok">console-verified</span>`
+          + (f.console_detail ? `<span class="rdwhy">${esc(f.console_detail)}</span>` : "")
+        : f.provided_via_form
+        ? `<span class="mono">${esc(String(f.value).slice(0,200))}</span>`
+          + ` <span class="pill">from intake form &mdash; not in the plan yet</span>`
         : `<span class="rdno">&mdash; not answered yet</span><span class="rdwhy">${esc(f.why)}</span>`)+
       `</td></tr>`).join("") + `</table>`
     + (d.note ? `<div class="sub" style="margin-top:6px">${esc(d.note)}</div>` : "")
@@ -1943,7 +1980,7 @@ async function loadTaskDetail(){
 // task they were showing; now the panel has exactly one entry point.
 function renderThread(t){
   renderTaskFlow(t); renderChat(t); renderTaskActions(t); renderChips(t);
-  renderChoices(t); renderDrop(t); renderReadiness(t);
+  renderChoices(t); renderDrop(t); renderReadiness(t); renderCatalog(t);
   // Fire-and-forget: the readiness fetch must not delay the thread paint, and it
   // no-ops unless the plan or the status actually moved.
   loadReadiness(t);
@@ -1979,6 +2016,114 @@ function newThread(){
 function tasksPoll(on, ms){
   if (taskTimer) { clearInterval(taskTimer); taskTimer = null; }
   if (on) taskTimer = setInterval(loadTasks, ms||15000);
+}
+
+// ── task-type catalog + guided intake form ────────────────────────────────────
+// The catalog and every form field come from GET /api/task-types — the server's
+// registry — so this file never holds a second copy of what the pipeline needs.
+// Unsupported types are shown with a badge rather than hidden: the need gets
+// recorded in a consult either way.
+let TASK_TYPES = null, INTAKE_SEL = null;
+
+async function loadTaskTypes(){
+  if (TASK_TYPES) return TASK_TYPES;
+  try {
+    const r = await fetch(API + "/api/task-types");
+    TASK_TYPES = ((await r.json()) || {}).taskTypes || [];
+  } catch(_) { TASK_TYPES = []; }
+  return TASK_TYPES;
+}
+
+async function renderCatalog(t){
+  const el = $("taskCatalog");
+  if (!el) return;
+  if (t) { el.innerHTML = ""; INTAKE_SEL = null; return; }
+  await loadTaskTypes();
+  if (TASK_SEL) return;         // a thread got selected while the fetch was in flight
+  if (INTAKE_SEL) return renderIntakeForm();
+  if (!TASK_TYPES.length) { el.innerHTML = ""; return; }
+  el.innerHTML =
+    '<div class="sub" style="margin:2px 0 6px">pick a task type for a guided form, or just describe your goal below:</div>'
+    + '<div class="ttgrid">' + TASK_TYPES.map(x =>
+      `<div class="ttcard${x.supported ? "" : " ttoff"}" onclick="openIntakeForm(${jstr(x.key)})">`
+      + `<b>${esc(x.label)}</b>`
+      + (x.supported ? "" : ' <span class="pill warn">not yet supported &middot; consult only</span>')
+      + `<div class="sub">${esc(x.description)}</div></div>`).join("")
+    + '</div>';
+}
+
+function openIntakeForm(key){ INTAKE_SEL = key; renderIntakeForm(); }
+function intakeCancel(){ INTAKE_SEL = null; renderCatalog(null); }
+
+function renderIntakeForm(){
+  const x = (TASK_TYPES || []).find(v => v.key === INTAKE_SEL);
+  const el = $("taskCatalog");
+  if (!x) { el.innerHTML = ""; return; }
+  const widget = f => {
+    const p = esc(f.param);
+    if (f.type === "text") return `<textarea rows="2" data-param="${p}"></textarea>`;
+    if (f.type === "bool") return `<select data-param="${p}"><option value=""></option>`
+      + `<option value="true">true</option><option value="false">false</option></select>`;
+    return `<input data-param="${p}" placeholder="${f.type === "uri" ? "s3://…" : ""}"/>`;
+  };
+  el.innerHTML = `<div class="intakeform">`
+    + `<div class="flex" style="justify-content:space-between;flex-wrap:wrap">`
+    + `<b>${esc(x.label)}</b>`
+    + (x.supported ? "" : '<span class="pill warn">not yet supported &middot; the consult records your requirements</span>')
+    + `<span class="flex"><a href="#" onclick="downloadTemplate(${jstr(x.key)});return false">&#8659; offline form</a>`
+    + `<button onclick="intakeCancel()">back</button></span></div>`
+    + `<div class="sub" style="margin-top:2px">${esc(x.description)}</div>`
+    + x.fields.map(f =>
+        `<div class="ifrow"><label>${esc(f.label)}${f.required ? ' <span class="req">*</span>' : ""}</label>`
+        + widget(f)
+        + `<div class="rdwhy">${esc(f.why)}</div>`
+        + `<div class="iferr" data-err="${esc(f.param)}"></div></div>`).join("")
+    + `<div class="flex" style="margin-top:10px">`
+    + `<button class="primary" onclick="submitIntake()">Start consultation</button>`
+    + `<span class="sub">anything typed in the message box below rides along as a note</span>`
+    + `</div></div>`;
+}
+
+async function submitIntake(){
+  const x = (TASK_TYPES || []).find(v => v.key === INTAKE_SEL);
+  if (!x) return;
+  const fields = {};
+  document.querySelectorAll("#taskCatalog [data-param]").forEach(i => {
+    const v = i.value.trim();
+    if (v) fields[i.getAttribute("data-param")] = v;
+  });
+  document.querySelectorAll("#taskCatalog .iferr").forEach(e => e.textContent = "");
+  const r = await postApi("/api/tasks",
+                          {task_type: x.key, fields, goal: $("taskMsg").value.trim()});
+  if (!r.ok) {
+    const fe = (r.data && r.data.field_errors) || [];
+    fe.forEach(e => {
+      const row = document.querySelector(`#taskCatalog .iferr[data-err="${CSS.escape(e.field)}"]`);
+      if (row) row.textContent = e.error;
+    });
+    $("taskChatMsg").textContent = fe.length
+      ? "fix the highlighted field" + (fe.length === 1 ? "" : "s") : (r.msg || "failed");
+    return;
+  }
+  $("taskChatMsg").textContent = "consultation started";
+  $("taskMsg").value = "";
+  INTAKE_SEL = null;
+  TASK_SEL = r.data.task.id;
+  loadTasks(); loadTaskDetail();
+}
+
+async function downloadTemplate(key){
+  try {
+    const r = await fetch(API + "/api/task-types/" + encodeURIComponent(key) + "/template");
+    const blob = new Blob([await r.text()], {type: "text/plain"});
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    // .txt, deliberately: it is the extension the upload drop zone accepts, so the
+    // filled form comes back through the same door as a dataset.
+    a.download = "intake-" + key + ".txt";
+    a.click();
+    URL.revokeObjectURL(a.href);
+  } catch(e){ $("taskChatMsg").textContent = "template download failed: " + e; }
 }
 
 // Starter prompts. The first turn of a consultation is the hardest one to write --

@@ -536,7 +536,7 @@ svg.append(f'  <text class="sub" x="30" y="{296+CH+18}">POSTs carry the access t
 
 # ---- the one handler ----
 LAMX, LAMY, LAMW = 286, 196, CW + 20
-svg.append(card(LAMX, LAMY, LAMW, CH, "cSpine", "🖥️", "llmops-admin λ", "frontend + 30 route handlers in one λ", "deploy/console/lambda_function.py"))
+svg.append(card(LAMX, LAMY, LAMW, CH, "cSpine", "🖥️", "llmops-admin λ", "frontend + 32 route handlers in one λ", "deploy/console/lambda_function.py"))
 svg.append(wire(f"M{30+CW},{196+CH/2} L{LAMX-4},{196+CH/2}", "wireP", "ahP"))
 lam_r, lam_cx = LAMX + LAMW, LAMX + LAMW / 2
 

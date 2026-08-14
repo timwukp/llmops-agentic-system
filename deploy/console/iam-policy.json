@@ -139,6 +139,18 @@
       "Resource": "*"
     },
     {
+      "Sid": "IntakeKbVerify",
+      "_comment": "Intake normalization verifies a customer-named Knowledge Base (status + latest ingestion). NAMING TRAP: these are bedrock-agent API calls but IAM authorizes them under the bedrock: action prefix — same class of gotcha as budgets:ViewBudget below. The orchestrator role deliberately does NOT get these; the console checks what the agent cannot.",
+      "Effect": "Allow",
+      "Action": [
+        "bedrock:GetKnowledgeBase",
+        "bedrock:ListDataSources",
+        "bedrock:ListIngestionJobs",
+        "bedrock:GetDataSource"
+      ],
+      "Resource": "arn:aws:bedrock:REGION:ACCOUNT_ID:knowledge-base/*"
+    },
+    {
       "Sid": "SsmParams",
       "Effect": "Allow",
       "Action": [
