@@ -355,29 +355,32 @@ class FakeAgentCoreControl:
     The failover bug was a write to shared, durable control-plane state, so a double
     that forgot each UpdateHarness could not express it. `model_of` reads back what was
     written, exactly as a later run's GetHarness would.
+
+    The driver no longer writes here -- a failover is a per-invocation override on
+    InvokeHarness -- so `update_harness` is kept for the opposite reason: `updates == []`
+    is only a meaningful assertion against a double that WOULD have recorded a write.
+    `reads` counts get_harness for the same reason, one control-plane call being the
+    entire remaining footprint.
     """
 
-    def __init__(self, model_id="global.anthropic.claude-fable-5", status="READY",
-                 fail_update_on=()):
+    def __init__(self, model_id="global.anthropic.claude-fable-5", status="READY"):
         self.models = {}
         self.default_model = model_id
         self.status = status
         self.updates = []
-        #: model ids whose UpdateHarness raises — the restore-failed path.
-        self.fail_update_on = set(fail_update_on)
+        self.reads = 0
 
     def model_of(self, harness_id):
         return self.models.get(harness_id, self.default_model)
 
     def get_harness(self, harnessId, **kw):
+        self.reads += 1
         return {"harness": {
             "status": self.status,
             "model": {"bedrockModelConfig": {"modelId": self.model_of(harnessId)}}}}
 
     def update_harness(self, harnessId, model, **kw):
         new = model["bedrockModelConfig"]["modelId"]
-        if new in self.fail_update_on:
-            raise RuntimeError(f"ValidationException: cannot set {new}")
         self.updates.append((harnessId, new))
         self.models[harnessId] = new
         return {"harness": {"status": self.status}}
@@ -6628,8 +6631,8 @@ def test_driver_role_grants_every_control_plane_call_its_handler_makes():
     """Same family as start_pipeline's missing PutEvents, but this one stayed invisible.
 
     harness_driver's role shipped with bedrock-agentcore:InvokeHarness and
-    InvokeAgentRuntime -- and WITHOUT GetHarness/UpdateHarness, which are the only two
-    calls _maybe_failover_model makes. So get_harness() raised AccessDeniedException on
+    InvokeAgentRuntime -- and WITHOUT GetHarness, the one control-plane call
+    _maybe_failover_model makes. So get_harness() raised AccessDeniedException on
     every vendor 5xx the failover was ever invoked for, and the
     `except Exception: pass` guarding the retry path ate it. The mitigation had never
     once run in production and nothing said so: no log, no model_failover on the run
@@ -6643,6 +6646,16 @@ def test_driver_role_grants_every_control_plane_call_its_handler_makes():
     than from a hand-kept list -- the same reason deploy/07_lambdas.py grows its env
     contract out of required_env_keys(): the hand-kept version of this exact contract
     disagreed with the driver for eight days.
+
+    Deriving is also what keeps this honest through a redesign. The failover used to
+    call UpdateHarness as well, which authorizes against the underlying AgentCore
+    Runtime and Memory too -- a fan-out this test had to carry as a hand-kept map,
+    because UpdateAgentRuntime and UpdateMemory appear nowhere in handler.py. Switching
+    to InvokeHarness's per-invocation `model` override removed the call, and with it the
+    only entry that could not be derived: what is left is one read, and GetHarness fans
+    out not at all ("Required IAM permissions for callers",
+    https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/harness-security.html).
+    A control-plane WRITE reappearing in handler.py needs its fan-out looked up again.
     """
     src = (REPO / "orchestration/harness_driver/handler.py").read_text()
     # Both spellings that can reach the control plane: the `ctl` parameter/local that
@@ -6650,29 +6663,11 @@ def test_driver_role_grants_every_control_plane_call_its_handler_makes():
     called = set(re.findall(r"(?:\bctl|_agentcore_control\([^)]*\))\.([a-z_]+)\(", src))
     required = {"bedrock-agentcore:" + "".join(w.capitalize() for w in m.split("_"))
                 for m in called}
-    # The action a caller invokes is NOT the whole grant it needs: harness APIs authorize
-    # against the underlying AgentCore Runtime and Memory resources as well. This map is
-    # the one part of this test that cannot come from handler.py -- it is an external
-    # service contract, published as "Required IAM permissions for callers" in
-    # https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/harness-security.html
-    # It is the same shape as the InvokeHarness/InvokeAgentRuntime pair the role already
-    # carries in InvokeLlmopsHarnessesDualArn, which this repo learned the hard way.
-    # UpdateHarness fans out two further ways; GetHarness fans out not at all.
-    FAN_OUT = {
-        "bedrock-agentcore:InvokeHarness": {"bedrock-agentcore:InvokeAgentRuntime"},
-        "bedrock-agentcore:UpdateHarness": {"bedrock-agentcore:UpdateAgentRuntime",
-                                            "bedrock-agentcore:UpdateMemory"},
-    }
-    required |= {dep for action in required for dep in FAN_OUT.get(action, ())}
     # A regex that matched nothing would make every assertion below vacuously true --
     # which is the failure mode this whole test exists to punish.
-    assert {"bedrock-agentcore:GetHarness",
-            "bedrock-agentcore:UpdateHarness",
-            "bedrock-agentcore:UpdateAgentRuntime",
-            "bedrock-agentcore:UpdateMemory"} <= required, (
-        f"derivation found {sorted(required)}; the failover's own two calls and the "
-        "fan-out UpdateHarness authorizes against must appear or this test is asserting "
-        "nothing")
+    assert "bedrock-agentcore:GetHarness" in required, (
+        f"derivation found {sorted(required)}; the failover's own control-plane read "
+        "must appear or this test is asserting nothing")
 
     missing = required - _allowed_actions("driver")
     assert missing == set(), (
@@ -8269,20 +8264,26 @@ def test_the_informational_model_failover_is_not_an_escalation():
         "a self-healed failover still emits the triage trigger"
 
 
-# ── the failover that never came back ─────────────────────────────────────────
-# UpdateHarness is a control-plane write on a resource all seven agents and every
-# concurrent run share. _maybe_failover_model used it to serve a need that is neither
-# shared nor durable -- one salvage retry, one invocation -- and never reverted, so a
-# single vendor 5xx burst repointed the deployed fleet PERMANENTLY. Every later run then
-# executed on a model the human never signed (the KMS approval spine's whole purpose),
-# that the cost model priced at a different tier, and that ARCHITECTURE.md §9.3
-# explicitly asserts is not what is deployed -- invisible to every guard in the tree,
-# because the divergence lives in the control plane while agents/*/harness.json reads
-# exactly as it always did.
+# ── the failover that must not touch anything shared ──────────────────────────
+# A fallback is needed by ONE session for a few minutes. UpdateHarness is the opposite
+# of that in every dimension: a control-plane write on a resource all seven agents and
+# every concurrent run share, minting an immutable version and repointing the DEFAULT
+# endpoint that every stage here invokes through (no qualifier appears anywhere in
+# state_machine.asl.json). _maybe_failover_model used it anyway, and the first version
+# never reverted, so a single vendor 5xx burst repointed the deployed fleet PERMANENTLY:
+# every later run executed on a model the human never signed (the KMS approval spine's
+# whole purpose), priced at a different tier, and that ARCHITECTURE.md §9.3 explicitly
+# asserts is not what is deployed -- invisible to every guard in the tree, because the
+# divergence lived in the control plane while agents/*/harness.json read exactly as it
+# always did. The restore that followed shrank the window without closing it: it ran on
+# the same control plane that was 5xxing, and a lost restore left the fleet diverged.
 #
-# These drive the real handler() through a real stream death. Asserting on the source
-# text (the test above) could not have caught this: the swap was there, correct, and
-# emitted its event; what was missing was the second half.
+# So the switch is now InvokeHarness's own per-invocation `model` override, which is
+# scoped to the call by construction. These tests drive the real handler() through a
+# real stream death and assert BOTH halves of that: the fallback reaches the invoke, and
+# the control plane is never written to at all. Asserting on the source text (the test
+# above) could not have caught either -- the old swap was there, correct, and emitted
+# its event.
 def _failover_clients(scripts, s3=None, ctl=None):
     c = clients(FakeAgentCore(scripts), s3)
     c["agentcore_control"] = ctl or FakeAgentCoreControl()
@@ -8299,36 +8300,50 @@ def _model_5xx_stream():
     return _S()
 
 
-def test_a_model_failover_is_reverted_before_the_invocation_ends():
+def test_a_model_failover_reaches_the_invoke_and_only_the_invoke():
+    """The two halves. The fallback has to actually take effect -- a failover that logs
+    and changes nothing is r6e all over again -- and it has to take effect WITHOUT a
+    control-plane write, which is what makes it this session's business alone."""
     uri = "s3://llmops-data-test/runs/run-test-1/raw/data.jsonl"
     ctl = FakeAgentCoreControl(model_id="global.anthropic.claude-fable-5")
-    c = _failover_clients([_model_5xx_stream(),
-                           tool_use_stream("stage_complete", {"outputs": [uri]}),
-                           text_stream("ack")],
-                          s3=FakeS3(existing=[uri]), ctl=ctl)
+    ac = FakeAgentCore([_model_5xx_stream(),
+                        tool_use_stream("stage_complete", {"outputs": [uri]}),
+                        text_stream("ack")])
+    c = _failover_clients([], s3=FakeS3(existing=[uri]), ctl=ctl)
+    c["agentcore"] = ac
     out = driver.handler(driver_event(), clients=c)
 
     assert out["status"] == "completed", "the salvage retry must still succeed"
+    # The turn that 5xxed carried no override; every turn after the failover carries it.
+    assert "model" not in ac.calls[0], (
+        "the first turn overrode the model before anything had gone wrong; the declared "
+        "model is what a healthy turn must use")
+    overridden = [k for k in ac.calls[1:] if k.get("model")]
+    assert len(overridden) == len(ac.calls) - 1, (
+        f"{len(ac.calls) - 1 - len(overridden)} of the post-failover invokes went out "
+        "without the override, i.e. straight back into the storm that caused it")
+    assert (overridden[0]["model"]["bedrockModelConfig"]["modelId"]
+            == "global.anthropic.claude-opus-5"), overridden[0]["model"]
+
     arn = driver._resolve_harness_arn("llmops_data_prep").rsplit("/", 1)[-1]
+    assert ctl.updates == [], (
+        f"the failover wrote to the control plane: {ctl.updates}. UpdateHarness repoints "
+        "the DEFAULT endpoint every other run in flight is invoking through, so one "
+        "session's fallback would move the model under all of them")
     assert ctl.model_of(arn) == "global.anthropic.claude-fable-5", (
-        f"the harness was left on {ctl.model_of(arn)}; a failover is scoped to one "
-        "invocation, and an unreverted one silently repoints every future run of all "
-        "seven agents to a model no human signed")
-    # Both directions happened, in order: swap out, then back.
-    assert [m for _, m in ctl.updates] == ["global.anthropic.claude-opus-5",
-                                           "global.anthropic.claude-fable-5"], ctl.updates
+        f"the shared harness is declaring {ctl.model_of(arn)}; an override is per-call "
+        "and must leave what the fleet declares exactly as the signed plan left it")
 
 
-def test_the_revert_happens_even_when_the_stage_crashes():
-    """The restore is in `finally` for this reason. A failover followed by a crash is
-    the likeliest shape in production -- the 5xx burst that triggered the swap is
-    exactly the condition that goes on to kill the stage -- and it is the one where
-    leaving the fleet swapped would persist longest, because nothing succeeds to
-    prompt anyone to look."""
+def test_the_override_expires_with_the_invocation_even_when_the_stage_crashes():
+    """A failover followed by a crash is the likeliest shape in production -- the 5xx
+    burst that triggered it is exactly the condition that goes on to kill the stage --
+    and under the old UpdateHarness design it was the shape where a diverged fleet
+    persisted longest, because nothing succeeds to prompt anyone to look. There is no
+    restore to get right any more: the override lives on `c`, so a crash cannot leak it.
+    """
     ctl = FakeAgentCoreControl()
-    # stage_complete naming an output that does not exist in S3: the driver rejects it,
-    # and with the FakeS3 empty the verification raises inside _run_stage.
-    c = _failover_clients([_model_5xx_stream()], ctl=ctl)
+    c = _failover_clients([], ctl=ctl)
 
     class _ExplodingSfn(FakeSfn):
         def send_task_success(self, **kw):
@@ -8342,36 +8357,58 @@ def test_the_revert_happens_even_when_the_stage_crashes():
         driver.handler(driver_event(), clients=c)
 
     arn = driver._resolve_harness_arn("llmops_data_prep").rsplit("/", 1)[-1]
+    assert ctl.updates == [], f"a crash mid-failover wrote to the control plane: {ctl.updates}"
     assert ctl.model_of(arn) == "global.anthropic.claude-fable-5", (
         "a crash after failover left the fleet on the fallback model")
 
 
-def test_an_unrevertable_failover_is_recorded_and_said_out_loud(capsys):
-    """The restore can fail -- the control plane is the same one that was 5xxing.
-
-    Then the fleet really is diverged, and the only remaining defences are the run
-    row and the log line. Both must exist, or the divergence is undetectable.
-    """
+def test_the_run_row_records_which_model_actually_served_the_stage(capsys):
+    """The override leaves no trace anywhere else: no control-plane version to read
+    back, and the artifacts do not say which model made them. Fable 5 and Opus 5 are
+    different price tiers, so a run that failed over was billed at a rate its plan did
+    not budget, and this row is what finops reconciles against."""
     uri = "s3://llmops-data-test/runs/run-test-1/raw/data.jsonl"
-    ctl = FakeAgentCoreControl(fail_update_on={"global.anthropic.claude-fable-5"})
-    c = _failover_clients([_model_5xx_stream(),
-                           tool_use_stream("stage_complete", {"outputs": [uri]}),
-                           text_stream("ack")],
-                          s3=FakeS3(existing=[uri]), ctl=ctl)
+    ctl = FakeAgentCoreControl()
+    c = _failover_clients([], s3=FakeS3(existing=[uri]), ctl=ctl)
+    c["agentcore"] = FakeAgentCore([_model_5xx_stream(),
+                                    tool_use_stream("stage_complete", {"outputs": [uri]}),
+                                    text_stream("ack")])
     c["ddb"].tables.setdefault("llmops-pipeline-runs", FakeTable()).items.append(
         {"run_id": "run-test-1", "status": "running"})
     out = driver.handler(driver_event(), clients=c)
 
-    assert out["status"] == "completed", "a failed restore must not fail the stage"
-    printed = capsys.readouterr().out
-    assert "FAILOVER NOT RESTORED" in printed, printed[-800:]
+    assert out["status"] == "completed"
+    assert "failing over" in capsys.readouterr().out, (
+        "the failover ran silently; not saying so is what made r6e unreadable")
     row = c["ddb"].tables["llmops-pipeline-runs"].items[0]
     assert "model_failover" in row, (
-        "nothing on the run row records that this run swapped the fleet's model; a "
-        "driver that dies mid-failover would leave no witness at all")
+        "nothing on the run row records that this stage ran on the fallback")
     rec = json.loads(row["model_failover"])
+    assert rec["from_model"] == "global.anthropic.claude-fable-5"
     assert rec["to_model"] == "global.anthropic.claude-opus-5"
-    assert rec["restored"] is False
+    assert rec["scope"] == "invocation", (
+        "the record does not say how far the switch reached; 'restored: false' used to "
+        "mean the fleet was diverged, and a reader carrying that habit over would "
+        "misread a per-call override as an unreverted swap")
+
+
+def test_a_second_5xx_in_one_invocation_does_not_re_read_the_control_plane(capsys):
+    """The override is already parked, so the answer cannot change -- and during a storm
+    this path is reached once per dead-stream turn, up to INFRA_ERROR_BUDGET of them, on
+    the same control plane the data plane is failing on. It still has to SAY something:
+    an early return that printed nothing is exactly the silence that hid r6e."""
+    ctl = FakeAgentCoreControl()
+    c = _failover_clients([], ctl=ctl)
+    c["agentcore"] = FakeAgentCore([_model_5xx_stream(), _model_5xx_stream(),
+                                    tool_use_stream("stage_complete", {"outputs": []}),
+                                    text_stream("ack")])
+    driver.handler(driver_event(), clients=c)
+
+    assert ctl.reads == 1, (
+        f"get_harness ran {ctl.reads} times for one invocation's failover; the declared "
+        "model cannot have changed between two 5xxs of the same storm")
+    printed = capsys.readouterr().out
+    assert "already failed over" in printed, printed[-800:]
 
 
 def test_every_escalation_emitter_carries_the_stage_the_rule_filters_on():

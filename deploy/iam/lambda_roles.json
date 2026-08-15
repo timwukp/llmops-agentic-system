@@ -1,5 +1,5 @@
 {
-  "_comment": "Four Lambda execution roles for the orchestration spine, one per function, each least-privilege for exactly its job. deploy/01_iam.py creates roles llmops-lambda-<key> from the 'roles' map and substitutes <REGION>/<ACCOUNT_ID>/<DATA_BUCKET>. GOTCHAS baked in: (1) invoking a harness needs BOTH bedrock-agentcore:InvokeHarness on the harness/* ARN AND bedrock-agentcore:InvokeAgentRuntime on the runtime/harness_* ARN (the harness API is fronted by an agent runtime named harness_<name>_*; missing either => AccessDeniedException); (2) states:SendTaskSuccess/Failure/Heartbeat do not support resource-level permissions for waitForTaskToken callbacks, so Resource must be '*'; (3) ec2 ENI actions for VPC-attached Lambdas (prod) largely do not support resource-level permissions \u2014 kept as the standard AWSLambdaVPCAccessExecutionRole action set with Resource '*'; (4) Secrets Manager ARNs end in a random 6-char suffix, hence the trailing wildcard on the webhook secret.",
+  "_comment": "Four Lambda execution roles for the orchestration spine, one per function, each least-privilege for exactly its job. deploy/01_iam.py creates roles llmops-lambda-<key> from the 'roles' map and substitutes <REGION>/<ACCOUNT_ID>/<DATA_BUCKET>. GOTCHAS baked in: (1) invoking a harness needs BOTH bedrock-agentcore:InvokeHarness on the harness/* ARN AND bedrock-agentcore:InvokeAgentRuntime on the runtime/harness_* ARN (the harness API is fronted by an agent runtime named harness_<name>_*; missing either => AccessDeniedException); (2) states:SendTaskSuccess/Failure/Heartbeat do not support resource-level permissions for waitForTaskToken callbacks, so Resource must be '*'; (3) ec2 ENI actions for VPC-attached Lambdas (prod) largely do not support resource-level permissions — kept as the standard AWSLambdaVPCAccessExecutionRole action set with Resource '*'; (4) Secrets Manager ARNs end in a random 6-char suffix, hence the trailing wildcard on the webhook secret.",
   "trustPolicy": {
     "Version": "2012-10-17",
     "Statement": [
@@ -61,19 +61,14 @@
             ]
           },
           {
-            "_comment": "The ONLY dependency of harness_driver's _maybe_failover_model: on a vendor 5xx burst it reads the harness config and repoints modelId at MODEL_FALLBACKS, then handler()'s finally restores it. Two calls, four actions: a harness API authorizes against the underlying AgentCore Runtime and Memory resources as well, so UpdateHarness also needs UpdateAgentRuntime + UpdateMemory -- the same fan-out as the InvokeHarness/InvokeAgentRuntime pair below, published as 'Required IAM permissions for callers' in https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/harness-security.html. GetHarness fans out not at all. The runtime/ and memory/ prefixes match the names AgentCore actually derives for these harnesses (harness_llmops_<agent>_<hash>), so the grant stays scoped instead of falling back to the '*' that deploy/console/iam-policy.json uses. Deliberately NOT folded into InvokeLlmopsHarnessesDualArn above -- that statement is data-plane invoke, this is a control-plane WRITE on a resource all seven agents and every concurrent run share, and merging them would hide that difference behind one Sid. LIVE COST OF ITS ABSENCE: the role shipped with the invoke pair and without any of these four, so get_harness raised AccessDeniedException on every 5xx the failover was ever called for, and `except Exception: pass` ate it -- the mitigation had never once run in production. r6e's FinetuneAnalyze (run-20260814T161302Z-7ff2a30a, 2026-08-14) died ModelUnavailable with the failover silently inert and no log line, no model_failover on the run row, and no ModelFailedOver on the bus to say so. test_driver_role_grants_every_control_plane_call_its_handler_makes now derives the required actions from handler.py, so the next control-plane call added without a grant fails in tests instead of in a storm. It cannot derive the fan-out, though -- UpdateAgentRuntime and UpdateMemory appear nowhere in handler.py as calls -- so that half is a small map in the test citing the doc above, and it has to be updated by hand if AWS changes the contract.",
+            "_comment": "The ONLY dependency of harness_driver's _maybe_failover_model, and a READ: on a vendor 5xx burst it reads the harness config to learn the declared modelId, looks that up in MODEL_FALLBACKS, and passes the fallback as InvokeHarness's per-invocation `model` override -- which needs no permission of its own beyond the InvokeHarness the role already has in InvokeLlmopsHarnessesDualArn below. One call, one action: GetHarness does not fan out, unlike the InvokeHarness/InvokeAgentRuntime pair below, per 'Required IAM permissions for callers' in https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/harness-security.html. WHY THIS IS NOT UpdateHarness: an earlier version of this statement carried UpdateHarness plus the UpdateAgentRuntime + UpdateMemory it fans out to, because the failover hot-swapped the harness itself. UpdateHarness mints a new immutable version and repoints the DEFAULT endpoint, and every stage here invokes through DEFAULT (no qualifier appears anywhere in state_machine.asl.json) -- so a swap during a storm moved the model under every OTHER run in flight, and had to be undone by a restore that ran on the same control plane that was 5xxing. Four write actions and a blast radius, to serve one session for a few minutes. AgentCore documents the per-invocation override for exactly this, so the grant is now one read. Deliberately NOT folded into InvokeLlmopsHarnessesDualArn -- that statement is data-plane invoke, this is a control-plane read, and one Sid for both would hide which of the two a future AccessDenied belongs to. LIVE COST OF ITS ABSENCE: the role shipped with the invoke pair and without GetHarness, so get_harness raised AccessDeniedException on every 5xx the failover was ever called for, and `except Exception: pass` ate it -- the mitigation had never once run in production. r6e's FinetuneAnalyze (run-20260814T161302Z-7ff2a30a, 2026-08-14) died ModelUnavailable with the failover silently inert and no log line, no model_failover on the run row, and no ModelFailedOver on the bus to say so. test_driver_role_grants_every_control_plane_call_its_handler_makes now derives the required actions from handler.py, so the next control-plane call added without a grant fails in tests instead of in a storm.",
             "Sid": "FailoverHarnessModel",
             "Effect": "Allow",
             "Action": [
-              "bedrock-agentcore:GetHarness",
-              "bedrock-agentcore:UpdateHarness",
-              "bedrock-agentcore:UpdateAgentRuntime",
-              "bedrock-agentcore:UpdateMemory"
+              "bedrock-agentcore:GetHarness"
             ],
             "Resource": [
-              "arn:aws:bedrock-agentcore:<REGION>:<ACCOUNT_ID>:harness/llmops_*",
-              "arn:aws:bedrock-agentcore:<REGION>:<ACCOUNT_ID>:runtime/harness_llmops_*",
-              "arn:aws:bedrock-agentcore:<REGION>:<ACCOUNT_ID>:memory/harness_llmops_*"
+              "arn:aws:bedrock-agentcore:<REGION>:<ACCOUNT_ID>:harness/llmops_*"
             ]
           },
           {
@@ -84,7 +79,9 @@
             "Resource": "arn:aws:dynamodb:<REGION>:<ACCOUNT_ID>:table/llmops-stage-events",
             "Condition": {
               "ForAllValues:StringEquals": {
-                "dynamodb:LeadingKeys": ["__liveness__"]
+                "dynamodb:LeadingKeys": [
+                  "__liveness__"
+                ]
               }
             }
           },
@@ -176,14 +173,14 @@
             "Resource": "arn:aws:s3:::<DATA_BUCKET>/monitoring/manifests/*"
           },
           {
-            "_comment": "Servicing the conductor's launch_run: the driver invokes start-pipeline on the orchestrator's behalf. Without this, an orchestrator run with params.task=plan reaches the dispatch moment and dies on AccessDenied \u2014 the exact defect that made launch_run 'unsupported' for five phases.",
+            "_comment": "Servicing the conductor's launch_run: the driver invokes start-pipeline on the orchestrator's behalf. Without this, an orchestrator run with params.task=plan reaches the dispatch moment and dies on AccessDenied — the exact defect that made launch_run 'unsupported' for five phases.",
             "Sid": "ConductorDispatch",
             "Effect": "Allow",
             "Action": "lambda:InvokeFunction",
             "Resource": "arn:aws:lambda:<REGION>:<ACCOUNT_ID>:function:llmops-start-pipeline"
           },
           {
-            "_comment": "launch_run verifies the human-acceptance record's KMS signature before injecting it into a manifest. Verify only \u2014 the driver must never be able to MINT an approval, that power is the console's alone.",
+            "_comment": "launch_run verifies the human-acceptance record's KMS signature before injecting it into a manifest. Verify only — the driver must never be able to MINT an approval, that power is the console's alone.",
             "Sid": "ApprovalVerifyOnly",
             "Effect": "Allow",
             "Action": [
@@ -297,7 +294,9 @@
             "Resource": "arn:aws:dynamodb:<REGION>:<ACCOUNT_ID>:table/llmops-stage-events",
             "Condition": {
               "ForAllValues:StringEquals": {
-                "dynamodb:LeadingKeys": ["__liveness__"]
+                "dynamodb:LeadingKeys": [
+                  "__liveness__"
+                ]
               }
             }
           },
@@ -327,7 +326,7 @@
       }
     },
     "finops_reconcile": {
-      "_comment": "finops_reconcile: EventBridge Scheduler target, daily 09:00 UTC. Picks the periods to reconcile and delegates the streaming turn loop to harness-driver. It reads billing itself for nothing \u2014 the agent does that through its own execution role; this Lambda only needs to choose periods and invoke.",
+      "_comment": "finops_reconcile: EventBridge Scheduler target, daily 09:00 UTC. Picks the periods to reconcile and delegates the streaming turn loop to harness-driver. It reads billing itself for nothing — the agent does that through its own execution role; this Lambda only needs to choose periods and invoke.",
       "permissionsPolicy": {
         "Version": "2012-10-17",
         "Statement": [

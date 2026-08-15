@@ -430,7 +430,7 @@ inferred from whichever rules happen to exist.
 Wiring it up forced two emitters to be **renamed**, because the discrimination has to live
 somewhere an EventBridge pattern can read it — a pattern cannot read prose:
 
-- `_maybe_failover_model` hot-swaps a model after a vendor 5xx burst and the retry
+- `_maybe_failover_model` overrides the model after a vendor 5xx burst and the retry
   *continues*. It announced itself as `EscalatedToHuman` with the words "informational,
   pipeline continuing" buried in a reason string, which was harmless only while nothing
   subscribed. The first rule routing that detail-type to triage would have paged the
@@ -869,8 +869,14 @@ streams). ~12 Fable 5 5xx bursts
 recurred across a single day. Design rules (full text in [AGENTS.md](../AGENTS.md)):
 
 1. Every harness has a fallback chain: `global.anthropic.claude-fable-5` →
-   `global.anthropic.claude-opus-5` (same family, zero prompt changes). Hot-swap via
-   `UpdateHarness`, ~15 s to READY; sessions survive the swap.
+   `global.anthropic.claude-opus-5` (same family, zero prompt changes). Switched via
+   `InvokeHarness`'s per-invocation `model` override — scoped to the one call, no
+   control-plane write, nothing to restore. It was `UpdateHarness` until r6e's follow-up:
+   that mints an immutable new version and repoints the DEFAULT endpoint, which is the
+   endpoint every stage here invokes through (no `qualifier` appears anywhere in
+   `state_machine.asl.json`), so one session's fallback moved the model under every other
+   run in flight and then needed a ~15 s swap-plus-restore pair, on the control plane
+   that was 5xxing at the time.
 2. The "switch" signature: repeated `InternalServerException`/`ServiceUnavailableException`
    from ConverseStream while a direct single-shot probe of the same model succeeds —
    quota pressure, not an outage (it never surfaces as an explicit ThrottlingException).
@@ -884,9 +890,16 @@ recurred across a single day. Design rules (full text in [AGENTS.md](../AGENTS.m
    though the split had shipped, which is the same mistake as the diagram claiming
    VPC-isolated harnesses (§11) — an intended design read back as delivered fact.
    `tests/test_docs_claims.py` now asserts the model claim against the real configs.
-4. The driver detects model-5xx during stream salvage and hot-swaps to the fallback,
-   emitting an informational failover event (`_maybe_failover_model` in
-   `orchestration/harness_driver/handler.py`); full automated-failover hardening is Phase 6.
+4. The driver detects model-5xx during stream salvage and overrides the model for the
+   rest of the invocation, emitting an informational failover event
+   (`_maybe_failover_model` in `orchestration/harness_driver/handler.py`). Its one
+   remaining control-plane call is a `GetHarness` read, to learn which model the harness
+   declares and therefore which link of the chain to take; the driver role's grant is
+   scoped to exactly that (`FailoverHarnessModel` in `deploy/iam/lambda_roles.json`). That
+   grant was missing until r6e, so the read raised `AccessDeniedException` on every 5xx
+   the failover was ever called for and the `except` that protects the retry path
+   swallowed it — the mechanism had never once run in production, and said nothing.
+   Full automated-failover hardening is Phase 6.
 
 ## 10. The driver's turn-continuation design (900 s Lambda vs 840 s turns)
 
