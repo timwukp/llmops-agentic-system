@@ -298,14 +298,24 @@ SERVICED_TOOLS = frozenset({"stage_complete", "checkpoint", "escalate_human",
                             "page_human", "write_report"})
 
 
-def _invoke(ac, harness_id: str, sess: str, messages: list, qualifier: Optional[str]):
+def _invoke(ac, harness_id: str, sess: str, messages: list, qualifier: Optional[str],
+            model: Optional[dict] = None):
     """`messages` is the full messages list -- a resume needs two entries (assistant
     toolUse echo + user toolResult), so this can no longer wrap a single content
-    block. See _tool_result_content."""
+    block. See _tool_result_content.
+
+    `model` is InvokeHarness's per-invocation model override ("If specified, overrides
+    the harness default"), and it is how _maybe_failover_model switches models: the
+    override is scoped to THIS CALL, so nothing outside this session can observe it.
+    Omitted when None -- the harness serves its declared model, which is what every
+    turn outside a vendor 5xx burst wants.
+    """
     kwargs = dict(harnessArn=_resolve_harness_arn(harness_id), runtimeSessionId=sess,
                   messages=messages)
     if qualifier:
         kwargs["qualifier"] = qualifier
+    if model:
+        kwargs["model"] = model
     return ac.invoke_harness(**kwargs)
 
 
@@ -335,7 +345,8 @@ def _ack_terminal(c, event, sess, tu, payload, effect: str) -> None:
     """
     try:
         _invoke(c["agentcore"], event["harness_id"], sess,
-                _tool_result_content(tu, payload), event.get("qualifier"))
+                _tool_result_content(tu, payload), event.get("qualifier"),
+                c.get("_model_override"))
     except Exception as exc:  # noqa: BLE001 -- the effect is already irreversible
         print(f"[driver] ack for {tu.get('name')} was rejected "
               f"({type(exc).__name__}: {exc}); {effect} already landed and nothing "
@@ -1779,6 +1790,19 @@ def _is_model_5xx(error: str) -> bool:
 #:     lengthening one sleep past ~20 min. Hence the 180s cap.
 #:   - Lambda's 900s wall does NOT bound this: infra_error_turns rides the
 #:     _self_reinvoke() payload, so the counter survives across invocations.
+#:
+#: Two things this number is NOT, both worth stating because they are easy to assume:
+#:   - It is not an AWS-endorsed shape. The Builders' Library argues the other way --
+#:     cap retries, fail earlier, and treat a long timeout as wasted resources -- and AWS
+#:     documents Bedrock 503 as a "temporary capacity constraint" without ever putting a
+#:     duration on it or suggesting the same model will succeed on a later attempt. The
+#:     justification here is local and empirical: the two storms above, and a stage that
+#:     had nothing to salvage on failure. r6e's loss was giving up too early, not failing
+#:     too slowly.
+#:   - It is not multiplied by an SDK retry underneath. _AGENTCORE_CFG sets
+#:     retries={"max_attempts": 0}, so botocore adds no attempts of its own, and an
+#:     in-band event-stream error raises from the stream parser outside the retry chain
+#:     regardless. 10 turns here means 10 requests, not 30 or 50.
 INFRA_ERROR_BUDGET = int(os.environ.get("INFRA_ERROR_BUDGET", "10"))
 
 #: Ceiling on one backoff sleep. Deliberately below STALE_MINUTES (see above): a sleep
@@ -1801,35 +1825,16 @@ def _agentcore_control(c: dict):
     return c["agentcore_control"]
 
 
-def _set_harness_model(ctl, harness_full_id: str, model: dict, model_id: str,
-                       wait_ready: bool) -> None:
-    """Point a harness at `model_id`. `model` is the config dict from GetHarness.
+def _record_failover(c, event, harness_full_id: str, from_model: str,
+                     to_model: str) -> None:
+    """Leave the override on the run row: which model actually served this stage.
 
-    `wait_ready` is False on the restore path: nothing is about to invoke, so paying
-    ~15s of Lambda wall to watch a transition that completes on its own would only
-    make the restore likelier to be cut off by the deadline it is racing.
-    """
-    model["bedrockModelConfig"]["modelId"] = model_id
-    ctl.update_harness(harnessId=harness_full_id, model=model,
-                       clientToken=hashlib.sha256(
-                           f"{harness_full_id}-{model_id}".encode()).hexdigest()[:40])
-    if not wait_ready:
-        return
-    for _ in range(24):  # wait READY (~15s typical)
-        if ctl.get_harness(harnessId=harness_full_id)["harness"]["status"] == "READY":
-            break
-        time.sleep(5)
-
-
-def _record_failover(c, event, harness_full_id: str, from_model: str, to_model: str,
-                     restored: bool) -> None:
-    """Leave the swap on the run row, so a driver that dies mid-failover is visible.
-
-    The restore below is reliable while the driver lives, and the driver does not
-    always live: Lambda dropped an async self-reinvoke on 2026-08-08. Without a record
-    the only trace of a harness pointing somewhere its own agents/*/harness.json does
-    not declare would be a control-plane read nobody performs. Best effort -- a
-    bookkeeping write must not break the retry it is describing.
+    Not a divergence witness any more (there is nothing durable to diverge -- see
+    _maybe_failover_model), but still the only record that answers a question the
+    artifacts cannot: Fable 5 and Opus 5 are different price tiers, so a run that
+    failed over was billed at a rate the plan did not budget, and finops reconciles
+    against this row. Best effort -- a bookkeeping write must not break the retry it
+    is describing.
     """
     try:
         c["ddb"].Table(os.environ["RUNS_TABLE"]).update_item(
@@ -1838,53 +1843,76 @@ def _record_failover(c, event, harness_full_id: str, from_model: str, to_model: 
             ConditionExpression="attribute_exists(run_id)",
             ExpressionAttributeValues={":f": json.dumps({
                 "harness_id": harness_full_id, "from_model": from_model,
-                "to_model": to_model, "restored": restored,
+                "to_model": to_model, "scope": "invocation",
                 "at": datetime.now(timezone.utc).isoformat()})})
     except Exception as exc:  # noqa: BLE001
         print(f"[driver] could not record failover state: {type(exc).__name__}: {exc}")
 
 
 def _maybe_failover_model(c, event) -> None:
-    """Hot-swap the harness to its fallback model on a vendor 5xx burst.
+    """Switch this session to the fallback model on a vendor 5xx burst.
 
     Best-effort: any failure here must not break the salvage retry.
 
-    UpdateHarness is a CONTROL-PLANE write on a resource all seven agents and every
-    concurrent run share, so the swap is global and outlives this stage. It is being
-    used to serve a need that is neither: one salvage retry, in one invocation. So the
-    swap is scoped -- the original model is parked on `c` and `handler()` restores it
-    on the way out, whichever way this invocation ends.
+    The switch is InvokeHarness's own per-invocation `model` field, parked on `c` and
+    passed by every later _invoke in this invocation. AgentCore documents that field as
+    the way to override a harness's declared model for one call ("If specified,
+    overrides the harness default"), and being per-call is the entire point: a harness
+    is shared by all seven agents and every concurrent run, and a fallback is needed by
+    exactly one session for a few minutes.
 
-    Unscoped, a single 5xx burst repointed the deployed fleet permanently: every later
-    run would execute on a model the human never signed (the whole point of the KMS
+    UpdateHarness is the mechanism this used to reach for, and it is the wrong size in
+    both directions. It is a control-plane WRITE that mints a new immutable harness
+    version and repoints the DEFAULT endpoint -- and every stage here invokes through
+    DEFAULT (no qualifier appears anywhere in state_machine.asl.json), so a swap during
+    a storm moves the model under every OTHER run mid-flight, not just this one. It then
+    needed a restore on the way out to undo that blast radius, which cost a second write
+    plus ~15s of `wait_ready` per swap, on a control plane that is 5xxing at the time,
+    with the fleet left diverged whenever the restore lost. The override needs no write,
+    no wait, and no restore: `c` dies with the invocation.
+
+    Unscoped, the old swap repointed the deployed fleet permanently: every later run
+    would execute on a model the human never signed (the whole point of the KMS
     approval spine), that the cost model never priced (Fable 5 and Opus 5 are different
     tiers), and that docs/ARCHITECTURE.md §9.3 asserts is NOT what is deployed -- with
-    nothing in the tree able to notice, because the divergence lives in the control
-    plane and agents/*/harness.json still reads the way it always did.
+    nothing in the tree able to notice, because the divergence lived in the control
+    plane while agents/*/harness.json still read the way it always did.
     """
     try:
-        ctl = _agentcore_control(c)
         arn = _resolve_harness_arn(event["harness_id"])
         harness_full_id = arn.rsplit("/", 1)[-1]
-        h = ctl.get_harness(harnessId=harness_full_id)["harness"]
-        model = h["model"]
+        if c.get("_model_override"):
+            # Reached normally on the SECOND 5xx of an invocation. Said out loud because
+            # silence here was indistinguishable from a failover that ran, and returning
+            # early also spares the control plane a read per storm turn (up to
+            # INFRA_ERROR_BUDGET of them) that could only answer the same thing twice.
+            already = c["_model_override"]["bedrockModelConfig"]["modelId"]
+            print(f"[driver] already failed over to {already} for {harness_full_id}; "
+                  "retrying on the fallback")
+            return
+        # The one control-plane call left, and a READ: what the harness DECLARES, which
+        # is what MODEL_FALLBACKS is keyed on. Not taken from the dispatch event -- the
+        # fallback has to answer "what is this harness actually serving", and the answer
+        # lives in the control plane.
+        ctl = _agentcore_control(c)
+        model = ctl.get_harness(harnessId=harness_full_id)["harness"]["model"]
         current = model.get("bedrockModelConfig", {}).get("modelId", "")
         fallback = MODEL_FALLBACKS.get(current)
         if not fallback:
-            # Printed because this is one of the two ways the function can decline to do
-            # anything, and silence made them indistinguishable from each other AND from
-            # success. Reached normally on the SECOND 5xx of an invocation: the harness is
-            # already on the fallback, which has no onward entry in MODEL_FALLBACKS.
+            # The other way this can decline to do anything, also printed: the declared
+            # model has no onward entry in the chain, so the retry runs unprotected and
+            # an operator reading the log should know which of the two it was.
             print(f"[driver] no failover for {harness_full_id}: modelId={current!r} has "
                   "no MODEL_FALLBACKS entry; retrying on the same model")
             return
         print(f"[driver] failing over {harness_full_id}: {current} -> {fallback} "
-              "(vendor 5xx burst)")
-        _set_harness_model(ctl, harness_full_id, model, fallback, wait_ready=True)
-        # Parked BEFORE the event so a crash between the two still restores.
-        c["_failover"] = {"ctl": ctl, "harness_full_id": harness_full_id,
-                          "model": model, "from_model": current, "to_model": fallback}
-        _record_failover(c, event, harness_full_id, current, fallback, restored=False)
+              "(vendor 5xx burst, per-invocation override)")
+        # The whole config from GetHarness, with modelId repointed -- so inference
+        # settings the harness declares ride along instead of being dropped by a
+        # hand-built override.
+        model["bedrockModelConfig"]["modelId"] = fallback
+        c["_model_override"] = model
+        _record_failover(c, event, harness_full_id, current, fallback)
         # ModelFailedOver, NOT EscalatedToHuman. Nothing is being escalated: the
         # failover already fixed it and the retry continues. This carried the word
         # "informational" inside a reason string, which was harmless only while the bus
@@ -1901,48 +1929,16 @@ def _maybe_failover_model(c, event) -> None:
         # trying to help. Swallowing SILENTLY was the bug, and it cost r6e.
         #
         # The driver's role shipped with bedrock-agentcore:InvokeHarness and
-        # InvokeAgentRuntime but WITHOUT GetHarness/UpdateHarness, so the get_harness()
-        # above raised AccessDeniedException on every 5xx this function was ever called
-        # for. Failover has therefore never once run in production, and there was no way
-        # to know: no log here, no log on the no-fallback return, no log on success. The
-        # run row had no model_failover, the bus had no ModelFailedOver, and the only
-        # available reading was "the fallback was tried and did not help". A guard test
-        # now pins the policy to the calls this module makes; this line is what would
-        # have caught it on day one.
+        # InvokeAgentRuntime but WITHOUT GetHarness, so the get_harness() above raised
+        # AccessDeniedException on every 5xx this function was ever called for. Failover
+        # has therefore never once run in production, and there was no way to know: no
+        # log here, no log on the no-fallback return, no log on success. The run row had
+        # no model_failover, the bus had no ModelFailedOver, and the only available
+        # reading was "the fallback was tried and did not help". A guard test now pins
+        # the policy to the calls this module makes; this line is what would have caught
+        # it on day one.
         print(f"[driver] failover attempt failed (continuing to retry on the declared "
               f"model): {type(exc).__name__}: {exc}")
-
-
-def _restore_failover_model(c, event) -> None:
-    """Put a failed-over harness back on its declared model.
-
-    Called from handler()'s finally, so it runs on every exit -- settled, raised, or
-    self-reinvoked. A self-reinvoke that needs the fallback again will 5xx again and
-    fail over again, which costs one more swap and keeps the invariant that the fleet
-    converges back to what agents/*/harness.json declares. The alternative -- carrying
-    the swap forward across invocations -- is the unbounded version, and unbounded is
-    what the bug was.
-    """
-    swap = c.pop("_failover", None)
-    if not swap:
-        return
-    try:
-        _set_harness_model(swap["ctl"], swap["harness_full_id"], swap["model"],
-                           swap["from_model"], wait_ready=False)
-        _record_failover(c, event, swap["harness_full_id"], swap["to_model"],
-                         swap["from_model"], restored=True)
-        ev.emit_event(os.environ["EVENT_BUS"], ev.MODEL_FAILED_OVER, {
-            "run_id": event.get("run_id", "?"), "stage": event.get("stage", "?"),
-            "from_model": swap["to_model"], "to_model": swap["from_model"],
-            "reason": f"ModelFailover restored: {swap['to_model']} -> "
-                      f"{swap['from_model']} (temporary failover ended); "
-                      "informational, pipeline continuing"}, client=c["events"])
-    except Exception as exc:  # noqa: BLE001 — the stage is already settled by here
-        # Loud, because the fleet is now pointing somewhere it does not declare and
-        # the run row's model_failover record is the only other witness.
-        print(f"[driver] FAILOVER NOT RESTORED: {swap['harness_full_id']} is still on "
-              f"{swap['to_model']}, declared {swap['from_model']}: "
-              f"{type(exc).__name__}: {exc}")
 
 
 RE_ASK = ("Your turn ended without an inline-function call. If your task is "
@@ -2058,12 +2054,13 @@ def handler(event, context=None, clients=None):
         _backstop_page(c, event, {"status": "crashed",
                                   "reason": f"{type(exc).__name__}: {exc}"[:500]})
         raise
-    finally:
-        # A model failover is scoped to THIS invocation. In `finally` because every
-        # other exit here is already accounted for by name -- settled, crashed,
-        # self-reinvoked -- and a restore placed at any one of them would have to be
-        # repeated at the rest, which is the reasoning _backstop_page above records.
-        _restore_failover_model(c, event)
+    # No `finally` restoring a model here any more, and that is the point of the
+    # redesign: a failover is now InvokeHarness's per-invocation `model` override parked
+    # on `c`, so it expires when this invocation does. It used to be an UpdateHarness
+    # write that had to be undone on every exit path -- settled, crashed,
+    # self-reinvoked -- by a restore that could itself fail on the same control plane
+    # that was 5xxing, and did, leaving the whole fleet on a model no human signed. See
+    # _maybe_failover_model.
 
 
 def _run_stage(event, context=None, c=None):
@@ -2325,7 +2322,7 @@ def _run_stage(event, context=None, c=None):
             return _self_reinvoke()
         first_turn = False
         resp = _invoke(c["agentcore"], event["harness_id"], sess, messages,
-                       event.get("qualifier"))
+                       event.get("qualifier"), c.get("_model_override"))
         out = _drain(resp, out_of_wall=lambda: bool(context) and
                      context.get_remaining_time_in_millis() < DRAIN_DEADLINE_MARGIN_MS,
                      remaining_ms=(context.get_remaining_time_in_millis
@@ -2356,7 +2353,7 @@ def _run_stage(event, context=None, c=None):
                   f"{out['error']}")
             stream_retried = True
             if _is_model_5xx(out["error"]):
-                _maybe_failover_model(c, event)  # vendor-quota burst: hot-swap model
+                _maybe_failover_model(c, event)  # vendor-quota burst: override the model
             messages = _user_text("The stream was interrupted. Continue from where "
                                   "you left off; call your pending inline function.")
             continue

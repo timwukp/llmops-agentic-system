@@ -365,7 +365,7 @@ detail-type **必須**有 listener，宣告在 contracts 的 `EVENTS_NEEDING_A_R
 接這條線的過程中，有兩個 emitter 被迫**改名**，因為這個判別必須放在 EventBridge pattern
 讀得到的地方 —— pattern 讀不懂散文：
 
-- `_maybe_failover_model` 在廠商 5xx 突發後熱抽換模型，然後重試**繼續進行**。它卻以
+- `_maybe_failover_model` 在廠商 5xx 突發後把模型覆寫到後備，然後重試**繼續進行**。它卻以
   `EscalatedToHuman` 的身分宣告自己，把「informational, pipeline continuing」這幾個字
   埋在 reason 字串裡；這件事之所以無害，純粹是因為當時沒有人訂閱。第一條把這個
   detail-type 路由到 triage 的 rule，就會為一個剛剛自己痊癒的 run 去呼叫指揮家。
@@ -739,8 +739,13 @@ eval agent 重新進場、讀自己那個失敗 job 的 `FailureReason`、修自
 內 Fable 5 的 5xx 爆發重現約 12 次。設計規則（全文見 [AGENTS.md](../AGENTS.md)）：
 
 1. 每個 harness 都有後備鏈：`global.anthropic.claude-fable-5` →
-   `global.anthropic.claude-opus-5`（同家族，零 prompt 改動）。經 `UpdateHarness`
-   熱切換，約 15 秒到 READY；session 在切換中存活。
+   `global.anthropic.claude-opus-5`（同家族，零 prompt 改動）。切換方式是
+   `InvokeHarness` 的**單次呼叫層 `model` 覆寫** —— 只作用於這一次呼叫，不寫控制面，
+   也沒有需要還原的東西。r6e 的後續修補前用的是 `UpdateHarness`：它會鑄出一個不可變的
+   新版本並把 DEFAULT endpoint 重新指向，而這裡每個 stage 都是透過 DEFAULT 呼叫的
+   （`state_machine.asl.json` 裡完全沒有 `qualifier`），所以一個 session 的後備會把
+   模型從所有其他正在飛行中的 run 底下抽換掉，然後還需要一組約 15 秒的
+   切換＋還原 —— 而且是在當下正在 5xx 的那個控制面上跑。
 2. 「該切換」的特徵：ConverseStream 反覆拋
    `InternalServerException`/`ServiceUnavailableException`，而同一模型的單發直測卻成功
    —— 這是配額壓力，不是故障（它從不以顯式 ThrottlingException 出現）。
@@ -752,9 +757,14 @@ eval agent 重新進場、讀自己那個失敗 job 的 `FailureReason`、修自
    分流已經上線，這與架構圖聲稱 harness 已 VPC 隔離（§11）是同一個錯誤 ——
    把設計意圖當成已交付的事實在讀。
    `tests/test_docs_claims.py` 現在會拿真實配置去驗證這個模型聲明。
-4. Driver 在串流搶救時檢測到模型 5xx 即熱切換到後備模型並發出資訊性 failover 事件
-   （`orchestration/harness_driver/handler.py` 的 `_maybe_failover_model`）；
-   完整的自動 failover 加固屬於 Phase 6。
+4. Driver 在串流搶救時檢測到模型 5xx，就把這次調用剩下的回合全部覆寫到後備模型，
+   並發出資訊性 failover 事件（`orchestration/harness_driver/handler.py` 的
+   `_maybe_failover_model`）。它僅剩的一個控制面呼叫是 `GetHarness` 讀取，
+   用來得知 harness 宣告的是哪個模型、因此該走後備鏈的哪一節；driver 角色的授權
+   就精確地只有這一項（`deploy/iam/lambda_roles.json` 的 `FailoverHarnessModel`）。
+   這條授權在 r6e 之前是缺的，所以每一次 5xx 觸發 failover 時該讀取都拋
+   `AccessDeniedException`，又被保護重試路徑的 `except` 吞掉 —— 這個機制在生產環境
+   從未真正執行過一次，而且一聲不響。完整的自動 failover 加固屬於 Phase 6。
 
 ## 10. Driver 的回合續接設計（900 秒 Lambda vs 840 秒回合）
 

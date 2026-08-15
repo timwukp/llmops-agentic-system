@@ -11,7 +11,12 @@ model tier are structural, not incidental.
 Design rules:
 1. Every harness has a **fallback model chain**: `global.anthropic.claude-fable-5`
    → `global.anthropic.claude-opus-5` (same-family, zero prompt changes).
-   Hot-swap via `UpdateHarness` (~15s to READY); sessions survive the swap.
+   Switch via `InvokeHarness`'s per-invocation `model` override, which is scoped
+   to the one call. **Not** `UpdateHarness`: that mints a new harness version and
+   repoints the DEFAULT endpoint, and every stage here invokes through DEFAULT
+   (no `qualifier` anywhere in `state_machine.asl.json`) — so a swap during a
+   storm moves the model under every other run in flight, then has to be undone
+   by a restore running on the same control plane that is 5xxing.
 2. Failure signature that means "switch": repeated
    `runtimeClientError → InternalServerException/ServiceUnavailableException`
    from ConverseStream while a direct single-shot probe of the same model
