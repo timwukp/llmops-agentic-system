@@ -6078,15 +6078,53 @@ def test_every_supported_form_param_resolves_to_a_real_consumer(console):
                 (t["key"], p, "resolves to nothing the pipeline or the panel reads")
 
 
-def test_eval_only_required_fields_equal_mode_required_params(console):
-    """Drift guard (ii): imported from the dispatcher, not restated."""
+def test_every_mode_the_console_offers_asks_for_what_the_dispatcher_demands(console):
+    """Drift guard (ii): imported from the dispatcher, not restated.
+
+    Written over every supported entry rather than eval-only alone, because the one-mode
+    version only guarded the mode that happened to exist when it was written: deploy_only
+    was added with its own MODE_REQUIRED_PARAMS and would have inherited no guard at all.
+    A form that cannot ask for a required param produces a console dispatch that always
+    fails, and it fails in the one place the refusal is not free -- in front of a customer.
+    """
     sp = _load_start_pipeline()
-    required = {k for k, _ in sp.MODE_REQUIRED_PARAMS["eval_only"]}
-    t = console._task_type("eval-only")
-    form_required = {f["param"] for f in t["fields"] if f["required"]}
-    assert required <= form_required, (
-        f"the dispatcher refuses eval_only without {required - form_required} — the "
-        "form must ask for it")
+    checked = set()
+    for t in console.TASK_TYPE_REGISTRY:
+        if not t["supported"] or not t["pipeline_mode"]:
+            continue
+        required = {k for k, _ in sp.MODE_REQUIRED_PARAMS.get(t["pipeline_mode"], ())}
+        if not required:
+            continue
+        form_required = {f["param"] for f in t["fields"] if f["required"]}
+        assert required <= form_required, (
+            f"the dispatcher refuses {t['pipeline_mode']} without "
+            f"{required - form_required} — the {t['key']} form must ask for it")
+        checked.add(t["pipeline_mode"])
+    assert {"eval_only", "deploy_only"} <= checked, (
+        f"only checked {sorted(checked)}; a mode with prerequisites that the console does "
+        "not offer at all is how this guard silently stops guarding")
+
+
+def test_deploy_only_asks_for_the_student_role_the_dispatcher_will_not_default(console):
+    """MODE_REQUIRED_ROLES is a different question from MODE_REQUIRED_PARAMS and needs its
+    own guard: DEFAULT_MODELS always fills a silent student, so the dispatcher demands one
+    that was CHOSEN. The form's param therefore has to be a spelling
+    _role_assignments recognises as the student role -- hf_repo is not one of them (it is a
+    SUPPLY_CHAIN_KEY, i.e. where a model came from), so offering only the mirror field
+    would produce a form a customer can fill in completely and still not dispatch."""
+    sp = _load_start_pipeline()
+    assert "deploy_only" in sp.MODE_REQUIRED_ROLES, (
+        "the dispatcher no longer demands a chosen base model for deploy_only, so an "
+        "artifact can be merged onto whatever DEFAULT_MODELS happens to name — "
+        "discoverable only after the endpoint is paid for")
+    roles = {r for r, _ in sp.MODE_REQUIRED_ROLES["deploy_only"]}
+    form = {f["param"] for f in console._task_type("deploy-only")["fields"]
+            if f["required"]}
+    for role in roles:
+        aliases = set(sp.ROLE_ALIASES[role])
+        assert form & aliases, (
+            f"deploy_only needs an explicitly named {role} model, and the form asks for "
+            f"none of {sorted(aliases)} — it offers {sorted(form)}")
 
 
 def test_raft_form_params_match_the_prompt_clause(console):
@@ -6120,6 +6158,7 @@ def test_unsupported_types_are_listed_and_marked(console):
         assert key in cat and cat[key]["supported"] is False
     modes = {t["key"]: t["pipeline_mode"] for t in console.TASK_TYPE_REGISTRY}
     assert modes["eval-only"] == "eval_only" and modes["data-audit"] == "data_audit"
+    assert modes["deploy-only"] == "deploy_only"
 
 
 def test_presigned_upload_host_matches_the_csp_upload_origin(wired, monkeypatch):

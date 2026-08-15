@@ -3168,6 +3168,55 @@ def _exits(st: dict) -> list:
             + ([st["Default"]] if "Default" in st else []))
 
 
+def _tests_pipeline_mode(choice: dict) -> bool:
+    return any(r.get("Variable") == "$.pipeline_mode"
+               for r in choice.get("And", [choice]))
+
+
+def _mode_of(choice: dict):
+    for r in choice.get("And", [choice]):
+        if r.get("Variable") == "$.pipeline_mode" and "StringEquals" in r:
+            return r["StringEquals"]
+    return None
+
+
+def _reachable_in_mode(asl: dict, mode: str, start=None, seen=None) -> set:
+    """Reachability with `$.pipeline_mode`-testing Choices resolved to `mode`.
+
+    A plain reachability walk sees BOTH branches of every Choice, so it reaches states a
+    narrow mode exists specifically to avoid -- eval_only would "reach" RemediateFinetune
+    and deploy_only would "reach" the training stages. So mode conditions are resolved and
+    every other Choice is left open, which keeps a gate pass and a gate fail both explored.
+
+    Module scope rather than nested in one test: it was written inside the eval_only guard,
+    which meant the next narrow mode added to the machine started life with no reachability
+    guard at all and no obvious way to get one.
+    """
+    if seen is None:
+        seen = set()
+    if start is None:
+        start = asl["StartAt"]
+    if start in seen:
+        return seen
+    seen.add(start)
+    st = asl["States"][start]
+    exits = _exits(st)
+    if st.get("Type") == "Choice":
+        mode_branches = [c for c in st.get("Choices", []) if _tests_pipeline_mode(c)]
+        if mode_branches:
+            taken = [c["Next"] for c in mode_branches if _mode_of(c) == mode]
+            exits = taken or ([st["Default"]] if "Default" in st else [])
+    for nxt in exits:
+        _reachable_in_mode(asl, mode, nxt, seen)
+    return seen
+
+
+def _harnesses_of(states: dict, names) -> set:
+    """The harness_id each named state dispatches to, if any."""
+    return {((states[n].get("Parameters") or {}).get("Payload") or {}).get("harness_id")
+            for n in names} - {None}
+
+
 def _reaches(states: dict, start: str, target: str, seen=frozenset()) -> bool:
     """Can `start` transition to `target`, following any number of hops?
 
@@ -4688,12 +4737,31 @@ class TestConductorDispatch:
                 f"{name} is exempted here but no prompt reads it -- drop the exemption "
                 "rather than leaving a hole shaped like a param that no longer exists")
 
+        # Caught by the deliberately-wide pattern without being a model identity at all:
+        # this is the ModelApprovalStatus the deploy agent writes into the SageMaker Model
+        # Registry. It is not the driver's to inject, because it is not a fact about which
+        # model was chosen -- it is a statement about whether a human has approved serving
+        # this package, and the whole point is that it defaults to the answer that keeps
+        # the human in the loop. It reached the exception list the same way #20 did, in
+        # reverse: the prompt said "approval status per params" while no DEFAULT_PARAMS,
+        # console field or test supplied one, so the agent was being told to improvise on
+        # the single field separating a rehearsal from a production release.
+        default_supplied = {"model_package_approval_status"}
+        for name in sorted(default_supplied):
+            assert start_pipeline.DEFAULT_PARAMS.get(name), (
+                f"{name} is exempted here as having a default, but DEFAULT_PARAMS does "
+                "not supply one -- the prompt reads it and gets nothing")
+            assert any(f"params.{name}" in
+                       json.loads(cfg.read_text())["systemPrompt"][0]["text"]
+                       for cfg in (REPO / "agents").glob("*/harness.json")), (
+                f"{name} is exempted here but no prompt reads it")
+
         supplied = set(driver.MODEL_PARAM_FOR_ROLE.values())
         assert supplied, "the driver no longer injects any approved model param"
         for cfg in sorted((REPO / "agents").glob("*/harness.json")):
             text = json.loads(cfg.read_text())["systemPrompt"][0]["text"]
             read = set(re.findall(r"params\.([a-z_]*model[a-z_]*)", text))
-            unsupplied = sorted(read - supplied - plan_supplied)
+            unsupplied = sorted(read - supplied - plan_supplied - default_supplied)
             assert not unsupplied, (
                 f"{cfg.parent.name}: the prompt reads {unsupplied} but the driver "
                 f"supplies only {sorted(supplied)}. An agent that reads an absent model "
@@ -4967,6 +5035,12 @@ class TestConductorDispatch:
             # since the bug #23 cure, which needs it to decide whether the customer's
             # file is short of what the plan priced and the teacher must top it up.
             "sample_count": "default",
+            # The ModelApprovalStatus the deploy agent writes into the Model Registry. A
+            # default rather than a plan field because the default IS the policy: nothing
+            # automated may register a package as Approved, and a deploy_only rehearsal
+            # must not leave one behind. The prompt read this param before anything
+            # supplied it (#20's shape, one field further on), which is why it is here.
+            "model_package_approval_status": "default",
             # settings only a signed plan supplies (bug #21)
             "source_uri": "plan",
             "customer_eval_uri": "plan",
@@ -5967,41 +6041,10 @@ class TestConductorDispatch:
         asl = json.loads((REPO / "orchestration/state_machine.asl.json").read_text())
         states = asl["States"]
 
-        def reachable_in_mode(mode, start=None, seen=None):
-            """Reachability with `$.pipeline_mode`-testing Choices resolved to `mode`."""
-            if seen is None:
-                seen = set()
-            if start is None:
-                start = asl["StartAt"]
-            if start in seen:
-                return seen
-            seen.add(start)
-            st = states[start]
-            exits = _exits(st)
-            if st.get("Type") == "Choice":
-                mode_branches = [c for c in st.get("Choices", [])
-                                 if _tests_pipeline_mode(c)]
-                if mode_branches:
-                    taken = [c["Next"] for c in mode_branches if _mode_of(c) == mode]
-                    exits = taken or ([st["Default"]] if "Default" in st else [])
-            for nxt in exits:
-                reachable_in_mode(mode, nxt, seen)
-            return seen
-
-        def _tests_pipeline_mode(choice):
-            return any(r.get("Variable") == "$.pipeline_mode"
-                       for r in choice.get("And", [choice]))
-
-        def _mode_of(choice):
-            for r in choice.get("And", [choice]):
-                if r.get("Variable") == "$.pipeline_mode" and "StringEquals" in r:
-                    return r["StringEquals"]
-            return None
-
-        eval_only = reachable_in_mode("eval_only")
+        eval_only = _reachable_in_mode(asl, "eval_only")
         # The guard is only meaningful if the mode is actually routed somewhere distinct.
         assert "EvalGenerate" in eval_only, "eval_only never reaches the eval stage"
-        full = reachable_in_mode("full")
+        full = _reachable_in_mode(asl, "full")
         assert "DataPrepGenerate" in full and "RemediateFinetune" in full, (
             "the mode-resolving walk lost the full path, so it proves nothing about "
             "eval_only being narrower")
@@ -6017,12 +6060,8 @@ class TestConductorDispatch:
             "of whether it passed")
         assert "Deploy" in full, "a passing full run can no longer reach Deploy"
 
-        def harnesses(names):
-            return {((states[n].get("Parameters") or {}).get("Payload") or {})
-                    .get("harness_id")
-                    for n in names} - {None}
-
-        forbidden = {"llmops_data_prep", "llmops_finetune"} & harnesses(eval_only)
+        forbidden = {"llmops_data_prep", "llmops_finetune"} & _harnesses_of(states,
+                                                                           eval_only)
         assert not forbidden, (
             f"eval_only can reach {sorted(forbidden)}: this mode is dispatched with no "
             "corpus and no training stage in its manifest, so a GPU stage here spends "
@@ -6114,6 +6153,268 @@ class TestConductorDispatch:
                             ("neither deploys", "the prompt must say the run stops at the "
                                                 "verdict, so the report IS the deliverable")):
             assert phrase in low, f"{why}: {phrase!r} is missing from the eval prompt"
+
+    def test_state_machine_deploy_only_serves_an_artifact_without_training_or_judging_it(
+            self):
+        """deploy_only is the rehearsal lane for the five states that have never run.
+
+        Measured 2026-08-15: of 38 runs in llmops-pipeline-runs, `deploy` / `smoke` /
+        `teardown` have emitted zero stage events, ever, and the newest `deployment/`
+        object in S3 is from 2026-07-29. The cause is structural rather than a bug in
+        those states: QualityGateChoice is Deploy's only entry and `gate_passed=true` has
+        never once been produced, so the last five states of a 29-state machine are
+        unreachable and every defect in them is unfound. This mode gives them an entry
+        that costs one endpoint-hour instead of a full training run.
+
+        What makes it cheap is a property of the states themselves, not an assumption:
+        their Payloads carry only run_id / manifest_uri / stage / task / harness_id /
+        iteration, reading neither $.evaluation nor $.finetune. So nothing has to fake a
+        gate verdict and QualityGateChoice is untouched -- which is the point. This mode
+        exists because the gate is honest, not as a way around it.
+        """
+        asl = json.loads((REPO / "orchestration/state_machine.asl.json").read_text())
+        states = asl["States"]
+
+        deploy_only = _reachable_in_mode(asl, "deploy_only")
+        serving = ["Deploy", "SmokeTest", "MonitorHealth", "Teardown", "MonitorReport"]
+        unreached = [s for s in serving if s not in deploy_only]
+        assert not unreached, (
+            f"deploy_only does not reach {unreached}: the entire reason for the mode is "
+            "that these are the states no run has ever entered")
+        # The lane only pays for itself if it is narrower than the full pipeline.
+        forbidden = ({"llmops_data_prep", "llmops_finetune", "llmops_eval"}
+                     & _harnesses_of(states, deploy_only))
+        assert not forbidden, (
+            f"deploy_only can reach {sorted(forbidden)}: it is dispatched with a model "
+            "artifact and no corpus, so a GPU stage here is the $50 run this lane exists "
+            "to avoid")
+        assert "QualityGateChoice" not in deploy_only, (
+            "deploy_only routes through the gate, which cannot pass in a run that never "
+            "evaluated anything -- the mode would be dead on arrival")
+        # ... and the full pipeline must still be gated. A mode-aware walk that lost the
+        # full path would satisfy every assertion above while proving nothing.
+        full = _reachable_in_mode(asl, "full")
+        assert {"QualityGateChoice", "Deploy"} <= full, (
+            "the new Choice branch broke the gated path: a passing full run must still "
+            "reach Deploy THROUGH QualityGateChoice")
+        # A mode that cannot finish is not a mode.
+        assert _reaches(states, "Deploy", "Succeed")
+
+    def test_the_only_way_into_an_ungated_deploy_is_the_dispatch_that_asked_for_one(self):
+        """deploy_only is a deploy with no gate verdict, so its legitimacy rests entirely
+        on the dispatch being the approval -- the same argument EvalOnlyStopChoice makes
+        when it refuses to let a re-judge reach Deploy: "an autonomous deploy off a
+        re-judge is a spend nobody approved."
+
+        That argument only holds while the top of the machine is the ONLY entrance. If any
+        in-run state could route into this mode, a run a human approved as a full gated
+        pipeline could serve an endpoint without a passing gate, and the run record would
+        say it deployed -- indistinguishable from a deploy the gate allowed. So Deploy's
+        entrants are pinned to exactly two: the mode Choice at the top (dispatch approved
+        it) and the gate (a verdict approved it).
+        """
+        asl = json.loads((REPO / "orchestration/state_machine.asl.json").read_text())
+        entrants = {n for n, st in asl["States"].items() if "Deploy" in _exits(st)}
+        assert entrants == {"PipelineModeChoice", "QualityGateChoice"}, (
+            f"Deploy is entered from {sorted(entrants)}; only the top-level mode Choice "
+            "and the quality gate may lead there, because those are the only two things "
+            "that can carry an approval to spend on an endpoint")
+        # The mode string is read again mid-run -- EvalOnlyStopChoice does exactly that,
+        # legitimately -- so the invariant cannot be "only one state reads it". What it
+        # can be is directional: a mid-run mode read may only STOP work, never start it.
+        # The dispatch-time Choice is where a mode may buy something, because that is the
+        # only point a human's approval reaches; anywhere later, the mode may only spend
+        # less than the run was already approved for.
+        for name, st in asl["States"].items():
+            if name == "PipelineModeChoice":
+                continue
+            for c in st.get("Choices", []):
+                if not _tests_pipeline_mode(c):
+                    continue
+                downstream = _reachable_in_mode(asl, _mode_of(c), start=c["Next"])
+                spends = _harnesses_of(asl["States"], downstream)
+                assert not spends, (
+                    f"{name}'s {_mode_of(c)!r} branch reaches {sorted(spends)}: a mode "
+                    "read after dispatch may only end a run early. Starting a stage here "
+                    "means the mode, not the human who signed the plan, decided to spend")
+
+    def test_deploy_only_is_refused_without_the_artifact_and_the_base_it_merges_into(self):
+        """Refuse before a run_id exists, for the two inputs nothing downstream can infer.
+
+        `model_artifact_uri`: there is no finetune stage in a deploy_only run, so the only
+        alternative to naming it is the deploy agent picking the newest artifact in the
+        bucket -- which is how a rehearsal ends up serving a stranger's weights while
+        every log says the run succeeded.
+
+        `student`: the base the adapters merge into. This one is a ROLE, not a param, and
+        it needs its own table because DEFAULT_MODELS always supplies a student -- a
+        presence check can never fail, so the check has to ask whether a human CHOSE one.
+        A merge onto the wrong base weights is only discoverable after the endpoint has
+        been paid for. This is run 68cfa9c8's defect (a default standing in for an
+        approval) in the one mode where the default is silent AND the artifact is real.
+        """
+        good = {"pipeline_mode": "deploy_only",
+                "model_artifact_uri": "s3://b/runs/run-x/finetune/model.tar.gz",
+                "student_model": "Qwen/Qwen2.5-7B-Instruct"}
+        m = start_pipeline.seed_manifest("run-y", "conductor", {}, good)
+        assert m["params"]["model_artifact_uri"] == good["model_artifact_uri"]
+        assert m["models"]["student"] == good["student_model"]
+        # the rehearsal must not be able to leave an Approved model package behind
+        assert m["params"]["model_package_approval_status"] == "PendingManualApproval"
+
+        with pytest.raises(ValueError) as e:
+            start_pipeline.seed_manifest(
+                "run-y", "conductor", {},
+                {k: v for k, v in good.items() if k != "model_artifact_uri"})
+        assert "model_artifact_uri" in str(e.value) and "deploy_only" in str(e.value)
+
+        # A student that only DEFAULT_MODELS supplied is not a chosen student, and the
+        # manifest cannot tell the difference -- so the refusal has to happen here.
+        with pytest.raises(ValueError) as e:
+            start_pipeline.seed_manifest(
+                "run-y", "conductor", {},
+                {k: v for k, v in good.items() if k != "student_model"})
+        assert "student" in str(e.value), (
+            f"deploy_only started with no chosen base model: {e.value}")
+        # every alias the dispatcher accepts for the role has to satisfy it, or the
+        # refusal fires on plans that named the base perfectly legibly
+        for alias in start_pipeline.ROLE_ALIASES["student"]:
+            plan = {k: v for k, v in good.items() if k != "student_model"}
+            plan[alias] = "Qwen/Qwen2.5-7B-Instruct"
+            start_pipeline.seed_manifest("run-y", "conductor", {}, plan)
+        # canonically nested, which is how a signed plan spells it
+        nested = {k: v for k, v in good.items() if k != "student_model"}
+        nested["models"] = {"student": "Qwen/Qwen2.5-7B-Instruct"}
+        start_pipeline.seed_manifest("run-y", "conductor", {}, nested)
+        # and none of this may leak onto the modes that declare no prerequisites
+        for mode in ("full", "data_audit"):
+            start_pipeline.seed_manifest("run-y", "conductor", {},
+                                         {"pipeline_mode": mode, "source_uri": "s3://b/d"})
+
+    def test_the_run_row_records_which_mode_served_the_endpoint(self):
+        """A rehearsal deploy and a gated deploy must not look the same in the runs table.
+
+        `pipeline_mode` was written into the manifest only, and the runs table is what
+        every operator, cost review and triage reads first. A deploy_only run showing up
+        as an ordinary completed run is the one claim this platform has never been able to
+        make -- that a model reached service through a gate it passed. It is also the
+        finops seam: a rehearsal endpoint-hour and a production one bill identically and
+        only this field tells them apart.
+        """
+        c = {"s3": FakeS3(), "ddb": FakeDDB(), "sfn": FakeSfn(), "events": FakeEvents()}
+        start_pipeline.handler({"trigger_source": "conductor", "plan": {
+            "pipeline_mode": "deploy_only",
+            "model_artifact_uri": "s3://b/runs/run-x/finetune/model.tar.gz",
+            "student_model": "Qwen/Qwen2.5-7B-Instruct"}}, clients=c)
+        rows = [i for t in c["ddb"].tables.values() for i in t.items if "run_id" in i]
+        assert rows, "the dispatch minted no run row at all"
+        assert all(r.get("pipeline_mode") == "deploy_only" for r in rows), (
+            f"the run row does not say which mode served the model: {rows}")
+        # the default has to be explicit too, or the absence of the field becomes the
+        # ambiguity this test exists to remove
+        c2 = {"s3": FakeS3(), "ddb": FakeDDB(), "sfn": FakeSfn(), "events": FakeEvents()}
+        start_pipeline.handler({"trigger_source": "conductor"}, clients=c2)
+        rows2 = [i for t in c2["ddb"].tables.values() for i in t.items if "run_id" in i]
+        assert all(r.get("pipeline_mode") == "full" for r in rows2), (
+            f"a plain run row leaves the mode unstated: {rows2}")
+
+    def test_the_deploy_prompt_is_told_where_the_artifact_it_serves_comes_from(self):
+        """The deploy prompt never said where the model artifact comes from -- not in
+        deploy_only, not in a full run either. It said "merge the fine-tuning adapters
+        into the base weights" and left the agent to find them.
+
+        Nobody had ever noticed because nothing has ever reached Deploy. That is this
+        codebase's dominant defect shape: a capability the docs, the prompt and the IAM
+        policy all describe, that nothing can actually reach, so the gap only surfaces
+        when a run finally gets there and it reads as an agent failure. The eval prompt
+        needed the same sentence and got it; this one is the same hole one state later.
+
+        Second defect pinned here: the smoke task said to register the model with the
+        "approval status per params" while `model_package_approval_status` existed in no
+        DEFAULT_PARAMS, no console form and no test. A prompt naming an input that can
+        never arrive is an instruction to improvise on the one field that separates a
+        rehearsal from a production release.
+        """
+        text = json.loads((REPO / "agents/deploy/harness.json").read_text())
+        text = text["systemPrompt"][0]["text"]
+        low = text.lower()
+        for phrase, why in (
+                ("params.model_artifact_uri",
+                 "the prompt must name the param that carries the artifact"),
+                ("deploy_only",
+                 "the prompt must say what changes in the mode with no finetune stage"),
+                ("params.source_run_id",
+                 "a rehearsal must record whose artifact it served, or the deployment is "
+                 "untraceable to the run that paid for it"),
+                ("params.model_package_approval_status",
+                 "the registry approval status must come from a named param, not from "
+                 "the agent's judgement"),
+                ("pendingmanualapproval",
+                 "the default must be the one that keeps a human in the loop"),
+                ("never fall back",
+                 "picking the newest artifact in the bucket must be forbidden outright"),
+                ("escalate",
+                 "an absent or contradictory artifact must escalate, not proceed")):
+            assert phrase in low, f"{why}: {phrase!r} is missing from the deploy prompt"
+        # the param the prompt now names has to actually be supplied
+        assert "model_package_approval_status" in start_pipeline.DEFAULT_PARAMS, (
+            "the deploy prompt reads params.model_package_approval_status and nothing "
+            "puts it there -- the exact defect this test was written for")
+
+    def test_no_harness_state_carries_heartbeat_seconds(self):
+        """Not an omission: HeartbeatSeconds is deliberately absent, and this fails if
+        someone adds it back because it looks like the AWS-native version of the
+        driver's own liveness beat plus the resurrector.
+
+        It is not, and the two cannot coexist. A heartbeat timeout makes Step Functions
+        fail the STATE, which mints a NEW random task token on the retry and does not
+        terminate the harness that stopped beating -- only .sync integrations have
+        best-effort cancellation, the callback pattern promises nothing. So the orphan
+        keeps streaming, keeps burning the account-level TPM the whole fleet shares (the
+        r6e storm was 78% server errors on one inference profile), and keeps writing its
+        own liveness beat. The resurrector instead resumes the SAME session on the SAME
+        token from the parked payload, preserving the partial work of a stage that is
+        neither cheap nor idempotent -- S3 manifest append and a wall-clock DDB sort key,
+        which is also why these states carry Retry: NONE.
+
+        Two authorities to declare a stage dead means two independent dispatches of its
+        replacement. Exactly one may hold it, and it is the one that resumes rather than
+        restarts. Same idea as the Retry: NONE guard: make a deliberate absence into
+        something that turns red.
+
+        This deliberately overlaps and TIGHTENS
+        `test_a_heartbeat_interval_requires_something_to_send_heartbeats`, which forbids the
+        field only while nothing calls SendTaskHeartbeat and therefore invites the field
+        back the moment someone writes a sender. That was the right test for the defect it
+        was written for -- an invisible 18000s cap on states whose ASL said 21600 -- but
+        writing a sender is not the missing piece. Adding one gives Step Functions the
+        authority the resurrector already holds, which is worse than the field having no
+        sender at all: the failure would no longer be a stage that dies early, it would be
+        two live drivers on two tokens writing the same non-idempotent manifest.
+        """
+        asl = json.loads((REPO / "orchestration/state_machine.asl.json").read_text())
+        waiters = {n: st for n, st in asl["States"].items()
+                   if ".waitForTaskToken" in (st.get("Resource") or "")}
+        assert len(waiters) >= 5, (
+            f"only {len(waiters)} callback states found; this guard has stopped looking "
+            "at the states it was written for")
+        beating = sorted(n for n, st in waiters.items() if "HeartbeatSeconds" in st)
+        assert not beating, (
+            f"{beating} carry HeartbeatSeconds. Step Functions will now declare these "
+            "stages dead on its own, retry with a new token, and leave the original "
+            "harness streaming -- two death authorities, two dispatches, and the "
+            "resurrector's resumed session racing a restarted one. Remove it, or remove "
+            "the resurrector; not both.")
+        # TimeoutSeconds is the ceiling that IS load-bearing, so it must stay present
+        # everywhere -- otherwise "no heartbeat" means no bound on a stage at all.
+        assert all("TimeoutSeconds" in st for st in waiters.values()), (
+            "a callback state with neither HeartbeatSeconds nor TimeoutSeconds waits "
+            "forever on a token nothing will ever send")
+        # the reasoning has to live next to the machine, or the next reader re-adds it
+        comment = asl.get("Comment", "")
+        assert "HeartbeatSeconds" in comment, (
+            "the machine does not record why it has no heartbeat, so the absence reads "
+            "as an oversight and this test reads as pedantry")
 
     def test_the_signed_plan_outranks_the_boilerplate_model_defaults(self):
         """Model consent is model-specific: approving a Fable-5 teacher is not approving
@@ -8323,7 +8624,7 @@ def test_a_model_failover_reaches_the_invoke_and_only_the_invoke():
         f"{len(ac.calls) - 1 - len(overridden)} of the post-failover invokes went out "
         "without the override, i.e. straight back into the storm that caused it")
     assert (overridden[0]["model"]["bedrockModelConfig"]["modelId"]
-            == "global.anthropic.claude-opus-5"), overridden[0]["model"]
+            == "us.anthropic.claude-fable-5"), overridden[0]["model"]
 
     arn = driver._resolve_harness_arn("llmops_data_prep").rsplit("/", 1)[-1]
     assert ctl.updates == [], (
@@ -8385,30 +8686,75 @@ def test_the_run_row_records_which_model_actually_served_the_stage(capsys):
         "nothing on the run row records that this stage ran on the fallback")
     rec = json.loads(row["model_failover"])
     assert rec["from_model"] == "global.anthropic.claude-fable-5"
-    assert rec["to_model"] == "global.anthropic.claude-opus-5"
+    assert rec["to_model"] == "us.anthropic.claude-fable-5"
     assert rec["scope"] == "invocation", (
         "the record does not say how far the switch reached; 'restored: false' used to "
         "mean the fleet was diverged, and a reader carrying that habit over would "
         "misread a per-call override as an unreverted swap")
 
 
-def test_a_second_5xx_in_one_invocation_does_not_re_read_the_control_plane(capsys):
-    """The override is already parked, so the answer cannot change -- and during a storm
-    this path is reached once per dead-stream turn, up to INFRA_ERROR_BUDGET of them, on
-    the same control plane the data plane is failing on. It still has to SAY something:
-    an early return that printed nothing is exactly the silence that hid r6e."""
-    ctl = FakeAgentCoreControl()
+def test_the_second_5xx_advances_the_chain_without_re_reading_the_control_plane(capsys):
+    """One rung per dead-stream turn, every rung after the first served from `c`.
+
+    Two properties, and both are load-bearing. During a storm this path is reached once per
+    dead-stream turn, up to INFRA_ERROR_BUDGET of them, on the same control plane the data
+    plane is failing on -- so advancing a rung must cost ZERO reads. And it has to actually
+    advance: the previous design early-returned as soon as an override existed, so a session
+    whose one fallback had also 5xxed rode out the remaining nine turns of the storm with
+    nothing left to try, which is the shape r6e died in with the ladder working as written.
+
+    The order is what makes the walk cheap: rung 1 keeps the model and only changes
+    inference profile (global.* -> us.*), rung 2 spends the price-tier change.
+    """
+    ctl = FakeAgentCoreControl(model_id="global.anthropic.claude-fable-5")
     c = _failover_clients([], ctl=ctl)
-    c["agentcore"] = FakeAgentCore([_model_5xx_stream(), _model_5xx_stream(),
-                                    tool_use_stream("stage_complete", {"outputs": []}),
-                                    text_stream("ack")])
+    ac = FakeAgentCore([_model_5xx_stream(), _model_5xx_stream(),
+                        tool_use_stream("stage_complete", {"outputs": []}),
+                        text_stream("ack")])
+    c["agentcore"] = ac
     driver.handler(driver_event(), clients=c)
 
     assert ctl.reads == 1, (
         f"get_harness ran {ctl.reads} times for one invocation's failover; the declared "
-        "model cannot have changed between two 5xxs of the same storm")
-    printed = capsys.readouterr().out
-    assert "already failed over" in printed, printed[-800:]
+        "model cannot have changed between two 5xxs of the same storm, and every rung "
+        "after the first is walked from state already parked on `c`")
+    models = [k["model"]["bedrockModelConfig"]["modelId"]
+              for k in ac.calls if k.get("model")]
+    assert models[0] == "us.anthropic.claude-fable-5", (
+        f"the first rung was not the profile swap: {models}. Changing the model before "
+        "changing the route spends a price tier to answer a routing problem")
+    assert models[-1] == "global.anthropic.claude-opus-5", (
+        f"the second 5xx never advanced past the profile swap: {models}. A storm that "
+        "beats the first rung must be able to reach the model change behind it")
+    assert "rung 2/2" in capsys.readouterr().out
+
+
+def test_a_third_5xx_stops_walking_instead_of_flapping_between_spent_rungs(capsys):
+    """The chain is walked at most once end to end per invocation.
+
+    A storm turn reaches this up to INFRA_ERROR_BUDGET times, so past the last rung it must
+    do nothing at all -- no control-plane read, no ping-pong back to a rung already spent.
+    That last risk is not hypothetical: global.* names us.* as its first rung and us.* names
+    global.* as its own, so a walk that re-keyed MODEL_FALLBACKS on the CURRENT override
+    instead of indexing the declared model's chain would oscillate between the two profiles
+    forever and never reach Opus 5 at all.
+    """
+    ctl = FakeAgentCoreControl(model_id="global.anthropic.claude-fable-5")
+    c = _failover_clients([], ctl=ctl)
+    ac = FakeAgentCore([_model_5xx_stream(), _model_5xx_stream(), _model_5xx_stream(),
+                        tool_use_stream("stage_complete", {"outputs": []}),
+                        text_stream("ack")])
+    c["agentcore"] = ac
+    driver.handler(driver_event(), clients=c)
+
+    assert ctl.reads == 1, f"get_harness ran {ctl.reads} times across three 5xxs"
+    models = [k["model"]["bedrockModelConfig"]["modelId"]
+              for k in ac.calls if k.get("model")]
+    assert models[-1] == "global.anthropic.claude-opus-5", (
+        f"the walk left the last rung after exhausting the chain: {models}")
+    assert models.count("us.anthropic.claude-fable-5") == 1, (
+        f"the profile swap was re-entered after being spent: {models}")
+    assert "chain exhausted" in capsys.readouterr().out
 
 
 def test_every_escalation_emitter_carries_the_stage_the_rule_filters_on():

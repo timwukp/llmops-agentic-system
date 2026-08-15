@@ -3180,6 +3180,17 @@ INTAKE_ALIASES = {
     "kb_ocu_hours": ("kb_ocu_hours", "ocu_hours"),
     "pipeline_mode": ("pipeline_mode", "mode"),
     "hf_repo": ("hf_repo", "student_model", "student"),
+    # Deliberately NOT folded into hf_repo above, even though for a distillation run the
+    # two describe one model. hf_repo answers WHERE an open-weight model comes from (it is
+    # one of start_pipeline's SUPPLY_CHAIN_KEYS, and the console checks models-mirror/ for
+    # it); this answers WHICH model fills the student ROLE, which is what
+    # start_pipeline._role_assignments reads and what the driver injects as
+    # params.student_model_id. The distinction is invisible until a mode has an artifact
+    # but no training stage: deploy_only merges adapters into the base weights of the
+    # student role, and a mirror path is not a base model. teacher_model already has this
+    # exact shape -- a fixed point here and a ROLE_ALIASES entry there -- so the student
+    # having only a provenance field was the asymmetry, not this.
+    "student_model_id": ("student_model_id",),
     "teacher_model": ("teacher_model", "teacher", "teacher_model_id"),
     "budget_usd": ("budget_usd", "budget", "budget_reference"),
     "max_iterations": ("max_iterations", "iterations"),
@@ -3292,6 +3303,27 @@ TASK_TYPE_REGISTRY = (
          _pf("model_artifact_uri", "Model artifact (S3 URI)", "uri", True,
              "the trained model to judge — eval_only refuses to dispatch without it"),
          _rf("customer_eval_uri", ftype="uri"),
+         _pf("budget_usd", "Budget reference (USD)", "number", False,
+             "a reference, not a ceiling"),
+     )},
+    {"key": "deploy-only",
+     "label": "Serve an existing model artifact (deploy only)",
+     "description": "No training and no re-judging: an artifact an earlier run already "
+                    "produced is packaged, deployed to an endpoint, smoke-tested, "
+                    "health-checked and torn down. The rehearsal path for the serving "
+                    "half of the pipeline — it registers the model as "
+                    "PendingManualApproval and never as Approved, because no quality "
+                    "gate is consulted in this mode.",
+     "supported": True, "pipeline_mode": "deploy_only",
+     "fields": (
+         _pf("model_artifact_uri", "Model artifact (S3 URI)", "uri", True,
+             "the model.tar.gz to serve — deploy_only refuses to dispatch without it, "
+             "because an artifact the agent picked is a deployment nobody chose"),
+         _pf("student_model_id", "Base model the artifact fine-tuned", "string", True,
+             "the weights the artifact's adapters merge into; required because a "
+             "silent default here is only discoverable after the endpoint is paid for"),
+         _pf("keep_endpoint", "Keep the smoke endpoint", "bool", False,
+             "false tears the endpoint down after the smoke hour — the safe default"),
          _pf("budget_usd", "Budget reference (USD)", "number", False,
              "a reference, not a ceiling"),
      )},

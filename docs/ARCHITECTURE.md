@@ -57,8 +57,9 @@ from having none.
 
 The state machine (`orchestration/state_machine.asl.json`) has **12 harness-task states
 on the happy path** — each a `waitForTaskToken` Lambda invocation of the harness driver
-— plus the loop-only `RemediateFinetune`, the audit-only `DataAudit`, and (in `eval_only`
-mode) an entry that starts partway down this same path, at the eval stage:
+— plus the loop-only `RemediateFinetune`, the audit-only `DataAudit`, and two entries that
+start partway down this same path: `eval_only` at the eval stage and `deploy_only` at the
+serving stage:
 
 ```
 DataPrepGenerate → DataPrepCurate → FinetuneLaunch → FinetuneAnalyze → EvalGenerate → EvalScore → EvalGate
@@ -67,7 +68,7 @@ DataPrepGenerate → DataPrepCurate → FinetuneLaunch → FinetuneAnalyze → E
              Deploy → SmokeTest → MonitorHealth → Teardown → MonitorReport
 ```
 
-**Three entry modes, decided by one `Choice` at `StartAt`** reading `pipeline_mode` out of
+**Four entry modes, decided by one `Choice` at `StartAt`** reading `pipeline_mode` out of
 the execution input (it cannot read the manifest from S3, which is why the mode rides in the
 input at all). `full` is the `Default` above. `data_audit` is the conductor's cheap starter:
 audit the customer's data and stop before any GPU exists. **`eval_only`** enters at
@@ -85,6 +86,57 @@ should never get a run id, a manifest and a `PipelineStarted` event first.
 It exists because of r6c: an 8B run produced a 12.2 GiB model, the reformed judge metric had
 to re-score it, and with only `full` and `data_audit` the only way to do that was a script in
 someone's working directory — unversioned, unaudited, and invisible to the runs table.
+
+**`deploy_only`** enters at `Deploy` and runs the serving tail —
+`Deploy → SmokeTest → MonitorHealth → Teardown → MonitorReport` — against an artifact an
+earlier run already paid for. It exists because **those five states have never executed
+once**. Measured 2026-08-15: 38 rows in `llmops-pipeline-runs`, and `deploy` / `smoke` /
+`teardown` have emitted **zero** stage events, ever; the newest `deployment/` object in S3
+is from 2026-07-29, written by a hand-run script. The cause is not a bug in those states, it
+is arithmetic: `QualityGateChoice` is `Deploy`'s only other entrance and `gate_passed=true`
+has never been produced, so the last five states of a 29-state machine are structurally
+unreachable and every defect in them is undiscovered. Every recent run has died on a
+different one-off defect of the same shape — *a capability the docs, the prompt and the IAM
+policy all describe, that nothing can actually reach* (five separate missing IAM grants for
+calls the code always makes) — and that class is only findable by arriving. So this mode is
+a **rehearsal lane**: one `ml.g5.xlarge` endpoint-hour, under $5, against the real AWS
+control plane, versus ~$50 to reach the same states through a full run that has never
+managed it. It is cheap and it needs no faked gate verdict because of a property of the
+states themselves: their Payloads carry only `run_id` / `manifest_uri` / `stage` / `task` /
+`harness_id` / `iteration` and read neither `$.evaluation` nor `$.finetune`.
+
+It is also **a deploy with no gate verdict**, which is the one thing `EvalOnlyStopChoice`
+refuses to allow, so its legitimacy rests on three boundaries that each have a guard test:
+
+1. **The top-level `Choice` is the only entrance** — the dispatch *is* the approval, exactly
+   as in `eval_only`. `Deploy`'s entrants are pinned to `{PipelineModeChoice,
+   QualityGateChoice}`, and a mode read *after* dispatch (`EvalOnlyStopChoice` does one,
+   legitimately) may only end a run early, never start a stage.
+2. **The artifact must be named.** `MODE_REQUIRED_PARAMS` demands `model_artifact_uri`, and
+   `MODE_REQUIRED_ROLES` — a separate table, because `DEFAULT_MODELS` always supplies a
+   silent `student` so a presence check on it can never fail — demands that a human
+   explicitly *chose* the base model those adapters merge into. A merge onto the wrong base
+   is only discoverable after the endpoint is paid for.
+3. **The registry stays pending.** `model_package_approval_status` defaults to
+   `PendingManualApproval`; a rehearsal must never leave an `Approved` model package behind
+   because three canary prompts returned non-empty strings.
+
+`pipeline_mode` is now written to the run row as well as the manifest, so a rehearsal deploy
+and a gated deploy are never confused in the table every operator, cost review and triage
+reads first — and so the endpoint-hours bill apart.
+
+Building it surfaced two latent defects of exactly the class above, both in
+`agents/deploy/harness.json`, both invisible because nothing had ever reached the state that
+would hit them: the deploy prompt **never said where the model artifact comes from** (not in
+`deploy_only`, not in a full run either — it said "merge the fine-tuning adapters into the
+base weights" and left the agent to find them, which is how a run ends up serving a
+stranger's weights while every log reads as success), and its smoke task told the agent to
+register the model with the approval status "per params" while
+`model_package_approval_status` existed in no `DEFAULT_PARAMS`, no console form and no test.
+
+The mode is **not** a way around the gate. `gate_passed` having never been true is a separate,
+unsolved problem — the transfer floor r6c/r6d measured, not plumbing — and nothing here
+softens the gate to make this lane work.
 
 The two monitor states are placed by the shape of their work, not by taste.
 **`MonitorHealth`** must read CloudWatch *while the endpoint exists*, and `Teardown`
@@ -868,8 +920,15 @@ token-flood generator (6 harnesses then, 7 since `llmops_finops`, × agent loops
 streams). ~12 Fable 5 5xx bursts
 recurred across a single day. Design rules (full text in [AGENTS.md](../AGENTS.md)):
 
-1. Every harness has a fallback chain: `global.anthropic.claude-fable-5` →
-   `global.anthropic.claude-opus-5` (same family, zero prompt changes). Switched via
+1. Every harness has a fallback chain, and it is now **two rungs**:
+   `global.anthropic.claude-fable-5` → `us.anthropic.claude-fable-5` →
+   `global.anthropic.claude-opus-5`. The first rung changes only the **inference profile**,
+   not the model: same weights, same price, zero prompt changes, and a different Region pool
+   (both are ACTIVE `SYSTEM_DEFINED` profiles, verified via `ListInferenceProfiles`). Only
+   the second rung changes model family. The rung order follows the r6e measurement below —
+   the 5xx burst was confined to one profile while a sibling profile of the same model took
+   **zero** invocations in the same hour — so a model change should be the last resort, not
+   the first: it is the rung that alters what the prompts were written against. Switched via
    `InvokeHarness`'s per-invocation `model` override — scoped to the one call, no
    control-plane write, nothing to restore. It was `UpdateHarness` until r6e's follow-up:
    that mints an immutable new version and repoints the DEFAULT endpoint, which is the
@@ -900,6 +959,23 @@ recurred across a single day. Design rules (full text in [AGENTS.md](../AGENTS.m
    the failover was ever called for and the `except` that protects the retry path
    swallowed it — the mechanism had never once run in production, and said nothing.
    Full automated-failover hardening is Phase 6.
+5. **This is an app-layer availability-degradation decision, and it is filed as one.**
+   Measured over the r6e storm window in CloudWatch `AWS/Bedrock`:
+   `EstimatedTPMQuotaUsage` peaked at **44,719 against a 4,000,000 quota — 1.1%**,
+   `InvocationThrottles` returned **no data at all**, and `InvocationServerErrors` was
+   **46 of 59 invocations, 78%**, entirely on one inference profile while a sibling profile
+   of the same model and a different model family both took zero traffic. So these 503s were
+   **not** quota-driven: a Service Quotas increase buys nothing here, and neither does the
+   documented remedy for throttling — shedding your own load — because that remedy assumes
+   your own demand is the cause. Switching model is likewise **not** a documented AWS remedy
+   for `ServiceUnavailableException`; the documented ones are retry with backoff, and moving
+   Region or using cross-Region inference, which is exactly what rung 1 now does. Hence the
+   naming discipline: `_is_model_5xx` deliberately **excludes** `ThrottlingException`, and
+   `_maybe_failover_model` is not hung off a throttling-named path, because the next reader
+   who finds it there will go open a quota ticket for a capacity problem.
+   The counterpart caveat: because the failover had never executed, **the health of any
+   fallback rung has never been observed** — the chain is an untested hypothesis until a run
+   exercises it.
 
 ## 10. The driver's turn-continuation design (900 s Lambda vs 840 s turns)
 
@@ -955,6 +1031,26 @@ Both fields were removed, and
 `test_a_heartbeat_interval_requires_something_to_send_heartbeats` now refuses the field
 without a sender: a heartbeat interval with nobody sending is not monitoring, it is a
 shorter deadline that no surface reports.
+
+**Writing the sender is not the missing piece, and `HeartbeatSeconds` is not coming back.**
+That test lets the field in as soon as something calls `SendTaskHeartbeat`, which reads as a
+to-do; it is not one, and `test_no_harness_state_carries_heartbeat_seconds` now says so
+unconditionally for every `.waitForTaskToken` state. The reason is that the platform already
+has an authority to declare a stage dead — the driver's `__liveness__` beat plus the
+`llmops-resurrector` (§7) — and the two cannot coexist. A heartbeat timeout makes Step
+Functions fail **the state**, which mints a **new random task token** on the retry and
+**does not terminate the harness that stopped beating**: only `.sync` integrations have
+best-effort cancellation, the callback pattern promises nothing. So the orphan keeps
+streaming, keeps burning the account-level TPM the whole fleet shares (§9: the r6e storm was
+78% server errors on one inference profile), and keeps writing its own liveness beat. The
+resurrector instead resumes the **same session on the same token** from the parked payload,
+which preserves the partial work of a stage that is neither cheap nor idempotent — S3
+manifest append and a wall-clock DynamoDB sort key, the same non-idempotence that is why
+these states carry `Retry: NONE`. Two authorities to declare a stage dead means two
+independent dispatches of its replacement, so exactly one may hold that authority, and it is
+the one that resumes rather than restarts. The rationale is also written into the state
+machine's own top-level `Comment`, because an absence with no explanation beside it reads as
+an oversight and the guard protecting it reads as pedantry.
 
 ## 11. VPC posture for production
 

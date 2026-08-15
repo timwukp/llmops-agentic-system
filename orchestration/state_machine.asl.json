@@ -1,10 +1,10 @@
 {
-  "Comment": "llmops-pipeline — stage DAG with waitForTaskToken per harness task and the self-iteration remediation loop (eval gate fail -> remediate finetune, <=3 iterations, then escalate). TimeoutSeconds is the ONLY real ceiling on a stage: the driver Lambda's own 900s limit does not bound the stage, because it self-reinvokes across invocations via _continuation, but the task token it holds only lives for TimeoutSeconds. The six states that wait on real work (generate, curate, finetune launch, eval generate, eval gate, remediate) carry 86400 — a full day, on the platform owner's instruction, after a 480-teacher-call generation run was cut off at 7200s mid-work. The seven that do bookkeeping keep their hour: a wedged Teardown at 86400 would leave an ml.g5.2xlarge endpoint InService for a day at $1.515/hr, which is the exact shape of the 843-day orphan this project already paid for.",
+  "Comment": "llmops-pipeline — stage DAG with waitForTaskToken per harness task and the self-iteration remediation loop (eval gate fail -> remediate finetune, <=3 iterations, then escalate). TimeoutSeconds is the ONLY real ceiling on a stage: the driver Lambda's own 900s limit does not bound the stage, because it self-reinvokes across invocations via _continuation, but the task token it holds only lives for TimeoutSeconds. The six states that wait on real work (generate, curate, finetune launch, eval generate, eval gate, remediate) carry 86400 — a full day, on the platform owner's instruction, after a 480-teacher-call generation run was cut off at 7200s mid-work. The seven that do bookkeeping keep their hour: a wedged Teardown at 86400 would leave an ml.g5.2xlarge endpoint InService for a day at $1.515/hr, which is the exact shape of the 843-day orphan this project already paid for. NO harness state carries HeartbeatSeconds, and that is a decision rather than an omission -- a guard test in tests/test_orchestration.py fails if one appears. HeartbeatSeconds is a first-class part of .waitForTaskToken and it looks like the AWS-native replacement for the driver's own liveness beat plus the resurrector, but the two cannot coexist and the native one is the weaker of the pair here. A heartbeat timeout makes Step Functions fail the state itself, mint a NEW random task token on the retry, and it does not terminate the harness that stopped beating (only .sync has best-effort cancellation; the callback pattern promises nothing) -- so the orphan keeps streaming, keeps burning account-level TPM the whole fleet shares, and keeps writing its own liveness beat. The resurrector recovers the SAME session on the SAME token from the parked payload, which keeps the partial work of a stage that is neither cheap nor idempotent (S3 manifest append and a wall-clock DDB sort key are both non-idempotent, which is also why these states carry Retry: NONE). Two independent authorities to declare a stage dead means two independent dispatches of its replacement, so exactly one may hold that authority, and it is the one that resumes rather than restarts.",
   "StartAt": "PipelineModeChoice",
   "States": {
     "PipelineModeChoice": {
       "Type": "Choice",
-      "Comment": "data_audit is the conductor's starter: audit the customer's data and stop -- no GPU stage may run. eval_only re-enters an artifact a PREVIOUS run already paid for and re-judges it: no data-prep, no training, and it stops at the gate verdict without deploying, because re-measuring is not re-approving. It exists because r6c's 8B run produced a 12.2 GiB model and a gate the reformed metric had to re-score, and with only full/data_audit the only way to re-judge was a script in someone's working directory -- unversioned, unaudited, and invisible to the run table. Default full pipeline otherwise.",
+      "Comment": "data_audit is the conductor's starter: audit the customer's data and stop -- no GPU stage may run. eval_only re-enters an artifact a PREVIOUS run already paid for and re-judges it: no data-prep, no training, and it stops at the gate verdict without deploying, because re-measuring is not re-approving. It exists because r6c's 8B run produced a 12.2 GiB model and a gate the reformed metric had to re-score, and with only full/data_audit the only way to re-judge was a script in someone's working directory -- unversioned, unaudited, and invisible to the run table. deploy_only enters at Deploy against an artifact params.model_artifact_uri names, and it exists because the last five states of this machine (Deploy, SmokeTest, MonitorHealth, Teardown, MonitorReport) had never executed ONCE: 38 runs, 33 failed, and the single row marked completed carries one data-prep stage event. Their only entry is QualityGateChoice, gate_passed has never been true, so every defect in serving lived behind a door no run could open -- and this platform's dominant failure is exactly that shape, a capability the docs, the prompt and the IAM all describe that nothing can reach (five separate runs died on a missing grant for a call the code always makes). It is a REHEARSAL lane, not a shortcut: it does not soften the gate, it cannot be entered from inside a run, and its existence is not permission to bypass QualityGateChoice -- see EvalOnlyStopChoice, which refuses the far weaker version of the same move. What makes it legitimate is that the dispatch IS the approval, the same way eval_only's is: MODE_REQUIRED_PARAMS forces the operator to name the exact artifact rather than letting an agent pick the newest one in the bucket, and params.model_package_approval_status keeps what smoke registers at PendingManualApproval so a rehearsal can never leave an Approved model package behind. Default full pipeline otherwise.",
       "Choices": [
         {
           "And": [
@@ -31,6 +31,19 @@
             }
           ],
           "Next": "EvalGenerate"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.pipeline_mode",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.pipeline_mode",
+              "StringEquals": "deploy_only"
+            }
+          ],
+          "Next": "Deploy"
         }
       ],
       "Default": "DataPrepGenerate"

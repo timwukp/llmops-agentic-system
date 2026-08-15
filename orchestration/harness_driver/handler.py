@@ -19,6 +19,7 @@ Env: RUNS_TABLE, EVENTS_TABLE, EVENT_BUS, LLMOPS_SNS_TOPIC, DATA_BUCKET.
 """
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import os
@@ -1752,10 +1753,51 @@ def handle_finops_tool(c, event, name: str, args: dict) -> dict:
     return {"ok": True, "tool": name, "args": args}
 
 
-#: Fallback chain for vendor-quota 5xx bursts (AGENTS.md: failover is a design layer).
+#: Ordered fallback chain per declared model, cheapest deviation first.
+#
+# This is an APP-LAYER AVAILABILITY-DEGRADATION decision, not a throttling response, and
+# the distinction decides where the next operator looks. AWS documents 503
+# ServiceUnavailableException as a regional capacity constraint and prescribes switching
+# Region / cross-Region inference / provisioned throughput for it; "switch models" appears
+# nowhere in that list. 429 ThrottlingException is the one that means your own rate against
+# your own quota, and it is the only one a Service Quotas increase answers -- which is why
+# _is_model_5xx deliberately does not match it (a shared RETRY path is AWS's own advice for
+# both; a shared DIAGNOSIS path sends someone to file a quota ticket for an outage that had
+# nothing to do with their quota).
+#
+# Measured on the r6e storm window (CloudWatch AWS/Bedrock, 2026-08-14 18:00-19:00Z), which
+# is what turned that from a preference into a fact:
+#
+#   EstimatedTPMQuotaUsage peak      44,719 of a 4,000,000 global quota   = 1.1%
+#   InvocationThrottles              no data
+#   InvocationServerErrors           46 of 59 invocations                 = 78%
+#   global.anthropic.claude-opus-5   0 invocations  <- the fallback never once ran
+#   us.anthropic.claude-fable-5      0 invocations
+#
+# So the 503s were not ours to shed: at 1.1% of quota, throttling our own offered load buys
+# nothing, and a quota increase buys nothing. The app layer is the only layer that can act.
+#
+# The chain's FIRST rung changes inference profile without changing model:
+# global.* and us.* are distinct SYSTEM_DEFINED profiles (both ACTIVE in us-east-1,
+# verified with list-inference-profiles) routing into different Region pools, so the rung
+# costs zero prompt change and zero price change -- the same weights at the same rate,
+# reached another way. Only when that also fails do we spend a model change, because Fable
+# 5 and Opus 5 are different price tiers and a tier change is a spend the plan did not
+# budget (hence _record_failover).
+#
+# The two zeros in the table above are also the reason the ORDER matters more than it looks:
+# failover has never executed in production, so nothing here has ever observed the fallback
+# being healthy. A rung that keeps the model constant is the one rung whose success we can
+# still reason about if it fires.
 MODEL_FALLBACKS = {
-    "global.anthropic.claude-fable-5": "global.anthropic.claude-opus-5",
-    "us.anthropic.claude-fable-5": "global.anthropic.claude-opus-5",
+    "global.anthropic.claude-fable-5": (
+        "us.anthropic.claude-fable-5",
+        "global.anthropic.claude-opus-5",
+    ),
+    "us.anthropic.claude-fable-5": (
+        "global.anthropic.claude-fable-5",
+        "global.anthropic.claude-opus-5",
+    ),
 }
 
 
@@ -1835,6 +1877,13 @@ def _record_failover(c, event, harness_full_id: str, from_model: str,
     failed over was billed at a rate the plan did not budget, and finops reconciles
     against this row. Best effort -- a bookkeeping write must not break the retry it
     is describing.
+
+    Written on EVERY rung, including the profile-only first rung where the tier does not
+    move, because the row answers two questions and only one of them is about money: which
+    model served this stage at all. A run whose numbers came off us.* while its plan named
+    global.* changed nothing a finops reader cares about and everything a reproducibility
+    reader does. Each rung overwrites the last, so the row names the model that served the
+    stage rather than the whole path taken to it -- the path is in the log and on the bus.
     """
     try:
         c["ddb"].Table(os.environ["RUNS_TABLE"]).update_item(
@@ -1850,9 +1899,20 @@ def _record_failover(c, event, harness_full_id: str, from_model: str,
 
 
 def _maybe_failover_model(c, event) -> None:
-    """Switch this session to the fallback model on a vendor 5xx burst.
+    """Advance this session one rung down its model's fallback chain on a vendor 5xx burst.
 
     Best-effort: any failure here must not break the salvage retry.
+
+    One rung per dead-stream turn, and the chain is walked at most once end to end per
+    invocation -- see MODEL_FALLBACKS for why the first rung keeps the model and only
+    changes inference profile. Every rung after the first is served from state parked on
+    `c`, so a storm turn never re-reads the control plane it is already failing on.
+
+    The walk restarts at the DECLARED model in each fresh invocation, because `c` dies with
+    the invocation and _self_reinvoke() hands the retry to a new one. That is deliberate:
+    the declared model is the one a human signed, so it earns the first turn of every
+    invocation, and if the storm ended during the handoff that first turn is also the
+    cheapest possible recovery.
 
     The switch is InvokeHarness's own per-invocation `model` field, parked on `c` and
     passed by every later _invoke in this invocation. AgentCore documents that field as
@@ -1881,38 +1941,59 @@ def _maybe_failover_model(c, event) -> None:
     try:
         arn = _resolve_harness_arn(event["harness_id"])
         harness_full_id = arn.rsplit("/", 1)[-1]
-        if c.get("_model_override"):
-            # Reached normally on the SECOND 5xx of an invocation. Said out loud because
-            # silence here was indistinguishable from a failover that ran, and returning
-            # early also spares the control plane a read per storm turn (up to
-            # INFRA_ERROR_BUDGET of them) that could only answer the same thing twice.
-            already = c["_model_override"]["bedrockModelConfig"]["modelId"]
-            print(f"[driver] already failed over to {already} for {harness_full_id}; "
-                  "retrying on the fallback")
+        declared = c.get("_failover_declared")
+        if declared is None:
+            # First 5xx of this invocation: the one control-plane call left, and a READ --
+            # what the harness DECLARES, which is what MODEL_FALLBACKS is keyed on. Not
+            # taken from the dispatch event: the fallback has to answer "what is this
+            # harness actually serving", and that answer lives in the control plane.
+            #
+            # The whole config comes back with it, so inference settings the harness
+            # declares ride along on the override instead of being dropped by a hand-built
+            # one. It is parked and repointed per rung from here on.
+            ctl = _agentcore_control(c)
+            model = ctl.get_harness(harnessId=harness_full_id)["harness"]["model"]
+            declared = model.get("bedrockModelConfig", {}).get("modelId", "")
+            if not MODEL_FALLBACKS.get(declared):
+                # One of the two ways this declines to act, and it is printed for the same
+                # reason as the other: the declared model has no chain, so the retry runs
+                # unprotected, and an operator reading the log must be able to tell which
+                # of the two silences they are looking at.
+                print(f"[driver] no failover for {harness_full_id}: modelId={declared!r} "
+                      "has no MODEL_FALLBACKS entry; retrying on the same model")
+                return
+            c["_failover_declared"] = declared
+            c["_failover_config"] = model
+            c["_failover_depth"] = 0
+        chain = MODEL_FALLBACKS[declared]
+        depth = c["_failover_depth"]
+        if depth >= len(chain):
+            # Reached from the third 5xx of an invocation onward. A storm turn arrives here
+            # up to INFRA_ERROR_BUDGET times, so this must neither re-read the control
+            # plane nor flap between rungs it has already spent -- but it still has to SAY
+            # something, because an early return that printed nothing is exactly the
+            # silence that made r6e unreadable.
+            print(f"[driver] failover chain exhausted for {harness_full_id} "
+                  f"({declared} -> {' -> '.join(chain)}); retrying on {chain[-1]}")
             return
-        # The one control-plane call left, and a READ: what the harness DECLARES, which
-        # is what MODEL_FALLBACKS is keyed on. Not taken from the dispatch event -- the
-        # fallback has to answer "what is this harness actually serving", and the answer
-        # lives in the control plane.
-        ctl = _agentcore_control(c)
-        model = ctl.get_harness(harnessId=harness_full_id)["harness"]["model"]
-        current = model.get("bedrockModelConfig", {}).get("modelId", "")
-        fallback = MODEL_FALLBACKS.get(current)
-        if not fallback:
-            # The other way this can decline to do anything, also printed: the declared
-            # model has no onward entry in the chain, so the retry runs unprotected and
-            # an operator reading the log should know which of the two it was.
-            print(f"[driver] no failover for {harness_full_id}: modelId={current!r} has "
-                  "no MODEL_FALLBACKS entry; retrying on the same model")
-            return
-        print(f"[driver] failing over {harness_full_id}: {current} -> {fallback} "
-              "(vendor 5xx burst, per-invocation override)")
-        # The whole config from GetHarness, with modelId repointed -- so inference
-        # settings the harness declares ride along instead of being dropped by a
-        # hand-built override.
+        # Walk the DECLARED model's chain by index rather than re-keying MODEL_FALLBACKS on
+        # the current override. Re-keying would cycle: global.* names us.* as its first rung
+        # and us.* names global.* as its own, so a lookup on the override would ping-pong
+        # between two profiles forever and never reach the model change behind them.
+        previous = declared if depth == 0 else chain[depth - 1]
+        fallback = chain[depth]
+        c["_failover_depth"] = depth + 1
+        print(f"[driver] failing over {harness_full_id}: {previous} -> {fallback} "
+              f"(vendor 5xx burst, per-invocation override, rung {depth + 1}/{len(chain)})")
+        # Deep-copied per rung so the parked config stays the pristine declared one and
+        # each override is its own object. Mutating one shared dict in place would make
+        # every rung ALIAS the last: the request already sent on rung 1 would read back as
+        # rung 2 to anything holding the dict, which is the difference between a test that
+        # proves the chain advanced and a test that cannot tell.
+        model = copy.deepcopy(c["_failover_config"])
         model["bedrockModelConfig"]["modelId"] = fallback
         c["_model_override"] = model
-        _record_failover(c, event, harness_full_id, current, fallback)
+        _record_failover(c, event, harness_full_id, previous, fallback)
         # ModelFailedOver, NOT EscalatedToHuman. Nothing is being escalated: the
         # failover already fixed it and the retry continues. This carried the word
         # "informational" inside a reason string, which was harmless only while the bus
@@ -1921,8 +2002,8 @@ def _maybe_failover_model(c, event) -> None:
         # that had just healed itself.
         ev.emit_event(os.environ["EVENT_BUS"], ev.MODEL_FAILED_OVER, {
             "run_id": event.get("run_id", "?"), "stage": event.get("stage", "?"),
-            "from_model": current, "to_model": fallback,
-            "reason": f"ModelFailover: {current} -> {fallback} (vendor 5xx burst); "
+            "from_model": previous, "to_model": fallback,
+            "reason": f"ModelFailover: {previous} -> {fallback} (vendor 5xx burst); "
                       "informational, pipeline continuing"}, client=c["events"])
     except Exception as exc:  # noqa: BLE001 — never let failover break the retry path
         # Swallowing is still right: a failed failover must not break the retry it was
