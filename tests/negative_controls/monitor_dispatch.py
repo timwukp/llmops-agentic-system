@@ -5490,6 +5490,179 @@ case("prompt: curate reads params.retrieval_oracle_p, which nothing writes",
      [f"{_TO}TestConductorDispatch::test_every_param_a_prompt_reads_has_something_that_writes_it"])
 
 
+# ── the deploy_only rehearsal lane, the ungated-deploy boundaries, and the death
+#    authority (r6e follow-up) ────────────────────────────────────────────────────────
+# These guards protect a mode that deploys with NO gate verdict, so a control that does
+# not kill is worse here than elsewhere: the thing left unguarded is an endpoint nobody
+# approved. Each mutation below is one of the three boundaries the mode's legitimacy rests
+# on, or the mode's own existence.
+_MACHINE = "orchestration/state_machine.asl.json"
+_STARTP = "orchestration/start_pipeline/handler.py"
+_DEPLOY_PROMPT = "agents/deploy/harness.json"
+_DISPATCH = f"{_TO}TestConductorDispatch::"
+
+
+def m308(t):
+    # The mode loses its entrance: the five never-executed states go back to being
+    # reachable only through a gate that has never passed.
+    d = json.loads(t)
+    ch = d["States"]["PipelineModeChoice"]["Choices"]
+    kept = [c for c in ch
+            if not any(r.get("StringEquals") == "deploy_only" for r in c.get("And", [c]))]
+    assert len(kept) == len(ch) - 1, "the deploy_only Choice branch moved"
+    d["States"]["PipelineModeChoice"]["Choices"] = kept
+    return json.dumps(d, indent=2)
+
+
+case("ASL: the deploy_only entrance is removed",
+     _MACHINE, m308,
+     [f"{_DISPATCH}test_state_machine_deploy_only_serves_an_artifact_without_training_or_judging_it",
+      f"{_DISPATCH}test_the_only_way_into_an_ungated_deploy_is_the_dispatch_that_asked_for_one",
+      f"{_DISPATCH}test_every_pipeline_mode_the_machine_routes_on_is_one_the_dispatcher_knows"])
+
+
+def m309(t):
+    # Boundary 1 broken from the inside: a mode read AFTER dispatch now routes into
+    # Deploy, so an eval_only re-judge can serve an endpoint. Exactly what
+    # EvalOnlyStopChoice was written to refuse.
+    d = json.loads(t)
+    c = d["States"]["EvalOnlyStopChoice"]["Choices"][0]
+    assert c["Next"] != "Deploy", "the anchor already points at Deploy"
+    c["Next"] = "Deploy"
+    return json.dumps(d, indent=2)
+
+
+case("ASL: an in-run mode read routes into Deploy",
+     _MACHINE, m309,
+     [f"{_DISPATCH}test_the_only_way_into_an_ungated_deploy_is_the_dispatch_that_asked_for_one"])
+
+
+def m310(t):
+    # A second authority to declare a stage dead. Step Functions would fail the state,
+    # mint a new token, and leave the original harness streaming -- two dispatches of the
+    # replacement, racing the resurrector's resumed session on the old token.
+    d = json.loads(t)
+    assert "HeartbeatSeconds" not in d["States"]["Teardown"]
+    d["States"]["Teardown"]["HeartbeatSeconds"] = 600
+    return json.dumps(d, indent=2)
+
+
+case("ASL: a callback state grows a HeartbeatSeconds",
+     _MACHINE, m310,
+     [f"{_DISPATCH}test_no_harness_state_carries_heartbeat_seconds"])
+
+
+def m311(t):
+    # The absence stays but its reasoning goes. A deliberate omission with no explanation
+    # beside it reads as an oversight, and the next reader re-adds the field.
+    d = json.loads(t)
+    before = d["Comment"]
+    d["Comment"] = before.split("NO harness state carries HeartbeatSeconds")[0].rstrip()
+    assert d["Comment"] != before, "the Comment's heartbeat rationale moved"
+    return json.dumps(d, indent=2)
+
+
+case("ASL: the machine stops recording why it has no heartbeat",
+     _MACHINE, m311,
+     [f"{_DISPATCH}test_no_harness_state_carries_heartbeat_seconds"])
+
+
+def m312(t):
+    # Boundary 2 broken: the mode dispatches with no named artifact, so the deploy agent
+    # is free to serve the newest model.tar.gz it can find in the bucket.
+    m = re.search(r'\n    "deploy_only": \(\n        \("model_artifact_uri",.*?\n    \),\n',
+                  t, re.S)
+    assert m, "MODE_REQUIRED_PARAMS['deploy_only'] moved"
+    return t[:m.start()] + "\n" + t[m.end():]
+
+
+case("start-pipeline: deploy_only stops requiring the artifact it serves",
+     _STARTP, m312,
+     [f"{_DISPATCH}test_deploy_only_is_refused_without_the_artifact_and_the_base_it_merges_into",
+      f"{_DISPATCH}test_every_pipeline_mode_the_machine_routes_on_is_one_the_dispatcher_knows",
+      "tests/test_console_tasks.py::"
+      "test_every_mode_the_console_offers_asks_for_what_the_dispatcher_demands"])
+
+
+def m313(t):
+    # Boundary 2's other half: the base model reverts to whatever DEFAULT_MODELS names.
+    # A presence check can never catch this, which is why the table is separate -- and
+    # a merge onto the wrong weights is only discoverable after the endpoint is paid for.
+    m = re.search(r'MODE_REQUIRED_ROLES = \{.*?\n\}\n', t, re.S)
+    assert m, "MODE_REQUIRED_ROLES moved"
+    return t[:m.start()] + "MODE_REQUIRED_ROLES = {}\n" + t[m.end():]
+
+
+case("start-pipeline: deploy_only accepts a base model nobody chose",
+     _STARTP, m313,
+     [f"{_DISPATCH}test_deploy_only_is_refused_without_the_artifact_and_the_base_it_merges_into",
+      "tests/test_console_tasks.py::"
+      "test_deploy_only_asks_for_the_student_role_the_dispatcher_will_not_default"])
+
+
+def m314(t):
+    # A rehearsal deploy becomes indistinguishable from a gated one in the table every
+    # operator, cost review and triage reads first.
+    m = re.search(r'\n *"pipeline_mode": manifest\["params"\]\.get\("pipeline_mode", "full"\),',
+                  t)
+    assert m, "the run-row pipeline_mode write moved"
+    return t[:m.start()] + t[m.end():]
+
+
+case("start-pipeline: the run row stops saying which mode served the model",
+     _STARTP, m314,
+     [f"{_DISPATCH}test_the_run_row_records_which_mode_served_the_endpoint"])
+
+
+def m315(t):
+    # Boundary 3 broken: the prompt still reads the approval status, nothing supplies one,
+    # and the agent improvises on the field separating a rehearsal from a release. This is
+    # bug #20's shape, and the param existed nowhere until this work.
+    m = re.search(r'\n *"model_package_approval_status": "PendingManualApproval",', t)
+    assert m, "the DEFAULT_PARAMS approval-status entry moved"
+    return t[:m.start()] + t[m.end():]
+
+
+case("start-pipeline: the registry approval status loses its default",
+     _STARTP, m315,
+     [f"{_DISPATCH}test_the_deploy_prompt_is_told_where_the_artifact_it_serves_comes_from",
+      f"{_DISPATCH}test_every_param_a_prompt_reads_has_something_that_writes_it",
+      f"{_DISPATCH}test_every_model_param_a_prompt_reads_is_one_the_driver_supplies"])
+
+
+def m316(t):
+    # The rung order inverts, so the first response to a capacity 5xx is to change model
+    # family -- the one rung that alters what the prompts were written against -- while
+    # the same model's other inference profile, measured at zero invocations during the
+    # r6e storm, goes untried.
+    old = ('    "global.anthropic.claude-fable-5": (\n'
+           '        "us.anthropic.claude-fable-5",\n'
+           '        "global.anthropic.claude-opus-5",\n'
+           '    ),')
+    new = ('    "global.anthropic.claude-fable-5": (\n'
+           '        "global.anthropic.claude-opus-5",\n'
+           '        "us.anthropic.claude-fable-5",\n'
+           '    ),')
+    assert t.count(old) == 1, "the MODEL_FALLBACKS chain moved"
+    return t.replace(old, new, 1)
+
+
+case("driver: the failover chain changes model before changing pool",
+     _DRIVER, m316,
+     [f"{_TO}test_a_model_failover_reaches_the_invoke_and_only_the_invoke"])
+
+
+def m317(t):
+    # The prompt goes back to leaving the agent to find the artifact -- how a run ends up
+    # serving a stranger's weights while every log reads as success.
+    return _edit_prompt(t, "never fall back", "always fall back")
+
+
+case("prompt: deploy may guess which artifact to serve",
+     _DEPLOY_PROMPT, m317,
+     [f"{_DISPATCH}test_the_deploy_prompt_is_told_where_the_artifact_it_serves_comes_from"])
+
+
 #: Where the pristine text of the file currently mutated is parked, so a kill -9 -- which
 #: no handler can intercept -- still leaves the original recoverable. Under the repo root
 #: rather than /tmp because it must be obvious to whoever finds the tree dirty, and

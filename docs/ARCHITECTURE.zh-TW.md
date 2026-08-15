@@ -51,8 +51,8 @@ LLM 判斷。因此編排採用 **Step Functions Standard 狀態機**，智能�
 
 狀態機（`orchestration/state_machine.asl.json`）在正常路徑上有 **12 個 harness 任務狀態**
 —— 每個都是帶 `waitForTaskToken` 的 harness driver Lambda 調用 —— 外加只在迴路中出現的
-`RemediateFinetune`、只在審計模式出現的 `DataAudit`，以及（在 `eval_only` 模式下）
-一個從這同一條路徑中途、也就是 eval 階段進場的入口：
+`RemediateFinetune`、只在審計模式出現的 `DataAudit`，以及兩個從這同一條路徑中途進場的
+入口：`eval_only` 在 eval 階段進場，`deploy_only` 在服務階段進場：
 
 ```
 DataPrepGenerate → DataPrepCurate → FinetuneLaunch → FinetuneAnalyze → EvalGenerate → EvalScore → EvalGate
@@ -61,7 +61,7 @@ DataPrepGenerate → DataPrepCurate → FinetuneLaunch → FinetuneAnalyze → E
              Deploy → SmokeTest → MonitorHealth → Teardown → MonitorReport
 ```
 
-**三種入口模式，由 `StartAt` 的一個 `Choice` 讀執行輸入裡的 `pipeline_mode` 決定**（它讀不到
+**四種入口模式，由 `StartAt` 的一個 `Choice` 讀執行輸入裡的 `pipeline_mode` 決定**（它讀不到
 S3 上的 manifest，這正是模式必須搭在輸入裡的原因）。`full` 就是上面那條 `Default`。
 `data_audit` 是指揮家最便宜的開胃菜：稽核客戶資料，然後在任何 GPU 出現之前停下。
 **`eval_only`** 從 `EvalGenerate` 進場，重新評判一個先前 run 已經產出、也已經付過錢的 artifact，
@@ -76,6 +76,52 @@ manifest 裡根本沒有 finetune 階段可供補救，所以補救路徑只會�
 它的存在來自 r6c：一次 8B 的 run 產出了 12.2 GiB 的模型，改良後的裁決指標必須重算它的分數，
 而在只有 `full` 和 `data_audit` 的時候，唯一的做法是某人工作目錄裡的一支腳本 —— 沒有版本、
 沒有稽核紀錄，在 runs 表裡也看不見。
+
+**`deploy_only`** 從 `Deploy` 進場，用一個先前 run 已經付過錢的 artifact 走完服務尾段
+（`Deploy → SmokeTest → MonitorHealth → Teardown → MonitorReport`）。它存在的理由是：
+**這五個狀態從來沒有執行過一次。** 2026-08-15 實測：`llmops-pipeline-runs` 共 38 筆，
+而 `deploy` / `smoke` / `teardown` 至今發出的階段事件是**零**；S3 裡最新的 `deployment/`
+物件是 2026-07-29，由一支手動腳本寫的。原因不是那五個狀態有 bug，而是算術：
+`Deploy` 唯一的另一個入口是 `QualityGateChoice`，而 `gate_passed=true` 從未產生過，
+所以一個 29 狀態的機器最後五個狀態在結構上不可達，裡面每一個缺陷都還沒被發現。
+近期每一次 run 都死在一個形狀相同、內容各異的一次性缺陷上 ——
+*一個能力被文件、prompt、IAM 三方描述，但沒有任何東西真的到得了它*
+（五次各自獨立的 IAM 授權缺漏，對象都是程式碼一定會呼叫的 API）—— 而這一類缺陷
+只能靠「真的走到那裡」才找得到。所以這個模式是一條**排練通道**：一個
+`ml.g5.xlarge` endpoint-hour、不到 $5、打真實的 AWS 控制面；相對地，要靠一次完整 run
+走到同樣的狀態要 ~$50，而且從來沒有成功過。它便宜、而且不需要偽造任何門檻判決，
+原因是那五個狀態自己的性質：它們的 Payload 只帶 `run_id` / `manifest_uri` / `stage` /
+`task` / `harness_id` / `iteration`，既不讀 `$.evaluation` 也不讀 `$.finetune`。
+
+它同時也是**一次沒有門檻判決的 deploy** —— 那正是 `EvalOnlyStopChoice` 拒絕允許的事情。
+因此它的正當性建立在三條邊界上，每一條都有對應的 guard 測試：
+
+1. **唯一入口是頂層 `Choice`** —— 那次派發**就是**批准，與 `eval_only` 同構。`Deploy`
+   的入口被釘死為 `{PipelineModeChoice, QualityGateChoice}`；而在派發**之後**才讀模式的
+   狀態（`EvalOnlyStopChoice` 就是一個，且正當）只能讓 run 提早結束，不能啟動任何階段。
+2. **產物必須被指名。** `MODE_REQUIRED_PARAMS` 要求 `model_artifact_uri`；而
+   `MODE_REQUIRED_ROLES` —— 這是另一張表，因為 `DEFAULT_MODELS` 永遠會默默補上一個
+   `student`，所以對它做「存在性檢查」永遠不會失敗 —— 要求人類明確**選過**那些 adapter
+   要合併進去的底模。合併到錯的底模，只有在 endpoint 付完錢之後才會被發現。
+3. **Registry 維持 pending。** `model_package_approval_status` 預設
+   `PendingManualApproval`；不能因為三個 canary prompt 回了非空字串，就讓一次排練在
+   Model Registry 留下一個 `Approved` 的 model package。
+
+`pipeline_mode` 現在除了 manifest 也會寫進 run row，所以在每個操作者、成本審查與 triage
+最先讀的那張表裡，排練用的 deploy 與通過門檻的 deploy 永遠不會被混為一談 ——
+endpoint 的帳也分得開。
+
+做這個模式的過程順手翻出兩個潛伏缺陷，都在 `agents/deploy/harness.json`，都屬於上面那一類，
+之所以一直看不見是因為從來沒有東西走到會踩中它們的狀態：deploy prompt **從頭到尾沒說模型
+產物從哪裡來**（`deploy_only` 沒說，完整 run 也沒說 —— 它只寫「把 fine-tuning adapter
+合併進底模權重」，然後把「去哪找」留給 agent，而這正是一個 run 服務了別人的權重、
+同時每一行 log 都讀起來像成功的路徑）；以及它的 smoke 任務叫 agent 用「params 裡的」
+approval status 註冊模型，而 `model_package_approval_status` 在
+`DEFAULT_PARAMS`、console 表單、測試裡**全都不存在**。
+
+這個模式**不是**繞過門檻的方法。`gate_passed` 從未為真是另一個獨立、未解的問題 ——
+是 r6c/r6d 量到的 transfer floor，不是管線問題 —— 而這裡沒有任何一處為了讓排練通道
+能跑而軟化門檻。
 
 兩個 monitor 狀態的位置是由工作本身的形狀決定的，不是喜好問題。**`MonitorHealth`** 必須在
 端點還存在時讀 CloudWatch，而 `Teardown` 在每條路徑上都會刪掉它（包含 `SmokeTest` 的
@@ -738,8 +784,14 @@ eval agent 重新進場、讀自己那個失敗 job 的 `FailureReason`、修自
 × agent 迴圈 × 長串流）。單日
 內 Fable 5 的 5xx 爆發重現約 12 次。設計規則（全文見 [AGENTS.md](../AGENTS.md)）：
 
-1. 每個 harness 都有後備鏈：`global.anthropic.claude-fable-5` →
-   `global.anthropic.claude-opus-5`（同家族，零 prompt 改動）。切換方式是
+1. 每個 harness 都有後備鏈，而它現在是**兩節**：`global.anthropic.claude-fable-5` →
+   `us.anthropic.claude-fable-5` → `global.anthropic.claude-opus-5`。第一節只換
+   **inference profile**、不換模型：同一份權重、同一個價格、零 prompt 改動，
+   但是不同的 Region 池（兩者都是 ACTIVE 的 `SYSTEM_DEFINED` profile，
+   已用 `ListInferenceProfiles` 驗證）。只有第二節才換模型家族。這個節序來自下面第 5 項的
+   r6e 實測 —— 5xx 爆發被限制在單一 profile 上，而同一模型的姊妹 profile 在同一小時內
+   調用數是**零** —— 所以換模型應該是最後手段而不是第一手段：它是唯一會改變
+   「prompt 是針對什麼寫的」那一節。切換方式是
    `InvokeHarness` 的**單次呼叫層 `model` 覆寫** —— 只作用於這一次呼叫，不寫控制面，
    也沒有需要還原的東西。r6e 的後續修補前用的是 `UpdateHarness`：它會鑄出一個不可變的
    新版本並把 DEFAULT endpoint 重新指向，而這裡每個 stage 都是透過 DEFAULT 呼叫的
@@ -765,6 +817,21 @@ eval agent 重新進場、讀自己那個失敗 job 的 `FailureReason`、修自
    這條授權在 r6e 之前是缺的，所以每一次 5xx 觸發 failover 時該讀取都拋
    `AccessDeniedException`，又被保護重試路徑的 `except` 吞掉 —— 這個機制在生產環境
    從未真正執行過一次，而且一聲不響。完整的自動 failover 加固屬於 Phase 6。
+5. **這是 app 層的「可用性降級」決策，而且就照這個名字歸檔。** 在 r6e 風暴時段對
+   CloudWatch `AWS/Bedrock` 的實測：`EstimatedTPMQuotaUsage` 峰值
+   **44,719，對照 4,000,000 的配額 —— 1.1%**；`InvocationThrottles` **完全無資料**；
+   `InvocationServerErrors` 是 **59 次調用中的 46 次，78%**，全部集中在單一 inference
+   profile 上，而同一模型的姊妹 profile 與另一個模型家族在同一時段的流量都是零。
+   所以這些 503 **不是**配額造成的：調升 Service Quotas 在這裡買不到東西，
+   而針對限流的那條標準處方 —— 降低你自己的速率、丟載 —— 也買不到，
+   因為那條處方預設「你自己的需求就是成因」。同樣地，換模型**不是** AWS 對
+   `ServiceUnavailableException` 記載的補救手段；記載的是「帶退避重試」以及
+   「換 Region 或使用跨 Region 推論」，而這正是第一節現在做的事。因此命名紀律是：
+   `_is_model_5xx` 刻意**不含** `ThrottlingException`，而 `_maybe_failover_model`
+   也不掛在任何以 throttling 命名的路徑上 —— 否則下一個在那裡讀到它的人，
+   會為一個容量問題去開配額工單。
+   反面的注意事項：正因為 failover 從未執行過，**任何一節後備的健康狀態都從未被觀測過**
+   —— 在有 run 真的走過它之前，這條鏈是一個未經檢驗的假設。
 
 ## 10. Driver 的回合續接設計（900 秒 Lambda vs 840 秒回合）
 
@@ -811,6 +878,23 @@ Lambda 硬上限 **900 秒**，而 harness 回合預算（`timeoutSeconds`）是
 「heartbeat 18000s」。兩個欄位都被移除，而
 `test_a_heartbeat_interval_requires_something_to_send_heartbeats` 現在會拒絕「沒有送出方的
 欄位」：沒有人在送的心跳間隔不是監控，而是一條沒有任何介面會報出來的、更短的死線。
+
+**「補上送出方」不是缺的那一塊，而 `HeartbeatSeconds` 不會回來。** 上面那個測試只要有東西
+呼叫 `SendTaskHeartbeat` 就會放它進來，讀起來像一項待辦；它不是，而
+`test_no_harness_state_carries_heartbeat_seconds` 現在對每一個 `.waitForTaskToken` state
+無條件這樣宣告。理由是這個平台**已經有**一個宣告階段死亡的權威 —— driver 自己的
+`__liveness__` 心跳加上 `llmops-resurrector`（§7）—— 而兩者不能並存。心跳逾時會讓
+Step Functions 判**這個 state** 失敗，於是重試時**鑄出一個新的隨機 task token**，而且
+**完全不會終止那個停止心跳的 harness**：只有 `.sync` 整合有 best-effort 取消，callback
+模式什麼都沒承諾。所以那個孤兒會繼續串流、繼續燒整個 fleet 共用的帳號層級 TPM（§9：r6e
+的風暴是單一 inference profile 上 78% 的 server error）、也繼續寫它自己的 liveness beat。
+resurrector 的做法相反：它從 parked payload 復原**同一個 session、同一個 token**，
+保住一個既不便宜也不 idempotent 的階段已完成的部分工作 —— S3 manifest append 與
+wall-clock 的 DynamoDB sort key，正是同一種非 idempotent 性，也正是這些 state 帶
+`Retry: NONE` 的原因。兩個宣告階段死亡的權威，等於兩次各自獨立地派出替補，
+所以這個權威只能有一個持有者，而它是「會續跑而不是重跑」的那一個。這段推導也寫進了
+狀態機自己的頂層 `Comment`，因為一個旁邊沒有解釋的「刻意缺席」讀起來像疏漏，
+而守著它的那個 guard 讀起來會像吹毛求疵。
 
 ## 11. 生產環境的 VPC 態勢
 

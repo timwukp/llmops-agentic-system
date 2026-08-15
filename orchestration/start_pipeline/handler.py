@@ -36,6 +36,20 @@ DEFAULT_PARAMS = {
     "training_instance": "ml.g5.2xlarge",
     "inference_instance": "ml.g5.xlarge",
     "gates": {"relative_solve_rate": 0.80, "format_validity": 0.95},
+    # The deploy agent's smoke task registers the model in the Model Registry with an
+    # "approval status per params" -- and no param of that name existed anywhere: not here,
+    # not in the console's field map, not in a test. The prompt named an input that could
+    # never arrive, so the status was whatever the agent decided that turn. Same defect
+    # class as an emitted event with no rule, and nobody had ever reached the deploy stage
+    # to find it (llmops-stage-events has zero deploy/smoke/teardown events, ever).
+    #
+    # PendingManualApproval rather than Approved because approving a model package is the
+    # human decision this platform's whole KMS-signed spine exists to protect, and it must
+    # not be a side effect of the pipeline that produced the model -- least of all in
+    # deploy_only, where no gate was consulted at all. A run that earns Approved gets it
+    # from a human reading the registry, not from an agent that just watched three canary
+    # prompts return non-empty strings.
+    "model_package_approval_status": "PendingManualApproval",
 }
 
 #: Sentinel for "this run was not dispatched from a conductor task".
@@ -311,6 +325,13 @@ def _merge_params(params: dict, plan: dict) -> dict:
 # prompt set) nor a finetune stage entry (where it normally reads the model artifact) exists
 # in its manifest. Missing either one, the eval agent's only correct move is to escalate,
 # which costs a run row and a human's attention to learn something knowable here for free.
+#
+# deploy_only is the same argument one stage further along, and it carries more weight there
+# because this mode reaches Deploy without a gate verdict. Its legitimacy rests entirely on
+# the dispatch being the approval, so the artifact has to be NAMED here: a mode that let the
+# agent find the newest model.tar.gz in the bucket would be a deploy nobody chose the
+# subject of, which is the objection EvalOnlyStopChoice raises against the far milder case of
+# deploying off a re-judge. Refusing at dispatch is also the only place the refusal is free.
 MODE_REQUIRED_PARAMS = {
     "eval_only": (
         ("model_artifact_uri",
@@ -320,16 +341,53 @@ MODE_REQUIRED_PARAMS = {
          "the prompt set to judge against; the 10% val split the eval agent falls back to "
          "is written by data-prep's curate task, which this mode skips"),
     ),
+    "deploy_only": (
+        ("model_artifact_uri",
+         "the model.tar.gz to serve; this mode enters at Deploy, so there is no finetune "
+         "stage in its manifest to read the artifact from and no gate verdict about it"),
+    ),
+}
+
+#: Model roles a mode must have EXPLICITLY named, by plan or by params, before it may start.
+#
+# Separate from MODE_REQUIRED_PARAMS because it asks a different question. That table asks
+# whether a param is present; this one asks whether a role was CHOSEN, and for models those
+# are not the same question -- DEFAULT_MODELS always fills a silent role, so `student` is
+# never absent and a presence check on it can never fail. _resolve_models exists because a
+# default standing in for an approval is this platform's most expensive recurring bug (run
+# 68cfa9c8 executed on a teacher no human signed while every artifact agreed).
+#
+# deploy_only is where that bug would be most immediately fatal. The deploy agent merges the
+# artifact's adapters into the base weights of params.student_model_id; dispatched silently
+# it would get DEFAULT_MODELS' Qwen3-1.7B, and r6e's artifact -- the 12.2 GiB one this mode
+# was built to serve -- is an 8B. Merging adapters into the wrong base does not fail at
+# dispatch, it fails forty minutes and one GPU endpoint later, which is exactly the kind of
+# lesson this mode exists to stop paying for.
+MODE_REQUIRED_ROLES = {
+    "deploy_only": (
+        ("student",
+         "the base model this artifact's adapters merge into. DEFAULT_MODELS would supply "
+         "one silently, and a base that nobody chose is not a base: an artifact merged onto "
+         "the wrong weights is only discoverable after the endpoint is paid for"),
+    ),
 }
 
 
-def _check_mode_prerequisites(merged: dict) -> None:
-    """Refuse a mode whose inputs are absent, before a run_id exists to blame it on."""
+def _check_mode_prerequisites(merged: dict, named_roles=()) -> None:
+    """Refuse a mode whose inputs are absent, before a run_id exists to blame it on.
+
+    `named_roles` is the set of model roles a plan or params EXPLICITLY assigned, which is
+    the only way to tell a chosen model from one DEFAULT_MODELS filled in -- by the time a
+    role reaches the manifest the two are indistinguishable. See MODE_REQUIRED_ROLES.
+    """
     mode = merged.get("pipeline_mode", "full")
-    missing = [(k, why) for k, why in MODE_REQUIRED_PARAMS.get(mode, ())
+    missing = [(f"params.{k}", why) for k, why in MODE_REQUIRED_PARAMS.get(mode, ())
                if not merged.get(k)]
+    missing += [(f"an explicitly named {r} model", why)
+                for r, why in MODE_REQUIRED_ROLES.get(mode, ())
+                if r not in set(named_roles)]
     if missing:
-        detail = "; ".join(f"params.{k} ({why})" for k, why in missing)
+        detail = "; ".join(f"{what} ({why})" for what, why in missing)
         raise ValueError(
             f"pipeline_mode={mode!r} requires {detail}. Refusing at dispatch rather than "
             "starting a run that can only escalate: a half-specified mode produces a "
@@ -343,7 +401,10 @@ def seed_manifest(run_id: str, trigger_source: str, params, plan,
     plan = _as_obj(plan, "plan")
     approval = _as_obj(approval, "approval")
     merged = _merge_params(params or {}, plan or {})
-    _check_mode_prerequisites(merged)
+    _check_mode_prerequisites(
+        merged,
+        set(_role_assignments(plan or {}, "plan"))
+        | set(_role_assignments(params or {}, "params")))
     return {
         "run_id": run_id,
         "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -382,6 +443,16 @@ def handler(event, context=None, clients=None):
         "created_at": manifest["created_at"],
         "trigger_source": trigger_source,
         "iteration": 0,
+        # On the ROW, not only in the manifest, because the run table is what every reader
+        # who is not already holding an S3 client sees: the console's run list, finops
+        # reconciliation, and anyone asking the question this project could not answer for
+        # itself -- of 38 runs, which ones actually served a model? A deploy_only rehearsal
+        # ends in exactly the same terminal state as a full run that passed the gate and
+        # deployed, and without this field the two are indistinguishable from the row. That
+        # is not a reporting nicety: a rehearsal misread as a gated production deploy is a
+        # claim that the quality gate was met, which is the one claim this platform has
+        # never yet been able to make.
+        "pipeline_mode": manifest["params"].get("pipeline_mode", "full"),
     })
 
     ev.emit_event(os.environ["EVENT_BUS"], ev.PIPELINE_STARTED,
@@ -397,7 +468,9 @@ def handler(event, context=None, clients=None):
         # customer's data, report, stop before any GPU is provisioned);
         # "eval_only" re-judges an artifact an earlier run already paid for
         # (params.model_artifact_uri) and stops at the gate verdict without
-        # deploying — see MODE_REQUIRED_PARAMS for what it must be given.
+        # deploying; "deploy_only" enters at Deploy against a named artifact to
+        # rehearse the serving path this machine has never once executed — see
+        # MODE_REQUIRED_PARAMS and MODE_REQUIRED_ROLES for what each must be given.
         input=json.dumps({"run_id": run_id, "manifest_uri": manifest_uri,
                           "iteration": 0,
                           "pipeline_mode": manifest["params"].get("pipeline_mode", "full"),
