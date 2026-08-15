@@ -1030,6 +1030,43 @@ def test_a_dispatched_turn_is_not_re_asked_afterwards(wired, monkeypatch):
     assert calls["n"] == 2
 
 
+def test_accept_turn_that_reproposes_lands_plan_proposed_not_error(wired, monkeypatch):
+    """Live (r6e accept, 2026-08-14): the signed plan failed the dispatcher's
+    schema check (an extra models key), the agent corrected the bytes, and the
+    acceptance interlock then rightly refused the new hash — both controls
+    correct. The agent ended the turn asking for a fresh signature, WITH a full
+    plan trailer. The worker marked that "error", a TERMINAL status that
+    refuses every customer message at the route layer — so the re-accept the
+    agent asked for could never arrive, and a live negotiation became a dead
+    task. An accept turn that ends in a re-proposal must land plan_proposed:
+    the Accept card re-renders against the new bytes and the customer decides."""
+    tid = _mk_task(wired, status="accepting")
+    wired.tasks.items[tid]["approvals"] = [
+        _signed_approval(wired.kms, b'{"goal":"x"}')]
+
+    reply = ("Dispatch was refused: the corrected plan no longer matches the "
+             "hash you signed, and I will not defeat that check. Please "
+             "re-accept the current plan version.\n\n"
+             '```json\n{"plan_uri": "' + _PLAN_URI + '", '
+             '"plan_summary": "schema-fix revision, re-acceptance requested", '
+             '"cost_estimate_usd": 51.1}\n```')
+
+    class _AC:
+        def invoke_harness(self, **kw):
+            return _text_stream(reply)
+
+    monkeypatch.setattr(wired.console, "agentcore_chat", _AC())
+    monkeypatch.setattr(wired.console, "_resolve_harness_id",
+                        lambda x: "llmops_orchestrator-x")
+    wired.console.run_task_turn(tid, accept=True)
+    t = wired.tasks.items[tid]
+    assert t["status"] == "plan_proposed", (
+        f"a re-proposal on an accept turn became {t['status']!r} "
+        f"({t.get('error_msg')!r}) — the customer can never answer a dead task")
+    assert t["plan_summary"].startswith("schema-fix"), \
+        "the re-proposed trailer must register, or Accept signs the old summary"
+
+
 def test_accept_turn_names_the_signed_plan_uri_not_the_default(wired, monkeypatch):
     """The envelope's plan_uri is a SUGGESTION for where to write a new plan; the
     approval binds a specific URI. When the agent wrote its plan somewhere else

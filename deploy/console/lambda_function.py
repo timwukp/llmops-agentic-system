@@ -4209,6 +4209,18 @@ def run_task_turn(task_id, accept=False):
     trailer = _parse_plan_trailer(reply) if reply else None
     if now_status == "dispatched":
         final_status = "dispatched"
+    elif accept and trailer:
+        # The dispatch was refused and the agent RE-PROPOSED — live (r6e accept,
+        # 2026-08-14): the signed plan failed the dispatcher's schema check
+        # (an extra models key), the agent fixed the bytes, and the acceptance
+        # interlock then rightly refused the new hash. Both controls correct;
+        # the agent asked for a fresh signature with a full trailer. Marking
+        # that "error" made the negotiation TERMINAL: error refuses every
+        # customer message at the route layer, so the re-accept the agent
+        # asked for could never arrive. A re-proposal is plan_proposed — the
+        # Accept card re-renders against the new bytes and the customer signs
+        # or walks away with everything on the record.
+        final_status = "plan_proposed"
     elif accept:
         # accepted but the agent never dispatched — that is an error, not drafting
         final_status, err = "error", "accepted plan was not dispatched by the agent"
