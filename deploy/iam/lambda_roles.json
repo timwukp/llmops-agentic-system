@@ -61,6 +61,22 @@
             ]
           },
           {
+            "_comment": "The ONLY dependency of harness_driver's _maybe_failover_model: on a vendor 5xx burst it reads the harness config and repoints modelId at MODEL_FALLBACKS, then handler()'s finally restores it. Two calls, four actions: a harness API authorizes against the underlying AgentCore Runtime and Memory resources as well, so UpdateHarness also needs UpdateAgentRuntime + UpdateMemory -- the same fan-out as the InvokeHarness/InvokeAgentRuntime pair below, published as 'Required IAM permissions for callers' in https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/harness-security.html. GetHarness fans out not at all. The runtime/ and memory/ prefixes match the names AgentCore actually derives for these harnesses (harness_llmops_<agent>_<hash>), so the grant stays scoped instead of falling back to the '*' that deploy/console/iam-policy.json uses. Deliberately NOT folded into InvokeLlmopsHarnessesDualArn above -- that statement is data-plane invoke, this is a control-plane WRITE on a resource all seven agents and every concurrent run share, and merging them would hide that difference behind one Sid. LIVE COST OF ITS ABSENCE: the role shipped with the invoke pair and without any of these four, so get_harness raised AccessDeniedException on every 5xx the failover was ever called for, and `except Exception: pass` ate it -- the mitigation had never once run in production. r6e's FinetuneAnalyze (run-20260814T161302Z-7ff2a30a, 2026-08-14) died ModelUnavailable with the failover silently inert and no log line, no model_failover on the run row, and no ModelFailedOver on the bus to say so. test_driver_role_grants_every_control_plane_call_its_handler_makes now derives the required actions from handler.py, so the next control-plane call added without a grant fails in tests instead of in a storm. It cannot derive the fan-out, though -- UpdateAgentRuntime and UpdateMemory appear nowhere in handler.py as calls -- so that half is a small map in the test citing the doc above, and it has to be updated by hand if AWS changes the contract.",
+            "Sid": "FailoverHarnessModel",
+            "Effect": "Allow",
+            "Action": [
+              "bedrock-agentcore:GetHarness",
+              "bedrock-agentcore:UpdateHarness",
+              "bedrock-agentcore:UpdateAgentRuntime",
+              "bedrock-agentcore:UpdateMemory"
+            ],
+            "Resource": [
+              "arn:aws:bedrock-agentcore:<REGION>:<ACCOUNT_ID>:harness/llmops_*",
+              "arn:aws:bedrock-agentcore:<REGION>:<ACCOUNT_ID>:runtime/harness_llmops_*",
+              "arn:aws:bedrock-agentcore:<REGION>:<ACCOUNT_ID>:memory/harness_llmops_*"
+            ]
+          },
+          {
             "_comment": "DeleteItem on EXACTLY the __liveness__ partition (dynamodb:LeadingKeys): _settle_liveness deletes the beat item at the terminal-return choke point -- the review found a done_at mark makes items immortal and leaks the resurrection count into the subject's next incarnation. LeadingKeys keeps the delete away from real stage events: audit rows stay append-only.",
             "Sid": "DeleteOwnLivenessBeat",
             "Effect": "Allow",

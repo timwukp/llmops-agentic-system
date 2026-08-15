@@ -6624,6 +6624,63 @@ def _allowed_actions(role: str) -> set:
     return allowed
 
 
+def test_driver_role_grants_every_control_plane_call_its_handler_makes():
+    """Same family as start_pipeline's missing PutEvents, but this one stayed invisible.
+
+    harness_driver's role shipped with bedrock-agentcore:InvokeHarness and
+    InvokeAgentRuntime -- and WITHOUT GetHarness/UpdateHarness, which are the only two
+    calls _maybe_failover_model makes. So get_harness() raised AccessDeniedException on
+    every vendor 5xx the failover was ever invoked for, and the
+    `except Exception: pass` guarding the retry path ate it. The mitigation had never
+    once run in production and nothing said so: no log, no model_failover on the run
+    row, no ModelFailedOver on the bus. r6e's FinetuneAnalyze
+    (run-20260814T161302Z-7ff2a30a) then died ModelUnavailable while the failover that
+    existed to prevent exactly that sat inert.
+
+    The unit tests could not have caught it: every one of them injects a fake `ctl`
+    whose get_harness always answers. A fake client is not a permission. So this test
+    reads the role, and DERIVES the required actions from the handler's source rather
+    than from a hand-kept list -- the same reason deploy/07_lambdas.py grows its env
+    contract out of required_env_keys(): the hand-kept version of this exact contract
+    disagreed with the driver for eight days.
+    """
+    src = (REPO / "orchestration/harness_driver/handler.py").read_text()
+    # Both spellings that can reach the control plane: the `ctl` parameter/local that
+    # _agentcore_control() hands out, and a direct call on its return value.
+    called = set(re.findall(r"(?:\bctl|_agentcore_control\([^)]*\))\.([a-z_]+)\(", src))
+    required = {"bedrock-agentcore:" + "".join(w.capitalize() for w in m.split("_"))
+                for m in called}
+    # The action a caller invokes is NOT the whole grant it needs: harness APIs authorize
+    # against the underlying AgentCore Runtime and Memory resources as well. This map is
+    # the one part of this test that cannot come from handler.py -- it is an external
+    # service contract, published as "Required IAM permissions for callers" in
+    # https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/harness-security.html
+    # It is the same shape as the InvokeHarness/InvokeAgentRuntime pair the role already
+    # carries in InvokeLlmopsHarnessesDualArn, which this repo learned the hard way.
+    # UpdateHarness fans out two further ways; GetHarness fans out not at all.
+    FAN_OUT = {
+        "bedrock-agentcore:InvokeHarness": {"bedrock-agentcore:InvokeAgentRuntime"},
+        "bedrock-agentcore:UpdateHarness": {"bedrock-agentcore:UpdateAgentRuntime",
+                                            "bedrock-agentcore:UpdateMemory"},
+    }
+    required |= {dep for action in required for dep in FAN_OUT.get(action, ())}
+    # A regex that matched nothing would make every assertion below vacuously true --
+    # which is the failure mode this whole test exists to punish.
+    assert {"bedrock-agentcore:GetHarness",
+            "bedrock-agentcore:UpdateHarness",
+            "bedrock-agentcore:UpdateAgentRuntime",
+            "bedrock-agentcore:UpdateMemory"} <= required, (
+        f"derivation found {sorted(required)}; the failover's own two calls and the "
+        "fan-out UpdateHarness authorizes against must appear or this test is asserting "
+        "nothing")
+
+    missing = required - _allowed_actions("driver")
+    assert missing == set(), (
+        f"handler.py calls the control plane but llmops-lambda-driver cannot: {sorted(missing)}. "
+        "Add them to deploy/iam/lambda_roles.json roles.driver -- an AccessDenied inside "
+        "_maybe_failover_model is swallowed by design, so this will not surface at runtime.")
+
+
 def test_the_driver_role_can_write_the_report_the_driver_always_writes():
     """Same defect as start_pipeline's missing PutEvents, one function over, and the
     role even said so out loud: its S3 statement was GetObject-only and commented
@@ -11705,7 +11762,11 @@ class TestModelOutageBudget:
 
     def test_a_sustained_outage_settles_as_model_unavailable(self, monkeypatch):
         monkeypatch.setattr(driver.time, "sleep", lambda s: None)
-        ac = FakeAgentCore([DyingStream() for _ in range(6)])
+        # salvage + the whole budget + the exhausting death. Derived, not literal: this
+        # read `range(6)` against a budget of 4, so raising the budget for r6e turned a
+        # test of the EXHAUSTION path into a test of a stage that recovers.
+        deaths = driver.INFRA_ERROR_BUDGET + 2
+        ac = FakeAgentCore([DyingStream() for _ in range(deaths)])
         c = clients(ac)
         out = driver.handler(driver_event(), clients=c)
         assert out == {"status": "failed", "reason": "model_unavailable"}
@@ -11713,11 +11774,42 @@ class TestModelOutageBudget:
             "a vendor outage must not be labelled MissingStageComplete -- one sends "
             "the operator to the AWS status page, the other into a transcript that "
             "never existed")
-        # 6 deaths: salvage + budget 1-4 + the exhausting one. The first cause string
-        # said 5 -- an operator correlating against the vendor status page would
-        # reconstruct the outage window one turn short (review finding 9).
-        assert "6 consecutive turns" in c["sfn"].failures[0]["cause"]
+        # The cause string first said 5 where 6 turns had died -- an operator correlating
+        # against the vendor status page would reconstruct the outage window one turn
+        # short (review finding 9).
+        assert f"{deaths} consecutive turns" in c["sfn"].failures[0]["cause"]
         assert any(e["DetailType"] == ev.PIPELINE_FAILED for e in c["events"].entries)
+
+    def test_the_budget_outlasts_the_storms_that_have_actually_been_measured(self):
+        """The budget's SIZE is the whole mitigation, so it is pinned to evidence.
+
+        At 4 turns / 60s cap the ladder ran ~6 minutes -- a number calibrated against
+        nothing. Both storms ever measured ran ~3x that: r6c's EvalScore 02:18-02:36Z on
+        2026-08-12 (~18 min) and r6e's FinetuneAnalyze 18:21-18:37Z on 2026-08-14
+        (~16 min). r6e proves the ceiling and not the outage killed the run: it gave up
+        at 18:26:57, and the orchestrator's triage got a clean turn at 18:31:59 on the
+        same model every agents/*/harness.json declares.
+
+        A future reduction is not forbidden -- it just has to argue with these minutes.
+        """
+        backoffs = [min(20 * n, driver.INFRA_BACKOFF_CAP_S)
+                    for n in range(1, driver.INFRA_ERROR_BUDGET + 1)]
+        assert sum(backoffs) >= 16 * 60, (
+            f"the ladder waits {sum(backoffs)}s in total, less than the shortest storm "
+            "on record (r6e, ~16 min); a stage would again be failed while its model was "
+            "coming back")
+
+    def test_no_single_backoff_can_look_dead_to_the_resurrector(self):
+        """The liveness beat is written once per turn, so a backoff IS a gap in the beat.
+
+        Grow the budget by adding TURNS, never by lengthening one sleep: a sleep past
+        STALE_MINUTES makes the resurrector wake a second copy of a stage that is merely
+        being patient, and a duplicated finetune stage is not a cheap mistake.
+        """
+        assert driver.INFRA_BACKOFF_CAP_S < resurrector.STALE_MINUTES_DEFAULT * 60 / 2, (
+            f"one backoff of {driver.INFRA_BACKOFF_CAP_S}s is too close to the "
+            f"{resurrector.STALE_MINUTES_DEFAULT}min staleness threshold -- the "
+            "resurrector would duplicate the stage mid-backoff")
 
     def test_the_outage_budget_survives_a_self_reinvoke(self):
         """Same argument as _re_asks and _filtered_turns: the live failure spanned
