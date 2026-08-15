@@ -1753,6 +1753,39 @@ def _is_model_5xx(error: str) -> bool:
                ("InternalServerException", "ServiceUnavailableException"))
 
 
+#: Consecutive dead-stream turns the retry ladder will absorb before it settles the token
+#: ModelUnavailable. Env-overridable (like the resurrector's STALE_MINUTES) so a conductor
+#: watching a live vendor outage can widen it without a redeploy.
+#:
+#: Was 4, with a 60s backoff cap: a ~6 minute ceiling, and it was calibrated against
+#: nothing. Both storms actually measured ran ~3x longer, and the second one is why this
+#: number moved:
+#:
+#:   r6c  EvalScore        2026-08-12 02:18-02:36Z   ~18 min
+#:   r6e  FinetuneAnalyze  2026-08-14 18:21-18:37Z   ~16 min
+#:
+#: r6e is the proof that the ceiling, not the outage, killed the run. Analyze fought from
+#: 18:21:00 to 18:26:57 and gave up. The storm was BURSTY, and the orchestrator's triage
+#: got a clean turn at 18:31:59 -- five minutes later, on the SAME model (every
+#: agents/*/harness.json declares global.anthropic.claude-fable-5), so capacity had
+#: demonstrably returned while the stage that needed it had already been failed. 10 turns
+#: against the cap below is ~18 min of backoff plus the attempts themselves (a 5xx turn
+#: dies in seconds), i.e. ~21-22 min of patience.
+#:
+#: Three ceilings bound how far this may go, and all three still have room:
+#:   - ASL FinetuneAnalyze TimeoutSeconds=3600 is the outer guard.
+#:   - The resurrector wakes a stage whose liveness beat is STALE_MINUTES=20 old, and the
+#:     beat is written once per turn -- so the budget must grow by adding TURNS, never by
+#:     lengthening one sleep past ~20 min. Hence the 180s cap.
+#:   - Lambda's 900s wall does NOT bound this: infra_error_turns rides the
+#:     _self_reinvoke() payload, so the counter survives across invocations.
+INFRA_ERROR_BUDGET = int(os.environ.get("INFRA_ERROR_BUDGET", "10"))
+
+#: Ceiling on one backoff sleep. Deliberately below STALE_MINUTES (see above): a sleep
+#: long enough to look dead to the resurrector would be answered with a duplicate stage.
+INFRA_BACKOFF_CAP_S = 180
+
+
 def _agentcore_control(c: dict):
     """Control-plane client, created on first use — same shape as _kms above.
 
@@ -1838,7 +1871,15 @@ def _maybe_failover_model(c, event) -> None:
         current = model.get("bedrockModelConfig", {}).get("modelId", "")
         fallback = MODEL_FALLBACKS.get(current)
         if not fallback:
+            # Printed because this is one of the two ways the function can decline to do
+            # anything, and silence made them indistinguishable from each other AND from
+            # success. Reached normally on the SECOND 5xx of an invocation: the harness is
+            # already on the fallback, which has no onward entry in MODEL_FALLBACKS.
+            print(f"[driver] no failover for {harness_full_id}: modelId={current!r} has "
+                  "no MODEL_FALLBACKS entry; retrying on the same model")
             return
+        print(f"[driver] failing over {harness_full_id}: {current} -> {fallback} "
+              "(vendor 5xx burst)")
         _set_harness_model(ctl, harness_full_id, model, fallback, wait_ready=True)
         # Parked BEFORE the event so a crash between the two still restores.
         c["_failover"] = {"ctl": ctl, "harness_full_id": harness_full_id,
@@ -1855,8 +1896,21 @@ def _maybe_failover_model(c, event) -> None:
             "from_model": current, "to_model": fallback,
             "reason": f"ModelFailover: {current} -> {fallback} (vendor 5xx burst); "
                       "informational, pipeline continuing"}, client=c["events"])
-    except Exception:  # noqa: BLE001 — never let failover break the retry path
-        pass
+    except Exception as exc:  # noqa: BLE001 — never let failover break the retry path
+        # Swallowing is still right: a failed failover must not break the retry it was
+        # trying to help. Swallowing SILENTLY was the bug, and it cost r6e.
+        #
+        # The driver's role shipped with bedrock-agentcore:InvokeHarness and
+        # InvokeAgentRuntime but WITHOUT GetHarness/UpdateHarness, so the get_harness()
+        # above raised AccessDeniedException on every 5xx this function was ever called
+        # for. Failover has therefore never once run in production, and there was no way
+        # to know: no log here, no log on the no-fallback return, no log on success. The
+        # run row had no model_failover, the bus had no ModelFailedOver, and the only
+        # available reading was "the fallback was tried and did not help". A guard test
+        # now pins the policy to the calls this module makes; this line is what would
+        # have caught it on day one.
+        print(f"[driver] failover attempt failed (continuing to retry on the declared "
+              f"model): {type(exc).__name__}: {exc}")
 
 
 def _restore_failover_model(c, event) -> None:
@@ -2319,12 +2373,16 @@ def _run_stage(event, context=None, c=None):
         # an exhaustion that settles under its real name -- ModelUnavailable tells the
         # operator to check the vendor, MissingStageComplete sends them hunting a
         # transcript that never existed.
+        # r6e (run-20260814T161302Z-7ff2a30a, FinetuneAnalyze) is why the budget below is
+        # INFRA_ERROR_BUDGET rather than a literal 4: the ladder worked exactly as written
+        # and still lost a run whose model had recovered. See that constant for the
+        # measurements.
         if out["error"]:
-            if infra_error_turns < 4:
+            if infra_error_turns < INFRA_ERROR_BUDGET:
                 infra_error_turns += 1
                 if _is_model_5xx(out["error"]):
                     _maybe_failover_model(c, event)
-                wait_s = min(20 * infra_error_turns, 60)
+                wait_s = min(20 * infra_error_turns, INFRA_BACKOFF_CAP_S)
                 messages = _user_text("The stream was interrupted. Continue from "
                                       "where you left off; call your pending inline "
                                       "function.")
@@ -2333,13 +2391,20 @@ def _run_stage(event, context=None, c=None):
                 # hard-killed mid-sleep: no reinvoke, no settle, the counter's progress
                 # lost. If the backoff does not fit, hand the retry to a fresh
                 # invocation instead; its cold start IS the backoff.
+                #
+                # With the cap at INFRA_BACKOFF_CAP_S this branch is taken far more often
+                # than it was at 60s, and that is the intended shape: the deep end of the
+                # ladder wants long waits, and a long wait belongs in a fresh invocation's
+                # wall rather than gambling against this one's.
                 if context and context.get_remaining_time_in_millis() < (
                         wait_s * 1000 + 120_000):
-                    print(f"[driver] stream died again ({infra_error_turns}/4) with "
+                    print(f"[driver] stream died again "
+                          f"({infra_error_turns}/{INFRA_ERROR_BUDGET}) with "
                           f"too little wall left to back off in-place -- handing off: "
                           f"{out['error']}")
                     return _self_reinvoke()
-                print(f"[driver] stream died again ({infra_error_turns}/4), backing "
+                print(f"[driver] stream died again "
+                      f"({infra_error_turns}/{INFRA_ERROR_BUDGET}), backing "
                       f"off {wait_s}s before the retry (re_asks untouched): "
                       f"{out['error']}")
                 time.sleep(wait_s)
