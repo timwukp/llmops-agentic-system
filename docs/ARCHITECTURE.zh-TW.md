@@ -468,12 +468,71 @@ agent 真的照著做了的裁決一樣 —— 那種無法區分，正是 data-
 讀起來像已被回答的原因。
 
 若一輪結束時*沒有* inline-function 呼叫（模型有時會口頭宣稱完成卻漏掉結構化呼叫），
-driver 在同一 session 內最多追問**連續** 2 次，然後以 `MissingStageComplete` 判定階段失敗 ——
+driver 在同一 session 內最多追問**連續** `PROSE_REASK_BUDGET = 2` 次，然後判定階段失敗 ——
 口頭敘述永遠不會被晉升為成功。任何被服務的 tool call 都會重置這個額度：它計的是
 「不再說協議語言的 agent」，而不是相隔一小時各失誤一次、之後已自行恢復的 agent。每個
 fleet prompt 也把這份契約明寫為 TURN-END INVARIANT，點名該 harness 自己的終結工具，並附
 write-first 規則（artifact 先落 S3，宣稱它的呼叫在後）—— 有一個 guard test 從各 harness
-宣告的 tools 雙向推導這句話，讓它無法與工具清單漂移。
+宣告的 tools 雙向推導這句話，讓它無法與工具清單漂移。被**過濾**的回合另有一個同值的獨立常數
+（`FILTERED_TURN_BUDGET = 2`）：兩個數字今天相等而成因不同，共用一個常數會讓它們被悄悄綁死。
+
+**證據只能當預算花，永遠不能當判決。** 這是本系統史上被引用最多的死因 ——
+`MissingStageComplete` 是 32 次執行中 15 次的死因，且 15/15 致命 —— 所以值得把「沒有採用的
+那個修法」也講清楚。追問額度用盡時，driver 會從耐久狀態重新推導一份**宣稱**
+（`_derive_stage_claim`：manifest 的 `stages[stage]` 條目、以及 agent 寫在它旁邊那個薄的
+`"<stage>.<task>.i<n>"` 條目裡的 S3 URI），用 `verify_outputs` 自己重驗（逐 URI
+`head_object`，零新 IAM），並把結果指紋化成 `(present_count, total_bytes)`。
+它買到的是**回合，不是成功**：
+
+| 宣稱 | 讀法 | 授予 |
+|---|---|---|
+| 非空、無缺件、指紋**未變** | 看起來做完了 | 一次 `EVIDENCE_REASK_BUDGET` 回合，把 driver 自己驗過的 URI 原樣引述回去並要求用它們呼叫 `stage_complete` |
+| 指紋**嚴格成長**，或部分到位 | 還在做 | 一次 `PROGRESS_REASK`，上限 `PROGRESS_REASK_CAP`，點名 `checkpoint`（若有 job 在跑則點名 `job_launched`） |
+| 為空，或全數缺件 | 無證據 | 逐位元落回今天的 `MissingStageComplete` |
+
+若授予用盡而**確實**有驗到的證據，階段以一個新的、可區分的名稱結案 ——
+**`UnclaimedStageOutputs`** —— cause 寫明 driver 驗到的件數與前兩個 URI。run 仍然升級，
+沒有任何東西自動成功。改變的是人類現在拿到一份清單，可以重派一個 stage 而不是重跑整條管線。
+它不能再多做一步的理由：那些證據每一份都是被審者自己寫的 —— S3 物件與 manifest 條目都是 ——
+而一個能改寫自己所驗證產物的 role，可以為自己的證據洗白。用 15 次**大聲的失敗**換未知次數的
+**安靜的假成功**是嚴格更糟：假 `SUCCESS` 會被寫進 `manifest["stages"]`（每個後續 stage 都靠
+`stage_fact_params` 讀它），也會寫進人類要批准的報告。因此這份宣稱**刻意不**寫回 manifest，
+而 driver 真正非自陳的通道（`job_launched` 停泊 token、EventBridge 依真實 SageMaker 作業狀態
+結案）仍是唯一 agent 無法偽造的那一條。`UnclaimedStageOutputs` 從 `MissingStageComplete`
+切出來，用的是當年切出 `ModelUnavailable` 與 `ContentFiltered` 的同一個論證：兩者需要不同的
+操作者反應。**不需要改 ASL** —— 每個 state 都已有 `States.ALL` → `EscalateFail`，並有守門
+測試斷言這個新名稱不出現在任何 `ErrorEquals` 裡，讓沒有人能悄悄加一條「就重試它」。
+
+**每 stage 的協定紀錄讓那個比率變成可量測。** `re_asks`、`filtered_turns` 與 typed-call 救援
+過去只活在記憶體與 `print` 裡，而唯一的每回合耐久寫入是會覆寫自己的心跳 —— 所以一個燒掉三個
+壞回合的 stage，在所有耐久產物裡與一個乾淨的 stage **完全無法分辨**，這正是 p̂ = 0.8421 只能
+靠人工翻日誌數出來的原因。driver 現在為每個 stage epoch 在 `llmops-stage-events` 寫一列
+（`sk = protocol#<stage>#<task>#e<epoch>`，零新 IAM、零新資源），帶 `turns`、
+`serviced_turns`、`prose_turns`、`filtered_turns_total`、`recovered_typed_calls`、
+`recovered_ending_in_prose`、`infra_error_turns_total`、`deadline_cuts`。它寫在 stop_reason
+覆寫與 typed-call 救援**之後**，而不是之前 —— 那個順序正是 `[driver] turn` 那行日誌的缺陷：
+它印得太早，所以實際上被服務的回合會顯示 `tool=None`。寫**絕對值**而非 `ADD`，並帶
+`ConditionExpression="attribute_not_exists(turns) OR turns <= :turns"`，讓遲到的重播無法把
+計數器往回走；條件被拒就吞掉並印一行，因為 telemetry 永不殺工作。計數器與 `epoch` 一起搭
+心跳 payload，所以被復活的 stage 是接續編號而不是覆寫。兩個放置陷阱，都已核對過 console 的
+真實程式碼：`"protocol#" > "A"` = `TIMELINE_SK_MAX`，所以這些列落在 timeline 查詢之外、
+console 不用改（有守門測試釘住這個字典序事實）；而 `_recent_session_ids` 查事件表**沒有 sk
+過濾**並讀 `json.loads(detail)["task"]`，所以一列沒有 `detail` 屬性就會捏造出一個沒有 span 的
+session id —— 因此 `detail` 一定帶 `task`，並雙向釘住。`protocol_rollup(items)` 是一個只吃這些
+列的純函式，算出 per stage 與 per run 的結構化呼叫率。
+
+兩個唯讀工具把迴圈收起來。`tools/audit_drift.py` 回答「生產是不是在跑這棵樹的程式碼」，
+五條腿（IAM inline policy、狀態機定義、harness 設定、Lambda 設定、逐 zip member 的 Lambda
+程式碼）全部用 deploy 腳本自己的比較器，且只有「每一條腿都比較過且乾淨」才 exit `0` ——
+`2` 表示有東西看不到，那不是通過。它存在是因為那個答案曾經連續數週實測為「否」：2026-08-15
+排練之前，`eval_only` 從未被部署、`_check_mode_prerequisites` 完全不存在於 live 的 start
+Lambda、3/7 prompt 加 4/7 Lambda 已漂移 —— 沒有一項是讀工作樹的測試套件看得見的。
+`tools/probe_protocol_reliability.py` 的樣本量是導出的而非硬編：要在連過 n 次後以 95% 信心說
+真實通過率 ≥ p，需 `p**n <= alpha`，即 `n = ceil(log(alpha)/log(p))` → 0.80 要 **14 次
+($7.42)**、0.90 要 **29 次 ($15.37)**（`PROBE_UNIT_COST_USD = 0.53`，來源是 2026-08-15 那次
+實測成本）。它的 Wilson 區間由測試釘在 console 的 `_wilson` 上（一致到 1e-12），而它的 ledger
+寫在每次派發**之前**，所以同一個 slot 跨天也永不被派兩次。42% 與 13% 這兩個預測**不會**因為
+以上任何一項而被視為已修好 —— 它們要靠跑那支探測重新量測，而那需要另案授權。
 
 turn 的接力本身由**心跳 + 復活者**這對機制看守。driver 的自我重調是 async Lambda
 invoke —— fire-and-forget，而 Lambda 真的丟過一次（run 68cfa9c8 token 停泊、Step

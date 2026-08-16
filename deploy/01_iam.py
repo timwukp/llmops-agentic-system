@@ -189,11 +189,23 @@ def find_region_conflicts(iam, role_names, region):
     return out
 
 
-def show_diff(label, current, desired):
+def policy_diff(label, current, desired):
+    """The unified diff between a live document and the one this repo would send, [] if none.
+
+    Split out of show_diff so the comparison is available WITHOUT the printing, which is
+    what a read-only audit needs: the deploy path's comparators were all post-write-only
+    (they run inside ensure_role, on the way to a put), so "is production running this
+    tree's policy" was a question only a deploy could answer -- and answering it that way
+    is a write. tools/audit_drift.py is the read-only caller.
+    """
     cur = json.dumps(current, indent=2, sort_keys=True).splitlines() if current else []
     des = json.dumps(desired, indent=2, sort_keys=True).splitlines()
-    diff = list(difflib.unified_diff(cur, des, fromfile=f"{label} (current)",
+    return list(difflib.unified_diff(cur, des, fromfile=f"{label} (current)",
                                      tofile=f"{label} (desired)", lineterm=""))
+
+
+def show_diff(label, current, desired):
+    diff = policy_diff(label, current, desired)
     if not diff:
         print(f"    {label}: no change")
         return False

@@ -36,6 +36,10 @@ jobs:
         run: |
           python deploy/01_iam.py --region us-east-1 --account-id 123456789012 --dry-run > /dev/null
           python deploy/03_storage.py --region us-east-1 --account-id 123456789012 --dry-run > /dev/null
+          # The drift audit's OWN sent side, built with no AWS call at all. This is where a
+          # handler that starts requiring a new env var, or a config that keeps a
+          # <PLACEHOLDER>, fails the build -- instead of at a session start weeks later.
+          python tools/audit_drift.py --region us-east-1 --account-id 123456789012 --offline > /dev/null
           echo "dry-runs OK"
       - name: Unit tests
         run: python -m pytest tests/ -q --ignore=tests/golden

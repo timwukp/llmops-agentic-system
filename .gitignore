@@ -18,3 +18,7 @@ pipeline/v2/out/
 # by deploy.sh and by tests/test_intro_player.js. Committing it would give the repo a second,
 # staler copy of a file whose inputs are already tracked.
 build/
+
+# tools/audit_drift.py --json. Holds live ARNs, and therefore this account's id: the
+# redaction scanner guards tracked files, so the answer is to never track this one.
+/drift-audit*.json
