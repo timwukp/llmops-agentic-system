@@ -120,7 +120,37 @@ class FakeTable:
         self.items, self.updates = [], []
         self.query_result = []
 
-    def put_item(self, Item):
+    def put_item(self, Item, **kw):
+        """Append, and honour a ConditionExpression when one is given.
+
+        The kwargs used to be rejected outright, which is the dangerous direction for a
+        double to be wrong in: the driver's protocol record writes with a monotonic guard,
+        every such write raised TypeError inside the driver's own best-effort try/except,
+        and the row simply never existed while the tests went green.
+
+        A CONDITIONAL put also replaces the row at that key, because that guard exists to
+        keep exactly one row per key. Unconditional puts still append: the stage-event sk
+        carries a whole-second timestamp, so in a test where turns take no time at all
+        real DynamoDB would collapse rows that production writes minutes apart, and a fake
+        that reproduced that would be modelling the clock, not the code.
+        """
+        cond = kw.get("ConditionExpression")
+        vals = kw.get("ExpressionAttributeValues") or {}
+        key = {k: Item[k] for k in ("run_id", "sk") if k in Item}
+        prior = None
+        for item in self.items:
+            if key and all(item.get(k) == v for k, v in key.items()):
+                prior = item
+        if isinstance(cond, str):
+            # The one shape in use: `attribute_not_exists(a) OR a <= :a` -- monotonic.
+            attr = cond.split("attribute_not_exists(", 1)[1].split(")", 1)[0].strip()
+            _, _, tail = cond.partition(" OR ")
+            lhs, op, rhs = (p.strip() for p in tail.split())
+            assert lhs == attr and op == "<=", f"unsupported condition: {cond}"
+            if prior is not None and attr in prior and not prior[attr] <= vals[rhs]:
+                raise _conditional_check_failed()
+            if prior is not None:
+                self.items.remove(prior)
         self.items.append(Item)
 
     def update_item(self, **kw):
@@ -215,13 +245,27 @@ class FakeDDB:
 
 
 class FakeS3:
-    def __init__(self, existing=()):
+    """`existing` answers head_object; `sizes` gives it a ContentLength.
+
+    The size map exists because the driver's evidence probe distinguishes "outputs are
+    still being written" from "outputs are finished and unclaimed" by comparing byte
+    totals across probes -- a double that answered head_object with None could not
+    express either state. Default 1 byte, so an object that exists is never zero-sized.
+    `heads` records the calls, which is how a test proves the probe happened at all.
+    """
+
+    def __init__(self, existing=(), sizes=None):
         self.existing = set(existing)
         self.objects = {}
+        self.sizes = dict(sizes or {})
+        self.heads = []
 
     def head_object(self, Bucket, Key):
-        if f"s3://{Bucket}/{Key}" not in self.existing:
+        uri = f"s3://{Bucket}/{Key}"
+        if uri not in self.existing:
             raise Exception("404")
+        self.heads.append(uri)
+        return {"ContentLength": self.sizes.get(uri, 1)}
 
     def put_object(self, Bucket, Key, Body, **kw):
         self.objects[f"s3://{Bucket}/{Key}"] = Body
@@ -12259,6 +12303,739 @@ def test_the_outage_backoff_respects_the_lambda_wall(monkeypatch):
     assert out == {"status": "self_reinvoked_between_turns"}, (
         f"{out} -- the outage branch slept into the Lambda wall instead of handing off")
     assert not slept, f"slept {slept} with only 70s of wall left"
+
+
+# ── the failover chain is keyed on a DECLARED model id ───────────────────────────────
+# _maybe_failover_model looks MODEL_FALLBACKS up by the model id GetHarness DECLARES.
+# A miss is not an error: it prints one line and returns, so the ladder retries the
+# same 5xx model with failover silently disabled. Nothing else notices, because failover
+# has never executed a line in production -- there is no run to compare against. So the
+# key-set membership has to be a test, and it has to be derived from the list that
+# decides what gets deployed rather than from a hand-kept copy of it.
+
+def _harness_deployer():
+    return _load("deploy_harnesses_fallbacks", "deploy/05_harnesses.py")
+
+
+def test_every_deployed_harness_declares_a_model_with_a_fallback_chain():
+    dep = _harness_deployer()
+    missing = {}
+    for agent in dep.AGENTS:
+        cfg = json.loads((REPO / "agents" / agent / "harness.json").read_text())
+        model_id = cfg["model"]["bedrockModelConfig"]["modelId"]
+        if model_id not in driver.MODEL_FALLBACKS:
+            missing[agent] = model_id
+    assert not missing, (
+        f"{missing} declare model ids that are not MODEL_FALLBACKS keys "
+        f"(keys: {sorted(driver.MODEL_FALLBACKS)}). _maybe_failover_model looks the "
+        "chain up by the DECLARED id and treats a miss as 'no failover configured' -- "
+        "it prints and returns, so the retry ladder spends its whole budget on the "
+        "model that is already 5xx-ing. Pinning a harness to a dated model id without "
+        "adding that id here disables failover for that agent, silently, on a code "
+        "path production has never executed.")
+
+
+def test_the_agent_configs_on_disk_are_exactly_the_ones_the_deployer_ships():
+    """Otherwise the guard above is trivially evaded: a new agents/<x>/harness.json that
+    nobody added to AGENTS is both unprotected AND never deployed, and the second half
+    is what hides the first (05_harnesses.py's own comment: "a config on disk that no
+    script names is a harness that silently never exists")."""
+    dep = _harness_deployer()
+    on_disk = {d.name for d in (REPO / "agents").iterdir()
+               if (d / "harness.json").exists()}
+    assert set(dep.AGENTS) == on_disk, (
+        f"AGENTS={sorted(dep.AGENTS)} vs on disk={sorted(on_disk)}")
+
+
+def test_the_harness_template_is_not_a_deployable_config():
+    """agents/harness.json.template declares a model id that is NOT a fallback key, and
+    it is deliberately outside the guard above -- it is an illustration, not a harness.
+
+    That exemption rests on a premise, so the premise is the assertion: the template
+    still carries unresolved <PLACEHOLDER> tokens, so config_subst.resolve would reject
+    it and no deploy path can send it. The day someone fills those in, this fails and
+    the template has to earn its way into AGENTS (and therefore into MODEL_FALLBACKS)
+    instead of quietly becoming an unprotected model id."""
+    sys.path.insert(0, str(REPO / "deploy"))
+    import config_subst  # noqa: PLC0415 — deploy/ is not a package
+    tmpl = json.loads((REPO / "agents" / "harness.json.template").read_text())
+    assert config_subst.unresolved(tmpl), (
+        "harness.json.template no longer carries placeholders, so it is now a "
+        "deployable config outside every guard that covers agents/*/harness.json")
+    assert tmpl["model"]["bedrockModelConfig"]["modelId"] not in driver.MODEL_FALLBACKS, (
+        "the template's model id is now a MODEL_FALLBACKS key, so this exemption is "
+        "dead weight -- delete this test and let the template into AGENTS")
+
+
+# ── the dominant cause of death: prose where a call belonged ─────────────────────────
+# MissingStageComplete is 15 of 32 historical executions, 15/15 fatal, five times the
+# runner-up -- and several of those stages had all of their work in S3 already. The fix
+# is NOT to believe the evidence: the manifest and the objects are both agent-writable,
+# so accepting them would make the agent its own verifier. Evidence buys BOUNDED extra
+# turns and, when those are spent, a settle under a name an operator can act on.
+#
+# Every test below is written against that line: the grants are bounded and the verdict
+# is never bought.
+
+MANIFEST_URI = "s3://llmops-data-test/runs/run-test-1/manifest.json"
+
+
+def _claimed_s3(uris, present=None, sizes=None, entry="data-prep.generate.i0"):
+    """A FakeS3 holding a manifest whose stage entry names `uris` -- exactly the shape an
+    agent produces itself (handle_stage_complete records that agents write their own thin
+    `<stage>.<task>.i<n>` entries into the same map).
+
+    `present` defaults to all of `uris`, so the interesting cases are the ones that pass
+    it explicitly: a manifest naming objects that are not there is a claim, not evidence.
+    """
+    s3 = FakeS3(existing=uris if present is None else present, sizes=sizes)
+    s3.objects[MANIFEST_URI] = json.dumps(
+        {"run_id": "run-test-1", "iteration": 0,
+         "stages": {entry: {"status": "completed", "outputs": list(uris)}}})
+    return s3
+
+
+class _GrowingS3(FakeS3):
+    """Every probe pass sees the same objects one chunk bigger -- an agent still writing.
+
+    Growth is keyed on how many times THIS uri has been headed, so one probe pass reads a
+    consistent size and the next reads a larger one, which is exactly the signal the
+    driver uses to tell "still working" from "finished and silent".
+    """
+
+    def head_object(self, Bucket, Key):
+        uri = f"s3://{Bucket}/{Key}"
+        head = super().head_object(Bucket, Key)
+        return {**head, "ContentLength": 100 * self.heads.count(uri)}
+
+
+class _BoundedAgentCore(FakeAgentCore):
+    """Refuses to be invoked past a ceiling, so an UNCAPPED grant fails instead of hanging.
+
+    FakeAgentCore returns an empty stream once its scripts run out rather than raising, so
+    against `_GrowingS3` -- where every pass reads more bytes than the last, and so every
+    pass looks like progress -- a driver whose progress cap has been removed loops forever
+    on a fake that never objects. The negative control for that cap therefore never went
+    red; it hung, for 39 minutes, printing nothing. A budget test has to be able to observe
+    the budget being exceeded, which means the double has to be the thing that stops.
+    """
+
+    def __init__(self, scripts, limit):
+        super().__init__(scripts)
+        self.limit = limit
+
+    def invoke_harness(self, **kw):
+        assert len(self.calls) < self.limit, (
+            f"the driver asked for turn {len(self.calls) + 1} against a ceiling of "
+            f"{self.limit}: a grant payable in the agent's own writes is uncapped, so a "
+            "stage that appends one byte per turn is immortal")
+        return super().invoke_harness(**kw)
+
+
+PROSE = "The dataset is written and everything checks out."
+
+
+def test_durable_outputs_never_promote_a_prose_turn_to_success():
+    """The hole this whole design exists to keep shut.
+
+    An agent that writes real outputs to S3, records them in the manifest itself, and
+    then never makes the terminal call is the EXACT configuration a reward-hacking agent
+    would present -- and the one an honest-but-sloppy agent presents too. The driver may
+    not tell them apart, so it must not settle either as SUCCESS: the evidence is all
+    agent-written, and a driver that accepts it hands over its own verifier. Fifteen loud
+    failures are worth more than an unknown number of silent false successes, because a
+    fabricated success writes an unfinished stage into manifest["stages"], which every
+    downstream stage reads as fact and which reaches the report a human approves.
+    """
+    uri = "s3://llmops-data-test/runs/run-test-1/raw/data.jsonl"
+    ac = FakeAgentCore([text_stream(PROSE)] * 6)
+    c = clients(ac, _claimed_s3([uri]))
+    out = driver.handler(driver_event(), clients=c)
+    assert out["status"] == "failed", "verified outputs were promoted to a success"
+    assert c["sfn"].successes == [], (
+        "the task token was completed on evidence the AGENT wrote -- the driver just "
+        "made the claimant its own verifier")
+    assert c["sfn"].failures[0]["error"] == driver.UNCLAIMED_OUTPUTS_ERROR
+    assert uri in c["sfn"].failures[0]["cause"], (
+        "the cause must name what the driver verified, or the operator cannot tell this "
+        "from an agent that did nothing")
+    assert out["verified_outputs"] == [uri]
+    assert any(e["DetailType"] == ev.PIPELINE_FAILED for e in c["events"].entries)
+
+
+def test_verified_outputs_buy_one_more_re_ask_and_not_a_verdict():
+    """What the evidence IS allowed to buy: one more turn, carrying information the agent
+    did not have -- which of its own outputs the driver can independently see."""
+    uri = "s3://llmops-data-test/runs/run-test-1/raw/data.jsonl"
+    ac = FakeAgentCore([text_stream(PROSE), text_stream(PROSE), text_stream(PROSE),
+                        tool_use_stream("stage_complete", {"outputs": [uri]}),
+                        text_stream("ack")])
+    c = clients(ac, _claimed_s3([uri]))
+    out = driver.handler(driver_event(), clients=c)
+    assert out["status"] == "completed", (
+        "three prose turns killed a stage whose outputs the driver could see, and whose "
+        "next turn made the call -- the evidence-backed grant never happened")
+    assert not c["sfn"].failures
+    granted = ac.calls[3]["messages"][-1]["content"][0]["text"]
+    assert uri in granted, "the granted turn must quote the URIs the driver verified"
+    assert "stage_complete" in granted
+
+
+def test_the_evidence_grant_is_spent_once_per_stage_attempt():
+    """One grant, not one per turn: the same unchanged manifest entry cannot keep earning
+    turns, or the bound is decorative and a silent agent bills tokens until the wall."""
+    uri = "s3://llmops-data-test/runs/run-test-1/raw/data.jsonl"
+    ac = FakeAgentCore([text_stream(PROSE)] * 8)
+    c = clients(ac, _claimed_s3([uri]))
+    out = driver.handler(driver_event(), clients=c)
+    assert len(ac.calls) == 4, (
+        f"{len(ac.calls)} turns: the budget is PROSE_REASK_BUDGET + "
+        "EVIDENCE_REASK_BUDGET, and an unchanged claim earns the second one exactly once")
+    assert out["status"] == "failed"
+    assert c["sfn"].failures[0]["error"] == driver.UNCLAIMED_OUTPUTS_ERROR
+
+
+def test_the_ordinary_re_ask_costs_no_s3_read():
+    """The probe sits AFTER the ordinary budget, and that ordering is part of the design.
+
+    A prose turn-end is an ordinary event -- the plain RE_ASK absorbs one or two on runs
+    that then finish cleanly -- so probing durable state on each one would add a manifest
+    GET plus a head_object per claimed output to the COMMON path, to compute an answer
+    nothing is allowed to use yet. It would also move the expensive question from "this
+    stage is about to die" to "this stage stumbled", which is where an unnoticed cost
+    lives.
+
+    Asserted as an absence of S3 reads rather than by counting turns, because that is the
+    only form the ordering takes at runtime: a grant offered too early spends the same
+    number of turns as one offered on time, so every test above stays green if the two
+    branches are hoisted above the `re_asks` check.
+    """
+    uri = "s3://llmops-data-test/runs/run-test-1/raw/data.jsonl"
+    ac = FakeAgentCore([text_stream(PROSE), text_stream(PROSE),
+                        tool_use_stream("stage_complete", {"outputs": [uri]}),
+                        text_stream("ack")])
+    c = clients(ac, _claimed_s3([uri]))
+    out = driver.handler(driver_event(), clients=c)
+    assert out["status"] == "completed" and not c["sfn"].failures, (
+        "two prose turns are inside PROSE_REASK_BUDGET; this stage should have reached "
+        "its terminal call untouched")
+    assert c["s3"].heads == [uri], (
+        f"S3 was read {c['s3'].heads} for a stage that never exhausted its prose budget. "
+        "The one legitimate head here is handle_stage_complete verifying the claim it was "
+        "given; anything before it means the evidence probe ran on an ordinary re-ask")
+
+
+def test_growing_outputs_buy_progress_turns_and_a_stalled_claim_buys_none():
+    """The two sub-cases the byte total separates.
+
+    An agent whose objects are still GROWING is working and merely not saying so, and
+    deserves turns. An agent whose claim has not moved has stopped, and deserves none:
+    that asymmetry is why the fingerprint is bytes and not just presence.
+    """
+    uri = "s3://llmops-data-test/runs/run-test-1/raw/data.jsonl"
+    growing = _GrowingS3(existing=[uri])
+    growing.objects.update(_claimed_s3([uri]).objects)
+    ac_grow = FakeAgentCore([text_stream(PROSE)] * 12)
+    driver.handler(driver_event(), clients=clients(ac_grow, growing))
+
+    ac_stall = FakeAgentCore([text_stream(PROSE)] * 12)
+    driver.handler(driver_event(), clients=clients(ac_stall, _claimed_s3([uri])))
+
+    assert len(ac_stall.calls) == 4, "a stalled claim bought a progress turn"
+    assert len(ac_grow.calls) > len(ac_stall.calls), (
+        "outputs growing in S3 bought nothing -- the driver cannot tell an agent that is "
+        "still writing from one that has stopped")
+
+
+def test_the_progress_grant_is_bounded():
+    """Even against outputs that grow forever, the ceiling holds: 2 prose re-asks + 1
+    evidence grant + PROGRESS_REASK_CAP progress grants, then the stage settles. A budget
+    payable in the agent's own writes has to be capped, or a stage that appends one byte
+    per turn is immortal."""
+    uri = "s3://llmops-data-test/runs/run-test-1/raw/data.jsonl"
+    growing = _GrowingS3(existing=[uri])
+    growing.objects.update(_claimed_s3([uri]).objects)
+    ceiling = (driver.PROSE_REASK_BUDGET + driver.EVIDENCE_REASK_BUDGET
+               + driver.PROGRESS_REASK_CAP + 1)
+    # Bounded, not scripted-and-hope: outputs that grow forever are exactly the input a
+    # missing cap turns into an infinite loop, and the fake is the only thing in this test
+    # that can stop it. Slack above the ceiling so the failure names the overrun.
+    ac = _BoundedAgentCore([text_stream(PROSE)] * 30, limit=ceiling + 4)
+    c = clients(ac, growing)
+    out = driver.handler(driver_event(), clients=c)
+    assert len(ac.calls) == ceiling, f"{len(ac.calls)} turns against a ceiling of {ceiling}"
+    assert out["status"] == "failed"
+    assert c["sfn"].failures[0]["error"] == driver.UNCLAIMED_OUTPUTS_ERROR
+
+
+def test_a_partially_written_claim_is_progress_not_completion():
+    """Some outputs there and some missing is a stage MID-WRITE. It must not be offered
+    the "you look finished, just name them" prompt, because telling a half-written stage
+    to declare completion is how an incomplete stage gets claimed as done."""
+    here = "s3://llmops-data-test/runs/run-test-1/raw/data.jsonl"
+    gone = "s3://llmops-data-test/runs/run-test-1/raw/holdout.jsonl"
+    ac = FakeAgentCore([text_stream(PROSE)] * 12)
+    c = clients(ac, _claimed_s3([here, gone], present=[here]))
+    driver.handler(driver_event(), clients=c)
+    granted = ac.calls[3]["messages"][-1]["content"][0]["text"]
+    assert "checkpoint" in granted and "job_launched" in granted, (
+        "a partially written claim got the completion prompt; it should be told how to "
+        "ask for another turn, or how to park on a job that outlives this one")
+    assert here not in granted, "the progress prompt must not read as a verified claim"
+
+
+def test_an_absent_manifest_still_settles_missing_stage_complete():
+    """No durable evidence means the path is byte-identical to the one that shipped: same
+    name, same three turns. The new branch is reachable only past the old budget, so a
+    stage that produced nothing dies exactly as it did before."""
+    ac = FakeAgentCore([text_stream(PROSE)] * 6)
+    c = clients(ac)  # empty FakeS3: no manifest object at all
+    out = driver.handler(driver_event(), clients=c)
+    assert len(ac.calls) == 3
+    assert c["sfn"].failures[0]["error"] == "MissingStageComplete"
+    assert out["reason"] == "missing stage_complete"
+
+
+def test_a_claim_whose_objects_are_absent_is_not_evidence():
+    """A manifest entry is a CLAIM; only head_object makes it evidence. An agent that
+    writes URIs it never uploaded buys nothing -- which is the same guard that keeps
+    stage_complete honest, applied to the same data one layer earlier."""
+    ac = FakeAgentCore([text_stream(PROSE)] * 6)
+    c = clients(ac, _claimed_s3(["s3://llmops-data-test/runs/run-test-1/raw/x.jsonl"],
+                                present=[]))
+    out = driver.handler(driver_event(), clients=c)
+    assert len(ac.calls) == 3, "an unverifiable claim bought a turn"
+    assert c["sfn"].failures[0]["error"] == "MissingStageComplete"
+    assert "verified_outputs" not in out
+
+
+def test_the_evidence_probe_never_reads_the_agents_turn_text():
+    """The single invariant that keeps the probe from becoming the prose parser this
+    driver must not have. Source-scanned rather than behaviour-tested on purpose: the
+    day someone "improves" the claim by scraping URIs out of the turn, every behaviour
+    test above still passes and the driver has started inventing claims."""
+    src = (REPO / "orchestration/harness_driver/handler.py").read_text()
+    body = src[src.index("def _s3_uris_in"):src.index("JUDGE_PROMPT_KEY")]
+    # Prose about not reading prose is still prose: docstrings and comments are stripped
+    # so this reads the CODE, which is the only thing that can actually do it.
+    code = "\n".join(line.split("#")[0]
+                     for i, chunk in enumerate(body.split('"""')) if i % 2 == 0
+                     for line in chunk.splitlines())
+    # Word-boundary, not substring: `.get("text")` and `turn["text"]` are the same defect
+    # spelled differently, and a list of literal spellings only forbids the ones somebody
+    # thought of. `out` cannot be forbidden as a bare word -- it is _s3_uris_in's own
+    # accumulator parameter -- so it is forbidden in the two forms that READ from it.
+    for forbidden in (r"\btext\b", r"\bmessages\b", r"\bcontent\b",
+                      r"out\s*\[", r"out\s*\.\s*get"):
+        found = re.search(forbidden, code)
+        assert not found, (
+            f"the evidence probe now reads {found.group(0)!r} (/{forbidden}/); a claim "
+            "derived from prose is the agent's word wearing the driver's authority")
+    assert "head_object" in code, "the probe stopped verifying anything against S3"
+
+
+def test_unclaimed_outputs_and_missing_stage_complete_are_different_names():
+    """Two failures that need two different operator responses must not share a name --
+    the same argument that split ModelUnavailable and ContentFiltered out of this branch.
+    "Outputs are on S3 and unclaimed" means re-dispatch this stage; "nothing verifiable
+    happened" does not."""
+    assert driver.UNCLAIMED_OUTPUTS_ERROR != "MissingStageComplete"
+    src = (REPO / "orchestration/harness_driver/handler.py").read_text()
+    assert 'error="MissingStageComplete"' in src, (
+        "the no-evidence path lost its own name; every prose death now reports as an "
+        "unclaimed-output one")
+    assert "error=UNCLAIMED_OUTPUTS_ERROR" in src, \
+        "the settle stopped using the constant, so the guard below cannot find it"
+
+
+def test_the_unclaimed_outputs_error_is_not_wired_to_a_retry():
+    """A tripwire, not a behaviour. The new name will look to a future reader like
+    something worth retrying automatically -- it is not: nothing failed transiently, an
+    agent stopped speaking protocol, and a retry spends GPU hours to arrive in the same
+    place. It reaches EscalateFail today through States.ALL, and it must stay there."""
+    asl = json.loads((REPO / "orchestration/state_machine.asl.json").read_text())
+    found = []
+
+    def walk(node):
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if key in ("Retry", "Catch") and isinstance(value, list):
+                    for rule in value:
+                        found.extend(rule.get("ErrorEquals", []))
+                walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+
+    walk(asl)
+    assert driver.UNCLAIMED_OUTPUTS_ERROR not in found, (
+        f"{driver.UNCLAIMED_OUTPUTS_ERROR} is now named in a Retry/Catch rule; if that "
+        "is deliberate, it needs its own justification, because the default is escalate")
+    assert "States.ALL" in found, "the catch-all this name relies on is gone"
+
+
+def test_the_extra_grants_survive_a_self_reinvoke():
+    """Spent-once is a per-STAGE-ATTEMPT property, and a stage attempt spans Lambda
+    invocations. A grant counter dropped from the handoff refills on every reinvoke, so
+    the bound would silently become "once per 900 seconds" -- unbounded on exactly the
+    long stages where protocol violations happen. `_resumed` is the cautionary tale: a
+    continuation key nothing reads is a key that means nothing."""
+    src = (REPO / "orchestration/harness_driver/handler.py").read_text()
+    body = src[src.index("def _run_stage"):]
+    for key, local in (("_evidence_reask", "evidence_reask"),
+                       ("_progress_reasks", "progress_reasks"),
+                       ("_claim_bytes", "claim_bytes"),
+                       ("_no_arg_recoveries", "no_arg_recoveries")):
+        assert f'"{key}": {local}' in body, f"_self_reinvoke stopped carrying {key}"
+        assert f'event.get("{key}"' in body, f"the continuation stopped restoring {key}"
+    assert 'int(event.get("_claim_bytes", -1))' in body, (
+        "the byte fingerprint's restored default is no longer the -1 sentinel, so a "
+        "resumed stage cannot tell 'never probed' from 'probed and saw zero bytes' and "
+        "the growth comparison reads as growth on its first probe")
+
+
+def test_every_granted_turn_beats_the_run_row():
+    """The extra turns must not look like death to the resurrector, whose window is
+    STALE_MINUTES_DEFAULT. They are ordinary turns, so the loop-top heartbeat covers
+    them -- pinned because moving _heartbeat() below the turn would make a stage that
+    spends its grants indistinguishable from one that hung."""
+    src = (REPO / "orchestration/harness_driver/handler.py").read_text()
+    loop = src[src.index("    while True:"):]
+    beat, first_invoke = loop.index("_heartbeat()"), loop.index("resp = _invoke(")
+    assert beat < first_invoke, (
+        "_heartbeat() no longer runs before the turn, so every granted turn is a gap in "
+        "the liveness trail rather than a sign of life")
+    # And the grants cannot outrun that window even in the worst case: every one of them
+    # is a turn, and a turn cannot start without passing the beat above.
+    assert resurrector.STALE_MINUTES_DEFAULT > 0
+
+
+def test_the_two_prose_budgets_are_named_and_independent():
+    """Two numerically equal, causally unrelated budgets used to share a bare literal 2:
+    prose turn-ends and platform-suppressed turns. Sharing a literal is how tuning one
+    silently moves the other, so they are separate names -- and the literals are gone."""
+    assert driver.PROSE_REASK_BUDGET == 2 and driver.FILTERED_TURN_BUDGET == 2
+    src = (REPO / "orchestration/harness_driver/handler.py").read_text()
+    assert "if re_asks < 2:" not in src and "if filtered_turns < 2:" not in src, \
+        "a bare budget literal is back in the turn loop"
+    assert src.count("PROSE_REASK_BUDGET =") == 1 and \
+        src.count("FILTERED_TURN_BUDGET =") == 1, \
+        "the two budgets were collapsed into one name; they are independent"
+    # Each holds its OWN literal. Two names is not independence if one is defined as the
+    # other -- `FILTERED_TURN_BUDGET = PROSE_REASK_BUDGET` reads as two budgets, counts as
+    # two assignments, compares equal to 2, and still moves both when either is tuned,
+    # which is the entire defect this pair of constants was introduced to remove.
+    assert "\nPROSE_REASK_BUDGET = 2\n" in src and "\nFILTERED_TURN_BUDGET = 2\n" in src, \
+        "one budget is now defined in terms of the other, so tuning either moves both"
+
+
+# ── the third spelling of a typed call: markdown emphasis ────────────────────────────
+# Live 86ab8a14 ended a turn with the literal `**checkpoint**` and died. The recovery is
+# narrower than the other two spellings for a reason a test has to hold: a bolded NAME
+# carries no arguments, and an empty args dict is a DEFAULTED claim, not an absent one.
+
+def test_a_bolded_checkpoint_is_recovered():
+    """The live text, verbatim in shape: the model kept the tool's name and dropped the
+    call grammar entirely."""
+    typed = driver.parse_typed_call("Continuing with the next batch.\n\n**checkpoint**")
+    assert typed and typed["name"] == "checkpoint"
+    assert typed["input"] == {} and typed["toolUseId"] is None
+
+
+def test_a_bolded_stage_complete_with_no_arguments_is_not_recovered():
+    """The narrowing, and the reason for it: a bare bolded name parses to args={},
+    normalize_stage_complete defaults outputs to [], verify_outputs([]) finds nothing
+    missing -- and the stage settles SUCCESS having verified nothing. A recovery that
+    turns a bolded word into a zero-output success is worse than the death it prevents."""
+    assert driver.parse_typed_call("All done. **stage_complete**") is None
+
+
+def test_a_bolded_call_that_brings_its_arguments_is_recovered():
+    """With an object the spelling carries as much as the other two, so it is admitted --
+    and its outputs still go through handle_stage_complete's head-check like any other."""
+    text = ('Wrapping up.\n\n**stage_complete**: {"outputs": '
+            '["s3://b/k.jsonl"], "metrics": {"rows": 3}}')
+    typed = driver.parse_typed_call(text)
+    assert typed and typed["name"] == "stage_complete"
+    assert typed["input"]["outputs"] == ["s3://b/k.jsonl"]
+    assert typed["input"]["metrics"] == {"rows": 3}
+
+
+def test_a_bolded_shell_is_never_recovered():
+    """The serviced gate is untouched by the new spelling. The harness runs shell itself,
+    so a driver that answered one would be answering a call the runtime never made."""
+    assert driver.parse_typed_call('**shell**: {"command": "ls"}') is None
+    assert driver.parse_typed_call("**shell**") is None
+
+
+def test_the_only_bolded_call_recovered_without_arguments_is_argument_free():
+    """NO_ARG_RECOVERABLE is not a taste judgement, it is a mechanical property: the
+    branch that services the tool must read NO field of args. Derived from the dispatch
+    source, so widening the set without widening that property fails here."""
+    assert driver.NO_ARG_RECOVERABLE <= set(driver.SERVICED_TOOLS)
+    src = (REPO / "orchestration/harness_driver/handler.py").read_text()
+    for name in driver.NO_ARG_RECOVERABLE:
+        start = src.index(f'if name == "{name}":')
+        branch = src[start:src.index('            if name == ', start + 20)]
+        code = "\n".join(line for line in branch.splitlines()
+                         if not line.lstrip().startswith("#"))
+        assert "args" not in code, (
+            f"{name} is recoverable from a bolded name alone, but its branch reads "
+            "args -- so a recovery would dispatch it with silently defaulted values")
+
+
+def test_a_bolded_name_cannot_buy_turns_forever():
+    """A recovered call re-arms the prose budget, and a bolded word in an ordinary
+    sentence can produce one. Without NO_ARG_RECOVERY_CAP a stage could keep buying
+    turns until the 8h session lifetime -- a worse failure than the death this recovery
+    exists to prevent. The cap counts only RECOVERED calls: a real toolUse block with no
+    arguments is a call the runtime actually made."""
+    ac = FakeAgentCore([text_stream("Still working. **checkpoint**")] * 12)
+    c = clients(ac)
+    out = driver.handler(driver_event(), clients=c)
+    assert out["status"] == "failed", "argument-less recoveries kept the stage alive"
+    expected = driver.NO_ARG_RECOVERY_CAP + driver.PROSE_REASK_BUDGET + 1
+    assert len(ac.calls) == expected, (
+        f"{len(ac.calls)} turns bought by a bolded word, ceiling is {expected}")
+    assert c["sfn"].failures[0]["error"] == "MissingStageComplete"
+
+
+def test_the_last_typed_call_wins_across_all_three_spellings():
+    """Position decides, matching _drain's one-slot capture of real toolUse blocks: a
+    turn that narrates a plan and then commits to it ends on the commitment. Held across
+    spellings so a turn that quotes the XML form and then writes the markdown one is not
+    settled by whichever loop happens to run last."""
+    xml = '<invoke name="checkpoint"><parameter name="next_action">a</parameter></invoke>'
+    py = 'stage_complete(**{"outputs": ["s3://b/one"]})'
+    md = '**stage_complete**: {"outputs": ["s3://b/two"]}'
+    assert driver.parse_typed_call(f"{md}\nthen\n{xml}")["name"] == "checkpoint"
+    assert driver.parse_typed_call(f"{xml}\nthen\n{md}")["input"]["outputs"] == \
+        ["s3://b/two"]
+    assert driver.parse_typed_call(f"{md}\nthen\n{py}")["input"]["outputs"] == \
+        ["s3://b/one"]
+
+
+# ── the durable protocol record, and the SLI nobody could compute ────────────────────
+# re_asks, suppressed turns and typed-call recoveries lived only in memory and in print(),
+# and the one durable per-turn write was a heartbeat that overwrites itself. So a stage
+# that burned three malformed turns and a stage that ran clean were byte-identical in
+# every durable artifact -- which is why 80/95 = 0.842 had to be counted by hand out of
+# CloudWatch, and why nothing could tell whether a fix moved it.
+
+def _protocol_rows(c):
+    return [r for r in c["ddb"].Table("llmops-stage-events").items
+            if str(r.get("sk", "")).startswith(driver.PROTOCOL_SK)]
+
+
+class SpyDDB(FakeDDB):
+    """Keeps every write, not just the surviving row.
+
+    The record is one row per stage attempt that gets REPLACED each turn, so the table
+    holds only the last state -- and "was the row written before or after the recovery"
+    is a question about the writes, not about what survived them.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.writes = []
+
+    def Table(self, name):
+        table = super().Table(name)
+        if name == "llmops-stage-events" and not getattr(table, "_spied", False):
+            original, writes = table.put_item, self.writes
+
+            def spy(Item, **kw):
+                writes.append(dict(Item))
+                return original(Item, **kw)
+
+            table.put_item, table._spied = spy, True
+        return table
+
+
+def test_a_stage_that_took_three_malformed_turns_is_distinguishable_from_a_clean_one():
+    """The whole point, stated as the comparison it makes possible."""
+    clean_ac = FakeAgentCore([tool_use_stream("stage_complete", {"outputs": []}),
+                              text_stream("ack")])
+    clean = clients(clean_ac)
+    assert driver.handler(driver_event(), clients=clean)["status"] == "completed"
+
+    rough_ac = FakeAgentCore([
+        text_stream("just thinking out loud"),                       # prose
+        text_stream("Continuing.\n\n**checkpoint**"),                # typed, recovered
+        tool_use_stream_ending_in_prose("checkpoint", {"next_action": "more"}),
+        tool_use_stream("stage_complete", {"outputs": []}),
+        text_stream("ack")])
+    rough = clients(rough_ac)
+    assert driver.handler(driver_event(), clients=rough)["status"] == "completed"
+
+    clean_row, rough_row = _protocol_rows(clean)[-1], _protocol_rows(rough)[-1]
+    assert clean_row["turns"] == 1 and clean_row["serviced_turns"] == 1
+    assert clean_row["prose_turns"] == 0
+    assert rough_row["turns"] == 4 and rough_row["prose_turns"] == 1
+    assert rough_row["recovered_typed_calls"] == 1, (
+        "the typed-call recovery is invisible again, so a stage kept alive by the parser "
+        "reads as a stage that never needed it")
+    assert rough_row["recovered_ending_in_prose"] == 1
+    both = driver.protocol_rollup([clean_row, rough_row])
+    assert both["structured_call_rate"] == 4 / 5
+    per_stage = driver.protocol_rollup([rough_row])["per_stage"]["data-prep"]
+    assert per_stage["structured_call_rate"] == 3 / 4, (
+        "the per-stage rate is the quantity 0.842 measured, and the one a five-stage "
+        "lane's 42% is derived from -- a run-level average hides it")
+
+
+def test_the_record_is_written_after_the_recovery_that_changes_its_answer():
+    """Written after BOTH recoveries, which is exactly the flaw in the per-turn log line:
+    it prints before them, so a turn that was in fact serviced is logged tool=None. A
+    record with that bug would report the pipeline's protocol compliance as worse than it
+    is and, worse, would report a working recovery as a failure."""
+    ac = FakeAgentCore([text_stream("Continuing.\n\n**checkpoint**"),
+                        tool_use_stream("stage_complete", {"outputs": []}),
+                        text_stream("ack")])
+    c = clients(ac)
+    c["ddb"] = SpyDDB()
+    driver.handler(driver_event(), clients=c)
+    writes = [w for w in c["ddb"].writes
+              if str(w.get("sk", "")).startswith(driver.PROTOCOL_SK)]
+    first = json.loads(writes[0]["detail"])
+    assert first["last_tool"] == "checkpoint", (
+        f"the row was written before the recovery: {first!r}")
+    assert writes[0]["serviced_turns"] == 1 and writes[0]["prose_turns"] == 0
+
+
+def test_a_replayed_turn_does_not_inflate_the_denominator():
+    """Absolute values plus a monotonic condition, not ADD. Async Lambda retries replay
+    stale payloads (live: run 68cfa9c8's replayed continuation), and under ADD every
+    replay would count its turns a second time -- inflating the denominator of the only
+    number this record exists to produce, in the direction that flatters it."""
+    ddb = FakeDDB()
+    counters = {k: 0 for k in driver.PROTOCOL_COUNTERS}
+    driver._record_protocol(ddb, "run-test-1", "data-prep", "generate", 0,
+                            {**counters, "turns": 5, "serviced_turns": 4})
+    driver._record_protocol(ddb, "run-test-1", "data-prep", "generate", 0,
+                            {**counters, "turns": 2, "serviced_turns": 1})  # stale replay
+    rows = [r for r in ddb.Table("llmops-stage-events").items
+            if str(r["sk"]).startswith(driver.PROTOCOL_SK)]
+    assert len(rows) == 1, f"the replay wrote a second row for one stage attempt: {rows}"
+    assert rows[0]["turns"] == 5 and rows[0]["serviced_turns"] == 4, (
+        "a late replay rolled the counters BACKWARD; the condition is not monotonic")
+    driver._record_protocol(ddb, "run-test-1", "data-prep", "generate", 0,
+                            {**counters, "turns": 6, "serviced_turns": 5})
+    rows = [r for r in ddb.Table("llmops-stage-events").items
+            if str(r["sk"]).startswith(driver.PROTOCOL_SK)]
+    assert len(rows) == 1 and rows[0]["turns"] == 6, "a real later turn was refused"
+
+
+def test_a_resurrected_stage_continues_its_turn_numbering():
+    """The counters are a property of the STAGE ATTEMPT, not of one invocation. Restarting
+    them on resume would write a row whose denominator is smaller than the one already
+    there -- which the monotonic condition then refuses, silently dropping every turn
+    after the first handoff. The long stages are exactly where the violations happen."""
+    ac = FakeAgentCore([tool_use_stream("stage_complete", {"outputs": []}),
+                        text_stream("ack")])
+    c = clients(ac)
+    resumed = driver_event(**{"_continuation": [{"role": "user",
+                                                 "content": [{"text": "carry on"}]}],
+                             "_turns": 7, "_serviced_turns": 6, "_prose_turns": 1})
+    driver.handler(resumed, clients=c)
+    row = _protocol_rows(c)[-1]
+    assert row["turns"] == 8 and row["serviced_turns"] == 7 and row["prose_turns"] == 1, (
+        f"a resumed stage restarted its numbering: {row}")
+    src = (REPO / "orchestration/harness_driver/handler.py").read_text()
+    body = src[src.index("def _run_stage"):]
+    assert body.count('**{f"_{k}": v for k, v in prot.items()}') >= 2, (
+        "the counters no longer ride BOTH the heartbeat payload (which is what a "
+        "resurrector re-invokes with) and the self-reinvoke payload")
+
+
+def test_the_protocol_prefix_sorts_outside_the_console_timeline_range():
+    """The console's timeline query is Key("sk").lt(TIMELINE_SK_MAX) with the bound "A",
+    so "protocol#" is excluded by lexicographic order alone and no console change was
+    needed. That is a load-bearing accident, so it is pinned in both directions: read from
+    the console source, because the two bundles deploy separately and a bound raised to
+    "z" would silently paste bookkeeping rows into the operator's timeline."""
+    src = (REPO / "deploy/console/lambda_function.py").read_text()
+    bound = re.search(r'^TIMELINE_SK_MAX\s*=\s*"([^"]*)"', src, re.M)
+    assert bound, "TIMELINE_SK_MAX is gone from the console; the exclusion is unpinned"
+    assert driver.PROTOCOL_SK > bound.group(1), (
+        f"{driver.PROTOCOL_SK!r} now sorts below the timeline bound {bound.group(1)!r}, "
+        "so every protocol row appears in the timeline a human reads to see what happened")
+    assert driver.DIRECTIVE_SK > bound.group(1)  # the same trick, already relied upon
+
+
+def test_a_protocol_record_cannot_fabricate_a_session_id():
+    """_recent_session_ids queries this table with NO sk filter, takes the stage from
+    sk.split("#")[1] and the task from json.loads(detail)["task"]. A row missing `detail`
+    would therefore contribute (stage, "") -- fabricating a session id with no spans,
+    which is the precise failure that function's docstring exists to prevent. So every
+    protocol row must carry a detail that names its task."""
+    ac = FakeAgentCore([text_stream("prose"),
+                        tool_use_stream("stage_complete", {"outputs": []}),
+                        text_stream("ack")])
+    c = clients(ac)
+    driver.handler(driver_event(), clients=c)
+    rows = _protocol_rows(c)
+    assert rows, "no protocol rows were written at all"
+    for row in rows:
+        detail = json.loads(row["detail"])  # KeyError here IS the fabricated session id
+        assert detail["task"] == "generate", f"a row that names no task: {row}"
+        assert str(row["sk"]).split("#")[1] == "data-prep", (
+            "the console reads the stage out of the sk's second field; this row would "
+            "hand it something else")
+
+
+def test_a_failed_record_write_never_kills_the_turn():
+    """Telemetry does not get to decide how a stage ends. The heartbeat already follows
+    this rule; a per-turn write that can throw would give the pipeline a brand-new way to
+    lose a completed stage -- and it would fire hardest during the incidents the record
+    exists to describe."""
+    class Hostile(FakeDDB):
+        """Throws on the PROTOCOL row and nothing else.
+
+        Deliberately narrow. Breaking every write to the events table would also break
+        the `stage_complete` record, whose write is not guarded today -- so the test
+        would be asserting something this PR did not build, and would pass or fail for
+        the wrong reason. The claim under test is about the row added here.
+        """
+
+        def Table(self, name):
+            table = super().Table(name)
+            if name == "llmops-stage-events":
+                real = table.put_item
+
+                def maybe_boom(*a, **kw):
+                    if str(kw.get("Item", {}).get("sk", "")).startswith(driver.PROTOCOL_SK):
+                        raise RuntimeError("ProvisionedThroughputExceededException")
+                    return real(*a, **kw)
+                table.put_item = maybe_boom
+            return table
+
+    ac = FakeAgentCore([tool_use_stream("stage_complete", {"outputs": []}),
+                        text_stream("ack")])
+    c = clients(ac)
+    c["ddb"] = Hostile()
+    out = driver.handler(driver_event(), clients=c)
+    assert out["status"] == "completed", f"a telemetry write failure killed the stage: {out}"
+
+
+def test_the_rollup_reports_no_rate_rather_than_a_zero_one():
+    """An empty denominator is UNKNOWN, not 0%. A rollup that reported 0.0 for a stage
+    with no turns would make a stage that never ran look like a total protocol failure --
+    and would drag every average that includes it, which is how a metric stops being
+    read at all."""
+    empty = driver.protocol_rollup([])
+    assert empty["structured_call_rate"] is None and empty["per_stage"] == {}
+    assert driver.protocol_rollup([{"sk": "1970#data-prep#stage_complete"}])["turns"] == 0, \
+        "the rollup counted a row that is not a protocol row"
+    mixed = driver.protocol_rollup([
+        {"sk": f"{driver.PROTOCOL_SK}eval#gate#e0", "turns": 4, "serviced_turns": 3},
+        {"sk": f"{driver.PROTOCOL_SK}eval#gate#e1", "turns": 2, "serviced_turns": 2},
+        {"sk": f"{driver.PROTOCOL_SK}finetune#launch#e0", "turns": 4,
+         "serviced_turns": 1}])
+    assert mixed["turns"] == 10 and mixed["structured_call_rate"] == 0.6
+    assert mixed["per_stage"]["eval"]["structured_call_rate"] == 5 / 6, (
+        "session epochs of one stage must roll up together -- they are one stage's turns")
+    assert mixed["per_stage"]["finetune"]["structured_call_rate"] == 0.25
 
 
 # ── the canonical trainer and the end of codegen roulette ───────────────────────────

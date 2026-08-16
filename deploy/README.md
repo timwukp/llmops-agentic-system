@@ -43,6 +43,49 @@ Offline dry-run (no AWS credentials at all): add `--account-id 123456789012` to 
 `preflight.py` and `validate_config.py` can be run at any point to sanity-check the
 environment and harness configs without touching AWS state.
 
+## Before you deploy (and before you trust a live result): `tools/audit_drift.py`
+
+One **read-only** command that answers "is production running this tree's code?", because
+the honest answer has been *no* for weeks at a time and nothing said so. Measured on
+2026-08-15, immediately before a live rehearsal: `eval_only` had never been deployed,
+`_check_mode_prerequisites` did not exist in the live start Lambda, the driver was still
+running a mechanism replaced two PRs earlier, and 3 of 7 prompts plus 4 of 7 Lambdas had
+drifted. Every one of those was invisible to the test suite, which reads the working tree.
+
+```bash
+.venv/bin/python tools/audit_drift.py --region us-east-1 [--json drift-audit.json]
+.venv/bin/python tools/audit_drift.py --region us-east-1 --account-id 123456789012 --offline
+```
+
+Five legs — IAM inline policies, the Step Functions definition, harness configs, Lambda
+configuration, Lambda **code** — each comparing what the deploy scripts *would send*
+against what the control plane holds. The comparators are the deploy scripts' own
+(`state_machine_drift`, `harness_config_drift`, `policy_diff`), so there is no second
+opinion to drift. Lambda code is compared **per zip member with the first differing line
+named**, never by `CodeSha256`: `bundle()` stamps source mtimes into the zip, so a sha
+cannot be reproduced from a fresh checkout and comparing it would report permanent drift.
+
+Exit codes are the contract, and `0` is the narrow one:
+
+| Code | Meaning |
+|------|---------|
+| `0` | every leg compared **and** clean — live matches this tree |
+| `1` | drift found |
+| `2` | no drift, but at least one leg could **not** be compared (no credentials, AccessDenied, resource absent). Not a pass |
+| `3` | usage error |
+
+`--offline` builds every sent side, runs `env_keys_for` + `env_values` for real, refuses
+any unresolved `<PLACEHOLDER>`, and makes **no AWS call at all** (it runs in CI's offline
+dry-run step). The report always ends by printing what it does *not* check — extra managed
+or inline policies, memory wiring, tags, `CodeSha256`, layers/concurrency/VPC, SSM
+parameters, EventBridge rules, DynamoDB tables — and it compares the **working tree**, so
+run it from a clean `main` checkout; the JSON carries `repo_head` so an answer can be
+attributed to a commit.
+
+Deliberately **not** wired into CI: the only credentialed workflow is scoped to
+`lambda:InvokeFunction` on one function, and widening that role to read the control plane
+would be both a live IAM write and a new standing capability.
+
 ## Teardown notes
 
 Reverse order. Nothing here bills meaningfully while idle **except** the interface VPC

@@ -562,6 +562,29 @@ _TYPED_PARAM_RE = re.compile(r'<parameter\s+name="([A-Za-z_][A-Za-z0-9_]*)"\s*>(
 #: The `{` is captured so the brace matcher knows where the object starts.
 _TYPED_PYCALL_RE = re.compile(r'\b([A-Za-z_][A-Za-z0-9_]*)\(\s*(?:\*\*)?\s*(\{)')
 
+#: The THIRD observed spelling: markdown emphasis. Live: run 86ab8a14 ended a turn with the
+#: literal `**checkpoint**` and died MissingStageComplete. Neither regex above can see it,
+#: because the model dropped the call grammar entirely and kept only the tool's NAME.
+_TYPED_MDCALL_RE = re.compile(r'\*\*([A-Za-z_][A-Za-z0-9_]*)\*\*')
+
+#: The connective tissue allowed between a bolded name and its argument object: whitespace,
+#: a colon, and an optional fenced-code opener. Anchored at a position, so anything else in
+#: between (a sentence, a comma) means the object is NOT this call's argument.
+_MD_ARGS_GAP_RE = re.compile(r'[\s:]*(?:```(?:json)?\s*)?(\{)')
+
+#: Serviced tools recoverable from a bolded NAME ALONE, with no argument object.
+#:
+#: Exactly one, and the rule that picks it is mechanical rather than a judgement call: the
+#: only branch in the turn loop that reads NO field of `args`. `checkpoint` qualifies -- it
+#: means "give me another turn" and its handler consults the directive table, not the call.
+#:
+#: Everything else must bring an object, because a bare bolded name parses to `args = {}`
+#: and an empty `args` is not an absent claim, it is a DEFAULTED one:
+#: normalize_stage_complete defaults `outputs` to `[]`, verify_outputs([]) finds nothing
+#: missing, and the stage settles SUCCESS having verified nothing. A recovery that turns a
+#: bolded word into a zero-output success is strictly worse than the death it prevents.
+NO_ARG_RECOVERABLE = frozenset({"checkpoint"})
+
 
 def _balanced_braces(text: str, start: int) -> Optional[str]:
     """The substring of `text` from the `{` at `start` to its matching `}`, JSON-aware.
@@ -632,6 +655,9 @@ def parse_typed_call(text: str, serviced=SERVICED_TOOLS) -> Optional[dict]:
       the literal string, because guessing is worse than a legible unverified value.
     * The LAST typed call wins, matching _drain's one-slot capture of real toolUse blocks:
       a turn that narrates a plan and then commits to it ends on the commitment.
+    * A name with NO argument object -- which only the markdown spelling can produce -- is
+      recovered for NO_ARG_RECOVERABLE alone. An empty `args` is a DEFAULTED claim, not an
+      absent one, so admitting every name would trade a loud death for a silent success.
     """
     if not text:
         return None
@@ -667,6 +693,29 @@ def parse_typed_call(text: str, serviced=SERVICED_TOOLS) -> Optional[dict]:
             continue
         if isinstance(args, dict):
             found, found_at = {"toolUseId": None, "name": name, "input": args}, match.start()
+    # The markdown spelling, held to the same last-call-wins rule and one extra bar: a
+    # bolded name with no argument object is recovered ONLY for NO_ARG_RECOVERABLE, so the
+    # spelling that carries the least information can never claim the most (see that
+    # constant for why a defaulted empty `outputs` is the dangerous case).
+    for match in _TYPED_MDCALL_RE.finditer(text):
+        name = match.group(1)
+        if name not in serviced or match.start() <= found_at:
+            continue
+        args, gap = None, _MD_ARGS_GAP_RE.match(text, match.end())
+        if gap:
+            body = _balanced_braces(text, gap.start(1))
+            if body is not None:
+                try:
+                    parsed = json.loads(body)
+                except (json.JSONDecodeError, ValueError):
+                    parsed = None
+                if isinstance(parsed, dict):
+                    args = parsed
+        if args is None:
+            if name not in NO_ARG_RECOVERABLE:
+                continue
+            args = {}
+        found, found_at = {"toolUseId": None, "name": name, "input": args}, match.start()
     return found
 
 
@@ -682,6 +731,108 @@ def verify_outputs(s3, outputs: list) -> list:
         except Exception:
             missing.append(uri)
     return missing
+
+
+def _s3_uris_in(node, out: list) -> None:
+    """Collect every `s3://` STRING reachable in a JSON value, in encounter order.
+
+    Shape-agnostic on purpose. The driver writes its own stage entry as
+    `{"outputs": [...], ...}` (handle_stage_complete), but the thin per-iteration entries
+    are written by the AGENTS, and their shape is theirs -- a list, a dict of roles, a
+    nested report. Walking for strings that start with `s3://` reads whatever they wrote
+    without a schema this module does not control, and admits nothing else: a URI is the
+    only thing here that can later be independently head_object'd.
+    """
+    if isinstance(node, str):
+        if node.startswith("s3://") and node not in out:
+            out.append(node)
+    elif isinstance(node, dict):
+        for value in node.values():
+            _s3_uris_in(value, out)
+    elif isinstance(node, (list, tuple)):
+        for value in node:
+            _s3_uris_in(value, out)
+
+
+def _derive_stage_claim(manifest: dict, stage: str, task: str = "",
+                        iteration=None) -> list:
+    """The s3:// URIs the DURABLE manifest already associates with this stage attempt.
+
+    Reads `manifest["stages"]` only: the bare `<stage>` entry this driver writes on a
+    successful stage_complete, plus the thin `"<stage>.<task>.i<n>"` entries the agents
+    write themselves (see handle_stage_complete's note on sharing that map).
+
+    ONE invariant carries the safety of everything built on this: it never reads the
+    agent's turn text. Not `out["text"]`, not the message list, nothing the model said
+    this turn. That is what keeps it from degenerating into the prose parser the driver
+    must not have -- every URI it returns is one that was written to durable storage
+    before this turn ended, and is about to be re-verified against S3 anyway.
+
+    It is NOT evidence of completion. The manifest is agent-writable, so a claim derived
+    from it buys bounded extra turns and never a verdict; see the settle path below.
+    """
+    stages = (manifest or {}).get("stages")
+    if not isinstance(stages, dict):
+        return []
+    keys = [stage]
+    if task:
+        if iteration is not None:
+            keys.append(f"{stage}.{task}.i{iteration}")
+        keys += sorted(k for k in stages
+                       if k.startswith(f"{stage}.{task}.") and k not in keys)
+    else:
+        keys += sorted(k for k in stages if k.startswith(f"{stage}.") and k not in keys)
+    claim = []
+    for key in keys:
+        if key in stages:
+            _s3_uris_in(stages[key], claim)
+    return claim
+
+
+def _claim_fingerprint(s3, claim: list) -> dict:
+    """head_object a derived claim: which URIs are really there, and how many bytes.
+
+    `{"claim", "verified", "missing", "bytes"}`. The byte total is the whole point of
+    doing this rather than reusing verify_outputs alone: two probes with the same present
+    set but a growing total mean the agent is still WRITING, which is a different
+    situation from an agent that has finished and merely failed to say so, and the two
+    earn different budgets.
+
+    Uses only s3:HeadObject, which the driver role already holds. Note the ceiling this
+    accepts: without s3:ListBucket the driver cannot discover outputs the manifest never
+    named, so an agent that wrote everything and recorded nothing looks empty here.
+    """
+    verified, missing, total = [], [], 0
+    for uri in claim or []:
+        if not uri.startswith("s3://"):
+            continue
+        bucket, _, key = uri[5:].partition("/")
+        try:
+            head = s3.head_object(Bucket=bucket, Key=key)
+        except Exception:
+            missing.append(uri)
+            continue
+        verified.append(uri)
+        try:
+            total += int((head or {}).get("ContentLength") or 0)
+        except (TypeError, ValueError):
+            pass
+    return {"claim": list(claim or []), "verified": verified, "missing": missing,
+            "bytes": total}
+
+
+def probe_stage_evidence(s3, manifest_uri: str, stage: str, task: str = "",
+                         iteration=None) -> dict:
+    """What durable state says about this stage attempt, derived without asking the agent.
+
+    Load manifest -> derive claim -> re-verify every URI against S3. Returns the
+    _claim_fingerprint dict; an unreadable manifest yields an empty one, which is the
+    same answer as "no evidence" and lands on today's unchanged failure path.
+    """
+    if not manifest_uri or not str(manifest_uri).startswith("s3://"):
+        return _claim_fingerprint(s3, [])
+    claim = _derive_stage_claim(_load_manifest(s3, manifest_uri), stage, task, iteration)
+    return _claim_fingerprint(s3, claim)
 
 
 #: The canonical pairwise judge prompt, as deploy/03_storage.py mirrors it. Spelled here
@@ -1019,6 +1170,96 @@ WAIT_ROW_CAP = 12
 #: prefix keeps directives in one contiguous query range and out of the timeline the
 #: console renders.
 DIRECTIVE_SK = "directive#"
+
+
+#: One row per (stage, task, session epoch) recording HOW its turns ended.
+#:
+#: Until this existed, `re_asks`, suppressed turns and typed-call recoveries lived only in
+#: memory and in print(), and the only per-turn durable write was a heartbeat that
+#: OVERWRITES itself. So a stage that burned three malformed turns and a stage that ran
+#: clean were byte-identical in every durable artifact -- which is why the one number that
+#: matters here (the share of turns that end in a structured call: 80/95 = 0.842 measured,
+#: predicting 42% for a five-stage lane) had to be recovered by hand-reading CloudWatch.
+#:
+#: Lives in EVENTS_TABLE because the driver role already holds Query/PutItem there and
+#: nothing new has to be created or granted. Two placement facts, both load-bearing:
+#:   * "protocol#" sorts ABOVE the console timeline's Key("sk").lt(TIMELINE_SK_MAX) bound
+#:     ("A"), so these rows are invisible to the timeline without a console change.
+#:   * _recent_session_ids queries this table with NO sk filter and reads `detail` for the
+#:     task name, so `detail` MUST be present and MUST carry `task` -- a row without it
+#:     would fabricate a session id that has no spans.
+PROTOCOL_SK = "protocol#"
+
+#: The counted quantities, in one place because they are also the continuation keys
+#: (`_turns`, ...) and the row attributes. Three of them exist because three code paths
+#: never reach the per-turn log line at all -- the deadline handoff, the first stream
+#: death, and the infra-error retry ladder -- and a denominator that silently omits them
+#: would make an outage look like a clean run.
+PROTOCOL_COUNTERS = ("turns", "serviced_turns", "prose_turns", "filtered_turns_total",
+                     "recovered_typed_calls", "recovered_ending_in_prose",
+                     "infra_error_turns_total", "deadline_cuts")
+
+
+def _record_protocol(ddb, run_id: str, stage: str, task: str, epoch: int,
+                     counters: dict, last_tool="", last_stop_reason=""):
+    """Write this stage attempt's protocol counters. Absolute values, never ADD.
+
+    ADD would double-count every retry: the counters already ride the continuation, and
+    async Lambda retries replay stale payloads (live: run 68cfa9c8's replayed
+    continuation). Absolute writes are idempotent under replay -- and the condition makes
+    them monotonic, so a LATE replay carrying smaller numbers cannot roll the row back.
+
+    Never raises. Telemetry does not get to decide how a stage ends: a ConditionalCheck
+    failure here means a newer row already won, which is the correct outcome and not an
+    error, and any other failure is worth one printed line and nothing more.
+    """
+    item = {"run_id": run_id, "sk": f"{PROTOCOL_SK}{stage}#{task}#e{epoch}",
+            # `detail` is not optional -- see PROTOCOL_SK on _recent_session_ids.
+            "detail": json.dumps({"stage": stage, "task": task, "epoch": epoch,
+                                  "last_tool": last_tool or "",
+                                  "last_stop_reason": last_stop_reason or "",
+                                  "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                                              time.gmtime())},
+                                 default=str)}
+    item.update({k: int(counters.get(k, 0)) for k in PROTOCOL_COUNTERS})
+    try:
+        ddb.Table(os.environ["EVENTS_TABLE"]).put_item(
+            Item=item,
+            ConditionExpression="attribute_not_exists(turns) OR turns <= :turns",
+            ExpressionAttributeValues={":turns": item["turns"]})
+    except Exception as exc:  # noqa: BLE001 -- see docstring
+        name = type(exc).__name__
+        if "ConditionalCheckFailed" not in name and "ConditionalCheckFailed" not in str(exc):
+            print(f"[driver] protocol record write failed (continuing): {name}: {exc}")
+
+
+def protocol_rollup(items) -> dict:
+    """The SLI, computed from `protocol#` rows alone: what share of turns ended in a call.
+
+    Per stage as well as per run, because the run-level number hides the shape that
+    matters: twelve stages at 0.84 each is a 13% chance of a clean path, and it is the
+    per-stage rate that any fix has to move. Reads only the row attributes, so it works
+    against a Query result, a scan, or a hand-assembled list.
+    """
+    totals = {k: 0 for k in PROTOCOL_COUNTERS}
+    per_stage: dict = {}
+    for item in items or []:
+        sk = str(item.get("sk") or "")
+        if not sk.startswith(PROTOCOL_SK):
+            continue
+        stage = sk[len(PROTOCOL_SK):].split("#")[0]
+        bucket = per_stage.setdefault(stage, {k: 0 for k in PROTOCOL_COUNTERS})
+        for key in PROTOCOL_COUNTERS:
+            try:
+                value = int(item.get(key) or 0)
+            except (TypeError, ValueError):
+                value = 0
+            totals[key] += value
+            bucket[key] += value
+    for bucket in list(per_stage.values()) + [totals]:
+        bucket["structured_call_rate"] = (bucket["serviced_turns"] / bucket["turns"]
+                                          if bucket["turns"] else None)
+    return {**totals, "per_stage": per_stage}
 
 
 #: A run in one of these states has no live driver invocation, so nothing will ever
@@ -2029,6 +2270,80 @@ RE_ASK = ("Your turn ended without an inline-function call. If your task is "
           "is already done, call stage_complete now (outputs may be an empty "
           "list if nothing was produced).")
 
+#: Consecutive prose turn-ends absorbed before the stage is settled. Named because it was
+#: a bare `2` in the loop while an identical bare `2` governed suppressed turns: two
+#: numerically equal, causally INDEPENDENT budgets sharing a literal is how a future
+#: tuning of one silently moves the other. They stay separate constants for that reason
+#: and not because the values differ today.
+PROSE_REASK_BUDGET = 2
+#: Consecutive platform-suppressed turns absorbed before ContentFiltered. See above.
+FILTERED_TURN_BUDGET = 2
+
+#: Extra turns bought by DURABLE evidence once PROSE_REASK_BUDGET is spent — see
+#: probe_stage_evidence for the rule that keeps this from becoming an auto-pass.
+#:
+#: ONE for the "looks finished" case, because the ask is trivial (name outputs the driver
+#: has already verified for you) and a second identical ask buys nothing an agent that
+#: ignored the first would answer. PROGRESS_REASK_CAP for the "still working" case, which
+#: is the opposite shape: each grant is justified by NEW bytes landing in S3, so a stage
+#: legitimately mid-write can earn several while a stalled one earns none.
+EVIDENCE_REASK_BUDGET = 1
+PROGRESS_REASK_CAP = 3
+
+#: Consecutive ARGUMENT-LESS recovered calls (see NO_ARG_RECOVERABLE) before the recovery
+#: stops and the turn counts as prose again.
+#:
+#: A recovered call resets re_asks, so without a cap an agent that keeps writing the word
+#: `**checkpoint**` in prose -- which the markdown spelling makes easy to do by accident,
+#: since it matches a bolded word in an ordinary sentence -- could never exhaust the prose
+#: budget: the stage would keep buying turns until the 8h session lifetime or the state
+#: machine's 86400s TimeoutSeconds, which is a worse failure than the death this recovery
+#: exists to prevent. TWO, because the live case (86ab8a14) needed exactly one.
+NO_ARG_RECOVERY_CAP = 2
+
+#: The settle name for "the driver can see this stage's outputs; the agent never claimed
+#: them". Distinct from MissingStageComplete because the operator response differs: this
+#: stage is worth re-dispatching (its work may already be on S3), the other is not. The
+#: precedent is ModelUnavailable and ContentFiltered, both split out of MissingStageComplete
+#: on exactly that argument. Needs no ASL change -- every state already catches States.ALL
+#: into EscalateFail, and the only named ErrorEquals are CapacityStopped and
+#: TrainingJobFailed -- and it must NEVER be wired to an automatic retry: the stage did not
+#: fail transiently, an agent stopped speaking protocol, and retrying that spends GPU hours
+#: to reach the same place.
+UNCLAIMED_OUTPUTS_ERROR = "UnclaimedStageOutputs"
+
+#: The evidence-backed re-ask: the driver quotes back the URIs IT verified and asks for
+#: the terminal call naming them. Deliberately not a nudge -- an agent that ended three
+#: turns in prose has already ignored two nudges. What is new here is information the
+#: agent did not have: which of its own outputs the driver can see.
+EVIDENCE_RE_ASK = (
+    "STOP and read this before writing anything else. Your turn ended without an "
+    "inline-function call for the third time, and this stage is one turn from being "
+    "failed.\n\n"
+    "The driver independently verified these outputs in S3 (head_object, just now):\n"
+    "{uris}\n\n"
+    "So the work appears to be DONE and only the terminal call is missing. Call "
+    "stage_complete now, with `outputs` listing exactly those URIs (add any others you "
+    "wrote). Do not summarise, do not explain, do not restate your findings — every "
+    "one of those is prose, and prose is what has already failed twice. If those URIs "
+    "are NOT your real outputs, call stage_complete with the ones that are.")
+
+#: The progress-backed re-ask: something is still landing in S3, so the agent is working
+#: and simply not saying so in the protocol. Names checkpoint (the "I need another turn"
+#: call) rather than stage_complete, because telling a mid-write agent to declare
+#: completion is how a half-written stage gets claimed as finished.
+PROGRESS_RE_ASK = (
+    "STOP and read this before writing anything else. Your turn ended without an "
+    "inline-function call, and this stage is close to being failed.\n\n"
+    "The driver can see your outputs still GROWING in S3, so you are evidently still "
+    "working — but nothing you write as prose keeps this stage alive. Only an "
+    "inline-function call does.\n\n"
+    "Right now, before any more work: call `checkpoint` to claim another turn. If you "
+    "launched a SageMaker job and are waiting on it, call `job_launched` with its exact "
+    "job name instead — that parks this stage until the job's own completion event wakes "
+    "it, and it is the only way to wait for a job that outlives this turn. When the work "
+    "is finished, call `stage_complete` with your output URIs.")
+
 #: The last resort before ContentFiltered: a fresh session whose first turn is told to
 #: attest WITHOUT prose. Appended to the re-seeded task payload by the filtered branch.
 #: Why a fresh session works when re-asking does not: the filter acts on what the model
@@ -2199,6 +2514,13 @@ def _run_stage(event, context=None, c=None):
     session_started_at = float(event.get("_session_started_at") or time.time())
     sess = session_id(event["run_id"], event["stage"], event["task"], epoch)
 
+    # Protocol counters, read HERE rather than in the continuation branch below, because
+    # they are a property of the stage attempt and not of one Lambda invocation or one
+    # session: a resurrected or self-reinvoked stage continues its turn numbering instead
+    # of restarting it. Everything below is memory-only until _record_protocol writes it,
+    # and every write is absolute (see that function for why not ADD).
+    prot = {k: int(event.get(f"_{k}", 0)) for k in PROTOCOL_COUNTERS}
+
     # Continuation across Lambda invocations: one harness turn can run 840s and the
     # Lambda dies at 900s, so only ONE turn fits per invocation. Whenever the loop
     # would start another turn without enough time left, self-reinvoke carrying the
@@ -2219,6 +2541,17 @@ def _run_stage(event, context=None, c=None):
         paged_at = str(event.get("_paged_at") or "")
         wait_turns = int(event.get("_wait_turns", 0))
         cf_recovery = int(event.get("_cf_recovery", 0))
+        # The evidence-backed grants ride the continuation for the same reason, and with
+        # an extra one: they are spent ONCE PER STAGE ATTEMPT, so a grant that reset at a
+        # Lambda boundary would let the same unchanged manifest entry earn extra turns
+        # again on every invocation -- an unbounded budget wearing a bound's clothes.
+        evidence_reask = int(event.get("_evidence_reask", 0))
+        progress_reasks = int(event.get("_progress_reasks", 0))
+        # -1, not 0: "never probed" has to be distinguishable from "probed and found zero
+        # bytes", because the progress branch is armed by bytes STRICTLY GROWING and a
+        # first probe has nothing to have grown from.
+        claim_bytes = int(event.get("_claim_bytes", -1))
+        no_arg_recoveries = int(event.get("_no_arg_recoveries", 0))
     else:
         messages = _user_text(json.dumps(payload, default=str))
         stream_retried = False
@@ -2233,6 +2566,10 @@ def _run_stage(event, context=None, c=None):
         # to draw the waiting pill -- and only the per-turn marker restarts.
         paged_at = ""
         wait_turns = 0
+        evidence_reask = 0  # 1 once the "outputs look finished" grant is spent
+        progress_reasks = 0  # up to PROGRESS_REASK_CAP, each paid for by new S3 bytes
+        claim_bytes = -1  # sentinel: this stage attempt has not probed durable state yet
+        no_arg_recoveries = 0  # consecutive argument-less recovered calls
 
     def _out_of_time() -> bool:
         return bool(context) and context.get_remaining_time_in_millis() < 850_000
@@ -2246,10 +2583,15 @@ def _run_stage(event, context=None, c=None):
                                 "_filtered_turns": filtered_turns,
                                 "_infra_error_turns": infra_error_turns,
                                 "_cf_recovery": cf_recovery,
+                                "_evidence_reask": evidence_reask,
+                                "_progress_reasks": progress_reasks,
+                                "_claim_bytes": claim_bytes,
+                                "_no_arg_recoveries": no_arg_recoveries,
                                 "_paged_at": paged_at,
                                 "_wait_turns": wait_turns,
                                 "_session_epoch": epoch,
-                                "_session_started_at": session_started_at},
+                                "_session_started_at": session_started_at,
+                                **{f"_{k}": v for k, v in prot.items()}},
                                default=str))
         return {"status": "self_reinvoked_between_turns"}
 
@@ -2338,7 +2680,14 @@ def _run_stage(event, context=None, c=None):
                                           "manifest_uri", "task_token", "iteration")
                                          if k in event},
                                       "_session_epoch": epoch,
-                                      "_session_started_at": session_started_at},
+                                      "_session_started_at": session_started_at,
+                                      # So a resurrected stage CONTINUES its turn
+                                      # numbering instead of restarting it -- a resumed
+                                      # counter that starts at zero writes a row whose
+                                      # denominator is smaller than the one already
+                                      # there, which the monotonic condition then
+                                      # refuses, silently losing the rest of the stage.
+                                      **{f"_{k}": v for k, v in prot.items()}},
                                      default=str)})
         except Exception as exc:  # noqa: BLE001 — the beat is telemetry, not the work
             if _is_condition_failure(exc):
@@ -2373,11 +2722,25 @@ def _run_stage(event, context=None, c=None):
                                           "params")
                                          if k in event},
                                       "_session_epoch": epoch,
-                                      "_session_started_at": session_started_at},
+                                      "_session_started_at": session_started_at,
+                                      # So a resurrected stage CONTINUES its turn
+                                      # numbering instead of restarting it -- a resumed
+                                      # counter that starts at zero writes a row whose
+                                      # denominator is smaller than the one already
+                                      # there, which the monotonic condition then
+                                      # refuses, silently losing the rest of the stage.
+                                      **{f"_{k}": v for k, v in prot.items()}},
                                      default=str)})
         except Exception as exc:  # noqa: BLE001 — still telemetry
             print(f"[driver] liveness beat write failed (continuing): "
                   f"{type(exc).__name__}: {exc}")
+
+    def _write_protocol(last_tool="", last_stop_reason=""):
+        """Persist the counters as they stand. Called from every path a turn can leave by,
+        including the three that never reach the per-turn log line."""
+        _record_protocol(c["ddb"], event["run_id"], event["stage"],
+                         str(event.get("task") or ""), epoch, prot,
+                         last_tool, last_stop_reason)
 
     first_turn = True
 
@@ -2409,7 +2772,10 @@ def _run_stage(event, context=None, c=None):
                      remaining_ms=(context.get_remaining_time_in_millis
                                    if context else None))
 
+        prot["turns"] += 1
         if out["error"] == DEADLINE_CUT:
+            prot["deadline_cuts"] += 1
+            _write_protocol("", out["stop_reason"])
             # The Lambda wall arrived mid-stream. This is not a stream death — the
             # harness turn is still running server-side (840s cap) and will finish
             # without us. Hand the session to the next invocation with the salvage
@@ -2433,6 +2799,8 @@ def _run_stage(event, context=None, c=None):
                   f"task={event.get('task')}, salvage retry in the same session: "
                   f"{out['error']}")
             stream_retried = True
+            prot["infra_error_turns_total"] += 1
+            _write_protocol("", out["stop_reason"])
             if _is_model_5xx(out["error"]):
                 _maybe_failover_model(c, event)  # vendor-quota burst: override the model
             messages = _user_text("The stream was interrupted. Continue from where "
@@ -2456,6 +2824,8 @@ def _run_stage(event, context=None, c=None):
         # and still lost a run whose model had recovered. See that constant for the
         # measurements.
         if out["error"]:
+            prot["infra_error_turns_total"] += 1
+            _write_protocol("", out["stop_reason"])
             if infra_error_turns < INFRA_ERROR_BUDGET:
                 infra_error_turns += 1
                 if _is_model_5xx(out["error"]):
@@ -2539,19 +2909,46 @@ def _run_stage(event, context=None, c=None):
             print(f"[driver] {tu['name']} arrived with stop_reason="
                   f"{out['stop_reason']}; servicing it anyway -- the harness cannot "
                   "have serviced a call only this driver can answer")
+            prot["recovered_ending_in_prose"] += 1
             out = {**out, "stop_reason": "tool_use"}
         # The turn may instead have WRITTEN the call out: `<invoke name="job_launched">`
         # as literal text, which no structured reader can see. Recovered only when no
         # real toolUse block arrived, so a genuine call always wins over a transcribed
         # one, and only for SERVICED_TOOLS -- see parse_typed_call for why this is a
         # dispatch path and not a prompt problem (job_launched: 0 real calls in 25 days).
+        recovered_no_arg = False
         if not tu:
             typed = parse_typed_call(out["text"])
+            # An ARGUMENT-LESS recovery is the weakest signal this driver acts on -- a
+            # bolded word in a sentence can produce one -- and it re-arms the prose budget,
+            # so a stage could buy turns with it forever. Capped, and the cap counts only
+            # recovered calls: a real toolUse block with no arguments is a call the runtime
+            # actually made, and rate-limiting those would be rate-limiting compliance.
+            if typed and not typed["input"] and no_arg_recoveries >= NO_ARG_RECOVERY_CAP:
+                print(f"[driver] {typed['name']} was typed with no arguments again "
+                      f"({no_arg_recoveries}/{NO_ARG_RECOVERY_CAP} already recovered); "
+                      "counting this turn as prose")
+                typed = None
             if typed:
                 print(f"[driver] {typed['name']} was TYPED as text, not called; "
                       f"dispatching it -- params={sorted(typed['input'])}")
+                recovered_no_arg = not typed["input"]
+                prot["recovered_typed_calls"] += 1
                 tu = typed
                 out = {**out, "stop_reason": "tool_use"}
+        # The durable per-turn record goes HERE, after BOTH recoveries, because they are
+        # what change its answer. This is the flaw in the per-turn log line above, which
+        # prints first and therefore reports tool=None for turns that were in fact
+        # serviced -- a log that misclassifies the one thing it exists to classify. The
+        # row is the only place a stage's protocol history survives the invocation.
+        if tu and out["stop_reason"] == "tool_use":
+            prot["serviced_turns"] += 1
+        elif not out["text"] and out["stop_reason"] in ("content_filtered",
+                                                        "guardrail_intervened"):
+            prot["filtered_turns_total"] += 1
+        else:
+            prot["prose_turns"] += 1
+        _write_protocol((tu or {}).get("name") or "", out["stop_reason"])
         if tu and out["stop_reason"] == "tool_use":
             # A structured call proves the agent still speaks protocol, so the
             # consecutive-prose budget re-arms — even for a rejected stage_complete
@@ -2562,6 +2959,7 @@ def _run_stage(event, context=None, c=None):
             # allowance and nothing ever gave it back.
             re_asks = 0
             filtered_turns = 0  # same consecutiveness rule as re_asks
+            no_arg_recoveries = no_arg_recoveries + 1 if recovered_no_arg else 0
             name, args = tu["name"], tu.get("input") or {}
             if name == "stage_complete":
                 result = handle_stage_complete(c, event, args)
@@ -2841,11 +3239,11 @@ def _run_stage(event, context=None, c=None):
         # transcript for prose that never existed.
         if not out["text"] and out["stop_reason"] in ("content_filtered",
                                                       "guardrail_intervened"):
-            if filtered_turns < 2:
+            if filtered_turns < FILTERED_TURN_BUDGET:
                 filtered_turns += 1
                 print(f"[driver] turn was suppressed by the platform "
                       f"({out['stop_reason']}); asking again "
-                      f"({filtered_turns}/2, re_asks untouched)")
+                      f"({filtered_turns}/{FILTERED_TURN_BUDGET}, re_asks untouched)")
                 messages = _user_text(
                     "Your previous reply was suppressed by the platform content "
                     "filter and was NEVER delivered -- nothing you just wrote was "
@@ -2886,12 +3284,95 @@ def _run_stage(event, context=None, c=None):
         filtered_turns = 0
 
         # Stream ended without a tool call.
-        if re_asks < 2:
+        if re_asks < PROSE_REASK_BUDGET:
             re_asks += 1
             messages = _user_text(RE_ASK)
             continue
 
-        # Re-asks exhausted → treat as stage failure.
+        # The ordinary budget is spent, and MissingStageComplete is the single largest
+        # cause of death this pipeline has: 15 of 32 historical executions, 15 of 15 of
+        # them fatal, five times the runner-up. Every one was a stage that ended its turns
+        # in prose -- several of them, verifiably, with all of their work already in S3.
+        #
+        # So before settling, ask one question whose answer does not come from this turn:
+        # does DURABLE state already associate outputs with this stage attempt, and can the
+        # driver still see them in S3 right now?
+        #
+        # What that answer is allowed to do is the whole design. It buys TURNS, never a
+        # verdict. Settling SUCCESS on this evidence is the obvious-looking fix and it is
+        # wrong: the manifest is agent-writable and so are the objects, so a driver that
+        # accepted them would be handing the agent its own verifier -- the failure mode
+        # this project already documents (a role that can rewrite the artifacts it verifies
+        # can launder its own evidence). Fifteen loud failures traded for an unknown number
+        # of silent false successes is strictly worse: MissingStageComplete costs one
+        # re-dispatch, while a fabricated success writes an unfinished stage into
+        # manifest["stages"], which every downstream stage reads as fact and which reaches
+        # the report a human is asked to approve.
+        #
+        # Bounded at PROSE_REASK_BUDGET + EVIDENCE_REASK_BUDGET + PROGRESS_REASK_CAP turns
+        # per stage attempt, and the progress grants are payable only in NEW S3 bytes, so a
+        # stalled agent earns exactly none of them.
+        probe = probe_stage_evidence(c["s3"], event.get("manifest_uri", ""),
+                                     event["stage"], event.get("task", ""),
+                                     event.get("iteration"))
+        verified, grew = probe["verified"], claim_bytes >= 0 and probe["bytes"] > claim_bytes
+        if verified and (grew or probe["missing"]) and progress_reasks < PROGRESS_REASK_CAP:
+            progress_reasks += 1
+            print(f"[driver] prose budget spent, but durable outputs are still moving "
+                  f"({len(verified)} present, {len(probe['missing'])} missing, "
+                  f"{probe['bytes']} bytes vs {claim_bytes}); granting a progress turn "
+                  f"({progress_reasks}/{PROGRESS_REASK_CAP})")
+            claim_bytes = probe["bytes"]
+            messages = _user_text(PROGRESS_RE_ASK)
+            continue
+        if verified and not probe["missing"] and not grew \
+                and evidence_reask < EVIDENCE_REASK_BUDGET:
+            evidence_reask += 1
+            print(f"[driver] prose budget spent, but {len(verified)} of this stage's "
+                  f"claimed outputs are verified in S3 ({probe['bytes']} bytes); granting "
+                  "one evidence-backed turn to make the terminal call")
+            claim_bytes = probe["bytes"]
+            messages = _user_text(EVIDENCE_RE_ASK.format(
+                uris="\n".join(f"  - {uri}" for uri in verified[:12])))
+            continue
+
+        # Re-asks exhausted → treat as stage failure. Two names, because they need two
+        # different operator responses -- the same argument that split ModelUnavailable and
+        # ContentFiltered out of this branch. Outputs the driver verified and the agent
+        # never claimed means "re-dispatch this stage, its work may already be on S3";
+        # nothing verifiable means "the agent never got anywhere". Neither succeeds.
+        if verified:
+            shown = ", ".join(verified[:2])
+            more = f" (+{len(verified) - 2} more)" if len(verified) > 2 else ""
+            cause = (f"{len(verified)} output(s) for this stage are present in S3 and were "
+                     f"verified by the driver -- {shown}{more} -- but the agent never "
+                     f"claimed them in a terminal inline-function call across "
+                     f"{re_asks + evidence_reask + progress_reasks} re-asks")
+            print(f"[driver] {cause}")
+            if event.get("task_token"):
+                settle_token(c["sfn"], event["task_token"],
+                             error=UNCLAIMED_OUTPUTS_ERROR, cause=cause[:250])
+            # Durable, because this list is the only part of the failure a human can act
+            # on and the return value dies with the Lambda. Never fatal: telemetry does
+            # not get to change how a stage settles.
+            try:
+                _record_stage_event(c["ddb"], event["run_id"], event["stage"],
+                                    "UnclaimedStageOutputs",
+                                    {"task": event.get("task", ""),
+                                     "verified_outputs": verified[:20],
+                                     "missing_outputs": probe["missing"][:20],
+                                     "bytes": probe["bytes"],
+                                     "re_asks": re_asks,
+                                     "evidence_reask": evidence_reask,
+                                     "progress_reasks": progress_reasks})
+            except Exception as exc:  # noqa: BLE001 -- see above
+                print(f"[driver] could not record unclaimed outputs: {exc}")
+            ev.emit_event(os.environ["EVENT_BUS"], ev.PIPELINE_FAILED,
+                          {"run_id": event["run_id"], "stage": event["stage"],
+                           "reason": "unclaimed stage outputs"}, client=c["events"])
+            return {"status": "failed", "reason": "unclaimed stage outputs",
+                    "verified_outputs": verified,
+                    "text_tail": out["text"][-500:]}
         if event.get("task_token"):
             settle_token(c["sfn"], event["task_token"],
                          error="MissingStageComplete", cause=out["text"][:250])

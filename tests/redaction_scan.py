@@ -107,8 +107,8 @@ ALLOWED = (b"6833" + b"13688378", b"7631" + b"04351884", b"1234" + b"56789012")
 #: this laptop, single-threaded CPython does 3.1M sha256/s, so the whole 1e12 space falls in
 #: about 4 days -- and a GPU does it in roughly 100 seconds. So the KDF is iterated. At 200k
 #: iterations a candidate costs ~16 ms, which makes the same sweep ~500 GPU-years, while the
-#: scan stays cheap because only 12-digit runs are ever hashed: measured across all 180
-#: tracked files there are 69 such runs, 10 distinct, and hashing the distinct set takes 0.16 s
+#: scan stays cheap because only 12-digit runs are ever hashed: measured across all 184
+#: tracked files there are 74 such runs, 10 distinct, and hashing the distinct set takes 0.16 s
 #: for the entire repo. (Re-measured whenever either number moves, and they move
 #: INDEPENDENTLY, which is why both are derived and neither is inferred from the other, and
 #: this branch is the proof in both directions. Its parent moved BOTH at once from DISJOINT
@@ -139,12 +139,19 @@ ALLOWED = (b"6833" + b"13688378", b"7631" + b"04351884", b"1234" + b"56789012")
 #: the deep-research evidence doc behind it (percentages and win rates), neither carrying
 #: a 12-digit run. Then the canonical RAFT context format moved 178 to 179 (a markdown template whose only
 #: numbers are fractions and a bar), and the r6d plan-and-probe evidence doc moved one more:
-#: 179 files became 180, digests, recall fractions and dollar ranges, no 12-digit run. (The
-#: "became" phrasing is the one the guard reads, so it names the LATEST movement -- the
+#: 179 to 180, digests, recall fractions and dollar ranges, no 12-digit run. Then the
+#: three-holes PR ENDED that streak by moving both at once: 180 files became 184 -- the
+#: drift auditor, the protocol probe and their two test modules -- and the run count went
+#: 69 -> 74, because three of the four pass the published placeholder account id to a sent-side
+#: reconstruction or a probe payload, and the deploy README gained the auditor's offline
+#: invocation -- which is a fifth run in a file that already existed, and so moved one number
+#: without the other inside a single commit. The DISTINCT count held at 10, which is the whole
+#: reason the KDF cost is bounded: five more runs of an id already in the set cost nothing to hash.
+#: (The "became" phrasing is the one the guard reads, so it names the LATEST movement -- the
 #: earlier ones are history and keep their own past tense.)
-#: EIGHT commits
-#: running, the file count moved and the run count did not move once --
-#: which is the whole reason these are two derived numbers and not one. The CI-only detection
+#: For EIGHT commits
+#: running, the file count moved and the run count did not move once, and then one commit moved
+#: both -- which is the whole reason these are two derived numbers and not one. The CI-only detection
 #: has now repeated FOUR times: `git ls-files` reads the INDEX, so on this push-via-API
 #: workstation a new file is invisible to the census until it is staged, and the guard agrees
 #: with the stale comment right up until CI disagrees with both. The third occurrence cost a

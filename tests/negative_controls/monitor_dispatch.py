@@ -47,6 +47,16 @@ REPO = pathlib.Path(__file__).resolve().parents[2]
 #: test id is the single likeliest defect in a file that is nothing but test ids.
 PYTEST_TESTS_FAILED = 1
 
+#: Every case here is seconds-scale, so a case that runs for minutes is not slow, it is
+#: hung -- and a hang is worse than a red run, because the runner waits forever and reports
+#: NOTHING, not even the cases before it (the tail of a piped run is written on exit). m322
+#: was exactly that: with `PROGRESS_REASK_CAP` deleted the driver and the growing-S3 double
+#: form an unbounded loop -- every probe pass sees more bytes, so every pass buys another
+#: turn -- and one pytest sat for 39 minutes. Scored as UNCAUGHT, which is the honest
+#: verdict: a test that never returns has not demonstrated that it fails.
+PYTEST_TIMEOUT_S = 300
+PYTEST_HUNG = -1
+
 
 def run(test):
     """Run one test with bytecode caching OFF.
@@ -61,8 +71,12 @@ def run(test):
     idea of what the source is.
     """
     env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
-    r = subprocess.run(['.venv/bin/python', '-m', 'pytest', test, '-q', '--no-header', '-x'],
-                       cwd=REPO, capture_output=True, text=True, env=env)
+    try:
+        r = subprocess.run(['.venv/bin/python', '-m', 'pytest', test, '-q', '--no-header', '-x'],
+                           cwd=REPO, capture_output=True, text=True, env=env,
+                           timeout=PYTEST_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        return PYTEST_HUNG, f"no result in {PYTEST_TIMEOUT_S}s -- hung, not slow"
     return r.returncode, (r.stdout + r.stderr).strip().splitlines()[-1]
 
 CASES = []
@@ -5661,6 +5675,447 @@ def m317(t):
 case("prompt: deploy may guess which artifact to serve",
      _DEPLOY_PROMPT, m317,
      [f"{_DISPATCH}test_the_deploy_prompt_is_told_where_the_artifact_it_serves_comes_from"])
+
+
+# ── the three holes: the protocol killer, the drift auditor, the reliability probe ─────
+# MissingStageComplete was 15 of 32 executions' cause of death and 15/15 fatal, and the fix
+# is the one place in this repo where the SAFE-LOOKING change is the dangerous one: every
+# piece of evidence that a stage finished was written by the agent being judged. So the
+# controls below are weighted towards one question -- can the driver be made to accept
+# agent-written evidence as a verdict -- because that is the mutation a well-meaning future
+# edit produces, and the one no behaviour test complains about.
+_AUDIT = "tools/audit_drift.py"
+_PROBE = "tools/probe_protocol_reliability.py"
+_HARNESS_DEPLOY = "deploy/05_harnesses.py"
+_MONITOR = "agents/monitor/harness.json"
+_TAD = "tests/test_audit_drift.py::"
+_TPR = "tests/test_probe_runner.py::"
+
+
+def m318(t):
+    # The one invariant that keeps the evidence probe from becoming the prose parser this
+    # driver must not have: it scrapes s3:// URIs out of the agent's turn text and adds
+    # them to the claim. The mutation is deliberately the HELPFUL-looking version -- "the
+    # agent named its outputs in the reply, why not read them?" -- because that is how
+    # a driver ends up verifying a claim the agent invented this turn.
+    old = ('def probe_stage_evidence(s3, manifest_uri: str, stage: str, task: str = "",\n'
+           '                         iteration=None) -> dict:\n')
+    new = ('def probe_stage_evidence(s3, manifest_uri: str, stage: str, task: str = "",\n'
+           '                         iteration=None, text: str = "") -> dict:\n')
+    tail = ('    claim = _derive_stage_claim(_load_manifest(s3, manifest_uri), stage, task, iteration)\n'
+            '    return _claim_fingerprint(s3, claim)\n')
+    new_tail = ('    claim = _derive_stage_claim(_load_manifest(s3, manifest_uri), stage, task, iteration)\n'
+                '    _s3_uris_in(re.findall(r"s3://[^\\s\\"]+", text or ""), claim)\n'
+                '    return _claim_fingerprint(s3, claim)\n')
+    assert t.count(old) == 1 and t.count(tail) == 1, "probe_stage_evidence moved"
+    return t.replace(old, new, 1).replace(tail, new_tail, 1)
+
+
+case("driver: the evidence probe reads the agent's turn text",
+     _DRIVER, m318,
+     [f"{_TO}test_the_evidence_probe_never_reads_the_agents_turn_text"])
+
+
+def m319(t):
+    # THE hole, reopened: the settle that reports the driver's own verified list becomes a
+    # SUCCESS carrying it. Everything the driver saw was written by the agent -- the S3
+    # objects and the manifest entry naming them -- so this makes the claimant its own
+    # verifier, which is the exact configuration a reward-hacking agent presents. Fifteen
+    # loud failures traded for an unknown number of silent false successes.
+    old = ('                settle_token(c["sfn"], event["task_token"],\n'
+           '                             error=UNCLAIMED_OUTPUTS_ERROR, cause=cause[:250])\n')
+    new = ('                settle_token(c["sfn"], event["task_token"],\n'
+           '                             output={"outputs": verified, "note": cause[:250]})\n')
+    assert t.count(old) == 1, "the UnclaimedStageOutputs settle moved"
+    return t.replace(old, new, 1)
+
+
+case("driver: unclaimed outputs settle as a SUCCESS on the agent's own evidence",
+     _DRIVER, m319,
+     [f"{_TO}test_durable_outputs_never_promote_a_prose_turn_to_success"])
+
+
+def m320(t):
+    # The fingerprint stops asking S3 anything and trusts the manifest. Then a manifest
+    # entry naming objects that were never written is "verified", and an agent can buy the
+    # extra turns -- and the re-dispatchable failure name -- by writing a claim alone.
+    old = ('        try:\n'
+           '            head = s3.head_object(Bucket=bucket, Key=key)\n'
+           '        except Exception:\n'
+           '            missing.append(uri)\n'
+           '            continue\n')
+    new = '        head = None\n'
+    assert t.count(old) == 1, "_claim_fingerprint's head_object moved"
+    return t.replace(old, new, 1)
+
+
+case("driver: the claim is trusted instead of re-verified against S3",
+     _DRIVER, m320,
+     [f"{_TO}test_a_claim_whose_objects_are_absent_is_not_evidence",
+      f"{_TO}test_the_evidence_probe_never_reads_the_agents_turn_text"])
+
+
+def m321(t):
+    # The grants are hoisted ABOVE the ordinary re-ask budget, so every prose turn-end --
+    # an event that happens on runs which then finish cleanly -- pays for a manifest GET
+    # and a head_object per claimed output. The turn count is unchanged, which is why only
+    # an S3-read assertion can see it.
+    block = ('        if re_asks < PROSE_REASK_BUDGET:\n'
+             '            re_asks += 1\n'
+             '            messages = _user_text(RE_ASK)\n'
+             '            continue\n')
+    anchor = "        # Re-asks exhausted → treat as stage failure."
+    assert t.count(block) == 1 and t.count(anchor) == 1, "the re-ask branch moved"
+    return t.replace(block, "", 1).replace(anchor, f"{block}\n{anchor}", 1)
+
+
+case("driver: the evidence probe runs on every ordinary re-ask",
+     _DRIVER, m321,
+     [f"{_TO}test_the_ordinary_re_ask_costs_no_s3_read"])
+
+
+def m322(t):
+    # The progress grant loses its cap. Each grant is paid for by new bytes, so this looks
+    # bounded by the agent's own writing -- but an agent appending one byte per turn now
+    # holds the stage until the 8h session lifetime or the machine's 86400s timeout.
+    old = '    if verified and (grew or probe["missing"]) and progress_reasks < PROGRESS_REASK_CAP:\n'
+    new = '    if verified and (grew or probe["missing"]):\n'
+    assert t.count(old) == 1, "the progress-grant branch moved"
+    return t.replace(old, new, 1)
+
+
+case("driver: the progress grant becomes unbounded",
+     _DRIVER, m322,
+     [f"{_TO}test_the_progress_grant_is_bounded"])
+
+
+def m323(t):
+    # "Strictly growing" becomes "not shrinking", which is the difference between an agent
+    # that is still writing and one that has stopped. A stalled agent then earns every
+    # progress turn there is, which is the budget this asymmetry exists to deny it.
+    old = ('    verified, grew = probe["verified"], claim_bytes >= 0 '
+           'and probe["bytes"] > claim_bytes\n')
+    new = ('    verified, grew = probe["verified"], claim_bytes >= 0 '
+           'and probe["bytes"] >= claim_bytes\n')
+    assert t.count(old) == 1, "the growth comparison moved"
+    return t.replace(old, new, 1)
+
+
+case("driver: a stalled claim counts as progress",
+     _DRIVER, m323,
+     [f"{_TO}test_growing_outputs_buy_progress_turns_and_a_stalled_claim_buys_none"])
+
+
+def m324(t):
+    # The new grants stop riding the continuation. One harness turn can run 840s against a
+    # 900s Lambda, so a stage crosses invocations routinely -- and a grant that resets at
+    # that boundary lets the same unchanged manifest entry earn its turns again on every
+    # invocation. The `_resumed` lesson: a continuation key nobody carries does not exist.
+    old = ('                                "_evidence_reask": evidence_reask,\n'
+           '                                "_progress_reasks": progress_reasks,\n'
+           '                                "_claim_bytes": claim_bytes,\n'
+           '                                "_no_arg_recoveries": no_arg_recoveries,\n')
+    assert t.count(old) == 1, "the self-reinvoke payload moved"
+    return t.replace(old, "", 1)
+
+
+case("driver: the extra grants reset at every Lambda boundary",
+     _DRIVER, m324,
+     [f"{_TO}test_the_extra_grants_survive_a_self_reinvoke"])
+
+
+def m325(t):
+    # The narrowing is removed, so a bolded NAME with no arguments is recovered for every
+    # serviced tool. `**stage_complete**` then parses to args={}, normalize_stage_complete
+    # defaults outputs to [], verify_outputs([]) finds nothing missing -- and the stage
+    # settles SUCCESS having verified nothing. A recovery that turns a bolded word into a
+    # zero-output success is strictly worse than the death it prevents.
+    old = 'NO_ARG_RECOVERABLE = frozenset({"checkpoint"})\n'
+    new = 'NO_ARG_RECOVERABLE = SERVICED_TOOLS\n'
+    assert t.count(old) == 1, "NO_ARG_RECOVERABLE moved"
+    return t.replace(old, new, 1)
+
+
+case("driver: a bolded name alone can claim a zero-output success",
+     _DRIVER, m325,
+     [f"{_TO}test_a_bolded_stage_complete_with_no_arguments_is_not_recovered",
+      f"{_TO}test_the_only_bolded_call_recovered_without_arguments_is_argument_free"])
+
+
+def m326(t):
+    # The markdown spelling loses the serviced gate, so the driver starts answering calls
+    # the runtime never made and never asked it to service -- a bolded `shell` in prose
+    # becomes a dispatch. The gate is the boundary between recovering a call the harness
+    # dropped and inventing one.
+    old = ('        if name not in serviced or match.start() <= found_at:\n'
+           '            continue\n'
+           '        args, gap = None, _MD_ARGS_GAP_RE.match(text, match.end())\n')
+    new = ('        if match.start() <= found_at:\n'
+           '            continue\n'
+           '        args, gap = None, _MD_ARGS_GAP_RE.match(text, match.end())\n')
+    assert t.count(old) == 1, "the markdown recovery loop moved"
+    return t.replace(old, new, 1)
+
+
+case("driver: the markdown spelling escapes the serviced gate",
+     _DRIVER, m326,
+     [f"{_TO}test_a_bolded_shell_is_never_recovered"])
+
+
+def m327(t):
+    # Two names, one number: the suppressed-turn budget is DEFINED as the prose budget.
+    # It reads as two budgets, counts as two assignments, still equals 2 -- and tuning
+    # either one silently moves the other, which is the defect the split removed.
+    old = "\nFILTERED_TURN_BUDGET = 2\n"
+    new = "\nFILTERED_TURN_BUDGET = PROSE_REASK_BUDGET\n"
+    assert t.count(old) == 1, "FILTERED_TURN_BUDGET moved"
+    return t.replace(old, new, 1)
+
+
+case("driver: the two prose budgets are aliased back together",
+     _DRIVER, m327,
+     [f"{_TO}test_the_two_prose_budgets_are_named_and_independent"])
+
+
+def m328(t):
+    # The protocol row is written BEFORE the two recoveries that decide what it says, which
+    # is exactly the flaw in the per-turn log line this row was added to replace: that line
+    # prints tool=None for turns which were in fact serviced. A record that misclassifies
+    # the one thing it exists to classify makes the SLI read worse than reality, and the
+    # measurement is the whole point of the row.
+    block = ('        if tu and out["stop_reason"] == "tool_use":\n'
+             '            prot["serviced_turns"] += 1\n'
+             '        elif not out["text"] and out["stop_reason"] in ("content_filtered",\n'
+             '                                                        "guardrail_intervened"):\n'
+             '            prot["filtered_turns_total"] += 1\n'
+             '        else:\n'
+             '            prot["prose_turns"] += 1\n'
+             '        _write_protocol((tu or {}).get("name") or "", out["stop_reason"])\n')
+    anchor = ('        if tu and out["stop_reason"] != "tool_use" '
+              'and tu.get("name") in SERVICED_TOOLS:\n')
+    assert t.count(block) == 1 and t.count(anchor) == 1, "the protocol write moved"
+    return t.replace(block, "", 1).replace(anchor, block + anchor, 1)
+
+
+case("driver: the protocol row is written before the recoveries that change its answer",
+     _DRIVER, m328,
+     [f"{_TO}test_the_record_is_written_after_the_recovery_that_changes_its_answer"])
+
+
+def m329(t):
+    # `detail` disappears from the row. The console's _recent_session_ids queries this table
+    # with NO sk filter and reads `detail` for the task name, so a row without it yields
+    # (stage, "") -- a fabricated session id that has no spans, which then appears in batch
+    # eval as a failed session. The row exists to measure the pipeline, not to invent work.
+    old = ('    item = {"run_id": run_id, "sk": f"{PROTOCOL_SK}{stage}#{task}#e{epoch}",\n'
+           '            # `detail` is not optional -- see PROTOCOL_SK on _recent_session_ids.\n'
+           '            "detail": json.dumps({"stage": stage, "task": task, "epoch": epoch,\n'
+           '                                  "last_tool": last_tool or "",\n'
+           '                                  "last_stop_reason": last_stop_reason or "",\n'
+           '                                  "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ",\n'
+           '                                                              time.gmtime())},\n'
+           '                                 default=str)}\n')
+    new = '    item = {"run_id": run_id, "sk": f"{PROTOCOL_SK}{stage}#{task}#e{epoch}"}\n'
+    assert t.count(old) == 1, "the protocol item shape moved"
+    return t.replace(old, new, 1)
+
+
+case("driver: a protocol row without `detail` fabricates a session id",
+     _DRIVER, m329,
+     [f"{_TO}test_a_protocol_record_cannot_fabricate_a_session_id"])
+
+
+def m330(t):
+    # One character, and the new rows land INSIDE the console timeline's
+    # Key("sk").lt("A") window: every stage view in the console grows a wall of protocol
+    # counters nobody asked for. The prefix's whole job is to sort above that bound so the
+    # console needs no change at all.
+    old = 'PROTOCOL_SK = "protocol#"\n'
+    new = 'PROTOCOL_SK = "#protocol#"\n'
+    assert t.count(old) == 1, "PROTOCOL_SK moved"
+    return t.replace(old, new, 1)
+
+
+case("driver: the protocol prefix sorts into the console timeline",
+     _DRIVER, m330,
+     [f"{_TO}test_the_protocol_prefix_sorts_outside_the_console_timeline_range"])
+
+
+def m331(t):
+    # The counters stop riding the heartbeat, so a stage the resurrector wakes restarts its
+    # turn numbering at zero. Its next row carries a SMALLER denominator than the one
+    # already there, the monotonic condition refuses the write, and the rest of that
+    # stage's protocol history is silently lost -- the SLI reads clean because the bad
+    # turns were never recorded.
+    old = ('                                      "_session_started_at": session_started_at,\n'
+           '                                      # So a resurrected stage CONTINUES its turn\n'
+           '                                      # numbering instead of restarting it -- a resumed\n'
+           '                                      # counter that starts at zero writes a row whose\n'
+           '                                      # denominator is smaller than the one already\n'
+           '                                      # there, which the monotonic condition then\n'
+           '                                      # refuses, silently losing the rest of the stage.\n'
+           '                                      **{f"_{k}": v for k, v in prot.items()}},\n')
+    new = '                                      "_session_started_at": session_started_at},\n'
+    assert t.count(old) == 2, "the heartbeat payloads moved"
+    return t.replace(old, new, 2)
+
+
+case("driver: a resurrected stage restarts its turn numbering",
+     _DRIVER, m331,
+     [f"{_TO}test_a_resurrected_stage_continues_its_turn_numbering"])
+
+
+def m332(t):
+    # The monotonic condition goes, and an async Lambda retry replaying a stale
+    # continuation (live: run 68cfa9c8) rolls the row BACKWARDS -- a stage that burned nine
+    # turns reports three. Absolute writes are idempotent under replay only while the
+    # condition refuses the late, smaller one.
+    old = ('            Item=item,\n'
+           '            ConditionExpression="attribute_not_exists(turns) OR turns <= :turns",\n'
+           '            ExpressionAttributeValues={":turns": item["turns"]})\n')
+    new = '            Item=item)\n'
+    assert t.count(old) == 1, "the protocol put_item moved"
+    return t.replace(old, new, 1)
+
+
+case("driver: a replayed continuation rolls the protocol row backwards",
+     _DRIVER, m332,
+     [f"{_TO}test_a_replayed_turn_does_not_inflate_the_denominator"])
+
+
+def m333(t):
+    # The audit reports CLEAN when a leg could not be compared at all -- no credentials, an
+    # AccessDenied, a missing resource. This is the failure mode tools/audit_landed.py was
+    # written against: the whole value of a pre-deploy drift check is that "I could not
+    # look" and "I looked and it matches" are different answers.
+    old = "    if unknown:\n        return 2\n"
+    assert t.count(old) == 1, "report's unknown branch moved"
+    return t.replace(old, "", 1)
+
+
+case("audit: an unanswerable leg exits 0 like a clean one",
+     _AUDIT, m333,
+     [f"{_TAD}test_an_unreachable_check_never_exits_zero",
+      f"{_TAD}test_the_exit_code_table_is_the_documented_one"])
+
+
+def m334(t):
+    # The tempting shortcut: compare CodeSha256 and skip the per-member walk. `bundle()`
+    # uses zipfile.write, which stamps each entry with the source file's mtime, so the zip
+    # bytes are not reproducible from a fresh checkout -- the sha comparison reports either
+    # permanent drift or, as here, nothing at all, and a stale member never gets named.
+    old = '        compared.append(f"lambda {fn} code ({len(want)} members)")\n'
+    new = ('        compared.append(f"lambda {fn} code (CodeSha256)")\n'
+           '        if got.get("CodeSha256") == want.get("CodeSha256"):\n'
+           '            continue\n')
+    assert t.count(old) == 1, "audit_lambda_code's comparison moved"
+    return t.replace(old, new, 1)
+
+
+case("audit: lambda code is compared by a sha that cannot be reproduced",
+     _AUDIT, m334,
+     [f"{_TAD}test_lambda_code_is_compared_per_member_not_by_sha",
+      f"{_TAD}test_a_stale_member_is_named_with_the_first_line_that_differs"])
+
+
+def m335(t):
+    # The sent side skips ensure_env, which is what sets OTEL_TRACES_SAMPLER=always_on --
+    # a value in nobody's harness.json. Every harness then reports environmentVariables
+    # drift forever, and an auditing tool that cries drift on a correct deploy is a tool
+    # whose output gets ignored, including the day it is right.
+    old = "    cfg = harness_deploy.ensure_env(cfg)\n"
+    assert t.count(old) == 1, "harness_sent moved"
+    return t.replace(old, "", 1)
+
+
+case("audit: the harness sent side skips what the deploy adds, so everything is drift",
+     _AUDIT, m335,
+     [f"{_TAD}test_the_harness_sent_side_pops_and_ensures_what_the_deploy_does",
+      f"{_TAD}test_a_perfectly_deployed_system_reports_clean"])
+
+
+def m336(t):
+    # A harness declares a model that is not a key of MODEL_FALLBACKS. _maybe_failover_model
+    # looks the LIVE model id up in that table, so failover for this agent silently becomes
+    # a no-op: the driver retries the same 5xx model, prints one line, and the run dies of a
+    # vendor outage the chain exists to survive. Failover has never executed in production,
+    # so nothing else would have noticed.
+    old = '"modelId": "global.anthropic.claude-fable-5"'
+    new = '"modelId": "global.anthropic.claude-sonnet-5"'
+    assert t.count(old) == 1, "the monitor harness model declaration moved"
+    return t.replace(old, new, 1)
+
+
+case("harness: a deployed model id has no failover chain",
+     _MONITOR, m336,
+     [f"{_TO}test_every_deployed_harness_declares_a_model_with_a_fallback_chain"])
+
+
+def m337(t):
+    # An agent disappears from the deployer's list while its config stays on disk. The
+    # model-id guard iterates AGENTS, so the dropped harness stops being checked -- the
+    # census exists because a list that decides what gets deployed and a directory that
+    # decides what gets checked drift apart silently.
+    old = 'AGENTS = ["data-prep", "finetune", "eval", "deploy", "monitor", "orchestrator",\n'
+    new = 'AGENTS = ["data-prep", "finetune", "eval", "deploy", "orchestrator",\n'
+    assert t.count(old) == 1, "the AGENTS list moved"
+    return t.replace(old, new, 1)
+
+
+case("deploy: an agent config on disk is no longer in the deployer's list",
+     _HARNESS_DEPLOY, m337,
+     [f"{_TO}test_the_agent_configs_on_disk_are_exactly_the_ones_the_deployer_ships"])
+
+
+def m338(t):
+    # `round` instead of `ceil`: 13.43 becomes 13 runs, and 0.80**13 = 0.055. The probe then
+    # quotes 95% confidence for a sweep that a system failing one run in five clears 5.5% of
+    # the time -- the sample size claims slightly more than the money bought, in the
+    # direction nobody checks.
+    old = "    return math.ceil(math.log(alpha) / math.log(target))\n"
+    new = "    return round(math.log(alpha) / math.log(target))\n"
+    assert t.count(old) == 1, "runs_needed moved"
+    return t.replace(old, new, 1)
+
+
+case("probe: the sample size rounds to nearest, so 14 runs becomes 13",
+     _PROBE, m338,
+     [f"{_TPR}test_the_sample_size_rounds_up_and_never_to_nearest",
+      f"{_TPR}test_fourteen_runs_are_what_eighty_percent_at_ninety_five_costs"])
+
+
+def m339(t):
+    # `--student` gains a default, so a probe launched without one merges an 8B artifact's
+    # adapters onto a 1.7B base and measures a lane nobody asked about -- at full price. The
+    # refusal is start_pipeline's own prerequisite check, and this is how it gets bypassed
+    # without touching it.
+    old = '    lp.add_argument("--student", default=None,\n'
+    new = '    lp.add_argument("--student", default="Qwen/Qwen3-1.7B",\n'
+    assert t.count(old) == 1, "the --student argument moved"
+    return t.replace(old, new, 1)
+
+
+case("probe: --student gains a default the artifact does not fit",
+     _PROBE, m339,
+     [f"{_TPR}test_a_dispatch_without_a_student_is_refused"])
+
+
+def m340(t):
+    # The ledger is written only AFTER the invoke returns. Every state a re-run can observe
+    # is identical, and the difference is one crash window wide: a launch that dies between
+    # the invoke and the write has spent $0.53 that nothing recorded, and the next launch
+    # dispatches that slot again. Money is the one resource here with no undo.
+    old = ('        slot["attempted_at"] = _iso(now)\n'
+           '        if path:\n'
+           '            save_state(path, state)           # before the invoke, never after\n')
+    new = '        slot["attempted_at"] = _iso(now)\n'
+    assert t.count(old) == 1, "launch's pre-invoke ledger write moved"
+    return t.replace(old, new, 1)
+
+
+case("probe: the dispatch is recorded only after the money is spent",
+     _PROBE, m340,
+     [f"{_TPR}test_a_slot_is_never_dispatched_twice"])
 
 
 #: Where the pristine text of the file currently mutated is parked, so a kill -9 -- which

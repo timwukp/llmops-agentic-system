@@ -550,14 +550,91 @@ acted on — the indistinguishability that let the data-prep escalation read as 
 three days.
 
 If a turn ends *without* an inline-function call (models sometimes narrate completion but
-skip the structured call), the driver re-asks up to 2 **consecutive** times in the same
-session, then fails the stage as `MissingStageComplete` — narration is never promoted to
-success. Any serviced tool call re-arms the budget: what it counts is an agent that has
-stopped speaking protocol, not one that slipped twice an hour apart and recovered. Every
+skip the structured call), the driver re-asks up to `PROSE_REASK_BUDGET = 2` **consecutive**
+times in the same session, then fails the stage — narration is never promoted to success.
+Any serviced tool call re-arms the budget: what it counts is an agent that has stopped
+speaking protocol, not one that slipped twice an hour apart and recovered. Every
 fleet prompt also states this contract explicitly as a TURN-END INVARIANT naming that
 harness's own terminal tools, with a write-first rule (artifacts land in S3 before the
 call that claims them) — a guard test derives both directions from each harness's
-declared tools, so the sentence cannot drift from the tool list.
+declared tools, so the sentence cannot drift from the tool list. The budget for *filtered*
+turns is a separate constant of the same value (`FILTERED_TURN_BUDGET = 2`): the numbers
+agree today and the causes do not, and one shared constant would silently couple them.
+
+**Evidence is spent as budget; it is never read as a verdict.** This is the most-cited
+failure in the system's history — `MissingStageComplete` was the cause of death in 15 of
+32 runs, fatal every time — so it is worth being explicit about the fix that was *not*
+taken. When the prose budget runs out the driver re-derives a **claim** from durable state
+(`_derive_stage_claim`: the S3 URIs named in the manifest's `stages[stage]` entry and in
+the thin `"<stage>.<task>.i<n>"` entry agents write beside it), re-verifies it itself with
+`verify_outputs` (per-URI `head_object`, zero new IAM), and fingerprints the result as
+`(present_count, total_bytes)`. What that buys is **turns, not success**:
+
+| Claim | Reading | Grant |
+|---|---|---|
+| non-empty, nothing missing, fingerprint **unchanged** | looks finished | one `EVIDENCE_REASK_BUDGET` turn, quoting the driver-verified URIs back and asking for `stage_complete` on them |
+| fingerprint **strictly grown**, or partially present | still working | one `PROGRESS_REASK`, capped at `PROGRESS_REASK_CAP`, naming `checkpoint` (or `job_launched` if a job is running) |
+| empty, or every object absent | no evidence | bit-for-bit today's `MissingStageComplete` |
+
+If the grants are exhausted *with* verified evidence the stage settles under a new,
+distinguishable name — **`UnclaimedStageOutputs`** — whose cause names the count and the
+first two URIs the driver verified. The run still escalates; nothing auto-succeeds. What
+changed is that a human now gets a list and can re-dispatch one stage instead of re-running
+the pipeline. The reason it cannot be more than that: every piece of that evidence is
+written by the agent being judged — the S3 objects and the manifest entries both — and a
+role that can rewrite the artifacts it is verified against can launder its own evidence.
+Trading 15 loud failures for an unknown number of quiet false successes is strictly worse,
+because a false `SUCCESS` is written into `manifest["stages"]`, which every later stage
+reads through `stage_fact_params`, and into the report a human approves. The claim is
+therefore deliberately **not** written back to the manifest, and the driver's control-plane
+evidence (`job_launched` parking a token, EventBridge resuming on real SageMaker job state)
+stays the only channel the agent cannot forge. `UnclaimedStageOutputs` splits off
+`MissingStageComplete` on the same argument that split `ModelUnavailable` and
+`ContentFiltered`: the two need different operator responses. No ASL change is needed —
+every state already catches `States.ALL` → `EscalateFail`, and a guard test asserts the new
+name appears in no `ErrorEquals`, so nobody can quietly add "just retry it".
+
+**Per-stage protocol records make that rate measurable.** `re_asks`, `filtered_turns` and
+typed-call recoveries used to live only in memory and in `print`, and the sole per-turn
+durable write is a heartbeat that overwrites itself — so a stage that burned three
+malformed turns was **indistinguishable** from a clean one in every durable artifact, which
+is why p̂ = 0.8421 had to be counted by hand out of logs. The driver now writes one row per
+stage epoch into `llmops-stage-events` under `sk = protocol#<stage>#<task>#e<epoch>`
+(zero new IAM, zero new resources) carrying `turns`, `serviced_turns`, `prose_turns`,
+`filtered_turns_total`, `recovered_typed_calls`, `recovered_ending_in_prose`,
+`infra_error_turns_total` and `deadline_cuts`. It is written **after** the stop-reason
+override and the typed-call recovery, not before — that ordering is the defect in the
+`[driver] turn` log line, which prints early and so reports `tool=None` for turns that were
+in fact serviced. Absolute values, not `ADD`, with
+`ConditionExpression="attribute_not_exists(turns) OR turns <= :turns"` so a late replay
+cannot walk a counter backwards; a rejected condition is swallowed and printed, because
+telemetry never kills work. The counters ride the heartbeat payload alongside `epoch`, so a
+resurrected stage continues its numbering instead of overwriting it. Two placement traps,
+both verified against the console's real code: `"protocol#" > "A"` = `TIMELINE_SK_MAX`, so
+the rows fall outside the timeline query and the console needs no change (a guard test pins
+that lexicographic fact); and `_recent_session_ids` queries the events table with **no sk
+filter** and reads `json.loads(detail)["task"]`, so a row without a `detail` attribute would
+fabricate a session id with no spans — hence `detail` always carries `task`, pinned in both
+directions. `protocol_rollup(items)` is a pure function over exactly those rows and yields
+the structured-call rate per stage and per run.
+
+Two read-only tools close the loop. `tools/audit_drift.py` answers "is production running
+this tree's code?" across five legs (IAM inline policies, the state-machine definition,
+harness configs, Lambda configuration, Lambda code per zip member) using the deploy
+scripts' own comparators, and exits `0` only when every leg was both compared and clean —
+`2` means something could not be looked at, which is not a pass. It exists because the
+answer was measurably *no* for weeks: before the 2026-08-15 rehearsal, `eval_only` had never
+been deployed, `_check_mode_prerequisites` was absent from the live start Lambda, and 3 of 7
+prompts plus 4 of 7 Lambdas had drifted — none of it visible to a test suite that reads the
+working tree. `tools/probe_protocol_reliability.py` derives the sample size rather than
+hard-coding it: to say with 95% confidence that the true pass rate is ≥ p after n
+consecutive passes needs `p**n <= alpha`, i.e. `n = ceil(log(alpha)/log(p))` → **14 runs
+($7.42)** for 0.80 and **29 ($15.37)** for 0.90 at `PROBE_UNIT_COST_USD = 0.53` (the
+measured cost of the 2026-08-15 rehearsal). Its Wilson interval is pinned to the console's
+`_wilson` to 1e-12 by test, and its ledger is written **before** each dispatch, so a slot is
+never dispatched twice across days. The 42% five-stage and 13% twelve-stage predictions are
+**not** retired by any of this — they are re-measured by running the probe, which is
+authorized separately.
 
 The turn handoff itself is guarded by a **heartbeat + resurrector** pair. The driver's
 self-reinvoke is an async Lambda invoke — fire-and-forget, and Lambda dropped one live

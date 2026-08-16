@@ -5,6 +5,86 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
 ## [Unreleased]
 
+### Three holes between "succeeded once" and "succeeds every time"
+
+The `deploy_only` rehearsal on 2026-08-15 passed end to end for $0.53 with no human
+intervention. Laying all 32 historical executions beside it showed that success was not
+yet repeatable, for three separately-measured reasons — the leading cause of death had
+never been touched, fixes were not reaching production, and "stable" rested on n = 1.
+This is code and read-only audit only: **no live AWS call, no deploy, and the 14 probe
+runs are priced but not executed** (separately authorized).
+
+**1. The killer: prose instead of a structured call.** `MissingStageComplete` was the
+cause of death in 15 of 32 runs and was fatal in 15/15 — 5× the runner-up, every instance
+an agent ending its turn in narration. When the (now named) `PROSE_REASK_BUDGET` runs out,
+the driver re-derives a claim from durable state, re-verifies it itself with
+`verify_outputs`, and fingerprints it as `(present_count, total_bytes)`. Verified evidence
+buys **turns, not verdicts**: one `EVIDENCE_REASK_BUDGET` turn quoting the driver-verified
+URIs back when the fingerprint is unchanged, or a `PROGRESS_REASK` (capped) when it is
+strictly growing; no claim, or every object absent, falls back bit-for-bit to today's
+`MissingStageComplete`. Exhausting the grants *with* evidence settles the new, separately
+named **`UnclaimedStageOutputs`**, whose cause names the verified count and first two URIs
+— the run still escalates, nothing auto-succeeds, but a human can now re-dispatch one
+stage instead of the pipeline. It cannot do more: the S3 objects *and* the manifest entries
+are both written by the agent being judged, and 15 loud failures are strictly better than
+an unknown number of quiet false successes written into `manifest["stages"]` and into a
+report a human approves. No ASL change (every state already catches `States.ALL`), and a
+guard asserts the new name appears in no `ErrorEquals`. `parse_typed_call` also learns the
+markdown spelling that killed run 86ab8a14 (`**checkpoint**`) — narrowed so a bare
+`**stage_complete**` with no arguments is *not* recovered, since empty `outputs` would pass
+`verify_outputs` trivially and settle a zero-artifact success. `FILTERED_TURN_BUDGET` and
+`PROSE_REASK_BUDGET` are two constants of equal value, deliberately not one.
+
+**2. Fixes were not reaching production** — `tools/audit_drift.py`, one read-only command
+across five legs (IAM inline policies, state-machine definition, harness configs, Lambda
+configuration, Lambda code **per zip member with the first differing line named**, never
+by `CodeSha256`, which `bundle()`'s mtimes make unreproducible). It reuses the deploy
+scripts' own comparators — `state_machine_drift`, `harness_config_drift`, and a
+`policy_diff` extracted out of `01_iam.py`'s `show_diff` — so there is no second opinion
+to drift. `0` requires every leg both compared *and* clean; `2` means a leg could not be
+looked at and is not a pass; `--offline` builds every sent side and makes no AWS call at
+all. It is first in line because the answer was *no* for weeks: `eval_only` had never been
+deployed, `_check_mode_prerequisites` was absent from the live start Lambda, the driver was
+still running the `UpdateHarness` mechanism PR #134 replaced, 3/7 prompts and 4/7 Lambdas
+had drifted — none of it visible to a suite that reads the working tree. Deliberately not
+wired into CI: widening the one credentialed role to read the control plane would be a live
+IAM write and a new standing capability.
+
+**3. "Stable" rested on n = 1.** `deploy_only` 1/1 → Wilson 95% CI [0.207, 1.000]; the
+full pipeline 0/30 → [0.000, 0.114]; per-stage protocol compliance p̂ = 80/95 = 0.8421
+[0.7557, 0.9019] → a five-stage lane predicts 42% and a twelve-stage path 13%. Two changes
+make that measurable instead of hand-counted. Durable per-stage protocol records land in
+`llmops-stage-events` under `protocol#<stage>#<task>#e<epoch>` (zero new IAM, zero new
+resources) carrying turn, prose, filtered, recovery and deadline counters — written *after*
+the stop-reason override and typed-call recovery, which is exactly the ordering bug in the
+`[driver] turn` log line that reports `tool=None` for serviced turns; absolute values under
+a monotonic `ConditionExpression`, riding the heartbeat so a resurrected stage continues
+its numbering, `detail` always carrying `task` so `_recent_session_ids` cannot fabricate a
+session id, and `protocol#` > `TIMELINE_SK_MAX` so the console needs no change.
+`protocol_rollup()` turns those rows into the structured-call rate per stage and per run.
+And `tools/probe_protocol_reliability.py` derives its sample size instead of hard-coding
+it — `n = ceil(log(alpha)/log(p))` → 14 runs / $7.42 at 0.80, 29 / $15.37 at 0.90, at the
+rehearsal's measured `PROBE_UNIT_COST_USD = 0.53` — with Wilson pinned to the console's
+`_wilson` at 1e-12, a refusal to dispatch without `--student` (the default would silently
+merge an adapter onto Qwen3-1.7B), and its ledger written *before* each invoke so no slot
+is ever dispatched twice. **The 42% and 13% predictions are not retired by this release**;
+they are re-measured by running the probe, which is a separate authorization.
+
+Also: a guard test asserting every deployed harness declares a `modelId` that is a key of
+`MODEL_FALLBACKS`, because `_maybe_failover_model` looks up the ID `GetHarness` reports and
+silently no-ops on a miss — and failover has never executed a line in production, so nobody
+would have noticed. The `MODEL_FALLBACKS` values are untouched. Zero existing tests
+required changes.
+
+94 new guards, 23 negative controls (m318–m340, 29 pairs), suite 1383→1477, controls
+374→403. Two of those controls bought a defect in the guards they were breaking: with the
+progress cap deleted the driver and the growing-outputs double loop forever, so the control
+**hung for 39 minutes instead of going red** — the double now stops at the ceiling, and
+`run()` in the control runner has a 300 s timeout because a control that hangs reports
+nothing at all, not even the cases before it. And the drift auditor's clean-report fixture
+builds its live side by calling `harness_sent()`, the function under test, so it moved with
+the mutation and stayed green; it now restates the sampler value as a literal.
+
 ### r6d: the facts move out of the weights (RAFT retrieval, #122–#125)
 
 r6c's diagnosis closed the closed-book road: decontamination correctly deletes exactly
