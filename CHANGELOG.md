@@ -5,6 +5,35 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
 ## [Unreleased]
 
+### finetune-vision: the first supported non-LLM task type
+
+Object-detection fine-tuning on customer-labeled COCO data, built as a proof that the
+platform's genericity holds: the driver, IAM and Lambdas are untouched, and the state
+machine gained one provably-equivalent Choice rule (`vision` routes explicitly to the
+state the Default already named, because the mode-drift guard requires every gated mode
+to be visible). Dispatch gained a third question — `MODE_REQUIRED_CHOSEN` asks whether a
+param's VALUE was chosen rather than inherited, closing the leak where a vision plan that
+forgot its `gates` block would have been judged against `DEFAULT_PARAMS`' ARC solve-rate
+gates (a presence check can never see this: the default is what puts the key there).
+`MODE_REQUIRED_ROLES["vision"]` stops `DEFAULT_MODELS` from silently handing a detection
+run its Qwen3-1.7B language-model student. New canonical artifacts, mirrored with byte
+read-back and readable-not-writable by the harness role: `code/vision/`
+(`train_detection.py`, full fine-tune of RT-DETR via HF Transformers script mode; D-FINE
+as a pinned-sha vendor path) and `code/eval/vision_map_scorer.py` (deterministic
+COCO-style AP50/AP[.50:.95] + seeded bootstrap CI, pure numpy, sha256-recorded per run
+like the judge prompt — there is no LLM judge on this line by construction). Ultralytics
+YOLO is unsupported by licensing design (the vendor asserts AGPL-3.0 over fine-tuned
+weights and the embedding application): the catalog entry says so, the orchestrator
+prompt makes it a red line, and `test_no_ultralytics_import_anywhere_in_vision_code`
+greps the surface forms. The old `finetune-yolo` catalog key survives, deprecated, so
+existing task rows still resolve. Specialist prompts gained mode-gated VISION MODE
+clauses only (existing task text untouched; pinned by anchor tests); the deploy smoke
+canary switches to images under the same gate. Suite 1477 → 1518; negative controls
+m341–m345 (default-student fill, gates leak, IoU boundary comparator, empty-mirror
+guard, self-authored scorer), 403 → 408 (guard, mutation) pairs. `tools/synth_shapes.py`
+ships the deterministic smoke corpus generator (seeded, exact boxes, zero PII); the live
+smoke run is priced but not executed — separately authorized, like every deploy.
+
 ### Three holes between "succeeded once" and "succeeds every time"
 
 The `deploy_only` rehearsal on 2026-08-15 passed end to end for $0.53 with no human

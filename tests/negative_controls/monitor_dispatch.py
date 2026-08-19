@@ -6118,6 +6118,99 @@ case("probe: the dispatch is recorded only after the money is spent",
      [f"{_TPR}test_a_slot_is_never_dispatched_twice"])
 
 
+_SCORER = "pipeline/eval/vision_map_scorer.py"
+_STORAGE3 = "deploy/03_storage.py"
+_EVAL_HARNESS = "agents/eval/harness.json"
+
+
+def m341(t):
+    # MODE_REQUIRED_ROLES loses its vision entry: DEFAULT_MODELS then fills the student
+    # role with Qwen3-1.7B -- a language model -- and the detection run dispatches
+    # cleanly, to fail a GPU-hour later inside a trainer handed the wrong weights.
+    old = ('    "vision": (\n'
+           '        ("student",\n'
+           '         "the detector family to fine-tune (an Apache-licensed RT-DETR/D-FINE id). "\n'
+           '         "DEFAULT_MODELS would silently fill this role with Qwen3-1.7B -- an LLM -- and a "\n'
+           '         "detection run training a language model does not fail at dispatch, it fails a "\n'
+           '         "GPU-hour later inside the trainer"),\n'
+           '    ),\n')
+    assert t.count(old) == 1, "MODE_REQUIRED_ROLES' vision entry moved"
+    return t.replace(old, "", 1)
+
+
+case("vision: the default student silently fills the detector role",
+     _STARTP, m341,
+     [f"{_TO}TestVisionModePrerequisites::"
+      "test_a_vision_run_never_gets_the_default_student"])
+
+
+def m342(t):
+    # MODE_REQUIRED_CHOSEN loses its gates entry: a vision plan that forgot its gates
+    # block inherits DEFAULT_PARAMS' ARC language gates and dispatches -- the leak the
+    # chosen-key check exists to stop, reopened.
+    old = ('        ("gates",\n'
+           '         "the mAP gate block (e.g. {\\"map50_uplift\\": ..., \\"format_validity\\": ...}); "\n'
+           '         "without an explicit choice the run inherits DEFAULT_PARAMS\' ARC solve-rate "\n'
+           '         "gates and the eval agent judges a detector against a language benchmark"),\n')
+    assert t.count(old) == 1, "MODE_REQUIRED_CHOSEN's gates entry moved"
+    return t.replace(old, "", 1)
+
+
+case("vision: forgotten gates inherit the ARC language gates",
+     _STARTP, m342,
+     [f"{_TO}TestVisionModePrerequisites::"
+      "test_a_vision_plan_that_omits_gates_is_refused_not_judged_by_llm_gates"])
+
+
+def m343(t):
+    # COCO's convention is that IoU exactly at the threshold MATCHES (>=). Flipping the
+    # comparator to > is invisible on almost every real box -- floats rarely land
+    # exactly on .50 -- which is why only a constructed boundary fixture can see it.
+    old = "if not claimed[col] and ious[row, col] >= best_iou:"
+    assert t.count(old) == 1, "the scorer's matching comparator moved"
+    return t.replace(old, "if not claimed[col] and ious[row, col] > best_iou:", 1)
+
+
+case("vision: IoU exactly at the threshold no longer matches",
+     _SCORER, m343,
+     ["tests/test_vision_scorer.py::TestHandComputedAP::"
+      "test_iou_exactly_at_the_threshold_matches"])
+
+
+def m344(t):
+    # The empty-mirror guard is deleted: a deploy against a tree missing the vision
+    # sourcedir "succeeds", and every vision launch then strands at runtime behind a
+    # prompt naming canonical code that is not there.
+    old = ('    if not files:\n'
+           '        raise SystemExit("pipeline/training/vision/ is empty -- the finetune prompt names "\n'
+           '                         "this mirror for vision runs, so an empty upload would strand "\n'
+           '                         "every vision launch")\n')
+    assert t.count(old) == 1, "ensure_vision_code's empty guard moved"
+    return t.replace(old, "", 1)
+
+
+case("vision: an empty canonical mirror uploads successfully",
+     _STORAGE3, m344,
+     ["tests/test_vision_trainer.py::TestMirrorGuards::"
+      "test_an_empty_vision_sourcedir_refuses_to_upload"])
+
+
+def m345(t):
+    # The eval prompt's canonical-scorer rule softens into permission to self-author:
+    # the gate's instrument becomes whatever the scored party wrote that turn, which is
+    # the judge-prompt lesson (r5's judge_ties: 0) replayed on the vision line.
+    old = "do NOT author your own scorer"
+    assert t.count(old) == 1, "the eval prompt's canonical-scorer clause moved"
+    return t.replace(
+        old, "you may author your own scorer when the canonical one is inconvenient", 1)
+
+
+case("vision: the gate's instrument becomes self-authored",
+     _EVAL_HARNESS, m345,
+     [f"{_TO}TestVisionPromptClauses::"
+      "test_the_eval_scorer_is_canonical_and_self_authoring_is_forbidden"])
+
+
 #: Where the pristine text of the file currently mutated is parked, so a kill -9 -- which
 #: no handler can intercept -- still leaves the original recoverable. Under the repo root
 #: rather than /tmp because it must be obvious to whoever finds the tree dirty, and

@@ -1228,7 +1228,36 @@ Least-privilege IAM throughout (no `*FullAccess`), all resources scoped to `llmo
 and this being a public repo: no account IDs anywhere — deploy scripts substitute
 `<ACCOUNT_ID>` at run time, enforced by a pre-commit hook and CI redaction scan.
 
-## 13. The admin console — one Lambda, three planes with different rules
+## 13. finetune-vision — the first non-LLM task type, and what "generic" bought
+
+The vision line (`pipeline_mode: "vision"`, catalog key `finetune-vision`) fine-tunes an
+Apache-2.0 detector (RT-DETR by default, D-FINE vendored) on the customer's own
+COCO-format labeled images and judges it with a deterministic mAP gate. Architecturally
+it is a demonstration that the platform's genericity was real: **the driver, the IAM
+policies and the Lambdas are byte-identical to the LLM lines**, and the state machine
+gained exactly one Choice rule whose `Next` equals the Default — an explicit route to the
+same full path, added because the mode-drift guard demands every mode with declared
+prerequisites be visible in the machine.
+
+What a mode actually is here: (a) a routed string; (b) entries in three dispatch tables —
+`MODE_REQUIRED_PARAMS` (presence), `MODE_REQUIRED_ROLES` (was the model *chosen*, since
+`DEFAULT_MODELS` would silently hand a detection run a language model), and
+`MODE_REQUIRED_CHOSEN` (was the *value* chosen, since `DEFAULT_PARAMS` would silently
+hand it ARC's solve-rate gates — a leak no presence check can see, because the default
+puts the key there); (c) mode-gated clauses appended to the specialist prompts; (d) two
+canonical artifacts the deploy mirrors and the role can read but not write:
+`code/vision/` (the trainer) and `code/eval/vision_map_scorer.py` (the gate's
+instrument, sha256-recorded per run like the judge prompt).
+
+Two deliberate refusals shape the line. Ultralytics YOLO is unsupported **by licensing
+design**: the vendor asserts AGPL-3.0 over fine-tuned weights and the embedding
+application, so the catalog says so out loud, the orchestrator prompt makes it a red
+line, and a repo test greps the vision code for the import. And the LLM judge is
+unreachable **by measurement design**: COCO-style mAP is a fixed algorithm over fixed
+annotations — the same class of instrument as the exact-grid gate, with zero judge
+variance to argue about.
+
+## 14. The admin console — one Lambda, three planes with different rules
 
 ![Console architecture](architecture-console.svg)
 

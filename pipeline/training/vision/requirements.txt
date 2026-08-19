@@ -1,0 +1,7 @@
+# Canonical vision trainer deps -- Apache-2.0 families only.
+# ultralytics MUST NOT appear here, directly or transitively pinned: the vendor asserts
+# AGPL-3.0 over trained weights and the embedding application (tests grep this file).
+transformers==4.49.0
+torch>=2.2,<3
+Pillow>=10.0
+numpy>=1.26

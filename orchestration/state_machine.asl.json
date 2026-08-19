@@ -44,6 +44,19 @@
             }
           ],
           "Next": "Deploy"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.pipeline_mode",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.pipeline_mode",
+              "StringEquals": "vision"
+            }
+          ],
+          "Next": "DataPrepGenerate"
         }
       ],
       "Default": "DataPrepGenerate"

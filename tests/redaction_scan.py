@@ -107,7 +107,7 @@ ALLOWED = (b"6833" + b"13688378", b"7631" + b"04351884", b"1234" + b"56789012")
 #: this laptop, single-threaded CPython does 3.1M sha256/s, so the whole 1e12 space falls in
 #: about 4 days -- and a GPU does it in roughly 100 seconds. So the KDF is iterated. At 200k
 #: iterations a candidate costs ~16 ms, which makes the same sweep ~500 GPU-years, while the
-#: scan stays cheap because only 12-digit runs are ever hashed: measured across all 184
+#: scan stays cheap because only 12-digit runs are ever hashed: measured across all 191
 #: tracked files there are 74 such runs, 10 distinct, and hashing the distinct set takes 0.16 s
 #: for the entire repo. (Re-measured whenever either number moves, and they move
 #: INDEPENDENTLY, which is why both are derived and neither is inferred from the other, and
@@ -140,7 +140,7 @@ ALLOWED = (b"6833" + b"13688378", b"7631" + b"04351884", b"1234" + b"56789012")
 #: a 12-digit run. Then the canonical RAFT context format moved 178 to 179 (a markdown template whose only
 #: numbers are fractions and a bar), and the r6d plan-and-probe evidence doc moved one more:
 #: 179 to 180, digests, recall fractions and dollar ranges, no 12-digit run. Then the
-#: three-holes PR ENDED that streak by moving both at once: 180 files became 184 -- the
+#: three-holes PR ENDED that streak by moving both at once: 184 files became 191 -- the
 #: drift auditor, the protocol probe and their two test modules -- and the run count went
 #: 69 -> 74, because three of the four pass the published placeholder account id to a sent-side
 #: reconstruction or a probe payload, and the deploy README gained the auditor's offline

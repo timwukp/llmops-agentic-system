@@ -250,6 +250,41 @@ def ensure_code(s3, bucket, dry):
 #: that consumes it, not writable by the agent it measures.
 EVAL_PREFIX = "code/eval/"
 
+#: Same property, third artifact: the canonical vision trainer. (The vision mAP SCORER
+#: needs no prefix of its own -- it lives in pipeline/eval/, so ensure_eval_instrument
+#: already mirrors and digests it with the judge prompt.)
+VISION_PREFIX = "code/vision/"
+
+
+def ensure_vision_code(s3, bucket, dry):
+    """Upload pipeline/training/vision/ to s3://<bucket>/code/vision/ and VERIFY it.
+
+    Same argument as ensure_code one screen up, applied to the detection trainer: the
+    finetune prompt names this mirror as CANONICAL for pipeline_mode="vision", so an
+    empty or drifted upload is a per-run codegen surprise instead of a deploy-time diff.
+    Under code/ so the harness role's existing S3CanonicalCodeReadOnly grant covers it --
+    readable by the agent, writable only by the deployer. Zero IAM change by design.
+    """
+    src_dir = pathlib.Path(__file__).resolve().parent.parent / "pipeline" / "training" / "vision"
+    files = sorted(p for p in src_dir.glob("*") if p.is_file())
+    if not files:
+        raise SystemExit("pipeline/training/vision/ is empty -- the finetune prompt names "
+                         "this mirror for vision runs, so an empty upload would strand "
+                         "every vision launch")
+    if dry:
+        return {"would": f"upload {len(files)} canonical vision trainer files",
+                "to": f"s3://{bucket}/{VISION_PREFIX}"}
+    verified = {}
+    for p in files:
+        key = f"{VISION_PREFIX}{p.name}"
+        body = p.read_bytes()
+        s3.upload_file(str(p), bucket, key)
+        got = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+        if got != body:
+            raise SystemExit(f"read-back mismatch for s3://{bucket}/{key}")
+        verified[p.name] = hashlib.sha256(body).hexdigest()
+    return {"uploaded_and_verified": verified, "to": f"s3://{bucket}/{VISION_PREFIX}"}
+
 
 def ensure_eval_instrument(s3, bucket, dry):
     """Upload pipeline/eval/ to s3://<bucket>/code/eval/ and VERIFY it byte-for-byte.
@@ -758,6 +793,7 @@ def main():
     results["skills"] = ensure_skills(s3, bucket, args.dry_run, args.skills_src)
     results["code"] = ensure_code(s3, bucket, args.dry_run)
     results["eval_instrument"] = ensure_eval_instrument(s3, bucket, args.dry_run)
+    results["vision_code"] = ensure_vision_code(s3, bucket, args.dry_run)
     results[RUNS_TABLE] = {
         "status": ensure_table(ddb, RUNS_TABLE, {
             "AttributeDefinitions": [

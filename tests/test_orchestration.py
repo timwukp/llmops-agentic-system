@@ -4488,11 +4488,17 @@ class TestTheCustomersOwnDataIsActuallyRead:
         states = asl["States"]
         start = asl["StartAt"]
         choice = states[start]
-        audit_only = {c.get("Next") for c in (choice.get("Choices") or [])}
         full_entry = choice.get("Default")
-        assert full_entry and full_entry not in audit_only, (
-            f"{start} has no Default distinct from its data_audit branch; this guard "
-            "assumes the full path is the Default one")
+        assert full_entry, f"{start} has no Default -- the full path lost its entry"
+        # Branches that target the Default state are no-op routes (vision routes there
+        # explicitly so the mode-drift guard can see it), not detours: a mode sent to
+        # the very state the Default names IS the full path. Only branches leading
+        # elsewhere are the audit/eval/deploy shortcuts this guard must exclude.
+        audit_only = ({c.get("Next") for c in (choice.get("Choices") or [])}
+                      - {full_entry})
+        assert audit_only, (
+            f"{start} routes nothing away from the Default; the data_audit branch "
+            "this guard exists to exclude has disappeared")
 
         on_full_path = set()
         for name, st in states.items():
@@ -11644,7 +11650,10 @@ def _eval_instrument_mirror():
     # canonical-looking artifact nobody reads (a component with no consumer), and a
     # disappearance strands the prompt that names it. The RAFT format joined 2026-08-13
     # (r6d): the same mirror carries it because data-prep and eval must read ONE key.
-    assert files == ["judge_prompt_pairwise.md", "raft_context_format.md"], (
+    # The vision mAP scorer joined for finetune-vision: the eval prompt's VISION MODE
+    # clause names code/eval/vision_map_scorer.py as the gate's canonical instrument.
+    assert files == ["judge_prompt_pairwise.md", "raft_context_format.md",
+                     "vision_map_scorer.py"], (
         f"pipeline/eval/ holds {files}; this guard pins the canonical instrument set and "
         "the prompts name each member by name -- teach the prompts and this list together")
 
@@ -11883,7 +11892,9 @@ def test_the_raft_format_is_mirrored_by_the_same_upload_as_the_judge_prompt():
     with no deploy path — a component that does not exist."""
     storage = _load("llmops_03_storage_raft", "deploy/03_storage.py")
     got = storage.ensure_eval_instrument(None, "<bucket>", dry=True)
-    n_files = len(list((REPO / "pipeline/eval").glob("*")))
+    # is_file, like the upload itself counts: an unfiltered glob counted a __pycache__
+    # dir some unrelated import left behind, and this guard failed about bytecode
+    n_files = len([p for p in (REPO / "pipeline/eval").glob("*") if p.is_file()])
     assert f"upload {n_files} eval instrument files" in got["would"]
     assert got["to"].endswith("code/eval/"), got["to"]
     # And the file is actually in the directory that glob reads.
@@ -13596,3 +13607,123 @@ def test_the_async_dropped_alarms_name_functions_that_exist():
     dropped = {p["Dimensions"][0]["Value"] for p in _alarm_plans()
                if p["MetricName"] == "AsyncEventsDropped"}
     assert dropped == set(obs.ASYNC_DELIVERED)
+
+
+class TestVisionModePrerequisites:
+    """pipeline_mode="vision" and the third dispatch question: chosen, not inherited.
+
+    MODE_REQUIRED_PARAMS asks presence, MODE_REQUIRED_ROLES asks whether a model role
+    was chosen -- vision adds MODE_REQUIRED_CHOSEN, which asks whether a PARAM value
+    was chosen, because DEFAULT_PARAMS fills `gates` and `dataset` with ARC language
+    values that pass every presence check while describing the wrong product entirely.
+    """
+
+    def _vision_plan(self, **over):
+        plan = {"pipeline_mode": "vision",
+                "dataset": "shapes-smoke-v1",
+                "gates": {"map50_uplift": 0.10, "format_validity": 0.98},
+                "models": {"student": "PekingU/rtdetr_r50vd"},
+                "data": {"source_uri": "s3://b/customer-data/v/train/",
+                         "customer_eval_uri": "s3://b/customer-data/v/eval/"}}
+        plan.update(over)
+        return plan
+
+    def test_a_fully_specified_vision_plan_dispatches(self):
+        m = start_pipeline.seed_manifest("run-v", "conductor", {}, self._vision_plan())
+        assert m["params"]["pipeline_mode"] == "vision"
+        assert m["models"]["student"] == "PekingU/rtdetr_r50vd"
+        assert m["params"]["gates"] == {"map50_uplift": 0.10, "format_validity": 0.98}
+
+    def test_a_vision_plan_that_omits_gates_is_refused_not_judged_by_llm_gates(self):
+        """The DEFAULT_PARAMS leak: forget gates and the merged params still HAVE gates
+        -- ARC's relative_solve_rate -- so only a chosen-key check can catch it."""
+        plan = self._vision_plan()
+        del plan["gates"]
+        with pytest.raises(ValueError) as e:
+            start_pipeline.seed_manifest("run-v", "conductor", {}, plan)
+        assert "gates" in str(e.value) and "vision" in str(e.value)
+
+    def test_a_vision_plan_that_omits_the_dataset_label_is_refused(self):
+        plan = self._vision_plan()
+        del plan["dataset"]
+        with pytest.raises(ValueError) as e:
+            start_pipeline.seed_manifest("run-v", "conductor", {}, plan)
+        assert "dataset" in str(e.value)
+
+    def test_a_vision_run_never_gets_the_default_student(self):
+        """DEFAULT_MODELS fills student with an LLM; a detection run must have chosen."""
+        plan = self._vision_plan(models={})
+        with pytest.raises(ValueError) as e:
+            start_pipeline.seed_manifest("run-v", "conductor", {}, plan)
+        assert "student" in str(e.value)
+
+    def test_a_vision_dispatch_without_the_labeled_corpus_is_refused(self):
+        plan = self._vision_plan(data={"customer_eval_uri": "s3://b/eval/"})
+        with pytest.raises(ValueError) as e:
+            start_pipeline.seed_manifest("run-v", "conductor", {}, plan)
+        assert "source_uri" in str(e.value)
+
+    def test_existing_modes_are_untouched_by_the_chosen_key_check(self):
+        """Isolation pin: full/eval_only/deploy_only have no MODE_REQUIRED_CHOSEN entry,
+        so a plan that inherits every default still dispatches exactly as before."""
+        assert set(start_pipeline.MODE_REQUIRED_CHOSEN) == {"vision"}
+        m = start_pipeline.seed_manifest("run-f", "webhook", {}, {})
+        assert m["params"].get("pipeline_mode", "full") == "full"
+        assert m["params"]["gates"] == start_pipeline.DEFAULT_PARAMS["gates"]
+
+    def test_the_machine_routes_vision_explicitly_to_the_same_state_as_default(self):
+        """The vision Choice rule must be a provable no-op: same Next as Default, so
+        adding the mode cannot have moved any run anywhere new."""
+        asl = json.loads(
+            (REPO / "orchestration/state_machine.asl.json").read_text())
+        choice = asl["States"]["PipelineModeChoice"]
+        vision = [c for c in choice["Choices"]
+                  if any(r.get("StringEquals") == "vision" for r in c.get("And", [c]))]
+        assert len(vision) == 1, "vision must be routed exactly once"
+        assert vision[0]["Next"] == choice["Default"], (
+            "vision's explicit route must target the Default state; anything else is "
+            "a behavior change this feature promised not to make")
+
+
+class TestVisionPromptClauses:
+    """The vision clauses are ADDITIVE and conditional -- pinned so neither property
+    erodes: the clause text itself (negative control m345 mutates it) and the fact
+    that every clause names its own mode gate."""
+
+    def _prompt(self, agent):
+        cfg = json.loads((REPO / "agents" / agent / "harness.json").read_text())
+        return cfg["systemPrompt"][0]["text"]
+
+    def test_the_eval_scorer_is_canonical_and_self_authoring_is_forbidden(self):
+        t = self._prompt("eval")
+        assert "code/eval/vision_map_scorer.py" in t
+        assert "do NOT author your own scorer" in t
+        assert "scorer_sha256" in t
+
+    def test_every_vision_clause_is_gated_on_the_mode(self):
+        for agent in ("data-prep", "finetune", "eval"):
+            t = self._prompt(agent)
+            i = t.find("VISION MODE")
+            assert i >= 0, f"{agent} lost its vision clause"
+            gate = t[i:i + 220]
+            assert 'params.pipeline_mode is “vision”' in gate or \
+                   'params.pipeline_mode is "vision"' in gate, (
+                f"{agent}'s vision clause no longer names its own mode gate -- an "
+                "ungated clause is an instruction every LLM run reads as its own")
+
+    def test_the_finetune_clause_names_the_canonical_vision_sourcedir(self):
+        t = self._prompt("finetune")
+        assert "code/vision/" in t and "train_detection.py" in t
+
+    def test_the_deploy_canary_switch_is_one_sentence_and_gated(self):
+        t = self._prompt("deploy")
+        assert 'params.pipeline_mode is \\"vision\\"' in t.replace('\\"', '\\"') or \
+               'params.pipeline_mode is "vision"' in t
+        assert "detection JSON" in t
+        # the LLM canary text survives untouched beside it
+        assert "3 canary prompts" in t and "coherent non-empty completion" in t
+
+    def test_the_data_prep_clause_forbids_synthetic_rows(self):
+        t = self._prompt("data-prep")
+        assert "never write synthetic rows" in t
+        assert "VALIDATE, not synthesise" in t

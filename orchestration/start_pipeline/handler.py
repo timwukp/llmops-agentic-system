@@ -346,6 +346,15 @@ MODE_REQUIRED_PARAMS = {
          "the model.tar.gz to serve; this mode enters at Deploy, so there is no finetune "
          "stage in its manifest to read the artifact from and no gate verdict about it"),
     ),
+    "vision": (
+        ("source_uri",
+         "the labeled detection dataset (images + COCO annotations); vision has no "
+         "teacher-generation task to synthesise a corpus from, so without this the "
+         "data-prep agent has nothing to verify and nothing to train on"),
+        ("customer_eval_uri",
+         "the held-out labeled set the mAP gate is anchored to; scored against training "
+         "data a detector's gate measures nothing"),
+    ),
 }
 
 #: Model roles a mode must have EXPLICITLY named, by plan or by params, before it may start.
@@ -370,15 +379,49 @@ MODE_REQUIRED_ROLES = {
          "one silently, and a base that nobody chose is not a base: an artifact merged onto "
          "the wrong weights is only discoverable after the endpoint is paid for"),
     ),
+    "vision": (
+        ("student",
+         "the detector family to fine-tune (an Apache-licensed RT-DETR/D-FINE id). "
+         "DEFAULT_MODELS would silently fill this role with Qwen3-1.7B -- an LLM -- and a "
+         "detection run training a language model does not fail at dispatch, it fails a "
+         "GPU-hour later inside the trainer"),
+    ),
+}
+
+#: Params a mode must have EXPLICITLY chosen -- by plan or by params -- not inherited.
+#
+# The third question, after presence (MODE_REQUIRED_PARAMS) and role choice
+# (MODE_REQUIRED_ROLES): was this VALUE picked by someone, or did DEFAULT_PARAMS fill it?
+# For most modes inheritance is the feature -- the defaults ARE the LLM product. For
+# vision they are a trap wearing a passing shape: DEFAULT_PARAMS carries
+# `dataset: "arc-agi-2"` and `gates: {relative_solve_rate, format_validity}`, so a vision
+# plan that forgets its gates block dispatches cleanly and the eval agent then judges a
+# detector against an ARC solve-rate gate. A presence check can never catch this --
+# merged params always contain `gates`, because the default put it there. Same argument
+# as named_roles: by the time the value reaches the manifest, "chosen" and "defaulted"
+# are indistinguishable, so dispatch is the only place the distinction exists for free.
+MODE_REQUIRED_CHOSEN = {
+    "vision": (
+        ("gates",
+         "the mAP gate block (e.g. {\"map50_uplift\": ..., \"format_validity\": ...}); "
+         "without an explicit choice the run inherits DEFAULT_PARAMS' ARC solve-rate "
+         "gates and the eval agent judges a detector against a language benchmark"),
+        ("dataset",
+         "the dataset label for this detection corpus; the inherited default is "
+         "'arc-agi-2', which would stamp every manifest and cost row of a vision run "
+         "with an LLM benchmark's name"),
+    ),
 }
 
 
-def _check_mode_prerequisites(merged: dict, named_roles=()) -> None:
+def _check_mode_prerequisites(merged: dict, named_roles=(), chosen_keys=()) -> None:
     """Refuse a mode whose inputs are absent, before a run_id exists to blame it on.
 
     `named_roles` is the set of model roles a plan or params EXPLICITLY assigned, which is
     the only way to tell a chosen model from one DEFAULT_MODELS filled in -- by the time a
     role reaches the manifest the two are indistinguishable. See MODE_REQUIRED_ROLES.
+    `chosen_keys` is the same distinction for params: the keys a plan or params actually
+    set, before DEFAULT_PARAMS filled the rest. See MODE_REQUIRED_CHOSEN.
     """
     mode = merged.get("pipeline_mode", "full")
     missing = [(f"params.{k}", why) for k, why in MODE_REQUIRED_PARAMS.get(mode, ())
@@ -386,6 +429,9 @@ def _check_mode_prerequisites(merged: dict, named_roles=()) -> None:
     missing += [(f"an explicitly named {r} model", why)
                 for r, why in MODE_REQUIRED_ROLES.get(mode, ())
                 if r not in set(named_roles)]
+    missing += [(f"an explicitly chosen params.{k}", why)
+                for k, why in MODE_REQUIRED_CHOSEN.get(mode, ())
+                if k not in set(chosen_keys)]
     if missing:
         detail = "; ".join(f"{what} ({why})" for what, why in missing)
         raise ValueError(
@@ -404,7 +450,8 @@ def seed_manifest(run_id: str, trigger_source: str, params, plan,
     _check_mode_prerequisites(
         merged,
         set(_role_assignments(plan or {}, "plan"))
-        | set(_role_assignments(params or {}, "params")))
+        | set(_role_assignments(params or {}, "params")),
+        set(params or {}) | set(_plan_params(plan or {})))
     return {
         "run_id": run_id,
         "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
