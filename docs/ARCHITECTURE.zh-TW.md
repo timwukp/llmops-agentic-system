@@ -1039,7 +1039,31 @@ $20,000 審批基準住在 console 與 `cost_model.py`，不在審計員身上�
 任何地方不出現帳號 ID —— 部署腳本在運行時替換 `<ACCOUNT_ID>`，由 pre-commit hook 與
 CI 遮蔽掃描強制執行。
 
-## 13. 管理 console —— 一個 Lambda，三個規則不同的平面
+## 13. finetune-vision —— 第一個非 LLM 任務型，以及「泛用」到底買到了什麼
+
+視覺線（`pipeline_mode: "vision"`，目錄鍵 `finetune-vision`）在客戶自己的 COCO 格式
+已標註影像上微調 Apache-2.0 偵測器（預設 RT-DETR，D-FINE 以 vendor 方式支援），
+用確定性的 mAP 門檻判定。架構上它證明了平台的泛用性是真的：**driver、IAM 政策與
+Lambda 與 LLM 線逐位元相同**，狀態機只多了一條 `Next` 等於 Default 的 Choice 規則——
+指向同一條完整路徑的顯式路由，加它是因為 mode 漂移守門要求每個宣告了前提條件的
+mode 都要在狀態機裡看得見。
+
+一個 mode 在這裡實際上是什麼：(a) 一個被路由的字串；(b) 三張派發表裡的條目——
+`MODE_REQUIRED_PARAMS`（存在性）、`MODE_REQUIRED_ROLES`（模型是不是被「選擇」的，
+因為 `DEFAULT_MODELS` 會靜默塞給偵測 run 一個語言模型）、`MODE_REQUIRED_CHOSEN`
+（「值」是不是被選擇的，因為 `DEFAULT_PARAMS` 會靜默塞給它 ARC 的解題率門檻——
+存在性檢查看不見這種洩漏，因為正是預設值把鍵放在那裡）；(c) 附加在專家 prompt 上、
+以 mode 為門的條款；(d) 部署鏡射、角色可讀不可寫的兩個 canonical 工件：
+`code/vision/`（訓練器）與 `code/eval/vision_map_scorer.py`（門檻的量測儀器，
+和 judge prompt 一樣逐 run 記錄 sha256）。
+
+兩個刻意的拒絕塑造了這條線。Ultralytics YOLO **因授權設計**不支援：其廠商主張
+AGPL-3.0 連微調權重與嵌入應用都涵蓋，所以目錄大聲說明、orchestrator prompt 把它
+列為紅線、repo 測試對視覺程式碼 grep 這個 import。而 LLM judge **因量測設計**
+不可達：COCO 式 mAP 是固定標註上的固定演算法——和精確格子比對同級的儀器，
+沒有任何 judge 變異可以爭論。
+
+## 14. 管理 console —— 一個 Lambda，三個規則不同的平面
 
 ![Console 架構](architecture-console.svg)
 

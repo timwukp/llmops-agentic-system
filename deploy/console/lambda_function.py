@@ -3197,6 +3197,8 @@ INTAKE_ALIASES = {
     "training_instance": ("training_instance",),
     "keep_endpoint": ("keep_endpoint",),
     "sample_count": ("sample_count", "samples"),
+    "labels_format": ("labels_format", "annotation_format", "label_format"),
+    "classes": ("classes", "class_names", "categories"),
 }
 _INTAKE_CANON = {a: c for c, al in INTAKE_ALIASES.items() for a in al}
 _INTAKE_URI_PARAMS = {"source_uri", "customer_eval_uri", "ood_eval_uri",
@@ -3327,11 +3329,50 @@ TASK_TYPE_REGISTRY = (
          _pf("budget_usd", "Budget reference (USD)", "number", False,
              "a reference, not a ceiling"),
      )},
+    {"key": "finetune-vision",
+     "label": "Fine-tune an open-source vision detector on labeled images",
+     "description": "Object detection fine-tuning on your COCO-format labeled data: an "
+                    "Apache-licensed detector (RT-DETR default, D-FINE optional) is "
+                    "fine-tuned, judged against your held-out set by a deterministic "
+                    "mAP gate, and deployed behind the same sign-off chain as every "
+                    "other run. Ultralytics YOLO is deliberately unsupported: its "
+                    "vendor asserts AGPL-3.0 over fine-tuned weights.",
+     "supported": True, "pipeline_mode": "vision",
+     "fields": (
+         _rf("source_uri", ftype="uri"),
+         _rf("customer_eval_uri", ftype="uri"),
+         _pf("ood_eval_uri", "Out-of-distribution eval set (S3 URI)", "uri", False,
+             "report-only mAP on data unlike training; small sets never gate"),
+         _pf("student_model_id", "Detector to fine-tune", "string", True,
+             "an Apache-2.0 family id, e.g. PekingU/rtdetr_r50vd; required because "
+             "the platform's silent default student is a language model"),
+         _pf("labels_format", "Annotation format", "string", False,
+             "COCO is the only format the canonical trainer reads today; state it "
+             "so a different export is caught at intake, not inside a GPU job"),
+         _pf("classes", "Class names", "text", False,
+             "the category names in your annotations, so the plan and the report "
+             "speak your labels rather than integer ids"),
+         _pf("budget_usd", "Budget reference (USD)", "number", False,
+             "a reference, not a ceiling — the plan is priced against it"),
+         _pf("training_instance", "Training instance", "string", False,
+             "e.g. ml.g5.2xlarge; leave blank to let the plan choose"),
+         _pf("max_iterations", "Max training iterations", "number", False,
+             "remediation retries before the run stops trying"),
+         _pf("keep_endpoint", "Keep the smoke endpoint", "bool", False,
+             "false tears the endpoint down after the smoke hour — the safe default"),
+         _rf("verification_method"),
+         _rf("datasheet.provenance"),
+         _rf("datasheet.license"),
+         _rf("datasheet.pii_disposition"),
+         _rf("datasheet.consent"),
+         _rf("decontamination"),
+     )},
     {"key": "finetune-yolo",
-     "label": "Fine-tune an open-source YOLO vision model",
-     "description": "Object detection / vision fine-tuning. The pipeline cannot run "
-                    "this yet — the consult records your requirements for the "
-                    "roadmap and scopes what support would need.",
+     "label": "Fine-tune an open-source YOLO vision model (deprecated)",
+     "description": "Deprecated in favour of finetune-vision, which runs on "
+                    "Apache-licensed detector families. Kept so existing task rows "
+                    "created under this key still resolve; new vision work should use "
+                    "finetune-vision.",
      "supported": False, "pipeline_mode": "",
      "fields": (
          _pf("requirements", "Describe the vision task and your data", "text", True,

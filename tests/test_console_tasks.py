@@ -6189,3 +6189,52 @@ def test_presigned_upload_host_matches_the_csp_upload_origin(wired, monkeypatch)
         f"presigned URL host and CSP connect-src origin disagree: the browser will "
         f"block the PUT before it leaves.\n  presigned: {url.split('?')[0]}\n  "
         f"CSP names: {origin}")
+
+
+class TestVisionTaskType:
+    """finetune-vision: the first supported non-LLM catalog entry, and the registry
+    facts other components key on (pipeline_mode, required fields, the deprecation
+    of finetune-yolo) pinned so they cannot drift apart silently."""
+
+    def test_the_vision_entry_is_supported_and_routes_to_the_vision_mode(self, console):
+        cat = {t["key"]: t for t in console.TASK_TYPE_REGISTRY}
+        assert cat["finetune-vision"]["supported"] is True
+        assert cat["finetune-vision"]["pipeline_mode"] == "vision"
+
+    def test_the_vision_entry_requires_what_the_dispatcher_will_refuse_without(self, console):
+        """Registry-required fields and start_pipeline's vision prerequisites must
+        agree: a form that lets the customer omit what dispatch refuses is a consult
+        that ends in an error the intake existed to prevent."""
+        entry = [t for t in console.TASK_TYPE_REGISTRY
+                 if t["key"] == "finetune-vision"][0]
+        required = {f["param"] for f in entry["fields"] if f["required"]}
+        assert {"source_uri", "customer_eval_uri", "student_model_id"} <= required
+        # datasheet is REAL for images (faces, plates): all four answers required
+        assert {"datasheet.provenance", "datasheet.license",
+                "datasheet.pii_disposition", "datasheet.consent"} <= required
+        assert "decontamination" in required and "verification_method" in required
+
+    def test_the_vision_uris_are_existence_verified_at_intake(self, console):
+        entry = [t for t in console.TASK_TYPE_REGISTRY
+                 if t["key"] == "finetune-vision"][0]
+        uri_fields = {f["param"] for f in entry["fields"] if f["type"] == "uri"}
+        assert uri_fields <= console._INTAKE_URI_PARAMS, (
+            "every uri field must be in _INTAKE_URI_PARAMS or the console records "
+            "it as a fact it never checked")
+
+    def test_finetune_yolo_stays_resolvable_but_deprecated(self, console):
+        """Existing task rows carry the old key; renaming it would orphan them. The
+        entry survives, unsupported, and its description points at the successor."""
+        cat = {t["key"]: t for t in console.TASK_TYPE_REGISTRY}
+        assert cat["finetune-yolo"]["supported"] is False
+        assert "finetune-vision" in cat["finetune-yolo"]["description"]
+
+    def test_the_vision_intake_aliases_resolve(self, console):
+        assert console._INTAKE_CANON.get("annotation_format") == "labels_format"
+        assert console._INTAKE_CANON.get("class_names") == "classes"
+
+    def test_the_ultralytics_refusal_is_stated_where_the_customer_reads(self, console):
+        """The AGPL landmine is a licensing decision the catalog must own out loud,
+        not a footnote in a trainer comment."""
+        cat = {t["key"]: t for t in console.TASK_TYPE_REGISTRY}
+        assert "AGPL" in cat["finetune-vision"]["description"]
