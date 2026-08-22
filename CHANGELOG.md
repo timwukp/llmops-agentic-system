@@ -83,6 +83,18 @@ asserted, since checking one side would pass for a solver that is merely broken.
 against `pytest --collect-only` rather than remembered (it had said 40 while the module
 held 59, and the existing count guard reads only `docs/TEST_RESULTS*.md`).
 
+`generate_student.py`: the hardcoded 8,192-token input window (against training's 14,336)
+left-truncated ~10% of val rows and scored them as wrong programs. Now `--input-window`,
+default `DEFAULT_INPUT_WINDOW = 14336`, cross-checked against the trainer's own
+`--max_length` default by a test so the pair cannot drift silently; `--max-new-tokens`
+1024 → 1536 (measured: solver code p99 715 tokens, 983 wrapped — the prompt was always the
+binding constraint, median 4,461 / p90 9,082 / max 11,143). `--n-samples k` feeds the
+pass@k scoring above, tagging every row with its `sample_idx`, and is refused at
+temperature 0, where it would return k copies of one greedy answer and report pass@1 over a
+k× denominator. Truncation is **not** difficulty-neutral, measured on the 49-triplet pilot:
+an 8,192 window drops 18.4% of rows and all 9 dropped were held-out-correct (9/9) while the
+40 that fit were 33/40. Suite 1573 → 1580 (generator 35 → 42).
+
 ### finetune-vision: the first supported non-LLM task type
 
 Object-detection fine-tuning on customer-labeled COCO data, built as a proof that the

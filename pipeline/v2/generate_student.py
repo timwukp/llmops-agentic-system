@@ -6,11 +6,22 @@ and scoring in separate processes means a scoring bug never costs GPU time to re
 and the scorer stays testable without torch installed.
 
 Greedy decoding by default: the eval gate must be reproducible, and sampling would
-make the solve rate a distribution rather than a number.
+make the solve rate a distribution rather than a number. `--n-samples k` opts into
+the ARC submission protocol (k attempts per task) and then REQUIRES a temperature,
+because k greedy samples are k copies of one answer.
+
+The input window is a flag, not a constant. It was 8192 while training used
+max_length 14336, so ~10% of val rows lost their oldest context to left-truncation
+and came back looking like wrong programs; measured with the real Qwen3 tokenizer,
+ARC grid text runs ~2 chars/token, so a window sized from a chars/4 estimate is
+about half of what the corpus needs. The default here tracks
+`train_qlora.py --max_length`; a run that shortens it is choosing to score some
+rows on an incomplete task description and says so in `n_prompt_truncated`.
 
 Usage (on the GPU host):
     python generate_student.py --model-dir /opt/ml/model/merged \
         --val val_raw.jsonl --out generations.jsonl --limit 200
+    python generate_student.py ... --n-samples 2 --temperature 0.7   # pass@2
 
 Writes incrementally, so an interrupted run still yields a scorable partial file.
 """
@@ -20,6 +31,30 @@ import argparse
 import json
 import time
 from pathlib import Path
+
+# Kept equal to train_qlora.py's own --max_length default. The two are a pair: a
+# generation window shorter than the training window silently scores rows on a
+# prompt the trained model would have been given in full.
+DEFAULT_INPUT_WINDOW = 14336
+
+
+def check_sampling(n_samples: int, temperature: float) -> None:
+    """Refuse a multi-sample run that cannot produce distinct samples.
+
+    `do_sample` is `temperature > 0`, so `--n-samples 2 --temperature 0` asks
+    `generate` for two sequences from a greedy decode: two identical strings. Every
+    downstream pass@2 then reads as pass@1 while the report says 2 attempts were
+    made -- the numbers stay plausible and the second attempt never existed.
+    """
+    if n_samples < 1:
+        raise SystemExit("--n-samples must be at least 1")
+    if n_samples > 1 and temperature <= 0:
+        raise SystemExit(
+            f"--n-samples {n_samples} with --temperature 0 would return "
+            f"{n_samples} copies of one greedy answer, so pass@{n_samples} would "
+            f"equal pass@1 over a {n_samples}x denominator. Set --temperature > 0 "
+            f"(ARC submissions sample), or keep --n-samples 1 for the reproducible "
+            f"gate.")
 
 
 def build_prompt(tokenizer, prompt_text: str, thinking: str = "auto") -> str:
@@ -151,10 +186,27 @@ def main() -> int:
     ap.add_argument("--val", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--limit", type=int, default=0, help="0 = all rows")
-    ap.add_argument("--max-new-tokens", type=int, default=1024)
+    # 1024 was too tight for the wrapped augmentation targets: measured over the
+    # 849-row corpus with the real Qwen3 tokenizer, solver code runs p99 715 tokens
+    # and 983 at the maximum once the augmentation wrapper is added -- and a
+    # <think> preamble from a base model in a lift comparison comes on top of that.
+    # A ceiling hit is indistinguishable from a model that cannot write code except
+    # via the `truncated` flag, so headroom is cheaper than the ambiguity.
+    ap.add_argument("--max-new-tokens", type=int, default=1536)
     ap.add_argument("--temperature", type=float, default=0.0,
                     help="0 = greedy; keep it 0 for a reproducible gate")
     ap.add_argument("--batch-size", type=int, default=1)
+    ap.add_argument("--input-window", type=int, default=DEFAULT_INPUT_WINDOW,
+                    help=f"max prompt tokens; longer prompts lose their OLDEST "
+                         f"context to left-truncation and are counted as cut. "
+                         f"Default {DEFAULT_INPUT_WINDOW} tracks train_qlora.py's "
+                         f"--max_length, so a row the training run could hold is a "
+                         f"row this run can read")
+    ap.add_argument("--n-samples", type=int, default=1,
+                    help="attempts per task (ARC scores pass@2). Requires "
+                         "--temperature > 0: k greedy samples are k identical "
+                         "answers, and pass@k over them is pass@1 with a k-times "
+                         "larger denominator")
     ap.add_argument("--thinking", choices=["auto", "on", "off"], default="auto",
                     help="Qwen3 enable_thinking. Use the SAME value for the "
                          "fine-tuned and base runs of a lift comparison")
@@ -162,6 +214,10 @@ def main() -> int:
                     help="cpu is for dry-running this script's code path only; "
                          "the numbers from a CPU run are not an eval")
     args = ap.parse_args()
+
+    # Before torch is even imported: an impossible sampling request should cost a
+    # second, not a model load.
+    check_sampling(args.n_samples, args.temperature)
 
     import torch
     import transformers
@@ -228,19 +284,29 @@ def main() -> int:
             # below -- an add_special_tokens=False probe would measure a shorter
             # string than the one actually truncated and undercount rows sitting
             # just over the line.
-            over = [len(tokenizer(t_)["input_ids"]) > 8192 for t_ in texts]
+            over = [len(tokenizer(t_)["input_ids"]) > args.input_window
+                    for t_ in texts]
             n_prompt_truncated += sum(over)
             enc = tokenizer(texts, return_tensors="pt", padding=True,
-                            truncation=True, max_length=8192).to(model.device)
+                            truncation=True,
+                            max_length=args.input_window).to(model.device)
 
             with torch.no_grad():
                 out = model.generate(
                     **enc, max_new_tokens=args.max_new_tokens,
                     do_sample=args.temperature > 0,
                     temperature=args.temperature if args.temperature > 0 else None,
+                    num_return_sequences=args.n_samples,
                     pad_token_id=tokenizer.pad_token_id)
 
-            for row, seq, prompt_cut in zip(batch, out, over):
+            # With num_return_sequences=k, `generate` returns the k samples of row 0
+            # first, then row 1's -- so the row index is i // k, NOT i. Zipping the
+            # batch against `out` directly would attach row 1's task_id to row 0's
+            # second sample and every generation after the first would be scored
+            # against the wrong task's pairs.
+            expanded = [(batch[i // args.n_samples], seq, over[i // args.n_samples],
+                         i % args.n_samples) for i, seq in enumerate(out)]
+            for row, seq, prompt_cut, sample_idx in expanded:
                 # Slice off the prompt so only the completion is scored.
                 new_ids = seq[enc["input_ids"].shape[1]:].tolist()
                 completion = tokenizer.decode(new_ids, skip_special_tokens=True)
@@ -257,13 +323,22 @@ def main() -> int:
                                      "generation": completion,
                                      "n_new_tokens": n_new,
                                      "truncated": bool(truncated),
-                                     "prompt_truncated": bool(prompt_cut)}) + "\n")
+                                     "prompt_truncated": bool(prompt_cut),
+                                     # The scorer needs both to say anything honest:
+                                     # sample_idx to group k attempts into one task
+                                     # rather than k independent rows, and the window
+                                     # so its truncation caveat names the number this
+                                     # run actually used instead of a stale constant.
+                                     "sample_idx": sample_idx,
+                                     "input_window": args.input_window}) + "\n")
                 written += 1
             fh.flush()                        # partial file stays scorable
 
-            if written % 20 == 0 or written == len(rows):
+            expected = len(rows) * args.n_samples
+            if written % 20 == 0 or written == expected:
                 rate = written / max(time.time() - started, 1e-9)
-                print(f"[gen] {written}/{len(rows)} ({rate:.2f}/s)", flush=True)
+                print(f"[gen] {written}/{expected} generations ({rate:.2f}/s)",
+                      flush=True)
 
     print(f"[gen] wrote {written} generations to {args.out} "
           f"in {(time.time() - started) / 60:.1f} min", flush=True)
@@ -274,7 +349,7 @@ def main() -> int:
               flush=True)
     if n_prompt_truncated:
         print(f"[gen] WARNING {n_prompt_truncated}/{written} prompts exceeded the "
-              f"8192-token input window and lost their OLDEST context to "
+              f"{args.input_window}-token input window and lost their OLDEST context to "
               f"left-truncation; those rows were scored on an incomplete task "
               f"description, so their failures are a data gap, not model ability",
               flush=True)
@@ -286,10 +361,15 @@ def main() -> int:
         # different measurement from one where none did, and a report stating only
         # n_written implies a completeness it does not have.
         "n_prompt_truncated": n_prompt_truncated,
-        "input_window": 8192, "truncation_side": tokenizer.truncation_side,
+        "input_window": args.input_window,
+        "truncation_side": tokenizer.truncation_side,
         "model_dir": args.model_dir, "thinking": args.thinking,
         "thinking_changed_rendering": (thinking_effect or {}).get("changed_rendering"),
         "max_new_tokens": args.max_new_tokens, "temperature": args.temperature,
+        # Part of the "everything but model_dir must match" comparison between a
+        # base run and a fine-tuned one: k attempts against 1 is a different
+        # measurement, and so is a different window.
+        "n_samples": args.n_samples, "n_prompts": len(rows),
     }, indent=2))
     return 0
 
