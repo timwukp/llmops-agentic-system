@@ -232,10 +232,27 @@ pairs.
 
 ## Eval: verifiable, not judged
 
-The student is scored by **executing** what it writes. A generation counts as
-solved only when its `transform` reproduces every training pair in its prompt,
-cell for cell, in the same sandbox that gated the training data. No LLM judge,
-no ROUGE, no partial credit for code that merely looks plausible.
+The student is scored by **executing** what it writes: cell for cell, in the same
+sandbox that gated the training data. No LLM judge, no ROUGE, no partial credit for
+code that merely looks plausible. Two rates are reported side by side, because they
+are two different claims:
+
+| Metric | Question it answers |
+|---|---|
+| `solve_rate` | does the student write code that runs and reproduces the pairs **in its prompt**? |
+| `heldout_solve_rate` | did it find the **rule** — does the same code work on an input nobody showed it? |
+| `overfit_gap` | the difference, over the identical rows: the student's own version of the teacher's 8.8% tax |
+
+The first was the only one that existed, and it inherits exactly the tautology the
+held-out gate was built to remove: the pairs it checks are the pairs in the prompt, so a
+student that memorises them scores `solved`. Neither replaces the other — reporting only
+the held-out rate would erase the difference between "wrong rule" and "did not emit
+compilable code", which are fixed by different work. When a row carries no held-out pair
+the field is **absent**, never `False`: an unmeasured task and a failed task are not the
+same fact.
+
+`overfit_gap` recomputes the shown-pair rate *over the held-out subset* rather than
+reusing `solve_rate`, so the two numbers in the subtraction are rates over the same rows.
 
 Generation and scoring are separate processes on purpose:
 
@@ -263,17 +280,21 @@ sides before any student number is believed:
 ```
 $ python eval_student.py self-test --val out/val_raw.jsonl --sample 80
 oracle: solved 80/80 (solve_rate 1.000, format 1.000)
+oracle held-out: 80/80 (heldout_solve_rate 1.000)
 PASS — scorer credits every verified solution
 ```
 
 The oracle direction feeds the *verified ground-truth* code back in as if the
 model had emitted it; anything below 1.000 means the scorer rejects known-correct
 solutions and would understate the model. Measured over **all 1,000 val rows**:
-1000/1000, `format 1.000`.
+1000/1000 shown-pair and 1000/1000 held-out, `format 1.000`. The held-out line has
+to be checked separately: the shown-pair oracle passes by construction on a corpus
+whose code was verified against those very pairs, so it would still read 1.000 if
+the held-out path never executed a pair at all.
 
 An oracle pass only proves the scorer does not *reject* correct code — not that it
 *discriminates*. The adversarial direction lives in `tests/test_eval_student.py`
-(40 tests): a wrong answer, a partially-correct answer, a hardcoded output that
+(59 tests): a wrong answer, a partially-correct answer, a hardcoded output that
 memorizes pair 1, crashing code, code that does not compile, an infinite loop, a
 filesystem-escape attempt, a generation for an unknown task, and a sibling
 *variant* of the right task must all score 0 — that last one matters because
@@ -407,6 +428,35 @@ keep that visible instead of invisible:
 The caveat fires only for failures that actually ran out of tokens — a model that
 simply refused to write code gets no budget excuse, and truncated-but-parseable code
 is still scored on its merits.
+
+### pass@k, and the attempt a submission would actually send
+
+With `--n-samples k`, each row is generated k times and every output carries a
+`sample_idx`, so the scorer can group attempts by `(task_id, variant)` — per *variant*,
+not per task, because sibling variants share a `task_id` and need different code.
+
+Three numbers come out of that group, and conflating them is how a pass@k figure becomes
+an advertisement:
+
+| Field | Meaning |
+|---|---|
+| `pass_at_k` | **any** attempt is held-out-correct — the oracle upper bound, requires the answer to compute |
+| `selected_at_k` | the attempt `select_attempt` picks is held-out-correct — what a submission scores |
+| `selection_loss` | `pass_at_k − selected_at_k`: the part of pass@k that no submission can collect |
+
+`select_attempt` may use only what a submission may see, so it takes the lowest-numbered
+attempt that reproduces the **shown** pairs and falls back to attempt 0 when none does.
+Picking "any attempt that is held-out-correct" would be the oracle wearing a submission's
+clothes.
+
+`pick_metric` then walks `selected_at_k → heldout_solve_rate → solve_rate` and takes the
+first metric present **on every side of the comparison** — all-or-nothing, because a lift
+computed from the student's held-out rate against the base's shown-pair rate is not a
+comparison. It also **skips `selected_at_k` when the two runs used different k**
+(`sampling_mismatch`), since pass@2 beats pass@1 for identical weights and the gain would
+be the sampling budget, not the fine-tuning. When only one attempt exists per row the
+whole block is omitted rather than reported as pass@1, and when attempt counts are ragged
+a `sampling_caveat` names the range.
 
 ### Dry-running the generator before it costs GPU time
 

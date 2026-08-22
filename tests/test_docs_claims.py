@@ -189,6 +189,39 @@ def test_documented_test_counts_match_the_real_suite():
         "variants in the same commit.")
 
 
+#: A README that names a test module AND how many tests are in it. Registered here because
+#: the claim is load-bearing -- "(40 tests)" is the evidence that the adversarial direction of
+#: the eval was actually attacked -- and because it is the kind of number that is true on the
+#: day it is written and never looked at again. It was: the module had grown to 59 while the
+#: sentence still said 40, and the whole suite stayed green, because the count guard above
+#: reads only docs/TEST_RESULTS*.md.
+_MODULE_COUNT_CLAIMS = (
+    ("pipeline/v2/README.md", r"`tests/(test_\w+)\.py`\s*\n\((\d+) tests\)"),
+)
+
+
+def test_readme_claims_about_a_test_modules_size_are_derived():
+    for rel, pattern in _MODULE_COUNT_CLAIMS:
+        src = (REPO / rel).read_text()
+        found = list(re.finditer(pattern, src))
+        assert found, (
+            f"{rel}: no module test-count claim matching /{pattern}/. If the sentence was "
+            "reworded, update the pattern; if the claim is gone, delete this entry -- a "
+            "pattern matching nothing is a guard that passes by finding nothing to check")
+        for m in found:
+            module, claimed = m.group(1), int(m.group(2))
+            path = REPO / "tests" / f"{module}.py"
+            assert path.exists(), f"{rel} cites tests/{module}.py, which does not exist"
+            proc = subprocess.run(
+                [sys.executable, "-m", "pytest", str(path), "--collect-only", "-q",
+                 "-p", "no:cacheprovider"],
+                capture_output=True, text=True, cwd=REPO)
+            n = re.search(r"^(\d+) tests? collected", proc.stdout, re.MULTILINE)
+            assert n, f"could not read a collection count for {module}: {proc.stdout[-400:]}"
+            assert claimed == int(n.group(1)), (
+                f"{rel} claims {module} has {claimed} tests, pytest collects {n.group(1)}")
+
+
 def test_both_language_variants_make_the_same_count_claims():
     """A count fixed in one language only reads as verified in whichever is opened."""
     per_doc = {doc.name: sorted(int(m.group(1)) for m in _CLAIM.finditer(doc.read_text()))
