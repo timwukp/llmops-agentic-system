@@ -5,6 +5,68 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
 ## [Unreleased]
 
+### v2 distillation: `verified` becomes a measurement instead of a tautology
+
+Both ends of the ARC pipeline scored a program against **the pairs that were in its own
+prompt**, so the one failure that matters — a rule pinned by 2–4 examples and wrong on a
+fifth — could not be seen at either end. Measured non-circularly against
+`arc-agi_training_solutions.json` (n=742, a `test_score` per task that had been sitting in
+`distill_results.json` unread): 677/742 = 91.2% [89.0, 93.1] of shown-pair-verified
+solvers are also correct on the unseen test pair, 439/463 = 94.8% of clean ones and
+238/279 = 85.3% of those repaired after being told which pair mismatched — monotone in
+repair rounds (1 → 94.8%, 2 → 90.2%, 3 → 78.7%, 7 → 66.7%). So the tax is 8.8% overall and
+14.7% on repaired solvers, and augmentation multiplies it by 25 without moving
+`rejection_rate` off 0.0%, because `transform' = g∘f∘g⁻¹` replicates a wrong `f` perfectly.
+
+`pipeline/v2/build_heldout_source.py` gates at the source: every ARC test pair executed
+(not the first — 69 of 1,000 tasks have more than one), rejects kept with their code as
+evidence about the teacher, repair rounds carried as a **tag and never a filter** (after
+the gate both populations are held-out-correct by definition; missing provenance is
+`"unknown"`, never `0`, which would flatten the dose-response into the clean bucket).
+`gate_self_check()` runs before any data: accept a correct solver, reject one **a single
+character** away, reject an infinite loop — a permissive verifier reports every solver
+correct, which reads exactly like a corpus that needed no gating. `augment.py` pushes each
+held-out pair through that variant's own `g` and keeps three statuses distinct: `missing`
+(refused by default), `gated_out` (wrong program, dropped), `wrapper_mismatch` (a defect in
+`augment.py`, exit 1). Applied to the existing corpus: 848/849 = 99.88% survive, so this is
+a guard rail for data yet to be bought rather than a repair.
+
+That tag needed a second fix, found by running the real corpus rather than a fixture:
+`task_id` is not a key for the join. A corpus is assembled over several distillation
+passes and a later pass can replace a task's solver while keeping its id, so only
+**676 of 848** rows carry the code their provenance entry describes — and among the
+entries recording `rounds_used: 10` (the loop cap) just **6 of 154**. Joined on the id
+alone, those 148 rows reported `10 → 154/154 = 100%`: a wrong join sitting in the report
+as evidence *against* the dose-response measured above, which is what a broken join looks
+like when nothing checks it. The tag is now used only when the entry's `code` **is** the
+row's code, otherwise `"superseded"` — kept distinct from `"unknown"`, since one means
+nobody recorded the effort and the other means someone did and spent it on a different
+program — and the report's `provenance` block counts all three so a table whose largest
+bucket is `superseded` cannot be misread as a measurement.
+
+The negative control is two-sided, because a gate that cannot say no is indistinguishable
+from a corpus that needs none: a lying solver that reproduces every shown pair through a
+lookup table is required to take all 25 of its variants down with it, while the shown-pair
+check it was written to satisfy still accepts it.
+
+The same argument applies one level up, to WHICH tasks are held out. The split drew 40 of
+848 with a pinned `rng.sample` — unbiased in expectation, and an expectation is not what a
+pinned seed draws. Measured with the student's own tokenizer, that one draw gave a val set
+whose task-median was **3,334 tokens against the corpus's 2,340, 47% longer**, outside the
+90% band [1,974, 2,827] of 20,000 resamples, two-sided **p = 0.0009**. Prompt length here
+is grid size, so the health check every later number is read against was quietly a
+measurement of the corpus's harder end: `eval_loss` incomparable to train loss, both solve
+rates over bigger grids than the model ever saw. The holdout now takes one task per
+equal-width length stratum (same seed → **2,423 vs 2,340, p = 0.735**), `split_stats.json`
+records each side's median so the absence of the bias is visible rather than asserted, and
+the negative control searches seeds for a uniform draw that IS extreme and requires the
+stratified selection to survive all of them — a test that merely checked "the median is
+close" would have passed for the sampler that caused this.
+
+Suite 1518 → 1553 (`tests/test_heldout_gate.py` +22, `tests/test_make_splits.py` +7 on a
+module that had none, augment 9 → 15), every guard confirmed by mutating the production
+code until a named test dies.
+
 ### finetune-vision: the first supported non-LLM task type
 
 Object-detection fine-tuning on customer-labeled COCO data, built as a proof that the

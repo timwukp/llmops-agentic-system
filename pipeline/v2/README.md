@@ -45,6 +45,77 @@ Every row in `out/augmented.jsonl` carries `verified: true` earned by
 execution, not by proof-on-paper. A negative control (deliberately corrupted
 wrapper) is rejected by the same path.
 
+## What zero-noise does **not** guarantee (the held-out gate)
+
+`verified: true` means the code reproduces the train pairs **that were in its own
+prompt**. The author of that code — a teacher LLM — saw those pairs. So the verdict
+cannot fail for the reason anyone cares about, and the failure it cannot see is the
+common one: a rule that is pinned by 2–4 examples and wrong on a fifth.
+
+The augmentation makes this worse rather than better, and by construction. Because
+`transform'(z) = g(f(g⁻¹(z)))` is correct *whenever `f` is*, a wrong `f` is replicated
+faithfully across all 25 variants, every one of them passes the sandbox, and
+`rejection_rate` stays `0.0%`. **One wrong source solver is 25 wrong rows that no
+downstream number distinguishes from good ones.** Zero-noise is a statement about
+execution, not about rules.
+
+Measured, non-circularly, on the real ARC training corpus — `distill_results.json`
+records a `test_score` per task that no gate in this pipeline had ever read:
+
+| Population | Also correct on the unseen test pair | Wilson 95% |
+|---|---|---|
+| all shown-pair-verified solvers | **677 / 742 = 91.2%** | [89.0, 93.1] |
+| clean (solved on the first sample) | 439 / 463 = 94.8% | [92.4, 96.5] |
+| repaired (told which pair mismatched, ≥2 rounds) | 238 / 279 = 85.3% | [80.7, 89.0] |
+
+and monotone in repair effort: round 1 → 94.8%, 2 → 90.2%, 3 → 78.7%, 7 → 66.7%. So
+the tax is **8.8% overall / 14.7% on repaired solvers**, and "verified after being told
+which example failed" is a materially weaker claim than "verified".
+
+`build_heldout_source.py` closes it at the source: it executes each solver against the
+ARC **test** pairs — which its author never saw — and drops the ones that fail.
+
+- Every test pair is checked, not the first: 69 of the 1,000 training tasks have more
+  than one, and a rule that is nearly right is exactly the one that handles one unseen
+  input and not the other.
+- A rejected row keeps its `code` in `<out>.rejected.jsonl`. That file is the evidence
+  about the teacher; deleting it would make the gate unfalsifiable.
+- **Repair rounds are a tag, never a filter.** After the gate, a repaired solver is
+  held-out-correct by the same definition as a clean one, so excluding it would discard
+  the hardest tasks in exchange for no measured gain. The count travels as
+  `repair_rounds` (missing → `"unknown"`, never `0`, which would flatten the
+  dose-response above into the clean bucket).
+- **`task_id` is not a key for that tag.** A corpus is assembled over several
+  distillation passes and a later pass can replace a task's solver while keeping its id,
+  which leaves the recorded round count describing a program that is no longer there.
+  Measured: only **676 of 848** rows carry the code their provenance entry describes, and
+  among the entries recording `rounds_used: 10` (the loop cap) just **6 of 154** do.
+  Joined on `task_id` alone, those 148 rows reported `10 → 154/154 = 100%` — a wrong join
+  sitting in the report as evidence *against* the dose-response two paragraphs above. The
+  tag is therefore only used when the entry's `code` **is** the row's code; otherwise it
+  reads `"superseded"`, kept distinct from `"unknown"` because they call for different
+  work, and the report's `provenance` block counts all three so a table whose largest
+  bucket is `superseded` cannot be read as a measurement.
+- An empty result exits non-zero, and a corpus whose `task_id`s do not appear in the ARC
+  files is refused rather than reported as "0 gated of 0 matched".
+- The gate must be able to say no, so `gate_self_check()` runs three probes before any
+  data does: accept a correct solver, reject one that differs by a **single character**,
+  reject an infinite loop. A permissive verifier — a SIGALRM that never fires, a
+  comparison that coerces types — reports every solver held-out-correct, which reads
+  exactly like a corpus that needed no gating.
+
+`augment.py` then requires the held-out pair to survive its own `g`, and carries it into
+every emitted variant, so the pair is genuine ground truth *for that variant's prompt*.
+Three statuses are kept distinct because they mean different things: `missing` (the
+measurement was never taken — refused by default, `--no-require-heldout` to opt out
+explicitly), `gated_out` (the program is wrong — the row is dropped), and
+`wrapper_mismatch` (train pairs pass but the transformed held-out pair does not — that is
+a **defect in `augment.py`**, not bad data, and it exits 1).
+
+Applied to the existing 849-row corpus: **848 pass (99.88%)**; the one failure
+(`4e45f183`) raises on the test input. The corpus was already clean, so this gate is a
+guard rail for data yet to be bought, not a repair of what is on disk.
+
 ## Prompt discipline (train == inference format)
 
 Augmented prompts are produced by surgically replacing only the
@@ -61,55 +132,96 @@ all 25 variants of a held-out task go to val; no variant of a train task
 ever appears in val. Outputs TRL messages format (`train.jsonl`,
 `val.jsonl`) plus raw copies (`train_raw.jsonl`, `val_raw.jsonl`).
 
-## Stats (run of 2026-07-30)
+**Which 40, and why not just `rng.sample`.** The holdout takes one task from each of
+40 equal-width prompt-length strata rather than a uniform sample of 40 of 848. A
+uniform sample is unbiased *in expectation*, and a pinned seed does not draw an
+expectation — it draws once and keeps it. Measured with the student's own tokenizer,
+seed 20260730's uniform draw gave a val set whose task-median was **3,334 tokens
+against the corpus's 2,340 — 47% longer**, outside the 90% band [1,974, 2,827] of
+20,000 resamples, two-sided **p = 0.0009**. Nothing was wrong with the sampler.
+
+Prompt length in this corpus *is* grid size, so that draw quietly made every val
+number a measurement of the corpus's harder end: `eval_loss` not comparable to train
+loss, and both solve rates reported over systematically bigger grids than the model
+was trained on. Stratified, the same seed gives a val task-median of **2,423 against
+2,340 (p = 0.735)**, and `split_stats.json` now records the median prompt length of
+each side so the absence of the bias is visible rather than asserted. `--seed` still
+varies which task comes out of each stratum, so reruns stay reproducible and
+variable — just never length-extreme.
+
+The property under test is structural, in `tests/test_make_splits.py`
+(7 tests): exactly one task per stratum, which is what makes an extreme draw
+unreachable. The negative control matters more than the property — it searches seeds
+for a *uniform* draw that IS extreme on the same corpus and then shows the stratified
+selection cannot produce one at any of those seeds. Without it, a test that only
+checked "the median is close" would pass for the uniform sampler most of the time,
+which is exactly how the defect survived.
+
+## Stats (corpus of 2026-08-22)
 
 | Metric | Value |
 |---|---|
-| Source rows | 849 |
-| Emitted (all sandbox-verified) | 21,225 (849 × 25) |
+| Source rows | 848 (849 gated, 1 dropped: `4e45f183` fails its held-out pair) |
+| Emitted (all sandbox-verified) | 21,200 (848 × 25) |
 | Rejected (verify-fail) | 0 (0.0%) |
-| Train rows / tasks | 20,225 / 809 |
+| Train rows / tasks | 20,200 / 808 |
 | Val rows / tasks | 1,000 / 40 |
-| Median prompt+code tokens (Qwen3 tokenizer) | 2,298 (p90 5,285, p99 9,097, max 12,967) |
+| Median prompt+code tokens (student tokenizer) | 2,319 (p90 5,214, p99 9,585, max 12,981) |
 | Full-run wall time (8 workers) | ~108 s |
 
-Per-transform counts live in `out/augment_stats.json`.
+Per-transform counts live in `out/augment_stats.json`; the token census and the
+per-task length derivation live in `~/Documents/llmops-evidence/arc2-v2/`.
 
-Those token counts are measured with the real `Qwen/Qwen3-1.7B` tokenizer over all
-20,225 train rows, not estimated. An earlier version of this table used the usual
-`chars / 4` rule of thumb and understated every figure by 2.0–2.5× (it reported
-median 1,134 / p90 2,114 / max 5,656). The rule fails badly on this specific
-domain: ARC prompts are space-separated single digits, where one token covers
-about two characters rather than four. Anything sized from the estimate — a
+Those token counts are measured with the tokenizer and chat template of
+**`Qwen/Qwen3-4B-Thinking-2507`** — the model that will actually train — pulled from
+its in-account mirror, over all 21,200 rows. Both halves of that matter. An earlier
+version of this table used the `chars / 4` rule of thumb and understated every figure
+by 2.0–2.5× (it reported median 1,134 / p90 2,114 / max 5,656); the rule fails badly
+on this specific domain, where ARC prompts are space-separated single digits and one
+token covers about two characters rather than four. The version after that fixed the
+estimate but measured with `Qwen/Qwen3-1.7B`, a same-family stand-in for a model that
+was no longer the student — and a `max_length` is sized against the tokenizer that
+will do the counting, not a relative of it. Anything sized from the estimate — a
 `max_length`, a `max_new_tokens`, a cost projection — would have been wrong by
 more than a factor of two, so the measurement is worth its one-off cost.
 
 ### The `max_length` cliff (read this before setting `--max-length`)
 
 At the `max_length 4096` used by the 2026-07-31 training run, `--drop-overlong`
-discards **3,603 train rows (17.8%)** and **125 val rows (12.5%)**. Those rows are
+discards **3,625 train rows (17.95%)** and **150 val rows (15.0%)**. Those rows are
 not a random sample, and the reason is structural: a row's length is set almost
 entirely by its grid size, and all 25 variants of a source task share that size
-(the augmentation group permutes colors and rotates, which cannot change the cell
-count). So dropping is effectively **all-or-nothing per source task**, and it
-removes the largest grids first:
+(the augmentation group permutes colors and applies a geometry, neither of which
+changes the cell count — measured, every variant of a task tokenizes its *prompt* to
+the identical length). So dropping is **nearly all-or-nothing per source task**, and
+it removes the largest grids first:
 
 | Split | Rows dropped | Source tasks *entirely* removed |
 |---|---|---|
-| train | 3,603 / 20,225 (17.8%) | **131 / 809 (16.2%)** |
-| val | 125 / 1,000 (12.5%) | **5 / 40 (12.5%)** |
+| train | 3,625 / 20,200 (17.95%) | **130 / 808 (16.09%)** |
+| val | 150 / 1,000 (15.0%) | **6 / 40 (15.0%)** |
+
+"Nearly", because the row is prompt **plus code** and the code is per-variant: the
+wrapper encodes that variant's colour permutation and geometry, so it varies by up to
+~150 tokens where the prompt does not vary at all. At 4096, **19 of 808 train tasks
+straddle the window** — some variants in, some out. `0a938d79` is the clean example:
+prompt 3,301 tokens for all 25 variants, code 750→897, row totals 4,065→4,212 across a
+window at 4,096. The earlier claim that the variants "share that size" was true of the
+prompt and false of the row, which is the kind of gap that makes a task look retained
+while a third of its variants are gone.
 
 Two consequences worth stating plainly rather than discovering later:
 
-- A `eval_loss` or `solve_rate` from that configuration covers **35 val tasks, not
-  40**, and the 5 missing ones are the hardest-to-render (largest) tasks in the
+- A `eval_loss` or `solve_rate` from that configuration covers **34 val tasks, not
+  40**, and the 6 missing ones are the hardest-to-render (largest) tasks in the
   held-out set. Reported without this note, a deliberate configuration choice reads
   as a model deficiency.
 - The student is never shown a large grid at all, so it cannot be expected to
   generalize to one. Raising `max_length` to 8192 would recover most of the gap
-  (p90 is 5,285, p99 9,097) at roughly 2× attention memory per sample — the
-  compensating knob is `per_device_batch_size` with `gradient_accumulation` raised
-  to hold the effective batch size fixed.
+  (p90 is 5,214, p99 9,585 — 394 train rows and 15 tasks still lost, 1.95%) at
+  roughly 2× attention memory per sample — the compensating knob is
+  `per_device_batch_size` with `gradient_accumulation` raised to hold the effective
+  batch size fixed.
 
 ## Size-generic note
 
@@ -339,9 +451,16 @@ log rather than inferred.
   `--arc-dir` (or `$V2_ARC_TRAINING_DIR`, default `/tmp/arc/data/training`) is an
   optional speedup only; without it the train pairs are parsed back out of the
   prompt text.
+- `build_heldout_source.py` — the held-out gate: attaches each task's ARC **test**
+  pairs to its solver, executes the solver against them, and writes only the survivors
+  (`--source`, `--challenges`, `--solutions`, `--out`; `--provenance` for repair
+  rounds). Rejects go to `<out>.rejected.jsonl` with their code, the rates to
+  `<out>.report.json`. Exits non-zero on an empty result, an empty source, or a corpus
+  whose task_ids the ARC files do not describe.
 - `verify_sandbox.py` — sandboxed exec + exact grid compare (also reusable
   for eval)
-- `make_splits.py` — deterministic task-level split, TRL + raw formats
+- `make_splits.py` — deterministic task-level split, TRL + raw formats; carries
+  `heldout_pairs` through to `val_raw.jsonl` verbatim
 - `generate_student.py` — GPU-side generation (greedy; writes incrementally so
   an interrupted run stays scorable)
 - `eval_student.py` — `score` (execute + gate) and `self-test` (oracle check)
