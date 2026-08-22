@@ -67,6 +67,22 @@ Suite 1518 → 1553 (`tests/test_heldout_gate.py` +22, `tests/test_make_splits.p
 module that had none, augment 9 → 15), every guard confirmed by mutating the production
 code until a named test dies.
 
+`eval_student.py` reports `heldout_solve_rate` and `overfit_gap` **beside** `solve_rate`
+rather than instead of it (two rates, two claims: "writes runnable code" and "found the
+rule"), with the shown-pair rate recomputed over the held-out subset so the subtraction
+compares the same rows, and an absent measurement stored as absent, never as `False`.
+Multi-attempt runs get pass@k with an honest selector: `pass_at_k` is the oracle,
+`selected_at_k` is what a submission scores (lowest-numbered attempt that reproduces the
+**shown** pairs, else attempt 0), `selection_loss` is the gap no submission can collect.
+`pick_metric` walks `selected_at_k → heldout_solve_rate → solve_rate` all-or-nothing
+across every side of a comparison, and skips `selected_at_k` when the two runs used
+different k, since pass@2 beats pass@1 for identical weights. The same lying solver is
+required to score `solve_rate 1.000` **and** `heldout_solve_rate 0.000` — both halves
+asserted, since checking one side would pass for a solver that is merely broken. Suite
+1553 → 1573 (eval 40 → 59); a README stating how many tests a module has is now checked
+against `pytest --collect-only` rather than remembered (it had said 40 while the module
+held 59, and the existing count guard reads only `docs/TEST_RESULTS*.md`).
+
 ### finetune-vision: the first supported non-LLM task type
 
 Object-detection fine-tuning on customer-labeled COCO data, built as a proof that the
