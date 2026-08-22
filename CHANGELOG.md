@@ -95,6 +95,21 @@ k× denominator. Truncation is **not** difficulty-neutral, measured on the 49-tr
 an 8,192 window drops 18.4% of rows and all 9 dropped were held-out-correct (9/9) while the
 40 that fit were 33/40. Suite 1573 → 1580 (generator 35 → 42).
 
+`train_qlora.py` verified the mirrored weights against `MODEL_MANIFEST.json` by reading
+per-file digests from `files_sha256`. The student model's own in-account mirror names them
+`files` — written by a different producer than the data-prep `mirror_model` task the code
+was built against — so the loop ran over **zero** files, found nothing to disagree with,
+and printed `mirror verified: 0 files` before training. A supply-chain gate that cannot
+fail is worse than none, because the log now claims the bytes were checked. The check is
+now a testable top-level function that understands both producers and **exits non-zero when
+it finds no digests at all**, since "the weights match what a human signed" and "there was
+nothing to compare" are indistinguishable in a log line. Both copies of the trainer carry
+it, asserted by a test that globs for them rather than naming the deployed one — the
+deliverability rules this file already documents went missing in exactly the copy that ran.
+Suite 1580 → 1588 (deliverability 15 → 23), each guard confirmed by mutating the production
+code until a named test dies: keying on one producer kills two tests, dropping the
+zero-digest guard kills two more.
+
 ### finetune-vision: the first supported non-LLM task type
 
 Object-detection fine-tuning on customer-labeled COCO data, built as a proof that the

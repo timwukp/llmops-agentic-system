@@ -241,5 +241,103 @@ def test_the_preflight_ships_in_the_same_directory_the_trainer_is_mirrored_from(
         "callers, which is exactly what it had for the entire life of the previous trainer")
 
 
+# ------------------------------------------------- the mirror integrity check must be able to fail
+#
+# Measured on the real in-account mirror of the student model
+# (runs/run-arc2v2-experiments/models/qwen3-4b-thinking/): the trainer read digests from
+# `files_sha256`, that manifest names them under `files`, so the loop ran over ZERO files
+# and the trainer printed "mirror verified: 0 files" and trained. Nothing was compared.
+# Every test below pins the difference between "the bytes match what a human signed" and
+# "there was nothing to compare", because a log line cannot tell them apart.
+
+verify_mirror_manifest = _extract("verify_mirror_manifest")
+
+
+def _mirror(tmp_path, files: dict, key="files_sha256", extra=None):
+    """Write files into a fake synced mirror and return (dir, manifest dict)."""
+    import hashlib
+    digests = {}
+    for name, body in files.items():
+        (tmp_path / name).write_bytes(body)
+        digests[name] = hashlib.sha256(body).hexdigest()
+    mm = {"hf_repo": "Qwen/Qwen3-4B-Thinking-2507", key: digests}
+    mm.update(extra or {})
+    return str(tmp_path), mm
+
+
+def test_a_manifest_with_no_digests_at_all_is_fatal(tmp_path):
+    """The regression, reduced: nothing to check must never read as checked."""
+    with pytest.raises(SystemExit) as e:
+        verify_mirror_manifest(str(tmp_path), {"hf_repo": "x", "sha256": {"a": "b"}},
+                               "/m/MODEL_MANIFEST.json")
+    msg = str(e.value)
+    assert "files_sha256" in msg and "'files'" in msg, \
+        "the error must name the keys it looked for, or the next producer guesses again"
+    assert "must not pass" in msg
+
+
+def test_an_empty_digest_map_is_fatal(tmp_path):
+    """`{"files_sha256": {}}` is the shape a half-written mirror leaves behind, and it is
+    the one input for which the old code's `bad` list was empty for the right reason."""
+    d, mm = _mirror(tmp_path, {})
+    with pytest.raises(SystemExit):
+        verify_mirror_manifest(d, mm, "/m/MODEL_MANIFEST.json")
+
+
+def test_both_producers_key_names_are_understood(tmp_path):
+    """`files_sha256` from the data-prep `mirror_model` task, `files` from the
+    experiment-side mirror script. Two producers, one consumer; the consumer knowing only
+    one of them is what made the check vacuous on a mirror that was actually intact."""
+    for key in ("files_sha256", "files"):
+        sub = tmp_path / key
+        sub.mkdir()
+        d, mm = _mirror(sub, {"tokenizer.json": b"{}", "config.json": b"{}"}, key=key)
+        assert verify_mirror_manifest(d, mm, "/m/MODEL_MANIFEST.json") == 2
+
+
+def test_the_count_it_reports_is_the_count_it_checked(tmp_path):
+    """The printed number is the only evidence a human sees, so it has to come from the
+    digests that were compared -- not from `len(mm)` or a key that may be absent."""
+    d, mm = _mirror(tmp_path, {"a.json": b"1", "b.json": b"2", "c.json": b"3"})
+    assert verify_mirror_manifest(d, mm, "/m") == 3
+
+
+def test_a_file_the_manifest_names_but_the_sync_skipped_is_fatal(tmp_path):
+    """`aws s3 sync` dropping one shard leaves every file that IS present matching."""
+    d, mm = _mirror(tmp_path, {"model-00001.safetensors": b"weights"})
+    mm["files_sha256"]["model-00002.safetensors"] = "0" * 64
+    with pytest.raises(SystemExit) as e:
+        verify_mirror_manifest(d, mm, "/m")
+    assert "missing" in str(e.value)
+
+
+def test_a_single_flipped_byte_is_fatal(tmp_path):
+    """The check exists for tampering, so the control is one byte, not a truncated file."""
+    d, mm = _mirror(tmp_path, {"config.json": b'{"a": 1}'})
+    (tmp_path / "config.json").write_bytes(b'{"a": 2}')
+    with pytest.raises(SystemExit) as e:
+        verify_mirror_manifest(d, mm, "/m")
+    assert "sha256 mismatch" in str(e.value)
+
+
+def test_the_deployed_trainer_calls_the_guard_rather_than_hashing_inline():
+    """A helper the trainer stopped using is the gap this file already documents once."""
+    assert "verify_mirror_manifest(local_dir, mm, manifest_path)" in trainer_src
+    assert "_hl" not in trainer_src, \
+        "an inline hashing loop next to the guard means two checks with one tested"
+
+
+def test_every_copy_of_the_trainer_in_the_repo_carries_the_guard():
+    """There are two trainers in this repo and only one is deployed -- which is how the
+    deliverability rules stayed unimplemented in the copy that ran. A guard applied to the
+    mirrored copy alone is one `ensure_code()` edit away from being applied to none."""
+    copies = sorted(REPO.glob("pipeline/**/train_qlora.py"))
+    assert len(copies) >= 2, f"expected the known copies, found {copies}"
+    for path in copies:
+        src = path.read_text()
+        assert "def verify_mirror_manifest(" in src, f"{path} has no integrity guard"
+        assert 'mm.get("files") or {}' in src, f"{path} understands one producer only"
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))
