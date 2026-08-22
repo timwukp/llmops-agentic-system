@@ -23,7 +23,7 @@ step 1 of 1265 with save_strategy="no" and produced ZERO artifacts):
      trained on 60% of the data is a deliverable; a killed job is not.
   3. Resume automatically from the newest checkpoint if one is present.
 """
-import argparse, gc, glob, inspect, json, os, re, time
+import argparse, gc, glob, inspect, json, math, os, re, time
 
 
 def parse_args():
@@ -42,6 +42,14 @@ def parse_args():
     # deliverability controls
     p.add_argument("--save_steps", type=int, default=100,
                    help="checkpoint cadence; 0 disables periodic saves (NOT recommended)")
+    p.add_argument("--max_steps", type=int, default=0,
+                   help="stop after N optimizer steps. 0 = run the epochs. This exists for "
+                        "the preflight the v2 plan requires: measure s/step and peak VRAM on "
+                        "the target instance at the real max_length BEFORE signing a "
+                        "multi-hour run. --max_train_seconds cannot do it -- a wall-clock "
+                        "budget gives you whatever step count it gives you, and the step "
+                        "count is the thing being measured. A run capped this way reports "
+                        "completed_fraction against the FULL run, not against the cap")
     p.add_argument("--max_train_seconds", type=float, default=0,
                    help="graceful stop budget for the TRAINING loop only; leave headroom "
                         "under MaxRuntimeInSeconds for eval+merge+upload. 0 = unlimited")
@@ -131,6 +139,100 @@ def verify_mirror_manifest(local_dir, mm, manifest_path):
     return len(digests)
 
 
+def intended_steps(n_rows, epochs, per_device_batch_size, gradient_accumulation):
+    """Optimizer steps a FULL pass over n_rows would take. Two callers need this number.
+
+    The preflight (`validate_job_config.py --sec-per-it`) multiplies steps by seconds per
+    step, so both sides have to count the same unit. One optimizer step consumes
+    per_device_batch_size * gradient_accumulation rows -- NOT per_device_batch_size.
+    Multiplying the accumulation in on both sides is how a 9-hour estimate becomes a
+    36-hour one and a launch gets refused for a limit it actually clears.
+
+    It is also what makes a step-capped probe label itself honestly; see
+    completed_fraction below.
+    """
+    eff = max(1, int(per_device_batch_size) * int(gradient_accumulation))
+    total = n_rows * float(epochs) / eff
+    return max(1, math.ceil(total))
+
+
+def completed_fraction(global_step, trainer_max_steps, n_intended, step_capped):
+    """How much of the run the operator asked for actually happened.
+
+    `--max_steps 20` sets trainer.state.max_steps to 20, so the obvious
+    global_step / max_steps is 20/20 = 1.0 and a 20-step probe writes
+    "completed_fraction": 1.0 into metrics.json. Every downstream gate in this repo reads
+    that field to tell a partial run from a finished one -- the whole point of the
+    graceful-budget work -- so a probe that reports 1.0 is a lie in the one field built to
+    prevent exactly this confusion. A capped run is measured against the full run instead.
+    """
+    if step_capped:
+        return global_step / n_intended if n_intended else None
+    return global_step / trainer_max_steps if trainer_max_steps else None
+
+
+WARMUP_STEPS_EXCLUDED = 3
+
+
+def step_timing(step_seconds, warmup_excluded=WARMUP_STEPS_EXCLUDED):
+    """Seconds per optimizer step, with the steady state separated from the warmup.
+
+    train_runtime / global_step folds in the first steps' CUDA autotune and allocator
+    growth. Over 3,000 steps that is noise; over the 20 a preflight can afford it IS the
+    measurement -- a first step of 90s against a steady 11s puts the mean at 15s, 36% high,
+    and a 36%-high s/step is a runtime estimate that asks for hours the run will not use.
+    So report both and name which is which, rather than picking one and hoping the reader
+    guesses. `first_step` is kept because a first step wildly above the rest is itself the
+    signal that the excluded window was too small.
+    """
+    def pct(vals, q):
+        if not vals:
+            return None
+        s = sorted(vals)
+        return s[min(len(s) - 1, int(q * len(s)))]
+
+    steady = step_seconds[warmup_excluded:] or step_seconds
+    return {
+        "unit": "seconds per OPTIMIZER step (gradient-accumulation micro-batches included)",
+        "n_steps_timed": len(step_seconds),
+        "mean": (sum(step_seconds) / len(step_seconds)) if step_seconds else None,
+        "p50": pct(step_seconds, 0.5),
+        "p90": pct(step_seconds, 0.9),
+        "warmup_steps_excluded": warmup_excluded,
+        "p50_steady": pct(steady, 0.5),
+        "p90_steady": pct(steady, 0.9),
+        "first_step": step_seconds[0] if step_seconds else None,
+    }
+
+
+def vram_snapshot(torch_mod, device=0):
+    """Peak GPU memory, or None with a reason. Never silently absent.
+
+    The question a preflight has to answer is not "did it run" but "how close to the edge
+    did it run" -- max_length 14336 either fits with headroom or OOMs on some longer row
+    later in the epoch, and those two look identical for the first 20 steps. reserved is
+    the number that OOMs (the allocator's pool), allocated is what the tensors needed;
+    reporting only the second understates the risk.
+    """
+    try:
+        if not torch_mod.cuda.is_available():
+            return {"available": False, "reason": "no CUDA device visible to this process"}
+        gib = float(1 << 30)
+        total = torch_mod.cuda.get_device_properties(device).total_memory
+        reserved = torch_mod.cuda.max_memory_reserved(device)
+        allocated = torch_mod.cuda.max_memory_allocated(device)
+        return {
+            "available": True,
+            "device_name": torch_mod.cuda.get_device_name(device),
+            "max_allocated_gib": round(allocated / gib, 2),
+            "max_reserved_gib": round(reserved / gib, 2),
+            "device_total_gib": round(total / gib, 2),
+            "reserved_fraction_of_device": round(reserved / total, 3) if total else None,
+        }
+    except Exception as exc:                      # noqa: BLE001 -- a probe must not lose the run
+        return {"available": False, "reason": f"{type(exc).__name__}: {exc}"}
+
+
 def newest_checkpoint(ckpt_dir):
     if not os.path.isdir(ckpt_dir):
         return None
@@ -184,6 +286,32 @@ def main():
                 print(f"[budget] {self.budget:.0f}s training budget reached at step "
                       f"{state.global_step}/{state.max_steps} — stopping gracefully to save artifacts")
             return control
+
+    class StepTimerCallback(TrainerCallback):
+        """Wall-clock per OPTIMIZER step, so a 20-step probe can size a 3,000-step run.
+
+        on_step_end fires once per optimizer step, after all gradient-accumulation
+        micro-batches -- the same unit validate_job_config.py multiplies. Timing
+        micro-batches instead would report a number 8x too small at
+        gradient_accumulation=8 and pass every sanity check on the way to a runtime
+        estimate an eighth of the truth.
+        """
+
+        def __init__(self):
+            self.step_seconds = []
+            self._last = None
+
+        def on_train_begin(self, cfg, state, control, **kw):
+            self._last = time.time()
+            return control
+
+        def on_step_end(self, cfg, state, control, **kw):
+            now = time.time()
+            if self._last is not None:
+                self.step_seconds.append(now - self._last)
+            self._last = now
+            return control
+
 
     # Preflight: liger-kernel is load-bearing (it is what keeps the loss head from
     # OOM-ing at 4k context). Check it now — before the multi-minute base-model
@@ -270,6 +398,8 @@ def main():
     cfg = SFTConfig(**filtered_kwargs(SFTConfig, dict(
         output_dir=args.checkpoint_dir,
         num_train_epochs=args.epochs,
+        max_steps=args.max_steps if args.max_steps > 0 else -1,   # -1 = honour epochs
+
         per_device_train_batch_size=args.per_device_batch_size,
         per_device_eval_batch_size=1,
         gradient_accumulation_steps=args.gradient_accumulation,
@@ -302,10 +432,19 @@ def main():
         budget_cb = TimeBudgetCallback(args.max_train_seconds)
         trainer.add_callback(budget_cb)
 
+    # Always on. Timing costs one time.time() per step, and the reason the v2 relaunch
+    # arithmetic had to be reconstructed from a tqdm line someone happened to screenshot
+    # is that no run recorded it.
+    timer_cb = StepTimerCallback()
+    trainer.add_callback(timer_cb)
+
     resume = newest_checkpoint(args.checkpoint_dir)
     if resume:
         print(f"[resume] continuing from {resume}")
     train_result = trainer.train(resume_from_checkpoint=resume)
+    # Read before eval and merge: max_memory_reserved is a high-water mark that never
+    # falls, so asking after eval answers a different question than "does training fit".
+    vram_training = vram_snapshot(torch)
 
     # Save the adapter BEFORE evaluating: eval can OOM on a long val row, and an
     # unsaved adapter after a full training run is the worst possible outcome.
@@ -323,7 +462,11 @@ def main():
     history = list(trainer.state.log_history)
     train_losses = [h["loss"] for h in history if "loss" in h]
     eval_losses = [h["eval_loss"] for h in history if "eval_loss" in h]
-    completed_frac = (trainer.state.global_step / trainer.state.max_steps) if trainer.state.max_steps else None
+    step_capped = args.max_steps > 0
+    n_intended = intended_steps(len(train_ds), args.epochs,
+                                args.per_device_batch_size, args.gradient_accumulation)
+    completed_frac = completed_fraction(trainer.state.global_step, trainer.state.max_steps,
+                                        n_intended, step_capped)
     metrics = {
         "final_train_loss": train_losses[-1] if train_losses else None,
         "mean_train_loss": (sum(train_losses) / len(train_losses)) if train_losses else None,
@@ -335,6 +478,11 @@ def main():
         "global_step": trainer.state.global_step,
         "max_steps": trainer.state.max_steps,
         "completed_fraction": completed_frac,
+        "step_capped": step_capped,
+        "max_steps_requested": args.max_steps,
+        "intended_steps_full_run": n_intended,
+        "sec_per_step": step_timing(timer_cb.step_seconds),
+        "peak_vram": {"training": vram_training, "including_eval": vram_snapshot(torch)},
         "budget_stopped": bool(budget_cb and budget_cb.tripped),
         "resumed_from": resume,
         "rows_dropped_overlong": dropped,
@@ -351,6 +499,14 @@ def main():
     print(f"METRIC train_loss={metrics['final_train_loss']}")
     print(f"METRIC eval_loss={metrics['final_eval_loss']}")
     print(f"METRIC completed_fraction={completed_frac}")
+    _t = metrics["sec_per_step"]
+    print(f"METRIC sec_per_step_p50_steady={_t['p50_steady']} (first_step={_t['first_step']}, "
+          f"n={_t['n_steps_timed']})")
+    print(f"METRIC peak_vram_reserved_gib={(vram_training or {}).get('max_reserved_gib')}")
+    if step_capped:
+        print(f"[probe] STEP-CAPPED RUN: {trainer.state.global_step} of {n_intended} intended "
+              f"steps ({completed_frac:.2%}). This is a MEASUREMENT, not a trained adapter — "
+              f"do not promote it, and do not read TRAINING_COMPLETE below as a finished run.")
 
     if truthy(args.merge_adapters):
         print("[merge] merging LoRA adapters into base model (bf16, CPU)")
