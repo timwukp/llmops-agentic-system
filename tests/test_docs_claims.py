@@ -195,8 +195,15 @@ def test_documented_test_counts_match_the_real_suite():
 #: day it is written and never looked at again. It was: the module had grown to 59 while the
 #: sentence still said 40, and the whole suite stayed green, because the count guard above
 #: reads only docs/TEST_RESULTS*.md.
+#: The same claim in a second document, found by asking which OTHER files make it. The
+#: evidence doc said "`tests/test_training_deliverability.py` — 11 tests … **41 passed**"
+#: while the module held 23 and the suite 1,588 — stale for months, and green, because the
+#: suite-total guard above reads only docs/TEST_RESULTS*.md and this entry did not exist.
+#: A guard's scope is a claim about where the defect cannot be.
 _MODULE_COUNT_CLAIMS = (
     ("pipeline/v2/README.md", r"`tests/(test_\w+)\.py`\s*\n\((\d+) tests\)"),
+    ("deploy/evidence/VERIFICATION_v2_training_deliverability.md",
+     r"`tests/(test_\w+)\.py` — (\d+) tests"),
 )
 
 

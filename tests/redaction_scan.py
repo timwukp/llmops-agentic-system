@@ -107,7 +107,7 @@ ALLOWED = (b"6833" + b"13688378", b"7631" + b"04351884", b"1234" + b"56789012")
 #: this laptop, single-threaded CPython does 3.1M sha256/s, so the whole 1e12 space falls in
 #: about 4 days -- and a GPU does it in roughly 100 seconds. So the KDF is iterated. At 200k
 #: iterations a candidate costs ~16 ms, which makes the same sweep ~500 GPU-years, while the
-#: scan stays cheap because only 12-digit runs are ever hashed: measured across all 194
+#: scan stays cheap because only 12-digit runs are ever hashed: measured across all 195
 #: tracked files there are 74 such runs, 10 distinct, and hashing the distinct set takes 0.16 s
 #: for the entire repo. (Re-measured whenever either number moves, and they move
 #: INDEPENDENTLY, which is why both are derived and neither is inferred from the other, and
@@ -149,9 +149,13 @@ ALLOWED = (b"6833" + b"13688378", b"7631" + b"04351884", b"1234" + b"56789012")
 #: reason the KDF cost is bounded: five more runs of an id already in the set cost nothing to hash.
 #: Then the v2 held-out gate went back to moving one number only: 191 files grew to 193 -- the
 #: gate builder and its test module, whose numbers are pair counts, held-out rates and Wilson
-#: bounds -- while the runs held at 74 and the distinct set at 10. Then 193 files became 194,
+#: bounds -- while the runs held at 74 and the distinct set at 10. Then 193 files went to 194,
 #: the split's first test module, carrying medians and a permutation p-value and again no ids,
 #: with the runs still at 74: a tenth consecutive commit moving the file count alone.
+#: Then 194 files became 195, the preflight-measurement module, whose numbers are seconds per
+#: optimizer step, GiB reserved and step counts -- and, for the first time in this streak, a
+#: FAKE torch reporting 8 GiB allocated against 21 GiB reserved, none of them 12 digits long --
+#: with the runs still at 74: an eleventh consecutive commit moving the file count alone.
 #: (The "became" phrasing is the one the guard reads, so it names the LATEST movement -- the
 #: earlier ones are history and keep their own past tense.)
 #: For EIGHT commits

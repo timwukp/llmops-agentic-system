@@ -110,6 +110,39 @@ Suite 1580 → 1588 (deliverability 15 → 23), each guard confirmed by mutating
 code until a named test dies: keying on one producer kills two tests, dropping the
 zero-digest guard kills two more.
 
+The relaunch arithmetic that made a nine-hour run affordable multiplies one input, seconds
+per optimizer step, and nothing in the repo measured it: `--sec-per-it` **defaulted to 27.0**,
+a number measured once over 11 steps on a different instance with a 1.7B model at a quarter
+of the sequence length now planned, and the block that used it was **skipped** when the input
+was missing — so a preflight given no measurement printed `PASS — safe to launch`. Peak VRAM
+was recorded nowhere in any of the five real jobs, so "does `max_length 14336` fit" had no
+answer short of a job that OOMs an hour in. The trainer now takes `--max_steps N` to stop
+after N optimizer steps, times each one (reporting `p50_steady` with the warmup excluded
+beside `first_step`, because over 20 steps the first step's autotune is most of the mean), and
+records `max_memory_reserved` — the pool that OOMs, not the live tensors. A capped run reports
+`completed_fraction` against the FULL run and labels itself a measurement, since
+`global_step / max_steps` is 20/20 = 1.0 in the one field every gate reads to tell a partial
+run from a finished one. Both preflight inputs are now required, and the step count is ceiled
+on both sides of the multiplication.
+
+Running that gate on the first real payload rather than only on fixtures then found the next
+hole: the arithmetic never read `--max_steps`, the flag its own usage line tells you to pass,
+so a 20-step probe was sized and reported as a 75-step run. It now sizes the cap and says out
+loud that a PASS on a capped payload does not transfer to the uncapped run it measures.
+
+Both probes have since run on `ml.g6e.8xlarge` (`2xlarge` and `4xlarge` had no capacity; three
+identical payloads raced and a guard stopped the losers out of `Pending` for ~$0). Measured:
+**7.28 s/step** on a representative sample and **30.02 s/step** on the 200 longest rows, with
+peak reserved **8.53 GiB of 44.4 = 19.2%** at the worst case — so `max_length 14336` was never
+the risk, and `--drop_overlong` dropped nothing, in the job's own metrics, twice. A two-point
+fit anchored on the corpus's exact token total sizes the full run at **15.8 h / $91**, agreeing
+with the representative probe's own mean to 3.7%. The plan's `wall = steps × s/step ×
+grad_accum` would have said 126.6 h and refused it: `on_step_end` fires once per optimizer
+step, with the micro-batches already inside the number.
+
+Suite 1588 → 1609 (preflight_measurement 21), twenty-two mutants over both copies of each
+file, no survivors.
+
 ### finetune-vision: the first supported non-LLM task type
 
 Object-detection fine-tuning on customer-labeled COCO data, built as a proof that the
