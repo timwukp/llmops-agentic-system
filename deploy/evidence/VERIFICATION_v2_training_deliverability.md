@@ -133,12 +133,23 @@ Measured on g5.2xlarge: **~26.6 s/it** over 11 steps.
 
 | Setting | Value | Reasoning |
 |---|---|---|
-| Rows after dropping >4096-token samples | ~20,002 of 20,225 | 1.1% dropped, not truncated |
+| Rows after dropping >4096-token samples | ~20,002 of 20,225 | 1.1% dropped, not truncated — **wrong, see below** |
 | Steps per epoch | ~1,250 | effective batch 16 (2 × 8) |
 | Training time needed | ~9.2 h | 1,250 × 26.6 s |
 | `MaxRuntimeInSeconds` | 43,200 (12 h) | **must exceed** the above, unlike e1g6's 4 h |
 | `max_train_seconds` | 40,500 (11.25 h) | 45 min headroom for save + eval + merge + upload |
 | `save_steps` | 50 | ~25 checkpoints per epoch; worst-case loss is 50 steps |
+
+**Correction, measured later:** the 1.1% in the first row is an artifact of sizing rows with
+the `chars / 4` rule of thumb. Tokenized with the real Qwen3 tokenizer, `max_length 4096`
+drops **3,603 of 20,225 rows (17.8%)** — sixteen points more, and 131 of 809 source tasks
+disappear entirely (`pipeline/v2/README.md` carries the derivation). The row is left as
+written because this file records what was believed at launch time, and the belief is the
+point: every downstream figure in the table inherits it, so "steps per epoch ~1,250" was
+really ~1,039. The direction is conservative — an overstated row count overstates the wall
+clock, so the runtime the job was given was larger than it needed, not smaller. It is still
+a 16-point error in the one input the rest of the table multiplies, which is why the
+relaunch arithmetic is now a script fed a measured `--rows` instead of an estimate.
 
 This arithmetic is no longer done by hand. `validate_job_config.py` (now
 `pipeline/training/distill/`, mirrored to `code/distill/` beside the trainer) runs it against

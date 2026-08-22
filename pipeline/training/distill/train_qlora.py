@@ -113,6 +113,45 @@ def drop_overlong_rows(ds, tokenizer, max_length, tag):
     return ds, dropped
 
 
+def verify_mirror_manifest(local_dir, mm, manifest_path):
+    """SHA-256 every file MODEL_MANIFEST.json names. Returns the count verified.
+
+    Raises SystemExit unless at least one digest was found and every file it names is
+    present and matches, because the two failures this has to separate look identical in
+    a log: "the weights match what a human signed" and "there was nothing to compare".
+
+    Two producers write this manifest and they do NOT agree on the key -- the data-prep
+    `mirror_model` agent task writes `files_sha256`, the experiment-side mirror script
+    writes `files`. Reading one name only, this check ran over ZERO files against a real
+    in-account mirror and printed "mirror verified: 0 files".
+    """
+    import hashlib
+    digests = mm.get("files_sha256") or mm.get("files") or {}
+    if not digests:
+        raise SystemExit(
+            f"FATAL: {manifest_path} names no file digests -- looked for 'files_sha256' "
+            f"and 'files', found keys {sorted(mm)}. A mirror integrity check with nothing "
+            f"to check must not pass: either the manifest comes from a producer this "
+            f"trainer does not understand, or it is empty, and both mean the weights are "
+            f"unverified.")
+    bad = []
+    for fname, want in digests.items():
+        fpath = os.path.join(local_dir, fname)
+        if not os.path.exists(fpath):
+            bad.append(f"{fname}: missing")
+            continue
+        h = hashlib.sha256()
+        with open(fpath, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+        if h.hexdigest() != want:
+            bad.append(f"{fname}: sha256 mismatch")
+    if bad:
+        raise SystemExit(f"FATAL: mirror integrity check failed: {bad} -- "
+                         "the mirrored model does not match its manifest.")
+    return len(digests)
+
+
 def newest_checkpoint(ckpt_dir):
     if not os.path.isdir(ckpt_dir):
         return None
@@ -201,24 +240,9 @@ def main():
                         "--only-show-errors"], check=True)
         manifest_path = os.path.join(local_dir, "MODEL_MANIFEST.json")
         if os.path.exists(manifest_path):
-            import hashlib as _hl
             mm = json.load(open(manifest_path))
-            bad = []
-            for fname, want in (mm.get("files_sha256") or {}).items():
-                fpath = os.path.join(local_dir, fname)
-                if not os.path.exists(fpath):
-                    bad.append(f"{fname}: missing")
-                    continue
-                h = _hl.sha256()
-                with open(fpath, "rb") as fh:
-                    for chunk in iter(lambda: fh.read(1 << 20), b""):
-                        h.update(chunk)
-                if h.hexdigest() != want:
-                    bad.append(f"{fname}: sha256 mismatch")
-            if bad:
-                raise SystemExit(f"FATAL: mirror integrity check failed: {bad} — "
-                                 "the mirrored model does not match its manifest.")
-            print(f"[model] mirror verified: {len(mm.get('files_sha256') or {})} files, "
+            n_verified = verify_mirror_manifest(local_dir, mm, manifest_path)
+            print(f"[model] mirror verified: {n_verified} files, "
                   f"{mm.get('hf_repo')}@{mm.get('revision', '')[:12]}")
         else:
             print("[model] WARNING: mirror has no MODEL_MANIFEST.json — loading "
