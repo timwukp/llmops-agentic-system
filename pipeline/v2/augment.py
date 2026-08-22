@@ -21,6 +21,21 @@ Zero-noise guarantee: correctness is NOT assumed — every candidate
 (wrapped code, transformed pairs) is executed in the sandbox
 (verify_sandbox.py) and only emitted if ALL pairs reproduce exactly.
 
+What that guarantee CANNOT see, and why the held-out gate below exists:
+the wrapper is correct by construction, so it preserves the base program's
+semantics exactly — including when the base program is the WRONG RULE. A
+solver that reproduces every shown pair and still mis-transforms an unseen
+input passes the sandbox in all 25 variants, and `rejection_rate` stays
+0.0%. Measured on real ARC (n=742, `distill_results.json`): 8.8% of
+train-verified solvers are wrong programs, rising to 14.7% for those
+repaired after being told which pair mismatched. One such solver entering
+here becomes 25 poisoned rows that look pristine. So every source row must
+carry `heldout_pairs` — pairs the solver's author never saw — the BASE code
+is gated on them before any variant is built, and each variant is re-checked
+against the same pairs pushed through the same g. Pass
+--allow-missing-heldout to augment a corpus that has none, and accept that
+the emitted rows are verified only on examples the generator was shown.
+
 Prompt discipline: the augmented prompt is produced by surgically
 replacing only the "(HxW):\n<grid>" blocks inside the ORIGINAL prompt
 text, so header/trailer/rendering are byte-identical to the source
@@ -30,14 +45,21 @@ the two header variants present in the source file.
 Usage:
     python3 augment.py --source <triplets.jsonl> [--arc-dir DIR]
                        [--limit N] [--workers K] [--n-variants 24]
+                       [--allow-missing-heldout]
 
     --source (or $V2_SOURCE_JSONL) is required: the distill output holding the
-    sandbox-verified (task_id, prompt, code) rows. --arc-dir (or
-    $V2_ARC_TRAINING_DIR) is an optional speedup only -- without it the train
-    pairs are parsed back out of the prompt text.
+    sandbox-verified (task_id, prompt, code, heldout_pairs) rows -- see
+    build_heldout_source.py, which attaches the held-out pairs and provenance.
+    --arc-dir (or $V2_ARC_TRAINING_DIR) is an optional speedup only -- without
+    it the train pairs are parsed back out of the prompt text.
 
 Output: pipeline/v2/out/augmented.jsonl
         pipeline/v2/out/augment_stats.json
+
+Exits non-zero when nothing was emitted, or when any variant passes its train
+pairs but fails its transformed held-out pairs -- that combination cannot
+happen if the wrapper algebra is right, so it is a defect in this file, not a
+property of the data, and it must not be written out as a clean corpus.
 """
 from __future__ import annotations
 
@@ -294,27 +316,59 @@ def plan_variants(task_id: str, n_variants: int) -> list[dict]:
 # Per-task worker
 # --------------------------------------------------------------------------
 
-def process_task(args: tuple[dict, int, str]) -> dict:
+def transform_pairs(pairs: list[dict], geom: str | None,
+                    perm: tuple[int, ...] | None) -> list[dict]:
+    return [{"input": transform_grid(p["input"], geom, perm),
+             "output": transform_grid(p["output"], geom, perm)}
+            for p in pairs]
+
+
+def process_task(args: tuple[dict, int, str, bool]) -> dict:
     """Generate + sandbox-verify all variants for one source triplet.
 
     arc_dir travels in the tuple rather than being read from a module global: the
     worker pool uses `spawn` on Windows, which re-imports this module in a fresh
     interpreter, so a global mutated by main() in the parent would silently revert
-    to its default in every worker."""
-    row, n_variants, arc_dir = args
+    to its default in every worker. require_heldout travels the same way and for
+    the same reason -- a gate that reverts to a default in the workers is not a
+    gate.
+
+    Held-out handling, in order:
+      1. no held-out pairs and they are required -> emit nothing, status "missing"
+      2. base code fails them                    -> emit nothing, status "gated_out"
+         (the whole task goes, not one variant: every variant shares the base rule)
+      3. a variant passes train but fails its transformed held-out pairs
+         -> "wrapper_mismatch": impossible unless transform_pairs and
+            build_wrapped_code disagree, so it is reported as a code defect and
+            the driver exits non-zero rather than emitting the row.
+    """
+    row, n_variants, arc_dir, require_heldout = args
     task_id, prompt, code = row["task_id"], row["prompt"], row["code"]
     pairs = load_train_pairs(task_id, prompt, arc_dir)
+    heldout = row.get("heldout_pairs") or []
+    repair_rounds = row.get("repair_rounds", "unknown")
 
-    emitted, rejected = [], []
+    base = {"task_id": task_id, "emitted": [], "rejected": [],
+            "heldout_mismatch": [], "heldout_status": "ok"}
+
+    if not heldout:
+        if require_heldout:
+            return {**base, "heldout_status": "missing"}
+    else:
+        hv = verify_code(code, heldout, TIMEOUT_SEC)
+        if not hv["all_pass"]:
+            return {**base, "heldout_status": "gated_out",
+                    "heldout_fail_reason": hv["fail_reason"]}
+
+    emitted, rejected, mismatch = [], [], []
 
     # variant 0: the original, re-verified (belt and braces)
     candidates = [{"geom": None, "perm": None, "tag": "orig", "sig": "orig",
-                   "prompt": prompt, "code": code, "pairs": pairs}]
+                   "prompt": prompt, "code": code, "pairs": pairs,
+                   "heldout": heldout}]
 
     for pl in plan_variants(task_id, n_variants):
-        new_pairs = [{"input": transform_grid(p["input"], pl["geom"], pl["perm"]),
-                      "output": transform_grid(p["output"], pl["geom"], pl["perm"])}
-                     for p in pairs]
+        new_pairs = transform_pairs(pairs, pl["geom"], pl["perm"])
         grids = []
         for p in new_pairs:
             grids.extend([p["input"], p["output"]])
@@ -323,37 +377,61 @@ def process_task(args: tuple[dict, int, str]) -> dict:
             "prompt": rerender_prompt(prompt, grids),
             "code": build_wrapped_code(code, pl["geom"], pl["perm"]),
             "pairs": new_pairs,
+            # The same g that moved the train pairs moves the held-out pairs, so
+            # transform'(g(test_in)) == g(base(test_in)) == g(test_out) whenever
+            # the base is right on the test input. The variant's held-out pair is
+            # therefore ground truth for the variant's prompt, which is what makes
+            # a held-out metric possible at eval time at all.
+            "heldout": transform_pairs(heldout, pl["geom"], pl["perm"]),
         })
 
     for cand in candidates:
         v = verify_code(cand["code"], cand["pairs"], TIMEOUT_SEC)
-        if v["all_pass"]:
-            emitted.append({
-                "task_id": task_id,
-                "variant": cand["tag"] if cand["tag"] == "orig" else
-                           f"{cand['tag']}#{cand['sig']}",
-                "prompt": cand["prompt"],
-                "code": cand["code"],
-                "n_train_pairs": len(cand["pairs"]),
-                "verified": True,
-            })
-        else:
+        if not v["all_pass"]:
             rejected.append({"task_id": task_id, "tag": cand["tag"],
                              "sig": cand["sig"], "reason": v["fail_reason"]})
+            continue
+        if cand["heldout"]:
+            hv = verify_code(cand["code"], cand["heldout"], TIMEOUT_SEC)
+            if not hv["all_pass"]:
+                mismatch.append({"task_id": task_id, "tag": cand["tag"],
+                                 "sig": cand["sig"], "reason": hv["fail_reason"]})
+                continue
+        emitted.append({
+            "task_id": task_id,
+            "variant": cand["tag"] if cand["tag"] == "orig" else
+                       f"{cand['tag']}#{cand['sig']}",
+            "prompt": cand["prompt"],
+            "code": cand["code"],
+            "n_train_pairs": len(cand["pairs"]),
+            "verified": True,
+            # Carried per row, not per source task: the eval scorer sees one row
+            # at a time and has no way back to the source. Dropping these here is
+            # what made the student's solve_rate a shown-examples tautology.
+            "heldout_pairs": cand["heldout"],
+            "heldout_ok": bool(cand["heldout"]),
+            "repair_rounds": repair_rounds,
+        })
 
-    return {"task_id": task_id, "emitted": emitted, "rejected": rejected}
+    return {**base, "emitted": emitted, "rejected": rejected,
+            "heldout_mismatch": mismatch}
 
 
 # --------------------------------------------------------------------------
 # Driver
 # --------------------------------------------------------------------------
 
-def main() -> None:
+def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--limit", type=int, default=None,
                     help="only process first N source rows (smoke test)")
     ap.add_argument("--workers", type=int, default=max(1, os.cpu_count() - 2))
     ap.add_argument("--n-variants", type=int, default=24)
+    ap.add_argument("--allow-missing-heldout", action="store_true",
+                    help="augment source rows that carry no `heldout_pairs`. Off by "
+                         "default: without held-out pairs `verified` means only "
+                         "'reproduces the examples the generator was shown', and a "
+                         "wrong rule is copied into every variant undetected")
     ap.add_argument("--source", default=None,
                     help=f"sandbox-verified (task_id, prompt, code) triplets as "
                          f"jsonl; required, or set ${SOURCE_ENV}")
@@ -374,8 +452,11 @@ def main() -> None:
     print(f"source rows: {len(rows)}, workers: {args.workers}, "
           f"n_variants: {args.n_variants}")
 
+    require_heldout = not args.allow_missing_heldout
+    print(f"held-out gate: {'REQUIRED' if require_heldout else 'DISABLED'}")
+
     t0 = time.time()
-    tasks = [(r, args.n_variants, arc_dir) for r in rows]
+    tasks = [(r, args.n_variants, arc_dir, require_heldout) for r in rows]
     if args.workers > 1:
         ctx = mp.get_context("fork" if sys.platform != "win32" else "spawn")
         with ctx.Pool(args.workers) as pool:
@@ -389,10 +470,17 @@ def main() -> None:
     else:
         results = [process_task(t) for t in tasks]
 
-    emitted, rejected = [], []
+    emitted, rejected, mismatch = [], [], []
+    gated_out, missing = [], []
     for res in results:
         emitted.extend(res["emitted"])
         rejected.extend(res["rejected"])
+        mismatch.extend(res.get("heldout_mismatch", []))
+        if res.get("heldout_status") == "gated_out":
+            gated_out.append({"task_id": res["task_id"],
+                              "reason": res.get("heldout_fail_reason")})
+        elif res.get("heldout_status") == "missing":
+            missing.append(res["task_id"])
     emitted.sort(key=lambda r: (r["task_id"], r["variant"]))
 
     out_path = os.path.join(OUT_DIR, "augmented.jsonl")
@@ -403,25 +491,64 @@ def main() -> None:
     per_transform = Counter(r["variant"].split("#")[0] for r in emitted)
     reject_by_tag = Counter(r["tag"] for r in rejected)
     tok = sorted((len(r["prompt"]) + len(r["code"])) // 4 for r in emitted)
+    n_source_gated = len(rows) - len(gated_out) - len(missing)
     stats = {
         "source_rows": len(rows),
         "emitted": len(emitted),
         "rejected_verify_fail": len(rejected),
         "rejection_rate": round(len(rejected) /
                                 max(1, len(emitted) + len(rejected)), 4),
+        # The three numbers that describe the held-out gate. `rejection_rate`
+        # cannot: a wrong base rule passes every shown pair in every variant, so
+        # it is invisible there by construction. Kept as separate counters rather
+        # than folded into the rejection total because they mean different things
+        # -- one is a wrong program, one is an absent measurement, one is a bug.
+        "heldout_gate": "required" if require_heldout else "disabled",
+        "heldout_gated_out_tasks": len(gated_out),
+        "heldout_missing_tasks": len(missing),
+        "heldout_wrapper_mismatch": len(mismatch),
+        "source_tasks_heldout_ok": n_source_gated,
         "per_transform_emitted": dict(sorted(per_transform.items())),
         "per_transform_rejected": dict(sorted(reject_by_tag.items())),
         "median_prompt_plus_code_tokens_est": tok[len(tok) // 2] if tok else 0,
+        # chars/4 is the generic English ratio and it is WRONG for these rows.
+        # Measured with the real Qwen3 tokenizer on ARC grid text: ~2 chars per
+        # token (~2 tokens per cell), so this estimate understates the true length
+        # by 2-2.5x. Sizing --max_length from it is how 18% of a corpus gets
+        # silently dropped by --drop_overlong.
+        "token_estimate_caveat": (
+            "median_prompt_plus_code_tokens_est is chars/4; the real Qwen3 "
+            "tokenizer yields ~2 chars/token on ARC grid text, so multiply by "
+            "2-2.5x before choosing max_length (see pipeline/v2/README.md)"),
         "elapsed_sec": round(time.time() - t0, 1),
         "reject_samples": rejected[:20],
+        "heldout_gated_out_samples": gated_out[:20],
+        "heldout_wrapper_mismatch_samples": mismatch[:20],
     }
     with open(os.path.join(OUT_DIR, "augment_stats.json"), "w") as f:
         json.dump(stats, f, indent=2)
 
     print(json.dumps({k: v for k, v in stats.items()
-                      if k != "reject_samples"}, indent=2))
+                      if not k.endswith("_samples")}, indent=2))
     print(f"wrote {out_path}")
+
+    # Stats are written first: a run that stops here must still leave behind the
+    # evidence of why. Both conditions are failures of this program rather than
+    # verdicts about the corpus, so neither may exit 0.
+    if mismatch:
+        print(f"FAIL: {len(mismatch)} variants passed their train pairs and failed "
+              f"their transformed held-out pairs. The wrapper algebra guarantees "
+              f"this cannot happen -- transform_pairs and build_wrapped_code "
+              f"disagree. Nothing was emitted for those rows; fix before training.",
+              file=sys.stderr)
+        return 1
+    if not emitted:
+        print(f"FAIL: emitted 0 rows from {len(rows)} source rows "
+              f"({len(missing)} missing held-out pairs, {len(gated_out)} gated out). "
+              f"An empty corpus must not read as a successful run.", file=sys.stderr)
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
