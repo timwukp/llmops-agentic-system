@@ -223,6 +223,38 @@ Two consequences worth stating plainly rather than discovering later:
   `per_device_batch_size` with `gradient_accumulation` raised to hold the effective
   batch size fixed.
 
+**Which is why the production value is `14336`**, both trainers' own default: this
+corpus tops out at 12,981 tokens, so it drops **0 rows** — 0 of 20,200 train and 0 of
+1,000 val, measured with the student's tokenizer before any GPU was booked — and the
+cliff above stops being a caveat that has to be remembered at read time. 12,288 would
+not do it: one task (25 rows) exceeds it.
+
+### The truncation is not difficulty-neutral, measured
+
+The tempting reading of a dropped row is "one fewer sample". Measured on the 49-triplet
+teacher pilot, it is worse than that — an 8,192-token window drops **18.4% of the rows,
+and all 9 of them were held-out-correct (9/9)**, while the 40 rows that fit were 33/40.
+Length correlates with grid size, grid size correlates with the tasks a teacher had to
+work hardest on, and cutting on length preferentially deletes the *good* answers to the
+*hard* questions. A window chosen for memory reasons silently re-weights the corpus
+toward the easy tail, and a solve rate measured after it is not the solve rate of the
+data you paid for.
+
+The same argument applies at generation time, where the length that matters is the
+**prompt**, not the code. Measured with the real Qwen3 tokenizer over the pilot:
+
+| Quantity | median | p90 | p99 | max |
+|---|---|---|---|---|
+| prompt | 4,461 | 9,082 | — | 11,143 |
+| solver code | 229 | — | 715 | 983 (wrapped) |
+
+So `--max-new-tokens` was never the binding constraint (1024 → **1536** is ample headroom
+over a p99 of 715), and the generator's input window was: it was hardcoded to `8192`
+while training used `14336`, which left-truncated about a tenth of the val rows and
+scored them as wrong programs. `--input-window` now defaults to `DEFAULT_INPUT_WINDOW`
+= 14336, and a test reads `--max_length`'s default straight out of the trainer so the two
+cannot drift apart again in silence.
+
 ## Size-generic note
 
 Nothing in the pipeline assumes grid sizes: rotations of non-square grids
@@ -264,8 +296,10 @@ Generation and scoring are separate processes on purpose:
 The split means a scoring bug never costs GPU time to re-fix, and the scorer is
 testable with no torch installed. Scoring reconstructs ground-truth pairs from
 the prompt text itself, so a generations file carries only `task_id`, `variant`,
-and `generation`. Decoding is greedy (`--temperature 0`) so the gate is a number,
-not a distribution.
+and `generation`. Decoding defaults to greedy (`--temperature 0`) so the gate is a
+number, not a distribution; `--n-samples > 1` opts into pass@k and is refused at
+temperature 0, where it would return k copies of one greedy answer and report pass@1
+over a k× denominator.
 
 **Format discipline.** Training targets are bare unfenced code, and
 `generate_student.py` renders eval prompts through the same
@@ -511,8 +545,9 @@ log rather than inferred.
   for eval)
 - `make_splits.py` — deterministic task-level split, TRL + raw formats; carries
   `heldout_pairs` through to `val_raw.jsonl` verbatim
-- `generate_student.py` — GPU-side generation (greedy; writes incrementally so
-  an interrupted run stays scorable)
+- `generate_student.py` — GPU-side generation (greedy by default; writes incrementally
+  so an interrupted run stays scorable). `--input-window` (default 14336, pinned to the
+  trainer's `--max_length`) and `--n-samples` for pass@k
 - `eval_student.py` — `score` (execute + gate) and `self-test` (oracle check)
 - `out/` — `augmented.jsonl`, `train[.raw].jsonl`, `val[.raw].jsonl`,
   `augment_stats.json`, `split_stats.json`

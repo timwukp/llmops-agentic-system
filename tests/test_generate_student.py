@@ -119,9 +119,14 @@ class _StubModel:
     def generate(self, **kw):
         self.generate_kwargs.append(kw)
         n = kw["input_ids"].shape[0]
-        # Echo the 5 prompt ids, then 3 "generated" ids 900,901,902.
-        return [_StubSeqTensor([100, 101, 102, 103, 104, 900, 901, 902])
-                for _ in range(n)]
+        k = kw.get("num_return_sequences") or 1
+        # Row-major, like the real generate: all k samples of row 0, then row 1's.
+        # A stub that returned one sequence per row regardless of k would leave the
+        # i // k index arithmetic untested -- which is exactly the mapping that,
+        # wrong, attaches one task's id to another task's generation.
+        # The first generated id varies per sample so the samples are telling apart.
+        return [_StubSeqTensor([100, 101, 102, 103, 104, 900 + s, 901, 902])
+                for _ in range(n) for s in range(k)]
 
 
 @pytest.fixture
@@ -503,6 +508,15 @@ def test_prompts_are_truncated_from_the_left_not_the_right(gs, tmp_path):
     assert gs._stub_tokenizer.truncation_side == "left"
 
 
+# The stub counts one token per character, so a prompt longer than the window
+# passed alongside it is a cut row. Written relative to the flag rather than to a
+# constant: the window moved from 8192 to 14336 once the real tokenizer was
+# measured, and a test pinning the old number would have gone green by asserting
+# that a row which now fits was still cut.
+_WINDOW = 500
+_LONG = "x" * (_WINDOW + 100)
+
+
 def test_a_row_whose_prompt_exceeded_the_window_says_so(gs, tmp_path):
     """Left truncation keeps the row scorable but still drops its oldest context.
 
@@ -510,11 +524,36 @@ def test_a_row_whose_prompt_exceeded_the_window_says_so(gs, tmp_path):
     gap rather than model ability — and the scorer cannot tell the two apart unless
     the row carries the flag.
     """
-    long_row = {"task_id": "big", "variant": "orig", "prompt": "x" * 9000}
-    got = _run(gs, tmp_path, [ROWS[0], long_row])
+    long_row = {"task_id": "big", "variant": "orig", "prompt": _LONG}
+    got = _run(gs, tmp_path, [ROWS[0], long_row],
+               "--input-window", str(_WINDOW))
     by_id = {g["task_id"]: g for g in got}
     assert by_id["big"]["prompt_truncated"] is True
     assert by_id["t0"]["prompt_truncated"] is False, "a short prompt must not be flagged"
+    assert by_id["big"]["input_window"] == _WINDOW, \
+        "the scorer's truncation caveat names this number; it must be the one used"
+
+
+def test_the_same_row_is_not_cut_by_a_window_that_fits_it(gs, tmp_path):
+    """The other half: a flag that is read but never compared against would report
+    every long row cut, and the caveat would be permanent and meaningless."""
+    got = _run(gs, tmp_path, [{"task_id": "big", "variant": "orig", "prompt": _LONG}],
+               "--input-window", str(_WINDOW + 500))
+    assert got[0]["prompt_truncated"] is False
+
+
+def test_the_default_window_matches_what_the_trainer_can_hold(gs, tmp_path):
+    """A generation window shorter than the training window scores rows on a prompt
+    the trained model would have been given in full — measured at 8192 against a
+    trainer default of 14336, roughly 10% of val rows lost context and came back
+    looking like wrong programs."""
+    import re
+    trainer = (REPO / "pipeline/training/distill/train_qlora.py").read_text()
+    m = re.search(r'"--max_length", type=int, default=(\d+)', trainer)
+    assert m, "the trainer no longer declares --max_length; the pair is unpinned"
+    assert gs.DEFAULT_INPUT_WINDOW == int(m.group(1))
+    got = _run(gs, tmp_path, ROWS[:1])
+    assert got[0]["input_window"] == gs.DEFAULT_INPUT_WINDOW
 
 
 def test_the_done_marker_reports_truncation_coverage_not_just_volume(gs, tmp_path):
@@ -523,24 +562,95 @@ def test_the_done_marker_reports_truncation_coverage_not_just_volume(gs, tmp_pat
     val = tmp_path / "v.jsonl"
     val.write_text("".join(json.dumps(r) + "\n" for r in
                             [ROWS[0], {"task_id": "big", "variant": "orig",
-                                       "prompt": "x" * 9000}]))
+                                       "prompt": _LONG}]))
     out = tmp_path / "g.jsonl"
     sys.argv = ["generate_student.py", "--model-dir", "/fake", "--val", str(val),
-                "--out", str(out)]
+                "--out", str(out), "--input-window", str(_WINDOW)]
     assert gs.main() == 0
     meta = json.loads((tmp_path / "g.jsonl.done").read_text())
     assert meta["n_prompt_truncated"] == 1 and meta["n_written"] == 2
-    assert meta["input_window"] == 8192
+    assert meta["input_window"] == _WINDOW
     assert meta["truncation_side"] == "left", "the done marker must record which end was cut"
+    assert meta["n_samples"] == 1 and meta["n_prompts"] == 2, \
+        "a lift comparison must be able to see that both runs made the same attempts"
 
 
 def test_truncation_is_counted_per_row_not_per_batch(gs, tmp_path):
     """Batched rows are padded to the batch maximum, so the encoding's width says
     nothing about any individual row — one long row must not flag its neighbours."""
-    rows = [ROWS[0], {"task_id": "big", "variant": "orig", "prompt": "x" * 9000},
+    rows = [ROWS[0], {"task_id": "big", "variant": "orig", "prompt": _LONG},
             ROWS[1]]
-    got = _run(gs, tmp_path, rows, "--batch-size", "3")   # all three in one batch
+    got = _run(gs, tmp_path, rows, "--batch-size", "3",   # all three in one batch
+               "--input-window", str(_WINDOW))
     assert [g["prompt_truncated"] for g in got] == [False, True, False]
+
+
+# ------------------------------------------------------- k attempts per task
+
+def test_greedy_multi_sampling_is_refused_rather_than_silently_duplicated():
+    """`do_sample` is `temperature > 0`, so two greedy samples are one answer twice.
+    pass@2 over them equals pass@1 while the report claims two attempts — plausible
+    numbers, and the second attempt never existed."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "gs_nostub", REPO / "pipeline/v2/generate_student.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)          # no torch needed: the guard runs first
+    with pytest.raises(SystemExit) as e:
+        mod.check_sampling(2, 0.0)
+    msg = str(e.value)
+    assert "--n-samples" in msg and "--temperature" in msg
+    assert mod.check_sampling(2, 0.7) is None
+    assert mod.check_sampling(1, 0.0) is None, "the reproducible gate must still run"
+    with pytest.raises(SystemExit):
+        mod.check_sampling(0, 0.7)
+
+
+def test_the_guard_runs_before_the_model_is_loaded(gs, tmp_path):
+    """A rejected run must cost a second, not a model load — and the check has to be
+    wired into main(), not merely defined."""
+    val = tmp_path / "v.jsonl"
+    val.write_text(json.dumps(ROWS[0]) + "\n")
+    sys.argv = ["generate_student.py", "--model-dir", "/fake", "--val", str(val),
+                "--out", str(tmp_path / "g.jsonl"), "--n-samples", "2"]
+    with pytest.raises(SystemExit):
+        gs.main()
+    assert gs._stub_model.generate_kwargs == []
+
+
+def test_each_sample_is_attributed_to_its_own_task(gs, tmp_path):
+    """`num_return_sequences=k` returns row 0's k samples first, so the row index is
+    i // k. Zipping the batch against the output directly would label row 0's second
+    sample with row 1's task_id, and every generation after the first would then be
+    scored against the wrong task's pairs — a shifted, plausible, wrong eval."""
+    got = _run(gs, tmp_path, ROWS[:3], "--n-samples", "2", "--temperature", "0.7",
+               "--batch-size", "3")
+    assert [(g["task_id"], g["sample_idx"]) for g in got] == [
+        ("t0", 0), ("t0", 1), ("t1", 0), ("t1", 1), ("t2", 0), ("t2", 1)]
+    # The stub varies the first generated id per sample, so identical text here
+    # would mean the same sequence was written twice under two labels.
+    assert got[0]["generation"] != got[1]["generation"]
+    assert gs._stub_model.generate_kwargs[-1]["num_return_sequences"] == 2
+
+
+def test_a_multi_sample_run_records_its_k(gs, tmp_path):
+    val = tmp_path / "v.jsonl"
+    val.write_text(json.dumps(ROWS[0]) + "\n")
+    out = tmp_path / "g.jsonl"
+    sys.argv = ["generate_student.py", "--model-dir", "/fake", "--val", str(val),
+                "--out", str(out), "--n-samples", "2", "--temperature", "0.7"]
+    assert gs.main() == 0
+    meta = json.loads((out.parent / "g.jsonl.done").read_text())
+    assert meta["n_samples"] == 2 and meta["n_written"] == 2 and meta["n_prompts"] == 1
+
+
+def test_the_output_ceiling_leaves_room_for_the_wrapped_targets(gs, tmp_path):
+    """Measured with the real Qwen3 tokenizer over the 849-row corpus: solver code
+    is p99 715 tokens and 983 at maximum once the augmentation wrapper is added, and
+    a base model's <think> preamble sits on top of that in a lift comparison. At
+    1024 a ceiling hit is indistinguishable from inability except via the flag."""
+    _run(gs, tmp_path, ROWS[:1])
+    assert gs._stub_model.generate_kwargs[-1]["max_new_tokens"] == 1536
 
 
 if __name__ == "__main__":
