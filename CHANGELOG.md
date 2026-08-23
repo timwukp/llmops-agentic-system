@@ -117,6 +117,38 @@ The g5 configuration is a named regression test in both directions: refused once
 tok/s is known, and shown clearing the *old* single check with 180 s to spare — because
 "the old gate was insufficient" is otherwise an assertion rather than a measurement.
 
+### The main metric's corpus, and a caveat that pointed at the wrong cause
+
+`pipeline/v2/build_eval120_val.py` renders the 120 public ARC-AGI-2 evaluation tasks into the
+same `val_raw.jsonl` shape the model was trained on, so base and fine-tuned differ in weights
+and in nothing else. `--template a|b` exists because the training corpus is itself split across
+two prompt templates — A on 677 source tasks, 79.6% of the 20,200 rows; B on 172, 20.4% — and
+which one inference should use is answerable by one extra generation pass instead of by
+assumption. (Not to be confused with the wrapped/bare split, 19,392 vs 808 rows, which is a
+different partition of the same corpus and not what this flag selects.)
+
+It also stops carrying a `/Users/…` default for the ARC evaluation files, and takes `--arc-dir`
+or `$V2_ARC_EVAL_DIR` with **no** path default — `augment.py` can fall back to a directory
+because a missing ARC dir there only costs it pair metadata it can re-parse out of the prompt,
+whereas here the files *are* the corpus and reading the wrong ones is undetectable afterwards.
+
+`tests/test_build_eval120_val.py` (19 tests, 18 mutants, none surviving) is the module's first
+external coverage. That gap is how the hardcoded path survived: the only thing in the suite that
+touched this file was the repo-wide home-directory scan, and it was caught by verifying this
+stack level alone in a worktree rather than in a working tree holding all three levels at once.
+The module's own `self_test()` is genuinely self-mutating and still cannot close the gap — it
+proves the renderer is self-consistent, not that the suite reds when it stops being, so the new
+tests replace `render_grid_block` with wrong implementations and require `self_test()` to fail.
+
+`eval_student.py` reported `n_val_rows_with_heldout` only in the branch where the held-out
+metric was **missing**, which made it useless for the comparison it exists to support:
+`n_heldout_scored` shrinks with the model's output, so a falling held-out denominator is
+indistinguishable from a smaller corpus unless the corpus-side count is reported in both
+branches. It now is. The caveat text also blamed the wrong cause — a corpus with unseen pairs
+and no extractable code was told to rebuild the corpus, when the code was the problem — and
+the test for the fix asserts the wrong advice is **absent**, not merely that the right advice
+appears beside it.
+
 ### v2 distillation: `verified` becomes a measurement instead of a tautology
 
 Both ends of the ARC pipeline scored a program against **the pairs that were in its own
