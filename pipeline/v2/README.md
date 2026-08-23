@@ -524,6 +524,45 @@ The printed device/dtype/version line is part of the point: a lift comparison wh
 halves loaded under different dtypes is not a comparison, and now that is visible in the
 log rather than inferred.
 
+### Making a generation job's output deliverable: `--max-seconds`
+
+A training job that overruns `MaxRuntimeInSeconds` keeps its checkpoints, because
+`/opt/ml/checkpoints` syncs continuously. A **generation** job has nothing to checkpoint, so
+the question is what a hard kill actually costs it. That was measured rather than assumed,
+and the measurement corrected the assumption.
+
+`arc2v2-gen-base-0823a-g5` hit `MaxRuntimeExceeded`, and SageMaker **still uploaded**
+`/opt/ml/output/data` — a 20 KB tarball holding `argv.json` and the two generations already
+flushed. So a hard kill does not destroy the rows. What it destroys is their **label**: there
+was no `.done` sidecar, which makes a 2-row partial run byte-for-byte indistinguishable from
+a 2-row run that finished, leaves `compare_done.py` with nothing to read, and loses the
+45-minute batch that was in flight without recording that it was ever attempted.
+
+That is what `--max-seconds` buys — not the artifacts, but the sidecar that says what they
+are. It is a graceful in-process budget, checked before each batch, after which the loop
+writes what it has, records `stopped_early: true` and `n_prompts_attempted`, and **returns
+0**, because a nonzero exit is the one thing that would discard the output. Two properties
+are load-bearing and both are pinned by tests:
+
+- the check runs **before** a batch and elapsed time is 0 at the first one, so the budget can
+  never produce an empty output file — worst case is a partial run, never a wasted instance;
+- an incomplete run says so on stdout (`WARNING INCOMPLETE: 2/4 prompts`) and in the sidecar,
+  because a `solve_rate` over a shrunken denominator is not comparable to a full run's and
+  nothing else in the pipeline can tell the two apart.
+
+The budget is read **between** batches and never inside one, so the worst case is
+`max_seconds + one batch's decode`. That is a property of where the check sits, not a tuning
+detail: it is why `MaxRuntimeInSeconds` still has to leave room for a whole batch, and it is
+checked by the generation preflight rather than left to the reader.
+
+The progress line prints **every batch**, with tokens, an aggregate rate and elapsed against
+the budget on one line. The previous condition — `written % 20 == 0 or written == expected` —
+printed nothing at all for a run producing fewer than 20 generations, so the g5 job decoded
+for 45 minutes behind a completely silent log and the silence read as a hung job while the
+artifact on disk showed it working. A progress line whose visibility depends on the run being
+large is missing exactly when a run is being diagnosed, and rows/s is uninterpretable when a
+row can be 50 or `max_new_tokens` long.
+
 ## Files
 
 - `augment.py` — augmentation engine (multiprocessing; `--limit` for smoke
@@ -547,7 +586,8 @@ log rather than inferred.
   `heldout_pairs` through to `val_raw.jsonl` verbatim
 - `generate_student.py` — GPU-side generation (greedy by default; writes incrementally
   so an interrupted run stays scorable). `--input-window` (default 14336, pinned to the
-  trainer's `--max_length`) and `--n-samples` for pass@k
+  trainer's `--max_length`), `--n-samples` for pass@k, and `--max-seconds` for a graceful
+  budget that keeps a partial run's artifacts (see above)
 - `eval_student.py` — `score` (execute + gate) and `self-test` (oracle check)
 - `out/` — `augmented.jsonl`, `train[.raw].jsonl`, `val[.raw].jsonl`,
   `augment_stats.json`, `split_stats.json`

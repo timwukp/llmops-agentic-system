@@ -653,5 +653,183 @@ def test_the_output_ceiling_leaves_room_for_the_wrapped_targets(gs, tmp_path):
     assert gs._stub_model.generate_kwargs[-1]["max_new_tokens"] == 1536
 
 
+# ------------------------------------------- the wall-clock budget (--max-seconds)
+#
+# A generation job has nothing to checkpoint. What a hard kill costs it was then MEASURED
+# rather than assumed, and the measurement corrected the assumption: SageMaker DID upload
+# /opt/ml/output/data after arc2v2-gen-base-0823a-g5 hit MaxRuntimeExceeded, delivering the
+# two generations already flushed. So the loss is not the rows -- it is that they arrive
+# UNLABELLED. There was no .done sidecar, which means a 2-row partial run is byte-for-byte
+# indistinguishable from a 2-row run that finished, compare_done.py has nothing to read, and
+# the batch in flight (45 minutes of decode) is gone with no record that it was attempted.
+# That is what --max-seconds buys: not the artifacts, but the sidecar that says what they
+# are. The .done's ABSENCE is also the proof that the graceful path never ran on that job.
+#
+# THE CLOCK IS INJECTED AND ADVANCED BY THE DECODE. A test that slept for real would be
+# measuring this machine under suite load, and would have to assert a range; here each
+# generate() call advances a fake clock by a fixed amount, so every count below is exact
+# and a rate-of-machine change cannot turn a pass into a flake.
+
+def _clocked(gs, seconds_per_batch):
+    """Make time.time() advance by `seconds_per_batch` on every generate() call."""
+    state = {"now": 1_000_000.0}
+    gs.time = types.SimpleNamespace(time=lambda: state["now"])
+    real = gs._stub_model.generate
+
+    def generate(**kw):
+        state["now"] += seconds_per_batch
+        return real(**kw)
+
+    gs._stub_model.generate = generate
+    return state
+
+
+def _done(tmp_path):
+    return json.loads((tmp_path / "gen.jsonl.done").read_text())
+
+
+def test_without_a_budget_every_prompt_is_attempted(gs, tmp_path):
+    """Default 0 = unbounded. The budget is opt-in: a default cap would silently
+    truncate every existing caller's run and report the short result as a score."""
+    _clocked(gs, 10)
+    got = _run(gs, tmp_path, ROWS, "--batch-size", "1")
+    assert len(got) == 4
+    d = _done(tmp_path)
+    assert d["stopped_early"] is False
+    assert d["n_prompts_attempted"] == 4 and d["n_prompts"] == 4
+    assert d["max_seconds"] is None
+
+
+def test_the_budget_stops_between_batches_and_keeps_what_was_produced(gs, tmp_path):
+    """25 s of budget against 10 s batches: three start (at 0, 10, 20) and the fourth
+    does not. The point is the EXIT CODE and the file -- a job that dies at the hard
+    kill returns nothing, and this one returns three fully-scorable rows."""
+    _clocked(gs, 10)
+    got = _run(gs, tmp_path, ROWS, "--batch-size", "1", "--max-seconds", "25")
+    assert len(got) == 3
+    assert [g["task_id"] for g in got] == ["t0", "t1", "t2"]
+    d = _done(tmp_path)
+    assert d["stopped_early"] is True
+    assert d["n_prompts_attempted"] == 3
+    # n_prompts stays the FULL workload. Both numbers are needed: a reader with only
+    # the attempted count cannot tell a complete run from a truncated one.
+    assert d["n_prompts"] == 4
+    assert d["max_seconds"] == 25
+
+
+def test_the_budget_boundary_is_inclusive(gs, tmp_path):
+    """Budget exactly equal to one batch's cost stops after that batch. `>` instead of
+    `>=` here doubles the work done past the budget, and the difference only ever shows
+    up on a boundary -- 20 s of batches against a 20 s budget would run two, not one."""
+    _clocked(gs, 10)
+    got = _run(gs, tmp_path, ROWS, "--batch-size", "1", "--max-seconds", "10")
+    assert len(got) == 1
+    assert _done(tmp_path)["n_prompts_attempted"] == 1
+
+
+def test_a_budget_smaller_than_one_batch_still_produces_one(gs, tmp_path):
+    """The check runs BEFORE the batch and elapsed is 0 at the first one, so a budget
+    can never yield an empty output file. That is the property that makes the flag safe
+    to set aggressively: the worst case is a partial run, never a wasted instance."""
+    _clocked(gs, 600)
+    got = _run(gs, tmp_path, ROWS, "--batch-size", "1", "--max-seconds", "1")
+    assert len(got) == 1
+    assert _done(tmp_path)["stopped_early"] is True
+
+
+def test_stopping_early_is_a_success_and_the_sidecar_is_still_written(gs, tmp_path):
+    """rc 0 is the whole mechanism: SageMaker uploads /opt/ml/output/data on a normal
+    container exit, so a nonzero return here would throw away the generations the flag
+    was added to save."""
+    _clocked(gs, 10)
+    val = tmp_path / "val.jsonl"
+    val.write_text("".join(json.dumps(r) + "\n" for r in ROWS))
+    out = tmp_path / "gen.jsonl"
+    sys.argv = ["generate_student.py", "--model-dir", "/fake", "--val", str(val),
+                "--out", str(out), "--batch-size", "1", "--max-seconds", "15"]
+    assert gs.main() == 0
+    assert (tmp_path / "gen.jsonl.done").exists()
+    # Still valid JSONL, line by line -- a partial write would make the scorer's own
+    # json.loads the place this defect surfaced.
+    lines = [ln for ln in out.read_text().splitlines() if ln.strip()]
+    assert lines and all(json.loads(ln)["task_id"] for ln in lines)
+
+
+def test_an_incomplete_run_says_its_rate_is_not_comparable(gs, tmp_path, capsys):
+    """A partial run's solve_rate has a different denominator than a full one's, and
+    the two are the same field name. The warning is the only thing standing between
+    that and a reported regression that is really a clock."""
+    _clocked(gs, 10)
+    _run(gs, tmp_path, ROWS, "--batch-size", "1", "--max-seconds", "15")
+    out = capsys.readouterr().out
+    assert "INCOMPLETE" in out
+    assert "2/4" in out
+
+
+def test_a_run_that_fits_is_not_labelled_incomplete(gs, tmp_path, capsys):
+    """The other half. A warning that fires on every run carries no information, and
+    checking only the firing direction would pass for one that always fires."""
+    _clocked(gs, 10)
+    _run(gs, tmp_path, ROWS, "--batch-size", "1", "--max-seconds", "10000")
+    assert "INCOMPLETE" not in capsys.readouterr().out
+    assert _done(tmp_path)["stopped_early"] is False
+
+
+# ------------------------------------------------------- the progress line is visible
+#
+# MEASURED DEFECT. The condition was `written % 20 == 0 or written == expected`, so a run
+# producing fewer than 20 generations printed nothing until it was over.
+# arc2v2-gen-base-0823a-g5 (4 prompts, batch 2) therefore decoded for 45 minutes with a
+# completely silent log, and the silence was read as a hung job -- while the artifact on
+# disk showed it had been working the whole time. A progress line whose visibility depends
+# on the run being large is missing exactly when a run is being diagnosed.
+
+def test_a_run_too_small_for_the_old_modulus_still_reports_progress(gs, tmp_path, capsys):
+    """Four generations, which `written % 20` can only reach at 0. One line per batch."""
+    _clocked(gs, 10)
+    _run(gs, tmp_path, ROWS, "--batch-size", "1")
+    lines = [l for l in capsys.readouterr().out.splitlines() if "generations," in l]
+    assert len(lines) == 4, \
+        f"expected one progress line per batch, got {len(lines)}: {lines}"
+    assert "1/4 generations," in lines[0] and "4/4 generations," in lines[-1]
+
+
+def test_the_progress_line_reports_tokens_and_a_rate_not_only_rows(gs, tmp_path, capsys):
+    """Rows/s is uninterpretable when a row can be 50 or max_new_tokens long: the g5 job's
+    two rows were 16,384 tokens each, and "2 rows in 45 min" hides that entirely. The
+    token count is what sizes the next run's max_new_tokens and MaxRuntime."""
+    _clocked(gs, 10)
+    _run(gs, tmp_path, ROWS[:1], "--batch-size", "1")
+    line = [l for l in capsys.readouterr().out.splitlines() if "generations," in l][-1]
+    n_new = json.loads(
+        (tmp_path / "gen.jsonl").read_text().splitlines()[0])["n_new_tokens"]
+    assert f"{n_new} new tokens" in line, \
+        f"the progress line does not carry the measured token count: {line!r}"
+    # The count and the rate are TWO claims. Asserting the count and the literal
+    # "tok/s" leaves `written / elapsed` -- rows per second wearing a tokens-per-second
+    # label -- indistinguishable, and that mutant survived until this line existed.
+    # The clock advances 10s per batch, so the rate is fully determined.
+    assert f"at {n_new / 10:.1f} tok/s" in line, \
+        f"the rate is not {n_new} tokens over 10s: {line!r}"
+    assert "10s elapsed" in line
+
+
+def test_the_progress_line_names_the_budget_it_is_racing(gs, tmp_path, capsys):
+    """Elapsed alone does not answer "will this finish". Both terms on one line, because
+    the operator reading a live log cannot join them from two places."""
+    _clocked(gs, 10)
+    _run(gs, tmp_path, ROWS, "--batch-size", "1", "--max-seconds", "10000")
+    line = [l for l in capsys.readouterr().out.splitlines() if "generations," in l][0]
+    assert "10s elapsed/10000s budget" in line, line
+
+
+def test_without_a_budget_the_progress_line_claims_none(gs, tmp_path, capsys):
+    """The other half: printing a budget of 0 would read as "0 seconds remaining"."""
+    _clocked(gs, 10)
+    _run(gs, tmp_path, ROWS[:1], "--batch-size", "1")
+    line = [l for l in capsys.readouterr().out.splitlines() if "generations," in l][0]
+    assert "budget" not in line, line
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))

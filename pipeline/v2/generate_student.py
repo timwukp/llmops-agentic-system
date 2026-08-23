@@ -28,6 +28,7 @@ Writes incrementally, so an interrupted run still yields a scorable partial file
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import time
 from pathlib import Path
@@ -213,6 +214,19 @@ def main() -> int:
     ap.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto",
                     help="cpu is for dry-running this script's code path only; "
                          "the numbers from a CPU run are not an eval")
+    # The generation-side equivalent of train_qlora.py's --max_train_seconds, and
+    # for the same reason: run v2-code-distill-0001-e1g6 was hard-killed at
+    # MaxRuntimeInSeconds and produced ZERO artifacts. A generation job is exposed
+    # to that identically -- /opt/ml/output/data is uploaded when the container
+    # EXITS, so a job that is still decoding when the clock runs out can lose every
+    # generation it already produced. With a graceful budget the loop stops between
+    # batches, writes the .done sidecar, and exits 0, which makes the upload a
+    # consequence of the script rather than an assumption about how SageMaker
+    # handles a timeout.
+    ap.add_argument("--max-seconds", type=int, default=0,
+                    help="0 = no budget. Otherwise stop starting new batches once "
+                         "this many seconds of decoding have elapsed, write what "
+                         "was produced, and record stopped_early in the .done")
     args = ap.parse_args()
 
     # Before torch is even imported: an impossible sampling request should cost a
@@ -268,10 +282,27 @@ def main() -> int:
     print(f"[gen] stop ids {sorted(stop_ids)}, pad {tokenizer.pad_token_id}", flush=True)
 
     started = time.time()
-    written = n_truncated = n_prompt_truncated = 0
+    written = n_truncated = n_prompt_truncated = sum_new_tokens = 0
+    n_rows_attempted = 0
+    stopped_early = False
     with open(args.out, "w") as fh:
         for start in range(0, len(rows), args.batch_size):
+            # Checked BEFORE the batch, not after: a budget enforced after the work
+            # cannot prevent the overrun it exists to prevent. The cost of this
+            # placement is that the last batch can overshoot by one batch's decode
+            # time, which is why the launcher's preflight requires headroom between
+            # --max-seconds and MaxRuntimeInSeconds rather than treating the budget
+            # as exact.
+            if args.max_seconds and time.time() - started >= args.max_seconds:
+                stopped_early = True
+                print(f"[gen] STOPPING at {time.time() - started:.0f}s "
+                      f"(--max-seconds {args.max_seconds}) with {start}/{len(rows)} "
+                      f"prompts attempted; writing what was produced so the "
+                      f"container exits normally and the output is uploaded",
+                      flush=True)
+                break
             batch = rows[start:start + args.batch_size]
+            n_rows_attempted += len(batch)
             texts = [build_prompt(tokenizer, r["prompt"], args.thinking) for r in batch]
             # Measure input truncation BEFORE it happens, per row. Left-truncation
             # keeps the prompt scorable but still drops the oldest context, so a row
@@ -318,6 +349,7 @@ def main() -> int:
                 n_new, truncated = trim_new_tokens(
                     new_ids, stop_ids, tokenizer.pad_token_id, args.max_new_tokens)
                 n_truncated += truncated
+                sum_new_tokens += n_new
                 fh.write(json.dumps({"task_id": row["task_id"],
                                      "variant": row.get("variant", ""),
                                      "generation": completion,
@@ -334,14 +366,33 @@ def main() -> int:
                 written += 1
             fh.flush()                        # partial file stays scorable
 
+            # Every batch, unconditionally. The previous condition was
+            # `written % 20 == 0 or written == expected`, which for any run producing
+            # fewer than 20 generations printed NOTHING until the very end -- so
+            # arc2v2-gen-base-0823a-g5 (4 prompts) decoded for 45 minutes and emitted no
+            # progress line at all, and the frozen log was read as a hung job when the
+            # job was working. A progress line whose visibility depends on the run being
+            # large is absent exactly when the operator most needs it.
+            #
+            # Tokens, not just rows, because rows/s is uninterpretable when a row can be
+            # anywhere from 50 to max_new_tokens long; and elapsed against the budget,
+            # because the actionable question mid-run is "will this finish", which needs
+            # both terms on the same line.
             expected = len(rows) * args.n_samples
-            if written % 20 == 0 or written == expected:
-                rate = written / max(time.time() - started, 1e-9)
-                print(f"[gen] {written}/{expected} generations ({rate:.2f}/s)",
-                      flush=True)
+            elapsed = time.time() - started
+            tok_s = sum_new_tokens / max(elapsed, 1e-9)
+            budget = f"/{args.max_seconds}s budget" if args.max_seconds else ""
+            print(f"[gen] {written}/{expected} generations, {sum_new_tokens} new tokens "
+                  f"at {tok_s:.1f} tok/s, {elapsed:.0f}s elapsed{budget}", flush=True)
 
     print(f"[gen] wrote {written} generations to {args.out} "
           f"in {(time.time() - started) / 60:.1f} min", flush=True)
+    if stopped_early:
+        print(f"[gen] WARNING INCOMPLETE: {n_rows_attempted}/{len(rows)} prompts "
+              f"attempted before the {args.max_seconds}s budget. Any solve_rate from "
+              f"this file is over a subset, and it must NOT be compared against a "
+              f"run with a different n_prompts_attempted -- the gap would be the "
+              f"clock, not the model", flush=True)
     if n_truncated:
         print(f"[gen] WARNING {n_truncated}/{written} hit the "
               f"{args.max_new_tokens}-token ceiling; their format failures are a "
@@ -370,6 +421,34 @@ def main() -> int:
         # base run and a fine-tuned one: k attempts against 1 is a different
         # measurement, and so is a different window.
         "n_samples": args.n_samples, "n_prompts": len(rows),
+        # n_prompts is what was ASKED; n_prompts_attempted is what was reached. They
+        # differ only when the wall-clock budget fired, and the difference has to be
+        # a field rather than a log line: a partial run scores as a lower solve_rate
+        # on the SAME denominator, so a base run that finished compared against a
+        # fine-tuned run that was cut off reads as a regression caused by the clock.
+        "n_prompts_attempted": n_rows_attempted,
+        "max_seconds": args.max_seconds or None,
+        "stopped_early": stopped_early,
+        # WHICH QUESTIONS WERE ASKED. Everything above describes how the model was
+        # decoded; none of it describes what it was decoded on, so two runs could
+        # match field-for-field and still have been given different prompts. The
+        # eval120 corpus makes that concrete: it can be built from either of two
+        # prompt templates that the distillation corpus mixes 79.6%/20.4%, and
+        # `--template b` adds "Output ONLY the function" where `a` says nothing
+        # about format. A base-vs-fine-tuned comparison across that difference
+        # measures the template.
+        #
+        # The digest is over the prompt strings ACTUALLY used, in order, so it is
+        # derived rather than declared: it moves if the val file, the template, the
+        # row order or --limit moves. A recorded template name would not -- it
+        # would agree with itself while the file underneath changed.
+        "val": args.val,
+        "val_prompt_sha256": hashlib.sha256(
+            "\0".join(r["prompt"] for r in rows).encode()).hexdigest(),
+        # Present when the corpus labels itself (build_eval120_val.py does).
+        # A list, not a scalar: a corpus that mixed templates would show both here
+        # instead of silently reporting the first one.
+        "val_templates": sorted({r["template"] for r in rows if "template" in r}) or None,
     }, indent=2))
     return 0
 
