@@ -563,6 +563,74 @@ artifact on disk showed it working. A progress line whose visibility depends on 
 large is missing exactly when a run is being diagnosed, and rows/s is uninterpretable when a
 row can be 50 or `max_new_tokens` long.
 
+`validate_gen_config.py` is the preflight that checks that arithmetic. It exists separately
+from `validate_job_config.py` because every quantity that one multiplies — `save_steps`,
+`epochs`, `gradient_accumulation`, rows × epochs ÷ effective batch — is **absent** from a
+generation payload; pointed at one it emits four FAILs that are correct for a trainer and
+meaningless for a decoder, and the only way to launch would be to override it. A gate whose
+verdict is routinely overridden has stopped being a gate.
+
+Its two headroom checks are separate claims, and the second one was **added after a live job
+exposed the first as insufficient**:
+
+| Check | FAILs when |
+|---|---|
+| the budget clears the hard kill | `startup + max_seconds + upload ≥ MaxRuntimeInSeconds` — a budget that expires after the kill it exists to avoid buys nothing |
+| the **final batch** clears it too | `startup + max_seconds + one batch + upload ≥ MaxRuntimeInSeconds`, where one batch is `min(batch_size × n_samples, generations) × max_new_tokens ÷ tok/s` |
+
+The `× n_samples` is load-bearing. `batch_size` counts **prompts**, but `generate` is asked for
+`n_samples` sequences per prompt, so a batch decodes `batch_size × n_samples` sequences
+concurrently. Sizing the overshoot per prompt understates it by exactly `n_samples`, and
+understating an overshoot is the direction that lets a job launch. The same correction applies
+to the required-rate line below. It is called out here because the first version of this file
+had it wrong in both places and **42 tests did not notice**: every one of them used the
+`n_samples = 1` default, where the two expressions are numerically equal, so the defect was
+reachable only through a pass@k config. `generations` on the line above had always included
+`n_samples`, so the two halves of one file disagreed about what a batch is.
+
+The second matters because the budget cannot interrupt a batch, and the numbers come from a
+job that lost to exactly this. `arc2v2-gen-base-0823a-g5` (base Qwen3-4B-Thinking-2507,
+`ml.g5.2xlarge`, `--batch-size 2 --max-new-tokens 16384 --max-seconds 2700`, hard kill 3600)
+decoded 2 × 16,384 tokens in **2,686 s — 12.2 tok/s aggregate** — with both sequences hitting
+the ceiling and neither emitting EOS. The budget check before batch 2 therefore saw 2,686 s
+against 2,700: **it missed by fourteen seconds**, and the run committed to a second batch
+needing another 2,686 s with 671 s of wall clock left. It died at `MaxRuntimeExceeded` with no
+`.done`. Two independent readings agree on the cause — the timestamp arithmetic, and the
+sidecar's absence, which is itself proof the `break` never ran.
+
+It passed the old gate with 180 s of slack, because that gate warned on slack *thinness* — a
+quantity that says nothing about how long a batch takes. With `--tok-per-s 12.2` the new check
+computes `600 + 2700 + 2686 + 120 = 6106 s` against a 3600 s kill and refuses it outright.
+
+Be precise about what that does and does not buy: the g5 job had **no** measured rate, and a
+first job on a new model cannot have one, so the gate would have **warned**, not blocked. What
+it does without a rate is refuse to leave the overshoot as the word "UNKNOWN" — it states the
+rate the configuration *assumes*. Here the final batch had 180 s of slack for 32,768 tokens,
+so the launch silently required **≥ 182 tok/s**; the A10G delivered 12.2. A 15× gap is visible
+before any measurement of this model exists, and that is the number the gate now prints.
+
+Do not carry a rate between configurations, including between two runs on the *same* GPU.
+Measured on one L40S: Phase 1 read **562 tok/s** at a ~9k context, and
+`arc2v2-gen-base-0823rate-g6e8` read **39.1 tok/s** at batch 8 with a 16,384-token window and a
+4,096-token cap (32,768 tokens in 838 s) — a **14.4× spread on identical silicon**, because the
+KV cache is ~147 KB/token and per-token attention cost grows with context. Rate is a property
+of `(instance, window, max_new_tokens, batch)` jointly, so it has to be re-read off the `[gen]`
+progress line for each new shape rather than inherited from the last run.
+
+`run_eval_gen.py` is the SageMaker entry point. Every step it takes is "find the thing in the
+directory", and every way of getting that wrong produces a complete, plausible report against
+the wrong weights — the base model and the fine-tuned merge have identical architecture,
+tokenizer and file names. So each resolution step proves what it found or exits non-zero:
+ambiguity is an error rather than a preference order (two loadable models is a FAIL, not
+"prefer the one called `merged`"), `config.json` without weight shards is not a model, a
+missing channel does **not** fall back to the HF hub, and an unknown hyperparameter is fatal
+rather than silently dropped to a default. `tests/test_gen_job_preflight.py`
+(44 tests) drives all of it off fake channel trees on disk; all 44 mutants of the two
+modules' guards are killed by a named test — including the per-prompt overshoot formula
+above, whose two call sites are reverted together and are caught by two tests built so the
+per-prompt and per-sequence readings disagree on the **verdict**, not merely on a printed
+number.
+
 ## Files
 
 - `augment.py` — augmentation engine (multiprocessing; `--limit` for smoke
@@ -588,6 +656,10 @@ row can be 50 or `max_new_tokens` long.
   so an interrupted run stays scorable). `--input-window` (default 14336, pinned to the
   trainer's `--max_length`), `--n-samples` for pass@k, and `--max-seconds` for a graceful
   budget that keeps a partial run's artifacts (see above)
+- `validate_gen_config.py` — preflight for a **generation** payload: both headroom checks,
+  the k-greedy refusal, and the input-window floor at the measured 14,513-token maximum
+- `run_eval_gen.py` — SageMaker entry point: resolve the model channel (or merge a LoRA
+  checkpoint into the base first), record `argv.json` **before** the run, exec the generator
 - `eval_student.py` — `score` (execute + gate) and `self-test` (oracle check)
 - `out/` — `augmented.jsonl`, `train[.raw].jsonl`, `val[.raw].jsonl`,
   `augment_stats.json`, `split_stats.json`

@@ -107,7 +107,7 @@ ALLOWED = (b"6833" + b"13688378", b"7631" + b"04351884", b"1234" + b"56789012")
 #: this laptop, single-threaded CPython does 3.1M sha256/s, so the whole 1e12 space falls in
 #: about 4 days -- and a GPU does it in roughly 100 seconds. So the KDF is iterated. At 200k
 #: iterations a candidate costs ~16 ms, which makes the same sweep ~500 GPU-years, while the
-#: scan stays cheap because only 12-digit runs are ever hashed: measured across all 195
+#: scan stays cheap because only 12-digit runs are ever hashed: measured across all 199
 #: tracked files there are 74 such runs, 10 distinct, and hashing the distinct set takes 0.16 s
 #: for the entire repo. (Re-measured whenever either number moves, and they move
 #: INDEPENDENTLY, which is why both are derived and neither is inferred from the other, and
@@ -152,10 +152,18 @@ ALLOWED = (b"6833" + b"13688378", b"7631" + b"04351884", b"1234" + b"56789012")
 #: bounds -- while the runs held at 74 and the distinct set at 10. Then 193 files went to 194,
 #: the split's first test module, carrying medians and a permutation p-value and again no ids,
 #: with the runs still at 74: a tenth consecutive commit moving the file count alone.
-#: Then 194 files became 195, the preflight-measurement module, whose numbers are seconds per
+#: Then 194 files grew to 195, the preflight-measurement module, whose numbers are seconds per
 #: optimizer step, GiB reserved and step counts -- and, for the first time in this streak, a
 #: FAKE torch reporting 8 GiB allocated against 21 GiB reserved, none of them 12 digits long --
 #: with the runs still at 74: an eleventh consecutive commit moving the file count alone.
+#: Then 195 files became 199, the widest single move in this streak: the generation job's
+#: preflight, its SageMaker entry point, that entry point's requirements.txt and the
+#: preflight's test module. FOUR at once and the run count still held at 74, because the
+#: account id in this path is never written down -- the launcher reads it from STS and
+#: redacts it out of every artifact it saves -- so the numbers these files carry are
+#: seconds, token counts and GiB. A twelfth consecutive move of the file count alone, and
+#: the first one wide enough that "the streak is an artefact of one-file commits" stops
+#: being an available explanation.
 #: (The "became" phrasing is the one the guard reads, so it names the LATEST movement -- the
 #: earlier ones are history and keep their own past tense.)
 #: For EIGHT commits

@@ -1,0 +1,17 @@
+# Installed inside the SageMaker job that runs run_eval_gen.py (the DLC base image
+# provides torch). Deliberately SHORTER than the trainer's list: generation needs
+# neither trl, datasets, bitsandbytes nor liger-kernel, and every package dropped is
+# startup time that would otherwise be charged against the wall-clock budget.
+#
+# FLOORS ONLY, no pins, matching the trainer's convention.
+#   transformers>=4.52  — Qwen3 support, and the version family the merged artifact
+#                         was saved by; below 4.51 the architecture is unknown
+#   accelerate>=1.6     — device_map / dtype plumbing used by from_pretrained
+#   peft>=0.15          — ONLY reached by the adapter channel, which merges a
+#                         checkpoint-N LoRA onto the base weights. Listed anyway
+#                         rather than installed conditionally: an ImportError three
+#                         minutes into a paid job, after the 6 GiB download, is a
+#                         worse trade than ~20 s of pip on the runs that skip it.
+transformers>=4.52
+accelerate>=1.6
+peft>=0.15
