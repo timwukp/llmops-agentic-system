@@ -5,6 +5,53 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
 ## [Unreleased]
 
+### A generation job's output is now deliverable: `generate_student.py --max-seconds`
+
+A trainer that overruns `MaxRuntimeInSeconds` keeps its checkpoints; `/opt/ml/checkpoints`
+syncs continuously. A **generation** job has nothing to checkpoint, so what a hard kill costs
+it was measured rather than assumed — and the measurement corrected the assumption this work
+started from.
+
+`arc2v2-gen-base-0823a-g5` hit `MaxRuntimeExceeded`, and SageMaker uploaded
+`/opt/ml/output/data` anyway: a 20 KB tarball with `argv.json` and the two generations already
+flushed to disk. The rows survive a hard kill. What does not survive is any statement about
+what they are — there was no `.done` sidecar, so a 2-row partial run is byte-for-byte
+indistinguishable from a 2-row run that finished, `compare_done.py` has nothing to read, and
+the batch in flight (45 minutes of decode) is gone with no record it was attempted.
+
+So `--max-seconds` buys the label, not the artifacts, and that is the more useful framing:
+an unlabelled partial result is worse than a missing one, because it is comparable-looking.
+It is a graceful in-process budget, checked before each batch, after which the loop writes
+what it produced, records `stopped_early` and `n_prompts_attempted` in the `.done`, and
+**returns 0** — a nonzero exit is the one thing that would discard the output. Two properties
+are load-bearing and both are pinned. The check runs *before* a batch and elapsed is 0 at the
+first one, so the budget can never yield an empty output file: worst case is a partial run,
+never a wasted instance. And an incomplete run says so, on stdout and in the sidecar, because
+a `solve_rate` over a shrunken denominator is not comparable to a full run's and nothing
+downstream can tell them apart.
+
+The budget tests inject the clock rather than sleeping — advancing a fake `time.time()` inside
+the stubbed `generate()` makes every count exact instead of asserting a range against whatever
+the machine was doing under suite load. The inclusive boundary has its own test: with `>`
+instead of `>=` a budget equal to one batch's cost runs two batches, double the work the flag
+was given.
+
+### The progress line no longer hides a 45-minute batch
+
+The condition was `written % 20 == 0 or written == expected`, so a run producing fewer than 20
+generations printed **nothing** until it was over. The g5 job (4 prompts, batch 2) therefore
+decoded for 45 minutes behind a silent log — and the silence was read as a hung job, while the
+artifact on disk showed it had been working the whole time. A progress line whose visibility
+depends on the run being large is absent exactly when a run is being diagnosed.
+
+It now prints every batch, and carries tokens rather than only rows: rows/s is uninterpretable
+when a row can be 50 or `max_new_tokens` long, and the g5 job's two rows were 16,384 tokens
+each — "2 rows in 45 min" hides the number that sizes the next run. Elapsed and the budget go
+on the same line, because the actionable mid-run question is "will this finish", which needs
+both terms and cannot be joined from two places in a live log. Four tests, and the mutant that
+computes the rate from rows while still printing `tok/s` is one of them: the token count and
+the rate are two claims, and asserting the count alone let that mutant live.
+
 ### v2 distillation: `verified` becomes a measurement instead of a tautology
 
 Both ends of the ARC pipeline scored a program against **the pairs that were in its own
