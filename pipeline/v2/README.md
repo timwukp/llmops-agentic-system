@@ -328,7 +328,7 @@ the held-out path never executed a pair at all.
 
 An oracle pass only proves the scorer does not *reject* correct code — not that it
 *discriminates*. The adversarial direction lives in `tests/test_eval_student.py`
-(59 tests): a wrong answer, a partially-correct answer, a hardcoded output that
+(62 tests): a wrong answer, a partially-correct answer, a hardcoded output that
 memorizes pair 1, crashing code, code that does not compile, an infinite loop, a
 filesystem-escape attempt, a generation for an unknown task, and a sibling
 *variant* of the right task must all score 0 — that last one matters because
@@ -631,6 +631,30 @@ above, whose two call sites are reverted together and are caught by two tests bu
 per-prompt and per-sequence readings disagree on the **verdict**, not merely on a printed
 number.
 
+`build_eval120_val.py` builds the main metric's corpus, and `tests/test_build_eval120_val.py`
+(19 tests) is the first external coverage it has had. Until now the only thing in the suite
+that touched it was the repo-wide hardcoded-home-directory scan — which is exactly how a
+`/Users/…` default sat in its `main()` unnoticed, and how it was eventually caught: not in the
+working tree, where all three levels of this stack sit together, but by materialising this level
+alone in a worktree and running its own gates. A 400-line module whose output *is* the number
+the experiment reports had no test of its own.
+
+The module's internal `self_test()` cannot supply that coverage. It is genuinely
+self-mutating — every accepts-check is paired with a rejects-check, so a renderer returning
+prompts from a lookup table would fail it — but it proves the renderer is self-consistent, not
+that the suite goes red when it stops being. The external half replaces `render_grid_block`
+with three wrong implementations and demands that `self_test()` report failures; a
+`self_test` that always passed would otherwise be indistinguishable from one that works.
+
+The two ways this file can produce a plausible wrong answer are the two it is tested against.
+The corpus can be built from the **wrong ARC files** — it reads the held-out evaluation set, so
+a path default that happens to resolve on one machine makes "which 120 tasks did we measure"
+unanswerable after the fact, and there is deliberately no default now. Or an eval row can carry
+a **training row's provenance**: `verified`, `heldout_ok` and `repair_rounds` describe a
+distilled solver, and there is no solver on an eval row, so they must be absent rather than
+`false` — absent means not applicable, `false` means checked and failed, and the scorer reads
+them. All 18 mutants of the builder's guards are killed by a named test.
+
 ## Files
 
 - `augment.py` — augmentation engine (multiprocessing; `--limit` for smoke
@@ -656,6 +680,13 @@ number.
   so an interrupted run stays scorable). `--input-window` (default 14336, pinned to the
   trainer's `--max_length`), `--n-samples` for pass@k, and `--max-seconds` for a graceful
   budget that keeps a partial run's artifacts (see above)
+- `build_eval120_val.py` — renders the 120 public ARC-AGI-2 evaluation tasks into the same
+  `val_raw.jsonl` shape the trained model was fed, so the main metric's prompts differ from
+  training only in their content. `--template a|b` exists because the corpus itself is split
+  across two prompt templates — A on 677 source tasks (79.6% of the 20,200 training rows), B on
+  172 (20.4%) — and one extra generation pass decides which one inference should use by
+  measurement rather than by assumption. Reads the held-out ARC files from `--arc-dir` or
+  `$V2_ARC_EVAL_DIR`, with no path default
 - `validate_gen_config.py` — preflight for a **generation** payload: both headroom checks,
   the k-greedy refusal, and the input-window floor at the measured 14,513-token maximum
 - `run_eval_gen.py` — SageMaker entry point: resolve the model channel (or merge a LoRA

@@ -130,6 +130,13 @@ def score_generations(generations: list[dict], val_rows: list[dict],
                       timeout_sec: int = 5) -> dict:
     """Execute every generation against its task's pairs; exact match only."""
     by_key = {(r["task_id"], r.get("variant", "")): r for r in val_rows}
+    # How many val rows COULD have been scored on unseen pairs, counted from the
+    # corpus and not from the loop below. `n_heldout_avail` only counts rows that
+    # got as far as having runnable code, so on its own it cannot tell "the corpus
+    # has no held-out pairs" from "the corpus has them and the model emitted no
+    # extractable program" -- two states with opposite fixes. Measured here so the
+    # caveat can name the actual cause instead of guessing one.
+    n_val_rows_with_heldout = sum(1 for r in val_rows if r.get("heldout_pairs"))
     results, n_solved, n_parsed, n_truncated = [], 0, 0, 0
     # Held-out counters. Kept over their OWN denominator -- rows that actually
     # carry unseen pairs -- and the shown-pair rate is recomputed over that same
@@ -263,6 +270,12 @@ def score_generations(generations: list[dict], val_rows: list[dict],
     # absent-with-a-caveat otherwise, so a reader can never mistake a run that
     # could not measure the rule for one that measured it at 0.
     report["n_heldout_scored"] = n_heldout_avail
+    # Reported in BOTH branches. `n_heldout_scored` shrinks with the model's output,
+    # so on its own a falling held-out denominator is indistinguishable from a
+    # smaller corpus; this is the number that stayed put. Two runs being compared
+    # must agree on it, and that cannot be checked if it is only present when the
+    # metric is missing.
+    report["n_val_rows_with_heldout"] = n_val_rows_with_heldout
     if n_heldout_avail:
         report["n_heldout_solved"] = n_heldout_solved
         report["heldout_solve_rate"] = n_heldout_solved / n_heldout_avail
@@ -280,13 +293,30 @@ def score_generations(generations: list[dict], val_rows: list[dict],
             f"programs that reproduce every shown example and encode the wrong "
             f"rule. Compare runs on heldout_solve_rate")
     else:
-        report["heldout_caveat"] = (
-            "no val row carried heldout_pairs, so solve_rate is measured against "
-            "the pairs each prompt already showed the model -- it says the student "
-            "writes runnable programs, NOT that it found the rule. On real ARC "
-            "roughly 1 in 11 shown-pair-verified solvers is a wrong program. "
-            "Rebuild the corpus through build_heldout_source.py to get the "
-            "measurement this number is routinely mistaken for")
+        # Two causes, opposite fixes. Naming the wrong one is worse than naming
+        # none: the corpus-rebuild advice below sends a reader to repair a data
+        # pipeline that is already correct, while the real cause (no extractable
+        # code, usually a token budget) sits in the truncation line right above it.
+        # Caught on the eval120 dry run, where every row carried held-out pairs and
+        # this branch still claimed none did.
+        if n_val_rows_with_heldout:
+            report["heldout_caveat"] = (
+                f"{n_val_rows_with_heldout} val rows DO carry heldout_pairs, but no "
+                f"generation produced extractable code, so nothing could be run "
+                f"against them. This is NOT a corpus defect -- do not rebuild the "
+                f"corpus. Check the truncation and format-failure counts above: at "
+                f"format_valid_rate 0 the held-out metric is unmeasurable by "
+                f"construction, and the usual cause is --max-new-tokens too small "
+                f"for a thinking model, or a prompt template the student was not "
+                f"trained on")
+        else:
+            report["heldout_caveat"] = (
+                "no val row carried heldout_pairs, so solve_rate is measured "
+                "against the pairs each prompt already showed the model -- it says "
+                "the student writes runnable programs, NOT that it found the rule. "
+                "On real ARC roughly 1 in 11 shown-pair-verified solvers is a wrong "
+                "program. Rebuild the corpus through build_heldout_source.py to get "
+                "the measurement this number is routinely mistaken for")
     report.update(aggregate_samples(scored))
 
     # The same rate over rows that saw their whole task. Reported ALONGSIDE

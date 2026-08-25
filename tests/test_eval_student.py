@@ -649,5 +649,62 @@ def test_runs_with_different_attempt_budgets_are_not_compared_on_pass_at_k():
     assert "1 base vs 2 student" in lift["sampling_caveat"]
 
 
+# ------------------- the caveat has to name the RIGHT cause, not a plausible one
+#
+# `heldout_solve_rate` is absent for two reasons with OPPOSITE fixes: the corpus carries
+# no unseen pairs (rebuild it), or it carries them and no generation produced extractable
+# code, so nothing could be run against them (raise the token budget / fix the template).
+# The caveat asserted the first unconditionally. Found on the eval120 GPU dry run, where
+# every row carried held-out pairs and the report still said none did -- advice to repair
+# a data pipeline that was already correct, while the real cause sat in the truncation
+# line directly above it.
+
+NO_CODE = "I considered several approaches but will not write the function."
+
+
+def test_a_corpus_with_unseen_pairs_and_no_extractable_code_is_not_a_corpus_defect():
+    rep = _score_heldout(NO_CODE)
+    assert rep["n_heldout_scored"] == 0, "nothing was runnable, so nothing was scored"
+    assert "heldout_solve_rate" not in rep
+    # The measurement that separates the two causes, counted from the corpus rather
+    # than from the scoring loop -- the loop only sees rows that got as far as having
+    # runnable code, so on its own it cannot tell the two states apart.
+    assert rep["n_val_rows_with_heldout"] == len(VAL_HELDOUT)
+    assert "do not rebuild the corpus" in rep["heldout_caveat"]
+    assert "max-new-tokens" in rep["heldout_caveat"]
+    # The wrong advice must be ABSENT, not merely accompanied by the right advice.
+    assert "1 in 11" not in rep["heldout_caveat"]
+    assert "build_heldout_source.py" not in rep["heldout_caveat"]
+
+
+def test_a_corpus_genuinely_without_unseen_pairs_still_gets_the_rebuild_advice():
+    """The other side. A caveat that always blamed the token budget would be exactly
+    as wrong in the other direction, and asserting one branch would pass for it."""
+    rep = score(NO_CODE)
+    assert rep["n_val_rows_with_heldout"] == 0
+    assert "1 in 11" in rep["heldout_caveat"]
+    assert "build_heldout_source.py" in rep["heldout_caveat"]
+    assert "do not rebuild the corpus" not in rep["heldout_caveat"]
+
+
+def test_the_available_count_is_taken_from_the_corpus_not_from_what_scored():
+    """One row runnable, one not: the count of rows that COULD have been scored stays
+    at 2 while the count actually scored is 1. Deriving the first from the second is
+    the defect -- it makes the corpus look as small as the model's output."""
+    rows = [{**VAL_HELDOUT[0]},
+            {**VAL_HELDOUT[0], "task_id": "t2"}]
+    gens = [{"task_id": VAL_HELDOUT[0]["task_id"], "variant": VAL_HELDOUT[0].get("variant", "orig"),
+             "generation": CORRECT},
+            {"task_id": "t2", "variant": VAL_HELDOUT[0].get("variant", "orig"),
+             "generation": NO_CODE}]
+    rep = es.score_generations(gens, rows)
+    assert rep["n_heldout_scored"] == 1
+    assert rep["n_val_rows_with_heldout"] == 2
+    # Present even though heldout_solve_rate exists, i.e. in the branch where the
+    # caveat is never built. Two runs being compared must agree on this denominator,
+    # and a field that only appears when the metric is MISSING cannot show that.
+    assert rep["heldout_solve_rate"] == 1.0
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))

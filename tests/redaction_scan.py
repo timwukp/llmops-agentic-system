@@ -107,7 +107,7 @@ ALLOWED = (b"6833" + b"13688378", b"7631" + b"04351884", b"1234" + b"56789012")
 #: this laptop, single-threaded CPython does 3.1M sha256/s, so the whole 1e12 space falls in
 #: about 4 days -- and a GPU does it in roughly 100 seconds. So the KDF is iterated. At 200k
 #: iterations a candidate costs ~16 ms, which makes the same sweep ~500 GPU-years, while the
-#: scan stays cheap because only 12-digit runs are ever hashed: measured across all 199
+#: scan stays cheap because only 12-digit runs are ever hashed: measured across all 201
 #: tracked files there are 74 such runs, 10 distinct, and hashing the distinct set takes 0.16 s
 #: for the entire repo. (Re-measured whenever either number moves, and they move
 #: INDEPENDENTLY, which is why both are derived and neither is inferred from the other, and
@@ -156,7 +156,7 @@ ALLOWED = (b"6833" + b"13688378", b"7631" + b"04351884", b"1234" + b"56789012")
 #: optimizer step, GiB reserved and step counts -- and, for the first time in this streak, a
 #: FAKE torch reporting 8 GiB allocated against 21 GiB reserved, none of them 12 digits long --
 #: with the runs still at 74: an eleventh consecutive commit moving the file count alone.
-#: Then 195 files became 199, the widest single move in this streak: the generation job's
+#: Then 195 files grew to 199, the widest single move in this streak: the generation job's
 #: preflight, its SageMaker entry point, that entry point's requirements.txt and the
 #: preflight's test module. FOUR at once and the run count still held at 74, because the
 #: account id in this path is never written down -- the launcher reads it from STS and
@@ -164,6 +164,13 @@ ALLOWED = (b"6833" + b"13688378", b"7631" + b"04351884", b"1234" + b"56789012")
 #: seconds, token counts and GiB. A twelfth consecutive move of the file count alone, and
 #: the first one wide enough that "the streak is an artefact of one-file commits" stops
 #: being an available explanation.
+#: Then 199 files became 201, the eval120 corpus builder and its first test module. Their
+#: numbers are grid dimensions, source-task counts and the 79.6/20.4 template split, and
+#: neither carries a 12-digit run -- the runs held at 74 for a thirteenth consecutive move of
+#: the file count alone. Worth naming what the builder DID carry until this move: a hardcoded
+#: developer home directory. The guard for that lives in test_augment.py rather than here, but
+#: it walks the same `git ls-files` census this file walks -- and an untracked file is outside
+#: both. The defect was not missed by the scan; it was never in the scan's population.
 #: (The "became" phrasing is the one the guard reads, so it names the LATEST movement -- the
 #: earlier ones are history and keep their own past tense.)
 #: For EIGHT commits
