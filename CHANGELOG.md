@@ -52,6 +52,71 @@ both terms and cannot be joined from two places in a live log. Four tests, and t
 computes the rate from rows while still printing `tok/s` is one of them: the token count and
 the rate are two claims, and asserting the count alone let that mutant live.
 
+### The generation job gets its own gate and its own entry point
+
+`validate_job_config.py` cannot preflight a generation payload: every quantity it multiplies
+— `save_steps`, `epochs`, `gradient_accumulation`, rows × epochs ÷ effective batch — is
+absent from one. Pointed at it, it emits four FAILs that are all correct for a trainer and
+all meaningless for a decoder, so the only way to launch would be to override the verdict,
+and a gate whose verdict is routinely overridden has stopped being a gate.
+`pipeline/v2/validate_gen_config.py` does the generation arithmetic instead.
+
+Two headroom checks, and the second exists because a live job proved the first insufficient.
+`startup + max_seconds + upload ≥ MaxRuntimeInSeconds` is a FAIL — a graceful budget that
+expires after the kill it exists to avoid buys nothing. But the budget is read *between*
+batches and never inside one, so the real worst case is `budget + one batch`.
+
+Measured, on `arc2v2-gen-base-0823a-g5` (base Qwen3-4B-Thinking-2507, `ml.g5.2xlarge`, batch 2,
+`max_new_tokens` 16384, `max_seconds` 2700, hard kill 3600): it decoded 2 × 16,384 tokens in
+**2,686 s = 12.2 tok/s aggregate**, both sequences hitting the ceiling without emitting EOS.
+The budget check before batch 2 saw 2,686 s against 2,700 — **it missed by fourteen seconds** —
+and the run committed to a second batch needing another 2,686 s with 671 s of wall clock left.
+It died at `MaxRuntimeExceeded` with no `.done`, which is itself the proof the `break` never
+ran, independent of the timestamp arithmetic that says the same thing.
+
+The old check cleared it with 180 s of slack, because it warned on slack *thinness* — a
+quantity that says nothing about how long a batch takes. So
+`min(batch_size × n_samples, generations) × max_new_tokens ÷ tok/s` is now a term in the
+FAIL: with 12.2
+tok/s the gate computes `600 + 2700 + 2686 + 120 = 6106 s` against 3600 and refuses.
+
+An unmeasured rate stays launchable, because the first job on a new model cannot produce one
+without running, and inventing a default would make the gate pass on a number nobody measured.
+The g5 job had no rate, so the honest statement is that the new gate would have **warned**
+there, not blocked. But UNKNOWN is not the same as unquantifiable, and the difference is the
+second thing this change adds: the gate now states the rate the configuration **assumes**.
+The g5 launch gave its final batch 180 s to produce 32,768 tokens, so it silently required
+**≥ 182 tok/s**, against the 12.2 the A10G delivered. That 15× gap is derivable with no
+measurement of the model at all, and printing it is what turns "coverage is UNKNOWN" from a
+disclaimer into something a reader can act on before spending the money.
+
+`pipeline/v2/run_eval_gen.py` is the entry point. Everything it does is "find the thing in
+the directory", and every way of getting that wrong produces a complete, plausible report
+against the wrong weights — base and merged share architecture, tokenizer and file names. So
+ambiguity is an error rather than a preference order (two loadable models is a FAIL, not
+"prefer `merged/`"), `config.json` without weight shards is not a model, two tarballs are
+refused *before* extraction rather than after the download is paid for, a missing channel does
+not fall back to the HF hub, an unknown hyperparameter is fatal, and `argv.json` is written
+**before** the generator runs so a job killed by the hard kill still records what it was asked
+to do.
+
+`tests/test_gen_job_preflight.py` — 44 tests against fake channel trees on disk, with a
+baseline payload that *passes* so each test changes exactly one thing. All 44 mutants of the
+two modules' guards are killed by a named test, and the three that survived a first pass are
+recorded as fixes rather than dropped, because each was the same mistake in a different
+costume — asserting one number while the mutant moved another:
+
+- a fact line printing both generations and prompts, tested only on the prompts;
+- `raises(SystemExit)` where argparse's usage error and a missing file are indistinguishable;
+- `"80s of slack"`, which silently became a **substring of the new fact's "780s of slack"** and
+  started passing through the wrong fact entirely — so the mutant that deleted the slack line
+  came back to life on a test that had killed it before. Both slack assertions are now matched
+  on the fact's own wording.
+
+The g5 configuration is a named regression test in both directions: refused once its 12.2
+tok/s is known, and shown clearing the *old* single check with 180 s to spare — because
+"the old gate was insufficient" is otherwise an assertion rather than a measurement.
+
 ### v2 distillation: `verified` becomes a measurement instead of a tautology
 
 Both ends of the ARC pipeline scored a program against **the pairs that were in its own
