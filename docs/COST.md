@@ -334,6 +334,42 @@ design.
 
 ## 8. The Cost tab
 
+### Cost v2 (2026-10-12): six sub-tabs, visibility then governance
+
+The tab now opens on six sub-tabs. The first five answer *where did the money go*; the sixth
+answers *what stops it*. The five panels described below still exist, inside **Governance**,
+until phase 2 removes them.
+
+| Sub-tab | Shows | Basis |
+|---|---|---|
+| Overview | workload spend, month to date, attributed training, Cost Explorer billed; daily stacked chart; top spenders | attributed + estimate, billed shown beside, never summed in |
+| Usage | Bedrock tokens and cost per model; training instance-hours | account-wide (Bedrock has no per-harness token dimension) |
+| By task | per console Task: estimate vs actual of the runs it dispatched, variance | attributed |
+| Breakdown | by category, model, run, AWS service | mixed, each badged |
+| Detail | every attributed training job: instance, hours, unit price, cost | attributed |
+| Governance | budgets (project-monthly or per-task, mode `notify` or `block`), forecast, guardrail posture, alert feed, AWS Budgets | estimate vs limit |
+
+**Why v2 prices usage instead of reading `llmops-cost-actuals`:** live, that table held 164
+rows and every one was `#audit#` — the reconcile had never written an attributed cost row,
+so the v1 panel read $0.00 while 68 training jobs had run. v2 prices what the pipeline
+demonstrably left behind: training jobs matched by name prefix (`COST_JOB_PREFIXES`, never
+"all SageMaker"), billable seconds × the same S3 rate card the estimator uses; Bedrock tokens
+from CloudWatch `AWS/Bedrock` by `ModelId`. Cost Explorer is shown as billed, account-wide
+context and cached 15 minutes, because each request bills $0.01.
+
+**Enforcement.** `budget_gate()` runs at the console's two launch points — `POST
+/api/start-run` and `POST /api/tasks/{id}/accept`. A `notify` breach records an alert (console
+table, `budget-alert#*`) and publishes to `llmops-escalations`, wrapped so a failed publish
+never changes the answer; a `block` breach refuses with HTTP 409 and names the budget. **Not
+armed yet (phase 2):** stopping a run that is already in flight — the harness driver does not
+consult budgets, and the posture table says so.
+
+| Method | Path | Auth | Purpose |
+|---|---|---|---|
+| GET | `/api/cost/v2?days=N` | public read | all five visibility sub-tabs in one payload |
+| GET | `/api/cost/budgets` | public read | budgets with state, AWS Budgets, alerts, posture |
+| POST | `/api/cost/budgets` | authed | create or update a budget |
+
 Five panels, in the money's own order:
 
 1. **Estimate a run** — plan inputs → a line-item table with `basis` and `rate_source` per

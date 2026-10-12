@@ -107,7 +107,7 @@ ALLOWED = (b"6833" + b"13688378", b"7631" + b"04351884", b"1234" + b"56789012")
 #: this laptop, single-threaded CPython does 3.1M sha256/s, so the whole 1e12 space falls in
 #: about 4 days -- and a GPU does it in roughly 100 seconds. So the KDF is iterated. At 200k
 #: iterations a candidate costs ~16 ms, which makes the same sweep ~500 GPU-years, while the
-#: scan stays cheap because only 12-digit runs are ever hashed: measured across all 212
+#: scan stays cheap because only 12-digit runs are ever hashed: measured across all 217
 #: tracked files there are 74 such runs, 10 distinct, and hashing the distinct set takes 0.16 s
 #: for the entire repo. (Re-measured whenever either number moves, and they move
 #: INDEPENDENTLY, which is why both are derived and neither is inferred from the other, and
@@ -173,10 +173,12 @@ ALLOWED = (b"6833" + b"13688378", b"7631" + b"04351884", b"1234" + b"56789012")
 #: both. The defect was not missed by the scan; it was never in the scan's population.
 #: (The "became" phrasing is the one the guard reads, so it names the LATEST movement -- the
 #: earlier ones are history and keep their own past tense.)
-#: Then 201 files became 212, the ai-native-sdlc governance layer: three vendored gate
+#: Then 201 files went to 212, the ai-native-sdlc governance layer: three vendored gate
 #: scripts, two hook configs, a CI workflow, the .sdlc pointer pair and a three-file intent
 #: chain. Their numbers are timeouts, exit codes and a schema version -- no 12-digit run
 #: among them, so the runs held at 74 through another file-count-only move.
+#: Then 212 files became 217: Cost v2 (its test file, its evidence file) and its intent/spec/plan chain.
+#: Dollar limits and percentages only -- no 12-digit run, so the runs held at 74 again.
 #: For EIGHT commits
 #: running, the file count moved and the run count did not move once, and then one commit moved
 #: both -- which is the whole reason these are two derived numbers and not one. The CI-only detection

@@ -132,6 +132,13 @@ an over-estimate run and launches it; `describe_budget_actions_for_budget` on
 Nothing in this account halts spend on its own. The references exist to make an overage get
 named — which is why the number was raised rather than deleted.
 
+**Cost v2 budgets (2026-10-12).** The Cost tab's Governance sub-tab adds console budgets
+(`budget#*` rows in the existing `LlmopsAdminRuns` table — no new AWS resource). A budget in
+`block` mode is the first control here that does stop something: `start-run` and task accept
+return HTTP 409 when it would be breached. As deployed, **no budget exists**, so the posture
+above is unchanged until one is created; in-flight hard-stop is phase 2. `llmops-admin` was
+redeployed with Cost v2 on 2026-10-12 (code only; IAM unchanged).
+
 The $20,000 figure is the platform owner's instruction of 2026-08-02: this is the project's own
 design-and-test platform, not a customer's production account, and the whole test-proven record
 to date cost **~$12–15**. A reference low enough to be crossed by ordinary work is a reference
