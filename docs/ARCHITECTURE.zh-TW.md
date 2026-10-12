@@ -1068,7 +1068,7 @@ AGPL-3.0 連微調權重與嵌入應用都涵蓋，所以目錄大聲說明、or
 ![Console 架構](architecture-console.svg)
 
 Dashboard 是**單一個 Lambda**
-同時供應 HTML 與全部 **30 個路由 handler**、共 **9 tabs**，**沒有 build step、沒有 CDN**：`frontend.html` 在冷啟動時
+同時供應 HTML 與全部 **37 個路由 handler**、共 **9 tabs**，**沒有 build step、沒有 CDN**：`frontend.html` 在冷啟動時
 內嵌，頁面帶著 `CSP connect-src 'self'` 加上上傳路徑所需的 S3 origin。單一產物意味著 UI 永遠
 不可能比它呼叫的 API 舊一個版本 —— 那正是「前端後端分開部署」會招來的故障模式。
 
@@ -1076,10 +1076,15 @@ Dashboard 是**單一個 Lambda**
 
 | 平面 | handler | 規則 |
 |---|---|---|
-| **讀** | 11 條 GET（`/api/overview`、`/api/pipeline`、`/api/run`、`/api/observability`、`/api/cost-overview`…） | 公開，伺服器端彙總 |
+| **讀** | 15 條 GET（`/api/overview`、`/api/pipeline`、`/api/run`、`/api/observability`、`/api/cost/v2`、`/api/cost/budgets`…） | 公開，伺服器端彙總 |
 | **session** | 3 條 POST：`/api/login`、`/api/refresh`、`/api/refresh/revoke` | **必然**未認證 —— 它們是產生／撤銷憑證的那三條 |
-| **寫** | 14 條 POST：`/api/start-run`、`/api/cost-approval*`、`/api/finops-run`、`/api/optimize*`、`/api/native-rec*`、`/api/batch-eval`… | 在單一關卡過 Cognito |
+| **寫** | 14 條 POST：`/api/start-run`、`/api/cost/{budgets,policy,sweep}`、`/api/cost-approval*`、`/api/finops-run`、`/api/optimize*`、`/api/native-rec*`、`/api/batch-eval`… | 在單一關卡過 Cognito |
 | **諮詢** | `/api/tasks` 底下的**全部**路由、**兩種 method 都算** —— 2 個 GET handler（`/api/tasks`、`/api/tasks/{id}[/approval|/readiness]`）以及 POST `/api/tasks/{id}/{message,accept,close}` 與 `/api/data-upload-url` | 需認證**並且**查群組；唯一會調用 agent 的平面 |
+
+除了 HTTP，同一個 Lambda 還有一個排程入口：EventBridge 規則 `llmops-budget-sweep` 每 15 分鐘
+以 `{"mode": "budget-sweep"}` 呼叫它，把 Cost 分頁上的每個預算對照目前為止的支出評估一次，
+每個門檻每月只告警一次。只有在 portal 的「超出預算時停止執行中的 job」開關為 ON（預設 OFF）
+時，它才會停下 run —— 見 [COST.zh-TW.md §8](COST.zh-TW.md#8-cost-分頁)。
 
 這張表的先前版本把 `/api/tasks` 同時列在讀平面**和**諮詢平面裡，而程式碼照的是第一個：四條諮詢
 **讀取** —— 討論串清單、討論串本身，以及它的核准紀錄與資料整備面板 —— 在一個公開的 API Gateway

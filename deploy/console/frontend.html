@@ -187,6 +187,12 @@
   .obsrow2 { display:grid; grid-template-columns:2fr 1fr; gap:10px; }
   @media (max-width:900px){ .obsrow2 { grid-template-columns:1fr; } }
 .meter i{background:var(--accent)}
+.polgrid{display:grid;gap:8px}
+.polrow{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:10px 12px;border:1px solid var(--line);border-radius:10px;background:var(--panel2)}
+.switch{display:inline-flex;align-items:center;gap:8px;min-width:86px;padding:4px 10px 4px 4px;border-radius:999px;border:1px solid var(--line);background:#1a2140;color:var(--muted);cursor:pointer;font-weight:600}
+.switch i{width:26px;height:26px;border-radius:50%;background:#55608c;transition:transform .15s}
+.switch.on{background:rgba(255,92,92,.18);border-color:var(--red);color:var(--red);flex-direction:row-reverse;padding:4px 4px 4px 10px}
+.switch.on i{background:var(--red)}
 .csubnav button{background:transparent;border:1px solid var(--line);color:var(--muted);padding:5px 12px;border-radius:8px;margin-right:4px;cursor:pointer;font-size:13px}
 .csubnav button.active{background:var(--accent);color:#fff;border-color:var(--accent)}
 </style>
@@ -475,13 +481,25 @@
     <div class="stat" id="cgForecast">&ndash;</div><small id="cgForecastSub">linear run-rate</small></div>
   <div data-tab-panel="cost" data-csub="governance" class="card col-3"><h2>Enforcement mode</h2>
     <div class="stat" id="cgMode">&ndash;</div><small id="cgModeSub"></small></div>
+  <div data-tab-panel="cost" data-csub="governance" class="card col-12"><h2>Enforcement policy &middot; what a breach does</h2>
+    <div class="sub" style="margin:-6px 0 10px">alarm + notification is always on. The two actions below are OFF by default &mdash; an approver switches them ON when a budget must be enforced, and every flip is logged in the alert feed</div>
+    <div class="polgrid">
+      <div class="polrow"><div><b>Alarm + notification</b><div class="sub">every launch and the 15-minute sweep record threshold crossings and publish to SNS <span class="mono">llmops-escalations</span></div></div>
+        <span class="pill ok">always ON</span></div>
+      <div class="polrow"><div><b>Block launches over budget</b><div class="sub">ON: start-run and task accept are refused (HTTP 409) when a budget would be exceeded</div></div>
+        <button class="switch" id="swBlock" role="switch" aria-checked="false" onclick="togglePolicy('block_launches')"><i></i><span>OFF</span></button></div>
+      <div class="polrow"><div><b>Stop running jobs over budget</b><div class="sub">ON: the sweep stops a breached run's execution and its in-progress training jobs (endpoints stay with Teardown)</div></div>
+        <button class="switch" id="swStop" role="switch" aria-checked="false" onclick="togglePolicy('stop_running')"><i></i><span>OFF</span></button></div>
+    </div>
+    <div class="flex" style="margin-top:10px;align-items:center"><button onclick="runSweep()">&#9201; Run budget check now</button>
+      <span id="cgPolMsg" class="sub"></span></div>
+  </div>
   <div data-tab-panel="cost" data-csub="governance" class="card col-7"><h2>Budgets</h2>
     <div id="cgBudgets"><span class="sub">loading&hellip;</span></div></div>
   <div data-tab-panel="cost" data-csub="governance" class="card col-5"><h2>Create / update budget</h2>
     <label>Name</label><input id="cgName" placeholder="llmops monthly" />
     <label>Scope</label><select id="cgScope"><option value="project_monthly">Project &middot; monthly</option><option value="per_task">Per task (launch estimate)</option></select>
     <label>Limit (USD)</label><input id="cgLimitIn" type="number" min="1" placeholder="500" />
-    <label>Mode</label><select id="cgModeIn"><option value="notify">Notify &mdash; alert, launch proceeds</option><option value="block">Block &mdash; refuse launches that breach</option></select>
     <div class="flex" style="margin-top:10px"><button class="primary" onclick="saveBudget()">Save budget</button><span id="cgMsg" class="sub"></span></div>
   </div>
   <div data-tab-panel="cost" data-csub="governance" class="card col-6"><h2>Cost guardrails &middot; posture</h2>
@@ -2492,22 +2510,46 @@ function renderGov(g){
   $("cgLimit").textContent=pm?usd(pm.limit_usd):"none"; $("cgLimitSub").textContent=pm?pm.name:"create one below";
   $("cgActual").textContent=usd(g.mtd_usd); $("cgActualSub").innerHTML=pm?`${pm.pct}% used · ${basis("estimate")}`:basis("estimate");
   $("cgForecast").textContent=pm?usd(pm.forecast_usd):"–";
-  const blocking=bs.some(b=>b.mode==="block");
-  $("cgMode").innerHTML=blocking?'<span style="color:var(--red)">Enforce</span>':'<span style="color:var(--green)">Notify-only</span>';
-  $("cgModeSub").textContent=blocking?"a blocking budget refuses launches that breach it":"no budget blocks launches";
+  const pol=g.policy||{};
+  COST_POLICY=pol;
+  const enforcing=[pol.block_launches&&"block launches",pol.stop_running&&"stop running jobs"].filter(Boolean);
+  $("cgMode").innerHTML=enforcing.length?'<span style="color:var(--red)">Enforce</span>':'<span style="color:var(--green)">Alarm only</span>';
+  $("cgModeSub").textContent=enforcing.length?("ON: "+enforcing.join(" + ")):"breaches alarm and notify; nothing is blocked or stopped";
+  setSwitch("swBlock", !!pol.block_launches); setSwitch("swStop", !!pol.stop_running);
+  $("cgPolMsg").textContent=pol.updated_by?`last changed by ${pol.updated_by} at ${String(pol.updated_at||"").slice(0,19).replace("T"," ")}`:"defaults (both OFF)";
   const st={on_track:"ok",warning:"warn",forecast_over:"warn",over:"err",per_task_limit:"idle"};
-  $("cgBudgets").innerHTML=bs.length?`<table><tr><th>budget</th><th>scope</th><th>mode</th><th style="width:30%">used</th><th style="text-align:right">limit</th><th>state</th></tr>${bs.map(b=>
-    `<tr><td>${esc(b.name)}</td><td>${esc(b.scope)}</td><td><span class="pill ${b.mode==="block"?"err":"idle"}">${esc(b.mode)}</span></td>
+  $("cgBudgets").innerHTML=bs.length?`<table><tr><th>budget</th><th>scope</th><th style="width:34%">used</th><th style="text-align:right">limit</th><th>state</th></tr>${bs.map(b=>
+    `<tr><td>${esc(b.name)}</td><td>${esc(b.scope)}</td>
      <td>${b.pct==null?'<span class="sub">checked per launch</span>':`<div class="meter"><i style="width:${Math.min(100,b.pct)}%;background:${b.pct>=100?"var(--red)":b.pct>=80?"var(--amber)":"var(--green)"}"></i></div><span class="sub">${usd(b.actual_usd)} · forecast ${usd(b.forecast_usd)}</span>`}</td>
      <td style="text-align:right">${usd(b.limit_usd)}</td><td><span class="pill ${st[b.state]||"idle"}">${esc(String(b.state).replace(/_/g," "))}</span></td></tr>`).join("")}</table>`:`<div class="sub">no budgets yet — every launch is ungoverned</div>`;
-  $("cgPosture").innerHTML=`<table>${(g.posture||[]).map(p=>`<tr><td><b>${esc(p.control)}</b><div class="sub">${esc(p.detail)}</div></td><td style="text-align:right"><span class="pill ${/not armed|no budgets|phase 2/.test(p.state)?"idle":"warn"}">${esc(p.state)}</span></td></tr>`).join("")}</table>`;
+  $("cgPosture").innerHTML=`<table>${(g.posture||[]).map(p=>`<tr><td><b>${esc(p.control)}</b><div class="sub">${esc(p.detail)}</div></td><td style="text-align:right"><span class="pill ${p.state==="ON"?"err":/OFF|no budgets/.test(p.state)?"idle":"ok"}">${esc(p.state)}</span></td></tr>`).join("")}</table>`;
   const al=g.alerts||[];
-  $("cgAlerts").innerHTML=al.length?`<table>${al.map(a=>`<tr><td style="white-space:nowrap" class="sub">${esc(String(a.created_at||"").slice(0,19).replace("T"," "))}</td><td><span class="pill ${a.severity==="CRITICAL"?"err":"warn"}">${esc(a.severity)}</span></td><td>${esc(a.message)}<div class="sub">${esc(a.action||"")}</div></td></tr>`).join("")}</table>`:`<div class="sub">no budget alerts — good news only if budgets exist</div>`;
+  $("cgAlerts").innerHTML=al.length?`<table>${al.map(a=>`<tr><td style="white-space:nowrap" class="sub">${esc(String(a.created_at||"").slice(0,19).replace("T"," "))}</td><td><span class="pill ${a.severity==="CRITICAL"?"err":a.severity==="INFO"?"idle":"warn"}">${esc(a.severity)}</span></td><td>${esc(a.message)}<div class="sub">${esc(a.action||"")}</div></td></tr>`).join("")}</table>`:`<div class="sub">no budget alerts — good news only if budgets exist</div>`;
   const aw=g.aws_budgets||[];
   $("cgAws").innerHTML=aw.length?`<table><tr><th>name</th><th style="text-align:right">actual</th><th style="text-align:right">forecast</th><th style="text-align:right">limit</th><th>period</th></tr>${aw.map(a=>`<tr><td>${esc(a.name)}</td><td style="text-align:right">${usd(a.actual_usd)}</td><td style="text-align:right">${usd(a.forecast_usd)}</td><td style="text-align:right">${usd(a.limit_usd)}</td><td>${esc(a.time_unit)}</td></tr>`).join("")}</table><div class="sub" style="margin-top:6px">${basis("billed")} via the payer account &mdash; can read $0 while real usage accrues; the estimates above move in near-real time.</div>`:`<div class="sub">no AWS Budgets readable</div>`;
 }
+let COST_POLICY={};
+function setSwitch(id,on){ const b=$(id); if(!b) return; b.classList.toggle("on",on);
+  b.setAttribute("aria-checked", on?"true":"false"); b.querySelector("span").textContent=on?"ON":"OFF"; }
+async function togglePolicy(key){
+  const next=!COST_POLICY[key];
+  const label={block_launches:"Block launches over budget", stop_running:"Stop running jobs over budget"}[key];
+  if(next && !confirm(`Turn ON "${label}"?\n\nThis enforces budgets for every run in this project.`)) return;
+  if(!(await ensureToken())) { $("cgPolMsg").textContent="sign in as an approver to change the policy"; return; }
+  const res=await postApi("/api/cost/policy", {[key]: next});
+  $("cgPolMsg").textContent=res.ok?`${label}: ${next?"ON":"OFF"}`:(res.msg||"failed");
+  if(res.ok) loadCostV2();
+}
+async function runSweep(){
+  if(!(await ensureToken())) { $("cgPolMsg").textContent="sign in to run the budget check"; return; }
+  $("cgPolMsg").textContent="checking budgets…";
+  const res=await postApi("/api/cost/sweep", {});
+  const r=res.data||{};
+  $("cgPolMsg").textContent=res.ok?`checked ${r.budgets} budget(s) against ${r.running_runs} running run(s): ${r.alerts} new alert(s), ${(r.stopped||[]).length} stopped`:(res.msg||"failed");
+  if(res.ok) loadCostV2();
+}
 async function saveBudget(){
-  const body={name:$("cgName").value, scope:$("cgScope").value, limit_usd:$("cgLimitIn").value, mode:$("cgModeIn").value};
+  const body={name:$("cgName").value, scope:$("cgScope").value, limit_usd:$("cgLimitIn").value};
   if(!(await ensureToken())) { $("cgMsg").textContent="sign in to save budgets"; return; }
   const res=await postApi("/api/cost/budgets", body);
   $("cgMsg").textContent=res.ok?"saved":(res.msg||"failed");

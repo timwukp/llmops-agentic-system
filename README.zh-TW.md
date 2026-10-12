@@ -137,7 +137,7 @@ Gateway，搭配 Cognito 認證：讀取公開，所有寫入都必須帶 Bearer
 | **Observability** | 各 harness 的 AgentCore 指標、每日用量、token 花費、SageMaker 訓練作業與 student endpoint |
 | **Evaluations** | 線上評估配置與分數儀表，以及批次評估 |
 | **Optimizations** | 先看 Insights 發現，再看 AWS 原生 prompt 建議與 Bedrock 起草的 prompt —— 經人工審核後才透過 `UpdateHarness` 套用 |
-| **Cost** | 逐列估算一個 run 的費用、批准或駁回超過 $20,000 基準的請求，再依專案／服務／run 對照估算讀取實際支出 —— 見 [docs/COST.zh-TW.md](docs/COST.zh-TW.md) |
+| **Cost** | 六個子頁籤。**Overview · Usage · By task · Breakdown · Detail** 顯示錢花到哪裡：每個 run、每個 task 的歸屬訓練成本，每個模型的 token 成本，並列 Cost Explorer 已計費金額，每個數字都標示依據。**Governance** 設定預算並顯示強制政策：告警 + 通知永遠開啟，另外兩個看得見的 ON/OFF 開關 ——「超出預算時擋下啟動」與「超出預算時停止執行中的 job」—— 預設都是 OFF，只有審批者能切換。每 15 分鐘的巡檢會對每次門檻跨越告警。逐列估算器與 $20,000 審批佇列放在 Governance 底下 —— 見 [docs/COST.zh-TW.md](docs/COST.zh-TW.md#8-cost-分頁) |
 
 有兩點是刻意做嚴的：
 

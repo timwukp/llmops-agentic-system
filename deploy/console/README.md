@@ -27,9 +27,9 @@ is how the Introduction row below got written on the same commit as the tab itse
 | Observability | Per-harness AgentCore service metrics, daily bar chart, token tile, SageMaker training jobs + student endpoints |
 | Evaluations | Online eval configs with score gauges, batch evaluations, insights reports |
 | Optimizations | AWS-native system-prompt recommendations + Bedrock-drafted prompts (human-review-then-apply via UpdateHarness) |
-| Cost | Six sub-tabs: Overview · Usage · By task · Breakdown · Detail · Governance (budgets in `notify`/`block` mode, gate at start-run and task accept, alert feed, guardrail posture). Governance also keeps the v1 estimator, the $20,000 reference, the approval queue (approver group, never self-approve) and `finops-run` dispatch |
+| Cost | Six sub-tabs: Overview · Usage · By task · Breakdown · Detail · Governance. Governance: budgets (`project_monthly` / `per_task`), the enforcement policy — alarm + notification always on, **Block launches over budget** and **Stop running jobs over budget** switches (both OFF by default, `llmops-approver` only, every flip logged) — the *Run budget check now* button, alert feed, guardrail posture, AWS Budgets; plus the v1 estimator, the $20,000 reference, the approval queue and `finops-run` dispatch |
 
-Route shape: **35 handlers** (see `tests/test_console_routes.py` for the derived count).
+Route shape: **37 handlers** (see `tests/test_console_routes.py` for the derived count).
 See [ARCHITECTURE.md §13](../../docs/ARCHITECTURE.md#13-the-admin-console--one-lambda-three-planes-with-different-rules)
 for why the three planes carry different rules.
 
@@ -70,10 +70,11 @@ existing `agent-cicd-admin` stack):
 
 - Lambda `llmops-admin` (Python 3.12, zip = `lambda_function.py` + `frontend.html` + vendored boto3)
 - IAM role `LlmopsAdminLambdaRole` with `iam-policy.json`
-- DynamoDB `LlmopsAdminRuns` (console state: optimization drafts only)
+- DynamoDB `LlmopsAdminRuns` (console state: optimization drafts, Cost budgets `budget#*`, the enforcement policy `cost-policy`, budget alerts `budget-alert#*`)
 - Cognito pool `llmops-admin-pool` (admin-create-only, PLUS tier threat protection,
   20-char min password); admin credentials in Secrets Manager `llmops-admin/dashboard-login`
 - HTTP API `llmops-admin-api` with stage throttling
+- EventBridge rule `llmops-budget-sweep` (`rate(15 minutes)`, Input `{"mode":"budget-sweep"}`) targeting the Lambda — the Cost tab's running-job alarm
 
 ## Env contract (Lambda)
 

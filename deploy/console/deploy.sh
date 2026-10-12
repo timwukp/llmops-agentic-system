@@ -266,6 +266,22 @@ aws apigatewayv2 update-stage --api-id "$API_ID" --stage-name '$default' --regio
   --default-route-settings "ThrottlingRateLimit=$API_RATE_LIMIT,ThrottlingBurstLimit=$API_BURST_LIMIT,DetailedMetricsEnabled=true" \
   >/dev/null
 
+# ── Budget sweep schedule (Cost tab › Governance) ─────────────────────────────
+# The running-job alarm: every 15 minutes the console evaluates every budget against spend
+# so far, alarms each threshold crossing once per month, and -- only if the portal's
+# "Stop running jobs over budget" switch is ON -- stops a breached run. A constant Input
+# is the contract handler() reads ({"mode": "budget-sweep"}); with no budgets defined the
+# sweep returns at once, so the schedule costs ~2,900 near-empty invocations a month.
+SWEEP_RULE=llmops-budget-sweep
+aws events put-rule --name "$SWEEP_RULE" --schedule-expression "rate(15 minutes)" --state ENABLED \
+  --description "Cost tab budget sweep: alarm on threshold crossings; stop only if the portal switch is ON" \
+  --tags Key=project,Value=llmops-agentic-system --region "$REGION" >/dev/null
+aws events put-targets --rule "$SWEEP_RULE" --region "$REGION" --targets \
+  "Id=console,Arn=arn:aws:lambda:$REGION:$ACCOUNT_ID:function:$FN,Input='{\"mode\":\"budget-sweep\"}'" >/dev/null
+aws lambda add-permission --function-name "$FN" --statement-id budget-sweep --region "$REGION" \
+  --action lambda:InvokeFunction --principal events.amazonaws.com \
+  --source-arn "arn:aws:events:$REGION:$ACCOUNT_ID:rule/$SWEEP_RULE" >/dev/null 2>&1 || true
+
 echo ""
 echo "Dashboard: https://$API_ID.execute-api.$REGION.amazonaws.com/"
 echo "Login: username 'admin'; password in Secrets Manager '$SECRET_NAME'"

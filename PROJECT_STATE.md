@@ -47,7 +47,7 @@ Next: v2 experiments — code-as-reasoning distillation + augmentation; Kimi K3 
 | AgentCore Memory | llmops_shared_memory (SEMANTIC + EPISODIC) | deploy/04_wire_memory.py | shared across all 7 harnesses |
 | Lambdas ×7 | llmops-{harness-driver,start-pipeline,resume-pipeline,resurrector,webhook,finops-reconcile,monitor-sweep} | deploy/07_lambdas.py | driver: turn-continuation + auto model failover; monitor-sweep: own least-privilege role |
 | Step Functions | llmops-pipeline (STANDARD) | deploy/07_lambdas.py | 29 states; 12 harness tasks on the happy path incl. EvalGenerate/EvalScore and MonitorHealth/MonitorReport, plus the finetune remediation loop, the eval-job retry loop, and three entry modes (full / data_audit / eval_only, the last stopping at the gate verdict) |
-| Triggers | scheduler `llmops-nightly` (DISABLED) · `llmops-finops-daily` (ENABLED, 09:00 UTC) · `llmops-monitor-sweep-daily` (ENABLED, 08:00 UTC) · HTTP API `llmops-triggers` (/webhook, /runs) · secret `llmops/webhook` | deploy/08_triggers.py | endpoint in SSM `/llmops/triggers/api_endpoint`; both daily schedules use FlexibleTimeWindow OFF (each derives its period/id from the current date) |
+| Triggers | scheduler `llmops-nightly` (DISABLED) · `llmops-finops-daily` (ENABLED, 09:00 UTC) · `llmops-monitor-sweep-daily` (ENABLED, 08:00 UTC) · rule `llmops-budget-sweep` (ENABLED, 15 min, from deploy/console/deploy.sh) · HTTP API `llmops-triggers` (/webhook, /runs) · secret `llmops/webhook` | deploy/08_triggers.py | endpoint in SSM `/llmops/triggers/api_endpoint`; both daily schedules use FlexibleTimeWindow OFF (each derives its period/id from the current date) |
 | Admin console | `agent-cicd-admin` stack (Lambda+APIGW+DDB+Cognito) | ops-console deploy.sh | login secret `agent-admin/dashboard-login`; monitors orchestrator + finetune |
 | Online evals | one config per harness (Correctness/GoalSuccessRate/ToolSelectionAccuracy, 100% sampling) | deploy/06_observability.py --evals | role llmops-eval-execution |
 
@@ -111,9 +111,12 @@ Two recurring costs, both agent-turn cost only — every AWS API either of them 
 - the daily **09:00 UTC finops reconcile** at **~$1.5–4.5/month** (~$0.05–0.15 per invocation),
   reading read-only billing APIs;
 - the daily **08:00 UTC monitor sweep** at **~$1–3/month**, reading `sagemaker:ListEndpoints`,
-  `ListTags` and CloudWatch metrics.
+  `ListTags` and CloudWatch metrics;
+- the **15-minute budget sweep** `llmops-budget-sweep` (EventBridge rule → `llmops-admin`,
+  created by `deploy/console/deploy.sh`), ~2,900 invocations/month that return at once while
+  no budget exists; Cost Explorer reads behind it are cached 15 minutes.
 
-These are the only two schedules enabled by default (`llmops-nightly` stays DISABLED because it
+These are the only three schedules enabled by default (`llmops-nightly` stays DISABLED because it
 spends GPU money), for the same reason in both cases: a control that only runs when someone
 remembers to run it is not a control. The sweep runs an hour ahead of the reconcile so what is
 still standing is reported before the auditor tallies what was spent. Each writes one row per
@@ -132,12 +135,17 @@ an over-estimate run and launches it; `describe_budget_actions_for_budget` on
 Nothing in this account halts spend on its own. The references exist to make an overage get
 named — which is why the number was raised rather than deleted.
 
-**Cost v2 budgets (2026-10-12).** The Cost tab's Governance sub-tab adds console budgets
-(`budget#*` rows in the existing `LlmopsAdminRuns` table — no new AWS resource). A budget in
-`block` mode is the first control here that does stop something: `start-run` and task accept
-return HTTP 409 when it would be breached. As deployed, **no budget exists**, so the posture
-above is unchanged until one is created; in-flight hard-stop is phase 2. `llmops-admin` was
-redeployed with Cost v2 on 2026-10-12 (code only; IAM unchanged).
+**Cost v2 budgets and enforcement policy (2026-10-12).** The Cost tab's Governance sub-tab
+adds console budgets (`budget#*` rows in the existing `LlmopsAdminRuns` table) and one
+enforcement policy (`cost-policy` row): alarm + notification is always on; **Block launches
+over budget** and **Stop running jobs over budget** are visible ON/OFF switches, both **OFF**
+as deployed, flippable only by `llmops-approver`. With both OFF the posture above is unchanged —
+a breach alarms and nothing halts. When ON, the first refuses `start-run` / task accept (409)
+and the second lets the 15-minute sweep stop a breached run's execution and in-progress
+training jobs (never endpoints). New AWS pieces: the rule `llmops-budget-sweep` plus its Lambda
+permission, and the IAM statement `CostGuardrailStop` on `LlmopsAdminLambdaRole`
+(`states:StopExecution` on `llmops-pipeline` executions, `sagemaker:StopTrainingJob` on
+`llmops-*` / `arc2v2-*`). No budget exists yet.
 
 The $20,000 figure is the platform owner's instruction of 2026-08-02: this is the project's own
 design-and-test platform, not a customer's production account, and the whole test-proven record

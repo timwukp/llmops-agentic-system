@@ -140,7 +140,7 @@
     },
     {
       "Sid": "IntakeKbVerify",
-      "_comment": "Intake normalization verifies a customer-named Knowledge Base (status + latest ingestion). NAMING TRAP: these are bedrock-agent API calls but IAM authorizes them under the bedrock: action prefix — same class of gotcha as budgets:ViewBudget below. The orchestrator role deliberately does NOT get these; the console checks what the agent cannot.",
+      "_comment": "Intake normalization verifies a customer-named Knowledge Base (status + latest ingestion). NAMING TRAP: these are bedrock-agent API calls but IAM authorizes them under the bedrock: action prefix \u2014 same class of gotcha as budgets:ViewBudget below. The orchestrator role deliberately does NOT get these; the console checks what the agent cannot.",
       "Effect": "Allow",
       "Action": [
         "bedrock:GetKnowledgeBase",
@@ -233,6 +233,20 @@
         "budgets:DescribeBudgets"
       ],
       "Resource": "*"
+    },
+    {
+      "_comment": "The ONLY write the Cost tab's enforcement policy can perform, and only when its 'Stop running jobs over budget' switch is ON (default OFF): budget_sweep stops a breached run's execution of THIS state machine and its in-progress training jobs. Scoped to the two resource families the sweep attributes to the project (COST_JOB_PREFIXES); endpoints are deliberately absent -- teardown stays with the pipeline's own Teardown stage, and DeleteEndpoint is not reversible. The grant exists whether or not the switch is ON; the switch is the policy, IAM is the ceiling.",
+      "Sid": "CostGuardrailStop",
+      "Effect": "Allow",
+      "Action": [
+        "states:StopExecution",
+        "sagemaker:StopTrainingJob"
+      ],
+      "Resource": [
+        "arn:aws:states:REGION:ACCOUNT_ID:execution:llmops-pipeline:*",
+        "arn:aws:sagemaker:REGION:ACCOUNT_ID:training-job/llmops-*",
+        "arn:aws:sagemaker:REGION:ACCOUNT_ID:training-job/arc2v2-*"
+      ]
     },
     {
       "Sid": "InvokeStartPipelineAndSelf",

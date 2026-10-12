@@ -2414,7 +2414,6 @@ COST_JOB_PREFIXES = tuple(p for p in os.environ.get(
 COST_CE_SERVICES = ["Amazon Bedrock", "Amazon SageMaker", "Amazon Bedrock AgentCore",
                     "AWS Lambda", "AWS Step Functions", "Amazon DynamoDB",
                     "Amazon Simple Storage Service", "AmazonCloudWatch"]
-BUDGET_MODES_V2 = ("notify", "block")
 BUDGET_SCOPES_V2 = ("project_monthly", "per_task")
 _RUN_ID_RE = re.compile(r"run-\d{8}T\d{6}Z-[0-9a-f]{8}")
 _COST_CACHE = {}
@@ -2462,6 +2461,10 @@ def _training_job_costs(rates, days):
         rc = d.get("ResourceConfig") or {}
         inst, count = rc.get("InstanceType", ""), int(rc.get("InstanceCount") or 1)
         secs = float(d.get("BillableTimeInSeconds") or d.get("TrainingTimeInSeconds") or 0)
+        if not secs and d.get("TrainingJobStatus") == "InProgress" and d.get("TrainingStartTime"):
+            # A running job has no billable time yet; price the elapsed time so the
+            # budget sweep can see spend accrue while the job is still running.
+            secs = (datetime.now(timezone.utc) - d["TrainingStartTime"]).total_seconds()
         price = _rate(rates, f"sagemaker:training:{inst}")
         hours = secs * count / 3600.0
         m = _RUN_ID_RE.search(n)
@@ -2643,7 +2646,60 @@ def _sum_by(rows, key):
     return out
 
 
-# ── governance: budgets, the gate, the alert feed ────────────────────────────────
+# ── governance: budgets, the enforcement policy, the gate, the sweep, the alert feed ──
+# Enforcement is ONE visible policy with two switches, not a per-budget hidden mode: the
+# operator (and a demo audience) must be able to see what a breach will do before it
+# happens. Both switches default OFF. With both off, a breach is an alarm -- an alert row
+# plus an SNS notification -- and nothing is refused or stopped.
+COST_POLICY_ID = "cost-policy"
+COST_POLICY_DEFAULT = {"block_launches": False, "stop_running": False}
+#: Executions of THIS state machine are the only thing the stop switch may stop; the IAM
+#: grant (iam-policy.json CostGuardrailStop) is scoped to the same two resource families.
+SWEEP_ACTIVE_TASK_STATUSES = ("dispatched", "running", "accepting")
+
+
+def get_cost_policy():
+    pol = dict(COST_POLICY_DEFAULT)
+    if console_tbl:
+        try:
+            it = console_tbl.get_item(Key={"id": COST_POLICY_ID}).get("Item") or {}
+            for k in COST_POLICY_DEFAULT:
+                if k in it:
+                    pol[k] = it[k] is True or str(it[k]).lower() == "true"
+            pol["updated_by"], pol["updated_at"] = it.get("updated_by"), it.get("updated_at")
+        except Exception as e:  # noqa: BLE001 -- unreadable policy reads as the safe default
+            print(f"[budget] policy read failed, using defaults: {e}")
+    return pol
+
+
+def set_cost_policy(body, user):
+    """Flip a switch. Approver group only, and every flip is written to the alert feed so
+    the audit trail says who armed a control and when."""
+    if APPROVER_GROUP not in (user.get("groups") or []):
+        return {"error": f"only {APPROVER_GROUP} may change the enforcement policy",
+                "status_code": 403}
+    if not console_tbl:
+        return {"error": "console table not configured", "status_code": 503}
+    pol = get_cost_policy()
+    changed = []
+    for k in COST_POLICY_DEFAULT:
+        if k in body:
+            v = body[k] is True or str(body[k]).lower() in ("true", "on", "1")
+            if v != pol[k]:
+                changed.append(f"{k} {'ON' if v else 'OFF'}")
+            pol[k] = v
+    if not changed:
+        return {"ok": True, "policy": pol, "changed": []}
+    now = datetime.now(timezone.utc).isoformat()
+    console_tbl.put_item(Item={"id": COST_POLICY_ID, "block_launches": pol["block_launches"],
+                               "stop_running": pol["stop_running"],
+                               "updated_by": user.get("username", ""), "updated_at": now})
+    _record_budget_alert("enforcement policy", "INFO",
+                         f"{user.get('username', '?')} set " + ", ".join(changed), "policy change")
+    pol.update(updated_by=user.get("username", ""), updated_at=now)
+    return {"ok": True, "policy": pol, "changed": changed}
+
+
 def _budgets_raw():
     if not console_tbl:
         return []
@@ -2665,11 +2721,18 @@ def _alerts_raw():
     return [i for i in items if str(i.get("id", "")).startswith("budget-alert#")][:50]
 
 
+def _thresholds(b):
+    try:
+        return sorted(int(x) for x in json.loads(b.get("thresholds") or "[50,80,100]"))
+    except Exception:  # noqa: BLE001
+        return [50, 80, 100]
+
+
 def _budget_view(b, mtd_usd):
     limit = _f(b.get("limit_usd"))
-    th = [int(x) for x in json.loads(b.get("thresholds") or "[50,80,100]")]
+    th = _thresholds(b)
     view = {"id": b.get("id"), "name": b.get("name"), "scope": b.get("scope"),
-            "limit_usd": limit, "mode": b.get("mode", "notify"), "thresholds": th,
+            "limit_usd": limit, "thresholds": th,
             "updated_by": b.get("updated_by"), "updated_at": b.get("updated_at")}
     if b.get("scope") == "project_monthly":
         now = datetime.now(timezone.utc)
@@ -2682,6 +2745,25 @@ def _budget_view(b, mtd_usd):
     else:
         view.update({"state": "per_task_limit", "pct": None})
     return view
+
+
+def _posture(budgets, pol, aws_budgets):
+    return [
+        {"control": "Alarm + notification", "state": "armed" if budgets else "no budgets",
+         "switchable": False,
+         "detail": "always on: the 15-minute sweep and every launch record threshold crossings "
+                   "in the feed and publish them to SNS llmops-escalations"},
+        {"control": "Block launches over budget", "key": "block_launches", "switchable": True,
+         "state": "ON" if pol["block_launches"] else "OFF",
+         "detail": "ON: start-run and task accept are refused (HTTP 409) when a budget would "
+                   "be exceeded. OFF: the launch proceeds and the breach is alarmed"},
+        {"control": "Stop running jobs over budget", "key": "stop_running", "switchable": True,
+         "state": "ON" if pol["stop_running"] else "OFF",
+         "detail": "ON: the sweep stops a breached run's Step Functions execution and its "
+                   "in-progress training jobs (endpoints are left to Teardown). OFF: alarm only"},
+        {"control": "AWS Budgets (account)", "switchable": False,
+         "state": f"{len(aws_budgets)} budget(s)",
+         "detail": "read-only; billed via the payer account, so actuals here can read $0"}]
 
 
 def cost_budgets():
@@ -2699,38 +2781,30 @@ def cost_budgets():
                                 "time_unit": bd.get("TimeUnit")})
     except Exception as e:  # noqa: BLE001
         print(f"[budget] AWS Budgets unavailable: {e}")
-    blocking = [b for b in budgets if b["mode"] == "block"]
-    return {"budgets": budgets, "aws_budgets": aws_budgets, "mtd_usd": mtd,
+    pol = get_cost_policy()
+    return {"budgets": budgets, "aws_budgets": aws_budgets, "mtd_usd": mtd, "policy": pol,
             "alerts": [{"id": a.get("id"), "created_at": a.get("created_at"),
                         "severity": a.get("severity"), "message": a.get("message"),
                         "budget": a.get("budget"), "action": a.get("action")}
                        for a in _alerts_raw()],
-            "posture": [
-                {"control": "Budget alerts (notify)", "state": "armed" if budgets else "no budgets",
-                 "detail": "threshold crossings are recorded in the feed and published to SNS llmops-escalations"},
-                {"control": "Block at launch", "state": f"armed on {len(blocking)} budget(s)" if blocking else "not armed",
-                 "detail": "start-run and task accept are refused (HTTP 409) when a blocking budget would be exceeded"},
-                {"control": "AWS Budgets (account)", "state": f"{len(aws_budgets)} budget(s)",
-                 "detail": "read-only; billed via the payer account, so actuals here can read $0"},
-                {"control": "Hard-stop in-flight runs", "state": "phase 2 — not armed",
-                 "detail": "the harness driver does not yet stop a running stage on budget breach"}]}
+            "posture": _posture(budgets, pol, aws_budgets)}
 
 
 def save_budget(body, user):
     name = str(body.get("name") or "").strip()[:60]
-    scope, mode = body.get("scope"), body.get("mode", "notify")
+    scope = body.get("scope")
     try:
         limit = float(body.get("limit_usd"))
     except (TypeError, ValueError):
         limit = -1
-    if not name or scope not in BUDGET_SCOPES_V2 or mode not in BUDGET_MODES_V2 or limit <= 0:
-        return {"error": f"need name, scope in {BUDGET_SCOPES_V2}, mode in {BUDGET_MODES_V2}, "
-                         "limit_usd > 0", "status_code": 400}
+    if not name or scope not in BUDGET_SCOPES_V2 or limit <= 0:
+        return {"error": f"need name, scope in {BUDGET_SCOPES_V2}, limit_usd > 0",
+                "status_code": 400}
     if not console_tbl:
         return {"error": "console table not configured", "status_code": 503}
     th = sorted({int(x) for x in (body.get("thresholds") or [50, 80, 100]) if 0 < int(x) <= 200})
     slug = re.sub(r"[^a-z0-9-]+", "-", name.lower()).strip("-")[:40] or "budget"
-    item = {"id": f"budget#{slug}", "name": name, "scope": scope, "mode": mode,
+    item = {"id": f"budget#{slug}", "name": name, "scope": scope,
             "limit_usd": str(limit), "thresholds": json.dumps(th),
             "updated_by": user.get("username", ""),
             "updated_at": datetime.now(timezone.utc).isoformat()}
@@ -2738,39 +2812,47 @@ def save_budget(body, user):
     return {"ok": True, "budget": _budget_view(item, 0.0)}
 
 
-def _record_budget_alert(budget, severity, message, action):
+def _record_budget_alert(budget, severity, message, action, alert_id=None):
+    """One alert row + one SNS publish, each wrapped on its own: a notification channel
+    failing must never change what the gate or the sweep decided. `alert_id` makes the
+    write idempotent for the sweep (one alert per budget, threshold and month)."""
     now = datetime.now(timezone.utc).isoformat()
+    aid = alert_id or f"budget-alert#{now}#{secrets.token_hex(3)}"
     if console_tbl:
         try:
-            console_tbl.put_item(Item={"id": f"budget-alert#{now}#{secrets.token_hex(3)}",
-                                       "created_at": now, "severity": severity,
+            if alert_id and console_tbl.get_item(Key={"id": aid}).get("Item"):
+                return False
+            console_tbl.put_item(Item={"id": aid, "created_at": now, "severity": severity,
                                        "budget": budget, "message": message[:500],
                                        "action": action})
         except Exception as e:  # noqa: BLE001
             print(f"[budget] alert record failed: {e}")
-    if LLMOPS_SNS_TOPIC:
-        try:  # its own channel, wrapped: a failed publish must not change the gate's answer
+    if LLMOPS_SNS_TOPIC and severity != "INFO":
+        try:
             boto3.client("sns", region_name=REGION).publish(
                 TopicArn=LLMOPS_SNS_TOPIC, Subject=f"[llmops budget] {severity}"[:99],
                 Message=message)
         except Exception as e:  # noqa: BLE001
             print(f"[budget] SNS publish failed: {e}")
+    return True
 
 
 def budget_gate(est_usd, context=""):
-    """Evaluate every budget against a launch. notify -> record + allow; block -> refuse."""
+    """Evaluate every budget against a launch. Always alarms on a breach; refuses only
+    when the policy's block_launches switch is ON."""
     try:
         raw = _budgets_raw()
         if not raw:
             return {"allowed": True, "breaches": []}
         mtd = (cost_v2(30).get("overview") or {}).get("mtd_usd", 0.0)
+        block = get_cost_policy()["block_launches"]
     except Exception as e:  # noqa: BLE001
         print(f"[budget] gate could not evaluate: {e}")
         return {"allowed": True, "breaches": [], "note": "budgets unreadable"}
     est = _f(est_usd)
-    breaches, allowed = [], True
+    breaches = []
     for b in raw:
-        limit, mode = _f(b.get("limit_usd")), b.get("mode", "notify")
+        limit = _f(b.get("limit_usd"))
         if b.get("scope") == "project_monthly":
             over, msg = mtd + est > limit, (f"{b.get('name')}: month-to-date ${mtd:,.2f} + "
                                             f"this launch ${est:,.2f} > ${limit:,.2f}")
@@ -2778,18 +2860,121 @@ def budget_gate(est_usd, context=""):
             over, msg = est > limit, f"{b.get('name')}: estimate ${est:,.2f} > per-task ${limit:,.2f}"
         if not over:
             continue
-        blocked = mode == "block"
-        allowed = allowed and not blocked
-        breaches.append({"budget": b.get("name"), "mode": mode, "message": msg, "blocked": blocked})
-        _record_budget_alert(b.get("name"), "CRITICAL" if blocked else "WARNING",
-                             f"{msg} ({context})", "blocked launch" if blocked else "notified")
-    return {"allowed": allowed, "breaches": breaches}
+        breaches.append({"budget": b.get("name"), "message": msg, "blocked": block})
+        _record_budget_alert(b.get("name"), "CRITICAL" if block else "WARNING",
+                             f"{msg} ({context})",
+                             "blocked launch (block_launches ON)" if block
+                             else "notified; launch proceeded (block_launches OFF)")
+    return {"allowed": not (block and breaches), "breaches": breaches,
+            "block_launches": block}
 
 
 def _gate_refusal(gate):
     return {"error": "blocked by budget: " + "; ".join(x["message"] for x in gate["breaches"]
                                                       if x["blocked"]),
             "budget_gate": gate, "status_code": 409}
+
+
+def _running_runs():
+    """In-flight executions of this project's state machine, with their run ids."""
+    out = []
+    try:
+        arn = f"arn:aws:states:{REGION}:{ACCOUNT_ID}:stateMachine:{STATE_MACHINE}"
+        for e in sfn.list_executions(stateMachineArn=arn, statusFilter="RUNNING",
+                                     maxResults=50).get("executions", []):
+            run_id = ""
+            try:
+                run_id = json.loads(sfn.describe_execution(
+                    executionArn=e["executionArn"]).get("input") or "{}").get("run_id", "")
+            except Exception:  # noqa: BLE001
+                pass
+            out.append({"execution_arn": e["executionArn"], "run_id": run_id or e["name"]})
+    except Exception as e:  # noqa: BLE001
+        print(f"[sweep] list_executions failed: {e}")
+    return out
+
+
+def _stop_run(run, jobs, reason):
+    """Stop one run: its execution, then its in-progress training jobs. Endpoints are
+    deliberately left to the pipeline's own Teardown stage."""
+    stopped = []
+    try:
+        sfn.stop_execution(executionArn=run["execution_arn"], error="BudgetExceeded",
+                           cause=reason[:250])
+        stopped.append("execution")
+    except Exception as e:  # noqa: BLE001
+        print(f"[sweep] stop_execution failed: {e}")
+    for j in jobs:
+        if j.get("run_id") == run["run_id"] and j.get("status") == "InProgress":
+            try:
+                sm.stop_training_job(TrainingJobName=j["resource_id"])
+                stopped.append(j["resource_id"])
+            except Exception as e:  # noqa: BLE001
+                print(f"[sweep] stop_training_job {j['resource_id']} failed: {e}")
+    return stopped
+
+
+def budget_sweep(trigger="schedule"):
+    """The running-job alarm. Every budget is evaluated against spend so far; each
+    threshold crossing alarms once per month. If stop_running is ON, a breached budget
+    stops the in-flight runs it covers. Invoked by the 15-minute schedule
+    (llmops-budget-sweep) and by the portal's 'Run budget check now' button."""
+    raw = _budgets_raw()
+    pol = get_cost_policy()
+    result = {"trigger": trigger, "budgets": len(raw), "alerts": 0, "stopped": [],
+              "policy": pol, "running_runs": 0}
+    if not raw:
+        return result
+    v = cost_v2(30)
+    mtd = (v.get("overview") or {}).get("mtd_usd", 0.0)
+    jobs = (v.get("detail") or {}).get("line_items", [])
+    run_cost = {}
+    for j in jobs:
+        if j.get("run_id"):
+            run_cost[j["run_id"]] = run_cost.get(j["run_id"], 0.0) + _f(j.get("cost_usd"))
+    running = _running_runs()
+    result["running_runs"] = len(running)
+    month = datetime.now(timezone.utc).strftime("%Y-%m")
+    to_stop = {}
+    for b in raw:
+        name, limit = b.get("name"), _f(b.get("limit_usd"))
+        slug = str(b.get("id", "")).split("#", 1)[-1]
+        if limit <= 0:
+            continue
+        if b.get("scope") == "project_monthly":
+            pct = 100.0 * mtd / limit
+            for th in _thresholds(b):
+                if pct >= th:
+                    sev = "CRITICAL" if th >= 100 else "WARNING"
+                    if _record_budget_alert(name, sev, f"{name}: month-to-date ${mtd:,.2f} "
+                                            f"crossed {th}% of ${limit:,.2f}",
+                                            "alarm", f"budget-alert#{month}#{slug}#{th}"):
+                        result["alerts"] += 1
+            if mtd >= limit:
+                for r in running:
+                    to_stop[r["run_id"]] = (r, f"{name}: month-to-date ${mtd:,.2f} >= ${limit:,.2f}")
+        else:
+            for r in running:
+                spent = run_cost.get(r["run_id"], 0.0)
+                if spent > limit:
+                    if _record_budget_alert(name, "CRITICAL", f"{name}: run {r['run_id']} has "
+                                            f"spent ${spent:,.2f} > per-task ${limit:,.2f}",
+                                            "alarm", f"budget-alert#{month}#{slug}#{r['run_id']}"):
+                        result["alerts"] += 1
+                    to_stop[r["run_id"]] = (r, f"{name}: run spent ${spent:,.2f} > ${limit:,.2f}")
+    for run_id, (r, reason) in to_stop.items():
+        if pol["stop_running"]:
+            stopped = _stop_run(r, jobs, reason)
+            result["stopped"].append({"run_id": run_id, "stopped": stopped})
+            _record_budget_alert("enforcement policy", "CRITICAL",
+                                 f"stopped {run_id} ({', '.join(stopped) or 'nothing stoppable'}): {reason}",
+                                 "stopped running job (stop_running ON)")
+        else:
+            _record_budget_alert("enforcement policy", "WARNING",
+                                 f"{run_id} is over budget and still running: {reason}",
+                                 "notified; not stopped (stop_running OFF)",
+                                 f"budget-alert#{month}#nostop#{run_id}")
+    return result
 
 
 def rate_card_health(plan=None):
@@ -5172,6 +5357,11 @@ def handler(event, context):
                                         ExpressionAttributeValues={":s": "error", ":e": str(e)[:300]})
         return {"ok": True}
 
+    # Scheduled budget sweep (EventBridge rule llmops-budget-sweep, constant Input), so
+    # the running-job alarm fires even when nobody has the portal open.
+    if isinstance(event, dict) and event.get("mode") == "budget-sweep":
+        return budget_sweep("schedule")
+
     rc = (event.get("requestContext") or {}).get("http") or {}
     method = rc.get("method", "GET")
     path = rc.get("path", "/")
@@ -5337,6 +5527,10 @@ def handler(event, context):
                 return _resp_result(start_run(body))
             if path == "/api/cost/budgets":
                 return _resp_result(save_budget(body, user))
+            if path == "/api/cost/policy":
+                return _resp_result(set_cost_policy(body, user))
+            if path == "/api/cost/sweep":
+                return _resp(200, budget_sweep("manual"))
             if path == "/api/cost-estimate":
                 return _resp_result(create_estimate(body, user["username"], now))
             if path == "/api/cost-approval-request":
