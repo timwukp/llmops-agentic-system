@@ -5,6 +5,26 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
 ## [Unreleased]
 
+### Cost tab v2: spend visibility and budget governance
+
+The Cost tab opens on six sub-tabs — Overview, Usage, By task, Breakdown, Detail, Governance —
+and every figure carries its basis (`attributed`, `estimate`, `billed`, `account-wide`).
+
+- **Visibility prices real usage.** `llmops-cost-actuals` held 164 rows live and none was a
+  cost row (all `#audit#`), so v1 read $0.00 while 68 training jobs had run. `GET
+  /api/cost/v2` prices project training jobs (name-prefix match, billable seconds × the S3 rate
+  card) and Bedrock tokens (CloudWatch by `ModelId`, account-wide), and shows Cost Explorer
+  billed beside them, cached 15 min. Live 90-day read: $74.96 attributed training across 68
+  jobs, $4,212 token estimate, per-task estimate vs actual (e.g. $164.50 estimated, $49.13
+  attributed).
+- **Governance.** Budgets (`project_monthly` or `per_task`, mode `notify` or `block`) with
+  forecast, guardrail posture, alert feed and AWS Budgets. `budget_gate()` runs at start-run
+  and task accept: `notify` records + publishes (wrapped), `block` returns 409. In-flight
+  hard-stop is not armed (phase 2) and the posture table says so.
+- The v1 estimator, approval queue and rate-card health stay under Governance until phase 2.
+- 11 offline tests in `tests/test_console_cost_v2.py`. Evidence:
+  `deploy/evidence/VERIFICATION_cost_v2.md`.
+
 ### A generation job's output is now deliverable: `generate_student.py --max-seconds`
 
 A trainer that overruns `MaxRuntimeInSeconds` keeps its checkpoints; `/opt/ml/checkpoints`

@@ -2398,6 +2398,400 @@ def cost_overview(period_days=30):
     }
 
 
+# ── Cost v2: visibility (what was spent, on what, for which task) + governance ──
+# The finops reconcile has, live, written zero attributed cost rows (164 rows in
+# llmops-cost-actuals, every one #audit#), so v2 does not wait on it: it prices the
+# usage the pipeline demonstrably left behind -- SageMaker training jobs by billable
+# seconds, Bedrock tokens from CloudWatch -- against the same S3 rate card the estimator
+# uses, and shows Cost Explorer's billed figures beside them, never summed into them.
+# Every figure carries its basis: attributed / account-wide / estimate / billed.
+
+#: Training-job name prefixes that are this project's. Explicit, never "all SageMaker":
+#: the account carries unrelated training jobs (dr-sm-rltj-*, pipelines-*, xgboost...).
+COST_JOB_PREFIXES = tuple(p for p in os.environ.get(
+    "COST_JOB_PREFIXES", "llmops-,arc2v2-").split(",") if p)
+#: Cost Explorer services shown as billed, account-wide context for this workload.
+COST_CE_SERVICES = ["Amazon Bedrock", "Amazon SageMaker", "Amazon Bedrock AgentCore",
+                    "AWS Lambda", "AWS Step Functions", "Amazon DynamoDB",
+                    "Amazon Simple Storage Service", "AmazonCloudWatch"]
+BUDGET_MODES_V2 = ("notify", "block")
+BUDGET_SCOPES_V2 = ("project_monthly", "per_task")
+_RUN_ID_RE = re.compile(r"run-\d{8}T\d{6}Z-[0-9a-f]{8}")
+_COST_CACHE = {}
+COST_CACHE_S = 900  # CE bills $0.01/request; one page view must not cost one each
+
+
+def _cached(key, fn, ttl=COST_CACHE_S):
+    hit = _COST_CACHE.get(key)
+    if hit and time.time() - hit[0] < ttl:
+        return hit[1]
+    val = fn()
+    _COST_CACHE[key] = (time.time(), val)
+    return val
+
+
+def _rate(rates, sku):
+    v = rates.get(sku) if isinstance(rates, dict) else None
+    try:
+        return float(v.get("unit_price")) if isinstance(v, dict) else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _training_job_costs(rates, days):
+    """This project's training jobs in the window, priced by billable seconds."""
+    since = datetime.now(timezone.utc) - timedelta(days=int(days))
+    names, token = [], None
+    for _ in range(10):
+        kw = {"CreationTimeAfter": since, "MaxResults": 100}
+        if token:
+            kw["NextToken"] = token
+        r = sm.list_training_jobs(**kw)
+        names += [j["TrainingJobName"] for j in r.get("TrainingJobSummaries", [])
+                  if j["TrainingJobName"].startswith(COST_JOB_PREFIXES)]
+        token = r.get("NextToken")
+        if not token:
+            break
+    out = []
+    for n in names[:120]:
+        try:
+            d = sm.describe_training_job(TrainingJobName=n)
+        except Exception as e:  # noqa: BLE001
+            print(f"[cost] describe {n} failed: {e}")
+            continue
+        rc = d.get("ResourceConfig") or {}
+        inst, count = rc.get("InstanceType", ""), int(rc.get("InstanceCount") or 1)
+        secs = float(d.get("BillableTimeInSeconds") or d.get("TrainingTimeInSeconds") or 0)
+        price = _rate(rates, f"sagemaker:training:{inst}")
+        hours = secs * count / 3600.0
+        m = _RUN_ID_RE.search(n)
+        out.append({
+            "resource_id": n, "category": "sagemaker_training", "service": "Amazon SageMaker",
+            "instance": inst, "quantity": round(hours, 4), "unit": "instance-hours",
+            "unit_price": price, "cost_usd": round(hours * price, 4) if price else 0.0,
+            "priced": price is not None, "status": d.get("TrainingJobStatus"),
+            "day": str(d.get("CreationTime", ""))[:10],
+            "run_id": m.group(0) if m else "", "basis": "attributed"})
+    return out
+
+
+def _bedrock_token_costs(rates, days):
+    """Bedrock tokens by model, daily, from CloudWatch -- ACCOUNT-WIDE (no per-harness
+    dimension exists), so this is context for the agents' spend, not attributed to it."""
+    model_ids = set()
+    try:
+        for p in cw.get_paginator("list_metrics").paginate(
+                Namespace="AWS/Bedrock", MetricName="InputTokenCount"):
+            for m in p.get("Metrics", []):
+                for dm in m.get("Dimensions", []):
+                    if dm["Name"] == "ModelId":
+                        model_ids.add(dm["Value"])
+    except Exception as e:  # noqa: BLE001
+        print(f"[cost] list_metrics failed: {e}")
+    model_ids = sorted(model_ids)[:20]
+    if not model_ids:
+        return []
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=int(days))
+    queries = []
+    for i, mid in enumerate(model_ids):
+        for kind, metric in (("in", "InputTokenCount"), ("out", "OutputTokenCount")):
+            queries.append({"Id": f"{kind}{i}", "ReturnData": True, "MetricStat": {
+                "Metric": {"Namespace": "AWS/Bedrock", "MetricName": metric,
+                           "Dimensions": [{"Name": "ModelId", "Value": mid}]},
+                "Period": 86400, "Stat": "Sum"}})
+    series = {}
+    try:
+        r = cw.get_metric_data(MetricDataQueries=queries, StartTime=start, EndTime=end)
+        for res in r.get("MetricDataResults", []):
+            series[res["Id"]] = list(zip([str(t)[:10] for t in res.get("Timestamps", [])],
+                                         res.get("Values", [])))
+    except Exception as e:  # noqa: BLE001
+        print(f"[cost] get_metric_data failed: {e}")
+    out = []
+    for i, mid in enumerate(model_ids):
+        pin, pout = _rate(rates, f"bedrock:{mid}:input-tokens"), _rate(rates, f"bedrock:{mid}:output-tokens")
+        daily = {}
+        for kind, price in (("in", pin), ("out", pout)):
+            for day, v in series.get(f"{kind}{i}", []):
+                dd = daily.setdefault(day, {"in": 0.0, "out": 0.0, "usd": 0.0})
+                dd[kind] += v
+                dd["usd"] += (v / 1000.0) * price if price else 0.0
+        tin = sum(d["in"] for d in daily.values())
+        tout = sum(d["out"] for d in daily.values())
+        if not (tin or tout):
+            continue
+        out.append({"model_id": mid, "input_tokens": int(tin), "output_tokens": int(tout),
+                    "cost_usd": round(sum(d["usd"] for d in daily.values()), 4),
+                    "priced": pin is not None and pout is not None,
+                    "daily": {k: round(v["usd"], 4) for k, v in sorted(daily.items())},
+                    "basis": "account-wide estimate"})
+    out.sort(key=lambda x: -x["cost_usd"])
+    return out
+
+
+def _ce_billed(days):
+    """Cost Explorer daily unblended cost for the workload's services. Account-wide."""
+    end = datetime.now(timezone.utc).date() + timedelta(days=1)
+    start = end - timedelta(days=int(days) + 1)
+    r = boto3.client("ce", region_name="us-east-1").get_cost_and_usage(
+        TimePeriod={"Start": start.isoformat(), "End": end.isoformat()},
+        Granularity="DAILY", Metrics=["UnblendedCost"],
+        Filter={"Dimensions": {"Key": "SERVICE", "Values": COST_CE_SERVICES}},
+        GroupBy=[{"Type": "DIMENSION", "Key": "SERVICE"}])
+    daily, by_svc = {}, {}
+    for t in r.get("ResultsByTime", []):
+        day = t["TimePeriod"]["Start"]
+        for g in t.get("Groups", []):
+            v = float(g["Metrics"]["UnblendedCost"]["Amount"])
+            daily.setdefault(day, {})[g["Keys"][0]] = round(v, 4)
+            by_svc[g["Keys"][0]] = round(by_svc.get(g["Keys"][0], 0.0) + v, 4)
+    return {"daily": daily, "by_service": dict(sorted(by_svc.items(), key=lambda kv: -kv[1])),
+            "total_usd": round(sum(by_svc.values()), 2), "basis": "billed, account-wide",
+            "lag_note": "Cost Explorer settles ~24h late"}
+
+
+def _tasks_for_cost():
+    if not tasks_tbl:
+        return []
+    try:
+        items, _ = _scan_ordered(tasks_tbl, lambda i: str(i.get("created_at", "")))
+    except Exception as e:  # noqa: BLE001
+        print(f"[cost] tasks scan failed: {e}")
+        return []
+    out = []
+    for t in items[:200]:
+        runs = [r for r in (t.get("run_id"), t.get("prior_run_id")) if r]
+        out.append({"task_id": t.get("id"), "status": t.get("status"),
+                    "task_type": t.get("task_type", ""),
+                    "goal": str(t.get("goal") or t.get("plan_summary") or "")[:120],
+                    "created_at": t.get("created_at"), "runs": runs,
+                    "estimate_usd": _f(t.get("cost_estimate_usd"))})
+    return out
+
+
+def cost_v2(days=30):
+    """One payload for the Cost tab's visibility sub-tabs."""
+    days = max(1, min(int(days or 30), 90))
+    doc = _rate_card_doc() or {}
+    rates = doc.get("rates") or {}
+    errors = {}
+
+    def safe(name, fn, default):
+        try:
+            return fn()
+        except Exception as e:  # noqa: BLE001 -- one source down must not blank the tab
+            errors[name] = f"{type(e).__name__}: {e}"[:300]
+            return default
+    jobs = safe("training", lambda: _cached(f"jobs{days}", lambda: _training_job_costs(rates, days)), [])
+    tokens = safe("bedrock", lambda: _cached(f"tok{days}", lambda: _bedrock_token_costs(rates, days)), [])
+    billed = safe("cost_explorer", lambda: _cached(f"ce{days}", lambda: _ce_billed(days)), {})
+    tasks = safe("tasks", _tasks_for_cost, [])
+
+    by_run = {}
+    for j in jobs:
+        if j["run_id"]:
+            by_run[j["run_id"]] = round(by_run.get(j["run_id"], 0.0) + j["cost_usd"], 4)
+    task_runs = set()
+    for t in tasks:
+        t["actual_usd"] = round(sum(by_run.get(r, 0.0) for r in t["runs"]), 4)
+        t["variance_usd"] = round(t["actual_usd"] - t["estimate_usd"], 4)
+        task_runs.update(t["runs"])
+    direct = [{"run_id": r, "actual_usd": v} for r, v in by_run.items() if r not in task_runs]
+    unlinked = round(sum(j["cost_usd"] for j in jobs if not j["run_id"]), 4)
+
+    attributed = round(sum(j["cost_usd"] for j in jobs), 2)
+    token_usd = round(sum(m["cost_usd"] for m in tokens), 2)
+    daily = {}
+    for j in jobs:
+        daily.setdefault(j["day"], {}).setdefault("training", 0.0)
+        daily[j["day"]]["training"] = round(daily[j["day"]]["training"] + j["cost_usd"], 4)
+    for m in tokens:
+        for day, v in m["daily"].items():
+            daily.setdefault(day, {}).setdefault("bedrock tokens", 0.0)
+            daily[day]["bedrock tokens"] = round(daily[day]["bedrock tokens"] + v, 4)
+    month = datetime.now(timezone.utc).strftime("%Y-%m")
+    mtd = round(sum(sum(v.values()) for d, v in daily.items() if d.startswith(month)), 2)
+    return {
+        "days": days, "generated_at": datetime.now(timezone.utc).isoformat(),
+        "rate_card_as_of": doc.get("generated_at", ""), "n_rates": len(rates),
+        "overview": {"attributed_usd": attributed, "token_estimate_usd": token_usd,
+                     "workload_usd": round(attributed + token_usd, 2), "mtd_usd": mtd,
+                     "billed_usd": billed.get("total_usd"), "n_training_jobs": len(jobs),
+                     "n_tasks": len(tasks), "daily": dict(sorted(daily.items()))},
+        "usage": {"models": tokens, "training_hours": round(sum(j["quantity"] for j in jobs), 2),
+                  "instances": sorted({j["instance"] for j in jobs})},
+        "by_task": {"tasks": tasks, "direct_runs": direct, "unlinked_usd": unlinked},
+        "breakdown": {"by_category": {"sagemaker_training": attributed,
+                                      "bedrock_tokens (account-wide)": token_usd},
+                      "by_model": {m["model_id"]: m["cost_usd"] for m in tokens},
+                      "by_instance": _sum_by(jobs, "instance"),
+                      "by_run": dict(sorted(by_run.items(), key=lambda kv: -kv[1])[:25]),
+                      "billed_by_service": billed.get("by_service", {})},
+        "detail": {"line_items": sorted(jobs, key=lambda j: j["day"], reverse=True),
+                   "billed_daily": billed.get("daily", {}),
+                   "unpriced": [j["resource_id"] for j in jobs if not j["priced"]]
+                   + [m["model_id"] for m in tokens if not m["priced"]]},
+        "errors": errors,
+    }
+
+
+def _sum_by(rows, key):
+    out = {}
+    for r in rows:
+        out[r.get(key) or "unknown"] = round(out.get(r.get(key) or "unknown", 0.0) + r["cost_usd"], 4)
+    return out
+
+
+# ── governance: budgets, the gate, the alert feed ────────────────────────────────
+def _budgets_raw():
+    if not console_tbl:
+        return []
+    try:
+        items, _ = _scan_ordered(console_tbl, lambda i: str(i.get("id", "")), reverse=False)
+    except Exception as e:  # noqa: BLE001
+        print(f"[budget] scan failed: {e}")
+        return []
+    return [i for i in items if str(i.get("id", "")).startswith("budget#")]
+
+
+def _alerts_raw():
+    if not console_tbl:
+        return []
+    try:
+        items, _ = _scan_ordered(console_tbl, lambda i: str(i.get("created_at", "")))
+    except Exception:  # noqa: BLE001
+        return []
+    return [i for i in items if str(i.get("id", "")).startswith("budget-alert#")][:50]
+
+
+def _budget_view(b, mtd_usd):
+    limit = _f(b.get("limit_usd"))
+    th = [int(x) for x in json.loads(b.get("thresholds") or "[50,80,100]")]
+    view = {"id": b.get("id"), "name": b.get("name"), "scope": b.get("scope"),
+            "limit_usd": limit, "mode": b.get("mode", "notify"), "thresholds": th,
+            "updated_by": b.get("updated_by"), "updated_at": b.get("updated_at")}
+    if b.get("scope") == "project_monthly":
+        now = datetime.now(timezone.utc)
+        dim = (now.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)
+        forecast = round(mtd_usd / max(now.day, 1) * dim.day, 2)
+        pct = round(100.0 * mtd_usd / limit, 1) if limit else 0.0
+        state = ("over" if mtd_usd >= limit else "forecast_over" if forecast > limit
+                 else "warning" if pct >= (th[1] if len(th) > 1 else 80) else "on_track")
+        view.update({"actual_usd": mtd_usd, "forecast_usd": forecast, "pct": pct, "state": state})
+    else:
+        view.update({"state": "per_task_limit", "pct": None})
+    return view
+
+
+def cost_budgets():
+    mtd = (cost_v2(30).get("overview") or {}).get("mtd_usd", 0.0)
+    budgets = [_budget_view(b, mtd) for b in _budgets_raw()]
+    aws_budgets = []
+    try:
+        for bd in boto3.client("budgets", region_name=REGION).describe_budgets(
+                AccountId=ACCOUNT_ID, MaxResults=20).get("Budgets", []):
+            cs = bd.get("CalculatedSpend") or {}
+            aws_budgets.append({"name": bd.get("BudgetName"),
+                                "limit_usd": _f((bd.get("BudgetLimit") or {}).get("Amount")),
+                                "actual_usd": _f((cs.get("ActualSpend") or {}).get("Amount")),
+                                "forecast_usd": _f((cs.get("ForecastedSpend") or {}).get("Amount")),
+                                "time_unit": bd.get("TimeUnit")})
+    except Exception as e:  # noqa: BLE001
+        print(f"[budget] AWS Budgets unavailable: {e}")
+    blocking = [b for b in budgets if b["mode"] == "block"]
+    return {"budgets": budgets, "aws_budgets": aws_budgets, "mtd_usd": mtd,
+            "alerts": [{"id": a.get("id"), "created_at": a.get("created_at"),
+                        "severity": a.get("severity"), "message": a.get("message"),
+                        "budget": a.get("budget"), "action": a.get("action")}
+                       for a in _alerts_raw()],
+            "posture": [
+                {"control": "Budget alerts (notify)", "state": "armed" if budgets else "no budgets",
+                 "detail": "threshold crossings are recorded in the feed and published to SNS llmops-escalations"},
+                {"control": "Block at launch", "state": f"armed on {len(blocking)} budget(s)" if blocking else "not armed",
+                 "detail": "start-run and task accept are refused (HTTP 409) when a blocking budget would be exceeded"},
+                {"control": "AWS Budgets (account)", "state": f"{len(aws_budgets)} budget(s)",
+                 "detail": "read-only; billed via the payer account, so actuals here can read $0"},
+                {"control": "Hard-stop in-flight runs", "state": "phase 2 — not armed",
+                 "detail": "the harness driver does not yet stop a running stage on budget breach"}]}
+
+
+def save_budget(body, user):
+    name = str(body.get("name") or "").strip()[:60]
+    scope, mode = body.get("scope"), body.get("mode", "notify")
+    try:
+        limit = float(body.get("limit_usd"))
+    except (TypeError, ValueError):
+        limit = -1
+    if not name or scope not in BUDGET_SCOPES_V2 or mode not in BUDGET_MODES_V2 or limit <= 0:
+        return {"error": f"need name, scope in {BUDGET_SCOPES_V2}, mode in {BUDGET_MODES_V2}, "
+                         "limit_usd > 0", "status_code": 400}
+    if not console_tbl:
+        return {"error": "console table not configured", "status_code": 503}
+    th = sorted({int(x) for x in (body.get("thresholds") or [50, 80, 100]) if 0 < int(x) <= 200})
+    slug = re.sub(r"[^a-z0-9-]+", "-", name.lower()).strip("-")[:40] or "budget"
+    item = {"id": f"budget#{slug}", "name": name, "scope": scope, "mode": mode,
+            "limit_usd": str(limit), "thresholds": json.dumps(th),
+            "updated_by": user.get("username", ""),
+            "updated_at": datetime.now(timezone.utc).isoformat()}
+    console_tbl.put_item(Item=item)
+    return {"ok": True, "budget": _budget_view(item, 0.0)}
+
+
+def _record_budget_alert(budget, severity, message, action):
+    now = datetime.now(timezone.utc).isoformat()
+    if console_tbl:
+        try:
+            console_tbl.put_item(Item={"id": f"budget-alert#{now}#{secrets.token_hex(3)}",
+                                       "created_at": now, "severity": severity,
+                                       "budget": budget, "message": message[:500],
+                                       "action": action})
+        except Exception as e:  # noqa: BLE001
+            print(f"[budget] alert record failed: {e}")
+    if LLMOPS_SNS_TOPIC:
+        try:  # its own channel, wrapped: a failed publish must not change the gate's answer
+            boto3.client("sns", region_name=REGION).publish(
+                TopicArn=LLMOPS_SNS_TOPIC, Subject=f"[llmops budget] {severity}"[:99],
+                Message=message)
+        except Exception as e:  # noqa: BLE001
+            print(f"[budget] SNS publish failed: {e}")
+
+
+def budget_gate(est_usd, context=""):
+    """Evaluate every budget against a launch. notify -> record + allow; block -> refuse."""
+    try:
+        raw = _budgets_raw()
+        if not raw:
+            return {"allowed": True, "breaches": []}
+        mtd = (cost_v2(30).get("overview") or {}).get("mtd_usd", 0.0)
+    except Exception as e:  # noqa: BLE001
+        print(f"[budget] gate could not evaluate: {e}")
+        return {"allowed": True, "breaches": [], "note": "budgets unreadable"}
+    est = _f(est_usd)
+    breaches, allowed = [], True
+    for b in raw:
+        limit, mode = _f(b.get("limit_usd")), b.get("mode", "notify")
+        if b.get("scope") == "project_monthly":
+            over, msg = mtd + est > limit, (f"{b.get('name')}: month-to-date ${mtd:,.2f} + "
+                                            f"this launch ${est:,.2f} > ${limit:,.2f}")
+        else:
+            over, msg = est > limit, f"{b.get('name')}: estimate ${est:,.2f} > per-task ${limit:,.2f}"
+        if not over:
+            continue
+        blocked = mode == "block"
+        allowed = allowed and not blocked
+        breaches.append({"budget": b.get("name"), "mode": mode, "message": msg, "blocked": blocked})
+        _record_budget_alert(b.get("name"), "CRITICAL" if blocked else "WARNING",
+                             f"{msg} ({context})", "blocked launch" if blocked else "notified")
+    return {"allowed": allowed, "breaches": breaches}
+
+
+def _gate_refusal(gate):
+    return {"error": "blocked by budget: " + "; ".join(x["message"] for x in gate["breaches"]
+                                                      if x["blocked"]),
+            "budget_gate": gate, "status_code": 409}
+
+
 def rate_card_health(plan=None):
     """What the rate card knows and what it admits it does not.
 
@@ -4831,6 +5225,10 @@ def handler(event, context):
         if method == "GET" and path == "/api/optimizations":
             return _resp(200, {"recommendations": list_optimizations(),
                                "native": list_native_recommendations()})
+        if method == "GET" and path == "/api/cost/v2":
+            return _resp(200, cost_v2(qs.get("days", 30)))
+        if method == "GET" and path == "/api/cost/budgets":
+            return _resp(200, cost_budgets())
         if method == "GET" and path == "/api/cost-overview":
             out = cost_overview(qs.get("days", 30))
             out["rate_card"] = rate_card_health()
@@ -4923,13 +5321,22 @@ def handler(event, context):
                     if action == "message":
                         return _resp_result(post_task_message(tid, body, user))
                     if action == "accept":
+                        _t = _task_get(tid) or {}
+                        gate = budget_gate(_t.get("cost_estimate_usd"), f"accept {tid}")
+                        if not gate["allowed"]:
+                            return _resp_result(_gate_refusal(gate))
                         return _resp_result(accept_task(tid, user))
                     if action == "close":
                         return _resp_result(close_task(tid, body, user))
             if path == "/api/data-upload-url":
                 return _resp_result(data_upload_url(body, user))
             if path == "/api/start-run":
+                gate = budget_gate(body.get("estimate_usd") or 0, "start-run")
+                if not gate["allowed"]:
+                    return _resp_result(_gate_refusal(gate))
                 return _resp_result(start_run(body))
+            if path == "/api/cost/budgets":
+                return _resp_result(save_budget(body, user))
             if path == "/api/cost-estimate":
                 return _resp_result(create_estimate(body, user["username"], now))
             if path == "/api/cost-approval-request":

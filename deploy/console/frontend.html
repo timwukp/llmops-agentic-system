@@ -186,6 +186,9 @@
                border-radius:10px; padding:12px 14px; }
   .obsrow2 { display:grid; grid-template-columns:2fr 1fr; gap:10px; }
   @media (max-width:900px){ .obsrow2 { grid-template-columns:1fr; } }
+.meter i{background:var(--accent)}
+.csubnav button{background:transparent;border:1px solid var(--line);color:var(--muted);padding:5px 12px;border-radius:8px;margin-right:4px;cursor:pointer;font-size:13px}
+.csubnav button.active{background:var(--accent);color:#fff;border-color:var(--accent)}
 </style>
 </head>
 <body>
@@ -412,22 +415,98 @@
     </div>
   </div>
 
+  <!-- ═══ Cost v2: sub-tabs. Visibility (Overview · Usage · By task · Breakdown · Detail)
+       answers "where did the money go"; Governance answers "what stops it". Every figure
+       carries its basis badge, because an account-wide number summed into an attributed
+       one is the commonest way a cost page lies. -->
+  <div data-tab-panel="cost" class="card col-12" style="padding:10px 14px">
+    <div class="flex" style="align-items:center;gap:6px;flex-wrap:wrap">
+      <nav class="csubnav" id="csubNav">
+        <button data-csubbtn="overview" onclick="costSub('overview')">Overview</button>
+        <button data-csubbtn="usage" onclick="costSub('usage')">Usage</button>
+        <button data-csubbtn="bytask" onclick="costSub('bytask')">By task</button>
+        <button data-csubbtn="breakdown" onclick="costSub('breakdown')">Breakdown</button>
+        <button data-csubbtn="detail" onclick="costSub('detail')">Detail</button>
+        <button data-csubbtn="governance" onclick="costSub('governance')">Governance</button>
+      </nav>
+      <span style="flex:1"></span>
+      <label style="margin:0" class="sub">window</label>
+      <select id="cvDays" onchange="loadCostV2()" style="width:auto"><option value="7">7d</option><option value="30">30d</option><option value="90" selected>90d</option></select>
+      <span id="cvMeta" class="sub"></span>
+    </div>
+  </div>
+
+  <div data-tab-panel="cost" data-csub="overview" class="card col-3"><h2>Workload spend</h2>
+    <div class="stat" id="cvWorkload">&ndash;</div><small id="cvWorkloadSub">attributed + token estimate</small></div>
+  <div data-tab-panel="cost" data-csub="overview" class="card col-3"><h2>Month to date</h2>
+    <div class="stat" id="cvMtd">&ndash;</div><small id="cvMtdSub"></small></div>
+  <div data-tab-panel="cost" data-csub="overview" class="card col-3"><h2>Training (attributed)</h2>
+    <div class="stat" id="cvTrain">&ndash;</div><small id="cvTrainSub"></small></div>
+  <div data-tab-panel="cost" data-csub="overview" class="card col-3"><h2>Billed &middot; Cost Explorer</h2>
+    <div class="stat" id="cvBilled">&ndash;</div><small id="cvBilledSub">workload services, account-wide</small></div>
+  <div data-tab-panel="cost" data-csub="overview" class="card col-8"><h2>Daily spend &middot; by source</h2>
+    <div id="cvDaily" class="chartbox"><span class="sub">loading&hellip;</span></div></div>
+  <div data-tab-panel="cost" data-csub="overview" class="card col-4"><h2>Top spenders</h2>
+    <div id="cvTop"><span class="sub">loading&hellip;</span></div></div>
+
+  <div data-tab-panel="cost" data-csub="usage" class="card col-8"><h2>Model tokens &middot; by model</h2>
+    <div class="sub" style="margin:-6px 0 8px">CloudWatch AWS/Bedrock by ModelId &times; rate card &mdash; account-wide: Bedrock exposes no per-harness token dimension</div>
+    <div id="cvModels"><span class="sub">loading&hellip;</span></div></div>
+  <div data-tab-panel="cost" data-csub="usage" class="card col-4"><h2>Compute usage</h2>
+    <div id="cvCompute"><span class="sub">loading&hellip;</span></div></div>
+
+  <div data-tab-panel="cost" data-csub="bytask" class="card col-12"><h2>Cost per task &middot; estimate vs actual</h2>
+    <div class="sub" style="margin:-6px 0 8px">a task is a consultation on the Tasks tab; actual = attributed spend of the runs it dispatched</div>
+    <div id="cvTasks"><span class="sub">loading&hellip;</span></div></div>
+
+  <div data-tab-panel="cost" data-csub="breakdown" class="card col-6"><h2>By category</h2><div id="cvByCat"></div></div>
+  <div data-tab-panel="cost" data-csub="breakdown" class="card col-6"><h2>By model</h2><div id="cvByModel"></div></div>
+  <div data-tab-panel="cost" data-csub="breakdown" class="card col-6"><h2>By run</h2><div id="cvByRun"></div></div>
+  <div data-tab-panel="cost" data-csub="breakdown" class="card col-6"><h2>Billed by AWS service</h2><div id="cvBySvc"></div></div>
+
+  <div data-tab-panel="cost" data-csub="detail" class="card col-12"><h2>Line items &middot; attributed resources</h2>
+    <div id="cvLines"><span class="sub">loading&hellip;</span></div></div>
+
+  <div data-tab-panel="cost" data-csub="governance" class="card col-3"><h2>Monthly budget</h2>
+    <div class="stat" id="cgLimit">&ndash;</div><small id="cgLimitSub"></small></div>
+  <div data-tab-panel="cost" data-csub="governance" class="card col-3"><h2>Actual &middot; MTD</h2>
+    <div class="stat" id="cgActual">&ndash;</div><small id="cgActualSub"></small></div>
+  <div data-tab-panel="cost" data-csub="governance" class="card col-3"><h2>Forecast &middot; month end</h2>
+    <div class="stat" id="cgForecast">&ndash;</div><small id="cgForecastSub">linear run-rate</small></div>
+  <div data-tab-panel="cost" data-csub="governance" class="card col-3"><h2>Enforcement mode</h2>
+    <div class="stat" id="cgMode">&ndash;</div><small id="cgModeSub"></small></div>
+  <div data-tab-panel="cost" data-csub="governance" class="card col-7"><h2>Budgets</h2>
+    <div id="cgBudgets"><span class="sub">loading&hellip;</span></div></div>
+  <div data-tab-panel="cost" data-csub="governance" class="card col-5"><h2>Create / update budget</h2>
+    <label>Name</label><input id="cgName" placeholder="llmops monthly" />
+    <label>Scope</label><select id="cgScope"><option value="project_monthly">Project &middot; monthly</option><option value="per_task">Per task (launch estimate)</option></select>
+    <label>Limit (USD)</label><input id="cgLimitIn" type="number" min="1" placeholder="500" />
+    <label>Mode</label><select id="cgModeIn"><option value="notify">Notify &mdash; alert, launch proceeds</option><option value="block">Block &mdash; refuse launches that breach</option></select>
+    <div class="flex" style="margin-top:10px"><button class="primary" onclick="saveBudget()">Save budget</button><span id="cgMsg" class="sub"></span></div>
+  </div>
+  <div data-tab-panel="cost" data-csub="governance" class="card col-6"><h2>Cost guardrails &middot; posture</h2>
+    <div id="cgPosture"><span class="sub">loading&hellip;</span></div></div>
+  <div data-tab-panel="cost" data-csub="governance" class="card col-6"><h2>Alert feed</h2>
+    <div id="cgAlerts"><span class="sub">loading&hellip;</span></div></div>
+  <div data-tab-panel="cost" data-csub="governance" class="card col-12"><h2>AWS Budgets &middot; account</h2>
+    <div id="cgAws"><span class="sub">loading&hellip;</span></div></div>
+
   <!-- ═══ Cost (FinOps) ═══ -->
   <!-- Panel order is the money's own order: what a run will cost, who must say yes,
        what it did cost, how wrong the estimate was, and whether the rates behind all
        four can be trusted. The last panel is not an afterthought — an unnoticed stale
        rate makes the other four confidently wrong. -->
-  <div data-tab-panel="cost" class="card col-4"><h2>Project spend</h2>
+  <div data-tab-panel="cost" data-csub="governance" class="card col-4"><h2>Project spend</h2>
     <div class="stat" id="kpiCostTotal">&ndash;</div>
     <small id="kpiCostSub">settled + provisional</small></div>
-  <div data-tab-panel="cost" class="card col-4"><h2>Awaiting approval</h2>
+  <div data-tab-panel="cost" data-csub="governance" class="card col-4"><h2>Awaiting approval</h2>
     <div class="stat" id="kpiCostPending">&ndash;</div>
     <small id="kpiCostPendingSub">estimates over the limit</small></div>
-  <div data-tab-panel="cost" class="card col-4"><h2>Rate card</h2>
+  <div data-tab-panel="cost" data-csub="governance" class="card col-4"><h2>Rate card</h2>
     <div class="stat" id="kpiRateCard">&ndash;</div>
     <small id="kpiRateCardSub">priced SKUs</small></div>
 
-  <div data-tab-panel="cost" class="card col-5"><h2>1 &middot; Estimate a run &middot; before it spends</h2>
+  <div data-tab-panel="cost" data-csub="governance" class="card col-5"><h2>1 &middot; Estimate a run &middot; before it spends</h2>
     <div class="sub" style="margin:-6px 0 8px">priced from the rate card; nothing is launched by estimating</div>
     <label>Sample count (rows to distil)</label><input id="cSamples" type="number" min="1" placeholder="2000" />
     <label>Endpoint hours (0 if torn down immediately)</label><input id="cEndpointHours" type="number" min="0" step="0.5" placeholder="0" />
@@ -445,23 +524,23 @@
     <div id="cEstOut" style="margin-top:10px"></div>
   </div>
 
-  <div data-tab-panel="cost" class="card col-7"><h2>2 &middot; Approval queue &middot; admin gate</h2>
+  <div data-tab-panel="cost" data-csub="governance" class="card col-7"><h2>2 &middot; Approval queue &middot; admin gate</h2>
     <div class="sub" style="margin:-6px 0 8px">the server enforces this: approver group required, and the requester cannot approve their own estimate</div>
     <div id="cQueue"><span class="sub">loading&hellip;</span></div>
     <div id="cQueueMsg" class="sub" style="margin-top:8px"></div>
   </div>
 
-  <div data-tab-panel="cost" class="card col-7"><h2>3 &middot; Actual spend by project &middot; itemised</h2>
+  <div data-tab-panel="cost" data-csub="governance" class="card col-7"><h2>3 &middot; Actual spend by project &middot; itemised</h2>
     <div class="sub" style="margin:-6px 0 8px">attributed by explicit resource match, never by service &mdash; this account also carries unrelated SageMaker spend</div>
     <div id="cRollup"><span class="sub">loading&hellip;</span></div>
   </div>
 
-  <div data-tab-panel="cost" class="card col-5"><h2>4 &middot; Estimate vs actual</h2>
+  <div data-tab-panel="cost" data-csub="governance" class="card col-5"><h2>4 &middot; Estimate vs actual</h2>
     <div class="sub" style="margin:-6px 0 8px">names the line that drove the miss, so the next estimate can be better</div>
     <div id="cVariance"><span class="sub">loading&hellip;</span></div>
   </div>
 
-  <div data-tab-panel="cost" class="card col-12"><h2>5 &middot; Rate card health &middot; can these numbers be trusted?</h2>
+  <div data-tab-panel="cost" data-csub="governance" class="card col-12"><h2>5 &middot; Rate card health &middot; can these numbers be trusted?</h2>
     <div class="row" style="border-bottom:none;padding:2px 0 6px">
       <span class="sub">the Price List API cannot price Fable 5 or Opus 5 &mdash; the models these agents run on &mdash; so rates are derived from realised billing; a missing rate silently prices a line at $0</span>
       <span style="white-space:nowrap">
@@ -2338,6 +2417,102 @@ function loadArch(){
   inlineArchSvg("archOps", "/docs/architecture-console.svg");
 }
 
+// ── Cost v2: visibility sub-tabs + governance ───────────────────────────────
+let COST_SUB = localStorage.getItem("costSub") || "overview";
+function costSub(s){
+  COST_SUB = s; localStorage.setItem("costSub", s);
+  document.querySelectorAll('[data-tab-panel="cost"][data-csub]').forEach(el=>{
+    el.style.display = el.dataset.csub===s ? "" : "none"; });
+  document.querySelectorAll("#csubNav button").forEach(b=>b.classList.toggle("active", b.dataset.csubbtn===s));
+}
+function basis(b){ const c={attributed:"ok",billed:"idle",estimate:"warn","account-wide":"warn"}[b]||"idle";
+  return `<span class="pill ${c}" style="font-size:10px">${esc(b)}</span>`; }
+function cvBars(obj, label){
+  const rows=Object.entries(obj||{}).filter(([k,v])=>+v>0).sort((a,b)=>b[1]-a[1]).slice(0,12);
+  if(!rows.length) return `<div class="sub">no spend recorded in this window</div>`;
+  const max=Math.max(...rows.map(r=>+r[1]));
+  return `<table>${rows.map(([k,v])=>`<tr><td class="mono" style="max-width:260px;overflow:hidden;text-overflow:ellipsis">${esc(k)}</td>
+    <td style="width:45%"><div class="meter"><i style="width:${Math.max(2,100*v/max)}%"></i></div></td>
+    <td style="text-align:right">${usd(v)}</td></tr>`).join("")}</table>`;
+}
+function cvStacked(daily){
+  const days=Object.keys(daily||{}).sort(); if(!days.length) return `<div class="sub">no daily series in window</div>`;
+  const keys=[...new Set(days.flatMap(d=>Object.keys(daily[d])))];
+  const W=760,Ht=190,padL=48,padB=22,padT=10,cw=(W-padL-6)/days.length,bw=Math.max(2,Math.min(18,cw-3));
+  const tot=days.map(d=>keys.reduce((a,k)=>a+(+daily[d][k]||0),0)); const max=Math.max(1,...tot);
+  const y=v=>padT+(Ht-padT-padB)*(1-v/max);
+  let g=[0,.5,1].map(f=>`<line x1="${padL}" y1="${y(max*f)}" x2="${W-4}" y2="${y(max*f)}" stroke="#26305a"/><text x="${padL-6}" y="${y(max*f)+3.5}" font-size="10" fill="#8592c0" text-anchor="end">$${fmtN(Math.round(max*f))}</text>`).join("");
+  let bars=""; days.forEach((d,i)=>{ let acc=0; keys.forEach((k,ki)=>{ const v=+daily[d][k]||0; if(!v) return;
+    const x=padL+i*cw+(cw-bw)/2; bars+=`<rect x="${x}" y="${y(acc+v)}" width="${bw}" height="${y(acc)-y(acc+v)}" fill="${OBS_COLORS[ki%OBS_COLORS.length]}"><title>${esc(d)} · ${esc(k)}: $${v.toFixed(2)}</title></rect>`; acc+=v; }); });
+  const step=Math.ceil(days.length/8);
+  const xl=days.map((d,i)=>i%step?"":`<text x="${padL+i*cw+cw/2}" y="${Ht-6}" font-size="10" fill="#8592c0" text-anchor="middle">${esc(d.slice(5))}</text>`).join("");
+  const lg=keys.map((k,ki)=>`<span><span class="dot" style="background:${OBS_COLORS[ki%OBS_COLORS.length]}"></span>${esc(k)}</span>`).join(" &nbsp; ");
+  return `<svg viewBox="0 0 ${W} ${Ht}" style="width:100%;height:auto" role="img" aria-label="Daily spend by source">${g}${bars}${xl}</svg><div class="legend sub">${lg}</div>`;
+}
+async function loadCostV2(){
+  costSub(COST_SUB);
+  const days=$("cvDays").value;
+  $("cvMeta").textContent="loading…";
+  try {
+    const [v, g] = await Promise.all([
+      fetch(API+"/api/cost/v2?days="+encodeURIComponent(days)).then(r=>r.json()),
+      fetch(API+"/api/cost/budgets").then(r=>r.json())]);
+    const o=v.overview||{}, errs=Object.entries(v.errors||{});
+    $("cvMeta").innerHTML=`rate card ${esc((v.rate_card_as_of||"").slice(0,10))} · ${v.n_rates} rates`+
+      (errs.length?` · <span class="pill err">${errs.length} source(s) unavailable</span>`:"");
+    $("cvWorkload").textContent=usd(o.workload_usd); $("cvWorkloadSub").innerHTML=`${days}d · ${basis("attributed")} + ${basis("estimate")}`;
+    $("cvMtd").textContent=usd(o.mtd_usd); $("cvMtdSub").innerHTML=`this month · ${basis("estimate")}`;
+    $("cvTrain").textContent=usd(o.attributed_usd); $("cvTrainSub").innerHTML=`${o.n_training_jobs} training job(s) · ${basis("attributed")}`;
+    $("cvBilled").textContent=o.billed_usd==null?"–":usd(o.billed_usd); $("cvBilledSub").innerHTML=`${days}d · ${basis("billed")} ${basis("account-wide")} · ~24h lag`;
+    $("cvDaily").innerHTML=cvStacked(o.daily);
+    const top={...(v.breakdown||{}).by_model, ...Object.fromEntries(Object.entries((v.breakdown||{}).by_run||{}).map(([k,x])=>["run "+k,x]))};
+    $("cvTop").innerHTML=cvBars(top);
+    const ms=(v.usage||{}).models||[];
+    $("cvModels").innerHTML=ms.length?`<table><tr><th>model</th><th style="text-align:right">input tok</th><th style="text-align:right">output tok</th><th style="text-align:right">est. cost</th><th></th></tr>${ms.map(m=>
+      `<tr><td class="mono">${esc(m.model_id)}</td><td style="text-align:right">${fmtN(m.input_tokens)}</td><td style="text-align:right">${fmtN(m.output_tokens)}</td><td style="text-align:right">${m.priced?usd(m.cost_usd):'<span class="pill warn">unpriced</span>'}</td><td>${basis("account-wide")}</td></tr>`).join("")}</table>`:`<div class="sub">no Bedrock token metrics in window</div>`;
+    const u=v.usage||{};
+    $("cvCompute").innerHTML=`<div class="row"><span>SageMaker training</span><b>${fmtN(u.training_hours||0)} instance-h</b></div><div class="row"><span>instance types</span><span class="mono">${esc((u.instances||[]).join(", ")||"—")}</span></div><div class="row"><span>endpoints in service</span><b>see Pipeline · Teardown</b></div>`;
+    const bt=v.by_task||{}, ts=(bt.tasks||[]).filter(t=>t.estimate_usd||t.actual_usd||(t.runs||[]).length);
+    $("cvTasks").innerHTML=ts.length?`<table><tr><th>task</th><th>type</th><th>status</th><th>runs</th><th style="text-align:right">estimate</th><th style="text-align:right">actual</th><th style="text-align:right">variance</th></tr>${ts.map(t=>
+      `<tr><td><a href="#" onclick="showTab('tasks');selectTask(${jstr(t.task_id)});return false" class="mono">${esc(t.task_id)}</a><div class="sub">${esc(t.goal)}</div></td><td>${esc(t.task_type||"—")}</td><td>${esc(t.status||"")}</td>
+       <td class="mono" style="font-size:11px">${(t.runs||[]).map(esc).join("<br>")||"—"}</td><td style="text-align:right">${usd(t.estimate_usd)}</td><td style="text-align:right">${usd(t.actual_usd)} ${basis("attributed")}</td>
+       <td style="text-align:right">${t.actual_usd?usd(t.variance_usd):'<span class="sub">no attributed spend in window</span>'}</td></tr>`).join("")}</table>`+
+      `<div class="sub" style="margin-top:8px">${(bt.direct_runs||[]).length} run(s) with spend but no task · ${usd(bt.unlinked_usd||0)} attributed to project jobs with no run id. Agent token spend is account-wide and not split per task.</div>`:`<div class="sub">no tasks</div>`;
+    const b=v.breakdown||{};
+    $("cvByCat").innerHTML=cvBars(b.by_category); $("cvByModel").innerHTML=cvBars(b.by_model);
+    $("cvByRun").innerHTML=cvBars(b.by_run); $("cvBySvc").innerHTML=cvBars(b.billed_by_service);
+    const li=(v.detail||{}).line_items||[];
+    $("cvLines").innerHTML=li.length?`<table><tr><th>day</th><th>resource</th><th>run</th><th>instance</th><th style="text-align:right">qty</th><th style="text-align:right">unit price</th><th style="text-align:right">cost</th><th>status</th></tr>${li.map(l=>
+      `<tr><td>${esc(l.day)}</td><td class="mono">${esc(l.resource_id)}</td><td class="mono" style="font-size:11px">${esc(l.run_id||"—")}</td><td>${esc(l.instance)}</td><td style="text-align:right">${l.quantity} h</td><td style="text-align:right">${l.unit_price==null?'<span class="pill warn">unpriced</span>':usd(l.unit_price)}</td><td style="text-align:right">${usd(l.cost_usd)}</td><td>${esc(l.status||"")}</td></tr>`).join("")}</table>`:`<div class="sub">no project training jobs in this window — widen it to 90d</div>`;
+    renderGov(g);
+  } catch(e) { $("cvMeta").textContent="cost data unavailable: "+e; }
+}
+function renderGov(g){
+  const bs=g.budgets||[], pm=bs.find(b=>b.scope==="project_monthly");
+  $("cgLimit").textContent=pm?usd(pm.limit_usd):"none"; $("cgLimitSub").textContent=pm?pm.name:"create one below";
+  $("cgActual").textContent=usd(g.mtd_usd); $("cgActualSub").innerHTML=pm?`${pm.pct}% used · ${basis("estimate")}`:basis("estimate");
+  $("cgForecast").textContent=pm?usd(pm.forecast_usd):"–";
+  const blocking=bs.some(b=>b.mode==="block");
+  $("cgMode").innerHTML=blocking?'<span style="color:var(--red)">Enforce</span>':'<span style="color:var(--green)">Notify-only</span>';
+  $("cgModeSub").textContent=blocking?"a blocking budget refuses launches that breach it":"no budget blocks launches";
+  const st={on_track:"ok",warning:"warn",forecast_over:"warn",over:"err",per_task_limit:"idle"};
+  $("cgBudgets").innerHTML=bs.length?`<table><tr><th>budget</th><th>scope</th><th>mode</th><th style="width:30%">used</th><th style="text-align:right">limit</th><th>state</th></tr>${bs.map(b=>
+    `<tr><td>${esc(b.name)}</td><td>${esc(b.scope)}</td><td><span class="pill ${b.mode==="block"?"err":"idle"}">${esc(b.mode)}</span></td>
+     <td>${b.pct==null?'<span class="sub">checked per launch</span>':`<div class="meter"><i style="width:${Math.min(100,b.pct)}%;background:${b.pct>=100?"var(--red)":b.pct>=80?"var(--amber)":"var(--green)"}"></i></div><span class="sub">${usd(b.actual_usd)} · forecast ${usd(b.forecast_usd)}</span>`}</td>
+     <td style="text-align:right">${usd(b.limit_usd)}</td><td><span class="pill ${st[b.state]||"idle"}">${esc(String(b.state).replace(/_/g," "))}</span></td></tr>`).join("")}</table>`:`<div class="sub">no budgets yet — every launch is ungoverned</div>`;
+  $("cgPosture").innerHTML=`<table>${(g.posture||[]).map(p=>`<tr><td><b>${esc(p.control)}</b><div class="sub">${esc(p.detail)}</div></td><td style="text-align:right"><span class="pill ${/not armed|no budgets|phase 2/.test(p.state)?"idle":"warn"}">${esc(p.state)}</span></td></tr>`).join("")}</table>`;
+  const al=g.alerts||[];
+  $("cgAlerts").innerHTML=al.length?`<table>${al.map(a=>`<tr><td style="white-space:nowrap" class="sub">${esc(String(a.created_at||"").slice(0,19).replace("T"," "))}</td><td><span class="pill ${a.severity==="CRITICAL"?"err":"warn"}">${esc(a.severity)}</span></td><td>${esc(a.message)}<div class="sub">${esc(a.action||"")}</div></td></tr>`).join("")}</table>`:`<div class="sub">no budget alerts — good news only if budgets exist</div>`;
+  const aw=g.aws_budgets||[];
+  $("cgAws").innerHTML=aw.length?`<table><tr><th>name</th><th style="text-align:right">actual</th><th style="text-align:right">forecast</th><th style="text-align:right">limit</th><th>period</th></tr>${aw.map(a=>`<tr><td>${esc(a.name)}</td><td style="text-align:right">${usd(a.actual_usd)}</td><td style="text-align:right">${usd(a.forecast_usd)}</td><td style="text-align:right">${usd(a.limit_usd)}</td><td>${esc(a.time_unit)}</td></tr>`).join("")}</table><div class="sub" style="margin-top:6px">${basis("billed")} via the payer account &mdash; can read $0 while real usage accrues; the estimates above move in near-real time.</div>`:`<div class="sub">no AWS Budgets readable</div>`;
+}
+async function saveBudget(){
+  const body={name:$("cgName").value, scope:$("cgScope").value, limit_usd:$("cgLimitIn").value, mode:$("cgModeIn").value};
+  if(!(await ensureToken())) { $("cgMsg").textContent="sign in to save budgets"; return; }
+  const res=await postApi("/api/cost/budgets", body);
+  $("cgMsg").textContent=res.ok?"saved":(res.msg||"failed");
+  if(res.ok) loadCostV2();
+}
 // ── tabs (ported: persistence + poll only while active) ──────────────────────
 function showTab(t){
   document.querySelectorAll("[data-tab-panel]").forEach(el=>{
@@ -2367,6 +2542,7 @@ function showTab(t){
   if (t==="evals") loadEvals();
   if (t==="opts") loadOpts();
   if (t==="cost") loadCost();
+  if (t==="cost") loadCostV2();
 }
 
 // tab on load: ?tab= URL param > localStorage > intro for first-time visitors. The

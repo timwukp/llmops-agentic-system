@@ -312,6 +312,39 @@ orchestrator（透過 `page_human`），不屬於一個職責是「觀察」的�
 
 ## 8. Cost 分頁
 
+### Cost v2（2026-10-12）：六個子頁籤，先可見度、後治理
+
+分頁現在以六個子頁籤開啟。前五個回答「錢花到哪裡去了」，第六個回答「什麼能擋住它」。
+下面描述的五個面板仍然存在，放在 **Governance** 底下，直到 phase 2 移除。
+
+| 子頁籤 | 顯示 | 依據 |
+|---|---|---|
+| Overview | 工作負載支出、本月至今、歸屬的訓練成本、Cost Explorer 已計費；每日堆疊圖；最大支出項 | attributed + estimate；billed 並列顯示，絕不加總進去 |
+| Usage | 每個模型的 Bedrock token 與成本；訓練 instance-hours | account-wide（Bedrock 沒有 per-harness 的 token 維度） |
+| By task | 每個 console Task：它 dispatch 出去的 run 的估算 vs 實際、差異 | attributed |
+| Breakdown | 依類別、模型、run、AWS 服務 | 混合，各自標示 |
+| Detail | 每個歸屬的訓練 job：instance、時數、單價、成本 | attributed |
+| Governance | 預算（專案每月或每個 task，模式 `notify` 或 `block`）、預測、防護欄狀態、警示紀錄、AWS Budgets | estimate 對 limit |
+
+**為什麼 v2 改成為用量定價，而不是讀 `llmops-cost-actuals`：** 實測該表有 164 列，全部都是
+`#audit#` —— reconcile 從來沒寫過一筆歸屬成本，所以 v1 面板顯示 $0.00，而實際上跑過 68 個
+訓練 job。v2 為 pipeline 確實留下的東西定價：以名稱前綴比對的訓練 job（`COST_JOB_PREFIXES`，
+絕不是「所有 SageMaker」），計費秒數 × 估算器所用的同一張 S3 費率卡；以及 CloudWatch
+`AWS/Bedrock` 依 `ModelId` 的 Bedrock token。Cost Explorer 以「已計費、全帳號」的脈絡顯示，
+快取 15 分鐘，因為每次請求計費 $0.01。
+
+**強制執行。** `budget_gate()` 在 console 的兩個啟動點執行 —— `POST /api/start-run` 與
+`POST /api/tasks/{id}/accept`。`notify` 超標會記錄一筆警示（console 表，`budget-alert#*`）並
+發布到 `llmops-escalations`，發布有獨立包裝，失敗不會改變判定；`block` 超標以 HTTP 409 拒絕
+並指名是哪個預算。**尚未啟用（phase 2）：** 停下已在執行中的 run —— harness driver 還不會查
+預算，防護欄狀態表也照實這樣寫。
+
+| 方法 | 路徑 | 認證 | 用途 |
+|---|---|---|---|
+| GET | `/api/cost/v2?days=N` | 公開讀取 | 五個可見度子頁籤，一次回傳 |
+| GET | `/api/cost/budgets` | 公開讀取 | 預算與狀態、AWS Budgets、警示、防護欄狀態 |
+| POST | `/api/cost/budgets` | 需登入 | 建立或更新預算 |
+
 五個面板，順序就是錢自己的順序：
 
 1. **估算一個 run** —— plan 輸入 → 逐列的明細表，每列帶 `basis` 與 `rate_source`，

@@ -27,10 +27,9 @@ is how the Introduction row below got written on the same commit as the tab itse
 | Observability | Per-harness AgentCore service metrics, daily bar chart, token tile, SageMaker training jobs + student endpoints |
 | Evaluations | Online eval configs with score gauges, batch evaluations, insights reports |
 | Optimizations | AWS-native system-prompt recommendations + Bedrock-drafted prompts (human-review-then-apply via UpdateHarness) |
-| Cost | Estimates vs reconciled actuals, the $20,000 reference, approval queue (approver group, never self-approve), `finops-run` dispatch |
+| Cost | Six sub-tabs: Overview · Usage · By task · Breakdown · Detail · Governance (budgets in `notify`/`block` mode, gate at start-run and task accept, alert feed, guardrail posture). Governance also keeps the v1 estimator, the $20,000 reference, the approval queue (approver group, never self-approve) and `finops-run` dispatch |
 
-Route shape: **30 handlers** — 11 public GETs, 2 authenticated consult GETs, 3 session
-POSTs, 14 authenticated POSTs.
+Route shape: **35 handlers** (see `tests/test_console_routes.py` for the derived count).
 See [ARCHITECTURE.md §13](../../docs/ARCHITECTURE.md#13-the-admin-console--one-lambda-three-planes-with-different-rules)
 for why the three planes carry different rules.
 
@@ -80,7 +79,8 @@ existing `agent-cicd-admin` stack):
 
 | Var | Default | Purpose |
 |---|---|---|
-| `CONSOLE_TABLE` | `LlmopsAdminRuns` | Console state (opt- drafts) |
+| `CONSOLE_TABLE` | `LlmopsAdminRuns` | Console state (opt- drafts, `budget#*` budgets, `budget-alert#*` alerts) |
+| `COST_JOB_PREFIXES` | `llmops-,arc2v2-` | Training-job name prefixes the Cost tab attributes to this project (never all SageMaker) |
 | `RUNS_TABLE` | `llmops-pipeline-runs` | Pipeline runs (read) |
 | `EVENTS_TABLE` | `llmops-stage-events` | Stage events (read, Query by run_id) |
 | `STATE_MACHINE` | `llmops-pipeline` | Step Functions state machine name |
