@@ -129,8 +129,9 @@ worst case, or project-to-date + this estimate), then the pre-existing account-l
 `bedrock-monthly-dev` at **$1000/month**. See docs/COST.md.
 
 Neither one stops anything today, and that is worth stating plainly rather than leaving to be
-inferred from two separate facts. `BUDGET_MODE=advisory` means the console's reference reports
-an over-estimate run and launches it; `describe_budget_actions_for_budget` on
+inferred from two separate facts. The console's reference is advisory-only (the `BUDGET_MODE`
+switch was removed on 2026-10-12): it records an over-estimate plan in the signed approval and
+the plan dispatches; `describe_budget_actions_for_budget` on
 `bedrock-monthly-dev` returns **0 actions**, so the AWS Budget notifies and does not enforce.
 Nothing in this account halts spend on its own. The references exist to make an overage get
 named — which is why the number was raised rather than deleted.

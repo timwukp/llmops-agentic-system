@@ -217,11 +217,10 @@ ZIP_MB=$(( $(wc -c < /tmp/llmops-admin-dashboard.zip) / 1000000 ))
 echo "deployment package: ${ZIP_MB} MB (Lambda direct-upload limit is 50 MB)"
 [ "$ZIP_MB" -lt 50 ] || { echo "FATAL: package is ${ZIP_MB} MB — over Lambda's 50 MB direct-upload limit. Move the narration audio to S3 or drop a language."; exit 1; }
 
-# BUDGET_MODE=advisory: an over-budget run is REPORTED (named and numbered on the Cost
-# tab) and launches anyway. Set blocking to restore the approval gate. Stated explicitly
-# here rather than left to the code default, so the live behaviour is visible in the
-# deploy script and switchable without a code change.
-BUDGET_MODE="${BUDGET_MODE:-advisory}"
+# No BUDGET_MODE any more: the $20,000 references below are advisory only, and the one
+# way to refuse a launch over budget is the Cost tab's visible "Block launches over
+# budget" switch -- a policy row in the console table, flipped by an approver, not an env
+# var nobody can see from the portal.
 
 # The two budget references, READ OUT OF the module that owns the arithmetic rather than
 # retyped here. Until now this script set neither, so the live function reported
@@ -233,9 +232,9 @@ LIMITS=$("$PY_FOR_BUILD" -c "import sys; sys.path.insert(0,'$BUILD'); import cos
   print(f'{c.DEFAULT_SINGLE_RUN_LIMIT_USD:.0f} {c.DEFAULT_PROJECT_CUMULATIVE_LIMIT_USD:.0f}')")
 APPROVAL_LIMIT_USD="${APPROVAL_LIMIT_USD:-${LIMITS%% *}}"
 CUMULATIVE_LIMIT_USD="${CUMULATIVE_LIMIT_USD:-${LIMITS##* }}"
-echo "budget references: single-run \$$APPROVAL_LIMIT_USD, cumulative \$$CUMULATIVE_LIMIT_USD, mode $BUDGET_MODE"
+echo "budget references (advisory): single-run \$$APPROVAL_LIMIT_USD, cumulative \$$CUMULATIVE_LIMIT_USD"
 
-ENV_VARS="Variables={CONSOLE_TABLE=$TABLE,RUNS_TABLE=llmops-pipeline-runs,EVENTS_TABLE=llmops-stage-events,TASKS_TABLE=llmops-tasks,STATE_MACHINE=llmops-pipeline,START_FN=llmops-start-pipeline,DATA_BUCKET=$DATA_BUCKET,COGNITO_POOL_ID=$POOL_ID,COGNITO_CLIENT_ID=$CLIENT_ID,JUDGE_MODEL=$JUDGE_MODEL,SPANS_SINCE=$SPANS_SINCE,OPTIMIZE_HARNESS=$OPTIMIZE_HARNESS,LLMOPS_SNS_TOPIC=arn:aws:sns:$REGION:$ACCOUNT_ID:llmops-escalations,APPROVAL_KEY=alias/llmops-approval,DS_GROUP=llmops-datascience,BUDGET_MODE=$BUDGET_MODE,APPROVAL_LIMIT_USD=$APPROVAL_LIMIT_USD,CUMULATIVE_LIMIT_USD=$CUMULATIVE_LIMIT_USD}"
+ENV_VARS="Variables={CONSOLE_TABLE=$TABLE,RUNS_TABLE=llmops-pipeline-runs,EVENTS_TABLE=llmops-stage-events,TASKS_TABLE=llmops-tasks,STATE_MACHINE=llmops-pipeline,START_FN=llmops-start-pipeline,DATA_BUCKET=$DATA_BUCKET,COGNITO_POOL_ID=$POOL_ID,COGNITO_CLIENT_ID=$CLIENT_ID,JUDGE_MODEL=$JUDGE_MODEL,SPANS_SINCE=$SPANS_SINCE,OPTIMIZE_HARNESS=$OPTIMIZE_HARNESS,LLMOPS_SNS_TOPIC=arn:aws:sns:$REGION:$ACCOUNT_ID:llmops-escalations,APPROVAL_KEY=alias/llmops-approval,DS_GROUP=llmops-datascience,APPROVAL_LIMIT_USD=$APPROVAL_LIMIT_USD,CUMULATIVE_LIMIT_USD=$CUMULATIVE_LIMIT_USD}"
 
 # timeout 900: one orchestrator consultation turn can stream for up to 840s; the
 # old 300 killed the worker mid-turn and left the task stuck in 'thinking'.

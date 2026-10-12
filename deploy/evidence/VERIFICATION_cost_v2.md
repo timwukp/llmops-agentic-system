@@ -47,3 +47,16 @@ in flight and no budget exists). Both are covered offline in `tests/test_console
 (21 tests: approver-only flip, flip logged, gate under each switch, once-per-threshold alarm,
 stop OFF never stops, stop ON stops the execution and only in-progress jobs, per-task stop
 targets only the overspent run, schedule payload reaches the sweep, IAM scope).
+
+## v1 cost routes removed (2026-10-12)
+
+| Step | Result |
+|---|---|
+| Code | `update-function-code` OK (same patch method; `cost_model.py`, `conductor_tools.py` equal to `main`), then IAM |
+| IAM delta | `DDBCostEstimates`: Put/Update/Get/Query/Scan on table + `index/*` → `PutItem` on the table only; nothing else changed |
+| `GET /api/cost-overview`, `GET /api/cost-estimates` | **404** |
+| `POST /api/cost-estimate`, `/api/cost-approval-request`, `/api/cost-approval` (no token) | 401 — the auth chokepoint answers before routing, so this does not by itself prove removal; `test_the_v1_cost_routes_are_gone` asserts the handlers and routes are absent from the source |
+| `GET /api/cost/v2?days=90` | 200, workload $4,289.21, 68 jobs, `errors {}`, `detail.rate_card` present: 38 rates, 0 missing |
+| `GET /api/cost/budgets` | 200, policy both OFF, 4 posture rows |
+| Sweep with the schedule payload | 200, `{"trigger": "schedule", "budgets": 0, ...}` |
+| Portal, fresh load | Detail renders rate-card health with *Refresh rates* / *Reconcile now*; no `cEstOut`, `loadCost` undefined; network shows no v1 call (only `/api/refresh` 401, the signed-out session restore) |

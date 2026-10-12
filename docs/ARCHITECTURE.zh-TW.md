@@ -1068,7 +1068,7 @@ AGPL-3.0 連微調權重與嵌入應用都涵蓋，所以目錄大聲說明、or
 ![Console 架構](architecture-console.svg)
 
 Dashboard 是**單一個 Lambda**
-同時供應 HTML 與全部 **37 個路由 handler**、共 **9 tabs**，**沒有 build step、沒有 CDN**：`frontend.html` 在冷啟動時
+同時供應 HTML 與全部 **32 個路由 handler**、共 **9 tabs**，**沒有 build step、沒有 CDN**：`frontend.html` 在冷啟動時
 內嵌，頁面帶著 `CSP connect-src 'self'` 加上上傳路徑所需的 S3 origin。單一產物意味著 UI 永遠
 不可能比它呼叫的 API 舊一個版本 —— 那正是「前端後端分開部署」會招來的故障模式。
 
@@ -1076,9 +1076,9 @@ Dashboard 是**單一個 Lambda**
 
 | 平面 | handler | 規則 |
 |---|---|---|
-| **讀** | 15 條 GET（`/api/overview`、`/api/pipeline`、`/api/run`、`/api/observability`、`/api/cost/v2`、`/api/cost/budgets`…） | 公開，伺服器端彙總 |
+| **讀** | 13 條 GET（`/api/overview`、`/api/pipeline`、`/api/run`、`/api/observability`、`/api/cost/v2`、`/api/cost/budgets`…） | 公開，伺服器端彙總 |
 | **session** | 3 條 POST：`/api/login`、`/api/refresh`、`/api/refresh/revoke` | **必然**未認證 —— 它們是產生／撤銷憑證的那三條 |
-| **寫** | 14 條 POST：`/api/start-run`、`/api/cost/{budgets,policy,sweep}`、`/api/cost-approval*`、`/api/finops-run`、`/api/optimize*`、`/api/native-rec*`、`/api/batch-eval`… | 在單一關卡過 Cognito |
+| **寫** | 11 條 POST：`/api/start-run`、`/api/cost/{budgets,policy,sweep}`、`/api/finops-run`、`/api/optimize*`、`/api/native-rec*`、`/api/batch-eval`… | 在單一關卡過 Cognito |
 | **諮詢** | `/api/tasks` 底下的**全部**路由、**兩種 method 都算** —— 2 個 GET handler（`/api/tasks`、`/api/tasks/{id}[/approval|/readiness]`）以及 POST `/api/tasks/{id}/{message,accept,close}` 與 `/api/data-upload-url` | 需認證**並且**查群組；唯一會調用 agent 的平面 |
 
 除了 HTTP，同一個 Lambda 還有一個排程入口：EventBridge 規則 `llmops-budget-sweep` 每 15 分鐘
@@ -1099,11 +1099,13 @@ Dashboard 是**單一個 Lambda**
 **每一條會對平台動手的 POST，都在同一個地方被認證。** router 在派發任何 POST *之前* 解析一次
 `_authed_user(headers)`，失敗就回 401 —— 所以新增一條路由不可能順手新增一個未認證的寫入。
 它解析出來的是一個**使用者**而不是布林值，因為下游有兩個檢查需要身分而不只是「已認證」：
-approver 群組檢查，以及比對 approver 與 requester 帳號的「不得自我核准」檢查。未認證實測：
+守住 Cost 分頁強制開關的 approver 群組檢查，以及寫進每一份簽署 task 核准的核准者身分。未認證實測：
 `/api/tasks`、`/api/start-run`、`/api/cost-approval`、`/api/data-upload-url`、`/api/finops-run`
 與 `/api/tasks/{id}/message` 全部回 **401**；而 `/api/overview`、`/api/cost-overview` 的 GET
 回 **200**。當初實測時 `GET /api/tasks` 是列在那組 200 裡的；它現在是 401，而那一行正是這個漏洞
 留下的痕跡 —— 量測做了、也寫下來當成設計被證實的證據，因為被檢查的那個設計講的是 POST。
+（`/api/cost-approval` 與 `/api/cost-overview` 已於 2026-10-12 隨 v1 cost routes 移除；量測照當時
+的結果保留。）
 
 **有三條 POST 在那個關卡之上，而把它們指名出來本身就是設計的一部分。** `/api/login` 產生
 session；`/api/refresh` 在頁面重載後用 httpOnly cookie 復原 session（**cookie 就是憑證**，
@@ -1124,10 +1126,12 @@ session；`/api/refresh` 在頁面重載後用 httpOnly cookie 復原 session（
 帳號裡的每一筆客戶委託。那裡的 401 與 403 也和寫平面一樣必須分開：跟一個只是群組不對的操作者說
 「你的 session 過期了」，是把他送進一個幫不上忙的重新登入迴圈。
 
-**成本閘門在伺服器端，而且「advisory」是配置出來的，不是漏掉的。** `APPROVAL_LIMIT_USD`
-（預設 2000）與 `BUDGET_MODE`（`advisory` 或 `blocking`）住在 Lambda 裡而不是 UI 裡：
-由客戶端執行的閘門，就是客戶端能跳過的閘門。`advisory` 會**指名**這是一次超預算派發、
-放它過去、並把估算記錄下來；`blocking` 則拒絕。核准是 **KMS 簽章 + hash chain**
+**預算強制執行在伺服器端，而且看得見。** 唯一能擋下超預算啟動的方式，是 Lambda 裡的
+`budget_gate()`，由 Cost 分頁的「超出預算時擋下啟動」開關啟用 —— 那是一筆由審批者切換、顯示在
+頁面上的政策列，不是環境變數：由客戶端執行的閘門，就是客戶端能跳過的閘門；沒人看得見的閘門，
+就沒人知道它是否已啟用。`APPROVAL_LIMIT_USD` / `CUMULATIVE_LIMIT_USD` 參考基準（$20,000）
+僅供參考，連同任何超出額記錄在簽署的核准裡（見 [COST.zh-TW.md §3](COST.zh-TW.md#3-20000-基準僅供參考)）。
+核准是 **KMS 簽章 + hash chain**
 （`conductor_tools.sign_record`），帶著核准者身分與來源 IP —— 所以一次核准是**證據**，
 而不是一個 UI 狀態。
 

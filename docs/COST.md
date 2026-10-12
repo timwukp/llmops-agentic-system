@@ -47,8 +47,8 @@ they are 16,550 ÷ 24,924 and the residual from that same run. This is the whole
 worked example matters — the model is *seeded from a measurement*, so its accuracy on the
 training line is a fact, not a hope.
 
-`tests/test_console_cost.py::test_estimate_matches_the_measured_e3_run_within_one_percent`
-asserts this delta stays under 1%. Per the plan's own rule, **a >20% miss on a run whose
+`tests/test_cost_model.py::test_estimator_reproduces_the_measured_1077_run`
+asserts this delta stays under 1% (±$0.05 on $10.77). Per the plan's own rule, **a >20% miss on a run whose
 actual is known is a model bug, not noise.**
 
 ### The other half of the same estimate
@@ -131,18 +131,24 @@ a healthy card, and a check that counts rows would call it healthy.
 
 ---
 
-## 3. The $20,000 reference
+## 3. The $20,000 reference (advisory)
 
-Approval fires when **either** limit is crossed:
+Two figures, both recorded in **every KMS-signed task approval** and neither of which blocks:
 
-| Limit | Default | Rationale |
+| Reference | Default | What it measures |
 |---|---|---|
-| Single-run | `APPROVAL_LIMIT_USD` = **$20,000** | One expensive run |
-| Cumulative | `CUMULATIVE_LIMIT_USD` = **$20,000** | Project-to-date actual **+** this estimate |
+| Single-run | `APPROVAL_LIMIT_USD` = **$20,000** | the plan's `cost_estimate_usd`, read as its worst case |
+| Cumulative | `CUMULATIVE_LIMIT_USD` = **$20,000** | project-to-date actual **+** this plan |
 
 Twenty $1,500 runs are the same exposure as one $30,000 run, and each of the twenty passes a
-single-run check on its own. A gate with only the first limit is a gate against one shape of
-overspend and blind to the other.
+single-run comparison on its own — which is why both are recorded. When either is crossed, the
+signed record's `gate.over_budget` names the overage; the plan still dispatches.
+
+**Enforcement is not here.** The one way to refuse a launch over budget is the Cost tab's visible
+*Block launches over budget* switch (§8), evaluated against the budgets an operator defines. The
+earlier `BUDGET_MODE=blocking` path and the approval queue it fed were removed with the v1 cost
+routes on 2026-10-12: a second, env-var-only way to refuse a launch is a control nobody can see
+from the portal.
 
 ### Why $20,000, and why a number at all
 
@@ -150,84 +156,40 @@ Raised from $2,000 on 2026-08-02 by the platform owner's instruction. This is th
 design-and-test platform, not a customer's production account: the whole test-proven record —
 six agents, a trained model, a deployed and torn-down endpoint, five e2e iterations — cost
 **~$12–15**. A reference low enough to be crossed by ordinary work is a reference that gets
-ignored, and an ignored reference is worse than a high one because it trains people to click
-past it.
+ignored.
 
-Keeping a number is the less obvious half. With `BUDGET_MODE=advisory` (§8) the reference does
-not stop anything, so its only remaining job is to be the line that makes an over-estimate run
-get **named** in `start_run`'s `budget_notice`. Delete the number and that line goes with it:
-nothing would be left that could say "this run cost far more than it was estimated at", which is
-the failure this whole module exists to catch. A high reference still reports. No reference
-reports nothing.
+Keeping a number at all is the less obvious half. The reference stops nothing, so its only job
+is to make an over-estimate plan get **named** in the record a third party audits. Delete the
+number and that line goes with it. A high reference still reports; no reference reports nothing.
 
 The number lives in exactly one place that decides — `cost_model.DEFAULT_SINGLE_RUN_LIMIT_USD`.
-`deploy.sh` reads it out of the bundled module to set `APPROVAL_LIMIT_USD`, and the console's
-own fallback literal is pinned equal to it by
-`test_console_cost.py::test_the_consoles_fallback_limits_equal_the_canonical_ones`. Until
-2026-08-02 the deploy set neither env var, so the live function reported `APPROVAL_LIMIT_USD:
-null` and fell back to the code default — which happened to agree, so nothing was wrong and
-nothing could have told us when it stopped agreeing.
+`deploy.sh` reads it out of the bundled module to set `APPROVAL_LIMIT_USD`, and the console's own
+fallback literal is pinned equal to it by
+`test_console_cost.py::test_the_consoles_fallback_limits_equal_the_canonical_ones`.
 
-### It gates on `worst_case_usd`, never `total_usd`
-
-The remediation loop can re-run finetune up to `max_iterations` (default 3). So an estimate
-has two numbers:
-
-```
-sample_count 15,759,216, max_iterations 3:
-    total_usd        $9,988.46     (expected — one pass)
-    worst_case_usd  $29,964.38     (all three remediation iterations run)
-```
-
-Gating on `total_usd` would wave this through at $9,988 and permit $29,964 of spend. Reporting
-$20,000 for something that can silently become $60,000 is not a gate. The estimate reports both;
-the gate reads the worst case, and `gating_basis` in the response says which field decided.
-
-That row count is not a round number because it is not typed: the test fixture derives it from
-the reference (`0.5 × limit ÷ per-row cost`) so the expected total lands at half the reference
-and the worst case at ~1.5× it. It used to be a literal 2,000,000 rows at $1,268 / $3,804, which
-straddled $2,000 and then straddled nothing at all when the reference moved — the fixtures went
-green while never engaging the budget check. `_straddling_plan` now asserts the straddle on every
-use, because a derivation is still a claim.
-
-### The gate is re-derived at launch, not trusted from storage
-
-An estimate priced when project-to-date was low is a different exposure a week later. So
-`start_run` recomputes the decision at launch and requires approval if **either** the stored
-verdict or the fresh one demands it. A gate that trusts a stale verdict is no gate.
-
-### Every failure path fails closed
+### Unknown is a third answer
 
 | Failure | Behaviour | Why not the alternative |
 |---|---|---|
-| `cost_model` import fails | approval **required** | "We could not check the limit" must land on the require-approval side, never the allow side |
-| No rate card | estimate **refused (503)** | A `$0`-with-warnings total gets quoted; an explicit refusal does not |
-| Cognito group lookup fails | **deny** | A throttled API call must not become an approval |
-| No `sample_count`/`train_rows` | **400** | With neither, the training line is $0 and the total is not an estimate |
+| `cost_model` import fails | recorded as `budget_unknown`, with a note that the plan was **not** checked | "We could not check" must never render as "under the reference" |
+| Cognito group lookup fails | **deny** | A throttled API call must not become an authorization |
 
-### Separation of duties
+### Who may enforce
 
-Approval requires membership in the Cognito group `llmops-approver`, checked **server-side on
-every call** — hiding the button in the UI is not a control. The submitter cannot approve
-their own request: self-approval is **rejected with 403**, not merely flagged.
+Flipping an enforcement switch requires membership in the Cognito group `llmops-approver`,
+checked **server-side on every call** — hiding a button is not a control. Every flip is written
+to the alert feed with who and when.
 
-Two facts make this harder than it looks: `cognito-idp:GetUser` validates the token and
-returns the username but **not** group membership, and a bearer *access* token carries no
-`cognito:groups` claim. Membership therefore needs a second call
-(`AdminListGroupsForUser`) — which can fail, and when it does the user gets an empty group
-list and is denied.
-
-Terminal states are terminal. A `rejected` estimate cannot be re-launched (otherwise a
-rejection can be quietly retried until someone approves it) and a `launched` one cannot launch
-again (otherwise two runs attach to one approval and double-count in the variance report).
-Both apply whether or not the estimate needed approval — a cheap run is the one nobody thinks
-to guard.
+Two facts make this harder than it looks: `cognito-idp:GetUser` validates the token and returns
+the username but **not** group membership, and a bearer *access* token carries no
+`cognito:groups` claim. Membership therefore needs a second call (`AdminListGroupsForUser`) —
+which can fail, and when it does the user gets an empty group list and is denied.
 
 ### 401 and 403 are different in the browser
 
-`401` means the token is gone; `403` means the token is fine but this user lacks the right.
-The console keeps them apart. Collapsing them would sign an approver out of a working session
-and hide "you are not in the approver group" behind "session expired".
+`401` means the token is gone; `403` means the token is fine but this user lacks the right. The
+console keeps them apart. Collapsing them would sign an approver out of a working session and
+hide "you are not in the approver group" behind "session expired".
 
 ---
 
@@ -293,10 +255,10 @@ Consequences, all enforced:
 `verdict` that **names the driving category**. One aggregate "40% off" tells nobody what to
 fix; "bedrock_teacher drove the miss" does.
 
-The variance report also states `n_unestimated` — how many runs had no estimate at all. Runs
-launched without an estimate stay legal, because that is how every run worked before v1.1.0,
-and keeping it legal is what lets the report say honestly what fraction of spend was never
-estimated. A variance report silent about that implies a coverage it does not have.
+`reconcile` runs in the `llmops_finops` auditor (§7). In the console, estimate vs actual is
+the **By task** sub-tab (§8): each task's signed `cost_estimate_usd` against the attributed
+spend of the runs it dispatched. The v1 console variance panel, which joined estimates to
+actuals rows, was removed on 2026-10-12 along with the estimator that produced those estimates.
 
 ---
 
@@ -345,8 +307,8 @@ The tab answers two questions, in this order: **where did the money go** (visibi
 | Usage | Bedrock tokens and cost per model; training instance-hours | account-wide (Bedrock has no per-harness token dimension) |
 | By task | per console Task: estimate vs actual of the runs it dispatched, variance | attributed |
 | Breakdown | by category, model, run, AWS service | mixed, each badged |
-| Detail | every attributed training job: instance, hours, unit price, cost | attributed |
-| Governance | enforcement policy (two switches), budgets, forecast, guardrail posture, alert feed, AWS Budgets; the v1 estimator and approval queue | estimate vs limit |
+| Detail | every attributed training job: instance, hours, unit price, cost; rate-card health with *Refresh rates* / *Reconcile now* | attributed |
+| Governance | enforcement policy (two switches), budgets, forecast, guardrail posture, alert feed, AWS Budgets | estimate vs limit |
 
 #### Where the numbers come from
 
@@ -409,37 +371,27 @@ and an approver turns them ON when a budget must be enforced.
 | POST | `/api/cost/budgets` | authed | create or update a budget |
 | POST | `/api/cost/policy` | authed **+ `llmops-approver`** | flip `block_launches` / `stop_running` |
 | POST | `/api/cost/sweep` | authed | run the budget sweep now |
+| POST | `/api/finops-run` | authed | trigger the auditor's `reconcile` / `pricing_refresh` / `report` |
 
-#### The v1 panels
+#### Removed: the v1 panels and routes (2026-10-12)
 
-Five panels, in the money's own order:
+The v1 tab had five panels — an estimator, an approval queue, an actuals rollup, a variance
+table and rate-card health — behind five routes: `GET /api/cost-overview`,
+`GET /api/cost-estimates`, `POST /api/cost-estimate`, `POST /api/cost-approval-request` and
+`POST /api/cost-approval`. All five routes and the first four panels are gone:
 
-1. **Estimate a run** — plan inputs → a line-item table with `basis` and `rate_source` per
-   row, `total` vs `worst_case`, and an explicit red UNPRICED block.
-2. **Approval queue** — pending requests with full estimate detail; reject requires a reason.
-3. **Actual spend by project, itemised** — by category, by service, by run, by period, with
-   `settled`/`provisional` badges.
-4. **Estimate vs actual** — per-run variance, driving category, and `n_unestimated`.
-5. **Rate card health** — count, sources, oldest `as_of`, and what a plan needs but the card
-   lacks.
+| v1 | Replaced by |
+|---|---|
+| actuals rollup (read `llmops-cost-actuals`, which held no cost rows) | Overview / Breakdown / Detail, priced from real usage |
+| estimate vs actual | By task |
+| approval queue + `BUDGET_MODE=blocking` | the *Block launches over budget* switch |
+| line-item estimator | the orchestrator prices every plan from the same rate card (`rate_card_for_prompt`); the signed `cost_estimate_usd` is what By task compares |
 
-The fifth panel is not an afterthought. An unnoticed stale rate makes the other four
-confidently wrong — it is the panel that would have caught DeepSeek-R1 pricing at $0.
+Rate-card health survived and moved to Detail, because every v2 figure is priced from that card;
+an unnoticed stale rate makes all of them confidently wrong. `/api/finops-run` survived with it.
 
-### API
-
-| Method | Path | Auth | Purpose |
-|---|---|---|---|
-| GET | `/api/cost-overview` | public read | rollup, settled/provisional split, budgets, rate-card health |
-| GET | `/api/cost-estimates` | public read | estimates, approval queue, variance |
-| POST | `/api/cost-estimate` | authed | price a draft plan |
-| POST | `/api/cost-approval-request` | authed | submit for approval |
-| POST | `/api/cost-approval` | authed **+ `llmops-approver`** | approve / reject, optionally launch |
-| POST | `/api/finops-run` | authed | trigger `reconcile` / `pricing_refresh` / `report` |
-
-The gate arithmetic itself lives in **one** place — `pipeline/contracts/cost_model.py`. The
-console delegates to it rather than reimplementing it, because a second copy is the copy that
-drifts, and the drifting one would be the one guarding the launch button.
+The pricing arithmetic still lives in **one** place — `pipeline/contracts/cost_model.py` — which
+the auditor, the advisory reference and the rate-card health check all delegate to.
 
 ---
 
@@ -447,11 +399,12 @@ drifts, and the drifting one would be the one guarding the launch button.
 
 | Table | Key | Holds |
 |---|---|---|
-| `llmops-cost-estimates` | PK `id` | the full line-item estimate, `worst_case_usd`, `status` ∈ `draft｜pending_approval｜approved｜rejected｜launched｜reconciled`, `requested_by`, `approved_by`, `decided_at`, `rejection_reason`, `sfn_execution_arn`, `rate_card_as_of` |
+| `llmops-cost-estimates` | PK `id` | one `est-task-*` row per accepted task (`worst_case_usd` = its signed `cost_estimate_usd`, `status` `launched`), read by the reconcile Lambda; rows from the removed v1 estimator remain as history |
+| `LlmopsAdminRuns` (console) | PK `id` | Cost v2 budgets `budget#*`, the enforcement policy `cost-policy`, alerts `budget-alert#*` |
 | `llmops-cost-actuals` | PK `project`, SK `<period>#<run_id>#<category>` | attributed cost rows with `settlement` and `ce_estimated_flag`; plus reserved `#audit#` and `#finding#` rows |
 
-Approval state lives in its own table rather than the console's generic one: it is an audit
-record and needs its own schema and retention story.
+The signed approval itself lives in S3 (`tasks/<id>/approval.json`) and on the task row, not in
+either cost table: it is an audit record, KMS-signed and hash-chained.
 
 `#audit#` and `#finding#` rows are **excluded from every cost sum**. They are the agent's own
 notes — a finding describes a variance, and summing it would double-count the very spend it
@@ -495,11 +448,12 @@ guardrail meaningful and what makes it blind:
 
 | File | Tests | Covers |
 |---|---|---|
-| `tests/test_cost_model.py` | 64 | estimate arithmetic, rate precedence, attribution, reconcile |
-| `tests/test_finops.py` | 53 | harness config, reconcile Lambda, storage, IAM shape |
-| `tests/test_console_cost.py` | 71 | HTTP layer, the dual gate, separation of duties, launch guards |
+| `tests/test_cost_model.py` | 71 | estimate arithmetic, rate precedence, attribution, reconcile |
+| `tests/test_finops.py` | 79 | harness config, reconcile Lambda, storage, IAM shape |
+| `tests/test_console_cost.py` | 25 | HTTP layer, the advisory reference, rate-card health, finops dispatch, v1 removal |
+| `tests/test_console_cost_v2.py` | 21 | enforcement policy, launch gate, budget sweep, stop path, IAM scope |
 
-All 188 run without AWS credentials, against injected clients and account `123456789012`.
+All 196 run without AWS credentials, against injected clients and account `123456789012`.
 
 The suite was **mutation-checked**: each guard was broken in turn and the run re-executed to
 confirm a test fails. That found two guards a green suite did not cover — a launch-time gate

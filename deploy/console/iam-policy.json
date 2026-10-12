@@ -192,19 +192,14 @@
       ]
     },
     {
-      "_comment": "Estimates and approval decisions: the console writes them. Actuals are written only by the finops agent via the driver, so the console reads them and never writes -- a dashboard that can edit reconciled cost is not an audit trail.",
+      "_comment": "Shadow estimates only: accept_task writes one est-task-* row per signed plan, which the reconcile Lambda reads. PutItem and nothing else since the v1 estimator, approval queue and estimates list were removed (2026-10-12) -- the Get/Update/Query/Scan they needed, and the GSI resource, went with them. Actuals are written only by the finops agent via the driver, so the console reads them and never writes -- a dashboard that can edit reconciled cost is not an audit trail.",
       "Sid": "DDBCostEstimates",
       "Effect": "Allow",
       "Action": [
-        "dynamodb:PutItem",
-        "dynamodb:UpdateItem",
-        "dynamodb:GetItem",
-        "dynamodb:Query",
-        "dynamodb:Scan"
+        "dynamodb:PutItem"
       ],
       "Resource": [
-        "arn:aws:dynamodb:REGION:ACCOUNT_ID:table/llmops-cost-estimates",
-        "arn:aws:dynamodb:REGION:ACCOUNT_ID:table/llmops-cost-estimates/index/*"
+        "arn:aws:dynamodb:REGION:ACCOUNT_ID:table/llmops-cost-estimates"
       ]
     },
     {
