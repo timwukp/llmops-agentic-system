@@ -207,10 +207,11 @@ arc-agi-2" — those defaults were only harmful because a plan could not displac
   data audit is entirely about. The guard now asserts that case.
 - The console guard reads `start_run`'s **source text** for `payload["plan"] =`, so it passes
   against an `if False:` wrapped around the block. Source-text guards cannot see reachability.
-  Cured by `test_the_launch_payload_carries_the_priced_plan` in `test_console_cost.py`, which
+  Cured by a launch-payload test in `test_console_cost.py` (removed 2026-10-12 with the path it guarded), which
   asserts on the payload the fake Lambda client was **handed** and derives its key set from
   the console's own `INT/FLOAT/STR/BOOL_KEYS`. m178 now deletes the assignment; m178b neuters
-  the branch — two shapes, two controls.
+  the branch — two shapes, two controls. (2026-10-12: the v1 estimator, its launch-time
+  plan forward, that test and m178/m178b were removed together with the v1 cost routes.)
 
 ## Before that — bug #20 (task #27), one model with four names
 

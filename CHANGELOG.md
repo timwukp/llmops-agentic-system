@@ -5,6 +5,31 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
 ## [Unreleased]
 
+### Removed: the v1 cost routes, panels and `BUDGET_MODE`
+
+Cost v2 replaced every v1 panel, so the v1 surface goes:
+
+- **Routes (5):** `GET /api/cost-overview`, `GET /api/cost-estimates`, `POST /api/cost-estimate`,
+  `POST /api/cost-approval-request`, `POST /api/cost-approval` — with `create_estimate`,
+  `request_approval`, `decide_approval`, `cost_estimates`, `cost_overview`, `cost_variance`,
+  and `start_run`'s `estimate_id` gate. Route count 37 → 32.
+- **`BUDGET_MODE` and its blocking path:** the approval queue it fed no longer exists, and a
+  second, env-var-only way to refuse a launch is a control nobody can see. The one enforcement
+  mechanism is the Governance *Block launches over budget* switch. The $20,000 references stay,
+  advisory, recorded with any overage in every signed task approval.
+- **Panels:** estimator, approval queue, actuals rollup, variance. **Kept:** rate-card health
+  (moved to Detail, served by `/api/cost/v2`) and `/api/finops-run`.
+- **IAM:** the console's grant on `llmops-cost-estimates` narrowed to `PutItem` on the table (the
+  shadow estimate per accepted task, read by reconcile).
+- **Tests:** 66 tests of removed behaviour deleted; replacements assert the routes are gone,
+  the v2 routes stay public/authed as intended, rate-card health is on Detail, and a new
+  acceptance is hash-chained to the previous record (re-anchoring negative control m216, verified
+  by running the mutation). Nine negative controls whose code was removed (m80, m100–m103, m178,
+  m178b, m266, m298) retired.
+- **Docs:** COST.md §3 (the reference, now advisory-only), §6, §8, §9, §11 in EN + zh-TW;
+  ARCHITECTURE (EN + zh-TW) route planes and the enforcement paragraph; READMEs; console README;
+  PROJECT_STATE.
+
 ### Cost governance: visible ON/OFF enforcement, and a running-job alarm
 
 Enforcement moves from a hidden per-budget `notify`/`block` mode to **one visible policy** on

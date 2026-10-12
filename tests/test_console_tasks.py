@@ -411,42 +411,32 @@ def test_accept_over_budget_dispatches_but_signs_the_overage(wired):
     assert ct.verify_record(wired.kms, tampered) is False
 
 
-def test_accept_over_limit_goes_to_the_cost_queue(blocking):
-    wired = blocking
-    tid = _mk_task(wired, cost=_over_limit_cost(wired))
-    r = wired.console.accept_task(tid, DS_USER)
-    assert r["ok"] and r["status"] == "pending_approval"
-    pend = [p for p in wired.est.puts if p.get("status") == "pending_approval"]
-    assert pend and pend[0]["task_id"] == tid
-    # nothing dispatched yet
-    assert not any(json.loads(i["Payload"]).get("accept")
-                   for i in wired.lam.invokes if i.get("InvocationType") == "Event")
-
-
 def test_accept_requires_a_console_group_even_over_limit(wired):
-    """Over-limit acceptance is 'submit to the queue' — but a user in NO group must
-    not be able to enqueue spend requests at all."""
+    """Over the reference, acceptance still dispatches (advisory) — so a user in NO group
+    must not be able to sign, and therefore launch, spend at all."""
     tid = _mk_task(wired, cost=_over_limit_cost(wired))
     r = wired.console.accept_task(tid, NOBODY)
     assert r["status_code"] == 403
     assert not [p for p in wired.est.puts if p.get("task_id") == tid]
 
 
-def test_over_limit_self_approval_is_blocked_at_the_cost_queue(blocking):
-    """The REAL self-approval control lives in decide_approval via
-    cost_model.check_approval (requester != approver) — exactly the same rule the
-    form-based estimates enforce. Alice created and submitted; Alice may not decide."""
-    wired = blocking
-    tid = _mk_task(wired, cost=_over_limit_cost(wired))
-    wired.console.accept_task(tid, DS_USER)
-    eid = [p for p in wired.est.puts if p.get("task_id") == tid][-1]["id"]
-    wired.est.items[eid] = [p for p in wired.est.puts if p.get("id") == eid][-1]
-    alice_as_approver = {"username": "alice", "groups": ["llmops-approver"],
-                         "sub": "sub-alice", "source_ip": "ip"}
-    r = wired.console.decide_approval({"estimate_id": eid, "decision": "approve"},
-                                      alice_as_approver, "2026-08-01T00:00:00+00:00")
-    assert r.get("status_code") in (403, 409), "self-approval must be denied"
-    assert wired.tasks.items[tid]["status"] == "pending_approval"
+def test_a_new_acceptance_is_hash_chained_to_the_previous_record(wired):
+    """Each signed record names the digest of the one before it, so a deleted or edited
+    record in the middle of a task's history breaks the chain visibly. Re-anchored after
+    the v1 approval queue (which wrote the second record in the old version of this test)
+    was removed: a task re-proposed after an earlier acceptance carries that earlier
+    record, and the new acceptance must link to it."""
+    tid = _mk_task(wired)
+    prior = {"record_sha256": "ab" * 32, "decision": "accepted", "approved_by": "boss"}
+    wired.tasks.items[tid]["approvals"] = [prior]
+    r = wired.console.accept_task(tid, DS_USER)
+    assert r["ok"]
+    latest = wired.tasks.items[tid]["approvals"][-1]
+    # != "genesis" is the independent half: comparing only against chain_hash(prior) would
+    # pass even if chain_hash were broken to return "genesis" for everything (m216).
+    assert latest["prev_event_sha256"] != "genesis"
+    assert latest["prev_event_sha256"] == wired.console.conductor_tools.chain_hash(prior)
+    assert latest["decision"] == "accepted" and latest["approved_by"] == "alice"
 
 
 def test_accept_is_not_replayable(wired):
@@ -481,58 +471,7 @@ def test_tampered_approval_record_fails_verification(wired):
     assert not conductor_tools.verify_record(wired.kms, rec)
 
 
-def test_hash_chain_links_successive_records(wired, monkeypatch):
-    tid = _mk_task(wired, cost=_over_limit_cost(wired))
-    wired.console.accept_task(tid, DS_USER)          # record 1: submitted
-    first = wired.tasks.items[tid]["approvals"][-1]
-    # approver decides on the Cost tab
-    eid = [p for p in wired.est.puts if p.get("task_id") == tid][-1]["id"]
-    wired.est.items[eid] = [p for p in wired.est.puts if p.get("id") == eid][-1]
-    import cost_model
-    monkeypatch.setattr(cost_model, "check_approval",
-                        lambda *a, **k: {"allowed": True})
-    r = wired.console.decide_approval({"estimate_id": eid, "decision": "approve"},
-                                      APPROVER, "2026-07-31T00:00:00+00:00")
-    assert r["ok"]
-    second = wired.tasks.items[tid]["approvals"][-1]
-    assert second["prev_event_sha256"] == first["record_sha256"]
-    assert second["approved_by"] == "boss"
-
-
 # ── the Cost-tab decision routes back through the orchestrator ────────────────
-
-def test_budget_approval_enqueues_the_accept_turn_not_start_run(wired, monkeypatch):
-    tid = _mk_task(wired, cost=_over_limit_cost(wired))
-    wired.console.accept_task(tid, DS_USER)
-    eid = [p for p in wired.est.puts if p.get("task_id") == tid][-1]["id"]
-    wired.est.items[eid] = [p for p in wired.est.puts if p.get("id") == eid][-1]
-    import cost_model
-    monkeypatch.setattr(cost_model, "check_approval", lambda *a, **k: {"allowed": True})
-    start_run_calls = []
-    monkeypatch.setattr(wired.console, "start_run",
-                        lambda body: start_run_calls.append(body) or {"ok": True})
-    r = wired.console.decide_approval({"estimate_id": eid, "decision": "approve"},
-                                      APPROVER, "2026-07-31T00:00:00+00:00")
-    assert r["ok"] and r["task"]["status"] == "accepting"
-    assert not start_run_calls, "conductor plans dispatch via launch_run, never start_run"
-    payload = json.loads(wired.lam.invokes[-1]["Payload"])
-    assert payload == {"mode": "task-chat", "task_id": tid, "accept": True}
-
-
-def test_budget_rejection_feeds_the_reason_back_to_the_orchestrator(wired, monkeypatch):
-    tid = _mk_task(wired, cost=_over_limit_cost(wired))
-    wired.console.accept_task(tid, DS_USER)
-    eid = [p for p in wired.est.puts if p.get("task_id") == tid][-1]["id"]
-    wired.est.items[eid] = [p for p in wired.est.puts if p.get("id") == eid][-1]
-    import cost_model
-    monkeypatch.setattr(cost_model, "check_approval", lambda *a, **k: {"allowed": True})
-    r = wired.console.decide_approval(
-        {"estimate_id": eid, "decision": "reject", "reason": "too expensive, halve it"},
-        APPROVER, "2026-07-31T00:00:00+00:00")
-    assert r["ok"] and r["task"]["status"] == "thinking"
-    msgs = wired.tasks.items[tid]["messages"]
-    assert any("REJECTED" in m["text"] and "halve it" in m["text"] for m in msgs)
-
 
 # ── launch_run servicing (conductor_tools, direct) ────────────────────────────
 

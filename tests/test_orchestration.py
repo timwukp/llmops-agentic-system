@@ -6522,60 +6522,6 @@ class TestConductorDispatch:
                                         {"models": dict(models)})
         assert m["models"]["teacher"] == "global.anthropic.claude-fable-5"
 
-    def test_the_console_form_field_name_is_the_one_consent_is_read_from(self):
-        """The console UI is the ONLY path a customer has to sign a plan, and its form
-        posts `teacher_model` (create_estimate's STR_KEYS) -- which is also the field
-        cost_model.py prices the run from. The consent check read `models.teacher`.
-
-        So the field the human's money was quoted against and the field the dispatcher
-        obeyed were different fields, and the mismatch failed SILENTLY: `models` absent
-        means "the plan is silent", which falls through to DEFAULT_MODELS. Red before
-        the fix: teacher = us.deepseek.r1-v1:0 for a plan signed for Fable-5 -- priced
-        as one model, executed on another, with every artifact agreeing. The bug #9
-        class, reintroduced through a name rather than a precedence rule.
-
-        Derived from the console's own STR_KEYS so the two cannot drift apart again --
-        and checked as a THREE-way agreement (form posts -> estimator prices ->
-        dispatcher obeys), because a field only one of the three knows about is the bug.
-        Skipping a field this guard does not recognise is what let control m163 escape:
-        renaming the console's `teacher_model` to `teacher_mdl` left the form posting a
-        field the estimator never prices, and the whole suite stayed green.
-        """
-        console = (REPO / "deploy/console/lambda_function.py").read_text()
-        str_keys = console.split("STR_KEYS = (", 1)[1].split(")", 1)[0]
-        posted = [k.strip().strip('"\'') for k in str_keys.split(",") if "model" in k]
-        assert posted, "the console form no longer posts any *_model field"
-
-        priced = _fields_the_estimator_prices_models_from()
-        vocabulary = {a: role for role, aliases in start_pipeline.ROLE_ALIASES.items()
-                      for a in aliases}
-
-        # Every field cost_model prices from must be one the form can actually post,
-        # or the quote is computed from a default the customer never chose.
-        unpostable = sorted(f for f, nested in priced.items() if not nested
-                            and f not in posted)
-        assert not unpostable, (
-            f"cost_model prices a model from plan.{unpostable} but the console form "
-            f"posts only {sorted(posted)}. The estimate a customer signs would be "
-            "computed from a default they were never shown.")
-
-        for field in posted:
-            assert field in priced, (
-                f"the console form posts {field!r} but cost_model prices no model from "
-                f"it (it prices from {sorted(priced)}). The field the customer fills in "
-                "is not the field their money is quoted against.")
-            assert field in vocabulary, (
-                f"the console form posts {field!r} but the dispatcher's ROLE_ALIASES "
-                f"does not list it, so a plan signed through the UI dispatches on "
-                "DEFAULT_MODELS -- priced as one model, executed on another.")
-            role = vocabulary[field]
-            m = start_pipeline.seed_manifest(
-                "run-x", "conductor", {}, {field: "global.anthropic.claude-fable-5"})
-            assert m["models"].get(role) == "global.anthropic.claude-fable-5", (
-                f"the console signs plans with {field!r} and cost_model prices from it, "
-                f"but the manifest resolved {role} to {m['models'].get(role)!r} -- the "
-                "run would be priced as one model and executed on another")
-
     def test_a_plan_that_names_one_model_twice_with_two_ids_is_refused(self):
         """`teacher` and `teacher_model` are aliases for one fact. A document that uses
         both with different ids contradicts itself, and no precedence rule makes one
@@ -6820,38 +6766,6 @@ class TestConductorDispatch:
             f"the plan bought an audit and the execution input says "
             f"{sent.get('pipeline_mode')!r} -- the Choice state defaults to "
             "DataPrepGenerate, so the run provisions GPUs nobody paid for")
-
-    def test_the_console_launch_forwards_the_priced_plan_not_two_integers(self):
-        """The console is the only path a customer has, and its approve->launch step
-        scraped the priced plan for `task_count` and `sample_count` alone. The other
-        fields the estimator priced -- both instance types, teacher_model, harness_model,
-        endpoint_hours, keep_reasoning, teardown -- were dropped, and the run executed on
-        ARC defaults while the estimate record said otherwise.
-
-        Derived from the console's OWN key lists, so a field added to the form is covered
-        without editing this test.
-        """
-        console = (REPO / "deploy/console/lambda_function.py").read_text()
-        body = re.search(r"def start_run\(body\):(.*?)\ndef ", console, re.S).group(1)
-        assert re.search(r'payload\["plan"\]\s*=', body), (
-            "start_run builds no `plan` key, so start-pipeline sees the priced plan as "
-            "absent and every field it named falls to DEFAULT_PARAMS")
-        priced_keys = set()
-        for kind in ("INT_KEYS", "FLOAT_KEYS", "STR_KEYS", "BOOL_KEYS"):
-            m = re.search(kind + r" = \((.*?)\)", console, re.S)
-            priced_keys |= set(re.findall(r'"([a-z_0-9]+)"', m.group(1)))
-        # Whatever the form priced must survive seed_manifest -- as a param, or (for a
-        # model role) normalised into manifest.models.
-        roles = {a: r for r, aliases in start_pipeline.ROLE_ALIASES.items()
-                 for a in aliases}
-        for k in sorted(priced_keys):
-            probe = "global.anthropic.claude-fable-5" if k in roles else f"probe-{k}"
-            m = start_pipeline.seed_manifest("run-x", "console", {}, {k: probe})
-            got = (m["models"].get(roles[k]) if k in roles else m["params"].get(k))
-            assert got == probe, (
-                f"the console form prices {k}, and a plan naming it produced {got!r}. "
-                "The estimate record and the run would describe different spends, and "
-                "the variance report would call the difference an underspend.")
 
     def test_the_gate_prompt_reads_the_thresholds_the_plan_named(self):
         """The consumer half. `params.gates` now arrives from the signed plan, and the eval

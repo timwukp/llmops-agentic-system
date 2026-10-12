@@ -1177,30 +1177,6 @@ case("budget: the canonical single-run reference silently reverts to $2,000",
       "tests/test_console_cost.py::test_the_consoles_fallback_limits_equal_the_canonical_ones"])
 
 
-def m80(t):
-    """Freeze the straddling plan back to the literal 2,000,000 rows it used at $2,000.
-
-    Not a hypothetical: this IS what raising the reference did, and it is the reason the
-    plan is derived now. 2M rows price at $1,268 expected / $3,804 worst case -- both under
-    $20,000 -- so every budget test downstream would stop engaging the budget check at all
-    and pass while testing nothing. A fixture that no longer triggers the check it exists to
-    trigger is the failure mode its own docstring names, so the straddle relation is
-    asserted on every use rather than assumed.
-    """
-    old = 'return {"sample_count": int(0.5 * limit / per_sample), "max_iterations": 3}'
-    assert old in t, (
-        "the straddling plan's derivation has moved or been reworded; re-anchor this "
-        "mutation rather than letting it no-op")
-    return t.replace(old, 'return {"sample_count": 2_000_000, "max_iterations": 3}', 1)
-
-
-case("budget: the straddling fixture stops straddling and tests nothing",
-     "tests/test_console_cost.py", m80,
-     ["tests/test_console_cost.py::test_the_budget_check_reads_worst_case_not_expected",
-      "tests/test_console_cost.py::test_an_over_budget_launch_says_so_in_its_own_response",
-      "tests/test_console_cost.py::test_lowering_the_limit_re_gates_an_already_clean_estimate"])
-
-
 def m81(t):
     """Put the falsified $18/day back into the auditor's own system prompt.
 
@@ -1598,92 +1574,6 @@ def m99(t):
 case("docs: a shadowed duplicate test name is not reported",
      "tests/test_docs_claims.py", m99,
      ["tests/test_docs_claims.py::test_a_test_name_defined_twice_in_one_module_is_reported"])
-
-
-def m100(t):
-    """Ship the limits without the mode, exactly as they shipped until 2026-08-03.
-
-    Two numbers labelled as limits and no word on whether either is enforced. The route
-    keeps working, the page keeps rendering, and the reader concludes the platform stops an
-    over-budget run -- which in the deployed advisory default it does not.
-    """
-    old = ('                       "budget_mode": BUDGET_MODE,\n'
-           '                       "enforced": BUDGET_MODE == "blocking"}}')
-    assert t.count(old) == 1, f"the limits payload has moved; found {t.count(old)}"
-    return t.replace(old, '                       }}', 1)
-
-
-case("console: the limits ship without saying whether they are enforced",
-     "deploy/console/lambda_function.py", m100,
-     ["tests/test_console_cost.py::test_the_limits_say_whether_they_are_enforced"])
-
-
-def m101(t):
-    """Hardcode enforcement to False -- the shape that keeps the advisory test green forever.
-
-    This is the mutation the first version of this guard would NOT have caught: a test that
-    only checks the advisory default is satisfied by a constant, and every blocking
-    deployment then reports its real gate as advisory. Aimed at the blocking tests, because
-    their subject is the flag TRACKING the mode rather than matching today's value.
-    """
-    old = '                       "enforced": BUDGET_MODE == "blocking"}}'
-    assert t.count(old) == 1, f"the enforced flag has moved; found {t.count(old)}"
-    return t.replace(old, '                       "enforced": False}}', 1)
-
-
-case("console: enforcement is hardcoded rather than derived from the mode",
-     "deploy/console/lambda_function.py", m101,
-     ["tests/test_console_cost.py::"
-      "test_the_limits_report_enforcement_when_the_gate_really_blocks",
-      "tests/test_console_cost.py::test_enforced_is_true_and_the_run_really_is_held"])
-
-
-def m102(t):
-    """Put the numbers back on the card with the mode stripped off.
-
-    The API stays honest and the page still reads as a stop sign -- which is the actual
-    user-visible defect, and the reason the card is asserted separately from the payload.
-    """
-    old = 'const enf = lim.enforced === true;'
-    assert t.count(old) == 1, f"the card's mode read has moved; found {t.count(old)}"
-    t = t.replace(old, 'const enf = false;', 1)
-    old2 = ('      +(enf ? "ENFORCED &mdash; an over-budget run is held for an approver"\n'
-            '            : "ADVISORY &mdash; an over-budget run is reported, then launched '
-            'anyway")+"</span>";')
-    assert t.count(old2) == 1, f"the card's mode text has moved; found {t.count(old2)}"
-    return t.replace(old2, '      +""+"</span>";', 1)
-
-
-case("console: the cost card shows the limits with no word on enforcement",
-     "deploy/console/frontend.html", m102,
-     ["tests/test_console_cost.py::test_the_cost_card_renders_the_mode_next_to_the_numbers"])
-
-
-def m103(t):
-    """Strip the mode from the OVERVIEW limits only -- the state that actually shipped.
-
-    m100 breaks the estimates payload, which the first three guards all read. This breaks
-    the second payload and leaves the first intact, so it reproduces the live defect
-    exactly: /api/cost-estimates answered with budget_mode while /api/cost-overview
-    answered with two bare numbers, and every test named after the estimates endpoint
-    stayed green through the deploy. It is aimed at the source-derived guard as well as
-    the endpoint-named one, because the source-derived guard is the only one that would
-    have caught this before it shipped.
-    """
-    old = ('        "limits": {"single_usd": APPROVAL_LIMIT_USD,\n'
-           '                   "cumulative_usd": CUMULATIVE_LIMIT_USD,\n'
-           '                   "budget_mode": BUDGET_MODE,\n'
-           '                   "enforced": BUDGET_MODE == "blocking"},')
-    assert t.count(old) == 1, f"the overview limits payload has moved; found {t.count(old)}"
-    return t.replace(old, '        "limits": {"single_usd": APPROVAL_LIMIT_USD,\n'
-                          '                   "cumulative_usd": CUMULATIVE_LIMIT_USD},', 1)
-
-
-case("console: one limits payload states its mode and the other does not",
-     "deploy/console/lambda_function.py", m103,
-     ["tests/test_console_cost.py::"
-      "test_the_overview_limits_also_say_whether_they_are_enforced",
-      "tests/test_console_cost.py::test_no_limits_payload_anywhere_omits_the_mode"])
 
 
 def m104(t):
@@ -2946,8 +2836,7 @@ def m154(t):
 
 
 case("resolver: the signed plan's flat teacher_model is ignored again", _RESOLVER, m154,
-     [f"{_D}::test_the_console_form_field_name_is_the_one_consent_is_read_from",
-      f"{_D}::test_every_plan_field_the_estimator_prices_from_is_one_the_dispatcher_obeys"])
+     [f"{_D}::test_every_plan_field_the_estimator_prices_from_is_one_the_dispatcher_obeys"])
 
 
 # 155. One document naming the same role twice with two ids is resolved by precedence
@@ -3027,8 +2916,7 @@ def m160(t):
 
 
 case("resolver: the alias list drops the console's own field name", _RESOLVER, m160,
-     [f"{_D}::test_the_console_form_field_name_is_the_one_consent_is_read_from",
-      f"{_D}::test_every_plan_field_the_estimator_prices_from_is_one_the_dispatcher_obeys"])
+     [f"{_D}::test_every_plan_field_the_estimator_prices_from_is_one_the_dispatcher_obeys"])
 
 
 # 161. The estimator renames the field it prices the teacher from, out of the
@@ -3044,37 +2932,7 @@ def m161(t):
 
 case("estimator: prices the teacher from a field the dispatcher never reads",
      "pipeline/contracts/cost_model.py", m161,
-     [f"{_D}::test_the_console_form_field_name_is_the_one_consent_is_read_from",
-      f"{_D}::test_every_plan_field_the_estimator_prices_from_is_one_the_dispatcher_obeys"])
-
-
-# 162. The estimator prices a model from a field the console form cannot post, so the
-#      quote a customer signs is computed from a default they were never shown.
-def m162(t):
-    old = 'harness_model = str(plan.get("harness_model", "global.anthropic.claude-fable-5"))'
-    assert t.count(old) == 2, f"cost_model's harness field has moved; found {t.count(old)}"
-    return t.replace(old, 'harness_model = str(plan.get("harness", '
-                          '"global.anthropic.claude-fable-5"))')
-
-
-case("estimator: prices from a field the console form cannot post",
-     "pipeline/contracts/cost_model.py", m162,
-     [f"{_D}::test_the_console_form_field_name_is_the_one_consent_is_read_from"])
-
-
-# 163. The console form posts a field nothing prices and nothing dispatches. This
-#      escaped the first run for the same reason m161 did: the guard SKIPPED any field
-#      whose role it
-#      did not recognise, so renaming it made the mismatch invisible rather than red.
-def m163(t):
-    old = '"teacher_model"'
-    assert t.count(old) >= 1, f"the console's STR_KEYS has moved; found {t.count(old)}"
-    return t.replace(old, '"teacher_mdl"', 1)
-
-
-case("console: the signed form posts a field nothing prices or dispatches",
-     "deploy/console/lambda_function.py", m163,
-     [f"{_D}::test_the_console_form_field_name_is_the_one_consent_is_read_from"])
+     [f"{_D}::test_every_plan_field_the_estimator_prices_from_is_one_the_dispatcher_obeys"])
 
 
 # The stage-payload merge line, DERIVED. m164/m165/m183 below all patch it, and all
@@ -3306,39 +3164,6 @@ def m177(t):
 
 case("resolver: a nested data key overwrites the plan's explicit top-level one", _RESOLVER,
      m177, [f"{_D}::test_the_plans_data_block_reaches_the_prompt_that_reads_it_flat"])
-
-
-# 178. The console's approve->launch forwards no plan again, so a customer's priced
-#      instance types and teacher model die between the estimate record and the run.
-#
-# Two controls, because the block can be broken two ways that no single guard sees. The
-# orchestration guard reads start_run's SOURCE for `payload["plan"] =` -- so DELETING the
-# assignment (m178) trips it, but neutering the branch around it (m178b) does not: the text
-# is still there. The runner proved that escape. The catch for m178b has to be a test that
-# inspects the payload the Lambda client was actually HANDED, which is what
-# test_the_launch_payload_carries_the_priced_plan does.
-def m178(t):
-    old = '            payload["plan"] = priced'
-    assert t.count(old) == 1, f"the console plan forward has moved; found {t.count(old)}"
-    return t.replace(old, '            pass', 1)
-
-
-case("console: the priced plan is not forwarded to start-pipeline",
-     "deploy/console/lambda_function.py", m178,
-     [f"{_D}::test_the_console_launch_forwards_the_priced_plan_not_two_integers",
-      "tests/test_console_cost.py::test_the_launch_payload_carries_the_priced_plan"])
-
-
-# 178b. The forwarding code stays, unreachable -- the shape a source-text guard cannot see.
-def m178b(t):
-    old = '    if est is not None:\n        try:\n            priced = json.loads(est.get("plan", "{}"))'
-    assert t.count(old) == 1, f"the console plan forward has moved; found {t.count(old)}"
-    return t.replace(old, '    if False:\n        try:\n            priced = json.loads(est.get("plan", "{}"))', 1)
-
-
-case("console: the plan-forwarding block is present but unreachable",
-     "deploy/console/lambda_function.py", m178b,
-     ["tests/test_console_cost.py::test_the_launch_payload_carries_the_priced_plan"])
 
 
 # 179. The eval agent gates on a bar it remembers instead of the one the plan named --
@@ -4057,7 +3882,7 @@ def m216(t):
 
 
 case("approval: every record links to genesis, so the audit chain records no order",
-     _CT, m216, [f"{_T}test_hash_chain_links_successive_records"])
+     _CT, m216, [f"{_T}test_a_new_acceptance_is_hash_chained_to_the_previous_record"])
 
 
 #: ---------------------------------------------------------------------------------------
@@ -4841,20 +4666,6 @@ case("console page: the run list's truncation flag is dropped between the payloa
      [f"{_TC}test_the_lists_say_on_screen_what_they_could_not_read"])
 
 
-def m266(t):
-    old = """                items = _scan_ordered(estimates_tbl,
-                                      lambda i: str(i.get("created_at", "")))[0][:int(limit)]"""
-    assert t.count(old) == 1, "the estimates fallback has moved"
-    # The fallback path promised newest-first in its docstring and served hash order, so
-    # the same console showed two different arbitrary sets of estimates.
-    return t.replace(old, '                items = estimates_tbl.scan(Limit=int(limit)).get("Items", [])', 1)
-
-
-case("console cost: the GSI fallback windows its scan, so the estimate list silently "
-     "disagrees with the primary path",
-     _CN, m266, [f"{_TC}test_no_reader_windows_a_scan_inside_dynamodb"])
-
-
 # ── D14: the fix that reached five of seven, and the 43 records it would burn (m267-m275) ─
 _WM = "deploy/04_wire_memory.py"
 _FO = "agents/finops/harness.json"
@@ -5346,22 +5157,6 @@ def m297(t):
 case("cost model: the OCU assumption prices the cost but hides the teardown command",
      _CM, m297,
      ["tests/test_cost_model.py::test_the_ocu_assumption_names_the_teardown_command"])
-
-
-def m298(t):
-    old = ("    FLOAT_KEYS = (\"endpoint_hours\", \"train_rows\", \"minutes_per_stage\",\n"
-           "                  \"kb_ocu_hours\", \"kb_embed_ingest_tokens\")")
-    assert t.count(old) == 1, "the console FLOAT_KEYS allowlist has moved"
-    # The form silently drops the standing-cost key -- the operator typed it, the
-    # estimate never priced it, and "only keys the estimator reads are forwarded" is
-    # exactly the design that makes this failure invisible.
-    return t.replace(old, "    FLOAT_KEYS = (\"endpoint_hours\", \"train_rows\", "
-                          "\"minutes_per_stage\")", 1)
-
-
-case("console: kb_ocu_hours is dropped from the estimate form's allowlist",
-     "deploy/console/lambda_function.py", m298,
-     ["tests/test_console_cost.py::test_the_retrieval_index_keys_are_forwarded_and_priced"])
 
 
 # ── the canonical RAFT context format (r6d) ──────────────────────────────────────────

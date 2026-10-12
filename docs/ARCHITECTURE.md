@@ -1262,7 +1262,7 @@ variance to argue about.
 ![Console architecture](architecture-console.svg)
 
 The dashboard is a single
-Lambda serving the HTML and all **37 route handlers** across **9 tabs**, with **no build step
+Lambda serving the HTML and all **32 route handlers** across **9 tabs**, with **no build step
 and no CDN**:
 `frontend.html` is embedded at cold start and the page ships with `CSP connect-src 'self'`
 plus the S3 origin the upload path needs. One artifact means the UI can never be a version
@@ -1272,9 +1272,9 @@ Its design is four planes that deliberately do **not** share rules:
 
 | plane | handlers | rule |
 |---|---|---|
-| **read** | 15 GETs (`/api/overview`, `/api/pipeline`, `/api/run`, `/api/observability`, `/api/cost/v2`, `/api/cost/budgets`, …) | public, aggregated server-side |
+| **read** | 13 GETs (`/api/overview`, `/api/pipeline`, `/api/run`, `/api/observability`, `/api/cost/v2`, `/api/cost/budgets`, …) | public, aggregated server-side |
 | **session** | 3 POSTs: `/api/login`, `/api/refresh`, `/api/refresh/revoke` | unauthenticated **by necessity** — these mint or revoke the credential |
-| **write** | 14 POSTs: `/api/start-run`, `/api/cost/{budgets,policy,sweep}`, `/api/cost-approval*`, `/api/finops-run`, `/api/optimize*`, `/api/native-rec*`, `/api/batch-eval`, … | Cognito at one chokepoint |
+| **write** | 11 POSTs: `/api/start-run`, `/api/cost/{budgets,policy,sweep}`, `/api/finops-run`, `/api/optimize*`, `/api/native-rec*`, `/api/batch-eval`, … | Cognito at one chokepoint |
 | **consult** | everything under `/api/tasks`, **both methods** — 2 GET handlers (`/api/tasks`, `/api/tasks/{id}[/approval|/readiness]`) and the POSTs `/api/tasks/{id}/{message,accept,close}` plus `/api/data-upload-url` | authed **and** group-checked; the only plane that invokes an agent |
 
 Besides HTTP, the same Lambda has one scheduled entry point: the EventBridge rule
@@ -1300,13 +1300,15 @@ panel added to a thread would arrive anonymous the same way.
 resolves `_authed_user(headers)` once, before dispatching any POST, and returns 401 on
 failure — so adding a route cannot accidentally add an unauthenticated write. It resolves to
 a *user* rather than a boolean because two downstream checks need identity, not just
-authentication: the approver-group test, and the never-self-approve test that compares the
-approver's username to the requester's. Verified live, unauthenticated: `/api/tasks`,
+authentication: the approver-group test that guards the Cost tab's enforcement switches, and
+the approver identity written into every signed task approval. Verified live, unauthenticated: `/api/tasks`,
 `/api/start-run`, `/api/cost-approval`, `/api/data-upload-url`, `/api/finops-run` and
 `/api/tasks/{id}/message` all return **401**, while `/api/overview` and `/api/cost-overview`
 GET **200**. `GET /api/tasks` was in the 200 list when this was measured; it is a 401 now, and
 that line is the artifact of the leak — the measurement was taken and written down as
 confirmation of the design, because the design being checked was the one about POSTs.
+(`/api/cost-approval` and `/api/cost-overview` were removed with the v1 cost routes on
+2026-10-12; the measurement is kept as it was taken.)
 
 **Three POSTs sit above that chokepoint, and naming them is part of the design.** `/api/login`
 mints a session; `/api/refresh` restores one from the httpOnly cookie after a page reload (the
@@ -1333,10 +1335,12 @@ the Pipeline tab could read every engagement in the account. 401 and 403 stay di
 for the same reason as on the write plane: telling an operator who is simply in the wrong
 group that their session expired sends them round a re-login that cannot help.
 
-**The cost gate is server-side, and advisory by configuration rather than by accident.**
-`APPROVAL_LIMIT_USD` (default 2000) and `BUDGET_MODE` (`advisory`, or `blocking`) live in the
-Lambda, not the UI: a gate a client enforces is a gate a client can skip. `advisory` names an
-over-budget dispatch and lets it through with the estimate recorded; `blocking` refuses it.
+**Budget enforcement is server-side, and visible.** The one way to refuse a launch over budget
+is `budget_gate()` in the Lambda, armed by the Cost tab's *Block launches over budget* switch —
+a policy row an approver flips, shown on the page, not an env var: a gate a client enforces is a
+gate a client can skip, and a gate nobody can see is a gate nobody knows is armed. The
+`APPROVAL_LIMIT_USD` / `CUMULATIVE_LIMIT_USD` references ($20,000) are advisory only and are
+recorded, with any overage, in the signed approval (see [COST.md §3](COST.md#3-the-20000-reference-advisory)).
 Approvals are **KMS-signed and hash-chained** (`conductor_tools.sign_record`), carrying the
 approver's identity and source IP, so an approval is evidence rather than a UI state.
 

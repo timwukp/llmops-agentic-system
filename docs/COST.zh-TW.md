@@ -43,8 +43,8 @@ cost_usd:  10.770808          實測: $10.77          誤差: 0.0%
 16,550 ÷ 24,924，以及同一個 run 的殘差。這正是這個實測案例的意義所在 —— 模型是
 **從一次真實測量播種出來的**，所以它在 training 這條線上的準確度是事實，不是希望。
 
-`tests/test_console_cost.py::test_estimate_matches_the_measured_e3_run_within_one_percent`
-斷言這個誤差維持在 1% 以內。依照計畫自訂的規則：**對一個已知實際費用的 run 誤差超過
+`tests/test_cost_model.py::test_estimator_reproduces_the_measured_1077_run`
+斷言這個誤差維持在 1% 以內（$10.77 上下 ±$0.05）。依照計畫自訂的規則：**對一個已知實際費用的 run 誤差超過
 20%，那是模型的 bug，不是雜訊。**
 
 ### 同一個估算的另外一半
@@ -122,94 +122,59 @@ DeepSeek-R1 的名字」必然找不到，然後誤判為不存在。**要用明
 
 ---
 
-## 3. $20,000 基準
+## 3. $20,000 基準（僅供參考）
 
-**任一**門檻被跨越就觸發審批：
+兩個數字，都會被記錄在**每一份 KMS 簽署的 task 核准紀錄**裡，而且兩者都不會擋下任何東西：
 
-| 門檻 | 預設 | 理由 |
+| 基準 | 預設 | 衡量什麼 |
 |---|---|---|
-| 單次 run | `APPROVAL_LIMIT_USD` = **$20,000** | 一個很貴的 run |
-| 累計 | `CUMULATIVE_LIMIT_USD` = **$20,000** | 專案至今實際支出 **+** 本次估算 |
+| 單次 run | `APPROVAL_LIMIT_USD` = **$20,000** | plan 的 `cost_estimate_usd`，視為其最壞情況 |
+| 累計 | `CUMULATIVE_LIMIT_USD` = **$20,000** | 專案至今實際支出 **+** 這份 plan |
 
-二十個 $1,500 的 run 和一個 $30,000 的 run 是同樣的曝險，而那二十個每一個單獨看都能通過
-單次檢查。只有第一個門檻的閘門，是一個防得住一種超支形狀、卻對另一種完全看不見的閘門。
+二十個 $1,500 的 run 與一個 $30,000 的 run 是同樣的曝險，而那二十個各自都通得過單次比較 ——
+所以兩者都要記錄。任一個被跨過時，簽署紀錄的 `gate.over_budget` 會寫明超出多少；plan 照樣
+dispatch。
 
-### 為什麼是 $20,000，以及為什麼還要留一個數字
+**強制執行不在這裡。** 唯一能擋下超預算啟動的方式，是 Cost 分頁上看得見的「超出預算時擋下
+啟動」開關（§8），依操作者自訂的預算評估。先前的 `BUDGET_MODE=blocking` 路徑以及它所餵的審批
+佇列，已於 2026-10-12 隨 v1 cost routes 一併移除：第二種只靠環境變數、在 portal 上看不到的
+拒絕方式，是一個沒人看得見的控制項。
 
-2026-08-02 依平台擁有者的指示，從 $2,000 上調。這是本專案自己的設計／測試平台，不是客戶的
-生產帳戶：整個經測試證明的紀錄 —— 六個 agent、一個訓練好的模型、一個部署又拆除的 endpoint、
-五次 e2e 迭代 —— 總共花了 **$12–15**。一個低到會被日常工作跨過的基準，就是一個會被忽略的
-基準；而被忽略的基準比高的基準更糟，因為它訓練人們習慣性地按過去。
+### 為什麼是 $20,000，以及為什麼要有一個數字
 
-留著一個數字是比較不顯然的另一半。在 `BUDGET_MODE=advisory`（§8）之下這個基準不會攔下任何
-東西，所以它唯一剩下的職責，就是成為那條讓超估算的 run 在 `start_run` 的 `budget_notice` 裡
-**被指名**的線。把數字刪掉，那條線也一起消失：就再也沒有任何東西能說出「這個 run 比它的估算
-貴得多」—— 而這正是整個模組存在要抓的那種失敗。高的基準仍然會回報。沒有基準，什麼都不會回報。
+依平台擁有者的指示，於 2026-08-02 從 $2,000 調高。這是專案自己的設計與測試平台，不是客戶的
+正式環境帳號：整份經過測試驗證的紀錄 —— 六個 agent、一個訓練好的模型、一個部署後又拆除的
+endpoint、五次 e2e 迭代 —— 總共花了 **約 $12–15**。低到一般工作就會跨過的基準，會被忽略。
 
-這個數字只住在一個做決定的地方 —— `cost_model.DEFAULT_SINGLE_RUN_LIMIT_USD`。`deploy.sh` 從
-打包進去的模組讀它來設定 `APPROVAL_LIMIT_USD`，而 console 自己的後備字面值由
-`test_console_cost.py::test_the_consoles_fallback_limits_equal_the_canonical_ones` 釘住與它相等。
-在 2026-08-02 之前，deploy 兩個 env var 都沒有設，所以線上的 function 回報
-`APPROVAL_LIMIT_USD: null` 並落到程式碼預設值 —— 而它剛好一致，所以什麼都沒錯，也沒有任何
-東西能在它不再一致時告訴我們。
+保留一個數字，是比較不明顯的那一半。這個基準不擋任何東西，所以它唯一的工作就是讓超出估算的
+plan 在第三方會稽核的紀錄裡被**點名**。把數字刪掉，這一行也跟著消失。高的基準仍然會報告；
+沒有基準就什麼都不報告。
 
-### 它看的是 `worst_case_usd`，永遠不是 `total_usd`
+這個數字只存在於一個做決定的地方 —— `cost_model.DEFAULT_SINGLE_RUN_LIMIT_USD`。`deploy.sh`
+從打包進去的模組讀出它來設定 `APPROVAL_LIMIT_USD`，而 console 自己的 fallback 常數由
+`test_console_cost.py::test_the_consoles_fallback_limits_equal_the_canonical_ones` 釘住、必須相等。
 
-自我修復迴圈最多可以重跑 finetune `max_iterations` 次（預設 3）。所以一份估算有兩個
-數字：
+### 「不知道」是第三種答案
 
-```
-sample_count 15,759,216、max_iterations 3：
-    total_usd        $9,988.46     （預期 —— 只跑一次）
-    worst_case_usd  $29,964.38     （三次修復迭代全部發生）
-```
-
-用 `total_usd` 把關會在 $9,988 放它過去，然後允許 $29,964 的支出。回報一個 $20,000、卻
-可能靜靜變成 $60,000 的東西，不叫閘門。估算同時回報兩者；閘門讀最壞情況，而回應中的
-`gating_basis` 會說出是哪個欄位做的決定。
-
-那個筆數不是一個整數，因為它不是打上去的：測試 fixture 從基準推導它
-（`0.5 × 上限 ÷ 每筆成本`），所以預期總額落在基準的一半、最壞情況落在約 1.5 倍。它原本是
-字面的 2,000,000 筆、$1,268／$3,804 —— 那跨在 $2,000 兩側，然後在基準上移之後什麼都不跨了：
-那些 fixture 全綠，卻從此再也沒有觸發過預算檢查。`_straddling_plan` 現在在每次使用時都斷言
-這個跨越關係，因為一個推導出來的東西仍然是一個宣稱。
-
-### 閘門在啟動時重新推導，不信任儲存的結果
-
-一份在「專案至今支出很低」時定價的估算，一週後是不同的曝險。所以 `start_run` 在啟動時
-重新計算判定，只要**儲存的判定或新算的判定**任一要求審批，就要求審批。一個信任過期判定
-的閘門，不是閘門。
-
-### 每一條失敗路徑都朝「關閉」的方向倒
-
-| 失敗 | 行為 | 為何不採另一種做法 |
+| 失敗情況 | 行為 | 為什麼不是另一種 |
 |---|---|---|
-| `cost_model` 匯入失敗 | **要求**審批 | 「我們無法檢查限額」必須落在「要求審批」這一側，絕不能落在「放行」那側 |
-| 沒有費率卡 | **拒絕估算（503）** | 一個「$0 附帶警告」的總額會被拿去引用；一個明確的拒絕不會 |
-| Cognito 群組查詢失敗 | **拒絕** | 一次被限流的 API 呼叫，不該變成一次批准 |
-| 沒有 `sample_count`／`train_rows` | **400** | 兩者皆無時 training 這條線就是 $0，那個總額不是估算 |
+| `cost_model` 匯入失敗 | 記錄為 `budget_unknown`，並註明這份 plan **沒有**被檢查 | 「我們無法檢查」絕不能被呈現成「在基準之內」 |
+| Cognito 群組查詢失敗 | **拒絕** | 一次被節流的 API 呼叫不能變成一次授權 |
 
-### 職責分離
+### 誰可以強制執行
 
-審批需要 Cognito 群組 `llmops-approver` 的成員身分，且**每次呼叫都在伺服器端檢查** ——
-在 UI 上藏掉按鈕不是控制措施。送審者不能批准自己的請求：自我批准是**以 403 拒絕**，
-不是只標記一下。
+切換強制開關需要 Cognito 群組 `llmops-approver` 的成員資格，並且**每次呼叫都在伺服器端檢查**
+—— 把按鈕藏起來不是控制項。每次切換都會連同是誰、何時寫進警示紀錄。
 
-有兩個事實讓這件事比看起來難：`cognito-idp:GetUser` 會驗證 token 並回傳使用者名稱，
-但**不會**回傳群組成員身分；而 bearer *access* token 也不帶 `cognito:groups` claim。
-所以成員身分需要第二次呼叫（`AdminListGroupsForUser`）—— 而它可能失敗，失敗時使用者
-拿到空的群組清單並被拒絕。
-
-終態就是終態。被 `rejected` 的估算不能重新啟動（否則一次拒絕可以被安靜地重試到有人批准
-為止），已經 `launched` 的也不能再啟動一次（否則兩個 run 掛在同一次批准上，並在差異報告
-裡被重複計算）。這兩條**不論該估算是否需要審批都適用** —— 便宜的 run 才是沒人想到要防
-的那個。
+有兩件事讓這比看起來難：`cognito-idp:GetUser` 會驗證 token 並回傳使用者名稱，但**不**回傳群組
+成員資格；而 bearer *access* token 不帶 `cognito:groups` claim。所以成員資格需要第二次呼叫
+（`AdminListGroupsForUser`）—— 它可能失敗，失敗時使用者拿到空的群組清單，因而被拒絕。
 
 ### 在瀏覽器裡，401 和 403 是不同的事
 
-`401` 是 token 不見了；`403` 是 token 沒問題、但這個使用者沒有這個權限。console 把兩者
-分開。混為一談會把一個審批者從一個仍然有效的 session 登出，並把「你不在審批群組裡」
-藏在「session 過期」後面。
+`401` 代表 token 不見了；`403` 代表 token 沒問題，但這個使用者沒有這個權限。console 會把兩者
+分開。把它們混為一談，會讓審批者在正常的工作階段中被登出，並把「你不在審批者群組裡」藏在
+「工作階段已過期」後面。
 
 ---
 
@@ -273,10 +238,10 @@ Cost Explorer 大約延遲 **24 小時**，並把近期期間標記為 `Estimate
 **指名出主要肇因類別**的 `verdict`。一句總計「差了 40%」不能告訴任何人要修什麼；
 「bedrock_teacher 是主要肇因」可以。
 
-差異報告也會回報 `n_unestimated` —— 有多少個 run 根本沒有估算。不帶估算就啟動的 run
-仍然合法，因為 v1.1.0 之前每一個 run 都是這樣跑的；而**保持它合法，正是讓報告能誠實
-說出「有多少比例的支出從未被估算」的前提**。一份對此保持沉默的差異報告，會讓人以為它
-的覆蓋率比實際更高。
+`reconcile` 在 `llmops_finops` 審計員（§7）裡執行。在 console 上，估算 vs 實際就是
+**By task** 子頁籤（§8）：每個 task 簽署過的 `cost_estimate_usd`，對照它 dispatch 出去的 run
+的歸屬支出。v1 console 的差異面板（把估算與 actuals 列配對）已於 2026-10-12 隨產生那些估算的
+估算器一併移除。
 
 ---
 
@@ -323,8 +288,8 @@ orchestrator（透過 `page_human`），不屬於一個職責是「觀察」的�
 | Usage | 每個模型的 Bedrock token 與成本；訓練 instance-hours | account-wide（Bedrock 沒有 per-harness 的 token 維度） |
 | By task | 每個 console Task：它 dispatch 出去的 run 的估算 vs 實際、差異 | attributed |
 | Breakdown | 依類別、模型、run、AWS 服務 | 混合，各自標示 |
-| Detail | 每個歸屬的訓練 job：instance、時數、單價、成本 | attributed |
-| Governance | 強制政策（兩個開關）、預算、預測、防護欄狀態、警示紀錄、AWS Budgets；以及 v1 的估算器與審批佇列 | estimate 對 limit |
+| Detail | 每個歸屬的訓練 job：instance、時數、單價、成本；費率卡健康度，附 *Refresh rates* / *Reconcile now* | attributed |
+| Governance | 強制政策（兩個開關）、預算、預測、防護欄狀態、警示紀錄、AWS Budgets | estimate 對 limit |
 
 #### 數字從哪裡來
 
@@ -379,36 +344,26 @@ orchestrator（透過 `page_human`），不屬於一個職責是「觀察」的�
 | POST | `/api/cost/budgets` | 需登入 | 建立或更新預算 |
 | POST | `/api/cost/policy` | 需登入 **+ `llmops-approver`** | 切換 `block_launches` / `stop_running` |
 | POST | `/api/cost/sweep` | 需登入 | 立即執行預算巡檢 |
+| POST | `/api/finops-run` | 需登入 | 觸發審計員的 `reconcile`／`pricing_refresh`／`report` |
 
-#### v1 面板
+#### 已移除：v1 面板與路由（2026-10-12）
 
-五個面板，順序就是錢自己的順序：
+v1 分頁有五個面板 —— 估算器、審批佇列、實際支出彙總、差異表、費率卡健康度 —— 背後是五條路由：
+`GET /api/cost-overview`、`GET /api/cost-estimates`、`POST /api/cost-estimate`、
+`POST /api/cost-approval-request` 與 `POST /api/cost-approval`。這五條路由與前四個面板都已移除：
 
-1. **估算一個 run** —— plan 輸入 → 逐列的明細表，每列帶 `basis` 與 `rate_source`，
-   `total` 對照 `worst_case`，以及一個明確的紅色 UNPRICED 區塊。
-2. **審批佇列** —— 待審請求與完整估算明細；駁回必須填理由。
-3. **各專案實際支出（含明細）** —— 依類別、依服務、依 run、依期間，帶
-   `settled`／`provisional` 標記。
-4. **估算 vs 實際** —— 各 run 差異、主要肇因類別、以及 `n_unestimated`。
-5. **費率卡健康度** —— 筆數、來源、最舊的 `as_of`，以及 plan 需要但費率卡缺少的項目。
+| v1 | 取代者 |
+|---|---|
+| 實際支出彙總（讀 `llmops-cost-actuals`，而它沒有任何費用列） | Overview / Breakdown / Detail，以實際用量定價 |
+| 估算 vs 實際 | By task |
+| 審批佇列 + `BUDGET_MODE=blocking` | 「超出預算時擋下啟動」開關 |
+| 逐列估算器 | orchestrator 以同一張費率卡為每份 plan 定價（`rate_card_for_prompt`）；By task 比較的是簽署過的 `cost_estimate_usd` |
 
-第五個面板不是附加品。一個沒被注意到的過期費率，會讓前面四個面板都變成「很有信心地
-錯」—— 它正是那個本來就該抓到 DeepSeek-R1 被定價為 $0 的面板。
+費率卡健康度保留下來並移到 Detail，因為 v2 的每個數字都由那張卡定價；一個沒被注意到的過期
+費率會讓它們全部「很有信心地錯」。`/api/finops-run` 也一起保留。
 
-### API
-
-| 方法 | 路徑 | 認證 | 用途 |
-|---|---|---|---|
-| GET | `/api/cost-overview` | 公開讀取 | 彙總、已結算／暫定拆分、預算、費率卡健康度 |
-| GET | `/api/cost-estimates` | 公開讀取 | 估算、審批佇列、差異 |
-| POST | `/api/cost-estimate` | 需登入 | 為一份草稿 plan 定價 |
-| POST | `/api/cost-approval-request` | 需登入 | 送出審批 |
-| POST | `/api/cost-approval` | 需登入 **+ `llmops-approver`** | 批准／駁回，可選擇同時啟動 |
-| POST | `/api/finops-run` | 需登入 | 觸發 `reconcile`／`pricing_refresh`／`report` |
-
-閘門的算術本身只住在**一個**地方 —— `pipeline/contracts/cost_model.py`。console 委派給
-它，而不是自己再實作一份，因為第二份拷貝就是會飄移的那份，而飄移的那份恰好會是守著啟動
-按鈕的那份。
+定價算術仍然只住在**一個**地方 —— `pipeline/contracts/cost_model.py` —— 審計員、參考基準與
+費率卡健康度檢查都委派給它。
 
 ---
 
@@ -416,11 +371,12 @@ orchestrator（透過 `page_human`），不屬於一個職責是「觀察」的�
 
 | 表 | 鍵 | 存什麼 |
 |---|---|---|
-| `llmops-cost-estimates` | PK `id` | 完整逐列估算、`worst_case_usd`、`status` ∈ `draft｜pending_approval｜approved｜rejected｜launched｜reconciled`、`requested_by`、`approved_by`、`decided_at`、`rejection_reason`、`sfn_execution_arn`、`rate_card_as_of` |
+| `llmops-cost-estimates` | PK `id` | 每個被接受的 task 一列 `est-task-*`（`worst_case_usd` = 其簽署的 `cost_estimate_usd`，`status` `launched`），由 reconcile Lambda 讀取；已移除的 v1 估算器所寫的列保留為歷史 |
+| `LlmopsAdminRuns`（console） | PK `id` | Cost v2 預算 `budget#*`、強制政策 `cost-policy`、警示 `budget-alert#*` |
 | `llmops-cost-actuals` | PK `project`、SK `<period>#<run_id>#<category>` | 已歸帳的費用列，帶 `settlement` 與 `ce_estimated_flag`；另有保留的 `#audit#` 與 `#finding#` 列 |
 
-審批狀態住在自己的表裡，而不是 console 的通用表：它是一筆稽核紀錄，需要自己的 schema
-與保存期規劃。
+簽署過的核准紀錄本身住在 S3（`tasks/<id>/approval.json`）與 task 列上，不在任何一張費用表
+裡：它是一筆稽核紀錄，經 KMS 簽署並以雜湊串鏈。
 
 `#audit#` 與 `#finding#` 列**被排除在所有費用加總之外**。它們是 agent 自己的筆記 ——
 一個 finding 描述的是某個差異，把它加進去會把它所描述的那筆支出重複計算一次。
@@ -459,11 +415,12 @@ orchestrator（透過 `page_human`），不屬於一個職責是「觀察」的�
 
 | 檔案 | 測試數 | 涵蓋 |
 |---|---|---|
-| `tests/test_cost_model.py` | 64 | 估算算術、費率優先序、歸帳、reconcile |
-| `tests/test_finops.py` | 53 | harness 設定、reconcile Lambda、儲存、IAM 形狀 |
-| `tests/test_console_cost.py` | 71 | HTTP 層、雙門檻閘門、職責分離、啟動防護 |
+| `tests/test_cost_model.py` | 71 | 估算算術、費率優先序、歸帳、reconcile |
+| `tests/test_finops.py` | 79 | harness 設定、reconcile Lambda、儲存、IAM 形狀 |
+| `tests/test_console_cost.py` | 25 | HTTP 層、參考基準、費率卡健康度、finops 觸發、v1 移除 |
+| `tests/test_console_cost_v2.py` | 21 | 強制政策、啟動閘門、預算巡檢、停止路徑、IAM 範圍 |
 
-188 個測試全部不需要 AWS 憑證即可執行，使用注入的 client 與帳號 `123456789012`。
+196 個測試全部不需要 AWS 憑證即可執行，使用注入的 client 與帳號 `123456789012`。
 
 這套測試經過 **mutation check**（變異測試）：把每一道防護逐一破壞，重跑測試確認真的有
 測試會失敗。它找出兩道「測試全綠卻沒有真正涵蓋」的防護 —— 一是啟動時的閘門若改讀

@@ -27,9 +27,9 @@ is how the Introduction row below got written on the same commit as the tab itse
 | Observability | Per-harness AgentCore service metrics, daily bar chart, token tile, SageMaker training jobs + student endpoints |
 | Evaluations | Online eval configs with score gauges, batch evaluations, insights reports |
 | Optimizations | AWS-native system-prompt recommendations + Bedrock-drafted prompts (human-review-then-apply via UpdateHarness) |
-| Cost | Six sub-tabs: Overview · Usage · By task · Breakdown · Detail · Governance. Governance: budgets (`project_monthly` / `per_task`), the enforcement policy — alarm + notification always on, **Block launches over budget** and **Stop running jobs over budget** switches (both OFF by default, `llmops-approver` only, every flip logged) — the *Run budget check now* button, alert feed, guardrail posture, AWS Budgets; plus the v1 estimator, the $20,000 reference, the approval queue and `finops-run` dispatch |
+| Cost | Six sub-tabs: Overview · Usage · By task · Breakdown · Detail · Governance. Detail carries rate-card health with the `finops-run` *Refresh rates* / *Reconcile now* buttons. Governance: budgets (`project_monthly` / `per_task`), the enforcement policy — alarm + notification always on, **Block launches over budget** and **Stop running jobs over budget** switches (both OFF by default, `llmops-approver` only, every flip logged) — the *Run budget check now* button, alert feed, guardrail posture, AWS Budgets. The v1 estimator, approval queue and their five routes were removed 2026-10-12 |
 
-Route shape: **37 handlers** (see `tests/test_console_routes.py` for the derived count).
+Route shape: **32 handlers** (see `tests/test_console_routes.py` for the derived count).
 See [ARCHITECTURE.md §13](../../docs/ARCHITECTURE.md#13-the-admin-console--one-lambda-three-planes-with-different-rules)
 for why the three planes carry different rules.
 
@@ -98,7 +98,6 @@ existing `agent-cicd-admin` stack):
 | `PROJECT` | `llmops-agentic-system` | Cost attribution key |
 | `APPROVAL_LIMIT_USD` | `20000` | Single-run reference — **server-side**; a gate the client enforces is a gate the client can skip. `deploy.sh` sets it from `cost_model.DEFAULT_SINGLE_RUN_LIMIT_USD`; it set neither limit until 2026-08-02, so the live function read `null` and fell back to the code default |
 | `CUMULATIVE_LIMIT_USD` | `20000` | Period reference, checked alongside the single-run one |
-| `BUDGET_MODE` | `advisory` | `advisory` names an over-budget dispatch and records the estimate; `blocking` refuses it |
 | `APPROVER_GROUP` | `llmops-approver` | Cognito group that may decide approvals (never the requester) |
 | `DS_GROUP` | `llmops-datascience` | Cognito group that may create/chat tasks and mint upload URLs |
 | `APPROVAL_KEY` | `alias/llmops-approval` | KMS key signing approvals and plan acceptances (hash-chained) |
