@@ -1262,7 +1262,7 @@ variance to argue about.
 ![Console architecture](architecture-console.svg)
 
 The dashboard is a single
-Lambda serving the HTML and all **30 route handlers** across **9 tabs**, with **no build step
+Lambda serving the HTML and all **37 route handlers** across **9 tabs**, with **no build step
 and no CDN**:
 `frontend.html` is embedded at cold start and the page ships with `CSP connect-src 'self'`
 plus the S3 origin the upload path needs. One artifact means the UI can never be a version
@@ -1272,10 +1272,16 @@ Its design is four planes that deliberately do **not** share rules:
 
 | plane | handlers | rule |
 |---|---|---|
-| **read** | 11 GETs (`/api/overview`, `/api/pipeline`, `/api/run`, `/api/observability`, `/api/cost-overview`, …) | public, aggregated server-side |
+| **read** | 15 GETs (`/api/overview`, `/api/pipeline`, `/api/run`, `/api/observability`, `/api/cost/v2`, `/api/cost/budgets`, …) | public, aggregated server-side |
 | **session** | 3 POSTs: `/api/login`, `/api/refresh`, `/api/refresh/revoke` | unauthenticated **by necessity** — these mint or revoke the credential |
-| **write** | 14 POSTs: `/api/start-run`, `/api/cost-approval*`, `/api/finops-run`, `/api/optimize*`, `/api/native-rec*`, `/api/batch-eval`, … | Cognito at one chokepoint |
+| **write** | 14 POSTs: `/api/start-run`, `/api/cost/{budgets,policy,sweep}`, `/api/cost-approval*`, `/api/finops-run`, `/api/optimize*`, `/api/native-rec*`, `/api/batch-eval`, … | Cognito at one chokepoint |
 | **consult** | everything under `/api/tasks`, **both methods** — 2 GET handlers (`/api/tasks`, `/api/tasks/{id}[/approval|/readiness]`) and the POSTs `/api/tasks/{id}/{message,accept,close}` plus `/api/data-upload-url` | authed **and** group-checked; the only plane that invokes an agent |
+
+Besides HTTP, the same Lambda has one scheduled entry point: the EventBridge rule
+`llmops-budget-sweep` invokes it every 15 minutes with `{"mode": "budget-sweep"}`, which
+evaluates every Cost-tab budget against spend so far and alarms each threshold crossing once
+per month. It stops a run only when the portal's *Stop running jobs over budget* switch is ON
+(default OFF) — see [COST.md §8](COST.md#8-the-cost-tab).
 
 An earlier version of this table listed `/api/tasks` in the read plane *and* in the consult
 plane, and the code agreed with the first one: four consult **reads** — the thread list, the

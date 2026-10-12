@@ -28,3 +28,22 @@ every call. Rollback artifact: the pre-change zip, kept outside the repo.
 
 Not verified live: a `block`-mode refusal through the portal (it needs a signed-in POST);
 covered offline by `tests/test_console_cost_v2.py` (11 tests).
+
+## Cost guardrails: visible switches + running-job alarm (2026-10-12)
+
+| Step | Result |
+|---|---|
+| Live IAM before change | `LlmopsAdminPerms` byte-equal (sorted JSON) to `deploy/console/iam-policy.json`, so applying the file added exactly one statement: `CostGuardrailStop` |
+| IAM applied | `put-role-policy` OK; delta = `states:StopExecution` on `llmops-pipeline` executions, `sagemaker:StopTrainingJob` on `llmops-*` / `arc2v2-*` |
+| Code | `update-function-code` OK (zip = previous live zip with `lambda_function.py`, `frontend.html`, `architecture-console.svg` replaced; `cost_model.py`, `conductor_tools.py` verified equal to `main`) |
+| Schedule | rule `llmops-budget-sweep` ENABLED `rate(15 minutes)`, target Input `{"mode":"budget-sweep"}`, Lambda permission `budget-sweep` |
+| Sweep invoked with the schedule's payload | `200`, `{"trigger": "schedule", "budgets": 0, "alerts": 0, "stopped": [], "policy": {"block_launches": false, "stop_running": false}, "running_runs": 0}` |
+| Portal, Governance | both switches render `aria-checked="false"` / OFF; Enforcement mode KPI "Alarm only"; posture rows OFF / OFF |
+| `POST /api/cost/policy` without a token | `401`; policy read back unchanged (both false) |
+| SNS | `LLMOPS_SNS_TOPIC` set on the function; topic has 1 confirmed subscriber |
+
+Not exercised live: flipping a switch (needs an approver sign-in) and a real stop (no run was
+in flight and no budget exists). Both are covered offline in `tests/test_console_cost_v2.py`
+(21 tests: approver-only flip, flip logged, gate under each switch, once-per-threshold alarm,
+stop OFF never stops, stop ON stops the execution and only in-progress jobs, per-task stop
+targets only the overspent run, schedule payload reaches the sweep, IAM scope).

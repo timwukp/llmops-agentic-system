@@ -5,6 +5,30 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
 ## [Unreleased]
 
+### Cost governance: visible ON/OFF enforcement, and a running-job alarm
+
+Enforcement moves from a hidden per-budget `notify`/`block` mode to **one visible policy** on
+the Governance sub-tab, so an operator — or a demo audience — sees what a breach will do
+before it happens:
+
+- **Alarm + notification: always on.** Every breach writes an alert row and publishes to SNS
+  `llmops-escalations`.
+- **Block launches over budget: OFF by default.** ON refuses `start-run` and task accept (409).
+- **Stop running jobs over budget: OFF by default.** ON lets the sweep stop a breached run's
+  Step Functions execution and its in-progress training jobs. Endpoints are never touched
+  (Teardown keeps that job; `DeleteEndpoint` is not granted).
+- Switches flip only for `llmops-approver` (`POST /api/cost/policy`), and every flip is logged
+  in the alert feed.
+- **Running-job alarm:** EventBridge rule `llmops-budget-sweep` invokes the console every 15
+  minutes (`{"mode": "budget-sweep"}`); each budget/threshold/month alarms once. The portal's
+  *Run budget check now* button runs the same sweep (`POST /api/cost/sweep`). In-progress
+  training jobs are priced by elapsed time so spend is visible while a job runs.
+- IAM: `CostGuardrailStop` on `LlmopsAdminLambdaRole` — `states:StopExecution` on
+  `llmops-pipeline` executions, `sagemaker:StopTrainingJob` on `llmops-*` / `arc2v2-*`.
+- Docs: Cost design rewritten (`docs/COST.md` §8, EN + zh-TW), README Cost rows, ARCHITECTURE
+  console section (route counts re-derived: 37 = 15 + 2 + 3 + 17), console README,
+  PROJECT_STATE. Tests: `tests/test_console_cost_v2.py` now 21.
+
 ### Cost tab v2: spend visibility and budget governance
 
 The Cost tab opens on six sub-tabs — Overview, Usage, By task, Breakdown, Detail, Governance —

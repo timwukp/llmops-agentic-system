@@ -334,41 +334,83 @@ design.
 
 ## 8. The Cost tab
 
-### Cost v2 (2026-10-12): six sub-tabs, visibility then governance
+### Cost v2: design (2026-10-12)
 
-The tab now opens on six sub-tabs. The first five answer *where did the money go*; the sixth
-answers *what stops it*. The five panels described below still exist, inside **Governance**,
-until phase 2 removes them.
+The tab answers two questions, in this order: **where did the money go** (visibility) and
+**what happens when it goes too far** (governance). Six sub-tabs:
 
 | Sub-tab | Shows | Basis |
 |---|---|---|
-| Overview | workload spend, month to date, attributed training, Cost Explorer billed; daily stacked chart; top spenders | attributed + estimate, billed shown beside, never summed in |
+| Overview | workload spend, month to date, attributed training, Cost Explorer billed; daily stacked chart; top spenders | attributed + estimate; billed shown beside, never summed in |
 | Usage | Bedrock tokens and cost per model; training instance-hours | account-wide (Bedrock has no per-harness token dimension) |
 | By task | per console Task: estimate vs actual of the runs it dispatched, variance | attributed |
 | Breakdown | by category, model, run, AWS service | mixed, each badged |
 | Detail | every attributed training job: instance, hours, unit price, cost | attributed |
-| Governance | budgets (project-monthly or per-task, mode `notify` or `block`), forecast, guardrail posture, alert feed, AWS Budgets | estimate vs limit |
+| Governance | enforcement policy (two switches), budgets, forecast, guardrail posture, alert feed, AWS Budgets; the v1 estimator and approval queue | estimate vs limit |
 
-**Why v2 prices usage instead of reading `llmops-cost-actuals`:** live, that table held 164
-rows and every one was `#audit#` — the reconcile had never written an attributed cost row,
-so the v1 panel read $0.00 while 68 training jobs had run. v2 prices what the pipeline
-demonstrably left behind: training jobs matched by name prefix (`COST_JOB_PREFIXES`, never
-"all SageMaker"), billable seconds × the same S3 rate card the estimator uses; Bedrock tokens
-from CloudWatch `AWS/Bedrock` by `ModelId`. Cost Explorer is shown as billed, account-wide
-context and cached 15 minutes, because each request bills $0.01.
+#### Where the numbers come from
 
-**Enforcement.** `budget_gate()` runs at the console's two launch points — `POST
-/api/start-run` and `POST /api/tasks/{id}/accept`. A `notify` breach records an alert (console
-table, `budget-alert#*`) and publishes to `llmops-escalations`, wrapped so a failed publish
-never changes the answer; a `block` breach refuses with HTTP 409 and names the budget. **Not
-armed yet (phase 2):** stopping a run that is already in flight — the harness driver does not
-consult budgets, and the posture table says so.
+Live, `llmops-cost-actuals` held 164 rows and every one was `#audit#` — the reconcile had
+never written an attributed cost row, so v1 read $0.00 while 68 training jobs had run. v2
+therefore prices what the pipeline demonstrably left behind:
+
+- **Training (attributed):** jobs whose names start with `COST_JOB_PREFIXES`
+  (`llmops-,arc2v2-`; never "all SageMaker" — the account runs unrelated jobs), billable
+  seconds × the same S3 rate card the estimator uses. A job still `InProgress` is priced by
+  elapsed time, so the sweep sees spend accrue while it runs. The run id is parsed from the
+  job name; a task's actual is the sum over the runs it dispatched.
+- **Model tokens (estimate, account-wide):** CloudWatch `AWS/Bedrock` Input/OutputTokenCount
+  by `ModelId` × the rate card. It is context for what the agents cost, not attributed to a
+  task.
+- **Billed (account-wide):** Cost Explorer daily unblended for the workload's services,
+  cached 15 minutes because each request bills $0.01, and ~24 h behind.
+
+#### Governance: budgets, then one visible policy
+
+A **budget** is a limit and its thresholds (default 50 / 80 / 100 %), scoped either
+`project_monthly` (month-to-date spend) or `per_task` (one launch estimate, or one running
+run's spend). Budgets carry no enforcement setting of their own. Enforcement is **one
+policy** shown at the top of the Governance sub-tab, so anyone looking at the screen can see
+what a breach will do before it happens:
+
+| Control | Default | When ON |
+|---|---|---|
+| Alarm + notification | **always ON** | — every breach writes an alert row and publishes to SNS `llmops-escalations` |
+| Block launches over budget | **OFF** | `POST /api/start-run` and `POST /api/tasks/{id}/accept` return **409** naming the budget |
+| Stop running jobs over budget | **OFF** | the sweep stops the breached run's Step Functions execution and its in-progress training jobs |
+
+With both switches OFF — the deployed state — a breach is an alarm and nothing is refused or
+stopped. That is a deliberate default, not a missing feature: the switches exist, are visible,
+and an approver turns them ON when a budget must be enforced.
+
+- **Who may flip a switch:** members of `llmops-approver` only (`403` otherwise). Every flip
+  is written to the alert feed with who and when, so arming a control is itself on the record.
+- **When it is checked:** at every launch (the gate), and every 15 minutes by the EventBridge
+  rule `llmops-budget-sweep`, which invokes the console Lambda with `{"mode":
+  "budget-sweep"}`. The portal's **Run budget check now** button runs the same sweep on demand.
+- **Alarms do not repeat:** the sweep writes one alert per budget, threshold and month
+  (`budget-alert#<YYYY-MM>#<budget>#<threshold>`), so a breached budget does not page every
+  15 minutes.
+- **What "stop" stops:** `states:StopExecution` on `llmops-pipeline` executions and
+  `sagemaker:StopTrainingJob` on `llmops-*` / `arc2v2-*` jobs — nothing else. Endpoints are
+  deliberately left to the pipeline's Teardown stage; `DeleteEndpoint` is not reversible and is
+  not granted. The IAM grant (`CostGuardrailStop`) exists whether or not the switch is ON: the
+  switch is the policy, IAM is the ceiling.
+- **Notification never gates the decision:** the alert row and the SNS publish are wrapped
+  separately, so a failed notification cannot change whether a launch is refused or a run is
+  stopped.
+
+#### API
 
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
 | GET | `/api/cost/v2?days=N` | public read | all five visibility sub-tabs in one payload |
-| GET | `/api/cost/budgets` | public read | budgets with state, AWS Budgets, alerts, posture |
+| GET | `/api/cost/budgets` | public read | budgets with state, policy, posture, alerts, AWS Budgets |
 | POST | `/api/cost/budgets` | authed | create or update a budget |
+| POST | `/api/cost/policy` | authed **+ `llmops-approver`** | flip `block_launches` / `stop_running` |
+| POST | `/api/cost/sweep` | authed | run the budget sweep now |
+
+#### The v1 panels
 
 Five panels, in the money's own order:
 
@@ -422,8 +464,9 @@ describes.
 - **No multi-account or Organizations rollup** — single account today.
 - **No Savings Plans or Reserved Instance modelling** — on-demand rates only, stated as an
   assumption in every estimate.
-- **No auto-stop on budget breach** — the auditor reports and flags; stopping a run is the
-  orchestrator's authority. See §7.
+- **No auto-stop on budget breach by default** — the auditor reports and flags (§7), and the
+  console's *Stop running jobs over budget* switch, which can stop a breached run, ships OFF.
+  It stops executions and training jobs only, never endpoints. See §8.
 - **The total is a floor whenever `unpriced[]` is non-empty.** Today that includes the teacher
   and harness token lines, which is not a small omission — it is stated on every estimate
   rather than hidden.

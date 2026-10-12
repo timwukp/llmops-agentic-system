@@ -312,10 +312,10 @@ orchestrator（透過 `page_human`），不屬於一個職責是「觀察」的�
 
 ## 8. Cost 分頁
 
-### Cost v2（2026-10-12）：六個子頁籤，先可見度、後治理
+### Cost v2：設計（2026-10-12）
 
-分頁現在以六個子頁籤開啟。前五個回答「錢花到哪裡去了」，第六個回答「什麼能擋住它」。
-下面描述的五個面板仍然存在，放在 **Governance** 底下，直到 phase 2 移除。
+這個分頁依序回答兩個問題：**錢花到哪裡去了**（可見度），以及**花過頭時會發生什麼事**（治理）。
+六個子頁籤：
 
 | 子頁籤 | 顯示 | 依據 |
 |---|---|---|
@@ -324,26 +324,63 @@ orchestrator（透過 `page_human`），不屬於一個職責是「觀察」的�
 | By task | 每個 console Task：它 dispatch 出去的 run 的估算 vs 實際、差異 | attributed |
 | Breakdown | 依類別、模型、run、AWS 服務 | 混合，各自標示 |
 | Detail | 每個歸屬的訓練 job：instance、時數、單價、成本 | attributed |
-| Governance | 預算（專案每月或每個 task，模式 `notify` 或 `block`）、預測、防護欄狀態、警示紀錄、AWS Budgets | estimate 對 limit |
+| Governance | 強制政策（兩個開關）、預算、預測、防護欄狀態、警示紀錄、AWS Budgets；以及 v1 的估算器與審批佇列 | estimate 對 limit |
 
-**為什麼 v2 改成為用量定價，而不是讀 `llmops-cost-actuals`：** 實測該表有 164 列，全部都是
-`#audit#` —— reconcile 從來沒寫過一筆歸屬成本，所以 v1 面板顯示 $0.00，而實際上跑過 68 個
-訓練 job。v2 為 pipeline 確實留下的東西定價：以名稱前綴比對的訓練 job（`COST_JOB_PREFIXES`，
-絕不是「所有 SageMaker」），計費秒數 × 估算器所用的同一張 S3 費率卡；以及 CloudWatch
-`AWS/Bedrock` 依 `ModelId` 的 Bedrock token。Cost Explorer 以「已計費、全帳號」的脈絡顯示，
-快取 15 分鐘，因為每次請求計費 $0.01。
+#### 數字從哪裡來
 
-**強制執行。** `budget_gate()` 在 console 的兩個啟動點執行 —— `POST /api/start-run` 與
-`POST /api/tasks/{id}/accept`。`notify` 超標會記錄一筆警示（console 表，`budget-alert#*`）並
-發布到 `llmops-escalations`，發布有獨立包裝，失敗不會改變判定；`block` 超標以 HTTP 409 拒絕
-並指名是哪個預算。**尚未啟用（phase 2）：** 停下已在執行中的 run —— harness driver 還不會查
-預算，防護欄狀態表也照實這樣寫。
+實測 `llmops-cost-actuals` 有 164 列，全部都是 `#audit#` —— reconcile 從來沒寫過一筆歸屬
+成本，所以 v1 顯示 $0.00，而實際上跑過 68 個訓練 job。因此 v2 為 pipeline 確實留下的東西定價：
+
+- **訓練（attributed）：** 名稱以 `COST_JOB_PREFIXES`（`llmops-,arc2v2-`；絕不是「所有
+  SageMaker」——這個帳號還跑著不相關的 job）開頭的 job，計費秒數 × 估算器所用的同一張 S3
+  費率卡。仍在 `InProgress` 的 job 以已經過的時間定價，讓巡檢在 job 執行中就看得到支出累積。
+  run id 從 job 名稱解析；一個 task 的實際成本是它 dispatch 出去的所有 run 的總和。
+- **模型 token（estimate，account-wide）：** CloudWatch `AWS/Bedrock` 依 `ModelId` 的
+  Input/OutputTokenCount × 費率卡。這是 agent 花費的脈絡，不歸屬到任何 task。
+- **已計費（account-wide）：** Cost Explorer 該工作負載各服務的每日 unblended 成本，快取 15
+  分鐘（每次請求計費 $0.01），約落後 24 小時。
+
+#### 治理：先有預算，再有一個看得見的政策
+
+**預算**就是一個上限加上它的門檻（預設 50 / 80 / 100 %），範圍是 `project_monthly`（本月至今
+支出）或 `per_task`（一次啟動的估算，或一個執行中 run 的支出）。預算本身不帶任何強制設定。
+強制執行是放在 Governance 子頁籤最上方的**一個政策**，讓任何看著畫面的人都能在超標發生之前，
+就知道超標時會發生什麼事：
+
+| 控制項 | 預設 | 開啟（ON）時 |
+|---|---|---|
+| 告警 + 通知 | **永遠 ON** | —— 每次超標都寫一筆警示並發布到 SNS `llmops-escalations` |
+| 超出預算時擋下啟動 | **OFF** | `POST /api/start-run` 與 `POST /api/tasks/{id}/accept` 回 **409** 並指名是哪個預算 |
+| 超出預算時停止執行中的 job | **OFF** | 巡檢停下超標 run 的 Step Functions execution 以及它進行中的訓練 job |
+
+兩個開關都 OFF —— 也就是目前部署的狀態 —— 超標就是告警，不會拒絕或停止任何東西。這是刻意的
+預設，不是缺少的功能：開關存在、看得見，當預算必須被強制時，由審批者把它切到 ON。
+
+- **誰能切換開關：** 只有 `llmops-approver` 成員（否則回 `403`）。每次切換都會連同是誰、何時
+  寫進警示紀錄，所以「啟用一個控制項」這件事本身也留有紀錄。
+- **何時檢查：** 每次啟動（閘門）時，以及每 15 分鐘由 EventBridge 規則 `llmops-budget-sweep`
+  以 `{"mode": "budget-sweep"}` 呼叫 console Lambda。portal 的 **Run budget check now** 按鈕會
+  隨時執行同一個巡檢。
+- **告警不會重複：** 巡檢對每個預算、門檻與月份只寫一筆警示
+  （`budget-alert#<YYYY-MM>#<budget>#<threshold>`），所以超標的預算不會每 15 分鐘叫一次人。
+- **「停止」停的是什麼：** 對 `llmops-pipeline` execution 的 `states:StopExecution`，以及對
+  `llmops-*` / `arc2v2-*` job 的 `sagemaker:StopTrainingJob` —— 僅此而已。endpoint 刻意留給
+  pipeline 的 Teardown 階段；`DeleteEndpoint` 不可逆，也沒有被授權。IAM 授權
+  （`CostGuardrailStop`）不論開關是否 ON 都存在：開關是政策，IAM 是天花板。
+- **通知永遠不會左右判定：** 警示寫入與 SNS 發布各自獨立包裝，通知失敗不會改變啟動是否被擋、
+  run 是否被停。
+
+#### API
 
 | 方法 | 路徑 | 認證 | 用途 |
 |---|---|---|---|
 | GET | `/api/cost/v2?days=N` | 公開讀取 | 五個可見度子頁籤，一次回傳 |
-| GET | `/api/cost/budgets` | 公開讀取 | 預算與狀態、AWS Budgets、警示、防護欄狀態 |
+| GET | `/api/cost/budgets` | 公開讀取 | 預算與狀態、政策、防護欄狀態、警示、AWS Budgets |
 | POST | `/api/cost/budgets` | 需登入 | 建立或更新預算 |
+| POST | `/api/cost/policy` | 需登入 **+ `llmops-approver`** | 切換 `block_launches` / `stop_running` |
+| POST | `/api/cost/sweep` | 需登入 | 立即執行預算巡檢 |
+
+#### v1 面板
 
 五個面板，順序就是錢自己的順序：
 
@@ -395,8 +432,9 @@ orchestrator（透過 `page_human`），不屬於一個職責是「觀察」的�
 - **沒有多帳戶或 Organizations 層級彙總** —— 目前是單一帳戶。
 - **沒有 Savings Plans 或 Reserved Instance 模型** —— 只用 on-demand 費率，並在每份估算
   中明確列為假設。
-- **不會在超出預算時自動停機** —— 審計員只報告與標記；停掉一個 run 是 orchestrator 的
-  權限。見 §7。
+- **預設不會在超出預算時自動停機** —— 審計員只報告與標記（§7）；console 上可以停下超標
+  run 的「超出預算時停止執行中的 job」開關，出廠是 OFF。它只停 execution 與訓練 job，絕不
+  刪 endpoint。見 §8。
 - **只要 `unpriced[]` 非空，總額就是一個下限。** 今天這包含 teacher 與 harness 的 token
   兩條線，這不是小的遺漏 —— 所以它被寫在每一份估算上，而不是藏起來。
 
