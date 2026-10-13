@@ -1035,10 +1035,11 @@ def model_params_from_manifest(manifest: dict) -> dict:
 # produced. That is the difference that matters for autonomy: a pipeline whose stages cannot
 # read each other's results cannot reflect on a run or iterate on it, only redo it.
 #
-# Read from `stages`, never from `models`: `models.student.endpoint_name` exists in
-# manifest.schema.json, but `models` is the resolved record of model CONSENT and the driver
-# must not write it (see IMMUTABLE_MANIFEST_KEYS). The stage's own report is the honest
-# home for a stage's own finding.
+# Read from `stages`, never from `models`: `models` is the resolved record of model CONSENT
+# (role -> model id; manifest.schema.json once described a `models.student.endpoint_name`
+# that no writer ever produced) and the driver must not write it (see
+# IMMUTABLE_MANIFEST_KEYS). The stage's own report is the honest home for a stage's own
+# finding.
 STAGE_FACT_PARAMS = {
     "student_endpoint": ("deploy", "endpoint_name"),
 }

@@ -5,6 +5,27 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
 ## [Unreleased]
 
+### Manifest schema: describes the manifests again (Phase 1 PR-01)
+
+`pipeline/contracts/manifest.schema.json` was checked against every live run manifest before Phase 1
+extends it, and **0 of 40 were valid**: `run_id` was specified as `llmops-<ts>-<6 hex>` while
+`new_run_id` mints `run-<ts>-<8 hex>`; `trigger_source` was a 5-value enum while 15 values are in use;
+`models.teacher` was an object while every manifest holds a model-id string; `stages[*].status` was a
+6-value enum over a map the agents write into in a vocabulary of their own (19 distinct statuses,
+`outputs` as objects in 12 manifests). Nothing validated against the schema, so nothing noticed.
+
+Corrected to the writers: 36/40 valid, the 4 others explained in
+`deploy/evidence/VERIFICATION_manifest_schema.md` (3 hand-named pre-`start_pipeline` runs, 1 operator
+relaunch that copied `plan.models` verbatim). `stages` is now documented as shared and agent-writable,
+typing only `status`; the driver-only blocks `stage_history`, `attestations` and `escalations` are
+specified with types, and `params`/`plan`/`approval` are described. No lakehouse fields yet — they land
+with the PR that writes them, since a schema field no writer produces is the defect this fixes.
+
+New `tests/test_manifest_schema.py` (8 tests, stdlib only) validates what the REAL writers produce —
+`seed_manifest`, then the driver's `handle_stage_complete` and `_record_manifest_escalation` over an
+in-memory S3 — plus `new_run_id` and every `trigger_source` literal in the repo; a keyword guard keeps
+the validator from silently skipping a constraint, and 7 schema mutations were each caught.
+
 ### Spikes S4 (zh-TW PII) and S6 (VPC harness): live results
 
 **S4: 4/4 PASS** (`deploy/evidence/SPIKE_04_s4_pii_recall_zhtw.md`). On 1,000 seeded zh-TW/EN records
