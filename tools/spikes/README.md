@@ -13,7 +13,7 @@ resources, measuring, and deleting them again. They gate the lakehouse LLM-lifec
 | `s4_pii_recall_zhtw.py` | zh-TW / EN PII recall: Glue Detect-PII vs Guardrails vs privacy-filter | Phase 1 PR-07 | pending |
 | `s5_mlflow_registry.py` | MLflow App → Model Registry sync, aliases, approval event, condition-key deny | Phase 2 registry | pending |
 | `s6_vpc_harness.py` | VPC-mode harness without NAT | Phase 1 PR-03 | pending |
-| `s7_lakehouse_substrate.py` | Iceberg v2, Glue 5 IAM-mode writes, deterministic `UNLOAD … FOR VERSION AS OF`; Unified Studio (`--part domain`, follow-up) | Phase 1 PR-04/05 | substrate implemented |
+| `s7_lakehouse_substrate.py` | Iceberg v2, Glue 5 IAM-mode writes, deterministic `UNLOAD … FOR VERSION AS OF`; Unified Studio (`--part domain`, follow-up) | Phase 1 PR-04/05 | **substrate: 7/7 PASS (2026-10-13)** — `deploy/evidence/SPIKE_07_s7_lakehouse_substrate.md`; domain part pending |
 
 ## Usage
 
@@ -33,10 +33,15 @@ python3 tools/spikes/s7_lakehouse_substrate.py sweep                            
 - **Teardown always runs** (`finally`), unless `--keep` is passed for debugging.
 - **Everything is tagged** `project=llmops-agentic-system`, `spike=<name>`; `sweep` finds leftovers
   from a run that died before teardown.
-- **Evidence is redacted.** `deploy/evidence/SPIKE_0N_<name>.md` has every 12-digit run replaced by
-  `<ACCOUNT_ID>`; raw output goes to `*.local.json`, which `.gitignore` excludes.
+- **Evidence is redacted.** `deploy/evidence/SPIKE_0N_<name>.md` has registered values (e.g. the data
+  bucket → `<DATA_BUCKET>`) replaced, every 12-digit run replaced by `<ACCOUNT_ID>`, and longer digit
+  runs (Iceberg snapshot ids) grouped with separators; raw output goes to `*.local.json`, which
+  `.gitignore` excludes.
 - **Account-level settings are never changed silently.** If S7 finds the S3 Tables ↔ Glue Data
   Catalog integration missing, it records that and stops instead of enabling it.
+
+Resource names that AWS will not let you reuse right after deletion (table buckets) carry a
+`YYYYMMDD-HHMMSS` suffix per run.
 
 Each spike's `run()` is implemented and exercised live in that spike's own PR, in critical-path
 order: S7 → S6 → S4, then S1, S2, S3, S5.

@@ -43,13 +43,28 @@ PROJECT_TAG = {"project": "llmops-agentic-system"}
 #: The same candidate the repo's redaction scanner hashes (tests/redaction_scan.py). Anything
 #: matching it in rendered evidence is replaced, so a spike can never commit an account id.
 _ACCOUNT_CANDIDATE = re.compile(r"(?<![0-9])[0-9]{12}(?![0-9])")
+#: Longer digit runs (Iceberg snapshot ids are 19 digits) are not account ids, but the scanner
+#: counts any 12 consecutive digits. They are rendered with thousands separators: still exact and
+#: readable, no longer a run.
+_LONG_RUN = re.compile(r"(?<![0-9])[0-9]{13,}(?![0-9])")
 
 PASS, FAIL, NOT_RUN = "PASS", "FAIL", "NOT RUN"
 
 
-def redact(text: str) -> str:
-    """Replace every 12-digit run with <ACCOUNT_ID>; evidence files are public."""
-    return _ACCOUNT_CANDIDATE.sub("<ACCOUNT_ID>", text)
+def group_digits(value) -> str:
+    """1234567 -> 1,234,567 (an Iceberg snapshot id is ~19 digits)."""
+    return f"{int(value):,}"
+
+
+def redact(text: str, also: tuple[tuple[str, str], ...] = ()) -> str:
+    """Make evidence safe for a public repo: each (value, placeholder) in `also` is replaced
+    first (e.g. the data bucket, whose name embeds the account id), then every 12-digit run
+    becomes <ACCOUNT_ID>, then longer runs are grouped with separators."""
+    for value, placeholder in also:
+        if value:
+            text = text.replace(value, placeholder)
+    text = _ACCOUNT_CANDIDATE.sub("<ACCOUNT_ID>", text)
+    return _LONG_RUN.sub(lambda m: group_digits(m.group(0)), text)
 
 
 class Criterion:
@@ -83,6 +98,8 @@ class Spike:
         self.created: list[tuple[str, str, object]] = []
         self.observations: dict[str, object] = {}
         self.errors: list[str] = []
+        #: (value, placeholder) pairs redacted from evidence in addition to account ids.
+        self.redactions: list[tuple[str, str]] = []
         self.started_at = self.finished_at = None
 
     # ── resources ────────────────────────────────────────────────────────────
@@ -183,7 +200,7 @@ class Spike:
             "## Teardown\n\n"
             + ("- all tracked resources deleted\n" if not self.created
                else "".join(f"- LEFT RUNNING: {k} {i}\n" for k, i, _ in self.created)))
-        return redact(text)
+        return redact(text, tuple(self.redactions))
 
     def write_evidence(self, directory: pathlib.Path = EVIDENCE_DIR) -> pathlib.Path:
         directory.mkdir(parents=True, exist_ok=True)

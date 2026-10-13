@@ -50,6 +50,7 @@ Next: v2 experiments — code-as-reasoning distillation + augmentation; Kimi K3 
 | Triggers | scheduler `llmops-nightly` (DISABLED) · `llmops-finops-daily` (ENABLED, 09:00 UTC) · `llmops-monitor-sweep-daily` (ENABLED, 08:00 UTC) · rule `llmops-budget-sweep` (ENABLED, 15 min, from deploy/console/deploy.sh) · HTTP API `llmops-triggers` (/webhook, /runs) · secret `llmops/webhook` | deploy/08_triggers.py | endpoint in SSM `/llmops/triggers/api_endpoint`; both daily schedules use FlexibleTimeWindow OFF (each derives its period/id from the current date) |
 | Admin console | `agent-cicd-admin` stack (Lambda+APIGW+DDB+Cognito) | ops-console deploy.sh | login secret `agent-admin/dashboard-login`; monitors orchestrator + finetune |
 | Online evals | one config per harness (Correctness/GoalSuccessRate/ToolSelectionAccuracy, 100% sampling) | deploy/06_observability.py --evals | role llmops-eval-execution |
+| Glue Data Catalog | federated catalog `s3tablescatalog` (the S3 Tables ↔ analytics integration, **IAM mode**: `IAM_ALLOWED_PRINCIPALS`/`ALL`, no Lake Formation grants) | owner, `aws glue create-catalog`, 2026-10-13 | account-level and persistent — not torn down by any script; required by every Phase 1 table. Enabled because spike S7 run 1 found it missing (deploy/evidence/SPIKE_07_s7_lakehouse_substrate.md) |
 
 _Not deployed: retrieval Knowledge Base (deploy/09_retrieval.py, added for the r6d RAFT
 run) — an AOSS vector collection bills ~$11.52/day (min 2 OCU) while it EXISTS, so it is

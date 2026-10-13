@@ -33,7 +33,11 @@ import time
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from _spike import Spike, main  # noqa: E402
 
-BUCKET = "llmops-spike-s7"
+#: Table bucket name PREFIX. Each run appends a UTC timestamp: a deleted table bucket's name
+#: stays in a "transitional state" for a while, so CreateTableBucket on the same name right
+#: after a teardown fails with ConflictException (observed live, run 2, 2026-10-13). Leftovers
+#: are found by the spike= tag, so nothing depends on the name being fixed.
+BUCKET_PREFIX = "llmops-spike-s7"
 NAMESPACE = "spike"
 TABLE = "events"
 GLUE_ROLE = "llmops-spike-s7-glue"
@@ -87,12 +91,17 @@ class S7LakehouseSubstrate(Spike):
     )
     IMPLEMENTED = True  # substrate part; the smus_* criteria stay NOT RUN until --part domain
 
+    def __init__(self, region, account_id=None, session=None, bucket=None):
+        super().__init__(region, account_id, session)
+        # date-time split by a hyphen: a 14-digit stamp would be a digit run in the evidence
+        self.bucket = bucket or f"{BUCKET_PREFIX}-{time.strftime('%Y%m%d-%H%M%S', time.gmtime())}"
+
     def plan(self) -> list[dict]:
         acct = self.account_id or "<ACCOUNT_ID>"
         return [
-            {"kind": "s3tables bucket", "name": BUCKET},
-            {"kind": "s3tables namespace", "name": f"{BUCKET}/{NAMESPACE}"},
-            {"kind": "s3tables table", "name": f"{BUCKET}/{NAMESPACE}/{TABLE} (ICEBERG)"},
+            {"kind": "s3tables bucket", "name": self.bucket},
+            {"kind": "s3tables namespace", "name": f"{self.bucket}/{NAMESPACE}"},
+            {"kind": "s3tables table", "name": f"{self.bucket}/{NAMESPACE}/{TABLE} (ICEBERG)"},
             {"kind": "iam role", "name": f"arn:aws:iam::{acct}:role/{GLUE_ROLE}"},
             {"kind": "s3 objects", "name": f"s3://<DATA_BUCKET>/{PREFIX}/"},
             {"kind": "glue job", "name": f"{GLUE_JOB} (Glue 5.0, 2 x G.1X)"},
@@ -104,12 +113,14 @@ class S7LakehouseSubstrate(Spike):
         sts, ssm = self.client("sts"), self.client("ssm")
         self.account_id = self.account_id or sts.get_caller_identity()["Account"]
         data_bucket = ssm.get_parameter(Name="/llmops/storage/bucket")["Parameter"]["Value"]
+        self.redactions.append((data_bucket, "<DATA_BUCKET>"))
         s3t, s3 = self.client("s3tables"), self.client("s3")
         self.track("s3 prefix", f"s3://{data_bucket}/{PREFIX}/",
                    lambda: _delete_prefix(s3, data_bucket, PREFIX))
 
-        bucket_arn = s3t.create_table_bucket(name=BUCKET, tags=self.tags)["arn"]
-        self.track("s3tables bucket", BUCKET,
+        bucket_arn = s3t.create_table_bucket(name=self.bucket, tags=self.tags)["arn"]
+        self.observe("table_bucket", self.bucket)
+        self.track("s3tables bucket", self.bucket,
                    lambda: s3t.delete_table_bucket(tableBucketARN=bucket_arn))
         s3t.create_namespace(tableBucketARN=bucket_arn, namespace=[NAMESPACE])
         self.track("s3tables namespace", NAMESPACE,
@@ -124,7 +135,7 @@ class S7LakehouseSubstrate(Spike):
         self.record("v2", meta.get("format-version") == 2, f"format-version={meta.get('format-version')}")
 
         glue = self.client("glue")
-        catalog_id = f"{self.account_id}:s3tablescatalog/{BUCKET}"
+        catalog_id = f"{self.account_id}:s3tablescatalog/{self.bucket}"
         try:
             glue.get_catalog(CatalogId=f"{self.account_id}:s3tablescatalog")
             self.record("integration", True, "s3tablescatalog federated catalog present")
@@ -165,7 +176,7 @@ class S7LakehouseSubstrate(Spike):
                                      "EnforceWorkGroupConfiguration": True})
         self.track("athena workgroup", WORKGROUP,
                    lambda: athena.delete_work_group(WorkGroup=WORKGROUP, RecursiveDeleteOption=True))
-        ctx = {"Catalog": f"s3tablescatalog/{BUCKET}", "Database": NAMESPACE}
+        ctx = {"Catalog": f"s3tablescatalog/{self.bucket}", "Database": NAMESPACE}
         digests = []
         for leg in ("a", "b"):
             dest = f"s3://{data_bucket}/{PREFIX}/unload-{leg}/"
@@ -197,7 +208,7 @@ class S7LakehouseSubstrate(Spike):
                               Tags=[{"Key": k, "Value": v} for k, v in self.tags.items()])["Role"]["Arn"]
         iam.put_role_policy(RoleName=GLUE_ROLE, PolicyName="spike",
                             PolicyDocument=json.dumps(glue_role_policy(
-                                self.region, self.account_id, bucket_arn, data_bucket)))
+                                self.region, self.account_id, bucket_arn, data_bucket, self.bucket)))
 
         def _delete():
             iam.delete_role_policy(RoleName=GLUE_ROLE, PolicyName="spike")
@@ -207,7 +218,8 @@ class S7LakehouseSubstrate(Spike):
         return arn
 
 
-def glue_role_policy(region: str, account_id: str, bucket_arn: str, data_bucket: str) -> dict:
+def glue_role_policy(region: str, account_id: str, bucket_arn: str, data_bucket: str,
+                     bucket: str) -> dict:
     """Least-privilege IAM-only grants for the Glue writer. No Lake Formation, by design:
     whether IAM-only is enough is one of the questions this spike answers."""
     cat = f"arn:aws:glue:{region}:{account_id}"
@@ -220,9 +232,9 @@ def glue_role_policy(region: str, account_id: str, bucket_arn: str, data_bucket:
         {"Sid": "GlueCatalogFederation", "Effect": "Allow",
          "Action": ["glue:GetCatalog", "glue:GetDatabase", "glue:GetTable", "glue:UpdateTable"],
          "Resource": [f"{cat}:catalog", f"{cat}:catalog/s3tablescatalog",
-                      f"{cat}:catalog/s3tablescatalog/{BUCKET}",
-                      f"{cat}:database/s3tablescatalog/{BUCKET}/{NAMESPACE}",
-                      f"{cat}:table/s3tablescatalog/{BUCKET}/{NAMESPACE}/*"]},
+                      f"{cat}:catalog/s3tablescatalog/{bucket}",
+                      f"{cat}:database/s3tablescatalog/{bucket}/{NAMESPACE}",
+                      f"{cat}:table/s3tablescatalog/{bucket}/{NAMESPACE}/*"]},
         {"Sid": "ScriptAndTemp", "Effect": "Allow", "Action": ["s3:GetObject", "s3:PutObject"],
          "Resource": f"arn:aws:s3:::{data_bucket}/{PREFIX}/*"},
         {"Sid": "Logs", "Effect": "Allow",
