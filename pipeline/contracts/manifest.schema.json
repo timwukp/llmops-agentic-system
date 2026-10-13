@@ -2,15 +2,15 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "https://github.com/timwukp/llmops-agentic-system/pipeline/contracts/manifest.schema.json",
   "title": "LLMOps run manifest",
-  "description": "Single source of truth for one pipeline run, stored at s3://<bucket>/runs/<run_id>/manifest.json. Agents read it first and append their stage entries; the harness driver verifies claims before recording them. The iteration counter drives the remediation loop (max 3).",
+  "description": "Single source of truth for one pipeline run, stored at s3://<bucket>/runs/<run_id>/manifest.json. start_pipeline seeds it (seed_manifest); agents read it first and write their own entries into `stages`; the harness driver verifies a stage's claims before recording them in `stage_history`, `attestations` and `escalations`. The schema describes what those writers actually emit -- tests/test_manifest_schema.py validates seed_manifest's output and the driver's records against it -- so a field that drifts fails a test instead of the schema quietly describing a manifest nobody writes. The iteration counter drives the remediation loop (max 3).",
   "type": "object",
   "required": ["run_id", "created_at", "trigger_source", "iteration", "stages", "models"],
   "additionalProperties": true,
   "properties": {
     "run_id": {
       "type": "string",
-      "pattern": "^llmops-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{6}$",
-      "description": "llmops-<UTC timestamp>-<6 hex chars>, assigned by start_pipeline"
+      "pattern": "^run-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$",
+      "description": "run-<UTC %Y%m%dT%H%M%SZ>-<8 hex chars>, minted by start_pipeline.new_run_id. Three manifests written by hand before start_pipeline existed carry other ids; nothing mints that form today."
     },
     "created_at": {
       "type": "string",
@@ -18,12 +18,22 @@
     },
     "trigger_source": {
       "type": "string",
-      "enum": ["direct", "api", "webhook", "schedule", "conductor"],
-      "description": "Which of the pipeline triggers started this run"
+      "pattern": "^[a-z0-9][a-z0-9_.-]{0,63}$",
+      "description": "Free-form label of whoever started the run, taken verbatim from the start_pipeline event (default `unknown`). A pattern rather than an enum because the callers name themselves: in code today conductor, webhook, console, scheduler, resurrector-schedule, github-actions, protocol-probe; in live manifests also hand-named relaunches and rehearsals. tests/test_manifest_schema.py checks every literal the repo passes."
+    },
+    "params": {
+      "type": "object",
+      "description": "DEFAULT_PARAMS < trigger params < signed plan, merged by start_pipeline. Immutable after seeding (IMMUTABLE_MANIFEST_KEYS).",
+      "additionalProperties": true
     },
     "plan": {
       "type": "object",
-      "description": "Optional run plan written by the llmops_orchestrator conductor (plan.json contents): per-stage params, cost estimate, quality bar.",
+      "description": "Run plan written by the llmops_orchestrator conductor (plan.json contents): per-stage params, cost estimate, quality bar. Empty object when the run has no plan.",
+      "additionalProperties": true
+    },
+    "approval": {
+      "type": "object",
+      "description": "The signed human-acceptance record, stored verbatim. Empty object for non-conductor runs.",
       "additionalProperties": true
     },
     "iteration": {
@@ -33,57 +43,84 @@
     },
     "stages": {
       "type": "object",
-      "description": "One entry per pipeline stage/task keyed by stage name (e.g. data-prep, finetune, eval, deploy, monitor).",
+      "description": "SHARED and AGENT-WRITABLE, so not a verified record. The driver writes the bare stage name (data-prep, finetune, eval, deploy, monitor) with status `completed` when it accepts a stage_complete; agents write entries of their own -- often keyed `<stage>.<task>` or `<stage>.<task>.i<n>`, sometimes over the bare name -- in a vocabulary of their own (live: complete, in_progress, launched, blocked, escalated_conflict, ...), with `outputs` and `evidence` sometimes objects, and a few entries are lists. Only the driver's own entries are normalized (report.normalize_stage_complete: outputs a list of S3 URIs each verified to exist, metrics an object, evidence a string), so no field but `status` is typed here: normalize before reading, or read `stage_history`, which only the driver writes.",
       "additionalProperties": {
-        "type": "object",
-        "required": ["status"],
+        "type": ["object", "array"],
         "properties": {
-          "status": {
-            "type": "string",
-            "enum": ["pending", "running", "completed", "failed", "escalated", "skipped"]
-          },
-          "started_at": {"type": ["string", "null"], "format": "date-time"},
-          "ended_at": {"type": ["string", "null"], "format": "date-time"},
+          "status": {"type": "string"}
+        },
+        "additionalProperties": true
+      }
+    },
+    "stage_history": {
+      "type": "array",
+      "description": "Append-only, driver-written: one record per accepted stage_complete, re-read from S3 before each append so no iteration overwrites another's.",
+      "items": {
+        "type": "object",
+        "required": ["stage", "status"],
+        "properties": {
+          "stage": {"type": "string"},
+          "task": {"type": "string"},
+          "iteration": {"type": ["integer", "null"], "minimum": 0},
+          "recorded_at": {"type": "string", "format": "date-time"},
+          "status": {"type": "string"},
           "outputs": {
             "type": "array",
             "items": {"type": "string"},
-            "description": "S3 URIs of produced artifacts, verified to exist by the driver. Empty array is VALID (empty-but-valid is distinct from missing)."
+            "description": "S3 URIs of produced artifacts, each verified to exist by the driver. Empty array is VALID (empty-but-valid is distinct from missing)."
           },
-          "metrics": {
-            "type": "object",
-            "additionalProperties": true
-          },
-          "evidence": {
-            "type": "string",
-            "description": "Agent's one-paragraph proof of what was verified"
-          }
+          "metrics": {"type": "object", "additionalProperties": true},
+          "evidence": {"type": "string", "description": "The stage's one-paragraph proof of what was verified"}
+        },
+        "additionalProperties": true
+      }
+    },
+    "attestations": {
+      "type": "array",
+      "description": "Append-only, driver-written: what the DRIVER measured about a stage's claim, as opposed to what the stage said. kind `judge_instrument` compares a claimed judge-prompt digest with the canonical object's bytes; `verified` is false, with `error`, when the instrument could not be read.",
+      "items": {
+        "type": "object",
+        "required": ["kind", "verified"],
+        "properties": {
+          "kind": {"type": "string"},
+          "verified": {"type": "boolean"},
+          "key": {"type": "string"},
+          "claimed_sha256": {"type": "string"},
+          "canonical_sha256": {"type": "string"},
+          "checked_at": {"type": "string", "format": "date-time"},
+          "error": {"type": "string"},
+          "stage": {"type": "string"},
+          "task": {"type": "string"},
+          "iteration": {"type": ["integer", "null"], "minimum": 0}
+        },
+        "additionalProperties": true
+      }
+    },
+    "escalations": {
+      "type": "array",
+      "description": "Append-only, driver-written by handle_escalate for an escalation that belongs to this run.",
+      "items": {
+        "type": "object",
+        "required": ["stage", "reason", "escalated_at"],
+        "properties": {
+          "stage": {"type": "string"},
+          "task": {"type": "string"},
+          "iteration": {"type": ["integer", "null"], "minimum": 0},
+          "reason": {"type": "string"},
+          "escalated_at": {"type": "string", "format": "date-time"}
         },
         "additionalProperties": true
       }
     },
     "models": {
       "type": "object",
+      "description": "The resolved record of model CONSENT: role -> model id, signed plan > trigger params > DEFAULT_MODELS (start_pipeline._resolve_models). Immutable after seeding. Where an open-weight model came from (hf_repo, revision, ...) is plan content, not a role, and is not copied here.",
       "required": ["teacher", "student"],
       "properties": {
-        "teacher": {
-          "type": "object",
-          "required": ["provider", "model_id"],
-          "properties": {
-            "provider": {"type": "string", "description": "e.g. bedrock"},
-            "model_id": {"type": "string", "description": "e.g. the DeepSeek-R1 Bedrock model id"}
-          },
-          "additionalProperties": true
-        },
-        "student": {
-          "type": "object",
-          "required": ["model_id"],
-          "properties": {
-            "model_id": {"type": "string", "description": "e.g. Qwen/Qwen3-1.7B"},
-            "adapter_uri": {"type": "string", "description": "S3 URI of the trained QLoRA adapter"},
-            "endpoint_name": {"type": "string", "description": "SageMaker endpoint serving the student"}
-          },
-          "additionalProperties": true
-        }
+        "teacher": {"type": "string", "description": "e.g. us.deepseek.r1-v1:0 or a signed plan's teacher"},
+        "student": {"type": "string", "description": "e.g. Qwen/Qwen3-1.7B"},
+        "judge": {"type": "string"},
+        "harness": {"type": "string"}
       },
       "additionalProperties": false
     }
