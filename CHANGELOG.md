@@ -5,6 +5,18 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
 ## [Unreleased]
 
+### Phase 0 spike harness (`tools/spikes/`)
+
+Scaffolding for the seven spikes that gate the lakehouse LLM-lifecycle build
+(docs/research/LAKEHOUSE_LLM_LIFECYCLE.md §13). `_spike.py` enforces the contract every spike
+keeps: pass criteria declared as data before anything runs, an offline `plan()`, creation and
+deletion registered together (`track`), teardown in `finally`, tag-based `sweep` for leftovers,
+and evidence redacted before it is written. S1–S6 are defined (question, gate, criteria,
+planned resources); S7's substrate part (Iceberg v2, Glue 5 IAM-mode writes, deterministic
+`UNLOAD … FOR VERSION AS OF`) is implemented. 33 offline tests in `tests/test_spikes.py`,
+including S7 against fake AWS: every resource deleted on success and after a mid-run crash,
+and the account-level Glue integration never enabled silently.
+
 ### Removed: the v1 cost routes, panels and `BUDGET_MODE`
 
 Cost v2 replaced every v1 panel, so the v1 surface goes:
