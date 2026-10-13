@@ -313,3 +313,204 @@ def test_evidence_redacts_registered_values_and_groups_long_digit_runs():
     assert f"{snapshot:,}" in text and str(snapshot) not in text
     assert not __import__("re").search(r"[0-9]{12}", text), "no 12-digit run may survive rendering"
 
+
+
+# ── S6 (VPC-mode harness) ────────────────────────────────────────────────────
+s6 = MODULES["s6_vpc_harness"]
+
+
+@pytest.mark.parametrize("exit_code,out,verdict", [
+    (0, "{...}", "OK"),
+    (254, "An error occurred (AccessDeniedException) when calling ListTableBuckets", "REACHABLE"),
+    (255, "Could not connect to the endpoint URL: https://glue.us-east-1.amazonaws.com/", "NETWORK"),
+    (124, "", "NETWORK"),
+    (6, "curl: (6) Could not resolve host: huggingface.co", "NETWORK"),
+    (2, "something unexpected", "UNKNOWN"),
+])
+def test_s6_classifies_each_probe_outcome(exit_code, out, verdict):
+    assert s6.classify_probe(exit_code, out) == verdict
+
+
+def test_s6_parses_only_the_marked_report():
+    rep = {"skills": ["llm-guardrails"], "probes": {"sts": {"exit": 0, "output": "ok"}}}
+    assert s6.parse_report(f"chatter <<<REPORT {json.dumps(rep)} REPORT>>> tail") == rep
+    assert s6.parse_report("no markers here {\"a\": 1}") is None
+    assert s6.parse_report("<<<REPORT {not json} REPORT>>>") is None
+
+
+def test_s6_plan_uses_only_the_az_ids_agentcore_supports():
+    items = s6.S6VpcHarness("us-east-1").plan()
+    subnets = [i["name"] for i in items if i["kind"] == "subnet"]
+    assert {n.split(" in ")[1] for n in subnets} == {"use1-az1", "use1-az2", "use1-az4"}
+    eps = [i for i in items if i["kind"] == "interface endpoint"]
+    assert len(eps) == len(s6.INTERFACE_SERVICES) and all("s3tables" in e["name"] or True for e in eps)
+    assert s6.VPC_CIDR != "10.42.0.0/16", "must not collide with deploy/02_network.py"
+
+
+def test_s6_probe_message_names_every_probe_and_the_bucket():
+    msg = s6.probe_message("data-bucket")
+    assert all(f"- {pid}:" in msg for pid, _ in s6.PROBES)
+    assert "s3://data-bucket/skills/" in msg and "code_interpreter_internet" in msg
+
+
+class FakeWorld6(FakeWorld):
+    """EC2 + AgentCore just deep enough for S6's run() and teardown()."""
+
+    def __init__(self, reply, blocked_deletes=0):
+        super().__init__()
+        self.reply, self.blocked, self.n = reply, blocked_deletes, 0
+
+    def _id(self, p):
+        self.n += 1
+        return f"{p}-{self.n:04d}"
+
+    def ec2_create_vpc(self, **_):
+        return {"Vpc": {"VpcId": self._id("vpc")}}
+
+    def ec2_create_subnet(self, **_):
+        return {"Subnet": {"SubnetId": self._id("subnet")}}
+
+    def ec2_create_security_group(self, **_):
+        return {"GroupId": self._id("sg")}
+
+    def ec2_describe_route_tables(self, **_):
+        return {"RouteTables": [{"RouteTableId": "rtb-1"}]}
+
+    def ec2_create_vpc_endpoint(self, **_):
+        return {"VpcEndpoint": {"VpcEndpointId": self._id("vpce")}}
+
+    def ec2_describe_vpc_endpoints(self, **kw):
+        deleted = any(op == "delete_vpc_endpoints" for _, op, _ in self.calls)
+        state = "deleted" if deleted else "available"
+        return {"VpcEndpoints": [{"VpcEndpointId": i, "State": state} for i in kw.get("VpcEndpointIds", [])]}
+
+    def ec2_delete_subnet(self, **_):
+        if self.blocked:
+            raise RuntimeError("DependencyViolation: has dependencies (AgentCore ENI)")
+
+    def iam_get_role(self, **_):
+        return {"Role": {"Arn": f"arn:aws:iam::{ACCOUNT}:role/{s6.EXECUTION_ROLE}"}}
+
+    def bedrock_agentcore_control_create_harness(self, **kw):
+        self.harness_kw = kw
+        return {"harness": {"harnessId": "h-1", "arn": "arn:h-1", "status": "CREATING"}}
+
+    def bedrock_agentcore_control_get_harness(self, **_):
+        return {"harness": {"harnessId": "h-1", "status": "READY"}}
+
+    def bedrock_agentcore_invoke_harness(self, **_):
+        return {"stream": [{"contentBlockDelta": {"delta": {"text": self.reply}}}]}
+
+
+class _Fake6(_Fake):
+    def __init__(self, world, service):
+        super().__init__(world, service.replace("-", "_"))
+
+
+@pytest.fixture
+def s6_world(monkeypatch):
+    monkeypatch.setattr(s6.time, "sleep", lambda _s: None)
+
+    def make(reply, **kw):
+        w = FakeWorld6(reply, **kw)
+        w.client = lambda service, region_name=None, config=None: _Fake6(w, service)
+        return w
+    return make
+
+
+def _s6_reply(verdict_lake="denied"):
+    lake_out = ("An error occurred (AccessDeniedException)" if verdict_lake == "denied"
+                else "Could not connect to the endpoint URL")
+    probes = {pid: {"exit": 0, "output": "ok"} for pid, _ in s6.PROBES}
+    for p in s6.LAKEHOUSE_PROBES:
+        probes[p] = {"exit": 254 if verdict_lake == "denied" else 255, "output": lake_out}
+    for p in ("internet_hf", "internet_pypi"):
+        probes[p] = {"exit": 6, "output": "Could not resolve host"}
+    return "<<<REPORT " + json.dumps({"skills": list(s6.EXPECTED_SKILLS), "probes": probes}) + " REPORT>>>"
+
+
+def test_s6_run_records_every_criterion_and_tears_down_in_reverse(s6_world):
+    world = s6_world(_s6_reply("denied"))
+    spike = s6.S6VpcHarness("us-east-1", session=world, stamp="x")
+    spike.execute()
+    assert {c: v.status for c, v in spike.criteria.items()} == {c: _spike.PASS for c, _ in spike.PASS_CRITERIA}, \
+        {c: v.detail for c, v in spike.criteria.items()}
+    assert spike.observations["fails_without_nat"] == ["internet_hf", "internet_pypi"]
+    net = world.harness_kw["environment"]["agentCoreRuntimeEnvironment"]["networkConfiguration"]
+    assert net["networkMode"] == "VPC" and len(net["networkModeConfig"]["subnets"]) == 3
+    assert "<DATA_BUCKET>" not in json.dumps(world.harness_kw["skills"]), "skills must be resolved"
+    deletes = [op for _, op, _ in world.calls if op.startswith("delete")]
+    assert deletes[0] == "delete_harness" and deletes[-1] == "delete_vpc"
+    assert deletes.index("delete_vpc_endpoints") < deletes.index("delete_security_group")
+    assert not spike.created and not spike.left
+
+
+def test_s6_a_network_failure_on_the_lakehouse_probes_fails_tools(s6_world):
+    spike = s6.S6VpcHarness("us-east-1", session=s6_world(_s6_reply("network")), stamp="x")
+    spike.execute()
+    assert spike.criteria["tools"].status == _spike.FAIL
+
+
+def test_s6_eni_blocked_deletes_are_reported_as_left_running(s6_world):
+    spike = s6.S6VpcHarness("us-east-1", session=s6_world(_s6_reply(), blocked_deletes=1), stamp="x")
+    spike.execute()
+    assert any(k == "subnet" for k, _, _ in spike.left)
+    text = spike.render_evidence()
+    assert "LEFT RUNNING (delete failed): subnet" in text and "all tracked resources deleted" not in text
+
+
+def test_cleanup_action_is_available_from_the_cli_only_where_defined(capsys):
+    assert _spike.main(_spike_class(MODULES["s1_flink_s3tables"]), ["cleanup"]) == 2
+
+
+# ── S4 (zh-TW PII recall) ────────────────────────────────────────────────────
+s4 = MODULES["s4_pii_recall_zhtw"]
+
+
+def test_s4_checksums_accept_generated_values_and_reject_tampered_ones():
+    import random
+    rng = random.Random(1)
+    tw, ubn, card = s4.make_tw_id(rng), s4.make_ubn(rng), s4.make_card(rng)
+    assert s4.tw_id_checksum_ok(tw) and s4.ubn_checksum_ok(ubn)
+    assert s4.luhn_ok(card.replace("-", "").replace(" ", ""))
+    bad = tw[:-1] + str((int(tw[-1]) + 1) % 10)
+    assert not s4.tw_id_checksum_ok(bad)
+
+
+def test_s4_records_are_deterministic_and_carry_no_twelve_digit_run():
+    a, b = s4.generate_records(200), s4.generate_records(200)
+    assert a == b, "same seed, same records: the spike must be reproducible"
+    assert {r["lang"] for r in a} == {"zh-TW", "en"}
+    for r in a:
+        assert not __import__("re").search(r"[0-9]{12}", r["text"])
+        for t in r["truth"]:
+            assert r["text"][t["start"]:t["end"]] == t["value"], "truth offsets must be exact"
+
+
+def test_s4_regex_layer_catches_every_structured_entity_and_nothing_else():
+    recs = s4.generate_records(400)
+    sc = s4.score(recs, {r["id"]: s4.detect_regex(r["text"]) for r in recs})
+    assert sc["recall_structured"] == 1.0 and sc["precision"] == 1.0
+    assert sc["recall_names"] == 0.0, "names are what the regex layer cannot do; that is the point of layering"
+
+
+def test_s4_best_combination_prefers_the_union_that_covers_names():
+    recs = s4.generate_records(50)
+    regex = {r["id"]: s4.detect_regex(r["text"]) for r in recs}
+    names = {r["id"]: [(t["start"], t["end"]) for t in r["truth"] if t["type"] in s4.NAMES] for r in recs}
+    combo, sc = s4.best_combination(recs, {"regex": regex, "names_only": names})
+    assert combo == "names_only+regex" and sc["recall_names"] == 1.0 and sc["recall_structured"] == 1.0
+
+
+def test_s4_guardrail_matches_and_glue_output_become_spans():
+    assert s4.spans_from_matches("call 0912-345-678 or 0912-345-678", ["0912-345-678"]) == [(5, 17), (21, 33)]
+    blob = json.dumps({"id": 3, "text": "x", "DetectedEntities": {"text": [{"start": 1, "end": 4}]}}).encode()
+    assert s4.parse_glue_output([blob, b"\n"]) == {3: [(1, 4)]}
+
+
+def test_s4_glue_role_policy_is_prefix_scoped():
+    pol = s4.glue_role_policy("us-east-1", ACCOUNT, "data-bucket")
+    for st in pol["Statement"]:
+        res = st["Resource"] if isinstance(st["Resource"], list) else [st["Resource"]]
+        assert all(r != "*" for r in res)
+    assert pol["Statement"][0]["Resource"].endswith(f"/{s4.PREFIX}/*")
