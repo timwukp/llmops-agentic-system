@@ -65,7 +65,7 @@
     }
   ],
   "memory": {
-    "_comment": "memory is a union: managedMemoryConfiguration (DEFAULT — AWS creates/owns the memory; just pick strategies, e.g. {\"managedMemoryConfiguration\": {\"strategies\": [\"SEMANTIC\", \"SUMMARIZATION\"]}}), disabled ({}) to opt out, or the BYO agentCoreMemoryConfiguration below. BYO: wire via scripts/wire_memory.py (CreateMemory + UpdateHarness + IAM grant); strategyId values come from the CreateMemory response; retrievalConfig value = {strategyId, topK, relevanceScore}. On UpdateHarness, wrap this whole object in optionalValue. See references/memory.md.",
+    "_comment": "memory is a union: managedMemoryConfiguration (DEFAULT, and what a create gets when `memory` is OMITTED — deploy/create_harness.py therefore refuses an absent memory; AWS creates/owns the memory and UpdateHarness to BYO later does not delete it; just pick strategies, e.g. {\"managedMemoryConfiguration\": {\"strategies\": [\"SEMANTIC\", \"SUMMARIZATION\"]}}), disabled ({}) to opt out, or the BYO agentCoreMemoryConfiguration below. BYO: wire via scripts/wire_memory.py (CreateMemory + UpdateHarness + IAM grant); strategyId values come from the CreateMemory response; retrievalConfig value = {strategyId, topK, relevanceScore}. On UpdateHarness, wrap this whole object in optionalValue. See references/memory.md.",
     "agentCoreMemoryConfiguration": {
       "arn": "<MEMORY_ARN>",
       "actorId": "ci-pipeline",

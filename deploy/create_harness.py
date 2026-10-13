@@ -34,6 +34,35 @@ def load_config(path: str) -> dict:
         return _strip_comments(json.load(f))
 
 
+#: The members of CreateHarness's HarnessMemoryConfiguration union. Exactly one is set.
+MEMORY_KINDS = ("agentCoreMemoryConfiguration", "managedMemoryConfiguration", "disabled")
+#: The API's explicit opt-out. What every agents/*/harness.json declares.
+MEMORY_DISABLED = {"disabled": {}}
+
+
+def create_time_memory(cfg: dict, where: str) -> dict:
+    """The `memory` a create must send, refusing a config that leaves it to the default.
+
+    Omitting `memory` is not "no memory": live (2026-10-13), CreateHarness without it
+    provisions MANAGED memory, calling CreateMemory on `memory/<harnessName>-*`, and a probe
+    reached READY only with `{"disabled": {}}`. It was already true in July: each of the
+    seven llmops harnesses got a managed `harness_<name>_<hex>-*` memory at create, which
+    04_wire_memory.py then replaced with the shared BYO memory -- and UpdateHarness does not
+    delete the memory it replaces, so all seven are still there. A config that says nothing
+    therefore says "managed", and this refuses to let silence mean that.
+    """
+    mem = cfg.get("memory")
+    if mem is None:
+        raise SystemExit(
+            f"{where}: no `memory` declared. A create without it provisions MANAGED memory "
+            f"(CreateMemory on memory/<harnessName>-*). Declare {MEMORY_DISABLED} and attach "
+            "BYO memory afterwards, or declare the memory you want.")
+    kinds = [k for k in mem if k in MEMORY_KINDS] if isinstance(mem, dict) else []
+    if len(kinds) != 1 or len(mem) != 1:
+        raise SystemExit(f"{where}: `memory` must set exactly one of {MEMORY_KINDS}; got {mem!r}")
+    return mem
+
+
 def build_kwargs(cfg: dict, role_arn: str) -> dict:
     kwargs = dict(cfg)
     # convenience: accept 'name' and map to the real CreateHarness field 'harnessName'
@@ -72,6 +101,11 @@ def main() -> int:
         cfg = config_subst.resolve(
             cfg, config_subst.mapping_for(account_id, args.region, args.bucket),
             where=args.config)
+    try:
+        cfg["memory"] = create_time_memory(cfg, where=args.config)
+    except SystemExit as e:
+        print(f"FAIL  {e}")
+        return 1
     kwargs = build_kwargs(cfg, args.role_arn)
 
     if args.dry_run:

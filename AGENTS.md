@@ -65,9 +65,25 @@ versions and introspects the live CreateHarness/UpdateHarness schemas.
   Callers need BOTH `bedrock-agentcore:InvokeHarness` and `InvokeAgentRuntime`.
   `InvokeAgentRuntimeCommand` runs shell in the session VM and is NOT gated by
   `allowedTools` — gate it with IAM.
-- **Managed memory IAM**: managed memory auto-creates a Memory named `harness_<name>_*`;
-  the execution role needs event/retrieval permissions on `arn:...:memory/harness_*`
-  or the first InvokeHarness fails `AccessDeniedException ... ListEvents`.
+- **A create that omits `memory` provisions MANAGED memory, so no create here omits it.**
+  `memory` is a union (`agentCoreMemoryConfiguration | managedMemoryConfiguration |
+  disabled`) and absence selects managed. All 7 harness configs declare `{"disabled": {}}`;
+  `04_wire_memory.py` attaches the shared BYO memory afterwards, and `05_harnesses.py` never
+  sends `memory` on update, so a redeploy does not undo it. The configs used to say "Created
+  WITHOUT memory" while every create got a managed memory: audited 2026-10-13
+  (`deploy/evidence/VERIFICATION_harness_memory_audit.md`), each of the 7 llmops harnesses has
+  an orphaned managed memory created in the same second as the harness — **UpdateHarness does
+  not delete the memory it replaces**. All 7 are ACTIVE with 0 actors / 0 records. The name
+  pattern has changed: `harness_<name>_<4hex>-<10>` for creates through 2026-08-04,
+  `<harnessName>-<10>` from 2026-08-11 (and a 2026-10-13 probe, whose create called
+  `CreateMemory` on `memory/<harnessName>-*` and reached READY only with `{"disabled": {}}`).
+  So the execution role's `ManagedMemoryEvents` grant on `memory/harness_*` does NOT match a
+  managed memory created today; an agent on one would hit the `AccessDeniedException ...
+  ListEvents` that grant was added to fix (inferred from that earlier live failure, not
+  re-measured). `create_time_memory()` in `deploy/create_harness.py` refuses a
+  create with no `memory`; `05_harnesses.py` fails a create that comes back managed anyway;
+  `tests/test_harness_memory.py` derives this paragraph's count and grant from the configs and
+  the role file, and checks that every `create_harness(` call in the repo sends `memory`.
 - **UpdateHarness**: only `memory` / `environmentArtifact` / `authorizerConfiguration`
   wrap in `optionalValue`; `model`/`environment`/`truncation` pass directly;
   `tags` go via `TagResource`; `clientToken` ≥ 33 chars.

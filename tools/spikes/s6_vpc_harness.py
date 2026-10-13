@@ -237,6 +237,9 @@ class S6VpcHarness(Spike):
                 tools=[t for t in base["tools"] if t.get("type") == "agentcore_code_interpreter"],
                 allowedTools=["shell", "file_read", "file_write", "code_interpreter", "skills"],
                 skills=skills, maxIterations=30, timeoutSeconds=600,
+                # Explicit: an absent `memory` provisions MANAGED memory, which this probe
+                # does not need (deploy/create_harness.py create_time_memory).
+                memory={"disabled": {}},
                 environment={"agentCoreRuntimeEnvironment": {
                     "networkConfiguration": {"networkMode": "VPC", "networkModeConfig": {
                         "subnets": subnet_ids, "securityGroups": [sg_id]}},
