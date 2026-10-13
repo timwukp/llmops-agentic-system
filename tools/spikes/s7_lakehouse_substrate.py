@@ -31,6 +31,7 @@ import sys
 import time
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import _spike  # noqa: E402
 from _spike import Spike, main  # noqa: E402
 
 #: Table bucket name PREFIX. Each run appends a UTC timestamp: a deleted table bucket's name
@@ -205,7 +206,7 @@ class S7LakehouseSubstrate(Spike):
                  "Principal": {"Service": "glue.amazonaws.com"}, "Action": "sts:AssumeRole",
                  "Condition": {"StringEquals": {"aws:SourceAccount": self.account_id}}}]}
         arn = iam.create_role(RoleName=GLUE_ROLE, AssumeRolePolicyDocument=json.dumps(trust),
-                              Tags=[{"Key": k, "Value": v} for k, v in self.tags.items()])["Role"]["Arn"]
+                              **_spike.boundary_kwargs(), Tags=[{"Key": k, "Value": v} for k, v in self.tags.items()])["Role"]["Arn"]
         iam.put_role_policy(RoleName=GLUE_ROLE, PolicyName="spike",
                             PolicyDocument=json.dumps(glue_role_policy(
                                 self.region, self.account_id, bucket_arn, data_bucket, self.bucket)))

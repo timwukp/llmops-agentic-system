@@ -5,6 +5,42 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
 ## [Unreleased]
 
+### Build runner, and spike S6 run 3: VPC mode fails in every topology
+
+**Build runner** (`tools/runner/`, owner request 2026-10-13: long-task runner only). A dedicated EC2
+instance in the account runs long build/test jobs over SSM, so they survive a closed laptop: private
+subnet behind a NAT, zero ingress rules, no key pair, no public IP, IMDSv2, encrypted root. Its role is
+`AmazonSSMManagedInstanceCore` plus an inline policy scoped by the `project` tag and `llmops-spike-*`
+names; roles it creates must carry the `llmops-spike-boundary` boundary, which holds no IAM actions.
+AgentCore's create-time actions authorize against `harness/*`, `runtime/*` and the workload-identity
+directory before any name exists, so they are scoped by `aws:RequestTag/project` instead — each found
+by a live create/delete probe, one at a time. On the runner the two sandbox-only tests pass.
+
+**Identity guards.** Live, the account's legacy SSM Quick Setup association (`AWS-AttachIAMToInstance`,
+all instances, `ForceReplace=true`, hourly) replaced the runner's role with
+`AmazonSSMRoleForInstancesQuickSetup` at :01 — and six other instances' roles every hour. The owner set
+it back to `ForceReplace=false` (its 2020 v1 value). The runner no longer depends on that: `doctor`
+reports a wrong profile or any such association and `exec` refuses on either; `up` restores the profile;
+a job exits 5 before touching anything under another identity, and 6 if the identity changes mid-job
+(a watchdog checks every 30 s); and the SSM command now exits with the job's code instead of reporting
+Success for `exit=1`. A static guard checks that every AWS call a spike makes is granted to the runner —
+actions only, which is why the create-time family above needed the probe.
+
+**S6 run 3: FAIL in every VPC topology; PUBLIC passes 5/5** (`deploy/evidence/SPIKE_06_s6_vpc_harness.md`).
+Route 53 Resolver query logging now records what the runtime resolves while it initializes. Variables
+rejected one at a time — managed memory (disabled), public egress (a NAT), the S3 gateway path (S3 via
+the NAT), our interface endpoints' private DNS (none at all) — and the identical configuration in PUBLIC
+mode initializes, reads all three S3 skills and classifies every probe. Every failed run resolved only
+the service's own dependencies (its ECR registry, a service-owned S3 log bucket 39–60 times, NTP, Logs)
+and never a host a session would use. PR-03 stays gated; the next step is the AgentCore team. Also found:
+a harness created without `memory` now gets **managed** memory by default (tracked separately).
+
+S6 also gained: a tagged private route table (the untagged main one was out of reach of tag-scoped
+grants), a retry that waits out tag-authorization consistency on resources created seconds earlier
+(decoded: `ec2:RouteTableID = "*"`), a query-log teardown that waits for the association to settle,
+stream error members recorded instead of dropped, and a `cleanup` that deletes every free VPC and
+reports the held ones instead of raising on the first.
+
 ### Manifest schema: describes the manifests again (Phase 1 PR-01)
 
 `pipeline/contracts/manifest.schema.json` was checked against every live run manifest before Phase 1

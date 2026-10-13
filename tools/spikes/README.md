@@ -12,7 +12,7 @@ resources, measuring, and deleting them again. They gate the lakehouse LLM-lifec
 | `s3_gateway_auth.py` | AgentCore Gateway vs API Gateway + Lambda in front of the OpenAI path | Phase 2 gateway | pending |
 | `s4_pii_recall_zhtw.py` | zh-TW / EN PII recall: Glue Detect-PII vs Guardrails vs privacy-filter | Phase 1 PR-07 | **4/4 PASS (2026-10-13)**: regex + Guardrails — `deploy/evidence/SPIKE_04_s4_pii_recall_zhtw.md` |
 | `s5_mlflow_registry.py` | MLflow App → Model Registry sync, aliases, approval event, condition-key deny | Phase 2 registry | pending |
-| `s6_vpc_harness.py` | VPC-mode harness without NAT | Phase 1 PR-03 | **FAIL, 2 runs (2026-10-13)**: session init timeout; run 3 diagnostic pending — `deploy/evidence/SPIKE_06_s6_vpc_harness.md` |
+| `s6_vpc_harness.py` | VPC-mode harness without NAT | Phase 1 PR-03 | **FAIL, 7 VPC runs / 5 topologies (2026-10-13)**: no NAT, NAT, S3 via NAT, no interface endpoints — all fail to initialize; the identical config passes 5/5 in PUBLIC mode. Next: the AgentCore team — `deploy/evidence/SPIKE_06_s6_vpc_harness.md` |
 | `s7_lakehouse_substrate.py` | Iceberg v2, Glue 5 IAM-mode writes, deterministic `UNLOAD … FOR VERSION AS OF`; Unified Studio (`--part domain`, follow-up) | Phase 1 PR-04/05 | **substrate: 7/7 PASS (2026-10-13)** — `deploy/evidence/SPIKE_07_s7_lakehouse_substrate.md`; domain part pending |
 
 ## Usage
@@ -42,6 +42,9 @@ python3 tools/spikes/s7_lakehouse_substrate.py sweep                            
 
 Resource names that AWS will not let you reuse right after deletion (table buckets) carry a
 `YYYYMMDD-HHMMSS` suffix per run.
+
+Long spikes run on the build runner (`tools/runner/README.md`), so a closed laptop does not stop them;
+roles a spike creates there carry the `llmops-spike-boundary` permissions boundary.
 
 Each spike's `run()` is implemented and exercised live in that spike's own PR, in critical-path
 order: S7 → S6 → S4, then S1, S2, S3, S5.

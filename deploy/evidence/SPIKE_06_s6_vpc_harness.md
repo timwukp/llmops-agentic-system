@@ -1,81 +1,100 @@
 # SPIKE_06_s6_vpc_harness — VPC-mode AgentCore harness without NAT
 
-- **Verdict:** FAIL
+- **Verdict:** FAIL (7 VPC runs, 5 topologies; the identical configuration passes in PUBLIC mode)
 - **Gates:** Phase 1 PR-03: VPC foundation
 - **Region:** us-east-1
-- **Ran:** 2026-10-13T07:25:20Z → 2026-10-13T07:44:41Z
+- **Ran:** 2026-10-13, runs 1–2 from a laptop, runs 3a–3e from the build runner (`tools/runner/`)
 
-## Pass criteria
+## Pass criteria (run 3a: the spike's own question, no NAT)
 
 | id | criterion | result | detail |
 |---|---|---|---|
 | session | A session starts and the S3 skill sources resolve | **FAIL** | no parseable <<<REPORT>>> in the reply |
-| model | The model call succeeds through the bedrock-runtime endpoint | **FAIL** | no text: RuntimeClientError: An error occurred (RuntimeClientError) when calling the InvokeHarness operation: Runtime initialization time exceeded. Please make sure that initialization completes in 120s. |
-| tools | aws s3tables list-table-buckets, an Athena query and glue get-job succeed from the shell | **NOT RUN** |  |
-| egress | Which tools need egress is recorded | **NOT RUN** |  |
-| failures | What fails without NAT is recorded | **NOT RUN** |  |
-
-## Observations
-
-- **subnets:** {"use1-az1": "subnet-0d291e452aeddb625", "use1-az2": "subnet-04f717bb1567602fd", "use1-az4": "subnet-038bee6f430dcf4ed"}
-- **harness_status:** READY
-- **invoke_error:** RuntimeClientError: An error occurred (RuntimeClientError) when calling the InvokeHarness operation: Runtime initialization time exceeded. Please make sure that initialization completes in 120s.
-- **raw_reply_tail:** 
-
-## Errors
-
-- teardown: security group sg-003b71004b35375f1: RuntimeError: still blocked after 4 attempts (AgentCore ENIs persist up to 8 h; run `cleanup` later): An error occurred (DependencyViolation) when calling the DeleteSecurityGroup operation: resource sg-003b71004b35375f1 has a dependent object
-- teardown: subnet subnet-038bee6f430dcf4ed: RuntimeError: still blocked after 4 attempts (AgentCore ENIs persist up to 8 h; run `cleanup` later): An error occurred (DependencyViolation) when calling the DeleteSubnet operation: The subnet 'subnet-038bee6f430dcf4ed' has dependencies and cannot be deleted.
-- teardown: subnet subnet-04f717bb1567602fd: RuntimeError: still blocked after 4 attempts (AgentCore ENIs persist up to 8 h; run `cleanup` later): An error occurred (DependencyViolation) when calling the DeleteSubnet operation: The subnet 'subnet-04f717bb1567602fd' has dependencies and cannot be deleted.
-- teardown: subnet subnet-0d291e452aeddb625: RuntimeError: still blocked after 4 attempts (AgentCore ENIs persist up to 8 h; run `cleanup` later): An error occurred (DependencyViolation) when calling the DeleteSubnet operation: The subnet 'subnet-0d291e452aeddb625' has dependencies and cannot be deleted.
-- teardown: vpc vpc-0374f7d0ad60f8180: RuntimeError: still blocked after 4 attempts (AgentCore ENIs persist up to 8 h; run `cleanup` later): An error occurred (DependencyViolation) when calling the DeleteVpc operation: The vpc 'vpc-0374f7d0ad60f8180' has dependencies and cannot be deleted.
-
-## Teardown
-
-- LEFT RUNNING (delete failed): security group sg-003b71004b35375f1 — RuntimeError: still blocked after 4 attempts (AgentCore ENIs persist up to 8 h; run `cleanup` later): An error occurred (DependencyViolation) when calling the DeleteSecurityGroup operation: resource s
-- LEFT RUNNING (delete failed): subnet subnet-038bee6f430dcf4ed — RuntimeError: still blocked after 4 attempts (AgentCore ENIs persist up to 8 h; run `cleanup` later): An error occurred (DependencyViolation) when calling the DeleteSubnet operation: The subnet 'subne
-- LEFT RUNNING (delete failed): subnet subnet-04f717bb1567602fd — RuntimeError: still blocked after 4 attempts (AgentCore ENIs persist up to 8 h; run `cleanup` later): An error occurred (DependencyViolation) when calling the DeleteSubnet operation: The subnet 'subne
-- LEFT RUNNING (delete failed): subnet subnet-0d291e452aeddb625 — RuntimeError: still blocked after 4 attempts (AgentCore ENIs persist up to 8 h; run `cleanup` later): An error occurred (DependencyViolation) when calling the DeleteSubnet operation: The subnet 'subne
-- LEFT RUNNING (delete failed): vpc vpc-0374f7d0ad60f8180 — RuntimeError: still blocked after 4 attempts (AgentCore ENIs persist up to 8 h; run `cleanup` later): An error occurred (DependencyViolation) when calling the DeleteVpc operation: The vpc 'vpc-0374f7d
+| model | The model call succeeds through the bedrock-runtime endpoint | **FAIL** | `RuntimeClientError: Runtime initialization time exceeded. Please make sure that initialization completes in 120s.` |
+| tools | aws s3tables list-table-buckets, an Athena query and glue get-job succeed from the shell | **NOT RUN** | no session |
+| egress | Which tools need egress is recorded | **NOT RUN** | no session |
+| failures | What fails without NAT is recorded | **NOT RUN** | no session |
 
 ## Run history (2026-10-13)
 
-The table above is run 2. Both runs failed at the same point; the second run tested and rejected the
-first hypothesis.
+Every VPC run used a fresh VPC (10.43.0.0/16) with subnets in use1-az1/az2/az4 — the AZ IDs AgentCore
+supports — and a security group whose egress is the default allow-all. The harness clones the
+data-prep harness: same model, the three S3 skill sources, the `llmops-harness-execution` role.
+Runs 3a–3e add Route 53 Resolver query logging, so each records the hostnames the runtime resolved
+between `InvokeHarness` and the failure.
 
-| Run | Started (UTC) | Endpoints | Outcome |
-|---|---|---|---|
-| 1 | 07:05:55 | S3 gateway + bedrock-runtime, bedrock-agentcore, sts, logs, ssm, s3tables, glue, athena, secretsmanager | VPC, 3 subnets (use1-az1/az2/az4) and all endpoints `available`; harness **READY**; `InvokeHarness` → **`Runtime initialization time exceeded. Please make sure that initialization completes in 120s`** |
-| 2 | 07:25:20 | run 1 **+ ecr.api + ecr.dkr** (the AgentCore VPC docs list both as required without internet) | **Identical failure.** Hypothesis "ECR endpoints were missing" rejected. |
+| Run | Network | Interface endpoints | S3 | Memory | Harness | `InvokeHarness` |
+|---|---|---|---|---|---|---|
+| 1 | VPC, no NAT | 9 (bedrock-runtime, bedrock-agentcore, sts, logs, ssm, s3tables, glue, athena, secretsmanager) | gateway endpoint | managed (API default) | READY | init exceeded 120 s |
+| 2 | VPC, no NAT | run 1 + ecr.api + ecr.dkr | gateway endpoint | managed | READY | init exceeded 120 s |
+| 3a | VPC, no NAT | 11 | gateway endpoint | **disabled** | READY | init exceeded 120 s |
+| 3b | VPC **+ NAT** | 11 | gateway endpoint | disabled | READY | init exceeded 120 s |
+| 3c | VPC + NAT | 11 | **via NAT** (no gateway endpoint) | disabled | READY | init exceeded 120 s |
+| 3d | **PUBLIC** (no VPC) | — | — | disabled | READY | empty stream, no error (see below) |
+| 3d′ | **PUBLIC** (no VPC) | — | — | disabled | READY | **PASS, 5/5 criteria** |
+| 3e | VPC + NAT | **none** (public DNS via NAT) | gateway endpoint | disabled | READY | **health check failed or timed out** |
+
+Hostnames resolved during the failed initialization (count, all `NOERROR`):
+
+| Run | `kepler-ola-us-east-1-prod-logs-bucket.s3…` | `time.aws.com` | `api.ecr…` | `<registry>.dkr.ecr…` | `logs…` |
+|---|---|---|---|---|---|
+| 3a | 39 | 9 | 2 | 1 | 2 |
+| 3b | 39 | 1 | 2 | — | — |
+| 3c | 48 | 1 | — | 1 | 1 |
+| 3e | 60 | 7 | 5 | 1 | 6 |
+
+The registry is **not this account's** (compared against the caller's account id offline; the
+evidence redactor masks every 12-digit run, so it reads `<ACCOUNT_ID>` above): the runtime image comes
+from a service-owned ECR repository. No run resolved `bedrock-agentcore`, `sts`, `bedrock-runtime`,
+the data bucket the skills live in, or the ECR layer bucket (`prod-us-east-1-starport-layer-bucket`).
 
 ## What is established
 
-- **A VPC-mode harness without NAT, with every endpoint the AgentCore VPC documentation lists, does not
-  initialize a session within 120 s.** `CreateHarness` accepts the VPC configuration and the harness
-  reaches READY — READY is no evidence of a working session (the same lesson as AGENTS.md's skill-source
-  gotcha).
-- **The runtime's CloudWatch log group exists but holds no log events** for either run: initialization
-  failed before the agent process logged anything.
-- **The service-managed S3 gateway no longer exists for runtimes created after the May 2026 rollout**
-  (`requireServiceS3Endpoint` API documentation): all startup traffic, S3 included, goes through the
-  customer VPC. This VPC had an S3 gateway endpoint (default policy) on its main route table, so S3 is
-  not an obvious gap — but the runtime's other startup dependencies are not documented.
-- **AgentCore's ENIs (`agentic_ai`) outlive the harness**, as documented (up to 8 h): both runs left their
-  VPC, three subnets and security group behind (no charge). The billable interface endpoints were
-  deleted in both runs. `python3 tools/spikes/s6_vpc_harness.py cleanup` deletes the leftovers once the
-  ENIs are released.
+- **The configuration is not the problem.** In PUBLIC mode the identical harness (same model, skills,
+  role, memory disabled) initializes, lists all three S3 skills, streams model output and classifies
+  all 11 probes (3d′). One earlier PUBLIC attempt (3d) returned an empty stream with no error member;
+  it is recorded, not explained, and the rerun passed.
+- **No network topology we control changes the outcome.** Rejected one at a time:
+  * *missing ECR endpoints* — run 2 added them; identical failure;
+  * *managed memory* — runs 3a–3e disabled it (`memory={"disabled": {}}`); identical failure;
+  * *needs public egress* — 3b added a NAT; `time.aws.com` went from 9 lookups to 1 and
+    initialization still exceeded 120 s;
+  * *the S3 gateway endpoint path* — 3c sent S3 through the NAT instead; identical failure;
+  * *the security group* — the AgentCore VPC guide states inbound is not required ("The runtime only
+    initiates outbound connections"), and egress was allow-all in every run;
+  * *our interface endpoints' private DNS* — 3e removed all of them; the error **changed** (from
+    "initialization time exceeded" to "health check failed or timed out") but the runtime still never
+    served a request.
+- **Initialization stops before the runtime does any work of ours.** Every failed run resolved only
+  the service's own dependencies — its ECR registry, a service-owned S3 log bucket (looked up 39–60
+  times, which reads as retries), CloudWatch Logs and NTP — and never the hosts a session would use.
+  The runtime's CloudWatch log group held no events in runs 1–2.
+- **READY is not evidence of a working VPC-mode harness**, the same lesson as AGENTS.md's skill-source
+  gotcha: `CreateHarness` accepted every VPC configuration and every harness reached READY.
 
 ## Consequences for Phase 1 (PR-03)
 
-- **PR-03 is NOT unblocked.** Until a VPC-mode session initializes, lakehouse tasks stay on the PUBLIC
-  data-prep harness; Glue jobs and Athena (which run in AWS-managed networks) are unaffected.
-- **Phase 1's VPC must be a standing resource**, never torn down per run: ENI persistence makes a
-  per-run VPC impossible to delete for hours.
+- **PR-03 stays gated.** Lakehouse tasks run on the PUBLIC data-prep harness, as 3d′ shows they can;
+  Glue and Athena run in AWS-managed networks and are unaffected.
+- **Next step is the service team, not another topology.** The evidence above (5 topologies, the
+  PUBLIC control, the DNS profiles, the two error messages) is what to bring to the AgentCore team.
+  If they cannot answer, the remaining instrument is VPC Flow Logs on the runtime's ENIs, to see
+  whether the S3 log-bucket and ECR connections complete.
+- **Phase 1's VPC must be a standing resource**, never torn down per run: AgentCore's ENIs persist up
+  to 8 h after a harness is deleted, which held every spike VPC for hours and filled the account's
+  VPC quota (15) by run 3c.
+- **A harness created without `memory` now gets managed memory** (live, 2026-10-13: the runner's role
+  was refused `CreateMemory` until the spike passed `memory={"disabled": {}}`). Tracked separately.
 
-## Next diagnostic (run 3)
+## Teardown
 
-Enable **Route 53 Resolver query logging** on the spike VPC, so the evidence names the hostnames the
-runtime tries to resolve during initialization — and therefore which endpoint (if any) is missing —
-instead of guessing. A positive control (the same harness in a VPC **with** a NAT gateway) separates
-"an endpoint is missing" from "VPC-mode harnesses do not work without NAT at all".
-
+- Every billable resource of every run was deleted: interface and gateway endpoints, NAT gateways
+  and their Elastic IPs, Resolver query-log configs and associations, log groups, harnesses.
+- Left, by design and at no charge: one VPC per run that created a harness, with its three subnets and
+  security group, held by AgentCore `agentic_ai` ENIs. Run 1's VPC was deleted by `cleanup` once its
+  ENIs were released (about 8 h); the others follow the same way
+  (`python3 tools/spikes/s6_vpc_harness.py cleanup`, which deletes what is free and reports the rest).
+- Two early attempts at run 3a each left a Resolver query-log configuration and association behind
+  (a teardown race, then a missing grant — both fixed in this change); both were deleted by hand. Two
+  more attempts stopped on runner grants before creating a harness, and one left a route table
+  (tag-authorization consistency, fixed); deleted by hand with its VPC.
