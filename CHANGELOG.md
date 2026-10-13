@@ -26,6 +26,13 @@ be standing. Next: Route 53 Resolver query logging + a NAT positive control.
 Spike harness: S4 and S6 `run()` implemented; teardown failures are now reported as LEFT RUNNING rather
 than counted as deleted; new `cleanup` action for deferred deletion.
 
+**Redaction scanner precision fix (security control, stated explicitly).** The generic `bare 12-digit
+account id` rule now excuses a run ONLY when it lies inside a complete 40- or 64-character hex token (a
+git object id or a sha256 digest), bounded by non-hex on both sides. It fired on this PR's SDLC plan,
+whose `Accepted-for` merge-base SHA contains twelve consecutive decimal digits and must be written in
+full. Hex tokens of any other length, runs beside a few hex letters, and every ARN/digest rule are
+unchanged; six tests pin both directions.
+
 ### Spike S7 (lakehouse substrate): 7/7 PASS
 
 Live in us-east-1, 2026-10-13 (`deploy/evidence/SPIKE_07_s7_lakehouse_substrate.md`). A table created

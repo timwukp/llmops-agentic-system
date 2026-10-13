@@ -284,6 +284,24 @@ LONGER_NUMBER = re.compile(rb"[0-9]{13,}")
 #: Placeholders that stand in for a real id by design.
 PLACEHOLDERS = (b"<ACCOUNT_ID>", b"ACCOUNT_ID_PLACEHOLDER")
 
+#: A git object id (40 hex) or a sha256 digest (64 hex) can contain twelve consecutive decimal
+#: digits by chance -- one did: an SDLC plan's `Accepted-for` merge-base SHA, which the gate
+#: compares exactly and so cannot be abbreviated. A run is excused ONLY when it lies inside a
+#: complete hex token of exactly one of these lengths, bounded by non-hex on both sides; a
+#: 12-digit run next to a few hex letters, or inside a shorter or longer hex string, is still
+#: reported. Generic rule only -- the digest and ARN rules above are unaffected.
+HEX_DIGEST_LENGTHS = (40, 64)
+_HEX = frozenset(b"0123456789abcdefABCDEF")
+
+
+def _inside_hex_digest(blob: bytes, start: int, end: int) -> bool:
+    lo, hi = start, end
+    while lo > 0 and blob[lo - 1] in _HEX:
+        lo -= 1
+    while hi < len(blob) and blob[hi] in _HEX:
+        hi += 1
+    return (hi - lo) in HEX_DIGEST_LENGTHS
+
 #: These files contain the patterns above as their own subject matter. Scanning a scanner for
 #: the strings it searches for is a guaranteed self-report. Kept as an exact-path tuple, not a
 #: prefix or a glob: a broad skip rule is how a real file ends up unscanned by accident.
@@ -370,6 +388,8 @@ def scan_blob(path: str, blob: bytes):
     if not binary:
         for m in GENERIC_ACCOUNT_ID.finditer(blob):
             if _excused(m.group(0)):
+                continue
+            if _inside_hex_digest(blob, m.start(1), m.end(1)):
                 continue
             if _digest_matches(m.group(1)):
                 continue  # already reported above, with a better rule name

@@ -15,6 +15,7 @@
 3. `deploy/evidence/SPIKE_04_s4_pii_recall_zhtw.md`, `deploy/evidence/SPIKE_06_s6_vpc_harness.md` — new.
 4. `tests/test_spikes.py` — 54 tests.
 5. `tools/spikes/README.md`, `CHANGELOG.md`, `PROJECT_STATE.md`.
-6. `docs/TEST_RESULTS.md`, `docs/TEST_RESULTS.zh-TW.md`, `tests/redaction_scan.py`,
-   `tests/test_redaction_scan.py` — counts.
+6. `docs/TEST_RESULTS.md`, `docs/TEST_RESULTS.zh-TW.md` — counts. `tests/redaction_scan.py`,
+   `tests/test_redaction_scan.py` — counts, plus a narrow precision fix: a 12-digit run inside a complete
+   40/64-hex digest (this plan's Accepted-for SHA) is not an account id; six tests pin both directions.
 7. `intent/spike-4-6-evidence/{intent,spec,plan}.md`, `.sdlc/active`.
