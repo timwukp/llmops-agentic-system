@@ -253,3 +253,15 @@ def test_every_aws_call_a_spike_makes_is_granted_to_the_runner():
     missing = sorted({f"{iam_action(*c)}  ({f.name})" for f in SPIKE_FILES
                       for c in spike_aws_calls(f) if not _allowed(iam_action(*c))})
     assert not missing, "the runner role cannot make these spike calls:\n  " + "\n  ".join(missing)
+
+
+def test_the_jobs_own_files_are_excluded_from_the_rebuilt_index():
+    """Live: the full suite on the runner failed test_an_unstaged_new_file_is_a_lying_census
+    because job.log and pip.log are written into the tree after `git add -A`."""
+    lines = _script()
+    init = next(i for i, ln in enumerate(lines) if ln.startswith("git init"))
+    excl = next(i for i, ln in enumerate(lines) if ".git/info/exclude" in ln)
+    first_write = next(i for i, ln in enumerate(lines) if ">> pip.log" in ln or "> job.log" in ln)
+    assert init < excl < first_write
+    for name in ("job.log", "pip.log", "identity.log"):
+        assert name in lines[excl]

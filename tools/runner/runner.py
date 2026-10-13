@@ -339,6 +339,9 @@ def run_script(tree_uri: str, cmd: str, run_id: str, results_uri: str, boundary_
         # The tree ships without .git; an index rebuilt from it is what CI's checkout sees, and the
         # census/redaction tests read `git ls-files`, so without one they see an empty repo.
         "git init -q && git add -A",
+        # The job's own files land in the tree after the index is built; excluded locally, or the
+        # untracked-file guard (tests/test_redaction_scan.py) reports the runner's logs as unstaged.
+        "printf 'job.log\\npip.log\\nidentity.log\\ntree.tgz\\n' >> .git/info/exclude",
         "source /opt/llmops/venv/bin/activate && ln -sfn /opt/llmops/venv .venv",
         # user data runs once per instance; re-asserting the pins per job keeps a live runner in step
         f"pip install -q --disable-pip-version-check {' '.join(PINS)} >> pip.log 2>&1 || {{ tail -20 pip.log; exit 3; }}",
