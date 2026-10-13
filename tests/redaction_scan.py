@@ -107,8 +107,8 @@ ALLOWED = (b"6833" + b"13688378", b"7631" + b"04351884", b"1234" + b"56789012")
 #: this laptop, single-threaded CPython does 3.1M sha256/s, so the whole 1e12 space falls in
 #: about 4 days -- and a GPU does it in roughly 100 seconds. So the KDF is iterated. At 200k
 #: iterations a candidate costs ~16 ms, which makes the same sweep ~500 GPU-years, while the
-#: scan stays cheap because only 12-digit runs are ever hashed: measured across all 245
-#: tracked files there are 75 such runs, 10 distinct, and hashing the distinct set takes 0.16 s
+#: scan stays cheap because only 12-digit runs are ever hashed: measured across all 250
+#: tracked files there are 76 such runs, 11 distinct, and hashing the distinct set takes 0.16 s
 #: for the entire repo. (Re-measured whenever either number moves, and they move
 #: INDEPENDENTLY, which is why both are derived and neither is inferred from the other, and
 #: this branch is the proof in both directions. Its parent moved BOTH at once from DISJOINT
@@ -184,8 +184,11 @@ ALLOWED = (b"6833" + b"13688378", b"7631" + b"04351884", b"1234" + b"56789012")
 #: Then 228 files went to 241: the Phase 0 spike harness (tools/spikes/, its README and tests) and its intent chain.
 #: One new run -- the documentation-account constant in tests/test_spikes.py, already in the
 #: distinct set -- so the runs moved 74 -> 75 while the distinct count held at 10.
-#: Then 241 files became 245: spike S7's evidence file and its intent chain. Evidence rendering
-#: groups long digit runs (snapshot ids), so the runs held at 75.
+#: Then 241 files went to 245 (spike S7's evidence file and its intent chain).
+#: Then 245 files became 250: spike S4 and S6 evidence files and their intent chain. One new
+#: run, and it is not an account id: the plan's Accepted-for merge-base SHA happens to contain twelve
+#: consecutive decimal digits. The SDLC gate compares that SHA exactly (fail-closed), so it cannot be
+#: abbreviated -- runs 75 -> 76, distinct 10 -> 11, and the hash check still clears it.
 #: Dollar limits and percentages only -- no 12-digit run, so the runs held at 74 again.
 #: For EIGHT commits
 #: running, the file count moved and the run count did not move once, and then one commit moved
@@ -281,6 +284,24 @@ LONGER_NUMBER = re.compile(rb"[0-9]{13,}")
 #: Placeholders that stand in for a real id by design.
 PLACEHOLDERS = (b"<ACCOUNT_ID>", b"ACCOUNT_ID_PLACEHOLDER")
 
+#: A git object id (40 hex) or a sha256 digest (64 hex) can contain twelve consecutive decimal
+#: digits by chance -- one did: an SDLC plan's `Accepted-for` merge-base SHA, which the gate
+#: compares exactly and so cannot be abbreviated. A run is excused ONLY when it lies inside a
+#: complete hex token of exactly one of these lengths, bounded by non-hex on both sides; a
+#: 12-digit run next to a few hex letters, or inside a shorter or longer hex string, is still
+#: reported. Generic rule only -- the digest and ARN rules above are unaffected.
+HEX_DIGEST_LENGTHS = (40, 64)
+_HEX = frozenset(b"0123456789abcdefABCDEF")
+
+
+def _inside_hex_digest(blob: bytes, start: int, end: int) -> bool:
+    lo, hi = start, end
+    while lo > 0 and blob[lo - 1] in _HEX:
+        lo -= 1
+    while hi < len(blob) and blob[hi] in _HEX:
+        hi += 1
+    return (hi - lo) in HEX_DIGEST_LENGTHS
+
 #: These files contain the patterns above as their own subject matter. Scanning a scanner for
 #: the strings it searches for is a guaranteed self-report. Kept as an exact-path tuple, not a
 #: prefix or a glob: a broad skip rule is how a real file ends up unscanned by accident.
@@ -367,6 +388,8 @@ def scan_blob(path: str, blob: bytes):
     if not binary:
         for m in GENERIC_ACCOUNT_ID.finditer(blob):
             if _excused(m.group(0)):
+                continue
+            if _inside_hex_digest(blob, m.start(1), m.end(1)):
                 continue
             if _digest_matches(m.group(1)):
                 continue  # already reported above, with a better rule name

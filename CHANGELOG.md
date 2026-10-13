@@ -5,6 +5,34 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
 ## [Unreleased]
 
+### Spikes S4 (zh-TW PII) and S6 (VPC harness): live results
+
+**S4: 4/4 PASS** (`deploy/evidence/SPIKE_04_s4_pii_recall_zhtw.md`). On 1,000 seeded zh-TW/EN records
+(3,523 planted entities) the best layered combination is **zh-TW regex + Bedrock Guardrails**: structured
+recall 1.0, names 0.999, addresses 1.0, precision 1.0. Guardrails has no type for the Taiwan national ID
+or 統一編號 (regex carries those); Glue Detect-PII scored 0.0 on zh-TW names, IDs, cards, phones and
+addresses (fine on the same entities in English), so it is not used for this data. Run 1 found that a
+guardrail PII entity with only `action: ANONYMIZE` detects **nothing** under `ApplyGuardrail(source=
+"INPUT")`; every guardrail must set `inputAction`/`inputEnabled` explicitly — this matters again for the
+Phase 2 gateway.
+
+**S6: FAIL, 2 runs** (`deploy/evidence/SPIKE_06_s6_vpc_harness.md`). A VPC-mode harness with no NAT
+reaches READY, but `InvokeHarness` fails "Runtime initialization time exceeded … 120s" — with the
+documented endpoints (S3 gateway, logs, bedrock-runtime, bedrock-agentcore, sts, …) and again after
+adding ecr.api + ecr.dkr. PR-03 (VPC foundation) stays gated; lakehouse tasks stay on the PUBLIC harness.
+AgentCore ENIs outlive the harness, so both spike VPCs remain (free) until `cleanup`; Phase 1's VPC must
+be standing. Next: Route 53 Resolver query logging + a NAT positive control.
+
+Spike harness: S4 and S6 `run()` implemented; teardown failures are now reported as LEFT RUNNING rather
+than counted as deleted; new `cleanup` action for deferred deletion.
+
+**Redaction scanner precision fix (security control, stated explicitly).** The generic `bare 12-digit
+account id` rule now excuses a run ONLY when it lies inside a complete 40- or 64-character hex token (a
+git object id or a sha256 digest), bounded by non-hex on both sides. It fired on this PR's SDLC plan,
+whose `Accepted-for` merge-base SHA contains twelve consecutive decimal digits and must be written in
+full. Hex tokens of any other length, runs beside a few hex letters, and every ARN/digest rule are
+unchanged; six tests pin both directions.
+
 ### Spike S7 (lakehouse substrate): 7/7 PASS
 
 Live in us-east-1, 2026-10-13 (`deploy/evidence/SPIKE_07_s7_lakehouse_substrate.md`). A table created

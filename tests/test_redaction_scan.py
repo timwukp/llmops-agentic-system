@@ -218,7 +218,7 @@ def test_binary_classification_matches_git_for_every_tracked_file():
     purpose -- the finding is that a skip count nobody reads is where a guard goes to hide, and
     that finding does not expire when the arithmetic changes.) A guard whose name says "for every
     tracked file" was checking zero of them on the only machine that gates the merge, and
-    reported green for it. Against `4b825dc…` the diff is the whole index -- 245 files, 35 of
+    reported green for it. Against `4b825dc…` the diff is the whole index -- 250 files, 35 of
     them binary -- so it can never be empty and there is nothing left to skip on.
 
     One trap in the staging cure below: `git add -N` is NOT enough for this test. It records the
@@ -244,7 +244,7 @@ def test_binary_classification_matches_git_for_every_tracked_file():
             f"{path}: git says binary={git_says_binary}, is_binary() disagrees")
         checked += 1
     # EVERY tracked file, which is what the name promises -- not "at least one". `assert checked`
-    # was the old floor, and it is satisfied by checking a single file out of 245: a diff against
+    # was the old floor, and it is satisfied by checking a single file out of 250: a diff against
     # HEAD covers only what this branch happens to touch, so the coverage of this guard silently
     # tracked the size of the working change. Comparing against `git ls-files` makes the promise
     # in the name falsifiable, and is what fails if the diff base is ever narrowed again.
@@ -775,3 +775,35 @@ def test_an_unstaged_new_file_is_a_lying_census():
         f"census in this suite is measuring a different repo than CI will: {untracked}. Run "
         "`git add -N <path>` for anything the next push includes, or add it to .gitignore if "
         "it is local scratch")
+
+
+# ── 12-digit runs inside a git object id / sha256 digest ─────────────────────
+def _digits12() -> bytes:
+    # built at runtime: a literal would itself be a run in this file
+    return ("0681" + "2422" + "7242").encode()
+
+
+def _hexpad(n: int) -> bytes:
+    return (b"6d5fe315f3fa3bf9fcda0ab7226e" + b"abcdef" * 20)[:n]
+
+
+@pytest.mark.parametrize("total", [40, 64])
+def test_a_run_inside_a_full_hex_digest_is_not_an_account_id(total):
+    d = _digits12()
+    token = _hexpad(total - len(d) - 1) + b"e" + d
+    assert len(token) == total
+    blob = b"- **Accepted-for:** " + token + b"\n"
+    assert not [f for f in rs.scan_blob("intent/x/plan.md", blob) if f[1] == "bare 12-digit account id"]
+
+
+@pytest.mark.parametrize("total", [39, 41, 50])
+def test_a_run_inside_a_hex_token_of_any_other_length_is_still_reported(total):
+    d = _digits12()
+    token = _hexpad(total - len(d) - 1) + b"e" + d
+    blob = b"id " + token + b" end\n"
+    assert [f for f in rs.scan_blob("docs/x.md", blob) if f[1] == "bare 12-digit account id"]
+
+
+def test_a_run_next_to_a_few_hex_letters_is_still_reported():
+    blob = b"account abc" + _digits12() + b"def here\n"
+    assert [f for f in rs.scan_blob("docs/x.md", blob) if f[1] == "bare 12-digit account id"]

@@ -96,6 +96,8 @@ class Spike:
         self._session = session
         self.criteria = {cid: Criterion(cid, desc) for cid, desc in self.PASS_CRITERIA}
         self.created: list[tuple[str, str, object]] = []
+        #: (kind, id, error) for every deleter that failed: still running, and the evidence says so.
+        self.left: list[tuple[str, str, str]] = []
         self.observations: dict[str, object] = {}
         self.errors: list[str] = []
         #: (value, placeholder) pairs redacted from evidence in addition to account ids.
@@ -143,6 +145,7 @@ class Spike:
                 deleter()
             except Exception as e:  # noqa: BLE001 -- keep deleting the others
                 problems.append(f"{kind} {ident}: {type(e).__name__}: {e}")
+                self.left.append((kind, ident, f"{type(e).__name__}: {e}"))
         self.errors.extend(f"teardown: {p}" for p in problems)
         return problems
 
@@ -198,8 +201,10 @@ class Spike:
             "## Pass criteria\n\n| id | criterion | result | detail |\n|---|---|---|---|\n"
             f"{rows}\n\n## Observations\n\n{obs or '- none'}\n\n## Errors\n\n{errs}\n\n"
             "## Teardown\n\n"
-            + ("- all tracked resources deleted\n" if not self.created
-               else "".join(f"- LEFT RUNNING: {k} {i}\n" for k, i, _ in self.created)))
+            + ("- all tracked resources deleted\n" if not (self.created or self.left)
+               else "".join(f"- LEFT RUNNING: {k} {i}\n" for k, i, _ in self.created)
+               + "".join(f"- LEFT RUNNING (delete failed): {k} {i} — {err[:200]}\n"
+                         for k, i, err in self.left)))
         return redact(text, tuple(self.redactions))
 
     def write_evidence(self, directory: pathlib.Path = EVIDENCE_DIR) -> pathlib.Path:
@@ -219,7 +224,7 @@ def _now() -> str:
 
 def main(spike_cls, argv=None) -> int:
     ap = argparse.ArgumentParser(description=f"{spike_cls.NAME}: {spike_cls.QUESTION}")
-    ap.add_argument("action", choices=["plan", "run", "sweep"])
+    ap.add_argument("action", choices=["plan", "run", "sweep", "cleanup"])
     ap.add_argument("--region", default="us-east-1")
     ap.add_argument("--account-id", help="only needed by plan() for ARNs")
     ap.add_argument("--keep", action="store_true", help="skip teardown after run (debugging)")
@@ -236,6 +241,13 @@ def main(spike_cls, argv=None) -> int:
         for r in left:
             print(redact(f"still tagged spike={spike.NAME}: {r['arn']}"))
         return 1 if left else 0
+    if args.action == "cleanup":
+        if not hasattr(spike, "cleanup"):
+            print(f"{spike.NAME}: no deferred cleanup defined", file=sys.stderr)
+            return 2
+        for done in spike.cleanup():
+            print(redact(f"deleted: {done}"))
+        return 0
     if not spike.IMPLEMENTED:
         print(f"{spike.NAME}: run() is not implemented yet; see its docstring", file=sys.stderr)
         return 2

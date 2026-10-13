@@ -51,6 +51,7 @@ Next: v2 experiments — code-as-reasoning distillation + augmentation; Kimi K3 
 | Admin console | `agent-cicd-admin` stack (Lambda+APIGW+DDB+Cognito) | ops-console deploy.sh | login secret `agent-admin/dashboard-login`; monitors orchestrator + finetune |
 | Online evals | one config per harness (Correctness/GoalSuccessRate/ToolSelectionAccuracy, 100% sampling) | deploy/06_observability.py --evals | role llmops-eval-execution |
 | Glue Data Catalog | federated catalog `s3tablescatalog` (the S3 Tables ↔ analytics integration, **IAM mode**: `IAM_ALLOWED_PRINCIPALS`/`ALL`, no Lake Formation grants) | owner, `aws glue create-catalog`, 2026-10-13 | account-level and persistent — not torn down by any script; required by every Phase 1 table. Enabled because spike S7 run 1 found it missing (deploy/evidence/SPIKE_07_s7_lakehouse_substrate.md) |
+| Spike leftovers (temporary) | 2 VPCs tagged `spike=s6_vpc_harness` (10.43.0.0/16, 3 subnets + 1 security group each) | tools/spikes/s6_vpc_harness.py, 2026-10-13 | no charge; held by AgentCore `agentic_ai` ENIs (documented to persist up to 8 h after the harness is deleted). Delete with `python3 tools/spikes/s6_vpc_harness.py cleanup`. All billable endpoints already deleted |
 
 _Not deployed: retrieval Knowledge Base (deploy/09_retrieval.py, added for the r6d RAFT
 run) — an AOSS vector collection bills ~$11.52/day (min 2 OCU) while it EXISTS, so it is
