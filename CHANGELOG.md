@@ -5,6 +5,19 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
 ## [Unreleased]
 
+### Spike S7 (lakehouse substrate): 7/7 PASS
+
+Live in us-east-1, 2026-10-13 (`deploy/evidence/SPIKE_07_s7_lakehouse_substrate.md`). A table created
+through the S3 Tables API is Iceberg format-version 2; a Glue 5 job writes through the `s3tablescatalog`
+federation with IAM-only grants (no Lake Formation); two `UNLOAD … FOR VERSION AS OF` exports of one
+snapshot hash identically; an `UNLOAD` into a non-empty prefix fails (`HIVE_PATH_ALREADY_EXISTS`).
+Two findings from the failed runs, both fixed: the account had no S3 Tables ↔ Glue integration (the
+owner enabled it in IAM mode; recorded in PROJECT_STATE as a persistent account-level resource), and a
+deleted table bucket's name is not immediately reusable (`ConflictException`), so spike buckets carry a
+per-run `YYYYMMDD-HHMMSS` suffix. Evidence rendering now also redacts registered values (the data bucket
+→ `<DATA_BUCKET>`) and groups long digit runs (snapshot ids) so no 12-digit run reaches a committed file.
+The Unified Studio part of S7 (`--part domain`) remains open.
+
 ### Phase 0 spike harness (`tools/spikes/`)
 
 Scaffolding for the seven spikes that gate the lakehouse LLM-lifecycle build

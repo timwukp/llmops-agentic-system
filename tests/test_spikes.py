@@ -95,11 +95,11 @@ def test_the_verdict_is_pass_only_when_every_criterion_passed():
     assert "**Verdict:** FAIL" in s.render_evidence()
 
 
-def test_redact_leaves_shorter_and_longer_digit_runs_alone():
-    assert _spike.redact("id 12345678901 x") == "id 12345678901 x"
+def test_redact_handles_short_exact_and_long_digit_runs():
+    assert _spike.redact("id 12345678901 x") == "id 12345678901 x"  # 11 digits: untouched
+    assert _spike.redact(f"a {ACCOUNT} b") == "a <ACCOUNT_ID> b"      # 12: an account id
     thirteen = ACCOUNT + "3"  # built at runtime: a literal would add runs to the census
-    assert _spike.redact(f"x {thirteen} y") == f"x {thirteen} y"
-    assert _spike.redact(f"a {ACCOUNT} b") == "a <ACCOUNT_ID> b"
+    assert _spike.redact(f"x {thirteen} y") == f"x {int(thirteen):,} y"  # 13+: grouped
 
 
 # ── teardown symmetry ────────────────────────────────────────────────────────
@@ -284,9 +284,32 @@ def test_content_digest_ignores_file_splits_and_gzip_headers():
 
 def test_glue_role_policy_is_resource_scoped_and_iam_only():
     pol = s7.glue_role_policy("us-east-1", ACCOUNT,
-                              f"arn:aws:s3tables:us-east-1:{ACCOUNT}:bucket/{s7.BUCKET}", "data-bucket")
+                              f"arn:aws:s3tables:us-east-1:{ACCOUNT}:bucket/b", "data-bucket", "b")
     for st in pol["Statement"]:
         res = st["Resource"] if isinstance(st["Resource"], list) else [st["Resource"]]
         assert all(r != "*" for r in res), st["Sid"]
         assert not any(a.startswith("lakeformation:") for a in st["Action"]), \
             "IAM-only is the hypothesis under test; a Lake Formation grant would hide the answer"
+
+
+def test_s7_uses_a_fresh_table_bucket_name_per_run():
+    """A deleted table bucket's name is briefly unusable (ConflictException, observed live), so
+    a fixed name makes every second run fail at its first call."""
+    a = s7.S7LakehouseSubstrate("us-east-1", bucket=None)
+    assert a.bucket.startswith(s7.BUCKET_PREFIX + "-") and a.bucket != s7.BUCKET_PREFIX
+    assert a.bucket == a.bucket.lower(), "S3 Tables / Glue / Athena need lowercase names"
+    assert not __import__("re").search(r"[0-9]{13}", a.bucket), "a long stamp would be a digit run in evidence"
+
+
+def test_evidence_redacts_registered_values_and_groups_long_digit_runs():
+    s = _spike_class(MODULES["s7_lakehouse_substrate"])("us-east-1", ACCOUNT, bucket="b")
+    bucket = f"llmops-agentic-{ACCOUNT}-us-east-1"
+    s.redactions.append((bucket, "<DATA_BUCKET>"))
+    snapshot = int(ACCOUNT + "4567890")  # 19 digits, built at runtime like a real snapshot id
+    s.record("unload_nonempty", True, f"exists: s3://{bucket}/spikes/s7/unload-a/")
+    s.observe("snapshot_id", snapshot)
+    text = s.render_evidence()
+    assert bucket not in text and "s3://<DATA_BUCKET>/spikes/s7/" in text
+    assert f"{snapshot:,}" in text and str(snapshot) not in text
+    assert not __import__("re").search(r"[0-9]{12}", text), "no 12-digit run may survive rendering"
+
