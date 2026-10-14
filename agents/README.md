@@ -2,8 +2,9 @@
 
 Five per-stage worker harnesses, a conductor, and a FinOps auditor for the LLMOps distillation
 pipeline (teacher DeepSeek-R1 on Bedrock -> student Qwen3-1.7B on SageMaker). Each config is validated offline with
-`deploy/validate_config.py`, created with `deploy/create_harness.py`, and gets the shared BYO
-memory attached post-create by `deploy/04_wire_memory.py`.
+`deploy/validate_config.py`, created with `deploy/create_harness.py` with an explicit
+`"memory": {"disabled": {}}` (an omitted `memory` provisions MANAGED memory; see AGENTS.md), and
+gets the shared BYO memory attached post-create by `deploy/04_wire_memory.py`.
 
 | Stage | Agent | Harness | Skills (MLOps-agent-skills) | Inline functions | Tasks |
 |---|---|---|---|---|---|

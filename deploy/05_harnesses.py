@@ -33,6 +33,7 @@ import boto3
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import config_subst  # noqa: E402 — deploy/ is not a package; path is set just above
+from create_harness import create_time_memory  # noqa: E402 — same path
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 AGENTS = ["data-prep", "finetune", "eval", "deploy", "monitor", "orchestrator",
@@ -236,6 +237,22 @@ def confirm_harness_landed(ctl, harness_id: str, sent: dict, attempts: int = 4,
         "the entire time it is wrong.")
 
 
+def managed_memory_leak(sent_memory: dict, live: dict):
+    """The managed memory a CREATE produced without asking for one, or None.
+
+    `create_time_memory` makes every create say what memory it wants; this checks the
+    answer. It is the create-path half of `confirm_harness_landed`, which compares only
+    UPDATED_FIELDS and so cannot see `memory` at all. Only the one failure that has
+    happened is asserted -- managed memory appearing when it was not sent -- because what
+    GetHarness returns for a disabled memory is not something this repo has measured, and a
+    read-back that cries wolf on a correct create is a read-back somebody deletes.
+    """
+    managed = (live.get("memory") or {}).get("managedMemoryConfiguration")
+    if managed and "managedMemoryConfiguration" not in sent_memory:
+        return managed.get("arn") or "<no arn returned>"
+    return None
+
+
 def wait_ready(ctl, harness_id, timeout=300):
     for _ in range(timeout // 5):
         h = ctl.get_harness(harnessId=harness_id)["harness"]
@@ -367,7 +384,10 @@ def create_or_update(ctl, cfg, role_arn, dry, dat=None):
     if dry:
         return {"harness": name, "action": "would create/update",
                 "model": cfg["model"]["bedrockModelConfig"]["modelId"],
-                "skills": len(cfg.get("skills", [])), "tools": len(cfg.get("tools", []))}
+                "skills": len(cfg.get("skills", [])), "tools": len(cfg.get("tools", [])),
+                # Checked in the dry run too: it cannot know whether a real run would
+                # create or update, and a missing `memory` should fail offline.
+                "memory": create_time_memory(cfg, where=name)}
 
     if exists:
         # UpdateHarness: memory/environmentArtifact/authorizerConfiguration wrap in
@@ -379,6 +399,9 @@ def create_or_update(ctl, cfg, role_arn, dry, dat=None):
         ctl.update_harness(harnessId=harness_id, clientToken=secrets.token_hex(20), **sent)
         action = "updated"
     else:
+        # Absent memory is MANAGED memory, not none -- see create_time_memory. Never sent
+        # on update: 04_wire_memory.py owns the attach, and UPDATED_FIELDS excludes it.
+        cfg["memory"] = create_time_memory(cfg, where=name)
         resp = ctl.create_harness(harnessName=name, executionRoleArn=role_arn,
                                   clientToken=secrets.token_hex(20), **cfg)
         harness_id = resp["harness"]["harnessId"]
@@ -386,6 +409,12 @@ def create_or_update(ctl, cfg, role_arn, dry, dat=None):
         action = "created"
 
     h = wait_ready(ctl, harness_id)
+    leaked = managed_memory_leak(sent["memory"], h) if action == "created" else None
+    if leaked:
+        raise SystemExit(
+            f"{harness_id}: created with memory={sent['memory']} but came back with MANAGED "
+            f"memory {leaked}. That memory is now an orphan the moment 04_wire_memory.py "
+            "attaches the shared one -- UpdateHarness does not delete what it replaces.")
     if tags:
         ctl.tag_resource(resourceArn=h["arn"], tags=tags)
     out = {"harness": name, "harness_id": harness_id, "action": action,
