@@ -59,7 +59,20 @@ NAMESPACES = {RAW: ("bronze",), CURATED: ("silver", "gold")}
 WORKGROUP = "llmops-lakehouse"
 GLUE_ROLE = "llmops-lakehouse-glue"
 GLUE_PREFIX = "lakehouse/glue"
+LANDING_PREFIX = "lakehouse/landing"
+REPORT_PREFIX = "lakehouse/reports"
 ATHENA_PREFIX = "athena/lakehouse"
+#: PR-07: the guardrail that finds NAMES for the Bronze→Silver job (spike S4: structured identifiers
+#: by checksum regex, names by Guardrails). Both directions enabled explicitly -- with only
+#: `action` set, ApplyGuardrail(source="INPUT") detected nothing (S4 run 1).
+GUARDRAIL_NAME = "llmops-lakehouse-pii"
+JOBS = {"land": ("llmops-lakehouse-land-bronze", "land_bronze.py"),
+        "silver": ("llmops-lakehouse-bronze-to-silver", "bronze_to_silver.py"),
+        "gold": ("llmops-lakehouse-silver-to-gold", "silver_to_gold.py")}
+REPO = __import__("pathlib").Path(__file__).resolve().parents[1]
+GLUE_SRC = REPO / "pipeline" / "lakehouse" / "glue"
+TRANSFORM_SRC = REPO / "pipeline" / "lakehouse" / "transform.py"
+ORG_ENTITIES_SRC = REPO / "pipeline" / "lakehouse" / "reference" / "org_entities.json"
 SSM_PREFIX = "/llmops/lakehouse"
 KEY_DELETION_DAYS = 30
 
@@ -200,8 +213,10 @@ def glue_trust_policy(account_id: str) -> dict:
             "Condition": {"StringEquals": {"aws:SourceAccount": account_id}}}]}
 
 
-def glue_role_policy(region: str, account_id: str, data_bucket: str, key_arns: dict) -> dict:
-    """The S7-proven grants, widened from one spike bucket to the two lakehouse buckets."""
+def glue_role_policy(region: str, account_id: str, data_bucket: str, key_arns: dict,
+                     guardrail_arn: str | None = None) -> dict:
+    """The S7-proven grants, widened from one spike bucket to the two lakehouse buckets, plus
+    what the PR-07 jobs need: landing read, report write, the one guardrail, DQ publishing."""
     cat = f"arn:aws:glue:{region}:{account_id}"
     buckets = [bucket_arn(region, account_id, b) for b in (RAW, CURATED)]
     catalog = [f"{cat}:catalog", f"{cat}:catalog/s3tablescatalog"]
@@ -226,7 +241,17 @@ def glue_role_policy(region: str, account_id: str, data_bucket: str, key_arns: d
         {"Sid": "OwnLogs", "Effect": "Allow",
          "Action": ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"],
          "Resource": f"arn:aws:logs:{region}:{account_id}:log-group:/aws-glue/*"},
-    ]}
+        {"Sid": "LandingRead", "Effect": "Allow", "Action": "s3:GetObject",
+         "Resource": f"arn:aws:s3:::{data_bucket}/{LANDING_PREFIX}/*"},
+        {"Sid": "ListOwnPrefixes", "Effect": "Allow", "Action": "s3:ListBucket",
+         "Resource": f"arn:aws:s3:::{data_bucket}",
+         "Condition": {"StringLike": {"s3:prefix": [f"{p}/*" for p in (GLUE_PREFIX, LANDING_PREFIX, REPORT_PREFIX)]}}},
+        {"Sid": "ReportsWrite", "Effect": "Allow", "Action": "s3:PutObject",
+         "Resource": f"arn:aws:s3:::{data_bucket}/{REPORT_PREFIX}/*"},
+        {"Sid": "PublishDataQuality", "Effect": "Allow", "Action": "glue:PublishDataQuality",
+         "Resource": f"arn:aws:glue:{region}:{account_id}:dataQualityRuleset/*"},
+    ] + ([{"Sid": "NamesByGuardrail", "Effect": "Allow", "Action": "bedrock:ApplyGuardrail",
+           "Resource": guardrail_arn}] if guardrail_arn else [])}
 
 
 def workgroup_config(data_bucket: str) -> dict:
@@ -250,13 +275,15 @@ def plan(region: str, account_id: str, data_bucket: str) -> list[dict]:
                                            if t["partition"] else "") + ")"} for t in TABLES]
     items.append({"kind": "maintenance", "name": f"{RAW}: snapshots {RAW_SNAPSHOT}, files {RAW_FILE_REMOVAL}"})
     items.append({"kind": "athena workgroup", "name": f"{WORKGROUP} → s3://{data_bucket}/{ATHENA_PREFIX}/"})
+    items.append({"kind": "guardrail", "name": f"{GUARDRAIL_NAME} (NAME, ANONYMIZE both directions, numbered version)"})
     items.append({"kind": "iam role", "name": f"arn:aws:iam::{account_id}:role/{GLUE_ROLE}"})
+    items += [{"kind": "glue job", "name": f"{n} (Glue 5.0, {sc})"} for n, sc in JOBS.values()]
     items += [{"kind": "ssm parameter", "name": f"{SSM_PREFIX}/{k}"} for k in SSM_KEYS]
     return items
 
 
 SSM_KEYS = ("raw_bucket_arn", "curated_bucket_arn", "raw_kms_key_arn", "curated_kms_key_arn",
-            "workgroup", "glue_role_arn")
+            "workgroup", "glue_role_arn", "guardrail_id", "guardrail_version")
 
 
 # ── AWS operations ───────────────────────────────────────────────────────────
@@ -315,7 +342,7 @@ def ensure_table(s3t, arn, t) -> str:
         return "created"
 
 
-def ensure_role(iam, region, account_id, data_bucket, key_arns) -> str:
+def ensure_role(iam, region, account_id, data_bucket, key_arns, guardrail_arn=None) -> str:
     try:
         arn = iam.get_role(RoleName=GLUE_ROLE)["Role"]["Arn"]
     except iam.exceptions.NoSuchEntityException:
@@ -323,8 +350,69 @@ def ensure_role(iam, region, account_id, data_bucket, key_arns) -> str:
             glue_trust_policy(account_id)), Tags=_tags_list(),
             Description="llmops lakehouse Glue jobs (Bronze->Silver->Gold)")["Role"]["Arn"]
     iam.put_role_policy(RoleName=GLUE_ROLE, PolicyName="lakehouse", PolicyDocument=json.dumps(
-        glue_role_policy(region, account_id, data_bucket, key_arns)))
+        glue_role_policy(region, account_id, data_bucket, key_arns, guardrail_arn)))
     return arn
+
+
+def guardrail_config() -> dict:
+    return {"piiEntitiesConfig": [{"type": "NAME", "action": "ANONYMIZE", "inputAction": "ANONYMIZE",
+                                   "outputAction": "ANONYMIZE", "inputEnabled": True, "outputEnabled": True}]}
+
+
+def ensure_guardrail(bedrock) -> tuple[str, str, str, str]:
+    """(id, arn, version, status). A numbered version, never DRAFT: the job's detections must
+    come from a fixed configuration, or two runs over the same data are not comparable."""
+    found = next((g for page in [bedrock.list_guardrails(maxResults=100)] for g in page.get("guardrails", [])
+                  if g["name"] == GUARDRAIL_NAME), None)
+    if found is None:
+        g = bedrock.create_guardrail(
+            name=GUARDRAIL_NAME, description="llmops lakehouse: names in customer-service text",
+            sensitiveInformationPolicyConfig=guardrail_config(),
+            blockedInputMessaging="blocked", blockedOutputsMessaging="blocked",
+            tags=[{"key": k, "value": v} for k, v in PROJECT_TAG.items()])
+        gid, arn, status = g["guardrailId"], g["guardrailArn"], "created"
+    else:
+        gid, arn, status = found["id"], found["arn"], "exists"
+    versions = [v["version"] for v in bedrock.list_guardrails(guardrailIdentifier=gid).get("guardrails", [])
+                if v.get("version") not in (None, "DRAFT")]
+    version = max(versions, key=int) if versions else bedrock.create_guardrail_version(
+        guardrailIdentifier=gid, description="PR-07")["version"]
+    return gid, arn, version, status
+
+
+#: Glue 5 bundles a boto3 without bedrock-runtime apply_guardrail (live, smoke run 1:
+#: AttributeError). The Bronze→Silver job installs the repo's SDK floor instead (AGENTS.md).
+JOB_PYTHON_MODULES = {"bronze_to_silver.py": "boto3==1.43.57,botocore==1.43.57"}
+
+
+def job_definition(name, script, role_arn, data_bucket) -> dict:
+    extra = ({"--additional-python-modules": JOB_PYTHON_MODULES[script]} if script in JOB_PYTHON_MODULES else {})
+    return {"Name": name, "Role": role_arn, "GlueVersion": "5.0", "WorkerType": "G.1X",
+            "NumberOfWorkers": 2, "Timeout": 30,
+            "Command": {"Name": "glueetl", "PythonVersion": "3",
+                        "ScriptLocation": f"s3://{data_bucket}/{GLUE_PREFIX}/{script}"},
+            "DefaultArguments": {"--datalake-formats": "iceberg",
+                                 "--extra-py-files": f"s3://{data_bucket}/{GLUE_PREFIX}/transform.py",
+                                 "--TempDir": f"s3://{data_bucket}/{GLUE_PREFIX}/tmp/",
+                                 "--enable-glue-datacatalog": "true", **extra}}
+
+
+def ensure_jobs(glue, s3, role_arn, data_bucket) -> dict:
+    """Upload the scripts and transform.py, then create or update each job (idempotent)."""
+    out = {}
+    s3.put_object(Bucket=data_bucket, Key=f"{GLUE_PREFIX}/transform.py", Body=TRANSFORM_SRC.read_bytes())
+    s3.put_object(Bucket=data_bucket, Key=f"{GLUE_PREFIX}/org_entities.json", Body=ORG_ENTITIES_SRC.read_bytes())
+    for name, script in JOBS.values():
+        s3.put_object(Bucket=data_bucket, Key=f"{GLUE_PREFIX}/{script}", Body=(GLUE_SRC / script).read_bytes())
+        d = job_definition(name, script, role_arn, data_bucket)
+        try:
+            glue.get_job(JobName=name)
+            glue.update_job(JobName=name, JobUpdate={k: v for k, v in d.items() if k != "Name"})
+            out[name] = "updated"
+        except glue.exceptions.EntityNotFoundException:
+            glue.create_job(**d, Tags=dict(PROJECT_TAG))
+            out[name] = "created"
+    return out
 
 
 def ensure_workgroup(athena, data_bucket) -> str:
@@ -375,11 +463,14 @@ def deploy(session, region, account_id, data_bucket) -> dict:
             value={"status": "enabled", "settings": {"icebergSnapshotManagement": RAW_SNAPSHOT}})
     out["maintenance"] = "applied"
     out["workgroup"] = ensure_workgroup(session.client("athena", region_name=region), data_bucket)
-    role_arn = ensure_role(session.client("iam"), region, account_id, data_bucket, keys)
+    gid, garn, gver, out["guardrail"] = ensure_guardrail(session.client("bedrock", region_name=region))
+    role_arn = ensure_role(session.client("iam"), region, account_id, data_bucket, keys, garn)
     out["role"] = role_arn.rsplit("/", 1)[-1]
+    out["jobs"] = ensure_jobs(glue, session.client("s3", region_name=region), role_arn, data_bucket)
     values = {"raw_bucket_arn": arns[RAW], "curated_bucket_arn": arns[CURATED],
               "raw_kms_key_arn": keys[RAW], "curated_kms_key_arn": keys[CURATED],
-              "workgroup": WORKGROUP, "glue_role_arn": role_arn}
+              "workgroup": WORKGROUP, "glue_role_arn": role_arn,
+              "guardrail_id": gid, "guardrail_version": gver}
     ssm = session.client("ssm", region_name=region)
     for k in SSM_KEYS:
         ssm.put_parameter(Name=f"{SSM_PREFIX}/{k}", Value=values[k], Type="String", Overwrite=True)
@@ -414,8 +505,12 @@ def verify(session, region, account_id, data_bucket) -> dict:
             "Catalog": f"s3tablescatalog/{t['bucket']}", "Database": t["namespace"]})["QueryExecutionId"]
         state = _await_query(athena, qid)
         checks[f"athena {t['namespace']}.{t['name']}"] = True if state == "SUCCEEDED" else state
+    g = next((g for g in session.client("bedrock", region_name=region).list_guardrails(maxResults=100)
+              .get("guardrails", []) if g["name"] == GUARDRAIL_NAME), None)
+    checks["guardrail published"] = bool(g)
     checks.update(simulate_glue_role(session.client("iam"), region, account_id, data_bucket, arns,
-                                     _key_arns(session.client("kms", region_name=region))))
+                                     _key_arns(session.client("kms", region_name=region)),
+                                     g["arn"] if g else None))
     snap = s3t.get_table_maintenance_configuration(tableBucketARN=arns[RAW], namespace="bronze",
                                                    name="conversation_events")["configuration"]
     sm = snap.get("icebergSnapshotManagement", {}).get("settings", {}).get("icebergSnapshotManagement", {})
@@ -423,7 +518,7 @@ def verify(session, region, account_id, data_bucket) -> dict:
     return checks
 
 
-def glue_role_cases(region, account_id, data_bucket, arns, keys) -> list[tuple[str, str, bool]]:
+def glue_role_cases(region, account_id, data_bucket, arns, keys, guardrail_arn=None) -> list[tuple[str, str, bool]]:
     """(action, resource, should_be_allowed) for the Glue role: what it needs, and what it must
     not have. Asked of IAM as the role (simulate_principal_policy), not inferred from the JSON."""
     cat = f"arn:aws:glue:{region}:{account_id}"
@@ -442,17 +537,23 @@ def glue_role_cases(region, account_id, data_bucket, arns, keys) -> list[tuple[s
         ("kms:ScheduleKeyDeletion", keys[RAW], False),
         ("s3:GetObject", f"arn:aws:s3:::{data_bucket}/customer-data/x", False),
         ("iam:PassRole", f"arn:aws:iam::{account_id}:role/{GLUE_ROLE}", False),
-    ]
+        ("s3:GetObject", f"arn:aws:s3:::{data_bucket}/{LANDING_PREFIX}/d/bronze_feedback.jsonl", True),
+        ("s3:PutObject", f"arn:aws:s3:::{data_bucket}/{REPORT_PREFIX}/d/silver.json", True),
+        ("s3:PutObject", f"arn:aws:s3:::{data_bucket}/{LANDING_PREFIX}/d/x", False),
+    ] + ([("bedrock:ApplyGuardrail", guardrail_arn, True),
+          ("bedrock:ApplyGuardrail", f"arn:aws:bedrock:{region}:{account_id}:guardrail/someone-elses", False)]
+         if guardrail_arn else [])
 
 
-def simulate_glue_role(iam, region, account_id, data_bucket, arns, keys) -> dict:
+def simulate_glue_role(iam, region, account_id, data_bucket, arns, keys, guardrail_arn=None) -> dict:
     role = f"arn:aws:iam::{account_id}:role/{GLUE_ROLE}"
     out = {}
-    for action, resource, want in glue_role_cases(region, account_id, data_bucket, arns, keys):
+    for action, resource, want in glue_role_cases(region, account_id, data_bucket, arns, keys, guardrail_arn):
         r = iam.simulate_principal_policy(PolicySourceArn=role, ActionNames=[action],
                                           ResourceArns=[resource])["EvaluationResults"][0]
         allowed = r["EvalDecision"] == "allowed"
-        out[f"glue role {'may' if want else 'may NOT'} {action}"] = (
+        label = resource.split(":")[-1][:60]  # the resource part only: an ARN carries the account
+        out[f"glue role {'may' if want else 'may NOT'} {action} on {label}"] = (
             True if allowed == want else f"{r['EvalDecision']} on {resource.rsplit(':', 1)[-1]}")
     return out
 
@@ -481,6 +582,21 @@ def teardown(session, region, account_id) -> dict:
             ssm.delete_parameter(Name=f"{SSM_PREFIX}/{k}")
         except ssm.exceptions.ParameterNotFound:
             pass
+    glue, gone = session.client("glue", region_name=region), 0
+    for name, _ in JOBS.values():
+        try:
+            glue.get_job(JobName=name)
+            glue.delete_job(JobName=name)
+            gone += 1
+        except glue.exceptions.EntityNotFoundException:
+            pass
+    out["jobs"] = f"{gone} deleted" if gone else "absent"
+    bedrock = session.client("bedrock", region_name=region)
+    g = next((g for g in bedrock.list_guardrails(maxResults=100).get("guardrails", [])
+              if g["name"] == GUARDRAIL_NAME), None)
+    if g:
+        bedrock.delete_guardrail(guardrailIdentifier=g["id"])
+    out["guardrail"] = "deleted" if g else "absent"
     iam = session.client("iam")
     try:
         iam.delete_role_policy(RoleName=GLUE_ROLE, PolicyName="lakehouse")
@@ -524,6 +640,79 @@ def teardown(session, region, account_id) -> dict:
     return out
 
 
+def _load_module(name, path):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _run_job(glue, name, arguments, timeout_s=1800) -> tuple[str, str]:
+    run_id = glue.start_job_run(JobName=name, Arguments=arguments)["JobRunId"]
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        jr = glue.get_job_run(JobName=name, RunId=run_id)["JobRun"]
+        if jr["JobRunState"] in ("SUCCEEDED", "FAILED", "ERROR", "TIMEOUT", "STOPPED"):
+            return jr["JobRunState"], jr.get("ErrorMessage", "")[:300]
+        time.sleep(20)
+    return "TIMEOUT", ""
+
+
+def smoke(session, region, account_id, data_bucket, seed=7, scale="small") -> dict:
+    """Generate → land → Bronze→Silver → Silver→Gold through the deployed jobs, then hold the
+    Silver rule report to the generator's plants exactly. The deploy's live proof that the jobs,
+    the role's grants and the rules agree; the pipeline step that runs this is PR-09."""
+    import tempfile
+    gen = _load_module("lh_generate", REPO / "pipeline" / "lakehouse" / "generate.py")
+    tf = _load_module("lh_transform", TRANSFORM_SRC)
+    ssm = session.client("ssm", region_name=region)
+    p = {k: ssm.get_parameter(Name=f"{SSM_PREFIX}/{k}")["Parameter"]["Value"] for k in SSM_KEYS}
+    s3, glue = session.client("s3", region_name=region), session.client("glue", region_name=region)
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+    dataset = f"seed{seed}-{scale}-{stamp}"
+    ds = gen.generate(seed, scale)
+    with tempfile.TemporaryDirectory() as tmp:
+        manifest = gen.write(ds, __import__("pathlib").Path(tmp))
+        for f in sorted(__import__("pathlib").Path(tmp).iterdir()):
+            s3.put_object(Bucket=data_bucket, Key=f"{LANDING_PREFIX}/{dataset}/{f.name}", Body=f.read_bytes())
+    landing = f"s3://{data_bucket}/{LANDING_PREFIX}/{dataset}/"
+    reports = f"s3://{data_bucket}/{REPORT_PREFIX}/{dataset}/"
+    checks = {"dataset": dataset, "dataset_sha256": manifest["dataset_sha256"]}
+    common = {"--account_id": account_id}
+    steps = [("land", {"--raw_bucket": RAW, "--landing_uri": landing}),
+             ("silver", {"--raw_bucket": RAW, "--curated_bucket": CURATED,
+                         "--eval_prompts_uri": landing + "eval_prompts.jsonl",
+                         "--report_uri": reports + "silver.json", "--guardrail_id": p["guardrail_id"],
+                         "--guardrail_version": p["guardrail_version"], "--dq_run_id": dataset,
+                         "--org_entities_uri": f"s3://{data_bucket}/{GLUE_PREFIX}/org_entities.json"}),
+             ("gold", {"--curated_bucket": CURATED, "--report_uri": reports + "gold.json"})]
+    for key, extra in steps:
+        state, err = _run_job(glue, JOBS[key][0], {**common, **extra})
+        checks[f"job {JOBS[key][0]}"] = True if state == "SUCCEEDED" else f"{state}: {err}"
+        if state != "SUCCEEDED":
+            return checks
+    silver = json.loads(s3.get_object(Bucket=data_bucket, Key=f"{REPORT_PREFIX}/{dataset}/silver.json")["Body"].read())
+    gold = json.loads(s3.get_object(Bucket=data_bucket, Key=f"{REPORT_PREFIX}/{dataset}/gold.json")["Body"].read())
+    for rule, (ok, detail) in tf.compare_to_plants(silver["rules"], ds["expected_defects"]).items():
+        checks[f"rule {rule}"] = True if ok else detail
+    checks["silver dq"] = all(o["outcome"] == "Passed" for o in silver["dq"]["outcomes"]) or silver["dq"]
+    checks["gold dq"] = all(o["outcome"] == "Passed" for v in gold["dq"].values() for o in v) or gold["dq"]
+    athena = session.client("athena", region_name=region)
+    for bucket, ns, table, want in ((CURATED, "silver", "instruction_pairs", silver["pairs"]),
+                                    (CURATED, "gold", "qlora_train", gold["train"]),
+                                    (CURATED, "gold", "qlora_eval", gold["eval"])):
+        qid = athena.start_query_execution(
+            QueryString=f'SELECT count(*) FROM "{ns}"."{table}"', WorkGroup=WORKGROUP,
+            QueryExecutionContext={"Catalog": f"s3tablescatalog/{bucket}", "Database": ns})["QueryExecutionId"]
+        state = _await_query(athena, qid)
+        got = (int(athena.get_query_results(QueryExecutionId=qid)["ResultSet"]["Rows"][1]["Data"][0]["VarCharValue"])
+               if state == "SUCCEEDED" else state)
+        checks[f"athena {ns}.{table} rows"] = True if got == want else f"{got} != {want}"
+    checks["silver pairs"], checks["gold train/eval"] = silver["pairs"], f"{gold['train']}/{gold['eval']}"
+    return checks
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     ap.add_argument("--region", required=True)
@@ -533,6 +722,10 @@ def main(argv=None) -> int:
                     "--account-id and --bucket are given")
     ap.add_argument("--verify", action="store_true", help="read back encryption, format, "
                     "partitioning, retention and an Athena query per table")
+    ap.add_argument("--smoke", action="store_true", help="generate, land, run the three jobs and "
+                    "hold the rule report to the generator's plants (billable Glue runs)")
+    ap.add_argument("--seed", type=int, default=7)
+    ap.add_argument("--scale", default="small", choices=("small", "demo"))
     ap.add_argument("--teardown", action="store_true",
                     help="delete what this script creates (tables and their data included)")
     args = ap.parse_args(argv)
@@ -554,6 +747,15 @@ def main(argv=None) -> int:
         for item in plan(args.region, account_id, data_bucket):
             print(f"would ensure {item['kind']}: {item['name']}")
         return 0
+    if args.smoke:
+        checks = smoke(session, args.region, account_id, data_bucket, args.seed, args.scale)
+        for k, v in checks.items():
+            if isinstance(v, bool):
+                print(f"{'PASS' if v else 'FAIL'}  {k}")
+            else:
+                print(f"{'INFO' if k in ('dataset', 'dataset_sha256', 'silver pairs', 'gold train/eval') else 'FAIL'}  {k}: {v}")
+        return 0 if all(v is True for k, v in checks.items()
+                        if k not in ("dataset", "dataset_sha256", "silver pairs", "gold train/eval")) else 1
     if args.verify:
         checks = verify(session, args.region, account_id, data_bucket)
         for k, v in checks.items():

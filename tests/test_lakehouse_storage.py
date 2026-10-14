@@ -124,7 +124,7 @@ class FakeAccount:
         self.calls, self.integration = [], integration
         self.keys, self.aliases, self.buckets, self.ns, self.tables = {}, {}, {}, set(), set()
         self.workgroup = self.role = False
-        self.params = {}
+        self.params, self.guardrails, self.jobs, self.objects = {}, {}, {}, {}
 
     def client(self, service, region_name=None):
         return _Client(self, service)
@@ -237,6 +237,46 @@ class _Client:
             raise _NotFound()
         self.a.role = False
 
+    # bedrock guardrails
+    def _bedrock_list_guardrails(self, **kw):
+        if "guardrailIdentifier" in kw:
+            g = self.a.guardrails[kw["guardrailIdentifier"]]
+            return {"guardrails": [{"version": v} for v in ["DRAFT", *g["versions"]]]}
+        return {"guardrails": [{"id": i, "name": g["name"], "arn": f"arn:g/{i}"} for i, g in self.a.guardrails.items()]}
+
+    def _bedrock_create_guardrail(self, **kw):
+        pii = kw["sensitiveInformationPolicyConfig"]["piiEntitiesConfig"]
+        assert all(e["inputEnabled"] and e["outputEnabled"] for e in pii), "S4: enable both directions"
+        gid = f"gr{len(self.a.guardrails)}"
+        self.a.guardrails[gid] = {"name": kw["name"], "versions": []}
+        return {"guardrailId": gid, "guardrailArn": f"arn:g/{gid}"}
+
+    def _bedrock_create_guardrail_version(self, **kw):
+        g = self.a.guardrails[kw["guardrailIdentifier"]]
+        g["versions"].append(str(len(g["versions"]) + 1))
+        return {"version": g["versions"][-1]}
+
+    def _bedrock_delete_guardrail(self, **kw):
+        self.a.guardrails.pop(kw["guardrailIdentifier"])
+
+    # glue jobs and s3 scripts
+    def _glue_get_job(self, **kw):
+        if kw["JobName"] not in self.a.jobs:
+            raise _NotFound()
+        return {"Job": self.a.jobs[kw["JobName"]]}
+
+    def _glue_create_job(self, **kw):
+        self.a.jobs[kw["Name"]] = kw
+
+    def _glue_update_job(self, **kw):
+        self.a.jobs[kw["JobName"]].update(kw["JobUpdate"])
+
+    def _glue_delete_job(self, **kw):
+        self.a.jobs.pop(kw["JobName"], None)
+
+    def _s3_put_object(self, **kw):
+        self.a.objects[kw["Key"]] = kw["Body"]
+
     # ssm
     def _ssm_put_parameter(self, **kw):
         self.a.params[kw["Name"]] = kw["Value"]
@@ -273,6 +313,7 @@ def test_teardown_removes_everything_deploy_created_and_only_schedules_the_keys(
     out = lh.teardown(acct, REGION, ACCOUNT)
     assert not acct.buckets and not acct.tables and not acct.ns and not acct.params
     assert not acct.workgroup and not acct.role and not acct.aliases
+    assert not acct.jobs and not acct.guardrails
     assert acct.calls.count(("kms", "schedule_key_deletion")) == 2
     assert all("30 days" in out[f"key {b}"] for b in (lh.RAW, lh.CURATED))
     assert ("kms", "delete_key") not in acct.calls
@@ -295,3 +336,45 @@ def test_the_offline_dry_run_makes_no_aws_call(capsys, monkeypatch):
     assert lh.main(["--region", REGION, "--dry-run", "--account-id", ACCOUNT, "--bucket", DATA]) == 0
     printed = capsys.readouterr().out
     assert printed.count("would ensure table:") == len(lh.TABLES)
+
+
+
+def test_deploy_creates_a_numbered_guardrail_version_and_the_three_jobs():
+    acct = FakeAccount()
+    lh.deploy(acct, REGION, ACCOUNT, DATA)
+    (g,) = acct.guardrails.values()
+    assert g["versions"] == ["1"] and acct.params[f"{lh.SSM_PREFIX}/guardrail_version"] == "1"
+    assert set(acct.jobs) == {n for n, _ in lh.JOBS.values()}
+    for name, script in lh.JOBS.values():
+        assert f"{lh.GLUE_PREFIX}/{script}" in acct.objects
+        args = acct.jobs[name]["DefaultArguments"]
+        assert args["--extra-py-files"].endswith(f"{lh.GLUE_PREFIX}/transform.py")
+    assert acct.objects[f"{lh.GLUE_PREFIX}/transform.py"] == lh.TRANSFORM_SRC.read_bytes()
+    lh.deploy(acct, REGION, ACCOUNT, DATA)
+    assert g["versions"] == ["1"], "a second deploy must reuse the published version"
+
+
+def test_the_job_grants_are_scoped_to_their_prefixes_and_the_one_guardrail():
+    keys = {lh.RAW: "k1", lh.CURATED: "k2"}
+    pol = lh.glue_role_policy(REGION, ACCOUNT, DATA, keys, "arn:aws:bedrock:us-east-1:1:guardrail/g")
+    by = {st["Sid"]: st for st in pol["Statement"]}
+    assert by["NamesByGuardrail"]["Resource"] == "arn:aws:bedrock:us-east-1:1:guardrail/g"
+    assert by["LandingRead"]["Action"] == "s3:GetObject" and by["ReportsWrite"]["Action"] == "s3:PutObject"
+    assert by["LandingRead"]["Resource"].endswith(f"/{lh.LANDING_PREFIX}/*")
+    assert by["ReportsWrite"]["Resource"].endswith(f"/{lh.REPORT_PREFIX}/*")
+    assert "NamesByGuardrail" not in {st["Sid"] for st in lh.glue_role_policy(REGION, ACCOUNT, DATA, keys)["Statement"]}
+
+
+def test_every_job_script_exists_and_imports_transform():
+    for _, script in lh.JOBS.values():
+        src = (lh.GLUE_SRC / script).read_text()
+        assert "getResolvedOptions" in src
+        if script != "land_bronze.py":
+            assert "import transform" in src, script
+
+
+def test_the_guardrail_job_installs_an_sdk_that_has_apply_guardrail():
+    d = lh.job_definition("j", "bronze_to_silver.py", "r", DATA)["DefaultArguments"]
+    mods = dict(m.split("==") for m in d["--additional-python-modules"].split(","))
+    assert tuple(map(int, mods["boto3"].split("."))) >= (1, 43, 51), "AGENTS.md SDK gate"
+    assert "--additional-python-modules" not in lh.job_definition("j", "land_bronze.py", "r", DATA)["DefaultArguments"]
