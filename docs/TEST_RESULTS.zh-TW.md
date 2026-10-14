@@ -19,13 +19,14 @@
 | 契約 —— run manifest schema | 在 Phase 1 擴充前，用 `manifest.schema.json` 驗證每一份線上 run manifest | ✅ 36/40 通過（原為 0/40）；其餘 4 份逐一說明原因 | [VERIFICATION_manifest_schema.md](../deploy/evidence/VERIFICATION_manifest_schema.md) |
 | Phase 1 PR-04 —— lakehouse 儲存層 | 2 個 SSE-KMS table bucket、10 張 Iceberg v2 表、Athena workgroup、Glue role；逐項線上回讀 | ✅ `--verify` 36/36（加密、格式/欄位/分區、每張表的 Athena 查詢、Glue role 以模擬驗證「允許」**與**「拒絕」兩個方向、保留期） | [VERIFICATION_lakehouse_storage.md](../deploy/evidence/VERIFICATION_lakehouse_storage.md) |
 | Phase 1 PR-06 —— lakehouse 資料來源產生器 | 以種子產生繁中/英文對話、CRM/ERP CDC、網站事件，並植入 8 類缺陷；同一種子在兩台機器上產生 | ✅ macOS（Python 3.12.12）與 AL2023 runner（3.12.14）兩種規模的 `dataset_sha256` 完全相同；42 個測試以獨立判定逐一重新找出每個植入缺陷 | [VERIFICATION_lakehouse_generator.md](../deploy/evidence/VERIFICATION_lakehouse_generator.md) |
+| Phase 1 PR-07 —— lakehouse 分層轉換 | 3 個 Glue 5 job 以 `llmops-lakehouse-glue` 執行 landing → Bronze → Silver → Gold；8 條規則以產生器的植入缺陷為準；Glue DQ；Athena 筆數 | ✅ small 與 demo 規模皆 16/16：每條規則抓到的與植入的完全一致（人名由線上 guardrail 判斷）。發現：Glue 5 內建的 boto3 沒有 `apply_guardrail`；Guardrails 把門市名稱當成人名（以組織實體參考清單修正） | [VERIFICATION_lakehouse_medallion.md](../deploy/evidence/VERIFICATION_lakehouse_medallion.md) |
 | Harness 記憶體 —— 建立時的預設值 | 每個 harness 掛的是哪個記憶體，以及每次建立實際配置了什麼（唯讀） | ⚠️ 發現 —— 7 個都掛共享 BYO 記憶體；但每次建立都另外留下一個空的、無人使用的 MANAGED 記憶體。現在建立時一律宣告 `{"disabled": {}}` | [VERIFICATION_harness_memory_audit.md](../deploy/evidence/VERIFICATION_harness_memory_audit.md) |
 
 ## 靜態與離線檢查（可重複，CI 強制）
 
 | 檢查 | 結果 | 復現方式 |
 |---|---|---|
-| 單元測試（契約、成本模型、driver 迴圈、Lambda、狀態機文檔） | **1830/1830 通過** | `.venv/bin/python -m pytest tests/ -q --ignore=tests/golden` |
+| 單元測試（契約、成本模型、driver 迴圈、Lambda、狀態機文檔） | **1933/1933 通過** | `.venv/bin/python -m pytest tests/ -q --ignore=tests/golden` |
 | Shell 測試套件 —— N 路 capacity race guard（`tests/test_capacity_race_guard.sh`） | **10/10 斷言** | `bash tests/test_capacity_race_guard.sh` |
 | 反向控制 —— 逐一破壞每道 guard，確認它會失敗 | **389/389 反向控制** | `.venv/bin/python tests/negative_controls/monitor_dispatch.py` |
 | Harness 配置驗證（5 個專家 + 指揮家 + 審計員） | **7/7 `RESULT: OK`** | `python deploy/validate_config.py --config agents/<a>/harness.json` |
@@ -43,7 +44,7 @@
 
 | 檢查 | 結果 | 復現方式 |
 |---|---|---|
-| 非 run（triage）生命跡象 beat → sweep → 認領 → 復活 → 上限升級 → 終態刪除 | 對已部署 bundle **18/18 項檢查通過**（2026-08-12），對本 checkout 亦 18/18 | `python tools/probe_liveness_resurrection.py --region us-east-1` |
+| 非 run（triage）生命跡象 beat → sweep → 認領 → 復活 → 上限升級 → 終態刪除 | 對已部署 bundle **16/16 項檢查通過**（2026-08-12），對本 checkout 亦 16/16 | `python tools/probe_liveness_resurrection.py --region us-east-1` |
 
 沒有任何 agent turn（假的 AgentCore client 在第一次 invoke 前就拋錯，所以真正的心跳會跑，
 計費的那半根本沒開始）、沒有真的 `lambda:invoke`、沒有真的 `events:PutEvents`；
@@ -125,7 +126,7 @@ endpoint、五輪 e2e 迭代 —— 花費比這個帳戶單日花在一個沒�
 
 | 檢查 | 結果 | 重現方式 |
 |---|---|---|
-| 單元測試(全部套件,含 `test_cost_model.py` + `test_finops.py`) | **1830 passed** | `.venv/bin/python -m pytest tests/ -q` |
+| 單元測試(全部套件,含 `test_cost_model.py` + `test_finops.py`) | **1933 passed** | `.venv/bin/python -m pytest tests/ -q` |
 | Harness 配置驗證,7 個 agent | **`RESULT: OK`** | `python deploy/validate_config.py --config agents/finops/harness.json` |
 | 線上艦隊 | **7 個 harness READY** | 用 repo 內建 boto3 呼叫 `list_harnesses` |
 | 正典模組有散佈路徑 | 印出 `would upload 4 contract files` | `python deploy/03_storage.py --region us-east-1 --account-id 123456789012 --dry-run` |
