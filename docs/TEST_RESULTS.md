@@ -19,13 +19,14 @@ page is its ledger.
 | FinOps — cost governance | 7th runtime live; every rate carries its provenance; nothing publishes a guess | ⚠️ PARTIAL — runtime + arithmetic proven; rate card blocked on an IAM apply | [VERIFICATION_finops.md](../deploy/evidence/VERIFICATION_finops.md) |
 | Contracts — run manifest schema | every live run manifest validated against `manifest.schema.json`, before Phase 1 extends it | ✅ 36/40 valid (was 0/40); the 4 others explained | [VERIFICATION_manifest_schema.md](../deploy/evidence/VERIFICATION_manifest_schema.md) |
 | Phase 1 PR-04 — lakehouse storage | 2 SSE-KMS table buckets, 10 Iceberg v2 tables, Athena workgroup, Glue role; read back live | ✅ 36/36 `--verify` checks (encryption, format/columns/partitions, Athena per table, Glue role allowed **and** denied by simulation, retention) | [VERIFICATION_lakehouse_storage.md](../deploy/evidence/VERIFICATION_lakehouse_storage.md) |
+| Phase 1 PR-06 — lakehouse source generator | seeded zh-TW/EN conversations, CRM/ERP CDC, web events with 8 planted defect kinds; same seed on two machines | ✅ identical `dataset_sha256` on macOS (Python 3.12.12) and the AL2023 runner (3.12.14), both scales; 42 tests re-detect every plant with an independent oracle | [VERIFICATION_lakehouse_generator.md](../deploy/evidence/VERIFICATION_lakehouse_generator.md) |
 | Harness memory — create-time default | which memory each harness is on, and what each create provisioned (read-only) | ⚠️ FOUND — all 7 on the shared BYO memory; each create also left an empty orphaned MANAGED memory. Creates now declare `{"disabled": {}}` | [VERIFICATION_harness_memory_audit.md](../deploy/evidence/VERIFICATION_harness_memory_audit.md) |
 
 ## Static and offline checks (repeatable, CI-enforced)
 
 | Check | Result | How to reproduce |
 |---|---|---|
-| Unit tests (contracts, cost model, driver loop, Lambdas, state machine document) | **1788/1788 passed** | `.venv/bin/python -m pytest tests/ -q --ignore=tests/golden` |
+| Unit tests (contracts, cost model, driver loop, Lambdas, state machine document) | **1830/1830 passed** | `.venv/bin/python -m pytest tests/ -q --ignore=tests/golden` |
 | Shell suite — N-way capacity race guard (`tests/test_capacity_race_guard.sh`) | **10/10 assertions** | `bash tests/test_capacity_race_guard.sh` |
 | Negative controls — every guard broken in turn, confirmed to fail | **389/389 negative controls** | `.venv/bin/python tests/negative_controls/monitor_dispatch.py` |
 | Harness config validation (5 specialists + conductor + auditor) | **7/7 `RESULT: OK`** | `python deploy/validate_config.py --config agents/<a>/harness.json` |
@@ -136,7 +137,7 @@ Full record: [VERIFICATION_finops.md](../deploy/evidence/VERIFICATION_finops.md)
 
 | Check | Result | How to reproduce |
 |---|---|---|
-| Unit tests (all suites, incl. `test_cost_model.py` + `test_finops.py`) | **1788 passed** | `.venv/bin/python -m pytest tests/ -q` |
+| Unit tests (all suites, incl. `test_cost_model.py` + `test_finops.py`) | **1830 passed** | `.venv/bin/python -m pytest tests/ -q` |
 | Harness config validation, 7 agents | **`RESULT: OK`** | `python deploy/validate_config.py --config agents/finops/harness.json` |
 | Live fleet | **7 harnesses READY** | `list_harnesses` via the repo's vendored boto3 |
 | Canonical module has a distribution path | prints `would upload 4 contract files` | `python deploy/03_storage.py --region us-east-1 --account-id 123456789012 --dry-run` |
