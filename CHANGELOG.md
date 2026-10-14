@@ -5,6 +5,28 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
 ## [Unreleased]
 
+### Spike S7, Unified Studio part: lineage and price PASS, visibility FAIL
+
+`LLMOPS_S7_PART=domain` adds one spike project to the account's shared V2 domain (`demo`, owner decision),
+writes a table with a Glue 5 job that carries OpenLineage, imports it through a DataZone Glue data
+source, and reads the price, then deletes everything. It took seven live runs, and each one found
+something (`deploy/evidence/SPIKE_07_s7_lakehouse_substrate.md`):
+- the profile refuses custom project tags;
+- DataZone makes its ManageAccess role a **Lake Formation admin**, and a **deleted role left in the LF
+  admin list** broke project creation and deletion for the whole account (the owner removed it);
+- V2 data sources take a connection (`project.default_lakehouse`), not an environment, and no
+  `dataAccessRole`;
+- the project role still cannot read the IAM-mode `s3tablescatalog`, even with an IAM grant and after
+  waiting out propagation.
+
+**Lineage PASS:** 36 OpenLineage events, all processed, naming the Glue table in their `symlinks` facet.
+**Price PASS:** the global Price List entries, with no per-user charge. PR-05 must choose the S3 Tables
+integration mode (Lake Formation vs IAM) before Unified Studio can catalogue the lakehouse.
+
+The build runner's grant guard now reads a spike's declared `RUNNER_EXEMPT_SERVICES` instead of silently
+skipping calls, and it fails on any `self.client()` with a non-literal service. That form had hidden
+every DataZone call from the scanner.
+
 ### Lakehouse source generator (Phase 1 PR-06)
 
 `pipeline/lakehouse/generate.py` produces the research report's §2 sources, in the exact shapes of the

@@ -13,7 +13,7 @@ resources, measuring, and deleting them again. They gate the lakehouse LLM-lifec
 | `s4_pii_recall_zhtw.py` | zh-TW / EN PII recall: Glue Detect-PII vs Guardrails vs privacy-filter | Phase 1 PR-07 | **4/4 PASS (2026-10-13)**: regex + Guardrails — `deploy/evidence/SPIKE_04_s4_pii_recall_zhtw.md` |
 | `s5_mlflow_registry.py` | MLflow App → Model Registry sync, aliases, approval event, condition-key deny | Phase 2 registry | pending |
 | `s6_vpc_harness.py` | VPC-mode harness without NAT | Phase 1 PR-03 | **FAIL, 7 VPC runs / 5 topologies (2026-10-13)**: no NAT, NAT, S3 via NAT, no interface endpoints — all fail to initialize; the identical config passes 5/5 in PUBLIC mode. Next: the AgentCore team — `deploy/evidence/SPIKE_06_s6_vpc_harness.md` |
-| `s7_lakehouse_substrate.py` | Iceberg v2, Glue 5 IAM-mode writes, deterministic `UNLOAD … FOR VERSION AS OF`; Unified Studio (`--part domain`, follow-up) | Phase 1 PR-04/05 | **substrate: 7/7 PASS (2026-10-13)** — `deploy/evidence/SPIKE_07_s7_lakehouse_substrate.md`; domain part pending |
+| `s7_lakehouse_substrate.py` | Iceberg v2, Glue 5 IAM-mode writes, deterministic `UNLOAD … FOR VERSION AS OF`; Unified Studio (`LLMOPS_S7_PART=domain`, run from the owner's credentials) | Phase 1 PR-04/05 | **substrate: 7/7 PASS (2026-10-13)**; **domain part (2026-10-14, 7 runs): lineage + price PASS, visibility FAIL** (the project role cannot read the IAM-mode `s3tablescatalog`; PR-05 must choose the integration mode) — `deploy/evidence/SPIKE_07_s7_lakehouse_substrate.md` |
 
 ## Usage
 
