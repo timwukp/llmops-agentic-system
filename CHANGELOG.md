@@ -5,6 +5,14 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
 ## [Unreleased]
 
+### The 7 orphaned managed memories are deleted
+
+On the owner's request (2026-10-14), after a fresh all-or-nothing re-check (each one referenced by no
+harness, ACTIVE, 0 actors, 0 records), the 7 empty `harness_llmops_<agent>_*` memories found by the
+harness memory audit were deleted. All 7 harnesses stayed READY on `llmops_shared_memory`;
+`llmops_effort_probe`'s managed memory (4 records) was left alone. Recorded in
+`deploy/evidence/VERIFICATION_harness_memory_audit.md`.
+
 ### Build runner, and spike S6 run 3: VPC mode fails in every topology
 
 **Build runner** (`tools/runner/`, owner request 2026-10-13: long-task runner only). A dedicated EC2
@@ -61,7 +69,8 @@ are correctly on the shared BYO memory.
 - `tests/test_harness_memory.py` (25 tests) derives its checks from the configs, the role file and
   every `create_harness(` call site, rather than restating the claim.
 
-Not done, owner's call: deleting the 7 orphans, and re-scoping `ManagedMemoryEvents`.
+Not done, owner's call: deleting the 7 orphans (done 2026-10-14, above), and re-scoping
+`ManagedMemoryEvents`.
 
 ### Manifest schema: describes the manifests again (Phase 1 PR-01)
 

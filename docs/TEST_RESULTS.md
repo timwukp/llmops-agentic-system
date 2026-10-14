@@ -18,7 +18,7 @@ page is its ledger.
 | 5 — autonomy | hands-off e2e: trigger → state machine → agents → honest terminal state | ✅ PASSED | [VERIFICATION_phase5.md](../deploy/evidence/VERIFICATION_phase5.md) |
 | FinOps — cost governance | 7th runtime live; every rate carries its provenance; nothing publishes a guess | ⚠️ PARTIAL — runtime + arithmetic proven; rate card blocked on an IAM apply | [VERIFICATION_finops.md](../deploy/evidence/VERIFICATION_finops.md) |
 | Contracts — run manifest schema | every live run manifest validated against `manifest.schema.json`, before Phase 1 extends it | ✅ 36/40 valid (was 0/40); the 4 others explained | [VERIFICATION_manifest_schema.md](../deploy/evidence/VERIFICATION_manifest_schema.md) |
-| Harness memory — create-time default | which memory each harness is on, and what each create provisioned (read-only) | ⚠️ FOUND — all 7 on the shared BYO memory; each create also left an empty orphaned MANAGED memory. Creates now declare `{"disabled": {}}` | [VERIFICATION_harness_memory_audit.md](../deploy/evidence/VERIFICATION_harness_memory_audit.md) |
+| Harness memory — create-time default | which memory each harness is on, and what each create provisioned (read-only) | ⚠️ FOUND — all 7 on the shared BYO memory; each create also left an empty orphaned MANAGED memory (all 7 deleted 2026-10-14). Creates now declare `{"disabled": {}}` | [VERIFICATION_harness_memory_audit.md](../deploy/evidence/VERIFICATION_harness_memory_audit.md) |
 
 ## Static and offline checks (repeatable, CI-enforced)
 

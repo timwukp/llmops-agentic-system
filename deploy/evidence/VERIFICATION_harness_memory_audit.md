@@ -73,5 +73,24 @@ real create will either confirm the opt-out or say so.
 
 ## Not done (owner's decision)
 
-- Delete the 7 empty orphan memories (and decide on `llmops_effort_probe` with its 4 records).
+- ~~Delete the 7 empty orphan memories~~ — done 2026-10-14, below. `llmops_effort_probe` and its 4
+  records remain undecided.
 - Remove or re-scope `ManagedMemoryEvents` once nothing on the execution role uses managed memory.
+
+## Deletion, 2026-10-14 (owner's request)
+
+The only write in this file. The script re-checked every target immediately before deleting, and
+deleted nothing unless all 7 passed:
+
+| Check | Source | Result for all 7 |
+|---|---|---|
+| id matches `harness_llmops_<agent>_` for one of the 7 platform agents (not `effort_probe`) | ListMemories | 7 matched |
+| referenced by no harness's live `memory` | GetHarness on every harness (11 memories referenced in total) | none referenced |
+| status | GetMemory | ACTIVE |
+| actors | ListActors | 0 |
+| records, every strategy namespace | ListMemoryRecords | 0 |
+
+Then `DeleteMemory` on each: `harness_llmops_{data_prep_214a,deploy_72b3,eval_4ecb,finetune_29ae,
+finops_b05d,monitor_af13,orchestrator_c0d7}-*`. Post-check: none of the 7 is listed by ListMemories.
+`llmops_shared_memory-hbEZ9K8d57` is present, all 7 platform harnesses are READY and attached to it,
+and `harness_llmops_effort_probe_05cc-FR2mja5Td1` is still present and still attached to its probe.
