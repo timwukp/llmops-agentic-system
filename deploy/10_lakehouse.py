@@ -80,7 +80,7 @@ def _t(bucket, namespace, name, fields, partition=()):
             "partition": list(partition)}
 
 
-#: §4.3 of the research report. (name, type, required); partition = (source, transform, name).
+#: §2 and §4.3 of the research report. (name, type, required); partition = (source, transform, name).
 TABLES = [
     _t(RAW, "bronze", "conversation_events", [
         ("event_id", "string", True), ("conversation_id", "string", True),
@@ -95,6 +95,13 @@ TABLES = [
         ("op", "string", True), ("before", "string", False), ("after", "string", False),
         ("ts_ms", "long", True), ("source", "string", False),
         ("ingest_ts", "timestamptz", True)], [("ingest_ts", "day", "ingest_day")]),
+    # §2 lists web/business-system logs as a source landing in bronze.web_events; §4.3's table
+    # list omits it, which is the report's gap, not a decision.
+    _t(RAW, "bronze", "web_events", [
+        ("event_id", "string", True), ("session_id", "string", False),
+        ("customer_id", "string", False), ("event_type", "string", True),
+        ("page", "string", False), ("payload", "string", False),
+        ("event_ts", "timestamptz", True)], [("event_ts", "day", "event_day")]),
     _t(RAW, "bronze", "inference_logs", [
         ("request_id", "string", True), ("adapter_ic", "string", False),
         ("model_version", "string", False), ("prompt_redacted", "string", False),

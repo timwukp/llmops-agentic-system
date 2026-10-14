@@ -17,7 +17,7 @@
 | 5 — 自主運行 | 全程無人 e2e：觸發 → 狀態機 → agents → 誠實終態 | ✅ PASSED | [VERIFICATION_phase5.md](../deploy/evidence/VERIFICATION_phase5.md) |
 | FinOps — 成本治理 | 第七個 runtime 上線；每個費率都帶來源；不發表任何猜測 | ⚠️ 部分通過 —— runtime 與算術已驗證；rate card 卡在一次 IAM apply | [VERIFICATION_finops.md](../deploy/evidence/VERIFICATION_finops.md) |
 | 契約 —— run manifest schema | 在 Phase 1 擴充前，用 `manifest.schema.json` 驗證每一份線上 run manifest | ✅ 36/40 通過（原為 0/40）；其餘 4 份逐一說明原因 | [VERIFICATION_manifest_schema.md](../deploy/evidence/VERIFICATION_manifest_schema.md) |
-| Phase 1 PR-04 —— lakehouse 儲存層 | 2 個 SSE-KMS table bucket、9 張 Iceberg v2 表、Athena workgroup、Glue role；逐項線上回讀 | ✅ `--verify` 34/34（加密、格式/欄位/分區、每張表的 Athena 查詢、Glue role 以模擬驗證「允許」**與**「拒絕」兩個方向、保留期） | [VERIFICATION_lakehouse_storage.md](../deploy/evidence/VERIFICATION_lakehouse_storage.md) |
+| Phase 1 PR-04 —— lakehouse 儲存層 | 2 個 SSE-KMS table bucket、10 張 Iceberg v2 表、Athena workgroup、Glue role；逐項線上回讀 | ✅ `--verify` 36/36（加密、格式/欄位/分區、每張表的 Athena 查詢、Glue role 以模擬驗證「允許」**與**「拒絕」兩個方向、保留期） | [VERIFICATION_lakehouse_storage.md](../deploy/evidence/VERIFICATION_lakehouse_storage.md) |
 | Harness 記憶體 —— 建立時的預設值 | 每個 harness 掛的是哪個記憶體，以及每次建立實際配置了什麼（唯讀） | ⚠️ 發現 —— 7 個都掛共享 BYO 記憶體；但每次建立都另外留下一個空的、無人使用的 MANAGED 記憶體。現在建立時一律宣告 `{"disabled": {}}` | [VERIFICATION_harness_memory_audit.md](../deploy/evidence/VERIFICATION_harness_memory_audit.md) |
 
 ## 靜態與離線檢查（可重複，CI 強制）

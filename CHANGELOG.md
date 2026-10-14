@@ -12,13 +12,13 @@ writes into, per the research report's §4.3 and on the substrate spike S7 prove
 - Two SSE-KMS table buckets, `llmops-raw` (Bronze) and `llmops-curated` (Silver/Gold), each with
   **its own** rotating KMS key. Being able to decrypt the raw key is access to the PII, so it does not
   come bundled with the de-identified tables.
-- Nine Iceberg v2 tables with declared schemas and partition specs.
+- Ten Iceberg v2 tables with declared schemas and partition specs (`bronze.web_events` included: §2 lists the source, §4.3's table list omitted it).
 - An enforced Athena workgroup.
 - The Glue role for PR-07.
 - Short raw retention (72 h snapshots, 1-day file removal), so a right-to-be-forgotten delete becomes
   physical within days.
 
-Deployed live; `--verify` read back **34/34**:
+Deployed live; `--verify` read back **36/36**:
 - encryption, `format-version` 2, columns and partitions from each table's live metadata;
 - an Athena query on every table;
 - `simulate_principal_policy` on the Glue role in **both** directions — six grants it needs, seven it
