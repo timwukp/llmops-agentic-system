@@ -218,6 +218,15 @@ class Spike:
         return md
 
 
+def boundary_kwargs() -> dict:
+    """{"PermissionsBoundary": arn} when the build runner supplies one (tools/runner/runner.py).
+    The runner's role may create IAM roles only with that boundary attached, so a spike role can
+    never hold more than the boundary allows; on a laptop the variable is unset and nothing changes."""
+    import os
+    arn = os.environ.get("LLMOPS_SPIKE_BOUNDARY_ARN", "")
+    return {"PermissionsBoundary": arn} if arn else {}
+
+
 def _now() -> str:
     return _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -246,7 +255,7 @@ def main(spike_cls, argv=None) -> int:
             print(f"{spike.NAME}: no deferred cleanup defined", file=sys.stderr)
             return 2
         for done in spike.cleanup():
-            print(redact(f"deleted: {done}"))
+            print(redact(str(done)))
         return 0
     if not spike.IMPLEMENTED:
         print(f"{spike.NAME}: run() is not implemented yet; see its docstring", file=sys.stderr)

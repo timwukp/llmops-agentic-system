@@ -374,7 +374,27 @@ class FakeWorld6(FakeWorld):
         return {"GroupId": self._id("sg")}
 
     def ec2_describe_route_tables(self, **_):
-        return {"RouteTables": [{"RouteTableId": "rtb-1"}]}
+        return {"RouteTables": [{"RouteTableId": "rtb-main"}]}
+
+    def ec2_create_route_table(self, **_):
+        return {"RouteTable": {"RouteTableId": self._id("rtb")}}
+
+    def ec2_associate_route_table(self, **_):
+        return {"AssociationId": self._id("rtbassoc")}
+
+    def ec2_create_internet_gateway(self, **_):
+        return {"InternetGateway": {"InternetGatewayId": self._id("igw")}}
+
+    def ec2_allocate_address(self, **_):
+        return {"AllocationId": self._id("eipalloc")}
+
+    def ec2_create_nat_gateway(self, **_):
+        return {"NatGateway": {"NatGatewayId": self._id("nat")}}
+
+    def ec2_describe_nat_gateways(self, **kw):
+        deleted = any(op == "delete_nat_gateway" for _, op, _ in self.calls)
+        return {"NatGateways": [{"NatGatewayId": i, "State": "deleted" if deleted else "available"}
+                                for i in kw.get("NatGatewayIds", [])]}
 
     def ec2_create_vpc_endpoint(self, **_):
         return {"VpcEndpoint": {"VpcEndpointId": self._id("vpce")}}
@@ -400,6 +420,29 @@ class FakeWorld6(FakeWorld):
 
     def bedrock_agentcore_invoke_harness(self, **_):
         return {"stream": [{"contentBlockDelta": {"delta": {"text": self.reply}}}]}
+
+    def route53resolver_create_resolver_query_log_config(self, **_):
+        return {"ResolverQueryLogConfig": {"Id": "rqlc-1"}}
+
+    def route53resolver_list_resolver_query_log_config_associations(self, **_):
+        return {"ResolverQueryLogConfigAssociations": []}
+
+    def route53resolver_associate_resolver_query_log_config(self, **_):
+        return {"ResolverQueryLogConfigAssociation": {"Id": "rqlca-1"}}
+
+    #: Live, an association sits in CREATING for a while; run 3's teardown hit it there.
+    resolver_states = ("CREATING", "CREATING", "ACTIVE")
+
+    def route53resolver_get_resolver_query_log_config_association(self, **_):
+        self.status_reads = getattr(self, "status_reads", 0) + 1
+        st = self.resolver_states[min(self.status_reads - 1, len(self.resolver_states) - 1)]
+        return {"ResolverQueryLogConfigAssociation": {"Id": "rqlca-1", "Status": st}}
+
+    def logs_filter_log_events(self, **_):
+        recs = [{"query_name": "bedrock-runtime.us-east-1.amazonaws.com.", "rcode": "NOERROR"},
+                {"query_name": "unknown.service.example.", "rcode": "NXDOMAIN"},
+                {"query_name": "bedrock-runtime.us-east-1.amazonaws.com.", "rcode": "NOERROR"}]
+        return {"events": [{"message": json.dumps(r)} for r in recs]}
 
 
 class _Fake6(_Fake):
@@ -431,7 +474,7 @@ def _s6_reply(verdict_lake="denied"):
 
 def test_s6_run_records_every_criterion_and_tears_down_in_reverse(s6_world):
     world = s6_world(_s6_reply("denied"))
-    spike = s6.S6VpcHarness("us-east-1", session=world, stamp="x")
+    spike = s6.S6VpcHarness("us-east-1", session=world, stamp="x", dns_logging=False)
     spike.execute()
     assert {c: v.status for c, v in spike.criteria.items()} == {c: _spike.PASS for c, _ in spike.PASS_CRITERIA}, \
         {c: v.detail for c, v in spike.criteria.items()}
@@ -446,13 +489,13 @@ def test_s6_run_records_every_criterion_and_tears_down_in_reverse(s6_world):
 
 
 def test_s6_a_network_failure_on_the_lakehouse_probes_fails_tools(s6_world):
-    spike = s6.S6VpcHarness("us-east-1", session=s6_world(_s6_reply("network")), stamp="x")
+    spike = s6.S6VpcHarness("us-east-1", session=s6_world(_s6_reply("network")), stamp="x", dns_logging=False)
     spike.execute()
     assert spike.criteria["tools"].status == _spike.FAIL
 
 
 def test_s6_eni_blocked_deletes_are_reported_as_left_running(s6_world):
-    spike = s6.S6VpcHarness("us-east-1", session=s6_world(_s6_reply(), blocked_deletes=1), stamp="x")
+    spike = s6.S6VpcHarness("us-east-1", session=s6_world(_s6_reply(), blocked_deletes=1), stamp="x", dns_logging=False)
     spike.execute()
     assert any(k == "subnet" for k, _, _ in spike.left)
     text = spike.render_evidence()
@@ -514,3 +557,158 @@ def test_s4_glue_role_policy_is_prefix_scoped():
         res = st["Resource"] if isinstance(st["Resource"], list) else [st["Resource"]]
         assert all(r != "*" for r in res)
     assert pol["Statement"][0]["Resource"].endswith(f"/{s4.PREFIX}/*")
+
+
+
+def test_s6_dns_logging_records_resolved_names_and_tears_the_logging_down(s6_world):
+    world = s6_world(_s6_reply("denied"))
+    spike = s6.S6VpcHarness("us-east-1", session=world, stamp="x", dns_logging=True)
+    spike.execute()
+    q = spike.observations["dns_queries_during_invoke"]
+    assert q["bedrock-runtime.us-east-1.amazonaws.com"] == [2, ["NOERROR"]]
+    assert q["unknown.service.example"] == [1, ["NXDOMAIN"]]
+    deletes = [op for _, op, _ in world.calls if op.startswith(("delete", "disassociate"))]
+    for op in ("disassociate_resolver_query_log_config", "delete_resolver_query_log_config", "delete_log_group"):
+        assert op in deletes, op
+    assert deletes.index("disassociate_resolver_query_log_config") < deletes.index("delete_resolver_query_log_config")
+
+
+def test_s6_dns_summary_ignores_unparseable_records():
+    names = {}
+    s6.summarize_dns_event("not json", names)
+    s6.summarize_dns_event(json.dumps({"query_name": "A.Example.", "rcode": "NOERROR"}), names)
+    assert names == {"a.example": [1, {"NOERROR"}]}
+
+
+
+def test_s6_routes_through_its_own_tagged_route_table_never_the_main_one(s6_world):
+    """Run 3: the runner's tag-scoped grants could not attach the S3 gateway endpoint to the
+    untagged main route table (UnauthorizedOperation). Everything goes through a tagged table."""
+    world = s6_world(_s6_reply("denied"))
+    spike = s6.S6VpcHarness("us-east-1", session=world, stamp="x", dns_logging=False, nat=True)
+    spike.execute()
+    by_op = lambda op: [kw for _, o, kw in world.calls if o == op]
+    rt = spike.private_rt
+    assert rt.startswith("rtb-") and rt != "rtb-main"
+    gw = next(kw for kw in by_op("create_vpc_endpoint") if kw.get("VpcEndpointType") == "Gateway")
+    assert gw["RouteTableIds"] == [rt]
+    nat_route = [kw for kw in by_op("create_route") if "NatGatewayId" in kw]
+    assert nat_route and all(kw["RouteTableId"] == rt for kw in nat_route), nat_route
+    assert all(kw["RouteTableId"] != "rtb-main" for kw in by_op("create_route"))
+    assert not spike.left and not spike.errors, (spike.left, spike.errors)
+    tagged = by_op("create_route_table")
+    assert any("llmops-spike-s6-private" in json.dumps(kw) for kw in tagged)
+    assert len([kw for kw in by_op("associate_route_table") if kw["RouteTableId"] == rt]) == len(s6.SUBNETS)
+    assert by_op("delete_route_table"), "the route table must be torn down"
+
+
+def test_s6_query_logging_waits_for_active_and_never_disassociates_mid_transition(s6_world):
+    world = s6_world(_s6_reply("denied"))
+    spike = s6.S6VpcHarness("us-east-1", session=world, stamp="x", dns_logging=True)
+    spike.execute()
+    ops = [o for _, o, _ in world.calls]
+    first_invoke = ops.index("invoke_harness")
+    reads_before = ops[:first_invoke].count("get_resolver_query_log_config_association")
+    assert reads_before >= 3, "the invoke started before the association left CREATING"
+    i = ops.index("disassociate_resolver_query_log_config")
+    assert "get_resolver_query_log_config_association" in ops[first_invoke:i], (
+        "teardown must check the association has settled before disassociating (RSLVR-01400)")
+    assert not spike.left, spike.left
+
+
+def test_s6_waits_out_tag_consistency_but_not_a_missing_grant(monkeypatch):
+    monkeypatch.setattr(s6.time, "sleep", lambda _s: None)
+    n = {"calls": 0}
+
+    def flaky():
+        n["calls"] += 1
+        if n["calls"] < 3:
+            raise RuntimeError("An error occurred (UnauthorizedOperation) when calling AssociateRouteTable")
+        return "ok"
+    assert s6._retry_fresh(flaky) == "ok" and n["calls"] == 3
+
+    def denied():
+        raise RuntimeError("An error occurred (UnauthorizedOperation)")
+    with pytest.raises(RuntimeError):
+        s6._retry_fresh(denied)  # a grant that is really missing still fails, after a minute
+
+    def other():
+        n["other"] = n.get("other", 0) + 1
+        raise ValueError("InvalidRouteTableID.NotFound")
+    with pytest.raises(ValueError):
+        s6._retry_fresh(other)
+    assert n["other"] == 1, "only UnauthorizedOperation is retried"
+
+
+def test_s6_creates_its_harness_without_memory_and_says_so(s6_world):
+    world = s6_world(_s6_reply("denied"))
+    spike = s6.S6VpcHarness("us-east-1", session=world, stamp="x", dns_logging=False)
+    spike.execute()
+    assert world.harness_kw["memory"] == {"disabled": {}}, "omitting memory provisions managed memory"
+    assert world.harness_kw["tags"] == spike.tags, "the runner may create a harness only with the tag"
+    assert "disabled" in spike.observations["memory"]
+
+
+def test_s6_can_send_s3_through_the_nat_instead_of_the_gateway(s6_world, monkeypatch):
+    monkeypatch.setenv("LLMOPS_S6_S3_GATEWAY", "0")
+    world = s6_world(_s6_reply("denied"))
+    spike = s6.S6VpcHarness("us-east-1", session=world, stamp="x", dns_logging=False, nat=True)
+    spike.execute()
+    eps = [kw for _, op, kw in world.calls if op == "create_vpc_endpoint"]
+    assert eps and all(kw.get("VpcEndpointType") != "Gateway" for kw in eps)
+    assert "no S3 gateway" in spike.observations["variant"]
+    with pytest.raises(ValueError):
+        s6.S6VpcHarness("us-east-1", session=world, stamp="y")  # S3 would be unreachable
+
+
+def test_s6_public_control_builds_no_network_and_uses_the_same_config(s6_world, monkeypatch):
+    monkeypatch.setenv("LLMOPS_S6_PUBLIC", "1")
+    world = s6_world(_s6_reply("denied"))
+    spike = s6.S6VpcHarness("us-east-1", session=world, stamp="x")
+    spike.execute()
+    assert not [op for svc, op, _ in world.calls if svc == "ec2" and op.startswith("create")]
+    net = world.harness_kw["environment"]["agentCoreRuntimeEnvironment"]["networkConfiguration"]
+    assert net == {"networkMode": "PUBLIC"}
+    assert world.harness_kw["memory"] == {"disabled": {}} and world.harness_kw["tags"] == spike.tags
+    assert spike.criteria["model"].status == _spike.PASS, spike.errors
+
+
+def test_s6_an_error_inside_the_stream_is_reported_not_dropped(s6_world):
+    world = s6_world("")
+    world.bedrock_agentcore_invoke_harness = lambda **_: {"stream": [
+        {"messageStart": {"role": "assistant"}},
+        {"internalServerException": {"message": "skill source unreadable"}}]}
+    spike = s6.S6VpcHarness("us-east-1", session=world, stamp="x", dns_logging=False)
+    spike.execute()
+    assert "skill source unreadable" in spike.observations["invoke_error"]
+    assert spike.observations["stream_event_kinds"] == {"messageStart": 1, "internalServerException": 1}
+    assert spike.criteria["model"].status == _spike.FAIL
+
+
+def test_s6_can_run_without_interface_endpoints_behind_a_nat(s6_world, monkeypatch):
+    monkeypatch.setenv("LLMOPS_S6_INTERFACE_ENDPOINTS", "0")
+    world = s6_world(_s6_reply("denied"))
+    spike = s6.S6VpcHarness("us-east-1", session=world, stamp="x", dns_logging=False, nat=True)
+    spike.execute()
+    eps = [kw for _, op, kw in world.calls if op == "create_vpc_endpoint"]
+    assert [kw["VpcEndpointType"] for kw in eps] == ["Gateway"], eps
+    assert "no interface endpoints" in spike.observations["variant"] and not spike.left, spike.errors
+    with pytest.raises(ValueError):
+        s6.S6VpcHarness("us-east-1", session=world, stamp="y")
+
+
+def test_s6_cleanup_skips_a_held_vpc_and_still_deletes_the_free_ones(s6_world):
+    world = s6_world("")
+    world.ec2_describe_vpcs = lambda **_: {"Vpcs": [{"VpcId": "vpc-held"}, {"VpcId": "vpc-free"}]}
+    world.ec2_describe_network_interfaces = lambda **kw: {"NetworkInterfaces": (
+        [{"NetworkInterfaceId": "eni-1"}] if kw["Filters"][0]["Values"] == ["vpc-held"] else [])}
+    world.ec2_describe_subnets = lambda **_: {"Subnets": [{"SubnetId": "subnet-1"}]}
+    world.ec2_describe_security_groups = lambda **_: {"SecurityGroups": [{"GroupId": "sg-d", "GroupName": "default"}]}
+    world.ec2_describe_route_tables = lambda **_: {"RouteTables": [
+        {"RouteTableId": "rtb-main", "Associations": [{"Main": True}]},
+        {"RouteTableId": "rtb-priv", "Associations": [{"Main": False, "RouteTableAssociationId": "a-1"}]}]}
+    out = s6.S6VpcHarness("us-east-1", session=world, stamp="x").cleanup()
+    assert out[0].startswith("kept vpc-held") and out[1] == "deleted vpc-free", out
+    deleted = [kw for _, op, kw in world.calls if op == "delete_vpc"]
+    assert deleted == [{"VpcId": "vpc-free"}]
+    assert [kw for _, op, kw in world.calls if op == "delete_route_table"] == [{"RouteTableId": "rtb-priv"}]
