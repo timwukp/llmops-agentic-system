@@ -107,8 +107,8 @@ ALLOWED = (b"6833" + b"13688378", b"7631" + b"04351884", b"1234" + b"56789012")
 #: this laptop, single-threaded CPython does 3.1M sha256/s, so the whole 1e12 space falls in
 #: about 4 days -- and a GPU does it in roughly 100 seconds. So the KDF is iterated. At 200k
 #: iterations a candidate costs ~16 ms, which makes the same sweep ~500 GPU-years, while the
-#: scan stays cheap because only 12-digit runs are ever hashed: measured across all 261
-#: tracked files there are 77 such runs, 11 distinct, and hashing the distinct set takes 0.16 s
+#: scan stays cheap because only 12-digit runs are ever hashed: measured across all 266
+#: tracked files there are 78 such runs, 11 distinct, and hashing the distinct set takes 0.16 s
 #: for the entire repo. (Re-measured whenever either number moves, and they move
 #: INDEPENDENTLY, which is why both are derived and neither is inferred from the other, and
 #: this branch is the proof in both directions. Its parent moved BOTH at once from DISJOINT
@@ -190,9 +190,12 @@ ALLOWED = (b"6833" + b"13688378", b"7631" + b"04351884", b"1234" + b"56789012")
 #: consecutive decimal digits. The SDLC gate compares that SHA exactly (fail-closed), so it cannot be
 #: abbreviated -- runs 75 -> 76, distinct 10 -> 11, and the hash check still clears it.
 #: Then 250 files went to 255 (the manifest-schema test, its evidence file and its intent chain).
-#: Then 255 files became 261 (the build runner, its README and tests, and its intent chain). One new
+#: Then 255 files went to 260 (the harness-memory test, its evidence file and its intent chain).
+#: One new run, the suite's usual dummy account, named once as a constant -- runs 76 -> 77,
+#: distinct held at 11.
+#: Then 260 files became 266 (the build runner, its README and tests, and its intent chain). One new
 #: run -- the documentation-account constant in tests/test_runner.py, already in the distinct set --
-#: so the runs moved 76 -> 77 while the distinct count held at 11.
+#: so the runs moved 77 -> 78 while the distinct count held at 11.
 #: Dollar limits and percentages only -- no 12-digit run, so the runs held at 74 again.
 #: For EIGHT commits
 #: running, the file count moved and the run count did not move once, and then one commit moved

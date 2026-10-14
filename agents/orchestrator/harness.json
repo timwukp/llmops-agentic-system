@@ -205,7 +205,8 @@
       }
     }
   ],
-  "_memory_note": "Shared BYO memory llmops_shared_memory attached post-create by deploy/04_wire_memory.py (actorId = harness name). The conductor READS the specialists' learnings and WRITES planning/triage judgments.",
+  "memory": {"disabled": {}},
+  "_memory_note": "Created with memory {\"disabled\": {}}, explicitly: a create that omits `memory` provisions MANAGED memory, and each of these harnesses was created that way and left an orphaned managed memory behind (audit 2026-10-13, deploy/evidence/VERIFICATION_harness_memory_audit.md). The shared BYO memory (llmops_shared_memory, SEMANTIC+EPISODIC, shared by every agent) is attached post-create by deploy/04_wire_memory.py (CreateMemory + UpdateHarness optionalValue + IAM grant); deploy/05_harnesses.py never sends memory on update, so a redeploy does not undo it. The conductor READS the specialists' learnings and WRITES planning/triage judgments. 04_wire_memory.py keeps a live actorId rather than rewriting it, and this harness's live actorId is its full harness id, not the bare name.",
   "maxIterations": 100,
   "maxTokens": 65536,
   "timeoutSeconds": 840,

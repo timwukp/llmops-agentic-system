@@ -40,6 +40,28 @@ grants), a retry that waits out tag-authorization consistency on resources creat
 (decoded: `ec2:RouteTableID = "*"`), a query-log teardown that waits for the association to settle,
 stream error members recorded instead of dropped, and a `cleanup` that deletes every free VPC and
 reports the held ones instead of raising on the first.
+### Harnesses are created with an explicit memory; the managed default left 7 orphans
+
+`CreateHarness` without `memory` provisions MANAGED memory. Every config here said "Created WITHOUT
+memory", and every create got a managed memory anyway: a read-only audit on 2026-10-13
+(`deploy/evidence/VERIFICATION_harness_memory_audit.md`) found one `harness_llmops_<agent>_*` memory
+per platform harness, created in the same second as the harness, replaced by `04_wire_memory.py`'s
+BYO attach and never deleted. All 7 are empty (0 actors, 0 records) and still ACTIVE. All 7 harnesses
+are correctly on the shared BYO memory.
+
+- Every `agents/*/harness.json` declares `"memory": {"disabled": {}}`. It is sent on create only, so a
+  redeploy still never touches the attached BYO memory.
+- `create_time_memory()` (`deploy/create_harness.py`) refuses a create with no `memory`, and is used
+  by `create_harness.py` and `05_harnesses.py`, dry runs included; `validate_config.py` now treats an
+  absent `memory` as an error and accepts the whole union; the S6 spike's probe sends the opt-out.
+- `05_harnesses.py` fails a create that comes back with managed memory it did not ask for.
+- The managed memory's name pattern changed from `harness_<name>_<4hex>-*` to `<harnessName>-*`
+  (from 2026-08-11), so the execution role's `memory/harness_*` grant no longer matches a new one.
+  AGENTS.md and the IAM template comment now say so.
+- `tests/test_harness_memory.py` (25 tests) derives its checks from the configs, the role file and
+  every `create_harness(` call site, rather than restating the claim.
+
+Not done, owner's call: deleting the 7 orphans, and re-scoping `ManagedMemoryEvents`.
 
 ### Manifest schema: describes the manifests again (Phase 1 PR-01)
 

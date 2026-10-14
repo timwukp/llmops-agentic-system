@@ -176,14 +176,24 @@ def validate_limits_and_advanced(cfg: dict) -> None:
             "for JWT use {'customJWTAuthorizer': {'discoveryUrl': '...', 'allowedAudience': [...]}}.")
 
 
+MEMORY_KINDS = ("agentCoreMemoryConfiguration", "managedMemoryConfiguration", "disabled")
+
+
 def validate_memory(cfg: dict) -> None:
     mem = cfg.get("memory")
-    if not mem:
-        return  # memory is optional
+    if mem is None:
+        # Not optional in effect: CreateHarness without `memory` provisions MANAGED memory
+        # (live, 2026-10-13). Silence must not be how a config chooses that.
+        err("memory: not declared. A create without it provisions MANAGED memory; declare "
+            "{'disabled': {}} (attach BYO memory afterwards), or the memory you want.")
+        return
+    kinds = [k for k in mem if k in MEMORY_KINDS] if isinstance(mem, dict) else []
+    if len(kinds) != 1 or len(mem) != 1:
+        err(f"memory: must set exactly one of {MEMORY_KINDS}; got {sorted(mem) if isinstance(mem, dict) else mem!r}.")
+        return
     acc = mem.get("agentCoreMemoryConfiguration")
     if not acc:
-        err("memory: present but missing 'agentCoreMemoryConfiguration'.")
-        return
+        return  # disabled / managed carry nothing further to check here
     rc = acc.get("retrievalConfig", {})
     for ns, conf in rc.items():
         if "memoryStrategyId" in conf:

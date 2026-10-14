@@ -381,11 +381,12 @@ class S6VpcHarness(Spike):
                 tools=[t for t in base["tools"] if t.get("type") == "agentcore_code_interpreter"],
                 allowedTools=["shell", "file_read", "file_write", "code_interpreter", "skills"],
                 skills=skills, maxIterations=30, timeoutSeconds=600,
-                # Omitting `memory` now provisions MANAGED memory (probe, 2026-10-13: CreateHarness
-                # failed CreateMemory under the runner role). Runs 1-2 therefore had memory, run 3
-                # does not: a deliberate change of one variable, recorded in the evidence, because
-                # a runtime that must reach memory at start-up is itself a candidate for the
-                # init timeout, and a network spike should not carry it unasked.
+                # Explicit: an absent `memory` provisions MANAGED memory, which this probe does not
+                # need (deploy/create_harness.py create_time_memory; found here first, 2026-10-13,
+                # when CreateHarness failed CreateMemory under the runner role). Runs 1-2 therefore
+                # had memory and run 3 does not: a deliberate change of one variable, recorded in
+                # the evidence, because a runtime that must reach memory at start-up is itself a
+                # candidate for the init timeout.
                 memory={"disabled": {}},
                 environment={"agentCoreRuntimeEnvironment": {
                     "networkConfiguration": {"networkMode": "PUBLIC"} if self.public else {

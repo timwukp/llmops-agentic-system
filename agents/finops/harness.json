@@ -237,7 +237,8 @@
       }
     }
   ],
-  "_memory_note": "Created WITHOUT memory; the shared BYO memory (llmops-shared-memory, SEMANTIC+EPISODIC) is attached post-create by deploy/04_wire_memory.py. Memory matters more here than for the pipeline agents: estimate accuracy improves only if each reconciliation's finding (which category drove the miss, measured throughput per instance type) survives into the next estimate.",
+  "memory": {"disabled": {}},
+  "_memory_note": "Created with memory {\"disabled\": {}}, explicitly: a create that omits `memory` provisions MANAGED memory, and each of these harnesses was created that way and left an orphaned managed memory behind (audit 2026-10-13, deploy/evidence/VERIFICATION_harness_memory_audit.md). The shared BYO memory (llmops_shared_memory, SEMANTIC+EPISODIC, shared by every agent) is attached post-create by deploy/04_wire_memory.py (CreateMemory + UpdateHarness optionalValue + IAM grant); deploy/05_harnesses.py never sends memory on update, so a redeploy does not undo it. Memory matters more here than for the pipeline agents: estimate accuracy improves only if each reconciliation's finding (which category drove the miss, measured throughput per instance type) survives into the next estimate.",
   "_no_browser_note": "Deliberately no agentcore_browser tool. The other agents use it for console screenshots as evidence; this one's evidence is billing API output, which is text and re-derivable. A browser session on an auditor also widens what a read-only role can reach.",
   "maxIterations": 100,
   "maxTokens": 65536,
