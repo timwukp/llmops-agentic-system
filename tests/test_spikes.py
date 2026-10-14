@@ -712,3 +712,235 @@ def test_s6_cleanup_skips_a_held_vpc_and_still_deletes_the_free_ones(s6_world):
     deleted = [kw for _, op, kw in world.calls if op == "delete_vpc"]
     assert deleted == [{"VpcId": "vpc-free"}]
     assert [kw for _, op, kw in world.calls if op == "delete_route_table"] == [{"RouteTableId": "rtb-priv"}]
+
+
+# ── S7 --part domain (Unified Studio) ────────────────────────────────────────
+class _NotFoundDZ(Exception):
+    pass
+
+
+class _Fake7D(_Fake):
+    def __init__(self, world, service):
+        super().__init__(world, service)
+        self.exceptions = type("E", (), {"EntityNotFoundException": _NotFound,
+                                         "ResourceNotFoundException": _NotFoundDZ})
+
+
+class FakeWorld7D(FakeWorld):
+    """S7's FakeWorld plus DataZone and the Price List API."""
+
+    def __init__(self, domain=True, asset=True, lineage=True, **kw):
+        super().__init__(**kw)
+        self.domain, self.asset, self.lineage, self.project_deleted = domain, asset, lineage, False
+
+    def client(self, service, region_name=None):
+        return _Fake7D(self, service)
+
+    def datazone_list_domains(self, **_):
+        return {"items": [{"id": "dzd_1", "name": s7.DOMAIN_NAME}] if self.domain else []}
+
+    def datazone_get_domain(self, **_):
+        return {"domainVersion": "V2", "singleSignOn": {"type": "DISABLED"}}
+
+    def datazone_list_project_profiles(self, **_):
+        return {"items": [{"id": "pp_other", "name": "SQL analytics"},
+                          {"id": "pp_1", "name": s7.PROJECT_PROFILE}]}
+
+    refuse_tags = False
+
+    def datazone_create_project(self, **kw):
+        if self.refuse_tags and "resourceTags" in kw:
+            raise RuntimeError("ValidationException: Additional project resource tags are not allowed "
+                               "when allowCustomProjectResourceTags is false")
+        self.project_kw = kw
+        return {"id": "prj_1"}
+
+    def datazone_get_project(self, **_):
+        if self.project_deleted:
+            raise _NotFoundDZ()
+        return {"projectStatus": "ACTIVE"}
+
+    def datazone_delete_project(self, **kw):
+        assert kw["skipDeletionCheck"] is True
+        self.project_deleted = True
+
+    lake_status = "ACTIVE"
+
+    def datazone_list_connections(self, **_):
+        return {"items": [{"connectionId": "c_athena", "name": "project.athena", "type": "ATHENA"},
+                          {"connectionId": "c_lake", "name": "project.default_lakehouse", "type": "IAM"}]}
+
+    def datazone_list_environments(self, **_):
+        return {"items": [{"id": "env_t", "name": "Tooling"}, {"id": "env_l", "name": "Lakehouse Database"}]}
+
+    def datazone_get_environment(self, identifier, **_):
+        st = "ACTIVE" if identifier == "env_t" else self.lake_status
+        return {"status": st, "lastDeployment": {"failureReason": {"message": "invalid principal"}}
+                if st != "ACTIVE" else {},
+                "provisionedResources": [{"name": "userRoleArn", "type": "IAMRole",
+                                          "value": f"arn:aws:iam::{ACCOUNT}:role/datazone_usr_role_x"}]}
+
+    def datazone_create_data_source(self, **kw):
+        self.ds_kw = kw
+        return {"id": "ds_1"}
+
+    ds_status = "READY"
+
+    def datazone_get_data_source(self, **_):
+        return {"status": self.ds_status}
+
+    def datazone_start_data_source_run(self, **_):
+        return {"id": "run_1"}
+
+    def datazone_get_data_source_run(self, **_):
+        return {"status": "SUCCESS"}
+
+    def datazone_search(self, **_):
+        return {"items": [{"assetItem": {"name": s7.TABLE}}] if self.asset else []}
+
+    def datazone_list_lineage_events(self, **_):
+        return {"items": [{"id": "le_1", "processingStatus": "SUCCESS"}] if self.lineage else []}
+
+    def datazone_get_lineage_event(self, **_):
+        body = json.dumps({"job": {"name": s7.GLUE_JOB}, "outputs": [{"name": f"{s7.NAMESPACE}.{s7.TABLE}"}]})
+        return {"event": type("B", (), {"read": lambda _s: body.encode()})()}
+
+    def pricing_get_products(self, **kw):
+        assert kw["ServiceCode"] == "AmazonDataZone"
+
+        def prod(region, desc):  # live shape: global prices carry regionCode "" and location "Any"
+            attrs = {"regionCode": "", "location": "Any"} if region == "Any" else {"regionCode": region,
+                                                                                   "location": "elsewhere"}
+            return json.dumps({"product": {"attributes": attrs},
+                               "terms": {"OnDemand": {"t": {"priceDimensions": {"d": {
+                                   "description": desc, "unit": "Requests", "pricePerUnit": {"USD": "0.0001"}}}}}}})
+        return {"PriceList": [prod("Any", "requests"), prod("eu-west-1", "elsewhere")]}
+
+
+@pytest.fixture
+def s7d(monkeypatch):
+    monkeypatch.setattr(s7.time, "sleep", lambda _s: None)
+    return lambda **kw: FakeWorld7D(**kw)
+
+
+def test_s7_domain_part_passes_and_tears_down_the_project(s7d):
+    world = s7d()
+    spike = s7.S7LakehouseSubstrate("us-east-1", session=world, part="domain")
+    spike.execute()
+    done = {c: v.status for c, v in spike.criteria.items()}
+    for cid in ("smus_visible", "smus_lineage", "smus_price"):
+        assert done[cid] == _spike.PASS, (cid, spike.criteria[cid].detail, spike.errors)
+    assert all(done[c] == _spike.NOT_RUN for c in ("v2", "glue_write", "unload_det"))
+    assert world.project_kw["projectProfileId"] == "pp_1"
+    assert world.project_kw["resourceTags"]["spike"] == s7.S7LakehouseSubstrate.NAME
+    ops = [op for _, op, _ in world.calls]
+    assert "delete_project" in ops and "delete_data_source" in ops and not spike.left
+    assert ops.index("delete_data_source") < ops.index("delete_project"), "children before the project"
+
+
+def test_s7_domain_part_points_the_data_source_at_the_s3_tables_catalog(s7d):
+    world = s7d()
+    spike = s7.S7LakehouseSubstrate("us-east-1", session=world, part="domain")
+    spike.execute()
+    glue = world.ds_kw["configuration"]["glueRunConfiguration"]
+    assert glue["catalogName"] == f"s3tablescatalog/{spike.bucket}" and "dataAccessRole" not in glue
+    assert world.ds_kw["publishOnImport"] is False, "a spike must not publish into a shared catalog"
+    grant = next(kw for _, op, kw in world.calls if op == "put_role_policy" and kw["PolicyName"] == s7.PROJECT_GRANT)
+    assert grant["RoleName"] == "datazone_usr_role_x"
+    ops = [(op, kw.get("PolicyName")) for _, op, kw in world.calls]
+    assert ops.index(("delete_role_policy", s7.PROJECT_GRANT)) < ops.index(("delete_project", None)), \
+        "the grant must go before the project, or CloudFormation cannot delete the role"
+
+
+def test_s7_domain_part_emits_lineage_from_the_glue_job(s7d):
+    world = s7d()
+    spike = s7.S7LakehouseSubstrate("us-east-1", session=world, part="domain")
+    spike.execute()
+    job = next(kw for _, op, kw in world.calls if op == "create_job")
+    conf = job["DefaultArguments"]["--conf"]
+    assert "transport.type=amazon_datazone_api" in conf and "transport.domainId=dzd_1" in conf
+    role = next(kw for _, op, kw in world.calls if op == "put_role_policy" and kw["RoleName"] == s7.GLUE_ROLE)
+    lineage = [st for st in json.loads(role["PolicyDocument"])["Statement"] if st["Sid"] == "OpenLineageToTheDomain"]
+    assert lineage and lineage[0]["Resource"].endswith(":domain/dzd_1")
+
+
+def test_s7_substrate_part_carries_no_domain_grant():
+    pol = s7.glue_role_policy("us-east-1", ACCOUNT, "arn:b", "data", "b")
+    assert not any("datazone" in json.dumps(st) for st in pol["Statement"])
+
+
+def test_s7_domain_data_source_role_is_read_only():
+    pol = s7.datasource_role_policy("us-east-1", ACCOUNT, "b")
+    actions = [a for st in pol["Statement"] for a in st["Action"]]
+    assert all(a.split(":")[1].startswith("Get") for a in actions), actions
+
+
+@pytest.mark.parametrize("kw,cid", [({"asset": False}, "smus_visible"), ({"lineage": False}, "smus_lineage")])
+def test_s7_domain_part_fails_the_criterion_it_could_not_observe(s7d, kw, cid, monkeypatch):
+    monkeypatch.setattr(s7.time, "time", iter(range(0, 10**7, 400)).__next__)  # expire the lineage wait
+    world = s7d(**kw)
+    spike = s7.S7LakehouseSubstrate("us-east-1", session=world, part="domain")
+    spike.execute()
+    assert spike.criteria[cid].status == _spike.FAIL, spike.criteria[cid].detail
+
+
+def test_s7_domain_part_without_the_domain_creates_nothing(s7d):
+    world = s7d(domain=False)
+    spike = s7.S7LakehouseSubstrate("us-east-1", session=world, part="domain")
+    spike.execute()
+    assert spike.criteria["smus_visible"].status == _spike.FAIL
+    assert not [op for _, op, _ in world.calls if op.startswith("create")]
+
+
+def test_lineage_mentions_reads_the_event_text():
+    assert s7.lineage_mentions('{"job":{"name":"j"},"outputs":[{"name":"spike.events"}]}', ("j", "events")) == \
+        {"j": True, "events": True}
+
+
+def test_s7_domain_part_retries_without_tags_when_the_profile_refuses_them(s7d):
+    world = s7d()
+    world.refuse_tags = True
+    spike = s7.S7LakehouseSubstrate("us-east-1", session=world, part="domain")
+    spike.execute()
+    assert "resourceTags" not in world.project_kw and "refused" in spike.observations["project_tags"]
+    assert spike.criteria["smus_visible"].status == _spike.PASS
+
+
+def test_s7_price_keeps_global_and_this_region_only(s7d):
+    world = s7d()
+    spike = s7.S7LakehouseSubstrate("us-east-1", session=world, part="domain")
+    ok, detail = spike._price()
+    assert ok and [d["description"] for d in spike.observations["smus_price_dimensions"]] == ["requests"]
+
+
+def test_s7_domain_part_uses_the_lakehouse_environment_and_stops_if_it_failed(s7d):
+    world = s7d()
+    spike = s7.S7LakehouseSubstrate("us-east-1", session=world, part="domain")
+    spike.execute()
+    assert world.ds_kw["connectionIdentifier"] == "c_lake" and "environmentIdentifier" not in world.ds_kw
+    world = s7d()
+    world.lake_status = "VALIDATION_FAILED"
+    spike = s7.S7LakehouseSubstrate("us-east-1", session=world, part="domain")
+    spike.execute()
+    assert spike.criteria["smus_visible"].status == _spike.FAIL
+    assert "invalid principal" in spike.criteria["smus_visible"].detail
+    assert not [op for _, op, _ in world.calls if op == "create_data_source"]
+
+
+def test_s7_pick_connection_prefers_the_lakehouse_then_iam_then_athena():
+    a = {"connectionId": "a", "name": "project.athena", "type": "ATHENA"}
+    i = {"connectionId": "i", "name": "project.iam", "type": "IAM"}
+    lake = {"connectionId": "l", "name": "project.default_lakehouse", "type": "IAM"}
+    assert s7.pick_connection([a, i, lake])["connectionId"] == "l"
+    assert s7.pick_connection([a, i])["connectionId"] == "i"
+    assert s7.pick_connection([a])["connectionId"] == "a"
+    assert s7.pick_connection([]) is None
+
+
+def test_s7_domain_part_waits_for_the_data_source_and_stops_if_it_failed(s7d):
+    world = s7d()
+    world.ds_status = "FAILED_CREATION"
+    spike = s7.S7LakehouseSubstrate("us-east-1", session=world, part="domain")
+    spike.execute()
+    assert spike.criteria["smus_visible"].status == _spike.FAIL
+    assert not [op for _, op, _ in world.calls if op == "start_data_source_run"]

@@ -107,7 +107,7 @@ ALLOWED = (b"6833" + b"13688378", b"7631" + b"04351884", b"1234" + b"56789012")
 #: this laptop, single-threaded CPython does 3.1M sha256/s, so the whole 1e12 space falls in
 #: about 4 days -- and a GPU does it in roughly 100 seconds. So the KDF is iterated. At 200k
 #: iterations a candidate costs ~16 ms, which makes the same sweep ~500 GPU-years, while the
-#: scan stays cheap because only 12-digit runs are ever hashed: measured across all 291
+#: scan stays cheap because only 12-digit runs are ever hashed: measured across all 294
 #: tracked files there are 79 such runs, 11 distinct, and hashing the distinct set takes 0.16 s
 #: for the entire repo. (Re-measured whenever either number moves, and they move
 #: INDEPENDENTLY, which is why both are derived and neither is inferred from the other, and
@@ -203,8 +203,10 @@ ALLOWED = (b"6833" + b"13688378", b"7631" + b"04351884", b"1234" + b"56789012")
 #: 78 -> 79, distinct held at 11.
 #: Then 275 files went to 281 (the lakehouse source generator, its tests and evidence, and its intent
 #: chain). No 12-digit run; the runs held at 79.
-#: Then 281 files became 291 (the lakehouse medallion: transforms, three Glue jobs, org-entity
+#: Then 281 files went to 291 (the lakehouse medallion: transforms, three Glue jobs, org-entity
 #: reference data, tests, evidence and intent chain). No 12-digit run; the runs held at 79.
+#: Then 291 files became 294 (spike S7's domain-part intent chain). No 12-digit run; the runs held
+#: at 79.
 #: Dollar limits and percentages only -- no 12-digit run, so the runs held at 74 again.
 #: For EIGHT commits
 #: running, the file count moved and the run count did not move once, and then one commit moved

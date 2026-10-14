@@ -241,17 +241,50 @@ def test_the_call_scanner_sees_the_calls_that_have_failed_live():
     """A floor, so a scanner that stops matching cannot pass by finding nothing. Each of these
     was a live AccessDenied on the runner on 2026-10-13."""
     found = {iam_action(*c) for f in SPIKE_FILES for c in spike_aws_calls(f)}
+    s7 = next(f for f in SPIKE_FILES if f.name.startswith("s7_"))
+    assert ("datazone", "create_project") in spike_aws_calls(s7), "the domain part is invisible to the scanner"
     for a in ("route53resolver:CreateResolverQueryLogConfig", "ec2:CreateVpcEndpoint",
               "route53resolver:GetResolverQueryLogConfigAssociation", "logs:CreateLogGroup",
               "s3:ListBucket", "glue:CreateJob"):
         assert a in found, (a, sorted(found))
 
 
+def _exempt(path: pathlib.Path) -> dict:
+    """A spike's declared RUNNER_EXEMPT_SERVICES (service -> reason), read from its source."""
+    for node in ast.walk(ast.parse(path.read_text())):
+        if isinstance(node, ast.Assign) and any(getattr(t, "id", "") == "RUNNER_EXEMPT_SERVICES"
+                                                for t in node.targets):
+            return ast.literal_eval(node.value)
+    return {}
+
+
+def test_every_spike_client_names_its_service_literally():
+    """The scanner below only sees clients obtained as self.client("<literal>"). Live, a
+    `dz, s3 = (self.client(n) for n in (...))` hid every DataZone call from it."""
+    bad = []
+    for f in SPIKE_FILES:
+        for node in ast.walk(ast.parse(f.read_text())):
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "client" and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "self"
+                    and not (node.args and isinstance(node.args[0], ast.Constant))):
+                bad.append(f"{f.name}:{node.lineno}")
+    assert not bad, f"self.client() with a non-literal service hides calls from the grant check: {bad}"
+
+
+def test_runner_exemptions_carry_a_reason():
+    for f in SPIKE_FILES:
+        for svc, why in _exempt(f).items():
+            assert isinstance(why, str) and len(why) > 20, (f.name, svc)
+
+
 def test_every_aws_call_a_spike_makes_is_granted_to_the_runner():
     """Three runner runs in a row died on a call the spike made and the role did not grant --
-    each found only after creating a VPC. This finds them before."""
+    each found only after creating a VPC. This finds them before. A spike may exempt a
+    service only by declaring why (RUNNER_EXEMPT_SERVICES), never by omission."""
     missing = sorted({f"{iam_action(*c)}  ({f.name})" for f in SPIKE_FILES
-                      for c in spike_aws_calls(f) if not _allowed(iam_action(*c))})
+                      for c in spike_aws_calls(f)
+                      if c[0] not in _exempt(f) and not _allowed(iam_action(*c))})
     assert not missing, "the runner role cannot make these spike calls:\n  " + "\n  ".join(missing)
 
 
