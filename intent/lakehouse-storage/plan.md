@@ -3,10 +3,10 @@
 - **Spec:** ./spec.md
 - **Author:** Claude (AI agent)
 - **Accepted-by:** Tim WU
-- **Accepted-for:** 681813e341c9049d82a4adcf1185d31aa59e167e
+- **Accepted-for:** caa2c9d0bc9381a27d4bdd5e7d899e69e4e7d182
 - **Status:** accepted
 
-`Accepted-for` is the merge base with `main` at acceptance (PR #156's merge).
+`Accepted-for` is the merge base with `main` at acceptance (PR #157's merge; first written against #156's, re-bound when #157 landed and `main` was merged in).
 
 ## Files changed
 
