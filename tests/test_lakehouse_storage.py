@@ -378,3 +378,14 @@ def test_the_guardrail_job_installs_an_sdk_that_has_apply_guardrail():
     mods = dict(m.split("==") for m in d["--additional-python-modules"].split(","))
     assert tuple(map(int, mods["boto3"].split("."))) >= (1, 43, 51), "AGENTS.md SDK gate"
     assert "--additional-python-modules" not in lh.job_definition("j", "land_bronze.py", "r", DATA)["DefaultArguments"]
+
+
+def test_every_job_report_carries_rows_and_snapshots_for_the_data_tab():
+    """The console's Data tab reads the reports, never the tables: each job must say what it
+    wrote (rows, current snapshot) or the tab has nothing honest to show."""
+    for _, script in lh.JOBS.values():
+        src = (lh.GLUE_SRC / script).read_text()
+        assert '["tables"]' in src and "snapshots" in src and "report_uri" in src, script
+    smoke = __import__("inspect").getsource(lh.smoke)
+    assert '"--report_uri": reports + "land.json"' in smoke
+    assert '"--expected_defects_uri": landing + "expected_defects.json"' in smoke

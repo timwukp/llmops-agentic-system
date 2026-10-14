@@ -680,12 +680,13 @@ def smoke(session, region, account_id, data_bucket, seed=7, scale="small") -> di
     reports = f"s3://{data_bucket}/{REPORT_PREFIX}/{dataset}/"
     checks = {"dataset": dataset, "dataset_sha256": manifest["dataset_sha256"]}
     common = {"--account_id": account_id}
-    steps = [("land", {"--raw_bucket": RAW, "--landing_uri": landing}),
+    steps = [("land", {"--raw_bucket": RAW, "--landing_uri": landing, "--report_uri": reports + "land.json"}),
              ("silver", {"--raw_bucket": RAW, "--curated_bucket": CURATED,
                          "--eval_prompts_uri": landing + "eval_prompts.jsonl",
                          "--report_uri": reports + "silver.json", "--guardrail_id": p["guardrail_id"],
                          "--guardrail_version": p["guardrail_version"], "--dq_run_id": dataset,
-                         "--org_entities_uri": f"s3://{data_bucket}/{GLUE_PREFIX}/org_entities.json"}),
+                         "--org_entities_uri": f"s3://{data_bucket}/{GLUE_PREFIX}/org_entities.json",
+                         "--expected_defects_uri": landing + "expected_defects.json"}),
              ("gold", {"--curated_bucket": CURATED, "--report_uri": reports + "gold.json"})]
     for key, extra in steps:
         state, err = _run_job(glue, JOBS[key][0], {**common, **extra})

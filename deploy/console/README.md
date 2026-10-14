@@ -23,13 +23,14 @@ is how the Introduction row below got written on the same commit as the tab itse
 | Architecture | The generated diagrams (`docs/architecture-*.svg`), served from the same Lambda so the picture cannot lag the deployment |
 | Tasks | **The customer-facing plane** — one consultation thread per engagement with `llmops_orchestrator`: chat, presigned `customer-data/` upload, priced plan, KMS-signed acceptance, lifecycle strip |
 | Pipeline | Animated 9-stage flow (Step Functions `llmops-pipeline`) with remediation-loop arrow, execution picker, run detail (gates / metrics / evidence / training job), Start Run, and the verdicts panel (delivered / parked / never delivered) |
+| Data | **Read-only lakehouse view** (Phase 1). Every number comes from the Glue jobs' reports under `s3://<DATA_BUCKET>/lakehouse/reports/<dataset>/`, plus the S3 Tables metadata APIs: the 10 tables with rows and current snapshot, Silver pairs and Gold train/eval, each rule's catch against the generator's plants, and the Glue DQ outcomes. A dataset picker selects the run. The console never reads the tables themselves: they are SSE-KMS and Bronze holds PII. Routes: `GET /api/data`, `GET /api/data/run?dataset=` (the id is regex-checked) |
 | Fleet | The 7 `llmops_*` harnesses: status, model, skills, limits |
 | Observability | Per-harness AgentCore service metrics, daily bar chart, token tile, SageMaker training jobs + student endpoints |
 | Evaluations | Online eval configs with score gauges, batch evaluations, insights reports |
 | Optimizations | AWS-native system-prompt recommendations + Bedrock-drafted prompts (human-review-then-apply via UpdateHarness) |
 | Cost | Six sub-tabs: Overview · Usage · By task · Breakdown · Detail · Governance. Detail carries rate-card health with the `finops-run` *Refresh rates* / *Reconcile now* buttons. Governance: budgets (`project_monthly` / `per_task`), the enforcement policy — alarm + notification always on, **Block launches over budget** and **Stop running jobs over budget** switches (both OFF by default, `llmops-approver` only, every flip logged) — the *Run budget check now* button, alert feed, guardrail posture, AWS Budgets. The v1 estimator, approval queue and their five routes were removed 2026-10-12 |
 
-Route shape: **32 handlers** (see `tests/test_console_routes.py` for the derived count).
+Route shape: **34 handlers** (see `tests/test_console_routes.py` for the derived count).
 See [ARCHITECTURE.md §13](../../docs/ARCHITECTURE.md#13-the-admin-console--one-lambda-three-planes-with-different-rules)
 for why the three planes carry different rules.
 

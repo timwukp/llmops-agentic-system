@@ -5,6 +5,27 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
 ## [Unreleased]
 
+### Console: a read-only Data tab
+
+A new **Data** tab, the read-only version the owner asked for right after PR-07. It shows:
+- the lakehouse datasets with reports;
+- the 10 tables with their row counts and current snapshots;
+- Silver pairs and the Gold train/eval split;
+- each rule's catch against the generator's plants;
+- the Glue Data Quality outcomes.
+
+Exports and lineage show where they arrive (PR-08, PR-05). Routes: `GET /api/data` and
+`GET /api/data/run?dataset=`; the dataset id is regex-checked, and a bad one returns 400 before any read.
+
+**The tab never reads the tables.** They are SSE-KMS and Bronze holds PII, so every number comes from a
+report the Glue jobs wrote. The jobs' reports now carry rows, snapshot ids and, for generated data, the
+plant comparison; `land_bronze` gained a report of its own. The console's one new grant is metadata-only
+(`s3tables:List*/Get*` on the two lakehouse buckets, no `GetTableData`, no KMS).
+
+Verified in the live portal after a demo smoke: 8/8 rules exact, 16/16 DQ. The check also found that
+switching to an older dataset left the previous dataset's numbers in the table panel; that is now fixed
+and re-verified. `deploy/console/deploy.sh` now honours `$TMPDIR`.
+
 ### Spike S7, Unified Studio part: lineage and price PASS, visibility FAIL
 
 `LLMOPS_S7_PART=domain` adds one spike project to the account's shared V2 domain (`demo`, owner decision),

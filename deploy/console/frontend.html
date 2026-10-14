@@ -215,6 +215,7 @@
   <button data-tab="architecture" onclick="showTab('architecture')">Architecture</button>
   <button data-tab="tasks" onclick="showTab('tasks')">Tasks</button>
   <button data-tab="pipeline" class="active" onclick="showTab('pipeline')">Pipeline</button>
+  <button data-tab="data" onclick="showTab('data')">Data</button>
   <button data-tab="fleet" onclick="showTab('fleet')">Fleet</button>
   <button data-tab="obs" onclick="showTab('obs')">Observability</button>
   <button data-tab="evals" onclick="showTab('evals')">Evaluations</button>
@@ -425,6 +426,29 @@
        answers "where did the money go"; Governance answers "what stops it". Every figure
        carries its basis badge, because an account-wide number summed into an attributed
        one is the commonest way a cost page lies. -->
+  <!-- Data: the lakehouse, read-only. Every number comes from a Glue job's report; the console
+       never reads the tables (SSE-KMS; Bronze holds PII). -->
+  <div data-tab-panel="data" class="card col-12" style="padding:10px 14px">
+    <div class="flex" style="justify-content:space-between;align-items:center">
+      <span><b>Lakehouse</b> <span class="sub">Bronze &rarr; Silver &rarr; Gold &middot; read-only &middot; from the jobs' reports</span></span>
+      <span class="flex"><span class="sub">dataset</span> <select id="dataDataset" onchange="loadDataRun()" style="max-width:280px"></select>
+        <button onclick="loadData()" style="padding:4px 10px;font-size:12px">&#8635;</button></span>
+    </div>
+    <div id="dataMeta" class="sub" style="margin-top:4px">loading&hellip;</div>
+  </div>
+  <div data-tab-panel="data" class="card col-3"><h2>Silver pairs</h2><div class="stat" id="dataPairs">&ndash;</div><small>instruction pairs after the rules</small></div>
+  <div data-tab-panel="data" class="card col-3"><h2>Gold train / eval</h2><div class="stat" id="dataGold">&ndash;</div><small>deterministic split by pair_id</small></div>
+  <div data-tab-panel="data" class="card col-3"><h2>Rules vs plants</h2><div class="stat" id="dataPlants">&ndash;</div><small id="dataPlantsSub">each rule's catch = what the generator planted</small></div>
+  <div data-tab-panel="data" class="card col-3"><h2>Data quality</h2><div class="stat" id="dataDq">&ndash;</div><small>Glue DQ rules passed (Silver + Gold)</small></div>
+  <div data-tab-panel="data" class="card col-6"><h2>Tables</h2><div id="dataTables"><span class="sub">loading&hellip;</span></div></div>
+  <div data-tab-panel="data" class="card col-6"><h2>Rules &middot; planted vs caught</h2><div id="dataRules"><span class="sub">loading&hellip;</span></div></div>
+  <div data-tab-panel="data" class="card col-6"><h2>Data quality outcomes</h2><div id="dataDqList"><span class="sub">loading&hellip;</span></div></div>
+  <div data-tab-panel="data" class="card col-6"><h2>Exports &middot; Lineage</h2>
+    <div class="row"><span>Gold export (UNLOAD + sha256)</span><span class="pill warn">Phase 1 PR-08</span></div>
+    <div class="row"><span>Unified Studio catalog &amp; lineage</span><span class="pill warn">Phase 1 PR-05</span></div>
+    <div class="sub" style="margin-top:6px">lineage events already reach the domain (spike S7); catalog visibility waits on the S3 Tables integration-mode decision</div>
+  </div>
+
   <div data-tab-panel="cost" class="card col-12" style="padding:10px 14px">
     <div class="flex" style="align-items:center;gap:6px;flex-wrap:wrap">
       <nav class="csubnav" id="csubNav">
@@ -2339,6 +2363,52 @@ async function saveBudget(){
   if(res.ok) loadCostV2();
 }
 // ── tabs (ported: persistence + poll only while active) ──────────────────────
+// ── Data tab (read-only) ─────────────────────────────────────────────────────
+const RULE_LABEL = {dedup_event_id:"duplicate resends", tolerate_drift:"schema drift (tolerated)",
+  order_by_turn:"out-of-order turns", strip_think:"leaked <think> stripped", drop_toxic:"toxic turns dropped",
+  redact_pii:"PII redacted", decontaminate:"eval contamination dropped", near_dup:"near-duplicates dropped"};
+async function loadData(){
+  $("dataMeta").textContent="loading…";
+  try {
+    const o = await fetch(API+"/api/data").then(r=>r.json());
+    const sel=$("dataDataset"), keep=sel.value;
+    sel.innerHTML=(o.datasets||[]).map(d=>`<option value="${esc(d)}">${esc(d)}</option>`).join("")||`<option value="">no runs yet</option>`;
+    if ((o.datasets||[]).includes(keep)) sel.value=keep;
+    const errs=Object.entries(o.errors||{});
+    $("dataTables").innerHTML=(o.tables||[]).length?`<table><tr><th>table</th><th>bucket</th><th style="text-align:right">rows</th><th>snapshot</th><th>modified</th></tr>${o.tables.map(t=>
+      `<tr><td class="mono">${esc(t.namespace)}.${esc(t.name)}</td><td class="mono">${esc(t.bucket)}</td><td style="text-align:right" id="rows-${esc(t.namespace)}-${esc(t.name)}">–</td><td class="mono sub" id="snap-${esc(t.namespace)}-${esc(t.name)}">–</td><td class="sub">${esc(t.modified_at)}</td></tr>`).join("")}</table>`
+      :`<div class="sub">no lakehouse tables found${errs.length?" ("+esc(errs.map(e=>e.join(": ")).join("; "))+")":""}</div>`;
+    $("dataMeta").innerHTML=`${(o.datasets||[]).length} dataset(s) with reports`+(errs.length?` · <span class="pill err">${errs.length} source(s) unavailable</span>`:"");
+    if ((o.datasets||[]).length) await loadDataRun();
+  } catch(e){ $("dataMeta").textContent="failed: "+e; }
+}
+async function loadDataRun(){
+  const d=$("dataDataset").value; if(!d) return;
+  const r = await fetch(API+"/api/data/run?dataset="+encodeURIComponent(d)).then(x=>x.json());
+  if (r.error){ $("dataMeta").textContent=r.error; return; }
+  // Reset first: a dataset whose reports predate a field must show "–", not the last one's value.
+  document.querySelectorAll('[id^="rows-"],[id^="snap-"]').forEach(el=>el.textContent="–");
+  $("dataPlantsSub").textContent="each rule's catch = what the generator planted";
+  const m=r.manifest||{};
+  $("dataMeta").innerHTML=`<span class="mono">${esc(r.dataset)}</span> · seed ${esc(m.seed)} · ${esc(m.scale)} · sha256 <span class="mono">${esc((m.dataset_sha256||"").slice(0,16))}…</span> · stages ${["land","silver","gold"].map(s=>`<span class="pill ${r.stages[s]?"ok":"warn"}">${s}</span>`).join(" ")}`;
+  $("dataPairs").textContent=r.pairs==null?"–":fmtN(r.pairs);
+  $("dataGold").textContent=r.train==null?"–":`${fmtN(r.train)} / ${fmtN(r.eval)}`;
+  const pc=r.plant_check;
+  if (pc){ const ok=Object.values(pc).filter(v=>v.passed).length, n=Object.keys(pc).length;
+    $("dataPlants").innerHTML=`<span style="color:${ok===n?"var(--green)":"var(--red)"}">${ok}/${n}</span>`; }
+  else { $("dataPlants").textContent="n/a"; $("dataPlantsSub").textContent="no plant comparison in this dataset's report (real data, or a run before reports carried one)"; }
+  $("dataRules").innerHTML=`<table><tr><th>rule</th><th style="text-align:right">caught</th><th>vs plant</th></tr>${Object.entries(r.rules||{}).map(([k,v])=>{
+    const p=pc&&pc[k]; return `<tr><td>${esc(RULE_LABEL[k]||k)} <span class="sub mono">${esc(k)}</span></td><td style="text-align:right">${fmtN(v)}</td><td>${p?`<span class="pill ${p.passed?"ok":"err"}">${p.passed?"exact":"MISMATCH"}</span> <span class="sub">${esc(p.detail)}</span>`:"–"}</td></tr>`;}).join("")}</table>`;
+  const dq=Object.entries(r.dq||{}).flatMap(([t,os])=>(os||[]).map(o=>[t,o]));
+  const pass=dq.filter(([,o])=>o.outcome==="Passed").length;
+  $("dataDq").innerHTML=dq.length?`<span style="color:${pass===dq.length?"var(--green)":"var(--red)"}">${pass}/${dq.length}</span>`:"–";
+  $("dataDqList").innerHTML=dq.length?`<table><tr><th>table</th><th>rule</th><th>outcome</th></tr>${dq.map(([t,o])=>
+    `<tr><td class="mono">${esc(t)}</td><td class="mono sub">${esc(o.rule)}</td><td><span class="pill ${o.outcome==="Passed"?"ok":"err"}">${esc(o.outcome)}</span></td></tr>`).join("")}</table>`:`<div class="sub">no DQ results in this dataset's reports</div>`;
+  Object.entries(r.tables||{}).forEach(([full,v])=>{ const [ns,name]=full.split(".");
+    const rc=$("rows-"+ns+"-"+name), sc=$("snap-"+ns+"-"+name);
+    if(rc) rc.textContent=v.rows==null?"–":fmtN(v.rows); if(sc) sc.textContent=v.snapshot_id?String(v.snapshot_id).slice(0,10)+"…":"–"; });
+}
+
 function showTab(t){
   document.querySelectorAll("[data-tab-panel]").forEach(el=>{
     el.style.display = (el.dataset.tabPanel===t || el.dataset.tabPanel==="all") ? "" : "none"; });
@@ -2367,6 +2437,7 @@ function showTab(t){
   if (t==="evals") loadEvals();
   if (t==="opts") loadOpts();
   if (t==="cost") loadCostV2();
+  if (t==="data") loadData();
 }
 
 // tab on load: ?tab= URL param > localStorage > intro for first-time visitors. The
@@ -2374,7 +2445,7 @@ function showTab(t){
 // the diagrams show a reader HOW the system is wired, the narration tells them WHY it
 // exists and what it cost. Someone arriving for the first time needs the second one
 // first. A returning operator still lands on whatever tab they left.
-const KNOWN_TABS = ["intro","architecture","tasks","pipeline","fleet","obs","evals","opts","cost"];
+const KNOWN_TABS = ["intro","architecture","tasks","pipeline","data","fleet","obs","evals","opts","cost"];
 const _urlTab = new URLSearchParams(location.search).get("tab");
 const _memTab = localStorage.getItem("adminTab");
 showTab(KNOWN_TABS.includes(_urlTab) ? _urlTab

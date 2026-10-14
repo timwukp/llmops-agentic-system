@@ -9,6 +9,9 @@
 # Prereqs: aws cli v2 configured, python >= 3.10, zip.
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# Scratch files go under $TMPDIR when the environment sets one (sandboxed shells allow nothing
+# else); /tmp otherwise, as before.
+SCRATCH="${TMPDIR:-/tmp}"; SCRATCH="${SCRATCH%/}"
 
 # ── configuration ─────────────────────────────────────────────────────────────
 REGION="${REGION:-us-east-1}"
@@ -60,8 +63,8 @@ fi
 # in policy" — it does not name the offending key, so this cost a debugging round.
 # Strip them at apply time: the file keeps the rationale, IAM gets a clean policy.
 sed "s/ACCOUNT_ID/$ACCOUNT_ID/g; s/REGION/$REGION/g" "$(dirname "$0")/iam-policy.json" \
-  | jq 'del(.Statement[]._comment)' > /tmp/llmops-admin-policy.json
-aws iam put-role-policy --role-name "$ROLE" --policy-name LlmopsAdminPerms --policy-document file:///tmp/llmops-admin-policy.json
+  | jq 'del(.Statement[]._comment)' > $SCRATCH/llmops-admin-policy.json
+aws iam put-role-policy --role-name "$ROLE" --policy-name LlmopsAdminPerms --policy-document file://$SCRATCH/llmops-admin-policy.json
 
 # ── Cognito (admin login) ─────────────────────────────────────────────────────
 POOL_ID=$(aws cognito-idp list-user-pools --max-results 60 --region "$REGION" \
@@ -136,7 +139,7 @@ for G in llmops-approver llmops-datascience; do
 done
 
 # ── package: vendor boto3 (Lambda's builtin may predate AgentCore harness APIs) ─
-BUILD=$(mktemp -d)
+BUILD=$(mktemp -d "$SCRATCH/llmops-admin-build.XXXXXX")
 # AgentCore batch-eval/recommendation APIs need boto3 >= 1.43.51, which requires
 # Python >= 3.10 — macOS system python3 (3.9) silently vendors 1.42.x and every
 # batch-eval op then fails at runtime with "object has no attribute". Pick a
@@ -209,11 +212,11 @@ if small:
     sys.exit("FATAL: narration clip(s) under 1 KiB — truncated, not audio: " + ", ".join(small))
 print(f"bundled intro: {len(have)} narration clips in {len(spec['langs'])} languages OK")
 PYCHECK
-(cd "$BUILD" && zip -rq /tmp/llmops-admin-dashboard.zip .)
+(cd "$BUILD" && zip -rq $SCRATCH/llmops-admin-dashboard.zip .)
 # Lambda refuses a direct zip upload over 50 MB, and the failure arrives from
 # update-function-code as a validation error at the END of a multi-minute build. Say it
 # here, with the number, while the operator is still watching the build.
-ZIP_MB=$(( $(wc -c < /tmp/llmops-admin-dashboard.zip) / 1000000 ))
+ZIP_MB=$(( $(wc -c < $SCRATCH/llmops-admin-dashboard.zip) / 1000000 ))
 echo "deployment package: ${ZIP_MB} MB (Lambda direct-upload limit is 50 MB)"
 [ "$ZIP_MB" -lt 50 ] || { echo "FATAL: package is ${ZIP_MB} MB — over Lambda's 50 MB direct-upload limit. Move the narration audio to S3 or drop a language."; exit 1; }
 
@@ -239,13 +242,13 @@ ENV_VARS="Variables={CONSOLE_TABLE=$TABLE,RUNS_TABLE=llmops-pipeline-runs,EVENTS
 # timeout 900: one orchestrator consultation turn can stream for up to 840s; the
 # old 300 killed the worker mid-turn and left the task stuck in 'thinking'.
 if aws lambda get-function --function-name "$FN" --region "$REGION" >/dev/null 2>&1; then
-  aws lambda update-function-code --function-name "$FN" --zip-file fileb:///tmp/llmops-admin-dashboard.zip --region "$REGION" >/dev/null
+  aws lambda update-function-code --function-name "$FN" --zip-file fileb://$SCRATCH/llmops-admin-dashboard.zip --region "$REGION" >/dev/null
   aws lambda wait function-updated --function-name "$FN" --region "$REGION"
   aws lambda update-function-configuration --function-name "$FN" --environment "$ENV_VARS" --timeout 900 --region "$REGION" >/dev/null
 else
   aws lambda create-function --function-name "$FN" --runtime python3.12 --timeout 900 --memory-size 512 \
     --role "arn:aws:iam::$ACCOUNT_ID:role/$ROLE" --handler lambda_function.handler \
-    --zip-file fileb:///tmp/llmops-admin-dashboard.zip --environment "$ENV_VARS" --region "$REGION" >/dev/null
+    --zip-file fileb://$SCRATCH/llmops-admin-dashboard.zip --environment "$ENV_VARS" --region "$REGION" >/dev/null
 fi
 aws lambda wait function-active --function-name "$FN" --region "$REGION"
 

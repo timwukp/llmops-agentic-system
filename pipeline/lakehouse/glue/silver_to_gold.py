@@ -29,7 +29,7 @@ glue_ctx = GlueContext(spark.sparkContext)
 
 pairs = [r.asDict() for r in spark.table("cur.silver.instruction_pairs").collect()]
 train, ev = transform.silver_to_gold(pairs)
-report = {"silver_pairs": len(pairs), "train": len(train), "eval": len(ev), "dq": {}}
+report = {"silver_pairs": len(pairs), "train": len(train), "eval": len(ev), "dq": {}, "tables": {}}
 for table, rows in (("qlora_train", train), ("qlora_eval", ev)):
     target = spark.table(f"cur.gold.{table}")
     df = spark.createDataFrame(rows, schema=None if rows else target.schema)
@@ -42,6 +42,9 @@ for table, rows in (("qlora_train", train), ("qlora_eval", ev)):
                             "enableDataQualityResultsPublishing": True})
     report["dq"][table] = [{"rule": o["Rule"], "outcome": o["Outcome"]} for o in
                            (r.asDict() for r in dq.toDF().collect())]
+    snap = spark.sql(f"SELECT snapshot_id FROM cur.gold.{table}.snapshots "
+                     "ORDER BY committed_at DESC LIMIT 1").collect()
+    report["tables"][f"gold.{table}"] = {"rows": len(rows), "snapshot_id": str(snap[0][0]) if snap else None}
 
 bucket, _, key = args["report_uri"][len("s3://"):].partition("/")
 boto3.client("s3").put_object(Bucket=bucket, Key=key, ContentType="application/json",

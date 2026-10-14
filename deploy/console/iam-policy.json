@@ -363,6 +363,22 @@
       "Resource": [
         "arn:aws:sns:REGION:ACCOUNT_ID:llmops-escalations"
       ]
+    },
+    {
+      "Sid": "LakehouseTablesMetadata",
+      "Effect": "Allow",
+      "Action": [
+        "s3tables:ListTables",
+        "s3tables:ListNamespaces",
+        "s3tables:GetTable",
+        "s3tables:GetTableBucket"
+      ],
+      "Resource": [
+        "arn:aws:s3tables:REGION:ACCOUNT_ID:bucket/llmops-raw",
+        "arn:aws:s3tables:REGION:ACCOUNT_ID:bucket/llmops-curated",
+        "arn:aws:s3tables:REGION:ACCOUNT_ID:bucket/llmops-raw/table/*",
+        "arn:aws:s3tables:REGION:ACCOUNT_ID:bucket/llmops-curated/table/*"
+      ]
     }
   ]
 }
