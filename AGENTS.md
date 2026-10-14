@@ -71,9 +71,10 @@ versions and introspects the live CreateHarness/UpdateHarness schemas.
   `04_wire_memory.py` attaches the shared BYO memory afterwards, and `05_harnesses.py` never
   sends `memory` on update, so a redeploy does not undo it. The configs used to say "Created
   WITHOUT memory" while every create got a managed memory: audited 2026-10-13
-  (`deploy/evidence/VERIFICATION_harness_memory_audit.md`), each of the 7 llmops harnesses has
+  (`deploy/evidence/VERIFICATION_harness_memory_audit.md`), each of the 7 llmops harnesses had
   an orphaned managed memory created in the same second as the harness — **UpdateHarness does
-  not delete the memory it replaces**. All 7 are ACTIVE with 0 actors / 0 records. The name
+  not delete the memory it replaces**. All 7 were empty (0 actors / 0 records) and were deleted
+  2026-10-14 after a re-check; a harness deleted or re-pointed later leaves the same residue. The name
   pattern has changed: `harness_<name>_<4hex>-<10>` for creates through 2026-08-04,
   `<harnessName>-<10>` from 2026-08-11 (and a 2026-10-13 probe, whose create called
   `CreateMemory` on `memory/<harnessName>-*` and reached READY only with `{"disabled": {}}`).

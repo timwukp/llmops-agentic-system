@@ -170,12 +170,11 @@ live (torn down after eval per cost rule).
 
 ## Known issues / open items
 
-- 7 orphaned managed memories, `harness_llmops_<agent>_<4hex>-*`, one per platform harness,
-  created by each harness's create (no `memory` field = managed) and replaced, not deleted, by
-  `04_wire_memory.py`. Empty (0 actors / 0 records), ACTIVE, audited 2026-10-13
-  (deploy/evidence/VERIFICATION_harness_memory_audit.md). Creates now declare `{"disabled": {}}`.
-  Deleting them is pending the owner's decision; so is `llmops_effort_probe`, a probe harness still
-  on its own managed memory (4 records).
+- `llmops_effort_probe` (a 2026-08-01 probe harness) is still on its own managed memory
+  `harness_llmops_effort_probe_05cc-*`, 4 semantic records; keeping or deleting it is the owner's
+  call. The 7 empty orphaned managed memories the platform harnesses' creates left behind were
+  deleted 2026-10-14 (deploy/evidence/VERIFICATION_harness_memory_audit.md); creates now declare
+  `{"disabled": {}}`.
 - Fable 5 vendor-quota 5xx bursts: this file claimed "all harnesses on Opus 5" until
   2026-08-02, when GetHarness on all 8 returned `global.anthropic.claude-fable-5`. The
   hot-swap was evidently never applied, or was reverted by a later deploy from config
