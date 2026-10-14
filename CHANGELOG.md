@@ -5,6 +5,35 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
 ## [Unreleased]
 
+### Lakehouse storage (Phase 1 PR-04)
+
+`deploy/10_lakehouse.py` (idempotent, `--dry-run`, `--verify`, `--teardown`) builds the storage Phase 1
+writes into, per the research report's §4.3 and on the substrate spike S7 proved:
+- Two SSE-KMS table buckets, `llmops-raw` (Bronze) and `llmops-curated` (Silver/Gold), each with
+  **its own** rotating KMS key. Being able to decrypt the raw key is access to the PII, so it does not
+  come bundled with the de-identified tables.
+- Nine Iceberg v2 tables with declared schemas and partition specs.
+- An enforced Athena workgroup.
+- The Glue role for PR-07.
+- Short raw retention (72 h snapshots, 1-day file removal), so a right-to-be-forgotten delete becomes
+  physical within days.
+
+Deployed live; `--verify` read back **34/34**:
+- encryption, `format-version` 2, columns and partitions from each table's live metadata;
+- an Athena query on every table;
+- `simulate_principal_policy` on the Glue role in **both** directions — six grants it needs, seven it
+  must not have.
+
+The first run found that `CreateRole` rejects `→` in a description.
+
+New `tests/test_lakehouse_storage.py` (20 tests, offline) covers:
+- spec validation (lowercase names, Iceberg types, partition sources);
+- key and role policies;
+- deploy idempotency;
+- a teardown that removes everything deploy creates and only *schedules* the keys.
+
+Five mutations were each caught.
+
 ### Build runner, and spike S6 run 3: VPC mode fails in every topology
 
 **Build runner** (`tools/runner/`, owner request 2026-10-13: long-task runner only). A dedicated EC2
