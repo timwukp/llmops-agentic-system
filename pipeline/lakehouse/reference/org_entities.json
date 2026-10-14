@@ -1,0 +1,51 @@
+{
+  "_comment": "Organisation-owned entities that are not personal data: store and product names from the retailer's master data. The Bronze->Silver job never redacts a detected NAME that lies inside one of these in the same text (live, PR-07 demo smoke: Bedrock Guardrails flagged 高雄前鎮店 and Taichung Xitun as names). Maintained as reference data; tests/test_lakehouse_transform.py requires the generator's stores and products to be listed here.",
+  "stores": [
+    {
+      "zh-TW": "台北信義店",
+      "en": "Taipei Xinyi"
+    },
+    {
+      "zh-TW": "台中西屯店",
+      "en": "Taichung Xitun"
+    },
+    {
+      "zh-TW": "高雄前鎮店",
+      "en": "Kaohsiung Qianzhen"
+    }
+  ],
+  "products": [
+    {
+      "zh-TW": "無線耳機",
+      "en": "wireless earbuds"
+    },
+    {
+      "zh-TW": "保溫瓶",
+      "en": "insulated bottle"
+    },
+    {
+      "zh-TW": "行動電源",
+      "en": "power bank"
+    },
+    {
+      "zh-TW": "登山背包",
+      "en": "hiking backpack"
+    },
+    {
+      "zh-TW": "咖啡豆",
+      "en": "coffee beans"
+    },
+    {
+      "zh-TW": "運動鞋",
+      "en": "running shoes"
+    },
+    {
+      "zh-TW": "電動牙刷",
+      "en": "electric toothbrush"
+    },
+    {
+      "zh-TW": "藍牙喇叭",
+      "en": "bluetooth speaker"
+    }
+  ]
+}

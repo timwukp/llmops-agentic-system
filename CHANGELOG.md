@@ -26,6 +26,35 @@ integration mode (Lake Formation vs IAM) before Unified Studio can catalogue the
 The build runner's grant guard now reads a spike's declared `RUNNER_EXEMPT_SERVICES` instead of silently
 skipping calls, and it fails on any `self.client()` with a non-literal service. That form had hidden
 every DataZone call from the scanner.
+### Lakehouse medallion: Bronze → Silver → Gold (Phase 1 PR-07)
+
+`pipeline/lakehouse/transform.py` holds the rules as pure functions:
+- dedup by `event_id`, drift tolerance, `turn_idx` ordering, `<think>` stripping, toxic drop;
+- PII redaction: checksum-validated identifiers, plus names from an injected detector;
+- eval decontamination, and near-dup removal keyed on the case reference;
+- a deterministic 90/10 Gold split and the `messages` mapping;
+- the Silver and Gold DQDL rulesets.
+
+Three thin Glue 5 jobs run those rules:
+- `land_bronze`;
+- `bronze_to_silver`, which detects names through the Bedrock guardrail `llmops-lakehouse-pii` v1;
+- `silver_to_gold`.
+
+`deploy/10_lakehouse.py` now deploys the guardrail and the jobs, with scoped Glue-role grants that
+`--verify` checks in both directions. `--smoke` runs the generator's dataset through the deployed jobs
+and holds the rule report to the plants exactly.
+
+**Live: 16/16 at small and demo scale.** Every rule caught exactly what was planted, and this is the
+real write as the Glue role that PR-04 deferred.
+
+Two findings from live runs:
+- Glue 5's bundled boto3 has no `apply_guardrail`; the job now pins the repo's SDK floor.
+- At demo scale, Guardrails flagged six clean conversations because it read Taiwanese store names
+  (`高雄前鎮店`, `Taichung Xitun`) as people. These are now protected by an org-entity reference list
+  (`pipeline/lakehouse/reference/org_entities.json`).
+
+Measured, not assumed: text similarity alone cannot separate planted near-duplicates (0.878) from
+template mates (0.945), so `near_dup` groups on the case reference first.
 
 ### Lakehouse source generator (Phase 1 PR-06)
 
