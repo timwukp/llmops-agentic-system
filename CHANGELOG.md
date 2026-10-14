@@ -5,6 +5,29 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
 ## [Unreleased]
 
+### Lakehouse source generator (Phase 1 PR-06)
+
+`pipeline/lakehouse/generate.py` produces the research report's §2 sources, in the exact shapes of the
+Bronze tables PR-04 deployed:
+- customer-service conversations in Traditional Chinese and English;
+- CRM and ERP change events, Debezium-style;
+- web events.
+
+It also plants the eight defect kinds PR-07's Silver/Gold rules must catch, each with an exact count
+and its ids in `expected_defects.json`:
+- PII in free text, toxic turns, leaked `<think>` traces;
+- out-of-order ingestion, near-duplicates, eval-set contamination;
+- duplicate resends, schema drift.
+
+It is seeded and deterministic: the same seed produced an identical `dataset_sha256` on macOS
+(Python 3.12.12) and on the AL2023 build runner (3.12.14).
+
+`tests/test_lakehouse_generate.py` (42 tests) re-detects every plant with an independent oracle and
+requires exact agreement in both directions, and checks every row against the deployed schema. The
+oracles found one real defect: promo and stock conversations repeated verbatim, which made unplanted
+exact duplicates. Each agent reply now carries a case reference. Three generator mutations were each
+caught.
+
 ### Lakehouse storage (Phase 1 PR-04)
 
 `deploy/10_lakehouse.py` (idempotent, `--dry-run`, `--verify`, `--teardown`) builds the storage Phase 1
