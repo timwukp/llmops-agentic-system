@@ -462,8 +462,16 @@ def _drain(resp, out_of_wall=None, remaining_ms=None) -> dict:
     `remaining_ms` arms the watchdog that makes the above ACTUALLY reachable when the
     stream goes quiet instead of slow — the case `out_of_wall` structurally cannot see,
     because it is only evaluated when a chunk arrives. See _stream_watchdog.
+
+    `serviced_tool_use` is the last block naming a tool only this driver can answer
+    (SERVICED_TOOLS), which is not always the last block. Live, sweeps 2026-10-06 and -07:
+    the agent called stage_complete, the harness itself answered `Unknown tool:
+    stage_complete` (its registry held only shell and skills), and the agent went on to run
+    shell before ending the turn. With one slot the driver saw `tool=shell`, and three
+    turns that each called stage_complete were counted as prose.
     """
     text, tool_use, stop_reason, error = [], None, None, None
+    blocks = []
     try:
         with _stream_watchdog(remaining_ms):
             for event in resp.get("stream", []):
@@ -479,6 +487,7 @@ def _drain(resp, out_of_wall=None, remaining_ms=None) -> dict:
                     if "toolUse" in start:
                         tool_use = {"toolUseId": start["toolUse"].get("toolUseId"),
                                     "name": start["toolUse"].get("name"), "input": ""}
+                        blocks.append(tool_use)
                 if tool_use is not None and "contentBlockDelta" in event:
                     delta = event["contentBlockDelta"].get("delta", {})
                     if "toolUse" in delta:
@@ -494,12 +503,15 @@ def _drain(resp, out_of_wall=None, remaining_ms=None) -> dict:
         print(f"[driver] stream watchdog fired: {exc}")
     except Exception as exc:  # stream death is expected in production
         error = f"{type(exc).__name__}: {exc}"
-    if tool_use is not None and isinstance(tool_use.get("input"), str):
-        try:
-            tool_use["input"] = json.loads(tool_use["input"] or "{}")
-        except json.JSONDecodeError:
-            tool_use["input"] = {"_raw": tool_use["input"]}
+    for block in blocks:
+        if isinstance(block.get("input"), str):
+            try:
+                block["input"] = json.loads(block["input"] or "{}")
+            except json.JSONDecodeError:
+                block["input"] = {"_raw": block["input"]}
+    serviced = [b for b in blocks if b.get("name") in SERVICED_TOOLS]
     return {"text": "".join(text), "tool_use": tool_use,
+            "serviced_tool_use": serviced[-1] if serviced else None,
             "stop_reason": stop_reason, "error": error}
 
 
@@ -528,7 +540,18 @@ def _tool_result_content(tool_use: dict, payload: dict) -> list:
     unnecessary, it is a lie the runtime would reject on a null id. Such a call is
     answered as PLAIN TEXT: the agent still learns the outcome, which is the only thing
     the reply is for, and the two shapes stay honest about which one actually happened.
+
+    A SHADOWED call (one the harness answered `Unknown tool` before the turn went on) is
+    answered as text too, for the same reason in reverse: the runtime minted its id AND
+    already answered it, so there is no pending call, and an echo of that id after the
+    later messages would put an answered toolUse back into history. Its wording says what
+    happened, because the agent saw an error and has to learn the error was not the answer.
     """
+    if tool_use.get("recovered") == "shadowed":
+        return _user_text(f"Result of your {tool_use.get('name')} call (your session "
+                          f"answered it as an unknown tool, but the driver received it and "
+                          f"serviced it -- do not re-send it through shell or S3): "
+                          f"{json.dumps(payload, default=str)}")
     if not tool_use.get("toolUseId"):
         return _user_text(f"Result of your {tool_use.get('name')} call "
                           f"(recovered from your message text, which wrote the call out "
@@ -571,6 +594,14 @@ _TYPED_MDCALL_RE = re.compile(r'\*\*([A-Za-z_][A-Za-z0-9_]*)\*\*')
 #: a colon, and an optional fenced-code opener. Anchored at a position, so anything else in
 #: between (a sentence, a comma) means the object is NOT this call's argument.
 _MD_ARGS_GAP_RE = re.compile(r'[\s:]*(?:```(?:json)?\s*)?(\{)')
+
+#: The FOURTH observed spelling: a tag named after the declaration kind, with a JSON object
+#: as its whole body. Live: sweeps 2026-08-18 and -08-31 each ended three turns with
+#: `<inline-function name="stage_complete">{...}</inline-function>` and died
+#: UnclaimedStageOutputs with their report in S3. The `{` is captured for the brace matcher;
+#: the closing tag is checked after it, so a body with anything besides the object is prose.
+_TYPED_TAGCALL_RE = re.compile(r'<inline-function\s+name="([A-Za-z_][A-Za-z0-9_]*)"\s*>\s*(\{)')
+_TAGCALL_CLOSE_RE = re.compile(r'\s*</inline-function>')
 
 #: Serviced tools recoverable from a bolded NAME ALONE, with no argument object.
 #:
@@ -686,6 +717,21 @@ def parse_typed_call(text: str, serviced=SERVICED_TOOLS) -> Optional[dict]:
             continue
         body = _balanced_braces(text, match.start(2))
         if body is None:
+            continue
+        try:
+            args = json.loads(body)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(args, dict):
+            found, found_at = {"toolUseId": None, "name": name, "input": args}, match.start()
+    # The tag spelling, held to the Python spelling's bar -- ONE valid JSON object -- plus
+    # its own closing tag directly after it, so a tag wrapping a sentence stays prose.
+    for match in _TYPED_TAGCALL_RE.finditer(text):
+        name = match.group(1)
+        if name not in serviced or match.start() <= found_at:
+            continue
+        body = _balanced_braces(text, match.start(2))
+        if body is None or not _TAGCALL_CLOSE_RE.match(text, match.start(2) + len(body)):
             continue
         try:
             args = json.loads(body)
@@ -1239,9 +1285,11 @@ PROTOCOL_SK = "protocol#"
 #: never reach the per-turn log line at all -- the deadline handoff, the first stream
 #: death, and the infra-error retry ladder -- and a denominator that silently omits them
 #: would make an outage look like a clean run.
+#: `recovered_shadowed_calls` is a SUBSET of `recovered_ending_in_prose`: the recovered call
+#: was not the turn's last block, because a harness-run tool followed it (see _drain).
 PROTOCOL_COUNTERS = ("turns", "serviced_turns", "prose_turns", "filtered_turns_total",
                      "recovered_typed_calls", "recovered_ending_in_prose",
-                     "infra_error_turns_total", "deadline_cuts")
+                     "recovered_shadowed_calls", "infra_error_turns_total", "deadline_cuts")
 
 
 def _record_protocol(ddb, run_id: str, stage: str, task: str, epoch: int,
@@ -2450,6 +2498,59 @@ def _settle_liveness(c, event, result):
               f"a finished triage: {type(exc).__name__}: {exc}")
 
 
+#: Outcomes of a scheduled job that need no page: it finished, or it escalated -- and
+#: handle_escalate has already published that to the same topic.
+SCHEDULED_QUIET = ("completed", "escalated")
+
+
+def _settle_scheduled_outcome(c, event, result) -> None:
+    """Write a scheduled job's real outcome onto the row its dispatcher left, and page on
+    anything but success.
+
+    A scheduled job (the monitor sweep) has no task token and no run, so a failure here
+    settles nothing and notifies no one: the driver emits PipelineFailed, and the only rule
+    on that bus matches EscalatedToHuman. Live, sweeps 2026-08-18, -08-31, -10-06 and -10-07
+    each ended UnclaimedStageOutputs while their `sweep#sweep` row went on reading
+    `invoked` -- written by the dispatcher before the driver had run a turn. The cost
+    control had stopped four times, and nothing anyone reads said so.
+
+    The dispatcher names its row (`outcome_sk`) rather than this function guessing it from
+    the run_id, so a job that did not ask for this gets none of it. Two channels, each
+    wrapped: neither may change how the invocation ends, and the row must not wait on SNS.
+    """
+    sk = event.get("outcome_sk")
+    if not sk or event.get("task_token"):
+        return
+    status = str((result or {}).get("status") or "unknown")
+    if status == "self_reinvoked_between_turns":
+        return
+    detail = json.dumps(result, default=str)[:4000]
+    try:
+        c["ddb"].Table(os.environ["EVENTS_TABLE"]).update_item(
+            Key={"run_id": event["run_id"], "sk": sk},
+            UpdateExpression="SET #s = :s, driver_outcome = :d, settled_at = :t",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={
+                ":s": status, ":d": detail,
+                ":t": datetime.now(timezone.utc).isoformat()})
+    except Exception as exc:  # noqa: BLE001 -- bookkeeping must not withhold the page
+        print(f"[driver] could not settle the outcome row of {event.get('run_id')}: "
+              f"{type(exc).__name__}: {exc}")
+    if status in SCHEDULED_QUIET:
+        return
+    try:
+        c["sns"].publish(
+            TopicArn=os.environ["LLMOPS_SNS_TOPIC"],
+            Subject=(f"[llmops] scheduled {event.get('stage')} {event.get('task')} did not "
+                     f"complete: {event.get('run_id')}")[:100],
+            Message=json.dumps({"run_id": event.get("run_id"), "stage": event.get("stage"),
+                                "task": event.get("task"), "status": status,
+                                "outcome": result}, indent=2, default=str)[:60000])
+    except Exception as exc:  # noqa: BLE001
+        print(f"[driver] could not page the failed {event.get('task')} of "
+              f"{event.get('run_id')}: {type(exc).__name__}: {exc}")
+
+
 def handler(event, context=None, clients=None):
     """Run one stage, and never strand the task token on the way out.
 
@@ -2483,6 +2584,7 @@ def handler(event, context=None, clients=None):
         # check placed at any single one of those would have to be repeated at the rest.
         result = _run_stage(event, context, c)
         _settle_liveness(c, event, result)
+        _settle_scheduled_outcome(c, event, result)
         return _backstop_page(c, event, result)
     except Exception as exc:
         token = event.get("task_token")
@@ -2496,8 +2598,9 @@ def handler(event, context=None, clients=None):
         # A crashed triage is also an unanswered one, and the crash reaches nobody but
         # CloudWatch: a bus triage has no task token, so there is no send_task_failure
         # above to carry the news and no state machine waiting to hear it.
-        _backstop_page(c, event, {"status": "crashed",
-                                  "reason": f"{type(exc).__name__}: {exc}"[:500]})
+        crashed = {"status": "crashed", "reason": f"{type(exc).__name__}: {exc}"[:500]}
+        _settle_scheduled_outcome(c, event, crashed)
+        _backstop_page(c, event, crashed)
         raise
     # No `finally` restoring a model here any more, and that is the point of the
     # redesign: a failover is now InvokeHarness's per-invocation `model` override parked
@@ -2954,6 +3057,23 @@ def _run_stage(event, context=None, c=None):
         # ones it can, the call is serviced whatever the stop_reason says. The set is
         # the dispatch table itself (SERVICED_TOOLS), which is the same question the
         # branches below answer.
+        #
+        # And the call need not be the LAST block. When the harness answers an inline
+        # function itself (`Unknown tool`, see _drain) the agent often keeps going -- shell
+        # to write a stage_complete.json, an echo of STAGE_COMPLETE -- and the turn ends on
+        # that shell block. Sweeps 2026-10-06 and -07 each called stage_complete in three
+        # turns this way and settled UnclaimedStageOutputs. The earlier call is the one the
+        # agent made through the tool channel, so it is serviced; a shell block is not a
+        # competing call, since only this driver can answer an inline function.
+        shadowed = out.get("serviced_tool_use")
+        if tu and out["stop_reason"] != "tool_use" and tu.get("name") not in SERVICED_TOOLS \
+                and shadowed:
+            print(f"[driver] {shadowed['name']} was called earlier in this turn and then "
+                  f"followed by {tu.get('name')}; servicing it -- only this driver can "
+                  "answer it, whatever the harness told the agent")
+            prot["recovered_shadowed_calls"] += 1
+            # No toolUseId: the harness already answered that id. See _tool_result_content.
+            tu = {**shadowed, "toolUseId": None, "recovered": "shadowed"}
         if tu and out["stop_reason"] != "tool_use" and tu.get("name") in SERVICED_TOOLS:
             print(f"[driver] {tu['name']} arrived with stop_reason="
                   f"{out['stop_reason']}; servicing it anyway -- the harness cannot "
@@ -2962,11 +3082,16 @@ def _run_stage(event, context=None, c=None):
             out = {**out, "stop_reason": "tool_use"}
         # The turn may instead have WRITTEN the call out: `<invoke name="job_launched">`
         # as literal text, which no structured reader can see. Recovered only when no
-        # real toolUse block arrived, so a genuine call always wins over a transcribed
+        # real SERVICED call arrived, so a genuine call always wins over a transcribed
         # one, and only for SERVICED_TOOLS -- see parse_typed_call for why this is a
         # dispatch path and not a prompt problem (job_launched: 0 real calls in 25 days).
+        #
+        # "No serviced call", not "no block at all": the gate was `if not tu`, so a turn
+        # that ran shell and then typed `stage_complete({...})` -- sweep 2026-10-06's last
+        # two turns, a spelling this parser already knew -- never reached the parser.
         recovered_no_arg = False
-        if not tu:
+        if not tu or (tu.get("name") not in SERVICED_TOOLS
+                      and out["stop_reason"] != "tool_use"):
             typed = parse_typed_call(out["text"])
             # An ARGUMENT-LESS recovery is the weakest signal this driver acts on -- a
             # bolded word in a sentence can produce one -- and it re-arms the prose budget,

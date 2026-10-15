@@ -5,6 +5,32 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
 ## [Unreleased]
 
+### Monitor sweep: a stage_complete the agent made is heard, and a failed sweep is seen
+
+Four scheduled sweeps never completed: 2026-08-18, 08-31, 10-06 and 10-07. Each one wrote its report
+and ended `UnclaimedStageOutputs` with 0 serviced turns. The agent called `stage_complete` every
+time; the driver missed it.
+- 10-06 and 10-07: the harness answered the real call `Unknown tool` (its registry held only shell
+  and skills). The agent then ran shell, and `_drain` kept only that last block. Typed-call recovery
+  ran only when no block at all arrived, so the shell block also hid the `stage_complete({...})` the
+  agent typed next.
+- 08-18 and 08-31: the agent typed `<inline-function name="stage_complete">{…}</inline-function>`,
+  a spelling the parser did not know.
+
+The driver now services the last serviced call in a turn even when a harness tool followed it. Such
+a call is answered as text, because the harness already answered its id, and counted as
+`recovered_shadowed_calls`. Typed recovery runs whenever no serviced call arrived. The tag spelling
+is recovered under the same one-JSON-object bar as the Python spelling.
+
+The failures were also silent. `PipelineFailed` has no rule on the bus, and the `sweep#sweep` row
+kept reading `invoked`. The sweep payload now names that row (`outcome_sk`). The driver settles the
+row with the real outcome and publishes to `llmops-escalations` unless the sweep completed or
+escalated. No IAM change. The monitor prompt now says a file, an echo or typed text is not the call,
+and that after an `Unknown tool` error the agent should end the turn.
+
+14 tests replay the live shapes; 9 fail on the unfixed driver. Deploy and a live sweep wait for the
+owner. Evidence: `deploy/evidence/VERIFICATION_sweep_unheard_calls.md`.
+
 ### Phase 1 PR-08: Gold export, reproducible and re-verified by the driver
 
 Training will read a **file** pinned to one Gold snapshot, never the Iceberg table. The new Glue

@@ -3676,7 +3676,10 @@ case("contracts: a JSON-quoted single URI keeps its quote and is never verified"
 #      (442 billable seconds) with no parked token, so nothing would ever have settled it.
 #      Measured: `tool=job_launched` appears ZERO times in 25 days of driver logs.
 def m203(t):
-    old = re.search(r'\n        if not tu:\n            typed = parse_typed_call'
+    # The gate's condition is matched up to its colon rather than spelled out: it widened
+    # from `if not tu` to "no SERVICED call in hand" (sweep-unheard-calls), and a literal
+    # anchor expired the moment it was correctly updated.
+    old = re.search(r'\n        if not tu\b[^:]*?:\n            typed = parse_typed_call'
                     r'\(out\["text"\]\).*?\n                out = \{\*\*out, '
                     r'"stop_reason": "tool_use"\}\n', t, re.S)
     assert old, "the typed-call dispatch hook no longer matches; re-anchor this mutation"
@@ -3743,9 +3746,9 @@ case("driver: a recovered call is echoed back with a null toolUseId the runtime 
 #      talked about instead of what it did, which is the whole failure mode the `serviced`
 #      gate in 204 exists to bound, arriving by a different door.
 def m207(t):
-    old = "        if not tu:\n            typed = parse_typed_call"
-    assert t.count(old) == 1, f"the typed-call precondition has moved; found {t.count(old)}"
-    return t.replace(old, "        if True:\n            typed = parse_typed_call", 1)
+    found = re.findall(r'\n        if not tu\b[^:]*?:\n            typed = parse_typed_call', t)
+    assert len(found) == 1, f"the typed-call precondition has moved; found {len(found)}"
+    return t.replace(found[0], "\n        if True:\n            typed = parse_typed_call", 1)
 
 
 case("driver: a typed call in the same turn's text displaces the real tool call",
@@ -6004,6 +6007,75 @@ case("vision: the gate's instrument becomes self-authored",
      _EVAL_HARNESS, m345,
      [f"{_TO}TestVisionPromptClauses::"
       "test_the_eval_scorer_is_canonical_and_self_authoring_is_forbidden"])
+
+
+# ── sweep-unheard-calls: the stage_complete four sweeps made and nobody heard ─────────
+#
+# Sweeps 2026-08-18, -08-31, -10-06 and -10-07 each called stage_complete and settled
+# UnclaimedStageOutputs. Each control below restores one of the four ways that happened.
+
+# 346. The shadowed-call recovery is deleted: a stage_complete the harness answered
+#      `Unknown tool`, followed by shell, is counted as prose again (10-06 / 10-07).
+def m346(t):
+    old = re.search(r'\n        shadowed = out\.get\("serviced_tool_use"\)\n.*?'
+                    r'"recovered": "shadowed"\}\n', t, re.S)
+    assert old, "the shadowed-call recovery no longer matches; re-anchor this mutation"
+    return t.replace(old.group(0), "\n", 1)
+
+
+case("driver: a stage_complete followed by shell in the same turn is prose again",
+     _DRIVER, m346,
+     [f"{_TO}test_a_stage_complete_followed_by_shell_in_the_same_turn_is_serviced",
+      f"{_TO}test_a_shadowed_call_is_answered_as_text_because_the_harness_already_answered_it"])
+
+# 347. The typed-call gate narrows back to `if not tu`, so a shell block switches the parser
+#      off and 10-06's typed `stage_complete({...})` is never read.
+def m347(t):
+    found = re.findall(r'\n        if not tu\b[^:]*?:\n            typed = parse_typed_call', t)
+    assert len(found) == 1, f"the typed-call gate has moved; found {len(found)}"
+    return t.replace(found[0], "\n        if not tu:\n            typed = parse_typed_call", 1)
+
+
+case("driver: a shell block in the turn hides a typed call from the parser",
+     _DRIVER, m347,
+     [f"{_TO}test_a_call_typed_after_a_shell_block_is_recovered"])
+
+# 348. The shadowed call keeps its toolUseId, so it is echoed back as a toolUse/toolResult
+#      pair for an id the harness already answered.
+def m348(t):
+    old = 'tu = {**shadowed, "toolUseId": None, "recovered": "shadowed"}'
+    assert t.count(old) == 1, f"the shadowed-call id drop has moved; found {t.count(old)}"
+    return t.replace(old, 'tu = {**shadowed}', 1)
+
+
+case("driver: a shadowed call is echoed back under an id the harness already answered",
+     _DRIVER, m348,
+     [f"{_TO}test_a_shadowed_call_is_answered_as_text_because_the_harness_already_answered_it"])
+
+# 349. The <inline-function> spelling loses its closing-tag check, so a tag around an object
+#      followed by more prose is recovered as a call (08-18 / 08-31's spelling, loosened).
+def m349(t):
+    old = "if body is None or not _TAGCALL_CLOSE_RE.match(text, match.start(2) + len(body)):"
+    assert t.count(old) == 1, f"the tag close check has moved; found {t.count(old)}"
+    return t.replace(old, "if body is None:", 1)
+
+
+case("driver: an <inline-function> tag wrapping an object plus prose is recovered",
+     _DRIVER, m349,
+     [f"{_TO}test_the_tag_spelling_is_held_to_one_json_object_and_a_serviced_name"])
+
+# 350. The scheduled-outcome settle is never called, so a failed sweep's row reads `invoked`
+#      forever and nobody is paged -- the silence all four failures had.
+def m350(t):
+    old = "        _settle_scheduled_outcome(c, event, result)\n"
+    assert t.count(old) == 1, f"the outcome settle call has moved; found {t.count(old)}"
+    return t.replace(old, "", 1)
+
+
+case("driver: a scheduled sweep that fails leaves its row at `invoked` and pages no one",
+     _DRIVER, m350,
+     [f"{_TO}test_a_sweep_that_does_not_complete_settles_its_row_and_pages_once",
+      f"{_TO}test_a_completed_sweep_settles_its_row_without_paging"])
 
 
 #: Where the pristine text of the file currently mutated is parked, so a kill -9 -- which

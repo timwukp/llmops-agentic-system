@@ -509,7 +509,8 @@ write-first 規則（artifact 先落 S3，宣稱它的呼叫在後）—— 有�
 靠人工翻日誌數出來的原因。driver 現在為每個 stage epoch 在 `llmops-stage-events` 寫一列
 （`sk = protocol#<stage>#<task>#e<epoch>`，零新 IAM、零新資源），帶 `turns`、
 `serviced_turns`、`prose_turns`、`filtered_turns_total`、`recovered_typed_calls`、
-`recovered_ending_in_prose`、`infra_error_turns_total`、`deadline_cuts`。它寫在 stop_reason
+`recovered_ending_in_prose`、`recovered_shadowed_calls`（被救回的呼叫不是該回合最後一個 block）、
+`infra_error_turns_total`、`deadline_cuts`。它寫在 stop_reason
 覆寫與 typed-call 救援**之後**，而不是之前 —— 那個順序正是 `[driver] turn` 那行日誌的缺陷：
 它印得太早，所以實際上被服務的回合會顯示 `tool=None`。寫**絕對值**而非 `ADD`，並帶
 `ConditionExpression="attribute_not_exists(turns) OR turns <= :turns"`，讓遲到的重播無法把
