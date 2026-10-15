@@ -427,8 +427,11 @@ STAGE_FLOW = [
 ]
 # SFN state name -> logical stage (same mapping pattern as the source repo's
 # GitHub step-name -> stage table). RemediateFinetune re-enters finetune-launch.
+#: LakehouseReview shares the curate card: in a lakehouse run it is the step that hands finetune
+#: its dataset. The five lakehouse Glue states have no card; the Data tab shows their reports.
 STATE_TO_STAGE = {
     "DataPrepGenerate": "data-prep-generate", "DataPrepCurate": "data-prep-curate",
+    "LakehouseReview": "data-prep-curate",
     "FinetuneLaunch": "finetune-launch", "FinetuneAnalyze": "finetune-analyze",
     "RemediateFinetune": "finetune-launch", "EvalGate": "eval-gate",
     "Deploy": "deploy", "SmokeTest": "smoke", "Teardown": "teardown",

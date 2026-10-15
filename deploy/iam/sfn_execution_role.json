@@ -59,6 +59,19 @@
           "arn:aws:dynamodb:<REGION>:<ACCOUNT_ID>:table/llmops-pipeline-runs",
           "arn:aws:dynamodb:<REGION>:<ACCOUNT_ID>:table/llmops-tasks"
         ]
+      },
+      {
+        "Sid": "RunLakehouseJobs",
+        "_comment": [
+          "PR-09: the five lakehouse states are glue:startJobRun.sync, so the state machine",
+          "starts the jobs and polls them itself. Scoped to the llmops-lakehouse-* jobs. No",
+          "iam:PassRole: each job's role is fixed in its definition, and StartJobRun cannot",
+          "change it. BatchStopJobRun is what .sync calls when the execution is stopped or the",
+          "state times out, so a stopped run does not leave a Glue job writing tables."
+        ],
+        "Effect": "Allow",
+        "Action": ["glue:StartJobRun", "glue:GetJobRun", "glue:GetJobRuns", "glue:BatchStopJobRun"],
+        "Resource": "arn:aws:glue:<REGION>:<ACCOUNT_ID>:job/llmops-lakehouse-*"
       }
     ]
   }

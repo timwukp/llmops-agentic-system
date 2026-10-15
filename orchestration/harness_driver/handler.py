@@ -49,6 +49,9 @@ except ImportError:  # Lambda bundle layout (contracts vendored alongside)
 STAGE_EVENT_MAP = {
     ("data-prep", "generate"): ev.DATASET_GENERATED,
     ("data-prep", "curate"): ev.DATASET_CURATED,
+    # A lakehouse run's review is its curation: it hands finetune the dataset to train on (a
+    # pinned Gold extract), so it announces the same fact under the same name.
+    ("data-prep", "lakehouse_review"): ev.DATASET_CURATED,
     ("finetune", "analyze"): ev.MODEL_TRAINED,
     # ModelEvaluated was declared in the event vocabulary and emitted by NOTHING --
     # the same absence as the evaluate task itself, from the other side.

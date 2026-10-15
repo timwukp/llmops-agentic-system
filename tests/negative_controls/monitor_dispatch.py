@@ -3389,10 +3389,10 @@ case("prompt: the gate goes back to scoring the val split whatever the plan name
 #      between runs cannot be compared across runs, and nothing in the report would say so.
 def m189(t):
     old = ('Fall back to the 10% val split from distillation/curated.jsonl only when no '
-           'customer set was named, and say in the report which set was used')
+           'customer set was named')
     assert t.count(old) == 1, f"the fallback ranking has moved; found {t.count(old)}"
     return t.replace(old, 'The 10% val split from distillation/curated.jsonl is also '
-                          'available, and say in the report which set was used', 1)
+                          'available', 1)
 
 
 case("prompt: the val split stops being labelled the fallback and becomes an equal option",
@@ -6076,6 +6076,50 @@ case("driver: a scheduled sweep that fails leaves its row at `invoked` and pages
      _DRIVER, m350,
      [f"{_TO}test_a_sweep_that_does_not_complete_settles_its_row_and_pages_once",
       f"{_TO}test_a_completed_sweep_settles_its_row_without_paging"])
+# ── PR-09: the lakehouse modes ─────────────────────────────────────────────────────
+_LM = "tests/test_lakehouse_mode.py::"
+
+
+def m351(t):
+    # The state machine's Silver report path drifts from the layout the smoke proved: the
+    # job writes silver.json where the export (and the review) will never look for it.
+    old = "s3://{}/lakehouse/reports/{}/silver.json', $.lakehouse.data_bucket, $.lakehouse.dataset)\",\n"
+    assert t.count(old) >= 1, "the Silver report argument moved"
+    return t.replace(old, old.replace("silver.json", "silver-report.json"), 1)
+
+
+case("lakehouse: an ASL job argument drifts from the smoke-proven layout",
+     "orchestration/state_machine.asl.json", m351,
+     [f"{_LM}test_every_glue_state_passes_exactly_the_layout_the_deploy_smoke_uses"])
+
+
+def m352(t):
+    # Agents gain write on the extracts: a model's training bytes become replaceable after
+    # the driver hashed them, and every attestation reads true about a file that changed.
+    old = """        "Sid": "S3LakehouseReadOnly","""
+    assert t.count(old) == 1, "the lakehouse read-only statement moved"
+    head, _, tail = t.partition(old)
+    act = '"s3:GetObject"\n        ]'
+    assert act in tail, "its action list moved"
+    return head + old + tail.replace(act, '"s3:GetObject",\n          "s3:PutObject"\n        ]', 1)
+
+
+case("lakehouse: agents may write the Gold extracts",
+     "deploy/iam/harness_execution_role.json", m352,
+     [f"{_LM}test_agents_read_reports_and_extracts_and_can_neither_write_them_nor_run_a_job"])
+
+
+def m353(t):
+    # Dispatch stops checking the values: a dataset id like ../customer-data reaches a Glue
+    # job's S3 arguments, and a bad seed fails a GPU-less job one stage later instead of here.
+    old = "    _check_lakehouse_values(merged)\n"
+    assert t.count(old) == 1, "the lakehouse value check moved"
+    return t.replace(old, "", 1)
+
+
+case("lakehouse: dispatch stops refusing bad lakehouse values",
+     "orchestration/start_pipeline/handler.py", m353,
+     [f"{_LM}test_dispatch_refuses_what_a_glue_job_would_fail_on_a_stage_later"])
 
 
 #: Where the pristine text of the file currently mutated is parked, so a kill -9 -- which

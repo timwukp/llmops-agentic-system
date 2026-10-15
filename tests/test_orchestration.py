@@ -3448,6 +3448,15 @@ def _job_launching_tasks() -> set:
     return out
 
 
+def _load_lakehouse_deploy():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "lakehouse_deploy_for_asl", REPO / "deploy" / "10_lakehouse.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 class TestStateMachine:
 
     def test_all_next_targets_exist(self, asl):
@@ -3825,10 +3834,26 @@ class TestStateMachine:
         CLEANUP = {"Teardown", "MonitorHealth", "MonitorReport", "SmokeTest",
                    "Deploy", "DataAudit", "FinetuneAnalyze"}
         LONG_WORK = {"DataPrepGenerate", "DataPrepCurate", "FinetuneLaunch",
-                     "EvalGenerate", "EvalScore", "EvalGate", "RemediateFinetune"}
+                     "EvalGenerate", "EvalScore", "EvalGate", "RemediateFinetune",
+                     "LakehouseReview"}
+        # The lakehouse Glue states wait on a job with its own Timeout, and that one must fire
+        # first: a job that times out ends FAILED with its error, while a state that times out
+        # around a running job leaves .sync to stop it and the cause unrecorded. Derived from
+        # the jobs' definitions, so raising a job's limit cannot leave its state cutting it off.
+        GLUE = {n for n, st in asl["States"].items()
+                if st.get("Resource", "").startswith("arn:aws:states:::glue:")}
+        lh = _load_lakehouse_deploy()
+        job_timeout_s = {name: lh.job_definition(name, script, "r", "b")["Timeout"] * 60
+                         for name, script in lh.JOBS.values()}
+        for n in sorted(GLUE):
+            st = asl["States"][n]
+            limit = job_timeout_s[st["Parameters"]["JobName"]]
+            assert limit < st["TimeoutSeconds"] <= 7200, (
+                f"{n}: TimeoutSeconds {st['TimeoutSeconds']} must sit above its job's own "
+                f"{limit}s and within 7200")
         timed = {n for n, st in asl["States"].items() if "TimeoutSeconds" in st}
-        assert timed == CLEANUP | LONG_WORK, (
-            f"the timeout policy names {sorted(CLEANUP | LONG_WORK)} but the ASL times "
+        assert timed == CLEANUP | LONG_WORK | GLUE, (
+            f"the timeout policy names {sorted(CLEANUP | LONG_WORK | GLUE)} but the ASL times "
             f"{sorted(timed)}; a new timed state must be classified, not defaulted -- "
             "an unclassified state is how a cleanup stage inherits a 24-hour ceiling")
         for n in sorted(CLEANUP):
@@ -4577,13 +4602,18 @@ class TestTheCustomersOwnDataIsActuallyRead:
         # prompt said about the two evaluation sets. Measured: control m189 -- which strips
         # the ranking out of the val-split sentence, the exact defect this line exists to
         # catch -- was UNCAUGHT, while the documented control count reported it passing.
-        # A guard an unrelated sentence can satisfy is not a guard.
+        # A guard an unrelated sentence can satisfy is not a guard. It recurred inside the
+        # sentence itself: PR-09 added a parenthetical about the lakehouse fallback to the
+        # val-split sentence ("the fallback is its val_uri"), and /fall\s*back/ matched that
+        # while m189 stripped the ranking -- uncaught again, on the runner. So the match is
+        # now the ranking clause, the val split named AS the fallback, not the word.
         body = "".join(bullets[t] for t in sorted(readers))
         val = [s for s in re.split(r"(?<=\.)\s+", body) if "val split" in s]
         assert val, (
             "the eval prompt no longer mentions the val split at all, so this guard cannot "
             "tell whether it is still ranked below the customer's set")
-        assert any(re.search(r"fall\s*back|only when no customer", s, re.I) for s in val), (
+        assert any(re.search(r"fall\s*back to the 10% val split|only when no customer", s, re.I)
+                   for s in val), (
             "the eval prompt names customer_eval_uri without stating that the val "
             "split is the FALLBACK; two eligible sets and no precedence means the "
             "score's provenance is decided per-run by the model. Sentences naming the "
@@ -5108,6 +5138,10 @@ class TestConductorDispatch:
             # ending is an escalation.
             "model_artifact_uri": "plan",
             "source_run_id": "plan",
+            # lakehouse's prerequisite: which Gold dataset a training run trains on. Plan-only
+            # and refused at dispatch when absent or not a dataset id (MODE_REQUIRED_PARAMS,
+            # _check_lakehouse_values) -- there is no newest-dataset default to fall back on.
+            "lakehouse_dataset": "plan",
             # the r6d retrieval index (RAFT). Plan-only and activation-gating: every
             # clause that reads them is conditioned on retrieval_kb_id's PRESENCE, so a
             # closed-book plan runs the classic path untouched. The kb id itself is
@@ -13583,8 +13617,10 @@ class TestVisionModePrerequisites:
 
     def test_existing_modes_are_untouched_by_the_chosen_key_check(self):
         """Isolation pin: full/eval_only/deploy_only have no MODE_REQUIRED_CHOSEN entry,
-        so a plan that inherits every default still dispatches exactly as before."""
-        assert set(start_pipeline.MODE_REQUIRED_CHOSEN) == {"vision"}
+        so a plan that inherits every default still dispatches exactly as before. lakehouse
+        is the second mode whose defaults are a trap (an ARC gate on a customer-service
+        corpus), and it was added on purpose; anything else appearing here was not."""
+        assert set(start_pipeline.MODE_REQUIRED_CHOSEN) == {"vision", "lakehouse"}
         m = start_pipeline.seed_manifest("run-f", "webhook", {}, {})
         assert m["params"].get("pipeline_mode", "full") == "full"
         assert m["params"]["gates"] == start_pipeline.DEFAULT_PARAMS["gates"]

@@ -599,7 +599,14 @@ def test_the_orphans_monthly_figure_is_derived_and_the_budget_filter_is_stated_b
         # THIS paragraph -- the same way a repeated phrase elsewhere once silently
         # disarmed test_every_schedule_the_deployer_creates_is_named_in_the_cost_posture.
         assert "bedrock-monthly-dev" in text, f"{doc} no longer names the account budget"
-        para = text.partition("bedrock-monthly-dev")[2][:1600]
+        # Bounded by the passage itself (the next rule or heading), not by a character count:
+        # with a 1600-character window, deleting the bullet that names the sweep left a later
+        # section's "sweep" inside the window, and control m-"finops: COST.md states the
+        # budget's Bedrock filter..." went uncaught on main while the documented control count
+        # said every control passed.
+        rest = text.partition("bedrock-monthly-dev")[2]
+        end = re.search(r"\n---\n|\n#{1,6} ", rest)
+        para = rest[:end.start()] if end else rest
 
         assert stated in para, (
             f"{doc} does not state the orphan's monthly cost as {stated} alongside the "
