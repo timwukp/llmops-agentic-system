@@ -129,3 +129,28 @@ existing end_turn recovery: the agent stopped after the error, so the call was t
 live (`recovered_shadowed_calls 0`, `recovered_typed_calls 0`); they are proven by the replay tests in
 §5 only. The failure-page path (SNS on a non-completed sweep) was likewise not triggered, because the
 sweep completed. The next scheduled sweeps are the live sample for both.
+
+## 7. Deploying #168 on top, and a window this deploy opened (2026-10-15)
+
+CloudTrail (`UpdateFunctionCode` on `llmops-harness-driver`): #168's branch deployed the driver at
+**06:00:30Z**; §6's deploy replaced it at **08:16:42Z** with #167's tree, which predates #168's one
+driver change (`("data-prep", "lakehouse_review"): DATASET_CURATED` in `STAGE_EVENT_MAP`). The first
+read of the driver in this investigation (LastModified 2026-08-17) was taken before 06:00Z, which is
+why §6 called it the first deploy since August. It was not.
+
+Impact, checked: the only execution live in the window, `run-20261015T065307Z-97655783` (lakehouse
+mode), had finished `LakehouseReview` at 06:56Z, before the window opened. It later failed at EvalGate
+iteration 3, `EscalatedToHuman`: a borderline-gate page unanswered past its wait budget. Its stages
+after 08:16Z show `recovered_shadowed_calls 0` and `recovered_typed_calls 0`, so none of this change's
+new paths fired in it. Every one of its stages was serviced through `recovered_ending_in_prose`.
+
+Restored from `main` (`1c3c7c8`, #168's merge), with no execution running:
+- `07_lambdas.py --only driver --only start --only state_machine`: driver and start-pipeline at
+  10:01Z; state machine `definition_confirmed`, `states_live 35`, ASL validated with no diagnostics.
+- `deploy/console/deploy.sh`: `llmops-admin` at 10:04Z. pip ran with `PIP_USE_DEPRECATED=legacy-certs`,
+  because the sandbox blocks keychain TLS verification, so verification stayed on via certifi.
+- Checked live, not re-pushed: `01_iam.py --dry-run` `changes_pending: false` across all 10 roles;
+  `10_lakehouse.py --verify` 59/59; data-prep/finetune/eval last `UpdateHarness` 06:01–06:04Z (#168's own).
+
+No pipeline run was started for this redeploy. Starting one needs a signed plan, so that is the
+owner's step; the next scheduled sweep exercises the driver.

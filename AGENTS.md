@@ -293,9 +293,10 @@ versions and introspects the live CreateHarness/UpdateHarness schemas.
   in S3, and their `PipelineFailed` matched no rule. So read every serviced block in the stream, not
   the last one (`serviced_tool_use` in `_drain`). Never gate typed-call recovery on "no block at
   all". Answer such a call as text, since its id has already been answered. Why the registry omits
-  the inline functions is not established. The pipeline stages on record have
-  `recovered_ending_in_prose = 0`, while both scheduled jobs depend on it (the sweep, and
-  `finops/reconcile` at 16 of 93). `deploy/evidence/VERIFICATION_sweep_unheard_calls.md`.
+  the inline functions is not established, and it is not confined to the scheduled jobs: the
+  August pipeline rows show `recovered_ending_in_prose = 0`, but every stage of the 2026-10-15
+  lakehouse run `run-20261015T065307Z-97655783` was serviced through it (EvalGate 13 times). Treat
+  the end_turn path as the normal one, not a fallback. `deploy/evidence/VERIFICATION_sweep_unheard_calls.md`.
 - **Observability**: `OTEL_TRACES_SAMPLER=always_on` env var is mandatory or
   evaluations/insights sit at zero forever. X-Ray delivery takes no `outputFormat`.
 - **Turn budget**: harness `timeoutSeconds` is 840 here (driver Lambda caps at 900s).
