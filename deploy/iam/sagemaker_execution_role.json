@@ -31,8 +31,15 @@
         "Action": "s3:ListBucket",
         "Resource": "arn:aws:s3:::<DATA_BUCKET>",
         "Condition": {
-          "StringLike": { "s3:prefix": "runs/*" }
+          "StringLike": { "s3:prefix": ["runs/*", "lakehouse/extracts/*"] }
         }
+      },
+      {
+        "Sid": "S3GoldExtractsRead",
+        "_comment": "PR-09: a lakehouse run's training channels ARE the Gold extract (lakehouse/extracts/<dataset>/<snapshot>/train.jsonl, val.jsonl), used verbatim rather than copied, so the bytes the job trains on are the bytes the driver hashed. Read-only: the training job has no business writing the dataset it is judged by.",
+        "Effect": "Allow",
+        "Action": "s3:GetObject",
+        "Resource": "arn:aws:s3:::<DATA_BUCKET>/lakehouse/extracts/*"
       },
       {
         "Sid": "EcrAuth",

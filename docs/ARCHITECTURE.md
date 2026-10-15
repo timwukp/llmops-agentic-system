@@ -68,7 +68,7 @@ DataPrepGenerate → DataPrepCurate → FinetuneLaunch → FinetuneAnalyze → E
              Deploy → SmokeTest → MonitorHealth → Teardown → MonitorReport
 ```
 
-**Four entry modes, decided by one `Choice` at `StartAt`** reading `pipeline_mode` out of
+**Seven entry modes, decided by one `Choice` at `StartAt`** reading `pipeline_mode` out of
 the execution input (it cannot read the manifest from S3, which is why the mode rides in the
 input at all). `full` is the `Default` above. `data_audit` is the conductor's cheap starter:
 audit the customer's data and stop before any GPU exists. **`eval_only`** enters at
@@ -137,6 +137,41 @@ register the model with the approval status "per params" while
 The mode is **not** a way around the gate. `gate_passed` having never been true is a separate,
 unsolved problem — the transfer floor r6c/r6d measured, not plumbing — and nothing here
 softens the gate to make this lane work.
+
+**`vision`** routes to the same state as `full`, `DataPrepGenerate`, and the Choice rule is
+kept only to make the mode explicit. Each agent's VISION MODE clause turns the same stages
+into a detector fine-tune. Dispatch refuses it unless the plan names `source_uri`, a labeled
+detection set, since there is no teacher to synthesize one. It must also name
+`customer_eval_uri` (the held-out set the mAP gate is anchored to), the student, and its own
+`gates` and `dataset`, because the inherited ARC defaults would judge a detector against a
+language benchmark.
+
+**`lakehouse_ingest` and `lakehouse`** (Phase 1 PR-09) put the lakehouse on the pipeline.
+`lakehouse_ingest` runs `LakehouseGenerate → LakehouseLand → LakehouseSilver → LakehouseGold`
+and stops. It needs a generator seed and scale, names its dataset after the run, and reaches no
+harness and no GPU. `lakehouse` trains on a dataset an ingest already built, named by
+`params.lakehouse_dataset`. It runs `LakehouseExport` (a Gold extract pinned to the dataset's
+snapshots and named by its sha256), then `LakehouseReview`, then the ordinary
+`FinetuneLaunch → … → QualityGateChoice` path. The five Glue states are
+`glue:startJobRun.sync`, run by Step Functions itself rather than launched by an agent:
+- The jobs' work is fixed by the job and its arguments, so an agent turn would decide nothing.
+- An agent launch would need `glue:StartJobRun` on the role all seven harnesses share.
+- It would also need a wake chain for the job's completion.
+
+The state machine builds each job's per-run arguments with `States.Format`, from a `lakehouse`
+object that start-pipeline puts in the execution input and the manifest. The arguments shared by
+every run of a job are its `DefaultArguments`.
+
+A failed job escalates and never reaches remediation. That includes a failed data-quality rule:
+the Silver and Gold jobs fail themselves after writing their report, and a DQ failure is a fact
+about the data that no retry changes. The one agent turn is data-prep's `lakehouse_review`. It
+reads the export, Gold and Silver reports, escalates on any failure, and claims the train
+extract. The driver re-hashes that extract from S3 before the claim enters the manifest. Finetune
+then trains on the extract's files verbatim and never re-splits them.
+
+Dispatch refuses a lakehouse run that lacks its params, carries an invalid dataset id, seed or
+scale, or does not name its student model and its gates. The inherited ARC gate is wrong for a
+customer-service corpus.
 
 The two monitor states are placed by the shape of their work, not by taste.
 **`MonitorHealth`** must read CloudWatch *while the endpoint exists*, and `Teardown`

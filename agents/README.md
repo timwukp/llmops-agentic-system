@@ -8,7 +8,7 @@ gets the shared BYO memory attached post-create by `deploy/04_wire_memory.py`.
 
 | Stage | Agent | Harness | Skills (MLOps-agent-skills) | Inline functions | Tasks |
 |---|---|---|---|---|---|
-| 1 | [data-prep](data-prep/harness.json) | `llmops_data_prep` | llm-data-preparation, llm-prompt-engineering, llm-guardrails | stage_complete, checkpoint, escalate_human | verify, generate, curate |
+| 1 | [data-prep](data-prep/harness.json) | `llmops_data_prep` | llm-data-preparation, llm-prompt-engineering, llm-guardrails | stage_complete, checkpoint, escalate_human | verify, generate, curate, lakehouse_review, audit, mirror_model |
 | 2 | [finetune](finetune/harness.json) | `llmops_finetune` | llm-fine-tuning, llm-distillation, llm-cost-optimization | stage_complete, **job_launched**, checkpoint, escalate_human | prepare, launch, analyze |
 | 3 | [eval](eval/harness.json) | `llmops_eval` | llm-evaluation, llm-guardrails | stage_complete, checkpoint, escalate_human | evaluate, gate |
 | 4 | [deploy](deploy/harness.json) | `llmops_deploy` | llm-deployment, llm-cost-optimization | stage_complete, checkpoint, escalate_human | deploy, smoke, teardown |

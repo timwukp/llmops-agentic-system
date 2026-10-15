@@ -194,6 +194,18 @@
         "Resource": "arn:aws:s3:::<DATA_BUCKET>/customer-data/*"
       },
       {
+        "Sid": "S3LakehouseReadOnly",
+        "_comment": "PR-09: the lakehouse jobs' reports and the Gold extracts, readable and never writable. data-prep's lakehouse_review reads the export, Gold and Silver reports and the extract it claims; finetune and eval read the extract's train/val files. Get only: an agent that could write lakehouse/extracts/ could replace the bytes a model is trained on after the driver hashed them, and one that could write lakehouse/reports/ could turn a failed DQ outcome into a passed one. No Glue, Athena, s3tables or KMS: Step Functions runs the jobs, and the tables themselves stay readable only by the Glue roles (Bronze holds PII).",
+        "Effect": "Allow",
+        "Action": [
+          "s3:GetObject"
+        ],
+        "Resource": [
+          "arn:aws:s3:::<DATA_BUCKET>/lakehouse/reports/*",
+          "arn:aws:s3:::<DATA_BUCKET>/lakehouse/extracts/*"
+        ]
+      },
+      {
         "Sid": "MacieFindingsReadForDataAudit",
         "_comment": "Read-only Macie so the data-prep `audit` task can cite real classification results in the Data Readiness Report instead of only its own regex pass. The prompt states outright that its scan is HEURISTIC and not compliance-grade, and the console's readiness panel links that report as the answer behind `PII disposition` -- so if the agent cannot read Macie, adding a classification job changes nothing a customer can see. simulate_principal_policy on this role returned implicitDeny for ListFindings/GetFindings/GetFindingStatistics/DescribeClassificationJob, which is why this is asserted rather than assumed: nothing in this repo granted macie2 at all. Read-only and deliberately WITHOUT CreateClassificationJob: a per-GB billable scan is the deploy's decision (03_storage.py --enable-pii-scan), not something an agent should be able to launch mid-turn, and without UpdateMacieSession/DisableMacie it also cannot turn off the check it is judged by. No Resource scoping: the macie2 read actions do not support it (findings are account-scoped), so the narrowing is the action list.",
         "Effect": "Allow",
@@ -228,7 +240,9 @@
               "models-mirror/*",
               "customer-data/*",
               "skills/*",
-              "code/*"
+              "code/*",
+              "lakehouse/reports/*",
+              "lakehouse/extracts/*"
             ]
           }
         }

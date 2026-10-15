@@ -12,6 +12,7 @@ from __future__ import annotations
 import datetime
 import json
 import os
+import re
 import sys
 import uuid
 
@@ -346,6 +347,22 @@ MODE_REQUIRED_PARAMS = {
          "the model.tar.gz to serve; this mode enters at Deploy, so there is no finetune "
          "stage in its manifest to read the artifact from and no gate verdict about it"),
     ),
+    "lakehouse_ingest": (
+        ("generator_seed",
+         "the generator's seed. The same seed and scale give byte-identical source files on "
+         "any machine, so the seed is what makes an ingest run reproducible; a default "
+         "would make every ingest the same dataset without anyone having chosen that"),
+        ("generator_scale",
+         "the generator's size (small or demo); it fixes the row counts and the planted "
+         "defects the Silver rules are held to"),
+    ),
+    "lakehouse": (
+        ("lakehouse_dataset",
+         "the Gold dataset to train on, as a lakehouse_ingest run (or the deploy smoke) "
+         "named it. Training reads a pinned extract of that dataset's Gold snapshots, so "
+         "there is no newest-dataset default: a model nobody chose the data for is not "
+         "reproducible, whatever its extract's sha256 says"),
+    ),
     "vision": (
         ("source_uri",
          "the labeled detection dataset (images + COCO annotations); vision has no "
@@ -373,6 +390,11 @@ MODE_REQUIRED_PARAMS = {
 # dispatch, it fails forty minutes and one GPU endpoint later, which is exactly the kind of
 # lesson this mode exists to stop paying for.
 MODE_REQUIRED_ROLES = {
+    "lakehouse": (
+        ("student",
+         "the model the Gold extract trains. The extract is a customer-service corpus, not "
+         "ARC, so the default student is a choice nobody made for this data"),
+    ),
     "deploy_only": (
         ("student",
          "the base model this artifact's adapters merge into. DEFAULT_MODELS would supply "
@@ -401,6 +423,15 @@ MODE_REQUIRED_ROLES = {
 # as named_roles: by the time the value reaches the manifest, "chosen" and "defaulted"
 # are indistinguishable, so dispatch is the only place the distinction exists for free.
 MODE_REQUIRED_CHOSEN = {
+    "lakehouse": (
+        ("gates",
+         "the gate block for this corpus. The inherited default is the ARC solve-rate gate, "
+         "and a customer-service copilot judged against it passes or fails for reasons "
+         "that have nothing to do with the data it was trained on"),
+        ("dataset",
+         "the dataset label; the inherited 'arc-agi-2' would stamp a lakehouse run's "
+         "manifest and cost rows with a benchmark it never touched"),
+    ),
     "vision": (
         ("gates",
          "the mAP gate block (e.g. {\"map50_uplift\": ..., \"format_validity\": ...}); "
@@ -441,6 +472,51 @@ def _check_mode_prerequisites(merged: dict, named_roles=(), chosen_keys=()) -> N
             "pipeline cannot do.")
 
 
+#: The generator's scales. pipeline/lakehouse/generate.py is not in this Lambda's bundle, so
+#: the names are restated here and a test holds them equal to its SCALES.
+LAKEHOUSE_SCALES = ("demo", "small")
+#: The lakehouse dataset id: it becomes an S3 key segment in every Glue job's arguments, and
+#: the console and the export refuse anything else, so dispatch refuses it first.
+LAKEHOUSE_DATASET_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,79}$")
+
+
+def _check_lakehouse_values(merged: dict) -> None:
+    """Presence is MODE_REQUIRED_PARAMS' question; this is whether the values are usable.
+
+    Each one is formatted into a Glue job argument by the state machine, where a bad value
+    does not fail at dispatch but as a FAILED job a stage later, after a run row, a manifest
+    and a PipelineStarted event already describe work that cannot happen.
+    """
+    mode = merged.get("pipeline_mode", "full")
+    if mode == "lakehouse_ingest":
+        seed = merged.get("generator_seed")
+        if isinstance(seed, bool) or not str(seed).isdigit():
+            raise ValueError(f"params.generator_seed must be a non-negative integer, got {seed!r}")
+        if merged.get("generator_scale") not in LAKEHOUSE_SCALES:
+            raise ValueError(f"params.generator_scale must be one of {LAKEHOUSE_SCALES}, "
+                             f"got {merged.get('generator_scale')!r}")
+    if mode == "lakehouse" and not LAKEHOUSE_DATASET_ID.match(str(merged.get("lakehouse_dataset"))):
+        raise ValueError("params.lakehouse_dataset must match ^[a-z0-9][a-z0-9-]{0,79}$, got "
+                         f"{merged.get('lakehouse_dataset')!r}")
+
+
+def lakehouse_input(params: dict, run_id: str, bucket: str):
+    """The execution input's `lakehouse` object, or None outside the lakehouse modes.
+
+    It rides in the input for the same reason pipeline_mode does: the state machine builds
+    the Glue jobs' arguments with States.Format and cannot read the manifest from S3. An
+    ingest run names its dataset after itself (the run id, lowercased: Glue, the console and
+    the export all take lowercase ids), so two ingests can never write one landing prefix.
+    """
+    mode = params.get("pipeline_mode", "full")
+    if mode == "lakehouse_ingest":
+        return {"dataset": run_id.lower(), "data_bucket": bucket,
+                "seed": str(int(params["generator_seed"])), "scale": params["generator_scale"]}
+    if mode == "lakehouse":
+        return {"dataset": params["lakehouse_dataset"], "data_bucket": bucket}
+    return None
+
+
 def seed_manifest(run_id: str, trigger_source: str, params, plan,
                   approval=None) -> dict:
     params = _as_obj(params, "params")
@@ -452,6 +528,7 @@ def seed_manifest(run_id: str, trigger_source: str, params, plan,
         set(_role_assignments(plan or {}, "plan"))
         | set(_role_assignments(params or {}, "params")),
         set(params or {}) | set(_plan_params(plan or {})))
+    _check_lakehouse_values(merged)
     return {
         "run_id": run_id,
         "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -478,6 +555,10 @@ def handler(event, context=None, clients=None):
     manifest = seed_manifest(run_id, trigger_source, event.get("params"), event.get("plan"),
                              event.get("approval"))
     manifest_uri = f"s3://{bucket}/runs/{run_id}/manifest.json"
+    # In the manifest as well as the execution input: the Glue states write nothing to the
+    # manifest, so without this an ingest run's only record of the dataset it built is the
+    # convention that names the dataset after the run.
+    manifest["lakehouse"] = lakehouse_input(manifest["params"], run_id, bucket)
 
     c["s3"].put_object(
         Bucket=bucket, Key=f"runs/{run_id}/manifest.json",
@@ -524,7 +605,10 @@ def handler(event, context=None, clients=None):
                           # The conductor task this run answers to, so the machine can
                           # close that task out when the run ends -- it cannot read the
                           # manifest from S3, same constraint as pipeline_mode above.
-                          "task_id": manifest["approval"].get("task_id") or NO_TASK}))
+                          "task_id": manifest["approval"].get("task_id") or NO_TASK,
+                          # The Glue states' per-run arguments (dataset, bucket, generator
+                          # seed/scale); null outside the two lakehouse modes.
+                          "lakehouse": manifest["lakehouse"]}))
 
     return {"run_id": run_id, "manifest_uri": manifest_uri,
             "execution_arn": execution["executionArn"]}

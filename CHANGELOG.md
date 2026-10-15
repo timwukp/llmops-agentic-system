@@ -5,6 +5,54 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
 ## [Unreleased]
 
+### Phase 1 PR-09: the pipeline runs the lakehouse
+
+Two new pipeline modes, both routed only from `PipelineModeChoice`:
+- **`lakehouse_ingest`** generates a dataset and builds Bronze → Silver → Gold, then stops. It
+  reaches no harness and no GPU.
+- **`lakehouse`** trains on a dataset an ingest built, named by `params.lakehouse_dataset`. It
+  exports the dataset's Gold snapshots, has data-prep review the export (`lakehouse_review`), then
+  runs the ordinary finetune → eval → gate path.
+
+**How it runs.** At the owner's choice, the five Glue states are `glue:startJobRun.sync`, run by
+Step Functions itself. The state machine builds each job's per-run arguments with `States.Format`,
+from a `lakehouse` object start-pipeline writes to both the execution input and the manifest.
+Run-invariant arguments became each job's `DefaultArguments`, and `run_arguments()` in
+`10_lakehouse.py` is the one place the layout is spelled out; a test renders the ASL against it.
+
+**Failure handling.** A failed job, including a failed DQ rule, escalates and never reaches
+remediation. Only `Glue.ConcurrentRunsExceededException` is retried.
+
+**The generator.** It now runs as a Glue Python-shell job (`llmops-lakehouse-generate`). Its digest is
+identical on Python 3.9 and 3.12. It runs as a role of its own that may write landing and nothing
+else, so the transforms still cannot write their own input.
+
+**The review.** `lakehouse_review` writes `stats.json` with `source: "lakehouse"` and claims the
+train extract, which the driver re-hashes. Finetune uses the extract's files verbatim as its
+channels; eval falls back to the extract's `val_uri`.
+
+**Dispatch** refuses missing params, an invalid dataset id, seed or scale, an unnamed student, and
+inherited gates.
+
+**Grants**, each simulated as its role:
+- SFN: may run `job/llmops-lakehouse-*`.
+- Harness: Get-only on `lakehouse/reports/*` and `lakehouse/extracts/*`.
+- SageMaker: Get on extracts.
+
+**Live:**
+- `lakehouse_ingest` run SUCCEEDED in 9 min: 8/8 plants, 16/16 DQ.
+- A `lakehouse` run's review was re-verified by the driver (`verified: true`, 251 rows). Its finetune
+  channels are the two extract files.
+- Smoke 24/24; `--verify` 59/59.
+
+**Also fixed:**
+- The prompt-prefix guard compared only a URI's first segment.
+- ARCHITECTURE said "Four entry modes" for six, and never documented `vision`. Both languages now
+  name all seven, guarded.
+- Two negative controls were uncaught: m189, which this PR's eval clause had disarmed, and the
+  COST.md budget control, already uncaught on `main` while the documented count said 389/389.
+  Both guards were tightened, and all 392 controls now catch their break.
+
 ### Phase 1 PR-08: Gold export, reproducible and re-verified by the driver
 
 Training will read a **file** pinned to one Gold snapshot, never the Iceberg table. The new Glue
