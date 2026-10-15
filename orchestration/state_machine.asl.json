@@ -4,7 +4,7 @@
   "States": {
     "PipelineModeChoice": {
       "Type": "Choice",
-      "Comment": "data_audit is the conductor's starter: audit the customer's data and stop -- no GPU stage may run. eval_only re-enters an artifact a PREVIOUS run already paid for and re-judges it: no data-prep, no training, and it stops at the gate verdict without deploying, because re-measuring is not re-approving. It exists because r6c's 8B run produced a 12.2 GiB model and a gate the reformed metric had to re-score, and with only full/data_audit the only way to re-judge was a script in someone's working directory -- unversioned, unaudited, and invisible to the run table. deploy_only enters at Deploy against an artifact params.model_artifact_uri names, and it exists because the last five states of this machine (Deploy, SmokeTest, MonitorHealth, Teardown, MonitorReport) had never executed ONCE: 38 runs, 33 failed, and the single row marked completed carries one data-prep stage event. Their only entry is QualityGateChoice, gate_passed has never been true, so every defect in serving lived behind a door no run could open -- and this platform's dominant failure is exactly that shape, a capability the docs, the prompt and the IAM all describe that nothing can reach (five separate runs died on a missing grant for a call the code always makes). It is a REHEARSAL lane, not a shortcut: it does not soften the gate, it cannot be entered from inside a run, and its existence is not permission to bypass QualityGateChoice -- see EvalOnlyStopChoice, which refuses the far weaker version of the same move. What makes it legitimate is that the dispatch IS the approval, the same way eval_only's is: MODE_REQUIRED_PARAMS forces the operator to name the exact artifact rather than letting an agent pick the newest one in the bucket, and params.model_package_approval_status keeps what smoke registers at PendingManualApproval so a rehearsal can never leave an Approved model package behind. Default full pipeline otherwise.",
+      "Comment": "data_audit is the conductor's starter: audit the customer's data and stop -- no GPU stage may run. eval_only re-enters an artifact a PREVIOUS run already paid for and re-judges it: no data-prep, no training, and it stops at the gate verdict without deploying, because re-measuring is not re-approving. It exists because r6c's 8B run produced a 12.2 GiB model and a gate the reformed metric had to re-score, and with only full/data_audit the only way to re-judge was a script in someone's working directory -- unversioned, unaudited, and invisible to the run table. deploy_only enters at Deploy against an artifact params.model_artifact_uri names, and it exists because the last five states of this machine (Deploy, SmokeTest, MonitorHealth, Teardown, MonitorReport) had never executed ONCE: 38 runs, 33 failed, and the single row marked completed carries one data-prep stage event. Their only entry is QualityGateChoice, gate_passed has never been true, so every defect in serving lived behind a door no run could open -- and this platform's dominant failure is exactly that shape, a capability the docs, the prompt and the IAM all describe that nothing can reach (five separate runs died on a missing grant for a call the code always makes). It is a REHEARSAL lane, not a shortcut: it does not soften the gate, it cannot be entered from inside a run, and its existence is not permission to bypass QualityGateChoice -- see EvalOnlyStopChoice, which refuses the far weaker version of the same move. What makes it legitimate is that the dispatch IS the approval, the same way eval_only's is: MODE_REQUIRED_PARAMS forces the operator to name the exact artifact rather than letting an agent pick the newest one in the bucket, and params.model_package_approval_status keeps what smoke registers at PendingManualApproval so a rehearsal can never leave an Approved model package behind. lakehouse_ingest builds a dataset (generate -> Bronze -> Silver -> Gold) and stops; it spends no GPU and reaches no harness. lakehouse trains on a dataset an ingest already built, named by params.lakehouse_dataset: export its Gold snapshots, have data-prep review the export, then the ordinary finetune -> eval -> gate path. Both branch HERE and nowhere later, so neither can be entered from inside another run, and a lakehouse run reaches Deploy only through QualityGateChoice like any full run. Default full pipeline otherwise.",
       "Choices": [
         {
           "And": [
@@ -18,6 +18,32 @@
             }
           ],
           "Next": "DataAudit"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.pipeline_mode",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.pipeline_mode",
+              "StringEquals": "lakehouse_ingest"
+            }
+          ],
+          "Next": "LakehouseGenerate"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.pipeline_mode",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.pipeline_mode",
+              "StringEquals": "lakehouse"
+            }
+          ],
+          "Next": "LakehouseExport"
         },
         {
           "And": [
@@ -157,6 +183,210 @@
         }
       },
       "ResultPath": "$.data_prep_curate",
+      "TimeoutSeconds": 86400,
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "EscalateFail"
+        }
+      ],
+      "Next": "FinetuneLaunch"
+    },
+    "LakehouseGenerate": {
+      "Type": "Task",
+      "Comment": "lakehouse_ingest starts here: the seeded generator writes lakehouse/landing/<dataset>/ (the dataset is the run id, lowercased, so two ingests never share a prefix). The five lakehouse Glue states are run by Step Functions itself, not by an agent: their work is fixed by the job and its arguments, so an agent turn would add a model call and a fleet-wide StartJobRun grant and decide nothing. A failed job, including a failed data-quality rule (the Silver and Gold jobs fail themselves after writing their report), escalates and never reaches remediation: a DQ failure is a fact about the data, and no retry of the same job on the same data changes it. Only a concurrency refusal is retried -- a run that has just finished can still hold the job's slot (PR-08).",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName": "llmops-lakehouse-generate",
+        "Arguments": {
+          "--dataset.$": "$.lakehouse.dataset",
+          "--seed.$": "$.lakehouse.seed",
+          "--scale.$": "$.lakehouse.scale"
+        }
+      },
+      "ResultPath": null,
+      "TimeoutSeconds": 3600,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Glue.ConcurrentRunsExceededException"
+          ],
+          "IntervalSeconds": 30,
+          "BackoffRate": 2,
+          "MaxAttempts": 5
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "EscalateFail"
+        }
+      ],
+      "Next": "LakehouseLand"
+    },
+    "LakehouseLand": {
+      "Type": "Task",
+      "Comment": "Landing JSONL -> Bronze Iceberg tables. Arguments are built from $.lakehouse with the layout deploy/10_lakehouse.py run_arguments() spells out; tests/test_lakehouse_mode.py renders these strings and compares.",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName": "llmops-lakehouse-land-bronze",
+        "Arguments": {
+          "--landing_uri.$": "States.Format('s3://{}/lakehouse/landing/{}/', $.lakehouse.data_bucket, $.lakehouse.dataset)",
+          "--report_uri.$": "States.Format('s3://{}/lakehouse/reports/{}/land.json', $.lakehouse.data_bucket, $.lakehouse.dataset)"
+        }
+      },
+      "ResultPath": null,
+      "TimeoutSeconds": 3600,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Glue.ConcurrentRunsExceededException"
+          ],
+          "IntervalSeconds": 30,
+          "BackoffRate": 2,
+          "MaxAttempts": 5
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "EscalateFail"
+        }
+      ],
+      "Next": "LakehouseSilver"
+    },
+    "LakehouseSilver": {
+      "Type": "Task",
+      "Comment": "Bronze -> Silver: the eight rules (PII redaction, decontamination against the eval prompts, near-duplicates, ...) and Glue DQ; the report holds each rule's catch against the generator's plants.",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName": "llmops-lakehouse-bronze-to-silver",
+        "Arguments": {
+          "--eval_prompts_uri.$": "States.Format('s3://{}/lakehouse/landing/{}/eval_prompts.jsonl', $.lakehouse.data_bucket, $.lakehouse.dataset)",
+          "--report_uri.$": "States.Format('s3://{}/lakehouse/reports/{}/silver.json', $.lakehouse.data_bucket, $.lakehouse.dataset)",
+          "--dq_run_id.$": "$.lakehouse.dataset",
+          "--expected_defects_uri.$": "States.Format('s3://{}/lakehouse/landing/{}/expected_defects.json', $.lakehouse.data_bucket, $.lakehouse.dataset)"
+        }
+      },
+      "ResultPath": null,
+      "TimeoutSeconds": 3600,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Glue.ConcurrentRunsExceededException"
+          ],
+          "IntervalSeconds": 30,
+          "BackoffRate": 2,
+          "MaxAttempts": 5
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "EscalateFail"
+        }
+      ],
+      "Next": "LakehouseGold"
+    },
+    "LakehouseGold": {
+      "Type": "Task",
+      "Comment": "Silver -> Gold train/eval split, then the ingest run is done. Training on this dataset is a separate run (pipeline_mode lakehouse, params.lakehouse_dataset), so an ingest never spends a GPU and every training run names the data it trains on.",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName": "llmops-lakehouse-silver-to-gold",
+        "Arguments": {
+          "--report_uri.$": "States.Format('s3://{}/lakehouse/reports/{}/gold.json', $.lakehouse.data_bucket, $.lakehouse.dataset)"
+        }
+      },
+      "ResultPath": null,
+      "TimeoutSeconds": 3600,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Glue.ConcurrentRunsExceededException"
+          ],
+          "IntervalSeconds": 30,
+          "BackoffRate": 2,
+          "MaxAttempts": 5
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "EscalateFail"
+        }
+      ],
+      "Next": "Complete"
+    },
+    "LakehouseExport": {
+      "Type": "Task",
+      "Comment": "lakehouse starts here: UNLOAD the named dataset's Gold tables FOR VERSION AS OF the snapshots its Gold report recorded, into lakehouse/extracts/<dataset>/<snapshot>/ with a sha256 per file (PR-08). A missing dataset fails this job and escalates.",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName": "llmops-lakehouse-export",
+        "Arguments": {
+          "--dataset.$": "$.lakehouse.dataset",
+          "--gold_report_uri.$": "States.Format('s3://{}/lakehouse/reports/{}/gold.json', $.lakehouse.data_bucket, $.lakehouse.dataset)",
+          "--pii_report_uri.$": "States.Format('s3://{}/lakehouse/reports/{}/silver.json', $.lakehouse.data_bucket, $.lakehouse.dataset)",
+          "--report_uri.$": "States.Format('s3://{}/lakehouse/reports/{}/export.json', $.lakehouse.data_bucket, $.lakehouse.dataset)",
+          "--run_id.$": "$.run_id"
+        }
+      },
+      "ResultPath": null,
+      "TimeoutSeconds": 3600,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Glue.ConcurrentRunsExceededException"
+          ],
+          "IntervalSeconds": 30,
+          "BackoffRate": 2,
+          "MaxAttempts": 5
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "EscalateFail"
+        }
+      ],
+      "Next": "LakehouseReview"
+    },
+    "LakehouseReview": {
+      "Type": "Task",
+      "Comment": "The one agent turn on the lakehouse path: data-prep reads the export, Gold and Silver reports, escalates on any failed DQ outcome, plant check or row mismatch, and claims the train extract's uri and sha256 -- which the driver re-hashes from the bytes before the claim enters the manifest. It never edits, re-splits or re-filters the extract: its digest is what makes the model reproducible.",
+      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+      "Parameters": {
+        "FunctionName": "${HarnessDriverArn}",
+        "Payload": {
+          "run_id.$": "$.run_id",
+          "manifest_uri.$": "$.manifest_uri",
+          "stage": "data-prep",
+          "task": "lakehouse_review",
+          "harness_id": "llmops_data_prep",
+          "task_token.$": "$$.Task.Token",
+          "iteration.$": "$.iteration"
+        }
+      },
+      "ResultPath": "$.lakehouse_review",
       "TimeoutSeconds": 86400,
       "Catch": [
         {
@@ -394,6 +624,7 @@
         "manifest_uri.$": "$.manifest_uri",
         "pipeline_mode.$": "$.pipeline_mode",
         "task_id.$": "$.task_id",
+        "lakehouse.$": "$.lakehouse",
         "iteration.$": "States.MathAdd($.iteration, 1)"
       },
       "Next": "RemediateFinetune"
@@ -821,6 +1052,7 @@
         "manifest_uri.$": "$.manifest_uri",
         "pipeline_mode.$": "$.pipeline_mode",
         "task_id.$": "$.task_id",
+        "lakehouse.$": "$.lakehouse",
         "iteration.$": "States.MathAdd($.iteration, 1)"
       },
       "Next": "EvalGenerate"

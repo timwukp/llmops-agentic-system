@@ -47,7 +47,7 @@ Next: v2 experiments — code-as-reasoning distillation + augmentation; Kimi K3 
 | Harnesses ×7 | llmops_{data_prep,finetune,eval,deploy,monitor,orchestrator,finops} | deploy/05_harnesses.py | full ids in SSM `/llmops/harness/*`; shared Memory attached; obs + online evals wired; all 7 on `global.anthropic.claude-fable-5` as deployed (GetHarness, 2026-08-02); driver auto-failover covers quota bursts |
 | AgentCore Memory | llmops_shared_memory (SEMANTIC + EPISODIC) | deploy/04_wire_memory.py | shared across all 7 harnesses |
 | Lambdas ×7 | llmops-{harness-driver,start-pipeline,resume-pipeline,resurrector,webhook,finops-reconcile,monitor-sweep} | deploy/07_lambdas.py | driver: turn-continuation + auto model failover; monitor-sweep: own least-privilege role |
-| Step Functions | llmops-pipeline (STANDARD) | deploy/07_lambdas.py | 29 states; 12 harness tasks on the happy path incl. EvalGenerate/EvalScore and MonitorHealth/MonitorReport, plus the finetune remediation loop, the eval-job retry loop, and three entry modes (full / data_audit / eval_only, the last stopping at the gate verdict) |
+| Step Functions | llmops-pipeline (STANDARD) | deploy/07_lambdas.py | 35 states; 12 harness tasks on the happy path incl. EvalGenerate/EvalScore and MonitorHealth/MonitorReport, plus the finetune remediation loop, the eval-job retry loop, and seven entry modes (full / data_audit / eval_only, which stops at the gate verdict / deploy_only / vision / lakehouse_ingest, which generates and builds Bronze → Silver → Gold and stops / lakehouse, which exports a named Gold dataset, has data-prep review it and trains on the extract). The five lakehouse Glue states are `glue:startJobRun.sync`, run by the state machine itself (PR-09) |
 | Triggers | scheduler `llmops-nightly` (DISABLED) · `llmops-finops-daily` (ENABLED, 09:00 UTC) · `llmops-monitor-sweep-daily` (ENABLED, 08:00 UTC) · rule `llmops-budget-sweep` (ENABLED, 15 min, from deploy/console/deploy.sh) · HTTP API `llmops-triggers` (/webhook, /runs) · secret `llmops/webhook` | deploy/08_triggers.py | endpoint in SSM `/llmops/triggers/api_endpoint`; both daily schedules use FlexibleTimeWindow OFF (each derives its period/id from the current date) |
 | Admin console | `agent-cicd-admin` stack (Lambda+APIGW+DDB+Cognito) | ops-console deploy.sh | login secret `agent-admin/dashboard-login`; monitors orchestrator + finetune |
 | Online evals | one config per harness (Correctness/GoalSuccessRate/ToolSelectionAccuracy, 100% sampling) | deploy/06_observability.py --evals | role llmops-eval-execution |
@@ -174,7 +174,9 @@ live (torn down after eval per cost rule).
 #167; deploy/evidence/VERIFICATION_sweep_unheard_calls.md). v14 was the sweep's memory-orphan
 check (#164). `llmops-harness-driver` and `llmops-monitor-sweep` were redeployed from #167 the same
 day, 08:16Z — the driver's first deploy since 2026-08-17, so it also shipped #154 (manifest
-schema) and #165 (Gold export) driver changes, which had merged without one.
+schema) and #165 (Gold export) driver changes, which had merged without one. #168 (lakehouse PR-09)
+merged afterwards with its own driver, start-pipeline, state-machine and IAM changes; those are not
+deployed by this record.
 
 ## Model lineage
 

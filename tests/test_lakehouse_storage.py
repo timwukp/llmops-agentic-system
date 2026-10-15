@@ -147,7 +147,7 @@ class FakeAccount:
     def __init__(self, integration=True):
         self.calls, self.integration = [], integration
         self.keys, self.aliases, self.buckets, self.ns, self.tables = {}, {}, {}, set(), set()
-        self.workgroup = self.role = False
+        self.workgroup, self.roles = False, {}  # role name -> its inline policies
         self.params, self.guardrails, self.jobs, self.objects = {}, {}, {}, {}
 
     def client(self, service, region_name=None):
@@ -248,19 +248,28 @@ class _Client:
         self.a.workgroup = False
 
     # iam
-    def _iam_get_role(self, **_):
-        if not self.a.role:
+    def _iam_get_role(self, RoleName, **_):
+        if RoleName not in self.a.roles:
             raise _NotFound()
-        return {"Role": {"Arn": f"arn:aws:iam::{ACCOUNT}:role/{lh.GLUE_ROLE}"}}
+        return {"Role": {"Arn": f"arn:aws:iam::{ACCOUNT}:role/{RoleName}"}}
 
-    def _iam_create_role(self, **_):
-        self.a.role = True
-        return {"Role": {"Arn": f"arn:aws:iam::{ACCOUNT}:role/{lh.GLUE_ROLE}"}}
+    def _iam_create_role(self, RoleName, **_):
+        self.a.roles[RoleName] = {}
+        return {"Role": {"Arn": f"arn:aws:iam::{ACCOUNT}:role/{RoleName}"}}
 
-    def _iam_delete_role(self, **_):
-        if not self.a.role:
+    def _iam_put_role_policy(self, RoleName, PolicyName, PolicyDocument, **_):
+        self.a.roles[RoleName][PolicyName] = PolicyDocument
+
+    def _iam_delete_role_policy(self, RoleName, PolicyName, **_):
+        if PolicyName not in self.a.roles.get(RoleName, {}):
             raise _NotFound()
-        self.a.role = False
+        del self.a.roles[RoleName][PolicyName]
+
+    def _iam_delete_role(self, RoleName, **_):
+        if RoleName not in self.a.roles:
+            raise _NotFound()
+        assert not self.a.roles[RoleName], "IAM refuses to delete a role that still has policies"
+        del self.a.roles[RoleName]
 
     # bedrock guardrails
     def _bedrock_list_guardrails(self, **kw):
@@ -337,7 +346,7 @@ def test_teardown_removes_everything_deploy_created_and_only_schedules_the_keys(
     lh.deploy(acct, REGION, ACCOUNT, DATA)
     out = lh.teardown(acct, REGION, ACCOUNT)
     assert not acct.buckets and not acct.tables and not acct.ns and not acct.params
-    assert not acct.workgroup and not acct.role and not acct.aliases
+    assert not acct.workgroup and not acct.roles and not acct.aliases
     assert not acct.jobs and not acct.guardrails
     assert acct.calls.count(("kms", "schedule_key_deletion")) == 2
     assert all("30 days" in out[f"key {b}"] for b in (lh.RAW, lh.CURATED))
@@ -373,8 +382,15 @@ def test_deploy_creates_a_numbered_guardrail_version_and_every_job():
     for name, script in lh.JOBS.values():
         assert f"{lh.GLUE_PREFIX}/{script}" in acct.objects
         args = acct.jobs[name]["DefaultArguments"]
-        shipped = "export.py" if script in lh.PYTHON_SHELL_JOBS else "transform.py"
+        shipped = lh.SHELL_JOB_MODULE.get(script, "transform.py")
         assert args["--extra-py-files"].endswith(f"{lh.GLUE_PREFIX}/{shipped}"), (script, args)
+        assert f"{lh.GLUE_PREFIX}/{shipped}" in acct.objects, shipped
+        static = lh.static_arguments(script, ACCOUNT, DATA, "gr0", "1")
+        assert {k: args[k] for k in static} == static, f"{script}: its run-invariant arguments must be defaults"
+    roles = {acct.jobs[n]["Role"].rsplit("/", 1)[-1] for n, s in lh.JOBS.values() if s != "generate_landing.py"}
+    assert roles == {lh.GLUE_ROLE}
+    assert acct.jobs[lh.JOBS["generate"][0]]["Role"].endswith(f"/{lh.GENERATOR_ROLE}")
+    assert set(acct.roles) == {lh.GLUE_ROLE, lh.GENERATOR_ROLE}
     assert acct.objects[f"{lh.GLUE_PREFIX}/transform.py"] == lh.TRANSFORM_SRC.read_bytes()
     lh.deploy(acct, REGION, ACCOUNT, DATA)
     assert g["versions"] == ["1"], "a second deploy must reuse the published version"
@@ -396,7 +412,7 @@ def test_every_job_script_exists_and_imports_transform():
         src = (lh.GLUE_SRC / script).read_text()
         assert "getResolvedOptions" in src
         if script in lh.PYTHON_SHELL_JOBS:
-            assert "import export" in src, script
+            assert f"import {lh.SHELL_JOB_MODULE[script][:-3]}" in src, script
         elif script != "land_bronze.py":
             assert "import transform" in src, script
 
@@ -412,11 +428,13 @@ def test_every_job_report_carries_rows_and_snapshots_for_the_data_tab():
     """The console's Data tab reads the reports, never the tables: each job must say what it
     wrote (rows, current snapshot) or the tab has nothing honest to show."""
     for _, script in lh.JOBS.values():
+        if script == "generate_landing.py":
+            continue  # writes source files, not tables: its record is landing/<dataset>/manifest.json
         src = (lh.GLUE_SRC / script).read_text()
         assert '["tables"]' in src and "snapshots" in src and "report_uri" in src, script
-    smoke = __import__("inspect").getsource(lh.smoke)
-    assert '"--report_uri": reports + "land.json"' in smoke
-    assert '"--expected_defects_uri": landing + "expected_defects.json"' in smoke
+    assert lh.run_arguments("land", "b", "d")["--report_uri"] == "s3://b/lakehouse/reports/d/land.json"
+    assert lh.run_arguments("silver", "b", "d")["--expected_defects_uri"] == (
+        "s3://b/lakehouse/landing/d/expected_defects.json")
 
 
 class _Glue:

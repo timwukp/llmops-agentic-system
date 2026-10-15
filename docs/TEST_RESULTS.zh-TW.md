@@ -22,6 +22,7 @@
 | Phase 1 PR-07 —— lakehouse 分層轉換 | 3 個 Glue 5 job 以 `llmops-lakehouse-glue` 執行 landing → Bronze → Silver → Gold；8 條規則以產生器的植入缺陷為準；Glue DQ；Athena 筆數 | ✅ small 與 demo 規模皆 16/16：每條規則抓到的與植入的完全一致（人名由線上 guardrail 判斷）。發現：Glue 5 內建的 boto3 沒有 `apply_guardrail`；Guardrails 把門市名稱當成人名（以組織實體參考清單修正） | [VERIFICATION_lakehouse_medallion.md](../deploy/evidence/VERIFICATION_lakehouse_medallion.md) |
 | Console —— Data 分頁（唯讀） | demo smoke 後打開線上入口 `/?tab=data`：資料集、10 張表的筆數與 snapshot、規則與植入對照、DQ | ✅ 顯示 8/8 規則完全一致、16/16 DQ；錯誤的 dataset id → 400；舊資料集顯示 `–`/`n/a`。發現並修正：切換資料集時表格殘留上一個資料集的數字。只讀報告與 metadata，從不讀表本身 | [VERIFICATION_console_data_tab.md](../deploy/evidence/VERIFICATION_console_data_tab.md) |
 | Phase 1 PR-08 —— Gold 匯出 | `UNLOAD … FOR VERSION AS OF <snapshot>` → `train.jsonl`/`val.jsonl` 與 sha256，跑兩次；寫入 `gold.dataset_manifest`；driver 重新讀取檔案位元組 | ✅ demo smoke 22/22：兩次 sha256 相同（train `4dffee59…`、eval `c891df2b…`），driver 兩份都重新驗證通過，匯出筆數 = Gold 筆數（251/32）；`--verify` 48/48。發現並修正：workgroup 設定結果加密時，Athena 無法 INSERT 進 CMK 加密的表。另發現：Macie 覆蓋判斷讀取 list 項目沒有的欄位，所以每個 job 都被判為未覆蓋；已修正，並啟用 `llmops-lakehouse-extracts-pii`（首次執行 0 個 finding） | [VERIFICATION_gold_export.md](../deploy/evidence/VERIFICATION_gold_export.md) |
+| Phase 1 PR-09 —— lakehouse pipeline 模式 | 經 Step Functions 實跑 `lakehouse_ingest`（`glue:startJobRun.sync` ×4）；實跑 `lakehouse`：export → data-prep 審查 → 用 extract 訓練；派發時拒絕；以各 role 身分驗證授權 | ✅ ingest 9 分鐘 SUCCEEDED，8/8 plants、16/16 DQ，未呼叫任何 harness；審查宣告的 extract 經 driver 重新驗證（`verified: true`、251 筆、`4dffee59…`）；finetune 的 channels 就是那兩個 extract 檔；`../customer-data` 在派發時被拒；IAM 模擬 15/15；smoke 24/24（generator digest 3.9 = 3.12）；`--verify` 59/59 | [VERIFICATION_lakehouse_mode.md](../deploy/evidence/VERIFICATION_lakehouse_mode.md) |
 | Harness 記憶體 —— 建立時的預設值 | 每個 harness 掛的是哪個記憶體，以及每次建立實際配置了什麼（唯讀） | ⚠️ 發現 —— 7 個都掛共享 BYO 記憶體；但每次建立都另外留下一個空的、無人使用的 MANAGED 記憶體。現在建立時一律宣告 `{"disabled": {}}` | [VERIFICATION_harness_memory_audit.md](../deploy/evidence/VERIFICATION_harness_memory_audit.md) |
 | 殘留 memory 的 sweep —— 線上 | 排程 sweep 透過 pipeline 找出沒有任何 harness 使用的 AgentCore memory，只讀 metadata | ✅ PASSED —— 0 個殘留（與獨立的 ListMemories 一致），未讀取內容、無權限缺口；以執行角色模擬 10/10 | [VERIFICATION_memory_orphan_sweep.md](../deploy/evidence/VERIFICATION_memory_orphan_sweep.md) |
 | Console IAM —— S3 讀取範圍 | `LlmopsAdminLambdaRole` 只能讀 `lambda_function.py` 實際讀取的路徑（由其 AST 推導）；以 `simulate_principal_policy` 驗證兩個方向 | ✅ 25/25：11 個推導出的路徑皆「允許」（含 Data 分頁的報告與 landing manifest）；7 個不讀的前綴（含 landing 原始資料本身）、其他 bucket、不帶前綴的 list、3 個不列出的前綴皆「拒絕」。原本是 `"*"` 上的 `s3:GetObject` + `s3:ListBucket`。經由已部署的 Lambda：Data 分頁正常載入（6 個資料集、283 筆配對、8 條規則），不存在的 run manifest 回 `NoSuchKey` | [VERIFICATION_console_s3_scope.md](../deploy/evidence/VERIFICATION_console_s3_scope.md) |
@@ -31,9 +32,9 @@
 
 | 檢查 | 結果 | 復現方式 |
 |---|---|---|
-| 單元測試（契約、成本模型、driver 迴圈、Lambda、狀態機文檔） | **2028/2028 通過** | `.venv/bin/python -m pytest tests/ -q --ignore=tests/golden` |
+| 單元測試（契約、成本模型、driver 迴圈、Lambda、狀態機文檔） | **2063/2063 通過** | `.venv/bin/python -m pytest tests/ -q --ignore=tests/golden` |
 | Shell 測試套件 —— N 路 capacity race guard（`tests/test_capacity_race_guard.sh`） | **10/10 斷言** | `bash tests/test_capacity_race_guard.sh` |
-| 反向控制 —— 逐一破壞每道 guard，確認它會失敗 | **396/396 反向控制** | `.venv/bin/python tests/negative_controls/monitor_dispatch.py` |
+| 反向控制 —— 逐一破壞每道 guard，確認它會失敗 | **399/399 反向控制** | `.venv/bin/python tests/negative_controls/monitor_dispatch.py` |
 | Harness 配置驗證（5 個專家 + 指揮家 + 審計員） | **7/7 `RESULT: OK`** | `python deploy/validate_config.py --config agents/<a>/harness.json` |
 | 架構 SVG 幾何檢查（虛線零交叉、零穿框） | **CLEAN** | `python tests/test_svg_geometry.py docs/architecture-*.svg` |
 | 遮蔽掃描（帳號 ID、憑證、帶帳號的 ARN） | CLEAN | `.github/workflows/redaction-check.yml` |
@@ -131,13 +132,13 @@ endpoint、五輪 e2e 迭代 —— 花費比這個帳戶單日花在一個沒�
 
 | 檢查 | 結果 | 重現方式 |
 |---|---|---|
-| 單元測試(全部套件,含 `test_cost_model.py` + `test_finops.py`) | **2028 passed** | `.venv/bin/python -m pytest tests/ -q` |
+| 單元測試(全部套件,含 `test_cost_model.py` + `test_finops.py`) | **2063 passed** | `.venv/bin/python -m pytest tests/ -q` |
 | Harness 配置驗證,7 個 agent | **`RESULT: OK`** | `python deploy/validate_config.py --config agents/finops/harness.json` |
 | 線上艦隊 | **7 個 harness READY** | 用 repo 內建 boto3 呼叫 `list_harnesses` |
 | 正典模組有散佈路徑 | 印出 `would upload 4 contract files` | `python deploy/03_storage.py --region us-east-1 --account-id 123456789012 --dry-run` |
 
 本次新增的每一道 guard 都做過 **mutation check**:逐一還原被斷言的行為,確認測試會
-失敗 —— **396/396 反向控制**,340 個 mutation 斷言 396 組（guard, mutation）配對,runner 各印
+失敗 —— **399/399 反向控制**,343 個 mutation 斷言 399 組（guard, mutation）配對,runner 各印
 一行 PASS。一個「有這行為也過、沒這行為也過」的測試,不是測試。
 
 這個數字是刻意寫進句子裡的。「做過 mutation check」是一個形容詞,而形容詞不會過期:
