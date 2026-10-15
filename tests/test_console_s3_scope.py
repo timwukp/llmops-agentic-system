@@ -27,6 +27,7 @@ import ast
 import fnmatch
 import json
 import pathlib
+import re
 
 import pytest
 
@@ -397,3 +398,63 @@ def test_scope_tuples_are_top_level_prefixes():
         assert consts[name] and all(p.endswith("/") and p.count("/") == 1
                                     for p in consts[name]), (name, consts[name])
     assert consts["_UPLOAD_S3_PREFIXES"] == (consts["CUSTOMER_DATA_PREFIX"] + "/",)
+
+
+# ── the orchestrator's prompt states the scope the console and data-prep enforce ──────
+#
+# The console's role was scoped (above), and the prompt kept describing the old one: intake
+# checked "with its own broader IAM", and a customer whose data "already sits elsewhere in S3"
+# was to be asked for "that exact URI". The second was wrong before the scoping too --
+# data-prep's prompt refuses any source_uri outside customer-data/ -- so the orchestrator was
+# collecting URIs the next stage is told to refuse. Both sides of each check are read from
+# their sources, never restated here.
+
+def _prompt(agent):
+    cfg = json.loads((REPO / "agents" / agent / "harness.json").read_text())
+    return "\n".join(b.get("text", "") for b in cfg["systemPrompt"])
+
+
+def _intake_paragraph(prompt):
+    start = prompt.index("params.intake, when present")
+    return prompt[start:prompt.index("Cite a status", start)]
+
+
+def _not_checked_phrase():
+    """The literal head of the detail _verify_s3_uri writes for an out-of-scope URI."""
+    for fn in _functions(_tree()):
+        if fn.name != "_verify_s3_uri":
+            continue
+        for n in ast.walk(fn):
+            if (isinstance(n, ast.JoinedStr) and n.values and isinstance(n.values[0], ast.Constant)
+                    and n.values[0].value.startswith("not checked")):
+                return n.values[0].value.split(" s3://")[0]
+    raise AssertionError("_verify_s3_uri no longer writes a 'not checked' detail")
+
+
+def test_the_intake_paragraph_names_every_prefix_intake_checks():
+    para = _intake_paragraph(_prompt("orchestrator"))
+    consts = _module_constants(_tree())
+    missing = [p for p in consts["_INTAKE_S3_PREFIXES"] if p not in para]
+    assert not missing, f"the prompt's intake paragraph does not name {missing}"
+    assert "broader IAM" not in para, "the console's IAM is scoped, not broader"
+
+
+def test_the_prompt_quotes_the_detail_an_unchecked_uri_actually_gets():
+    """A fact the console did not examine must not read to the agent as a failed check."""
+    phrase = _not_checked_phrase()
+    assert phrase in _intake_paragraph(_prompt("orchestrator")), (
+        f"_verify_s3_uri writes {phrase!r}; the prompt must tell the agent what that means")
+
+
+def test_the_orchestrator_asks_only_for_data_where_data_prep_will_read_it():
+    rules = set(re.findall(r"must sit under the data bucket's (\S+) prefix", _prompt("data-prep")))
+    assert rules, "data-prep's prompt no longer states where a source_uri must sit"
+    orch = _prompt("orchestrator")
+    assert "sits elsewhere in S3, ask for that exact URI" not in orch, (
+        "the orchestrator still invites URIs data-prep is told to refuse")
+    step0 = orch[orch.index("DATA DISCOVERY"):orch.index("params.intake, when present")]
+    for prefix in rules:
+        assert f"s3://<bucket>/{prefix}" in step0 and "refuses a source_uri" in step0, (
+            f"step 0 must say data is usable in place only under {prefix}")
+    # ...and names where the drop zone lands what does not qualify.
+    assert _module_constants(_tree())["_UPLOAD_S3_PREFIXES"][0] in step0

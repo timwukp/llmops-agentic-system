@@ -5,6 +5,18 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
 ## [Unreleased]
 
+### Orchestrator prompt: the data scope the platform actually enforces
+
+Two sentences in the consult prompt described a platform that does not exist. Step 0 told the agent to
+"ask for that exact URI" when data "already sits elsewhere in S3", but data-prep refuses any
+`source_uri` outside `customer-data/`. The intake paragraph said the console checks "with its own
+broader IAM", which stopped being true in #163. Both now state the scope, and say that a "not checked:
+outside …" fact was not examined. Tested before deploying with `tools/probe_orchestrator_intake.py`,
+which passes the repo's prompt per call and leaves the live harness untouched. The new prompt passed
+S1 3/3 and S2 3/3; the live prompt passed 0/2 each: it offered a cross-account grant that does not
+exist, and it said the console had "checked" a URI it never examined. Deployed as `llmops_orchestrator`
+version 20 and re-checked live (`deploy/evidence/VERIFICATION_orchestrator_intake_scope.md`).
+
 ### Phase 1 PR-09: the pipeline runs the lakehouse
 
 Two new pipeline modes, both routed only from `PipelineModeChoice`:
