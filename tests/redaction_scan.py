@@ -107,7 +107,7 @@ ALLOWED = (b"6833" + b"13688378", b"7631" + b"04351884", b"1234" + b"56789012")
 #: this laptop, single-threaded CPython does 3.1M sha256/s, so the whole 1e12 space falls in
 #: about 4 days -- and a GPU does it in roughly 100 seconds. So the KDF is iterated. At 200k
 #: iterations a candidate costs ~16 ms, which makes the same sweep ~500 GPU-years, while the
-#: scan stays cheap because only 12-digit runs are ever hashed: measured across all 304
+#: scan stays cheap because only 12-digit runs are ever hashed: measured across all 307
 #: tracked files there are 80 such runs, 11 distinct, and hashing the distinct set takes 0.16 s
 #: for the entire repo. (Re-measured whenever either number moves, and they move
 #: INDEPENDENTLY, which is why both are derived and neither is inferred from the other, and
@@ -209,8 +209,10 @@ ALLOWED = (b"6833" + b"13688378", b"7631" + b"04351884", b"1234" + b"56789012")
 #: at 79.
 #: Then 294 files went to 299 (the console Data tab's test, evidence and intent chain). One new run,
 #: the documentation account in tests/test_console_data.py -- runs 79 -> 80, distinct held at 11.
-#: Then 299 files became 304 (the console S3 scope: its guard test, evidence and intent chain).
+#: Then 299 files went to 304 (the console S3 scope: its guard test, evidence and intent chain).
 #: No 12-digit run; the runs held at 80.
+#: Then 304 files became 307 (the memory-orphan sweep's intent chain). No 12-digit run; the runs
+#: held at 80.
 #: Dollar limits and percentages only -- no 12-digit run, so the runs held at 74 again.
 #: For EIGHT commits
 #: running, the file count moved and the run count did not move once, and then one commit moved

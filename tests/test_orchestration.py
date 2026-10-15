@@ -7743,6 +7743,10 @@ _CLI_TO_IAM = {
     ("ce", "get-cost-and-usage"): "ce:GetCostAndUsage",
     ("ce", "get-cost-and-usage-with-resources"): "ce:GetCostAndUsageWithResources",
     ("pricing", "get-products"): "pricing:GetProducts",
+    # The sweep's memory-orphan check (AgentCoreInventoryForSweep / AgentCoreHarnessReadOwn).
+    ("bedrock-agentcore-control", "list-memories"): "bedrock-agentcore:ListMemories",
+    ("bedrock-agentcore-control", "list-harnesses"): "bedrock-agentcore:ListHarnesses",
+    ("bedrock-agentcore-control", "get-harness"): "bedrock-agentcore:GetHarness",
 }
 
 
