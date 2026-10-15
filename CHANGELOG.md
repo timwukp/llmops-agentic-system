@@ -5,6 +5,37 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
 ## [Unreleased]
 
+### Phase 1 PR-08: Gold export, reproducible and re-verified by the driver
+
+Training will read a **file** pinned to one Gold snapshot, never the Iceberg table. The new Glue
+Python-shell job `llmops-lakehouse-export`:
+- runs `UNLOAD … FOR VERSION AS OF <snapshot>` for `gold.qlora_train` and `gold.qlora_eval`;
+- turns the parts into canonical chat-`messages` JSONL (`train.jsonl`, `val.jsonl`), sorted by `pair_id`,
+  so the sha256 depends on the rows only;
+- records each file in `gold.dataset_manifest` and writes `extract.json` beside them.
+
+Extracts live under `lakehouse/extracts/<dataset>/<snapshot>/`, a prefix a Macie job can scope to.
+`03_storage.py` reports that prefix's PII-scan coverage separately; creating the job is a billed
+scan and waits on `--enable-pii-scan`. When a stage reports `extract_uri` and `extract_sha256`, the harness
+driver reads the file itself and records a `gold_extract` attestation (`verified`, computed digest,
+rows, snapshot). It refuses any URI outside `lakehouse/extracts/`. The console's Data tab gained an
+Exports panel.
+
+Verified live: demo smoke 22/22. The export ran twice with the same sha256, the driver re-verified both
+splits, and export rows equal Gold rows. `--verify` 48/48.
+
+Two defects found on the way:
+- An Athena workgroup that sets **result encryption cannot INSERT into a CMK-encrypted S3 Table**
+  (`INTERNAL_ERROR_QUERY_ENGINE`; reads and UNLOAD are unaffected). The workgroup now leaves encryption
+  to the data bucket's default, and `--verify` checks that default. Recorded in AGENTS.md.
+- A Glue run that has just SUCCEEDED can still hold the job's concurrency slot, so `_run_job` retries
+  `ConcurrentRunsExceededException`, and only that.
+- **Macie coverage was False for every live job** (pre-existing). List items carry no scoping and no
+  `s3JobDefinition`, so the deploy told the operator to cancel the correctly scoped customer-data job.
+  Scope is now read from `describe_classification_job`; the test double returns the real list shape.
+
+`llmops-lakehouse-extracts-pii` is enabled at the owner's request: $0/day at the extracts' current
+258 KB (first GB/month free, then $1/GB of new extract). First run: 0 findings.
 ### The daily sweep reports orphaned AgentCore memories
 
 The 7 orphaned managed memories deleted on 2026-10-14 were found by a person calling AWS directly.

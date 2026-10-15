@@ -2650,7 +2650,16 @@ class _Macie:
         return {"status": self._session}
 
     def list_classification_jobs(self):
-        return {"items": self._jobs}
+        """The production shape (live, 2026-10-15): bucketDefinitions or bucketCriteria at the
+        item's top level, no scoping and no s3JobDefinition. A double that returned the full
+        definition here hid that ensure_pii_scan read a key list items do not have."""
+        return {"items": [{k: v for k, v in j.items() if k != "s3JobDefinition"}
+                          | {k: v for k, v in j["s3JobDefinition"].items() if k != "scoping"}
+                          for j in self._jobs]}
+
+    def describe_classification_job(self, jobId):
+        job = next(j for j in self._jobs if j["jobId"] == jobId)
+        return {"jobId": jobId, "name": job["name"], "s3JobDefinition": job["s3JobDefinition"]}
 
     def create_classification_job(self, **kw):
         self.created.append(kw)
@@ -6234,3 +6243,28 @@ class TestVisionTaskType:
         not a footnote in a trainer comment."""
         cat = {t["key"]: t for t in console.TASK_TYPE_REGISTRY}
         assert "AGPL" in cat["finetune-vision"]["description"]
+
+
+def test_our_correctly_scoped_job_is_read_from_describe_not_from_the_list(storage):
+    """Live, every coverage answer was False: the list item has no s3JobDefinition, so the
+    deploy reported llmops-customer-data-pii as wrongly scoped and said to cancel it."""
+    ours = _job("llmops-customer-data-pii", ["our-bucket"], scoping={"includes": {"and": [
+        {"simpleScopeTerm": {"comparator": "STARTS_WITH", "key": "OBJECT_KEY", "values": ["customer-data/"]}}]}})
+    macie = _Macie(jobs=[ours])
+    assert "s3JobDefinition" not in macie.list_classification_jobs()["items"][0]
+    res = storage.ensure_pii_scan(macie, "our-bucket", ACCOUNT, dry=False)
+    assert res["coverage"].startswith("job exists") and "NOT cover" not in res["coverage"]
+
+
+def test_a_foreign_job_counts_only_through_its_described_scope(storage):
+    other = _job("someone-elses-scan", ["our-bucket"])  # whole bucket, no scoping
+    res = storage.ensure_pii_scan(_Macie(jobs=[other]), "our-bucket", ACCOUNT, dry=False)
+    assert res["also_covered_by"] == ["someone-elses-scan (RUNNING)"]
+
+
+def test_a_job_whose_scope_cannot_be_read_is_undecidable_not_uncovered(storage):
+    class _Blind(_Macie):
+        def describe_classification_job(self, jobId):
+            raise RuntimeError("AccessDeniedException")
+    res = storage.ensure_pii_scan(_Blind(jobs=[_job("x", ["our-bucket"])]), "our-bucket", ACCOUNT, dry=False)
+    assert res["undecidable_jobs"] == ["x"] and "also_covered_by" not in res

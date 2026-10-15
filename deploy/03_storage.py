@@ -71,6 +71,8 @@ CONSOLE_FN = "llmops-admin"
 #: prefix a PII classification job should pay to read. Must match CUSTOMER_DATA_PREFIX in
 #: deploy/console/lambda_function.py and the prefix both agent prompts name.
 CUSTOMER_DATA_PREFIX = "customer-data"
+#: Phase 1 PR-08: where the Gold → training extracts live (pipeline/lakehouse/export.py).
+GOLD_EXTRACTS_PREFIX = "lakehouse/extracts"
 
 
 def safe_client(service, region, dry):
@@ -563,7 +565,8 @@ def macie_job_covers(job_def, bucket, account_id, prefix=CUSTOMER_DATA_PREFIX):
     return True
 
 
-def ensure_pii_scan(macie, bucket, account_id, dry, enable=False):
+def ensure_pii_scan(macie, bucket, account_id, dry, enable=False, prefix=CUSTOMER_DATA_PREFIX,
+                    purpose="classify customer-uploaded datasets for PII"):
     """Make sure something actually scans the customer's data for PII -- or say it doesn't.
 
     The data-prep `audit` task runs a HEURISTIC regex PII scan and states plainly in its own
@@ -590,7 +593,11 @@ def ensure_pii_scan(macie, bucket, account_id, dry, enable=False):
         creates a SECOND job. Idempotency has to come from looking for our own job by name
         first, or every deploy adds another scanner.
     """
-    job_name = f"llmops-{CUSTOMER_DATA_PREFIX}-pii"
+    # One job per prefix, because a Macie job's scope is immutable and only a key prefix can
+    # scope it. `customer-data` keeps its original name; PR-08 adds `lakehouse/extracts`, the
+    # Gold training extracts (de-identified by the Silver rules, and Macie is how that claim
+    # is checked).
+    job_name = f"llmops-{prefix.replace('/', '-')}-pii"
     if macie is None:
         return {"coverage": "unknown (no macie client; offline dry-run)"}
     try:
@@ -603,7 +610,16 @@ def ensure_pii_scan(macie, bucket, account_id, dry, enable=False):
     ours, foreign, undecidable = None, [], []
     try:
         for item in macie.list_classification_jobs().get("items", []):
-            covers = macie_job_covers(item.get("s3JobDefinition"), bucket, account_id)
+            # A list item carries `bucketDefinitions` at its top level and NO scoping, and no
+            # `s3JobDefinition` at all (live, 2026-10-15). Reading that key from the item made
+            # every job "not covering", including our own correctly scoped one, which the deploy
+            # then told the operator to cancel. The scope is only in describe_classification_job.
+            try:
+                defn = macie.describe_classification_job(jobId=item["jobId"]).get("s3JobDefinition")
+                covers = macie_job_covers(defn, bucket, account_id, prefix)
+            except Exception:  # noqa: BLE001 -- an unreadable job is undecidable, not uncovered
+                defn, covers = None, None
+            item = {**item, "s3JobDefinition": defn}
             if item.get("name") == job_name:
                 ours = item
             elif covers:
@@ -624,32 +640,37 @@ def ensure_pii_scan(macie, bucket, account_id, dry, enable=False):
         status = ours.get("jobStatus")
         res["coverage"] = f"job exists ({ours.get('jobType')}, {status})"
         res["job_id"] = ours.get("jobId")
-        if not macie_job_covers(ours.get("s3JobDefinition"), bucket, account_id):
+        if ours["s3JobDefinition"] is None:
+            res["coverage"] += " -- its scope could not be read (describe_classification_job failed)"
+        elif not macie_job_covers(ours["s3JobDefinition"], bucket, account_id, prefix):
             # The name matches but the scope does not, and no API can fix that in place.
             res["coverage"] = (f"job {job_name} exists but does NOT cover "
-                               f"{CUSTOMER_DATA_PREFIX}/ -- a job's scope is immutable "
+                               f"{prefix}/ -- a job's scope is immutable "
                                "(UpdateClassificationJob takes only jobStatus); cancel it "
                                "and re-run to create a correctly scoped replacement")
         return res
     if not enable:
+        only = ("the data-prep audit's heuristic regex scan, which says so in its own report"
+                if prefix == CUSTOMER_DATA_PREFIX else
+                "the Silver rules that produced it (checksum regex + Guardrails names), which "
+                "nothing independent re-checks")
         res["coverage"] = (
-            f"NO JOB SCANS {CUSTOMER_DATA_PREFIX}/ -- the only PII check on customer data is "
-            "the data-prep audit's heuristic regex scan, which says so in its own report. "
+            f"NO JOB SCANS {prefix}/ -- the only PII check on that data is {only}. "
             "Re-run with --enable-pii-scan to create a scheduled Macie job (billed per GB).")
         return res
     if dry:
-        res["coverage"] = f"would create SCHEDULED daily job over {CUSTOMER_DATA_PREFIX}/"
+        res["coverage"] = f"would create SCHEDULED daily job over {prefix}/"
         return res
     job = macie.create_classification_job(
         name=job_name,
         # >=33 chars, and stable per (bucket, prefix): a fresh random token on every deploy
         # would create a second job each time rather than failing as a duplicate.
-        clientToken=f"llmops-pii-{bucket}-{CUSTOMER_DATA_PREFIX}"[:64],
+        clientToken=f"llmops-pii-{bucket}-{prefix}"[:64],
         jobType="SCHEDULED",
         scheduleFrequency={"dailySchedule": {}},
         initialRun=True,
-        description="llmops: classify customer-uploaded datasets for PII. The data-prep "
-                    "audit's own scan is heuristic regex and not compliance-grade; this is.",
+        description=f"llmops: {purpose}. The pipeline's own checks are heuristic or rule-based "
+                    "and not compliance-grade; this is.",
         s3JobDefinition={
             "bucketDefinitions": [{"accountId": account_id, "buckets": [bucket]}],
             # Scoped to the prefix the console's presigned upload writes to. Without this the
@@ -657,7 +678,7 @@ def ensure_pii_scan(macie, bucket, account_id, dry, enable=False):
             # and none of them customer data.
             "scoping": {"includes": {"and": [{"simpleScopeTerm": {
                 "comparator": "STARTS_WITH", "key": "OBJECT_KEY",
-                "values": [f"{CUSTOMER_DATA_PREFIX}/"]}}]}},
+                "values": [f"{prefix}/"]}}]}},
         },
         # RECOMMENDED, not ALL: ALL turns on all 166 managed identifiers including ones for
         # regions and document types this pipeline never sees, and every extra identifier is
@@ -665,7 +686,7 @@ def ensure_pii_scan(macie, bucket, account_id, dry, enable=False):
         managedDataIdentifierSelector="RECOMMENDED",
         tags={TAG_KEY: TAG_VAL})
     res["job_id"] = job.get("jobId")
-    res["coverage"] = f"created SCHEDULED daily job over {CUSTOMER_DATA_PREFIX}/"
+    res["coverage"] = f"created SCHEDULED daily job over {prefix}/"
     return res
 
 
@@ -787,6 +808,12 @@ def main():
     results["pii_scan"] = ensure_pii_scan(
         safe_client("macie2", args.region, args.dry_run), bucket, account_id,
         args.dry_run, args.enable_pii_scan)
+    # PR-08: the Gold training extracts. De-identified by the Silver rules; Macie is the
+    # independent check of that claim, and it can only be scoped by key prefix.
+    results["pii_scan_extracts"] = ensure_pii_scan(
+        safe_client("macie2", args.region, args.dry_run), bucket, account_id,
+        args.dry_run, args.enable_pii_scan, prefix=GOLD_EXTRACTS_PREFIX,
+        purpose="classify the Gold training extracts for PII the Silver rules missed")
     results["contracts"] = ensure_contracts(s3, bucket, args.dry_run)
     # Reported on its own line for the same reason as CORS: when this is skipped there is
     # no other visible symptom until a source is switched and every session fails at start.

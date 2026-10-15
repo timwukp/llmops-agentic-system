@@ -274,6 +274,14 @@ versions and introspects the live CreateHarness/UpdateHarness schemas.
   stands on its own regardless
   — a channel that works today is still the wrong thing to gate a token settle on).
   Wrap each notification separately and order them so the state-releasing call is last.
+- **An Athena workgroup that sets result encryption cannot write a CMK-encrypted S3 Table.**
+  With `ResultConfiguration.EncryptionConfiguration` set, every `INSERT` into a table in
+  `llmops-curated` failed `INTERNAL_ERROR_QUERY_ENGINE` (`Retryable: False`, empty message), and
+  `SSE_KMS` naming the table's *own* key fails the same way. Under the same workgroup an `INSERT` into
+  an SSE-S3 table succeeds, and so do `SELECT` and `UNLOAD` against the CMK table, so reads tell you
+  nothing (measured 2026-10-15). `llmops-lakehouse` therefore sets none, and the data bucket's default
+  encryption covers results and extracts. `10_lakehouse.py --verify` checks both halves, and
+  `ensure_workgroup` removes an override it finds rather than reporting the workgroup `exists`.
 - **Observability**: `OTEL_TRACES_SAMPLER=always_on` env var is mandatory or
   evaluations/insights sit at zero forever. X-Ray delivery takes no `outputFormat`.
 - **Turn budget**: harness `timeoutSeconds` is 840 here (driver Lambda caps at 900s).
