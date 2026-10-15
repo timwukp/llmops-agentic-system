@@ -75,8 +75,12 @@ row with the real outcome and publishes to `llmops-escalations` unless the sweep
 escalated. No IAM change. The monitor prompt now says a file, an echo or typed text is not the call,
 and that after an `Unknown tool` error the agent should end the turn.
 
-14 tests replay the live shapes; 9 fail on the unfixed driver. Deploy and a live sweep wait for the
-owner. Evidence: `deploy/evidence/VERIFICATION_sweep_unheard_calls.md`.
+14 tests replay the live shapes; 9 fail on the unfixed driver. Deployed 2026-10-15 (driver,
+monitor-sweep, `llmops_monitor` v15), and one sweep through `llmops-monitor-sweep` completed in one
+turn with its outcome row settled `completed`. The harness still answered the call `Unknown tool`; the
+agent followed the new prompt clause and ended the turn, so the shadowed-call and typed-call paths were
+not exercised live and stay proven offline only. That morning's pre-deploy scheduled sweep was a fifth
+failure: `stage_complete` 8×, `checkpoint` and `escalate_human` once each, all `Unknown tool`. Evidence: `deploy/evidence/VERIFICATION_sweep_unheard_calls.md`.
 
 ### Phase 1 PR-08: Gold export, reproducible and re-verified by the driver
 
