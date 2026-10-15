@@ -97,14 +97,14 @@ def test_run_flattens_the_three_reports_and_the_manifest(wired):
     assert r["plant_check"]["redact_pii"]["passed"] is True
     assert r["tables"]["bronze.conversation_events"]["rows"] == 924
     assert set(r["tables"]) == {"bronze.conversation_events", "silver.instruction_pairs", "gold.qlora_train"}
-    assert r["manifest"]["dataset_sha256"] == "7a05b9ad" and r["stages"] == {"land": True, "silver": True, "gold": True}
+    assert r["manifest"]["dataset_sha256"] == "7a05b9ad" and r["stages"] == {"land": True, "silver": True, "gold": True, "export": False}
     assert [o["outcome"] for os in r["dq"].values() for o in os] == ["Passed", "Passed"]
 
 
 def test_a_dataset_with_missing_stages_is_shown_as_missing_not_as_an_error(wired):
     console, _, _ = wired
     r = console.data_run("seed7-small-20261014-104335")
-    assert r["stages"] == {"land": False, "silver": True, "gold": False} and r["train"] is None
+    assert r["stages"] == {"land": False, "silver": True, "gold": False, "export": False} and r["train"] is None
 
 
 @pytest.mark.parametrize("bad", ["../../customer-data", "x/../../y", "SEED7", "", "a" * 81, "seed 7", "seed7%2f..%2f"])
@@ -141,3 +141,17 @@ def test_the_frontend_has_the_tab_and_routes_it():
     assert 'data-tab="data"' in html and '"data"' in html.split("const KNOWN_TABS")[1].split("]")[0]
     assert 'if (t==="data") loadData();' in html
     assert html.count('data-tab-panel="data"') >= 6
+
+
+def test_the_export_report_is_shown_latest_first(wired):
+    console, s3, _ = wired
+    base = f"lakehouse/reports/{DATASET}/"
+    s3.objects[base + "export-1.json"] = {"prefix": "s3://b/lakehouse/extracts/x/1/", "files": {"train": {"sha256": "old"}}}
+    s3.objects[base + "export-2.json"] = {"prefix": "s3://b/lakehouse/extracts/x/1/", "files": {
+        "train": {"uri": "s3://b/lakehouse/extracts/x/1/train.jsonl", "sha256": "a" * 64, "rows": 251,
+                  "snapshot_id": "1", "table": "gold.qlora_train", "extra": "dropped"}}}
+    r = console.data_run(DATASET)
+    assert r["export"]["files"]["train"]["sha256"] == "a" * 64 and "extra" not in r["export"]["files"]["train"]
+    assert r["stages"]["export"] is True
+    del s3.objects[base + "export-1.json"], s3.objects[base + "export-2.json"]
+    assert console.data_run(DATASET)["export"] is None

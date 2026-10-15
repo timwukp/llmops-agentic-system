@@ -107,8 +107,8 @@ ALLOWED = (b"6833" + b"13688378", b"7631" + b"04351884", b"1234" + b"56789012")
 #: this laptop, single-threaded CPython does 3.1M sha256/s, so the whole 1e12 space falls in
 #: about 4 days -- and a GPU does it in roughly 100 seconds. So the KDF is iterated. At 200k
 #: iterations a candidate costs ~16 ms, which makes the same sweep ~500 GPU-years, while the
-#: scan stays cheap because only 12-digit runs are ever hashed: measured across all 312
-#: tracked files there are 80 such runs, 11 distinct, and hashing the distinct set takes 0.16 s
+#: scan stays cheap because only 12-digit runs are ever hashed: measured across all 319
+#: tracked files there are 81 such runs, 11 distinct, and hashing the distinct set takes 0.16 s
 #: for the entire repo. (Re-measured whenever either number moves, and they move
 #: INDEPENDENTLY, which is why both are derived and neither is inferred from the other, and
 #: this branch is the proof in both directions. Its parent moved BOTH at once from DISJOINT
@@ -213,8 +213,11 @@ ALLOWED = (b"6833" + b"13688378", b"7631" + b"04351884", b"1234" + b"56789012")
 #: No 12-digit run; the runs held at 80.
 #: Then 304 files went to 307 (the memory-orphan sweep's intent chain). No 12-digit run; the runs
 #: held at 80.
-#: Then 307 files became 312 (the orchestrator intake-scope probe tool, its evidence and intent
-#: chain). No 12-digit run; the runs held at 80.
+#: Then 307 files went to 314 (the Gold export module and Glue job, its tests and evidence, and its
+#: intent chain). One new run, the documentation account in tests/test_lakehouse_export.py -- runs
+#: 80 -> 81, distinct held at 11.
+#: Then 314 files became 319 (the orchestrator intake-scope probe tool, its evidence and intent
+#: chain). No 12-digit run; the runs held at 81.
 #: Dollar limits and percentages only -- no 12-digit run, so the runs held at 74 again.
 #: For EIGHT commits
 #: running, the file count moved and the run count did not move once, and then one commit moved

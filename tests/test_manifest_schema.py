@@ -234,6 +234,8 @@ def test_the_driver_records_validate_after_a_stage_and_an_escalation(env):
     s3.put_object("b", key, json.dumps(
         start_pipeline.seed_manifest(run_id, "conductor", {}, SIGNED_PLAN)).encode())
     s3.put_object("b", f"runs/{run_id}/eval/report.json", b"{}")
+    extract = b'{"messages":[]}\n{"messages":[]}\n'
+    s3.put_object("b", "lakehouse/extracts/seed7-demo-x/42/train.jsonl", extract)
     c = {"s3": s3, "ddb": _DDB(), "events": _Events(), "sfn": None}
     event = {"run_id": run_id, "stage": "eval", "task": "score", "iteration": 0,
              "manifest_uri": f"s3://b/{key}"}
@@ -241,7 +243,10 @@ def test_the_driver_records_validate_after_a_stage_and_an_escalation(env):
     # S3, so the attestation takes its could-not-check branch, `error` included.
     res = driver.handle_stage_complete(c, event, {
         "stage": "eval", "outputs": [f"s3://b/runs/{run_id}/eval/report.json"],
-        "metrics": {"judge_win_rate": 0.6, "judge_prompt_sha256": "0" * 64},
+        "metrics": {"judge_win_rate": 0.6, "judge_prompt_sha256": "0" * 64,
+                    "extract_uri": "s3://b/lakehouse/extracts/seed7-demo-x/42/train.jsonl",
+                    "extract_sha256": __import__("hashlib").sha256(extract).hexdigest(),
+                    "extract_snapshot_id": 42},
         "evidence": "scored 40 pairs"})
     assert res.get("ok"), res
     assert driver._record_manifest_escalation(c, event, {"reason": "gate missed twice"})
@@ -250,5 +255,7 @@ def test_the_driver_records_validate_after_a_stage_and_an_escalation(env):
     for block in ("stage_history", "attestations", "escalations"):
         assert saved.get(block), f"the driver wrote no {block}: {sorted(saved)}"
     assert saved["attestations"][0].get("error"), saved["attestations"]
+    gold = next(a for a in saved["attestations"] if a["kind"] == "gold_extract")
+    assert gold["verified"] is True and gold["rows"] == 2 and gold["snapshot_id"] == "42", gold
     errs = validate(saved, SCHEMA)
     assert not errs, "the driver wrote records the schema rejects:\n" + "\n".join(errs)

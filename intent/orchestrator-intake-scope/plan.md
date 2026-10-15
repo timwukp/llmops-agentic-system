@@ -3,10 +3,12 @@
 - **Spec:** ./spec.md
 - **Author:** Claude (AI agent)
 - **Accepted-by:** Tim WU
-- **Accepted-for:** 8f7c618d4e3b6863cb2ffa2365f55f9f05caccec
+- **Accepted-for:** 8a9af69bb3555f55ed69188f3b58d64bc854e1c9
 - **Status:** accepted
 
-`Accepted-for` is the merge base with `main` at acceptance (PR #164's merge).
+`Accepted-for` is the merge base with `main` (PR #165's merge). It was first written against #164's, then
+re-bound when #165 (Gold export) landed and `main` was merged in. #165 touches none of this change's
+source files.
 
 ## Files changed
 
