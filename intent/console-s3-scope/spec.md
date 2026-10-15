@@ -16,6 +16,9 @@
    - intake: a customer-named URI (HeadObject/GetObject, ListBucket for an existence check or a prefix),
      and the drop-zone template upload under `customer-data/`;
    - `models-mirror/<repo>/` (mirror presence), ListBucket;
+   - the Data tab (#162, merged in): `lakehouse/reports/` (list), `lakehouse/reports/<ds>/*.json` and
+     `lakehouse/landing/<ds>/manifest.json` through `_s3_json`. The landing data itself is not read;
+     the grant must not reach it;
    - the vendored `conductor_tools.service_launch_run`, handed the console's `s3` client, reads the
      plan_uri.
 2. Dynamic keys go through one guard, `_scoped_key(uri, prefixes)`: it returns `(bucket, key)` only

@@ -159,10 +159,11 @@ that gets ignored.
 
 **Console S3 read scope (2026-10-15).** `LlmopsAdminLambdaRole`'s `S3Manifests` statement
 (`s3:GetObject` + `s3:ListBucket` on `"*"`) is replaced by `S3ConsoleRead` (GetObject on the data
-bucket's `runs/*`, `tasks/*`, `customer-data/*`, `finops/rates/rate_card_latest.json`) and
-`S3ConsoleList` (ListBucket on the data bucket, `s3:prefix` in `runs/*`, `customer-data/*`,
-`models-mirror/*`). `llmops-admin` was redeployed with the guarded reads. No resources were created
-or deleted.
+bucket's `runs/*`, `tasks/*`, `customer-data/*`, `finops/rates/rate_card_latest.json`,
+`lakehouse/reports/*/*`, `lakehouse/landing/*/manifest.json`) and `S3ConsoleList` (ListBucket on the
+data bucket, `s3:prefix` in `runs/*`, `customer-data/*`, `models-mirror/*/`, `lakehouse/reports/`).
+`llmops-admin` was redeployed from `main` at `7349dc6` (incl. the Data tab) plus this change. No
+resources were created or deleted.
 
 ## Harness versions & endpoint pins
 

@@ -3,17 +3,19 @@
 - **Spec:** ./spec.md
 - **Author:** Claude (AI agent)
 - **Accepted-by:** Tim WU
-- **Accepted-for:** d8b989456dc0730a6542fc7a44525eda4f3ff885
+- **Accepted-for:** 7349dc60ba31ab985d13d2580eeb4de809b874a1
 - **Status:** accepted
 
-`Accepted-for` is the merge base with `main` at acceptance (PR #161's merge).
+`Accepted-for` is the merge base with `main` (PR #162's merge). It was first written against #161's,
+then re-bound when #162 (the Data tab) landed and `main` was merged in. The Data tab's reads are in scope.
 
 ## Files changed
 
 1. `deploy/console/iam-policy.json`: replace `S3Manifests` with `S3ConsoleRead` + `S3ConsoleList`.
 2. `deploy/console/lambda_function.py`: the scope constants, `_scoped_key`, guarded reads, list-based
    intake existence.
-3. `deploy/console/deploy.sh`: `${TMPDIR:-/tmp}`.
+3. `deploy/console/deploy.sh`: `${TMPDIR:-/tmp}`. Superseded: #162 made the same change, and the
+   merge takes `main`'s copy.
 4. `tests/test_console_s3_scope.py` (new). `tests/test_console_tasks.py`: FakeS3 list returns `Size`;
    intake tests use in-scope URIs, plus out-of-scope cases.
 5. `deploy/evidence/VERIFICATION_console_s3_scope.md` (new), `docs/TEST_RESULTS.md`,

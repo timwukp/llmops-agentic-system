@@ -2310,6 +2310,74 @@ def _posture(budgets, pol, aws_budgets):
          "detail": "read-only; billed via the payer account, so actuals here can read $0"}]
 
 
+# ── Data tab (read-only, Phase 1) ─────────────────────────────────────────────
+#
+# Reads the lakehouse jobs' REPORTS and the S3 Tables METADATA APIs, never the tables. The
+# tables are SSE-KMS and Bronze holds PII, so a console role that could decrypt them would be one
+# more path to that PII; every number this tab shows is one the Glue jobs already wrote into a
+# report (row counts, current snapshot ids, rule catches, DQ outcomes, the plant comparison).
+LAKEHOUSE_REPORTS = "lakehouse/reports/"
+LAKEHOUSE_LANDING = "lakehouse/landing/"
+#: A dataset id is a path segment chosen by the smoke/pipeline run: seed7-demo-20261014-110922.
+_DATASET_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,79}$")
+
+
+def _s3_json(key):
+    try:
+        return json.loads(s3.get_object(Bucket=data_bucket(), Key=key)["Body"].read())
+    except Exception:  # noqa: BLE001 -- an absent report is shown as absent, not as an error page
+        return None
+
+
+def data_overview():
+    """Datasets with reports (newest first) and the lakehouse tables' metadata."""
+    out, errors = {"datasets": [], "tables": []}, {}
+    try:
+        page = s3.list_objects_v2(Bucket=data_bucket(), Prefix=LAKEHOUSE_REPORTS, Delimiter="/")
+        ids = [p["Prefix"][len(LAKEHOUSE_REPORTS):].rstrip("/") for p in page.get("CommonPrefixes", [])]
+        # newest first by the trailing YYYYMMDD-HHMMSS stamp the run appends
+        out["datasets"] = sorted((i for i in ids if _DATASET_ID.match(i)), key=lambda i: i[-15:], reverse=True)
+    except Exception as e:  # noqa: BLE001
+        errors["reports"] = f"{type(e).__name__}"
+    try:
+        s3t = boto3.client("s3tables", region_name=REGION)
+        for key in ("raw_bucket_arn", "curated_bucket_arn"):
+            arn = ssm.get_parameter(Name=f"/llmops/lakehouse/{key}")["Parameter"]["Value"]
+            bucket = arn.rsplit("/", 1)[-1]
+            for t in s3t.list_tables(tableBucketARN=arn, maxTables=100).get("tables", []):
+                ns = t.get("namespace") or [""]
+                out["tables"].append({"bucket": bucket, "namespace": ns[0] if isinstance(ns, list) else ns,
+                                      "name": t["name"], "type": t.get("type", ""),
+                                      "modified_at": str(t.get("modifiedAt", ""))[:19]})
+        out["tables"].sort(key=lambda t: ({"bronze": 0, "silver": 1, "gold": 2}.get(t["namespace"], 3), t["name"]))
+    except Exception as e:  # noqa: BLE001
+        errors["tables"] = f"{type(e).__name__}"
+    out["errors"] = errors
+    return out
+
+
+def data_run(dataset):
+    """One dataset's reports, flattened for the tab. 400 on an id that is not one."""
+    if not _DATASET_ID.match(dataset or ""):
+        raise ValueError("dataset must be a lowercase id such as seed7-demo-20261014-110922")
+    base = f"{LAKEHOUSE_REPORTS}{dataset}/"
+    land, silver, gold = (_s3_json(base + f) for f in ("land.json", "silver.json", "gold.json"))
+    manifest = _s3_json(f"{LAKEHOUSE_LANDING}{dataset}/manifest.json")
+    tables = {}
+    for rep in (land, silver, gold):
+        tables.update((rep or {}).get("tables") or {})
+    rules = {k: v.get("count") for k, v in ((silver or {}).get("rules") or {}).items()}
+    dq = {"silver": ((silver or {}).get("dq") or {}).get("outcomes", []),
+          **{f"gold.{t}": o for t, o in ((gold or {}).get("dq") or {}).items()}}
+    return {"dataset": dataset,
+            "manifest": {k: (manifest or {}).get(k) for k in ("seed", "scale", "counts", "defect_counts",
+                                                               "dataset_sha256", "generator_version")},
+            "tables": tables, "rules": rules, "plant_check": (silver or {}).get("plant_check"),
+            "pairs": (silver or {}).get("pairs"), "train": (gold or {}).get("train"),
+            "eval": (gold or {}).get("eval"), "dq": dq,
+            "stages": {"land": land is not None, "silver": silver is not None, "gold": gold is not None}}
+
+
 def cost_budgets():
     mtd = (cost_v2(30).get("overview") or {}).get("mtd_usd", 0.0)
     budgets = [_budget_view(b, mtd) for b in _budgets_raw()]
@@ -4916,6 +4984,13 @@ def handler(event, context):
             return _resp(200, cost_v2(qs.get("days", 30)))
         if method == "GET" and path == "/api/cost/budgets":
             return _resp(200, cost_budgets())
+        if method == "GET" and path == "/api/data":
+            return _resp(200, data_overview())
+        if method == "GET" and path == "/api/data/run":
+            try:
+                return _resp(200, data_run(qs.get("dataset", "")))
+            except ValueError as e:
+                return _resp(400, {"error": str(e)})
         # The task-type catalog is registry data, not customer data: the same class of
         # already-public fact as /api/overview. The template is the catalog rendered
         # as a file.

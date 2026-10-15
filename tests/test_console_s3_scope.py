@@ -7,13 +7,15 @@ bucket, so the breadth was load-bearing for exactly one code path, and that path
 "verified" for objects the pipeline's own role cannot read.
 
 So the reads are read out of `lambda_function.py`'s AST, not listed here. Each S3 read
-call resolves to an object-key pattern in one of three ways, and anything else fails:
+call resolves to an object-key glob in one of three ways, and anything else fails:
 
-  * a literal key or an f-string with a literal head (`runs/{run_id}/manifest.json`
-    -> `runs/*`), on `Bucket=data_bucket()`;
-  * a local name assigned from such a literal (`prefix = f"models-mirror/{..}/"`);
+  * a key built from literals on `Bucket=data_bucket()`: literal text stays literal, a
+    module string constant contributes its value, any other interpolation becomes `*`
+    (`f"{LAKEHOUSE_LANDING}{dataset}/manifest.json"` -> `lakehouse/landing/*/manifest.json`),
+    through local names and `+`;
+  * the same, at every call site of a helper whose key is its own parameter (`_s3_json`);
   * a name whose last assignment comes from `_scoped_key(uri, <PREFIX_TUPLE>)`, which
-    pins the data bucket and the prefix -- the pattern is then each prefix + `*`.
+    pins the data bucket and the prefix -- the glob is then each prefix + `*`.
 
 Both directions are asserted, as `test_every_aws_call_a_handler_makes_is_in_its_role`
 does for the pipeline Lambdas: a read with no grant dies on AccessDenied in production,
@@ -79,17 +81,58 @@ def _innermost_function(tree, call):
     return best
 
 
-def _literal_pattern(node):
-    """Key pattern for a literal / f-string-with-literal-head, else None."""
+def _str_constants(consts):
+    return {k: v for k, v in consts.items() if isinstance(v, str)}
+
+
+def _local_assign(fn, name, before):
+    """The value of the last `name = <expr>` above line `before` in fn, else None."""
+    hit = None
+    for n in ast.walk(fn) if fn is not None else ():
+        if (isinstance(n, ast.Assign) and n.lineno < before and len(n.targets) == 1
+                and isinstance(n.targets[0], ast.Name) and n.targets[0].id == name):
+            if hit is None or n.lineno >= hit.lineno:
+                hit = n
+    return hit.value if hit is not None else None
+
+
+def _glob(node, fn, consts, before):
+    """A glob for the key `node` builds, or None when it is not built from literals.
+
+    Literal text stays literal, a module string constant contributes its value, and any
+    other interpolated piece becomes `*`: f"{LAKEHOUSE_LANDING}{dataset}/manifest.json" ->
+    lakehouse/landing/*/manifest.json. That precision is the point -- landing/ holds the raw
+    generated data, and the console may read each dataset's manifest, not the data.
+    """
+    strs = _str_constants(consts)
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
         return node.value
-    if (isinstance(node, ast.JoinedStr) and node.values
-            and isinstance(node.values[0], ast.Constant)):
-        head = node.values[0].value
-        # The head must reach at least one "/" -- f"{x}/manifest.json" is not a prefix.
-        if "/" in head:
-            return head[:head.index("/") + 1] + "*"
+    if isinstance(node, ast.Name):
+        if node.id in strs:
+            return strs[node.id]
+        v = _local_assign(fn, node.id, before)
+        return _glob(v, fn, consts, v.lineno) if v is not None else None
+    if isinstance(node, ast.JoinedStr):
+        out = ""
+        for part in node.values:
+            if isinstance(part, ast.Constant):
+                out += part.value
+            elif isinstance(part.value, ast.Name) and part.value.id in strs:
+                out += strs[part.value.id]
+            else:
+                out += "*"
+        return out
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left = _glob(node.left, fn, consts, before)
+        if left is None:
+            return None
+        return left + (_glob(node.right, fn, consts, before) or "*")
     return None
+
+
+def _anchored(pattern):
+    """A glob must start with a literal top-level prefix: "*" alone, or "{x}/a", bounds nothing."""
+    return pattern is not None and "/" in pattern.split("*", 1)[0]
 
 
 def _guard_scope(fn, call, name, consts):
@@ -131,8 +174,16 @@ def _is_data_bucket_call(node):
             and node.func.id == "data_bucket")
 
 
+def _key_param(fn, key):
+    """True when `key` is one of fn's own parameters and fn never rebinds it."""
+    if fn is None or not isinstance(key, ast.Name):
+        return False
+    params = {a.arg for a in fn.args.args}
+    return key.id in params and _local_assign(fn, key.id, fn.end_lineno + 1) is None
+
+
 def _derive_reads():
-    """[(lineno, function, iam_action, key_pattern, how)] for every S3 read; plus the
+    """[(lineno, function, iam_action, key_glob, how)] for every S3 read; plus the
     list of reads that could not be resolved, which the test reports as failures."""
     tree = _tree()
     consts = _module_constants(tree)
@@ -148,14 +199,30 @@ def _derive_reads():
         kw = {k.arg: k.value for k in call.keywords}
         key = kw.get("Prefix" if op == "list_objects_v2" else "Key")
         where = f"line {call.lineno} ({fn.name if fn else '<module>'})"
-        pat = _literal_pattern(key)
-        if pat is None and isinstance(key, ast.Name) and fn is not None:
-            for n in ast.walk(fn):                   # prefix = f"models-mirror/.."
-                if (isinstance(n, ast.Assign) and n.lineno < call.lineno
-                        and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name)
-                        and n.targets[0].id == key.id):
-                    pat = _literal_pattern(n.value) or pat
-        if pat is not None:
+
+        # A helper whose key is its own parameter (_s3_json(key)): the key is whatever each
+        # caller passes, so resolve it at every call site, in the CALLER's scope.
+        if _key_param(fn, key):
+            if not _is_data_bucket_call(kw.get("Bucket")):
+                unresolved.append(f"{where}: helper reads a bucket that is not data_bucket()")
+                continue
+            sites = [c for c in ast.walk(tree) if isinstance(c, ast.Call)
+                     and isinstance(c.func, ast.Name) and c.func.id == fn.name]
+            if not sites:
+                unresolved.append(f"{where}: helper {fn.name} has no call site to derive from")
+            for c in sites:
+                caller = _innermost_function(tree, c)
+                pat = _glob(c.args[0], caller, consts, c.lineno) if c.args else None
+                if not _anchored(pat):
+                    unresolved.append(f"line {c.lineno}: {fn.name}(...) key not built from "
+                                      "a literal prefix")
+                    continue
+                reads.append((c.lineno, caller.name if caller else "<module>",
+                              READ_OPS[op], pat, f"via {fn.name}"))
+            continue
+
+        pat = _glob(key, fn, consts, call.lineno) if key is not None else None
+        if _anchored(pat):
             if not _is_data_bucket_call(kw.get("Bucket")):
                 unresolved.append(f"{where}: literal key {pat!r} on a bucket that is not "
                                   "data_bucket()")
@@ -243,9 +310,9 @@ def test_the_derivation_still_finds_reads():
     actions = {a for _, _, a, _, _ in reads}
     hows = {h for _, _, _, _, h in reads}
     assert actions == {"s3:GetObject", "s3:ListBucket"}, actions
-    assert "literal" in hows and len(hows) >= 3, hows
+    assert "literal" in hows and "via _s3_json" in hows and len(hows) >= 4, hows
     fns = {f for _, f, _, _, _ in reads}
-    assert {"run_detail", "_verify_s3_uri", "accept_task"} <= fns, fns
+    assert {"run_detail", "_verify_s3_uri", "accept_task", "data_run", "data_overview"} <= fns, fns
 
 
 def test_every_s3_client_method_the_console_calls_is_modelled():
@@ -312,10 +379,15 @@ def test_every_derived_read_is_granted(action, grants):
 def test_nothing_is_granted_that_the_console_does_not_read(action, grants):
     reads, _ = _all_reads()
     pats = {p for _, _, a, p, _ in reads if a == action}
-    unused = [g for g in grants() if not any(fnmatch.fnmatchcase(p, g) for p in pats)]
-    assert not unused, (
-        f"{action} granted on {unused} and no console read matches. Either a read was "
-        "removed and its grant outlived it, or the grant is wider than the code.")
+    # fnmatch(g, p), not (p, g): the GRANT must fit inside a derived glob. The other way
+    # round only asks that the grant overlaps some read, so lakehouse/landing/* would pass
+    # for a code path that reads lakehouse/landing/*/manifest.json -- and would hand the
+    # console the raw generated data it was scoped away from.
+    wider = [g for g in grants() if not any(fnmatch.fnmatchcase(g, p) for p in pats)]
+    assert not wider, (
+        f"{action} granted on {wider}, which no console read needs that widely. Either a "
+        f"read was removed and its grant outlived it, or the grant is wider than the code. "
+        f"Derived: {sorted(pats)}")
 
 
 def test_scope_tuples_are_top_level_prefixes():

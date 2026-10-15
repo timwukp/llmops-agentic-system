@@ -8,14 +8,38 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 ### Console role: S3 reads scoped to what the console reads
 
 `LlmopsAdminLambdaRole` had `s3:GetObject` + `s3:ListBucket` on `"*"`, which is every bucket in the
-account. It now reads `runs/*`, `tasks/*`, `customer-data/*` and the rate-card key, and lists `runs/`,
-`customer-data/` and `models-mirror/`, all in the data bucket. `tests/test_console_s3_scope.py` derives
-those patterns from `lambda_function.py`'s AST and fails when the policy and the code disagree in either
-direction. Keys computed from data go through `_scoped_key(uri, <prefixes>)`. An intake URI outside
+account. It now reads `runs/*`, `tasks/*`, `customer-data/*`, the rate-card key, and the Data tab's
+`lakehouse/reports/*/*` and `lakehouse/landing/*/manifest.json` (not the landing data). It lists
+`runs/`, `customer-data/`, `models-mirror/` and `lakehouse/reports/`, all in the data bucket.
+`tests/test_console_s3_scope.py` derives those globs from `lambda_function.py`'s AST and fails when the
+policy and the code disagree in either direction, including a grant wider than the read it serves. Keys computed from data go through `_scoped_key(uri, <prefixes>)`. An intake URI outside
 those prefixes is `unverified` with the reason; it used to come back `verified` for objects the pipeline
 cannot read. Accept refuses a plan_uri outside `runs/` / `tasks/`; it used to read the data bucket plus
-the URI's key and ignore the URI's bucket. Live: 19/19 `simulate_principal_policy` cases
-(`deploy/evidence/VERIFICATION_console_s3_scope.md`). `deploy.sh` now stages under `$TMPDIR`.
+the URI's key and ignore the URI's bucket. Live, on the merged tree: 25/25 `simulate_principal_policy`
+cases, and the Data tab and run detail served by the deployed role
+(`deploy/evidence/VERIFICATION_console_s3_scope.md`). That file also records that two earlier deploys
+from a pre-#162 branch removed the live Data tab until it was redeployed from `main`.
+
+### Console: a read-only Data tab
+
+A new **Data** tab, the read-only version the owner asked for right after PR-07. It shows:
+- the lakehouse datasets with reports;
+- the 10 tables with their row counts and current snapshots;
+- Silver pairs and the Gold train/eval split;
+- each rule's catch against the generator's plants;
+- the Glue Data Quality outcomes.
+
+Exports and lineage show where they arrive (PR-08, PR-05). Routes: `GET /api/data` and
+`GET /api/data/run?dataset=`; the dataset id is regex-checked, and a bad one returns 400 before any read.
+
+**The tab never reads the tables.** They are SSE-KMS and Bronze holds PII, so every number comes from a
+report the Glue jobs wrote. The jobs' reports now carry rows, snapshot ids and, for generated data, the
+plant comparison; `land_bronze` gained a report of its own. The console's one new grant is metadata-only
+(`s3tables:List*/Get*` on the two lakehouse buckets, no `GetTableData`, no KMS).
+
+Verified in the live portal after a demo smoke: 8/8 rules exact, 16/16 DQ. The check also found that
+switching to an older dataset left the previous dataset's numbers in the table panel; that is now fixed
+and re-verified. `deploy/console/deploy.sh` now honours `$TMPDIR`.
 
 ### Spike S7, Unified Studio part: lineage and price PASS, visibility FAIL
 
