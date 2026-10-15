@@ -130,13 +130,39 @@
       "Resource": "*"
     },
     {
-      "Sid": "S3Manifests",
+      "_comment": "Every object the console reads, and nothing else. This was GetObject+ListBucket on \"*\" -- every bucket in the account -- for a console that reads one bucket. The patterns are DERIVED from lambda_function.py by tests/test_console_s3_scope.py in both directions: a literal key (runs/{run_id}/manifest.json -> runs/*, the rate card's exact key) or a _scoped_key(...) prefix tuple (_PLAN_S3_PREFIXES, _INTAKE_S3_PREFIXES, _UPLOAD_S3_PREFIXES). A read the code adds without a grant fails the test, and so does a grant nothing reads. HeadObject is authorised by GetObject. The Data tab reads lakehouse/reports/* and each dataset's lakehouse/landing/*/manifest.json, NOT the rest of landing/: that is the raw generated data, PII plants included, and the tab shows only what the reports and the manifest say. Not reports/ or code/: the console reads neither.",
+      "Sid": "S3ConsoleRead",
       "Effect": "Allow",
       "Action": [
-        "s3:GetObject",
+        "s3:GetObject"
+      ],
+      "Resource": [
+        "arn:aws:s3:::llmops-agentic-ACCOUNT_ID-REGION/runs/*",
+        "arn:aws:s3:::llmops-agentic-ACCOUNT_ID-REGION/tasks/*",
+        "arn:aws:s3:::llmops-agentic-ACCOUNT_ID-REGION/customer-data/*",
+        "arn:aws:s3:::llmops-agentic-ACCOUNT_ID-REGION/finops/rates/rate_card_latest.json",
+        "arn:aws:s3:::llmops-agentic-ACCOUNT_ID-REGION/lakehouse/reports/*/*",
+        "arn:aws:s3:::llmops-agentic-ACCOUNT_ID-REGION/lakehouse/landing/*/manifest.json"
+      ]
+    },
+    {
+      "_comment": "ListBucket is a BUCKET action, so it is scoped by the s3:prefix condition, not by the resource. runs/ and customer-data/ are intake's existence checks (list_objects_v2 Prefix=key, so 'not found' does not depend on S3's 404-vs-403 choice for a missing key; measured 2026-10-15, a GetObject on a missing runs/ key still returned NoSuchKey under this scoped grant); models-mirror/ is the mirror-presence check; lakehouse/reports/ is the Data tab's dataset picker. A list with no prefix, or under any other prefix, is denied.",
+      "Sid": "S3ConsoleList",
+      "Effect": "Allow",
+      "Action": [
         "s3:ListBucket"
       ],
-      "Resource": "*"
+      "Resource": "arn:aws:s3:::llmops-agentic-ACCOUNT_ID-REGION",
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": [
+            "runs/*",
+            "customer-data/*",
+            "models-mirror/*/",
+            "lakehouse/reports/"
+          ]
+        }
+      }
     },
     {
       "Sid": "IntakeKbVerify",
@@ -332,7 +358,7 @@
       }
     },
     {
-      "_comment": "plan.json / approval.json / transcript.jsonl live under tasks/. Write scoped to that prefix; the broad S3Manifests read already covers GetObject.",
+      "_comment": "plan.json / approval.json / transcript objects live under tasks/. Write scoped to that prefix; S3ConsoleRead covers the GetObject on tasks/*.",
       "Sid": "S3TasksWrite",
       "Effect": "Allow",
       "Action": [

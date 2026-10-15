@@ -175,8 +175,12 @@ class FakeS3:
 
     def list_objects_v2(self, Bucket, Prefix="", MaxKeys=1000, **kw):
         keys = sorted(k for k in self.objects if k.startswith(f"{Bucket}/{Prefix}"))
+        def size(k):
+            b = self.objects[k]
+            return len(b if isinstance(b, bytes) else str(b).encode())
         return {"KeyCount": min(len(keys), MaxKeys),
-                "Contents": [{"Key": k.split("/", 1)[1]} for k in keys[:MaxKeys]]}
+                "Contents": [{"Key": k.split("/", 1)[1], "Size": size(k)}
+                             for k in keys[:MaxKeys]]}
 
     def generate_presigned_url(self, ClientMethod, Params=None, ExpiresIn=None):
         """Records the call and returns a URL shaped like the real one.
@@ -5849,8 +5853,13 @@ def test_s3_verify_counts_jsonl_rows_and_404_is_failed_not_error(intake):
     intake.s3.objects["test-bucket/customer-data/t/x.jsonl"] = b'{"a":1}\n\n{"b":2}\n'
     ok = c._verify_s3_uri("source_uri", "s3://test-bucket/customer-data/t/x.jsonl")
     assert ok["status"] == "verified" and "2 rows" in ok["detail"]
-    gone = c._verify_s3_uri("source_uri", "s3://test-bucket/none/missing.jsonl")
-    assert gone["status"] == "failed"
+    gone = c._verify_s3_uri("source_uri", "s3://test-bucket/customer-data/t/missing.jsonl")
+    assert gone["status"] == "failed" and gone["detail"] == "object not found"
+    # A key that is only a PREFIX of an existing one is still not found: Prefix=key lists
+    # x.jsonl.bak first, and the exact-key comparison is what keeps that from counting.
+    intake.s3.objects["test-bucket/customer-data/t/z.jsonl.bak"] = b"{}\n"
+    assert c._verify_s3_uri("source_uri",
+                            "s3://test-bucket/customer-data/t/z.jsonl")["status"] == "failed"
 
 
 def test_s3_500_is_unverified_and_intake_never_raises(intake, monkeypatch):
@@ -5858,15 +5867,63 @@ def test_s3_500_is_unverified_and_intake_never_raises(intake, monkeypatch):
 
     def boom(**kw):
         raise RuntimeError("500 InternalError")
-    monkeypatch.setattr(intake.s3, "head_object", boom)
-    f = c._verify_s3_uri("source_uri", "s3://test-bucket/x/y.jsonl")
+    monkeypatch.setattr(intake.s3, "list_objects_v2", boom)
+    f = c._verify_s3_uri("source_uri", "s3://test-bucket/customer-data/x/y.jsonl")
     assert f["status"] == "unverified" and "500" in f["detail"]
     tid = _mk_task(intake, status="thinking")
     t = intake.tasks.items[tid]
     t["messages"].append({"role": "user", "at": "t1", "by": "alice",
-                          "text": "source_uri s3://test-bucket/x/y.jsonl"})
+                          "text": "source_uri s3://test-bucket/customer-data/x/y.jsonl"})
     out = c._run_intake(tid, json.loads(json.dumps(t, default=str)))
     assert isinstance(out, dict), "fail-open: the turn must get its task back"
+
+
+@pytest.mark.parametrize("uri", [
+    "s3://another-bucket/customer-data/t/x.jsonl",   # right prefix, wrong bucket
+    "s3://test-bucket/lakehouse/gold/x.jsonl",       # right bucket, a prefix nothing reads
+    "s3://test-bucket/customer-data",                # the prefix's name without its slash
+])
+def test_intake_outside_the_read_scope_is_unverified_and_never_touches_s3(intake,
+                                                                        monkeypatch, uri):
+    """The role cannot read these any more, and neither can the pipeline that would consume
+    them. So: no S3 call at all, and a status that does not claim the object is missing."""
+    def no_call(**kw):
+        raise AssertionError(f"S3 called for an out-of-scope URI: {kw}")
+    for op in ("list_objects_v2", "head_object", "get_object"):
+        monkeypatch.setattr(intake.s3, op, no_call)
+    f = intake.console._verify_s3_uri("source_uri", uri)
+    assert f["status"] == "unverified", f
+    assert f["detail"].startswith("not checked: outside s3://test-bucket/")
+
+
+def test_template_upload_outside_customer_data_is_not_read(intake):
+    """"data uploaded: <uri>" is chat text; only the drop zone's own prefix is read."""
+    body = b"---\ntask_type: finetune-private\n---\n"
+    intake.s3.objects["test-bucket/runs/r1/form.md"] = body
+    intake.s3.objects["test-bucket/customer-data/t/form.md"] = body
+    c = intake.console
+    assert c._maybe_template_upload("data uploaded: s3://test-bucket/runs/r1/form.md") is None
+    assert c._maybe_template_upload(
+        "data uploaded: s3://test-bucket/customer-data/t/form.md") is not None
+
+
+def test_accept_refuses_a_plan_uri_outside_the_plan_prefixes(wired):
+    """Accept used to read data_bucket() + the URI's KEY, ignoring the URI's bucket, so it
+    could hash and sign one object while launch_run read another."""
+    for uri in ("s3://another-bucket/tasks/task-abc123/plan.json",
+                "s3://test-bucket/reports/plan.json"):
+        tid = _mk_task(wired, cost="50")
+        wired.tasks.items[tid]["plan_uri"] = uri
+        r = wired.console.accept_task(tid, DS_USER)
+        assert r["status_code"] == 409 and "outside" in r["error"], (uri, r)
+        assert not wired.tasks.items[tid].get("approvals"), "nothing may be signed"
+
+
+def test_readiness_names_an_out_of_scope_plan_uri(wired):
+    tid = _mk_task(wired)
+    wired.tasks.items[tid]["plan_uri"] = "s3://another-bucket/tasks/x/plan.json"
+    r = wired.console.task_readiness(tid)
+    assert "status_code" not in r and "outside" in r["note"]
 
 
 def test_kb_active_matching_ssm_is_verified_and_notfound_is_failed(intake,

@@ -211,6 +211,40 @@ def data_bucket():
     return b
 
 
+# ── S3 read scope ─────────────────────────────────────────────────────────────
+# The role's S3 reads are granted per prefix (deploy/console/iam-policy.json S3ConsoleRead /
+# S3ConsoleList). Until 2026-10-15 they were granted on "*": every object in every bucket of
+# the account, for a console that reads five things from one bucket. A read whose key is
+# computed from data (a plan_uri, a URI a customer typed) goes through _scoped_key with one
+# of these tuples, and tests/test_console_s3_scope.py derives the policy's patterns from
+# them and from the literal keys. A new prefix is therefore a change here, in the policy,
+# and nowhere else.
+#: Where a plan.json is read from: the orchestrator writes under runs/<id>/ (live), and
+#: tasks/<id>/plan.json is the default plan_uri the console hands it.
+_PLAN_S3_PREFIXES = ("runs/", "tasks/")
+#: What intake may check. The harness execution role, which is what actually reads a
+#: source_uri, reads only data-bucket prefixes. So "verified" on an object in another
+#: bucket meant "exists, and the pipeline will get AccessDenied on it".
+_INTAKE_S3_PREFIXES = ("customer-data/", "runs/")
+#: Where the drop zone lands an upload (CUSTOMER_DATA_PREFIX).
+_UPLOAD_S3_PREFIXES = ("customer-data/",)
+
+
+def _scoped_key(uri, prefixes):
+    """(bucket, key) when `uri` names the data bucket under one of `prefixes`, else None.
+
+    The bucket is checked as well as the key. Reading data_bucket() + the URI's key while
+    ignoring the URI's own bucket would hash an object other than the one the URI names.
+    """
+    uri = str(uri or "")
+    if not uri.startswith("s3://"):
+        return None
+    bucket, _, key = uri[5:].partition("/")
+    if bucket != data_bucket() or not key.startswith(prefixes):
+        return None
+    return bucket, key
+
+
 _SPANS_SINCE_CACHE = None
 
 
@@ -3099,8 +3133,14 @@ def accept_task(task_id, user):
     # plan_sha256 binds the signature to THIS plan's exact bytes
     b = data_bucket()
     uri = str(task["plan_uri"])
+    scoped = _scoped_key(uri, _PLAN_S3_PREFIXES)
+    if scoped is None:
+        return {"error": f"plan_uri {uri} is outside s3://{b}/{{"
+                         + ",".join(_PLAN_S3_PREFIXES) + "}, which is where a plan is "
+                         "read from; ask the orchestrator to rewrite it there",
+                "status_code": 409}
     try:
-        plan_raw = s3.get_object(Bucket=b, Key=uri[5:].partition("/")[2])["Body"].read()
+        plan_raw = s3.get_object(Bucket=scoped[0], Key=scoped[1])["Body"].read()
     except Exception as e:
         return {"error": f"plan_uri unreadable: {e}", "status_code": 409}
     plan_sha = hashlib.sha256(plan_raw).hexdigest()
@@ -3669,13 +3709,30 @@ def _verify_s3_uri(name, uri):
         bucket, _, key = str(uri)[5:].partition("/")
         if not bucket or not key:
             return _fact(name, uri, "failed", "not a bucket/key S3 URI", "s3")
+        scoped = _scoped_key(uri, _INTAKE_S3_PREFIXES)
+        if scoped is None:
+            # Not checked, and not reported as failed: the object may well exist. The
+            # pipeline reads data only from these prefixes, so the customer's next step
+            # is the drop zone (or a copy into customer-data/).
+            return _fact(name, uri, "unverified",
+                         f"not checked: outside s3://{data_bucket()}/{{"
+                         + ",".join(_INTAKE_S3_PREFIXES) + "}, the only places the "
+                         "pipeline reads data from; drop the file into this thread", "s3")
+        bucket, key = scoped
+        # Existence by LIST, not by a HeadObject 404. Whether S3 answers a missing key with
+        # 404 or 403 depends on the caller's ListBucket grant, which is now scoped by
+        # s3:prefix (measured 2026-10-15: still NoSuchKey under runs/), and a 403 would read
+        # as "the check errored". The list answers the same either way. Prefix=key, MaxKeys=1
+        # returns the key itself first if it exists: every other key under it sorts after.
+        r = s3.list_objects_v2(Bucket=bucket, Prefix=key, MaxKeys=1)
         if key.endswith("/"):
-            r = s3.list_objects_v2(Bucket=bucket, Prefix=key, MaxKeys=1)
             if r.get("KeyCount"):
                 return _fact(name, uri, "verified", "prefix exists (non-empty)", "s3")
             return _fact(name, uri, "failed", "prefix empty or missing", "s3")
-        h = s3.head_object(Bucket=bucket, Key=key)
-        size = int(h.get("ContentLength") or 0)
+        first = (r.get("Contents") or [{}])[0]
+        if first.get("Key") != key:
+            return _fact(name, uri, "failed", "object not found", "s3")
+        size = int(first.get("Size") or 0)
         detail = f"exists, {size:,} bytes"
         if key.endswith(".jsonl") and size <= INTAKE_LINECOUNT_MAX_BYTES:
             body = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
@@ -3760,8 +3817,13 @@ def _maybe_template_upload(text):
     uri = m.group(1).rstrip(".,;")
     if not uri.lower().endswith((".txt", ".md")):
         return None
+    # "data uploaded:" is text anyone in the thread can type, so the URI it names is a
+    # claim; the drop zone only ever lands under customer-data/.
+    scoped = _scoped_key(uri, _UPLOAD_S3_PREFIXES)
+    if scoped is None:
+        return None
     try:
-        bucket, _, key = uri[5:].partition("/")
+        bucket, key = scoped
         h = s3.head_object(Bucket=bucket, Key=key)
         if int(h.get("ContentLength") or 0) > _INTAKE_TEMPLATE_MAX_BYTES:
             return None
@@ -3886,10 +3948,13 @@ def task_readiness(task_id):
     plan, note = {}, ""
     if not uri:
         note = "no plan yet — the orchestrator writes plan.json once it has enough to price"
+    elif _scoped_key(uri, _PLAN_S3_PREFIXES) is None:
+        note = (f"plan.json could not be read (plan_uri {uri[:120]} is outside "
+                + ",".join(_PLAN_S3_PREFIXES) + " of the data bucket)")
     else:
         try:
-            raw = s3.get_object(Bucket=data_bucket(),
-                                Key=uri[5:].partition("/")[2])["Body"].read()
+            bucket, key = _scoped_key(uri, _PLAN_S3_PREFIXES)
+            raw = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
             plan = json.loads(raw)
         except Exception as e:
             # A 200 with a note, not a 5xx: "the plan is unreadable" is itself a

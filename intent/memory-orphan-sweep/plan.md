@@ -3,10 +3,12 @@
 - **Spec:** ./spec.md
 - **Author:** Claude (AI agent)
 - **Accepted-by:** Tim WU
-- **Accepted-for:** 7349dc60ba31ab985d13d2580eeb4de809b874a1
+- **Accepted-for:** adc30b1ce979795c01e0b4d87a5054cef968f141
 - **Status:** accepted
 
-`Accepted-for` is the merge base with `main` at acceptance (PR #162's merge).
+`Accepted-for` is the merge base with `main` (PR #163's merge). It was first written against #162's,
+then re-bound when #163 (console S3 scope) landed and `main` was merged in to resolve count conflicts;
+#163 touches none of this plan's files except the shared counts, which the merge sums.
 
 ## Files changed
 
