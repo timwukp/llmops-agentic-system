@@ -240,6 +240,7 @@ def _clients():
         "sns": boto3.client("sns", region_name=region),
         "events": boto3.client("events", region_name=region),
         "lambda": boto3.client("lambda", region_name=region),
+        "sagemaker": boto3.client("sagemaker", region_name=region),
     }
 
 
@@ -940,6 +941,7 @@ def _verify_judge_instrument(s3, bucket: str, metrics: dict) -> dict:
 #: A stage that trained on (or exported) a Gold extract claims it with these metrics. The driver
 #: does not take the digest on trust: it re-reads the object and hashes the bytes itself.
 GOLD_EXTRACT_CLAIM_KEYS = ("extract_uri", "extract_sha256")
+ACCEPTANCE_CLAIM_KEYS = ("acceptance_uri", "acceptance_sha256")
 GOLD_EXTRACTS_PREFIX = "lakehouse/extracts/"
 
 
@@ -1609,6 +1611,12 @@ def handle_stage_complete(c, event, args) -> dict:
     if all(k in stage_metrics for k in GOLD_EXTRACT_CLAIM_KEYS):
         measured.append(_verify_gold_extract(
             c["s3"], os.environ.get("DATA_BUCKET", ""), stage_metrics))
+    # The held-out acceptance set the gate is anchored to (PR-11) is in the same bundle and is
+    # measured the same way: a gate's evaluation set is as much a claim as its training data.
+    if all(k in stage_metrics for k in ACCEPTANCE_CLAIM_KEYS):
+        measured.append({**_verify_gold_extract(c["s3"], os.environ.get("DATA_BUCKET", ""), {
+            "extract_uri": stage_metrics["acceptance_uri"],
+            "extract_sha256": stage_metrics["acceptance_sha256"]}), "kind": "acceptance_set"})
     attestation = [{**m, "stage": stage, "task": task,
                     "iteration": event.get("iteration", manifest.get("iteration"))} for m in measured] or None
     for one in attestation or []:
@@ -1698,7 +1706,55 @@ def handle_job_launched(c, event, args) -> dict:
     ev.emit_event(os.environ["EVENT_BUS"], ev.TRAINING_STARTED,
                   {"run_id": run_id, "job_name": args.get("job_name", "")},
                   client=c["events"])
-    return {"released": True}
+    return {"released": True, **_deliver_if_already_terminal(c, run_id, args.get("job_name", ""))}
+
+
+#: SageMaker statuses after which no further state-change event will come.
+TRAINING_TERMINAL = ("Completed", "Failed", "Stopped")
+RESUME_FUNCTION = "llmops-resume-pipeline"
+
+
+def _deliver_if_already_terminal(c, run_id: str, job_name: str) -> dict:
+    """If the job finished before its token was parked, deliver the event it already sent.
+
+    job_launched is serviced when the agent's turn ends, not when the agent calls it, and a turn
+    can outlast the job: run-20261015T104050Z-c7a2c9d8 named a 20-step probe in job_launched,
+    kept working until its 840 s budget ran out, and the driver parked the token four minutes
+    after the probe had completed. The completion event had arrived to a row with no token and
+    was skipped, which is correct for that moment and fatal for the run: nothing else would ever
+    settle the token, so the stage would sit until its 86400 s timeout. The fix is to ask the job,
+    after parking, whether it is already done -- and if so to hand the resume Lambda the same
+    state-change event, so the settle runs through its code (capacity stops, failures, the
+    clear) and not a second copy of it here. If the real event also lands, the resume Lambda's
+    first delivery clears the token and the second finds none: the existing double-delivery path.
+
+    Never raises: the token is parked either way, and a failed check leaves the run exactly where
+    it was before this existed."""
+    sm = c.get("sagemaker")
+    if not job_name or sm is None:
+        return {"terminal_check": "skipped"}
+    try:
+        d = sm.describe_training_job(TrainingJobName=job_name)
+    except Exception as exc:  # noqa: BLE001 -- not a training job, or not readable: nothing to deliver
+        return {"terminal_check": f"unavailable: {type(exc).__name__}"}
+    status = d.get("TrainingJobStatus", "")
+    if status not in TRAINING_TERMINAL:
+        return {"terminal_check": status or "unknown"}
+    detail = {"TrainingJobName": job_name, "TrainingJobStatus": status,
+              "BillingSecondsUsed": d.get("BillableTimeInSeconds") or 0,
+              "ModelArtifacts": d.get("ModelArtifacts") or {}, "FailureReason": d.get("FailureReason", "")}
+    try:
+        c["lambda"].invoke(FunctionName=os.environ.get("RESUME_FUNCTION", RESUME_FUNCTION),
+                           InvocationType="Event", Payload=json.dumps({
+                               "source": "llmops.harness-driver", "detail-type": "SageMaker Training Job State Change",
+                               "detail": detail}, default=str).encode())
+        print(f"[driver] {job_name} was already {status} when job_launched was serviced for {run_id}; "
+              "delivered its state change to the resume Lambda")
+        return {"terminal_check": status, "late_delivery": True}
+    except Exception as exc:  # noqa: BLE001 -- the token stays parked; say so
+        print(f"[driver] {job_name} is {status} but the late delivery failed for {run_id}: "
+              f"{type(exc).__name__}: {exc}")
+        return {"terminal_check": status, "late_delivery": False}
 
 
 #: The finops agent is the one harness that is NOT a pipeline stage: it is invoked by

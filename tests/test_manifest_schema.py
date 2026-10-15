@@ -236,6 +236,7 @@ def test_the_driver_records_validate_after_a_stage_and_an_escalation(env):
     s3.put_object("b", f"runs/{run_id}/eval/report.json", b"{}")
     extract = b'{"messages":[]}\n{"messages":[]}\n'
     s3.put_object("b", "lakehouse/extracts/seed7-demo-x/42/train.jsonl", extract)
+    s3.put_object("b", "lakehouse/extracts/seed7-demo-x/42/acceptance.jsonl", b'{"prompt":"q"}\n')
     c = {"s3": s3, "ddb": _DDB(), "events": _Events(), "sfn": None}
     event = {"run_id": run_id, "stage": "eval", "task": "score", "iteration": 0,
              "manifest_uri": f"s3://b/{key}"}
@@ -246,7 +247,9 @@ def test_the_driver_records_validate_after_a_stage_and_an_escalation(env):
         "metrics": {"judge_win_rate": 0.6, "judge_prompt_sha256": "0" * 64,
                     "extract_uri": "s3://b/lakehouse/extracts/seed7-demo-x/42/train.jsonl",
                     "extract_sha256": __import__("hashlib").sha256(extract).hexdigest(),
-                    "extract_snapshot_id": 42},
+                    "extract_snapshot_id": 42,
+                    "acceptance_uri": "s3://b/lakehouse/extracts/seed7-demo-x/42/acceptance.jsonl",
+                    "acceptance_sha256": "f" * 64},
         "evidence": "scored 40 pairs"})
     assert res.get("ok"), res
     assert driver._record_manifest_escalation(c, event, {"reason": "gate missed twice"})
@@ -257,5 +260,8 @@ def test_the_driver_records_validate_after_a_stage_and_an_escalation(env):
     assert saved["attestations"][0].get("error"), saved["attestations"]
     gold = next(a for a in saved["attestations"] if a["kind"] == "gold_extract")
     assert gold["verified"] is True and gold["rows"] == 2 and gold["snapshot_id"] == "42", gold
+    acc = next(a for a in saved["attestations"] if a["kind"] == "acceptance_set")
+    assert acc["verified"] is False and acc["rows"] == 1 and acc["computed_sha256"] != "f" * 64, (
+        "a wrong acceptance digest must be recorded as wrong, from the bytes")
     errs = validate(saved, SCHEMA)
     assert not errs, "the driver wrote records the schema rejects:\n" + "\n".join(errs)

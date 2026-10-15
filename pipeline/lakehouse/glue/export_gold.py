@@ -8,6 +8,7 @@ logic that decides the bytes is pipeline/lakehouse/export.py (shipped with --ext
 
 Arguments: --data_bucket --curated_bucket --workgroup --dataset --gold_report_uri --report_uri
            --pii_report_uri (Silver report: what the PII rules did to these rows) [--run_id]
+           [--acceptance_uri] (the generator's eval_prompts.jsonl: the held-out acceptance set)
 """
 import datetime
 import json
@@ -23,6 +24,8 @@ import export
 args = getResolvedOptions(sys.argv, ["data_bucket", "curated_bucket", "workgroup", "dataset",
                                      "gold_report_uri", "report_uri", "pii_report_uri"])
 run_id = getResolvedOptions(sys.argv, ["run_id"])["run_id"] if "--run_id" in sys.argv else None
+acceptance_uri = (getResolvedOptions(sys.argv, ["acceptance_uri"])["acceptance_uri"]
+                  if "--acceptance_uri" in sys.argv else None)
 s3, athena = boto3.client("s3"), boto3.client("athena")
 ctx = {"Catalog": f"s3tablescatalog/{args['curated_bucket']}", "Database": "gold"}
 
@@ -67,6 +70,19 @@ for split, table in export.SPLITS.items():
         "dataset_version": args["dataset"], "table_name": f"gold.{table}", "snapshot_id": snapshots[split],
         "export_uri": uri, "sha256": digest, "row_count": len(rows), "dq_score": None,
         "pii_report_uri": args["pii_report_uri"], "run_id": run_id, "created_ts": now}))
+
+# The held-out acceptance set rides in the same bundle, hashed like the splits, so the set a gate
+# is anchored to is as checkable as the data the model trained on. It is copied from landing, not
+# from a table: it is never trained on, so it never enters Bronze.
+if acceptance_uri:
+    body, n, why = export.acceptance_jsonl(_get(acceptance_uri))
+    if body is None:
+        report["acceptance"] = {"source": acceptance_uri, "exported": False, "reason": why, "rows": n}
+    else:
+        key = f"{prefix}/{export.ACCEPTANCE_FILE}"
+        s3.put_object(Bucket=args["data_bucket"], Key=key, Body=body, ContentType="application/x-ndjson")
+        report["files"]["acceptance"] = {"uri": f"s3://{args['data_bucket']}/{key}", "sha256": export.sha256(body),
+                                         "rows": n, "source": acceptance_uri}
 
 s3.put_object(Bucket=args["data_bucket"], Key=f"{prefix}/extract.json", ContentType="application/json",
               Body=json.dumps(report, indent=2).encode())

@@ -132,6 +132,16 @@
             "Resource": "arn:aws:sns:<REGION>:<ACCOUNT_ID>:llmops-escalations"
           },
           {
+            "_comment": "PR-11: job_launched is serviced when the agent's turn ENDS, and a job can reach a terminal state before that (live: run-20261015T104050Z-c7a2c9d8's probe completed at 11:01:51, its job_launched was serviced at 11:05:44, the completion event found no parked token and was skipped, and the run sat on a token nothing would ever settle). So after parking, the driver describes the job and, if it is already terminal, hands the resume Lambda the state-change event SageMaker already sent -- the same settle code, not a second copy of it. Read-only on llmops-* training jobs; invoke on the resume function only.",
+            "Sid": "LateJobDelivery",
+            "Effect": "Allow",
+            "Action": ["sagemaker:DescribeTrainingJob", "lambda:InvokeFunction"],
+            "Resource": [
+              "arn:aws:sagemaker:<REGION>:<ACCOUNT_ID>:training-job/llmops-*",
+              "arn:aws:lambda:<REGION>:<ACCOUNT_ID>:function:llmops-resume-pipeline"
+            ]
+          },
+          {
             "Sid": "SelfReinvokeOnCheckpoint",
             "Effect": "Allow",
             "Action": "lambda:InvokeFunction",

@@ -242,3 +242,55 @@ def test_the_cli_writes_a_manifest_whose_hashes_match_the_files(tmp_path):
     for name, digest in m["sha256"].items():
         assert hashlib.sha256((tmp_path / name).read_bytes()).hexdigest() == digest
     assert m["counts"]["conversation_events"] == sum(1 for _ in open(tmp_path / "bronze_conversation_events.jsonl"))
+
+
+# ── generator v2: a held-out acceptance set (PR-11) ──────────────────────────
+def _pattern(template):
+    return re.compile("^" + re.escape(template).replace(r"\{o\}", ".+").replace(r"\{p\}", ".+")
+                      .replace(r"\{s\}", ".+") + "$")
+
+
+def test_train_and_held_out_phrasings_are_disjoint_and_every_family_has_both():
+    for key, fam in gen._FAMILIES.items():
+        assert fam["train"] and fam["held_out"] and fam["answer"], key
+        assert not set(fam["train"]) & set(fam["held_out"]), key
+    assert {k[0] for k in gen._FAMILIES} == set(gen.INTENTS)
+
+
+def test_no_training_conversation_is_phrased_in_a_held_out_wording(ds):
+    """Except the planted contamination, which copies an acceptance prompt on purpose so the
+    decontaminate rule has something exact to catch."""
+    held = [_pattern(t) for fam in gen._FAMILIES.values() for t in fam["held_out"]]
+    planted = set(_ids(ds, "eval_contamination"))
+    leaks = [e["conversation_id"] for e in ds["tables"]["conversation_events"]
+             if e["turn_idx"] == 0 and e["conversation_id"] not in planted
+             and any(p.match(e["content"]) for p in held)]
+    assert not leaks
+
+
+def test_the_acceptance_set_is_held_out_referenced_distinct_and_sized(ds):
+    acc = ds["eval_prompts"]
+    assert len(acc) == gen.SCALES[ds["scale"]]["eval_prompts"]
+    assert len({a["prompt"] for a in acc}) == len(acc) and all(a["reference"] for a in acc)
+    assert collections.Counter(a["intent"] for a in acc) == {i: len(acc) // len(gen.INTENTS) for i in gen.INTENTS}
+    for a in acc:
+        fam = gen._FAMILIES[(a["intent"], a["lang"])]
+        assert any(_pattern(t).match(a["prompt"]) for t in fam["held_out"]), a["prompt"]
+        assert not any(_pattern(t).match(a["prompt"]) for t in fam["train"]), a["prompt"]
+        assert "C0" not in a["reference"], "a reference answer carries no case number"
+
+
+def test_demo_scale_carries_a_gate_and_its_items_are_far_from_training():
+    """n=120 at demo: at zero failures the Wilson lower bound is 0.969, so a 0.95 gate is
+    decidable (n=32 never was). And the distance is measured, not assumed: v1's eval split sat at a
+    median closest-match similarity of 0.935 to training; v2's acceptance prompts at ~0.54."""
+    ds = gen.generate(7, "demo")
+    train_q = sorted({e["content"] for e in ds["tables"]["conversation_events"]
+                      if e["turn_idx"] == 0 and e["role"] == "customer"})
+    planted = {gen_e["prompt_id"] for gen_e in ds["expected_defects"]["eval_contamination"]["items"]}
+    acc = [a for a in ds["eval_prompts"] if a["prompt_id"] not in planted]
+    best = sorted(max(difflib.SequenceMatcher(None, a["prompt"], q).ratio() for q in train_q) for a in acc)
+    assert len(ds["eval_prompts"]) >= 100
+    assert best[len(best) // 2] < 0.7, f"median closest-match similarity {best[len(best) // 2]:.3f}"
+    z, n = 1.959964, len(ds["eval_prompts"])
+    assert (n / (n + z * z)) > 0.95, "a perfect score must be able to clear a 0.95 Wilson lower bound"

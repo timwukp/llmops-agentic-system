@@ -43,15 +43,15 @@ import re
 import sys
 import uuid
 
-GENERATOR_VERSION = "1"
+GENERATOR_VERSION = "2"  # 2: paraphrase families and a held-out acceptance set (PR-11)
 NS = uuid.UUID("6f1d3c3e-7c4b-4e62-9a43-1b2f0c5d8e71")  # fixed namespace for uuid5 ids
 BASE = _dt.datetime(2026, 9, 1, tzinfo=_dt.timezone.utc)
 
 SCALES = {
     "small": {"customers": 40, "skus": 20, "orders": 120, "conversations": 80,
-              "web_events": 300, "eval_prompts": 20},
+              "web_events": 300, "eval_prompts": 40},
     "demo": {"customers": 200, "skus": 50, "orders": 600, "conversations": 300,
-             "web_events": 2000, "eval_prompts": 40},
+             "web_events": 2000, "eval_prompts": 120},
 }
 #: Planted defects per scale. Conversation-level defects land in DISJOINT conversations, so a
 #: rule's catch can be compared with the plant one to one.
@@ -78,32 +78,73 @@ _PRODUCTS = [("無線耳機", "wireless earbuds"), ("保溫瓶", "insulated bott
 _STORES = [("台北信義店", "Taipei Xinyi"), ("台中西屯店", "Taichung Xitun"), ("高雄前鎮店", "Kaohsiung Qianzhen")]
 _ID_LETTER = {c: v for c, v in zip("ABCDEFGHJKLMNPQRSTUVXYWZIO", range(10, 36))}
 
-#: (customer question, agent answer) per intent and language. {o} order, {p} product, {s} store.
-_TEMPLATES = {
-    ("order_status", "zh-TW"): [("請問訂單 {o} 目前寄到哪裡了？", "您好，訂單 {o} 已於昨日出貨，預計兩天內送達。"),
-                                ("我的訂單 {o} 什麼時候會到？", "訂單 {o} 目前在物流中心，明天會配送。")],
-    ("order_status", "en"): [("Where is my order {o} right now?", "Your order {o} shipped yesterday and should arrive within two days."),
-                             ("When will order {o} arrive?", "Order {o} is at the warehouse and goes out for delivery tomorrow.")],
-    ("return_request", "zh-TW"): [("我想退貨，訂單 {o} 的{p}有瑕疵。", "很抱歉造成不便，已為訂單 {o} 建立退貨單，將派員收件。"),
-                                  ("{p}尺寸不合，訂單 {o} 可以退嗎？", "可以的，訂單 {o} 在七天鑑賞期內，已為您申請退貨。")],
-    ("return_request", "en"): [("I want to return the {p} from order {o}, it is defective.", "Sorry about that. A return for order {o} is created and a courier will collect it."),
-                               ("The {p} in order {o} does not fit, can I return it?", "Yes, order {o} is within the 7-day window; the return is filed.")],
-    ("stock_check", "zh-TW"): [("{s}還有{p}的庫存嗎？", "{s}目前{p}尚有庫存，歡迎到店選購。"),
-                               ("{p}什麼時候會補貨？", "{p}預計下週補貨，到貨後會通知您。")],
-    ("stock_check", "en"): [("Does {s} still have the {p} in stock?", "{s} has the {p} in stock right now."),
-                            ("When will the {p} be restocked?", "The {p} is expected back next week; we will notify you.")],
-    ("promo_question", "zh-TW"): [("{p}的週年慶折扣可以和會員點數一起用嗎？", "可以，週年慶折扣與會員點數可以同時使用。"),
-                                  ("請問{p}現在有優惠嗎？", "{p}本週享九折優惠，結帳時自動折抵。")],
-    ("promo_question", "en"): [("Can the anniversary discount on the {p} be combined with member points?", "Yes, the anniversary discount and member points can be combined."),
-                               ("Is there a promotion on the {p} now?", "The {p} is 10% off this week, applied at checkout.")],
-    ("complaint", "zh-TW"): [("訂單 {o} 的配送員態度很差，我要客訴。", "非常抱歉，我們已記錄訂單 {o} 的客訴，主管會在一天內回覆您。")],
-    ("complaint", "en"): [("The courier for order {o} was rude, I want to complain.", "We are very sorry. The complaint on order {o} is logged; a supervisor will reply within a day.")],
+#: Paraphrase families (generator v2, Phase 1 PR-11). Each (intent, language) has ONE policy answer
+#: and several phrasings of the question. Training conversations use only the "train" phrasings; the
+#: acceptance set (eval_prompts.jsonl, with a reference answer per row) uses only the "held_out" ones.
+#: So an acceptance item is a question the student never saw worded that way, whose correct answer
+#: follows from the same policy it did see -- a measure of generalisation, not of template recall.
+#: v1 drew training rows and its eval split from one pool of 1-2 templates per intent, and measured
+#: on that data, every eval row was a near-copy of a training row (median similarity 0.935).
+#: {o} order, {p} product, {s} store.
+_FAMILIES = {
+    ("order_status", "zh-TW"): {
+        "answer": "您好，訂單 {o} 已出貨，預計兩天內送達。",
+        "train": ["請問訂單 {o} 目前寄到哪裡了？", "我的訂單 {o} 什麼時候會到？", "想查一下訂單 {o} 的配送進度。",
+                  "訂單 {o} 出貨了嗎？"],
+        "held_out": ["可以幫我看看 {o} 這筆訂單送到哪了嗎？", "{o} 這張單大概哪天會收到？"]},
+    ("order_status", "en"): {
+        "answer": "Your order {o} has shipped and should arrive within two days.",
+        "train": ["Where is my order {o} right now?", "When will order {o} arrive?",
+                  "Can you check the delivery status of order {o}?", "Has order {o} shipped yet?"],
+        "held_out": ["Any update on where {o} is?", "I'm still waiting on {o}, when should it show up?"]},
+    ("return_request", "zh-TW"): {
+        "answer": "很抱歉造成不便，已為訂單 {o} 建立退貨單，將派員到府收取{p}。",
+        "train": ["我想退貨，訂單 {o} 的{p}有瑕疵。", "{p}尺寸不合，訂單 {o} 可以退嗎？",
+                  "訂單 {o} 的{p}收到就壞了，要怎麼退？", "請幫我把訂單 {o} 的{p}退掉。"],
+        "held_out": ["{o} 買的{p}不想要了，能辦退貨嗎？", "剛收到的{p}有問題，訂單 {o}，我要退。"]},
+    ("return_request", "en"): {
+        "answer": "Sorry about that. A return for order {o} is filed and a courier will collect the {p}.",
+        "train": ["I want to return the {p} from order {o}, it is defective.",
+                  "The {p} in order {o} does not fit, can I return it?",
+                  "The {p} from order {o} arrived broken, how do I send it back?",
+                  "Please start a return for the {p} on order {o}."],
+        "held_out": ["Can I still send back the {p} I got with {o}?", "{o}: the {p} is faulty and I'd like a return."]},
+    ("stock_check", "zh-TW"): {
+        "answer": "{s}目前{p}尚有庫存，歡迎到店選購。",
+        "train": ["{s}還有{p}的庫存嗎？", "請問{s}現在有{p}的現貨嗎？", "我想去{s}買{p}，還有貨嗎？",
+                  "{s}的{p}還買得到嗎？"],
+        "held_out": ["今天去{s}拿得到{p}嗎？", "{p}在{s}缺貨了嗎？"]},
+    ("stock_check", "en"): {
+        "answer": "{s} has the {p} in stock right now.",
+        "train": ["Does {s} still have the {p} in stock?", "Is the {p} available at {s}?",
+                  "I want to pick up the {p} at {s}, is there stock?", "Can I buy the {p} at {s} today?"],
+        "held_out": ["Would I find the {p} on the shelf at {s}?", "Is {s} out of the {p}?"]},
+    ("promo_question", "zh-TW"): {
+        "answer": "可以，{p}的週年慶折扣與會員點數可以同時使用。",
+        "train": ["{p}的週年慶折扣可以和會員點數一起用嗎？", "買{p}時週年慶折扣跟點數能疊加嗎？",
+                  "{p}週年慶打折還能用點數折抵嗎？", "會員點數可以搭配{p}的週年慶優惠嗎？"],
+        "held_out": ["{p}已經是週年慶價了，點數還能再扣嗎？", "週年慶買{p}，點數跟折扣可以一起算嗎？"]},
+    ("promo_question", "en"): {
+        "answer": "Yes, the anniversary discount on the {p} can be combined with member points.",
+        "train": ["Can the anniversary discount on the {p} be combined with member points?",
+                  "Do member points stack with the anniversary deal on the {p}?",
+                  "Can I use points on the {p} while it is on the anniversary discount?",
+                  "Is the {p} anniversary discount compatible with member points?"],
+        "held_out": ["The {p} is already discounted for the anniversary; can I still apply my points?",
+                     "Points plus the anniversary price on the {p}, does that work?"]},
+    ("complaint", "zh-TW"): {
+        "answer": "非常抱歉，我們已記錄訂單 {o} 的客訴，主管會在一天內回覆您。",
+        "train": ["訂單 {o} 的配送員態度很差，我要客訴。", "我要投訴訂單 {o} 的送貨人員。",
+                  "訂單 {o} 的物流服務太糟了，我要反映。", "對訂單 {o} 的配送很不滿意，請處理。"],
+        "held_out": ["{o} 送貨的人很沒禮貌，這要跟誰反映？", "針對 {o} 的配送我想正式申訴。"]},
+    ("complaint", "en"): {
+        "answer": "We are very sorry. The complaint on order {o} is logged; a supervisor will reply within a day.",
+        "train": ["The courier for order {o} was rude, I want to complain.",
+                  "I want to file a complaint about the delivery of order {o}.",
+                  "The delivery service for order {o} was terrible.", "Please escalate my complaint about order {o}."],
+        "held_out": ["Who do I talk to about the rude driver on {o}?", "I'd like to lodge a formal complaint regarding {o}."]},
 }
 _FOLLOW = {"zh-TW": ("好的，謝謝。", "不客氣，祝您有美好的一天！"), "en": ("Great, thanks.", "You're welcome, have a nice day!")}
-#: Eval prompts use their own phrasing so a clean conversation can never equal one by accident.
-_EVAL = {"zh-TW": ["想確認一下{p}的保固期限是多久？", "{p}可以用信用卡分期付款嗎？", "如果{p}在運送途中損壞要怎麼處理？"],
-         "en": ["How long is the warranty on the {p}?", "Can I pay for the {p} in installments?",
-                "What happens if the {p} is damaged in transit?"]}
 _TOXIC = {"zh-TW": "你們客服真的是一群白痴，", "en": "you people are useless idiots, "}
 _PII_LEAD = {"zh-TW": {"NAME": "我是{v}，", "TW_MOBILE": "我的手機是{v}，", "EMAIL": "電子郵件{v}，",
                        "TW_ID": "身分證字號{v}，", "CARD": "信用卡號{v}，"},
@@ -215,13 +256,7 @@ def generate(seed: int = 7, scale: str = "demo") -> dict:
     for c in rng.sample(customers, k=max(1, size["customers"] // 40)):  # account deletions
         crm.append(_cdc("d", c, None, 8 * 86400, "crm", "customers"))
 
-    eval_prompts = []
-    for i in range(size["eval_prompts"]):
-        lang = "zh-TW" if i % 5 < 3 else "en"
-        p = _PRODUCTS[i % len(_PRODUCTS)][0 if lang == "zh-TW" else 1]
-        eval_prompts.append({"prompt_id": ids("eval", i), "lang": lang,
-                             "prompt": _EVAL[lang][i % len(_EVAL[lang])].format(p=p) + f"（#{i}）"
-                             if lang == "zh-TW" else _EVAL[lang][i % len(_EVAL[lang])].format(p=p) + f" (#{i})"})
+    eval_prompts = _acceptance_set(size["eval_prompts"], rng, ids, orders, skus)
 
     n_conv = size["conversations"]
     pool = list(range(n_conv))
@@ -327,7 +362,8 @@ def _conversation(i, rng, ids, customers, orders, skus) -> dict:
     p_idx = next(s["product"] for s in skus if s["sku"] == o["sku"])
     p = _PRODUCTS[p_idx][0 if lang == "zh-TW" else 1]
     s = rng.choice(_STORES)[0 if lang == "zh-TW" else 1]
-    q, a = rng.choice(_TEMPLATES[(intent, lang)])
+    fam = _FAMILIES[(intent, lang)]
+    q, a = rng.choice(fam["train"]), fam["answer"]
     # The case reference is what keeps two clean conversations from being exact copies: a promo
     # or stock question carries no order id, so the same product and template would otherwise
     # repeat verbatim -- an unplanted duplicate that a correct dedup rule would be blamed for.
@@ -341,6 +377,30 @@ def _conversation(i, rng, ids, customers, orders, skus) -> dict:
     return {"conversation_id": ids("conversation", i), "customer_id": cust["customer_id"],
             "lang": lang, "intent": intent, "channel": rng.choice(["chat", "chat", "email"]),
             "turns": turns}
+
+
+def _acceptance_set(n: int, rng, ids, orders, skus) -> list[dict]:
+    """n held-out items, {prompt_id, lang, intent, prompt, reference}: an equal share per intent,
+    60% zh-TW, every prompt distinct, phrased only in its family's held-out wording, and the
+    reference is the family's policy answer for those slots -- with no case reference, which a
+    customer's question never carries."""
+    items, seen = [], set()
+    for k in range(n):
+        intent, lang = INTENTS[k % len(INTENTS)], ("zh-TW" if (k // len(INTENTS)) % 5 < 3 else "en")
+        fam = _FAMILIES[(intent, lang)]
+        for _ in range(1000):
+            o = rng.choice(orders)
+            p = _PRODUCTS[next(s["product"] for s in skus if s["sku"] == o["sku"])][0 if lang == "zh-TW" else 1]
+            st = rng.choice(_STORES)[0 if lang == "zh-TW" else 1]
+            q = rng.choice(fam["held_out"]).format(o=o["order_id"], p=p, s=st)
+            if q not in seen:
+                break
+        else:
+            raise ValueError(f"cannot draw {n} distinct held-out prompts for {intent}/{lang}")
+        seen.add(q)
+        items.append({"prompt_id": ids("eval", k), "lang": lang, "intent": intent, "prompt": q,
+                      "reference": fam["answer"].format(o=o["order_id"], p=p, s=st)})
+    return items
 
 
 def _near_duplicate(src: dict, i: int, ids) -> dict:

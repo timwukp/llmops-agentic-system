@@ -384,3 +384,92 @@ def test_the_architecture_docs_count_the_modes_the_machine_routes():
     assert f"**{words['zh'][len(routed)]}種入口模式" in zh
     for mode in routed:
         assert f"`{mode}`" in en and f"`{mode}`" in zh, mode
+
+
+def test_the_review_claims_the_acceptance_set_and_eval_anchors_the_gate_to_it():
+    """PR-11: a lakehouse gate is anchored to the held-out acceptance set, not to a val split drawn
+    from the training phrasings, and the review hands the driver its digest to re-measure."""
+    body = re.search(r'\n- "lakehouse_review":(.*?)(?=\n- "[a-z_]+":|\nRules:)', _prompt("data-prep"), re.S).group(1)
+    assert set(driver.ACCEPTANCE_CLAIM_KEYS) <= set(re.findall(r"acceptance_[a-z0-9_]+", body))
+    assert "never build one yourself" in body and "appears as a user turn of train.jsonl" in body
+    ev_ = _prompt("eval")
+    i = ev_.index("in a lakehouse run")
+    clause = ev_[i:i + 600]
+    assert clause.index("acceptance_uri") < clause.index("val_uri"), "acceptance first, val split only without it"
+
+
+# ── a job that finished before its token was parked (found live in PR-11) ────
+class _SM:
+    def __init__(self, status, billed=0):
+        self.status, self.billed = status, billed
+
+    def describe_training_job(self, TrainingJobName):
+        return {"TrainingJobStatus": self.status, "BillableTimeInSeconds": self.billed,
+                "ModelArtifacts": {"S3ModelArtifacts": "s3://b/model.tar.gz"}, "FailureReason": "oom"}
+
+
+class _Lam:
+    def __init__(self, fail=False):
+        self.calls, self.fail = [], fail
+
+    def invoke(self, **kw):
+        if self.fail:
+            raise RuntimeError("AccessDenied")
+        self.calls.append(kw)
+
+
+@pytest.mark.parametrize("status,billed", [("Completed", 900), ("Failed", 30), ("Stopped", 0)])
+def test_a_job_already_terminal_when_parked_is_delivered_to_the_resume_lambda(status, billed):
+    lam = _Lam()
+    out = driver._deliver_if_already_terminal({"sagemaker": _SM(status, billed), "lambda": lam}, "run-x", "job-1")
+    assert out == {"terminal_check": status, "late_delivery": True}
+    (call,) = lam.calls
+    assert call["FunctionName"] == "llmops-resume-pipeline" and call["InvocationType"] == "Event"
+    detail = json.loads(call["Payload"])["detail"]
+    assert detail["TrainingJobName"] == "job-1" and detail["TrainingJobStatus"] == status
+    assert detail["BillingSecondsUsed"] == billed, "the capacity-stop rule reads billed seconds"
+
+
+def test_the_delivered_event_is_one_the_resume_lambda_settles():
+    """Shape parity: the resume handler must read what the driver sends exactly as it reads
+    SageMaker's own event, or a late delivery would settle differently from a timely one."""
+    resume = _load("resume_for_late", "orchestration/resume_pipeline/handler.py")
+    lam = _Lam()
+    driver._deliver_if_already_terminal({"sagemaker": _SM("Stopped", 0), "lambda": lam}, "run-x", "job-1")
+    detail = json.loads(lam.calls[0]["Payload"])["detail"]
+    assert resume._is_capacity_stop(detail) is True
+    detail = json.loads(json.dumps({**detail, "BillingSecondsUsed": 120}))
+    assert resume._is_capacity_stop(detail) is False
+
+
+@pytest.mark.parametrize("sm,lam,want", [
+    (_SM("InProgress"), _Lam(), {"terminal_check": "InProgress"}),
+    (None, _Lam(), {"terminal_check": "skipped"}),
+    (_SM("Completed"), _Lam(fail=True), {"terminal_check": "Completed", "late_delivery": False}),
+])
+def test_a_running_job_or_a_failed_check_changes_nothing(sm, lam, want):
+    assert driver._deliver_if_already_terminal({"sagemaker": sm, "lambda": lam}, "run-x", "job-1") == want
+    assert not lam.calls
+
+
+def test_servicing_job_launched_checks_the_job_and_delivers_a_finished_one(monkeypatch):
+    """Through handle_job_launched itself: the helper being correct is worth nothing if the
+    handoff stops calling it, and the stranded run is what that looks like."""
+    monkeypatch.setenv("RUNS_TABLE", "runs")
+    monkeypatch.setenv("EVENT_BUS", "bus")
+
+    class _Table:
+        def __init__(self):
+            self.updates = []
+
+        def update_item(self, **kw):
+            self.updates.append(kw)
+
+    table, lam = _Table(), _Lam()
+    c = {"ddb": types.SimpleNamespace(Table=lambda name: table), "events": types.SimpleNamespace(put_events=lambda **kw: {}),
+         "sagemaker": _SM("Completed", 900), "lambda": lam}
+    out = driver.handle_job_launched(c, {"run_id": "run-x", "stage": "finetune", "task_token": "tok"},
+                                     {"job_name": "job-probe"})
+    assert table.updates and table.updates[0]["ExpressionAttributeValues"][":t"] == "tok", "the token is parked first"
+    assert out["released"] is True and out["late_delivery"] is True
+    assert json.loads(lam.calls[0]["Payload"])["detail"]["TrainingJobName"] == "job-probe"

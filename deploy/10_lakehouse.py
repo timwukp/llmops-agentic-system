@@ -458,7 +458,7 @@ def run_arguments(step: str, data_bucket: str, dataset: str, **kw) -> dict:
         "export": lambda: {"--dataset": dataset, "--gold_report_uri": reports + "gold.json",
                            "--pii_report_uri": reports + "silver.json",
                            "--report_uri": reports + kw.get("export_report", "export.json"),
-                           "--run_id": kw["run_id"]},
+                           "--run_id": kw["run_id"], "--acceptance_uri": landing + "eval_prompts.jsonl"},
     }[step]()
 
 
@@ -869,8 +869,12 @@ def smoke(session, region, account_id, data_bucket, seed=7, scale="small") -> di
             return checks
         exports.append(json.loads(s3.get_object(
             Bucket=data_bucket, Key=f"{REPORT_PREFIX}/{dataset}/export-{attempt}.json")["Body"].read()))
+    acc = exports[1]["files"].get("acceptance") or exports[1].get("acceptance")
+    checks["acceptance set exported with every held-out item"] = (
+        (acc or {}).get("rows") == len(ds["eval_prompts"]) and bool((acc or {}).get("sha256"))) or acc
     checks["export reproducible (same sha256 twice)"] = all(
-        exports[0]["files"][k]["sha256"] == exports[1]["files"][k]["sha256"] for k in ("train", "eval")) or [
+        exports[0]["files"][k]["sha256"] == exports[1]["files"][k]["sha256"] for k in ("train", "eval", "acceptance")
+        if k in exports[0]["files"]) or [
         (e["files"]["train"]["sha256"][:12], e["files"]["eval"]["sha256"][:12]) for e in exports]
     driver = _load_module("lh_driver", REPO / "orchestration" / "harness_driver" / "handler.py")
     for split in ("train", "eval"):

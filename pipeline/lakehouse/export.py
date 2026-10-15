@@ -74,6 +74,30 @@ def to_jsonl(rows: list[dict]) -> bytes:
     return "".join(line + "\n" for line in lines).encode("utf-8")
 
 
+ACCEPTANCE_FILE = "acceptance.jsonl"
+ACCEPTANCE_KEYS = ("prompt_id", "lang", "intent", "prompt", "reference")
+
+
+def acceptance_jsonl(body: bytes) -> tuple[bytes | None, int, str]:
+    """The generator's eval_prompts.jsonl → the extract's acceptance set: canonical lines, sorted by
+    prompt_id, each {prompt_id, lang, intent, prompt, reference}. Returns (bytes, rows, why); bytes
+    is None when the file is not an acceptance set -- a generator-v1 dataset's prompts carry no
+    reference answer, and a set without references cannot anchor a gate, so it is reported as
+    absent rather than exported as if it could."""
+    rows = [json.loads(line) for line in body.decode("utf-8").splitlines() if line.strip()]
+    if not rows:
+        return None, 0, "empty"
+    missing = sorted({k for r in rows for k in ACCEPTANCE_KEYS if not r.get(k)})
+    if missing:
+        return None, len(rows), f"not an acceptance set: rows lack {missing}"
+    ids = [r["prompt_id"] for r in rows]
+    if len(set(ids)) != len(ids) or len({r["prompt"] for r in rows}) != len(rows):
+        return None, len(rows), "not an acceptance set: duplicate prompt ids or prompts"
+    lines = [json.dumps({k: r[k] for k in ACCEPTANCE_KEYS}, ensure_ascii=False, sort_keys=True,
+                        separators=(",", ":")) for r in sorted(rows, key=lambda r: r["prompt_id"])]
+    return "".join(line + "\n" for line in lines).encode("utf-8"), len(rows), "ok"
+
+
 def sha256(body: bytes) -> str:
     return hashlib.sha256(body).hexdigest()
 

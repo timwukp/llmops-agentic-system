@@ -6122,6 +6122,19 @@ case("lakehouse: dispatch stops refusing bad lakehouse values",
      [f"{_LM}test_dispatch_refuses_what_a_glue_job_would_fail_on_a_stage_later"])
 
 
+def m354(t):
+    # The handoff stops asking whether its job already finished: a job that completes before the
+    # agent's turn ends strands the run on a token nothing settles (run-20261015T104050Z-c7a2c9d8).
+    old = 'return {"released": True, **_deliver_if_already_terminal(c, run_id, args.get("job_name", ""))}'
+    assert t.count(old) == 1, "the late-delivery call in handle_job_launched moved"
+    return t.replace(old, 'return {"released": True}', 1)
+
+
+case("driver: a job that finished before its token was parked is never resumed",
+     "orchestration/harness_driver/handler.py", m354,
+     [f"{_LM}test_servicing_job_launched_checks_the_job_and_delivers_a_finished_one"])
+
+
 #: Where the pristine text of the file currently mutated is parked, so a kill -9 -- which
 #: no handler can intercept -- still leaves the original recoverable. Under the repo root
 #: rather than /tmp because it must be obvious to whoever finds the tree dirty, and
