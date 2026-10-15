@@ -30,6 +30,33 @@ Two defects found on the way:
   to the data bucket's default, and `--verify` checks that default. Recorded in AGENTS.md.
 - A Glue run that has just SUCCEEDED can still hold the job's concurrency slot, so `_run_job` retries
   `ConcurrentRunsExceededException`, and only that.
+- **Macie coverage was False for every live job** (pre-existing). List items carry no scoping and no
+  `s3JobDefinition`, so the deploy told the operator to cancel the correctly scoped customer-data job.
+  Scope is now read from `describe_classification_job`; the test double returns the real list shape.
+
+`llmops-lakehouse-extracts-pii` is enabled at the owner's request: $0/day at the extracts' current
+258 KB (first GB/month free, then $1/GB of new extract). First run: 0 findings.
+### The daily sweep reports orphaned AgentCore memories
+
+The 7 orphaned managed memories deleted on 2026-10-14 were found by a person calling AWS directly.
+Under the project's rule (work goes through the pipeline), finding them is now the scheduled `sweep`'s
+job: `llmops_monitor` lists every memory and harness, reads `GetHarness` on `llmops_*` harnesses only,
+and reports every `harness_llmops_*` / `llmops_*` memory that no llmops harness references as
+`memory_orphans` in its sweep.json. Other projects' memories are counted as "not assessed", never
+called orphans. The sweep reads no memory contents and deletes nothing.
+
+- `deploy/iam/harness_execution_role.json`: `AgentCoreInventoryForSweep` (`ListMemories`,
+  `ListHarnesses` on `*`) and `AgentCoreHarnessReadOwn` (`GetHarness` on `harness/llmops_*` only,
+  because a harness config carries env vars and another project's may carry secrets). Action names
+  checked with Access Analyzer `ValidatePolicy`, which flagged a deliberately misspelt control.
+- Guards: the existing prompt-command → IAM-action test now maps the three commands; new tests pin
+  the clause and prove no statement grants memory contents, harness config or mutation on a wildcard.
+- AGENTS.md: #157 said a harness "deleted or re-pointed" leaves the residue. Only re-pointing is
+  evidenced; whether deleting a harness removes its managed memory is not established. Corrected.
+
+Not yet deployed: needs `01_iam.py` (role) and `05_harnesses.py --agent monitor` (prompt), then one
+sweep through `llmops-monitor-sweep`.
+
 ### Console role: S3 reads scoped to what the console reads
 
 `LlmopsAdminLambdaRole` had `s3:GetObject` + `s3:ListBucket` on `"*"`, which is every bucket in the

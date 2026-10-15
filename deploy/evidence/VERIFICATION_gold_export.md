@@ -79,9 +79,46 @@ that one exception with backoff (15 s, 30 s, …, 6 attempts). Any other error p
   extract is **denied**. An export can add a file but cannot remove one.
 - The driver reads extracts only under `s3://<DATA_BUCKET>/lakehouse/extracts/`. Another bucket,
   `customer-data/`, `runs/`, a `..` path or a non-S3 URI is refused before any read (tests).
-- Macie: `03_storage.py` now reports PII-scan coverage of `lakehouse/extracts/` as its own job,
-  `llmops-lakehouse-extracts-pii`. The `customer-data/` job does not count as coverage. Today it reports
-  the gap; creating the job is a billed recurring scan and waits on the owner's `--enable-pii-scan`.
+- Macie: `03_storage.py` reports PII-scan coverage of `lakehouse/extracts/` as its own job,
+  `llmops-lakehouse-extracts-pii`; the `customer-data/` job does not count as coverage. The owner asked
+  for the daily cost first, and to enable the job if it was cheap. It was, so it is on (next section).
+
+## Macie over the extracts: cost, then the job
+
+**Cost.** The figures come from the Price List API, us-east-1:
+- Sensitive data discovery: **$1.00/GB**, first **1 GB/month free** per account.
+- Bucket inventory: $0.0033 per bucket-day. That is billed already: it is the session's
+  `DATA_INVENTORY_EVALUATION`, $14.35 over the last 30 days, and it does not change with the number of jobs.
+- Object monitoring: $0.01 per 100K objects.
+
+The extracts are **258 KB** (14 objects), and a demo export adds about 130 KB. So the job's marginal cost
+is **$0/day** while the account stays inside the free GB. Past it, the cost is $1 per GB of newly written
+extract.
+
+There is a measured data point beside the price. `llmops-customer-data-pii` has run daily since
+2026-08-02 (75 runs) over 127 MB. Its `SENSITIVE_DATA_DISCOVERY` usage for the last 30 days is **$0**,
+where 30 full re-scans would be about 3.8 GB. That is consistent with a scheduled job reading only
+objects new since its last run.
+
+**Found while checking: every live coverage answer was False.** `list_classification_jobs` items carry
+`bucketDefinitions` at the top level, with no `scoping` and no `s3JobDefinition` at all. `ensure_pii_scan`
+read `item["s3JobDefinition"]`, so the correctly scoped `llmops-customer-data-pii` was reported as
+*"exists but does NOT cover customer-data/ … cancel it"*. A foreign job could never count either. This
+was on `main` before this PR. The test double returned the full definition from `list`, so no test could
+see it: it was more forgiving than production.
+
+The fix reads each job's scope from `describe_classification_job`. A job whose scope cannot be read is
+**undecidable**, never "uncovered". The double now returns the production list shape, and three new tests
+fail on the old code.
+
+Live after the fix:
+- `--dry-run`: `llmops-customer-data-pii` reads `job exists (SCHEDULED, IDLE)`, and the extracts gap is
+  reported.
+- `--enable-pii-scan` created `llmops-lakehouse-extracts-pii`: SCHEDULED daily, scoped
+  `OBJECT_KEY STARTS_WITH lakehouse/extracts/`.
+- A second run reports `job exists` and creates nothing.
+- First run: IDLE, `lastRunErrorStatus: NONE`, **0 findings**. That is the expected answer, since Silver
+  redacted PII before Gold was written; it is now checked by something other than the rules that did it.
 
 ## Open
 

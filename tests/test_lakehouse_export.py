@@ -182,11 +182,15 @@ def test_macie_coverage_of_extracts_is_a_job_of_its_own():
         def get_macie_session(self):
             return {"status": "ENABLED"}
 
-        def list_classification_jobs(self):
-            return {"items": [{"name": "llmops-customer-data-pii", "jobStatus": "RUNNING", "jobType": "SCHEDULED",
-                               "s3JobDefinition": {"bucketDefinitions": [{"accountId": "1", "buckets": ["data"]}],
-                                                   "scoping": {"includes": {"and": [{"simpleScopeTerm": {
-                                                       "key": "OBJECT_KEY", "values": ["customer-data/"]}}]}}}}]}
+        def list_classification_jobs(self):  # the production shape: no scoping, no s3JobDefinition
+            return {"items": [{"name": "llmops-customer-data-pii", "jobId": "j1", "jobStatus": "RUNNING",
+                               "jobType": "SCHEDULED",
+                               "bucketDefinitions": [{"accountId": "1", "buckets": ["data"]}]}]}
+
+        def describe_classification_job(self, jobId):
+            return {"s3JobDefinition": {"bucketDefinitions": [{"accountId": "1", "buckets": ["data"]}],
+                                        "scoping": {"includes": {"and": [{"simpleScopeTerm": {
+                                            "key": "OBJECT_KEY", "values": ["customer-data/"]}}]}}}}
     res = storage.ensure_pii_scan(_Macie(), "data", "1", dry=False, enable=False, prefix=storage.GOLD_EXTRACTS_PREFIX)
     assert res["job"] == "llmops-lakehouse-extracts-pii"
     assert "NO JOB SCANS lakehouse/extracts/" in res["coverage"] and "Silver rules" in res["coverage"]

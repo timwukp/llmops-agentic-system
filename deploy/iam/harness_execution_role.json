@@ -313,6 +313,23 @@
         "_comment_orphans": "ListEndpointConfigs/ListModels extend the sweep to the two resource types teardown asymmetry orphans: a config or model whose endpoint no longer exists is invisible to an endpoint-only sweep, and the monitor self-reported exactly these two denials for 8 consecutive days. Same argument as ListEndpoints above: enumeration account-wide, every mutation stays scoped to llmops-*."
       },
       {
+        "_comment": "The sweep's memory-orphan check. A harness re-pointed from a managed memory to the shared BYO one leaves the managed memory behind (UpdateHarness does not delete it): 7 such were found 2026-10-13 by a person calling AWS directly, which is exactly the work the pipeline is meant to do itself. Enumeration only: ListMemories returns id/arn/status/createdAt and nothing inside a memory. Deliberately NOT here: GetMemory, ListActors, ListMemoryRecords, ListEvents (contents -- whether an orphan is empty is a human's check before deleting, and the other projects' memories in this account are not ours to read) and DeleteMemory (the sweep reports; it never deletes).",
+        "Sid": "AgentCoreInventoryForSweep",
+        "Effect": "Allow",
+        "Action": [
+          "bedrock-agentcore:ListMemories",
+          "bedrock-agentcore:ListHarnesses"
+        ],
+        "Resource": "*"
+      },
+      {
+        "_comment": "GetHarness on OUR harnesses only, to read which memory each references. Not harness/*: GetHarness returns the whole config, environment variables included, and another project's env vars may carry its secrets. The cost is that a memory referenced only by another project's harness cannot be checked -- so the prompt classifies only memories named harness_llmops_* / llmops_*, and calls the rest 'not assessed' rather than orphans.",
+        "Sid": "AgentCoreHarnessReadOwn",
+        "Effect": "Allow",
+        "Action": "bedrock-agentcore:GetHarness",
+        "Resource": "arn:aws:bedrock-agentcore:<REGION>:<ACCOUNT_ID>:harness/llmops_*"
+      },
+      {
         "Sid": "PassSageMakerExecutionRoleOnly",
         "Effect": "Allow",
         "Action": "iam:PassRole",

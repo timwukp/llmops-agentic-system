@@ -325,3 +325,68 @@ def test_the_agents_md_memory_gotcha_matches_the_configs_and_the_role():
         f"the role grants managed memory on memory/{grant}; the gotcha names a different one"
     # Both live name patterns, because the grant matches only one of them.
     assert "harness_<name>_" in para and "<harnessName>-" in para
+
+
+# --- the pipeline finds the next orphan itself -------------------------------------------
+
+def _sweep_clause() -> str:
+    text = _cfg(REPO / "agents/monitor/harness.json")["systemPrompt"][0]["text"]
+    lines = [ln for ln in text.splitlines() if ln.startswith('- "sweep"')]
+    assert len(lines) == 1, "the sweep clause moved; re-anchor this guard"
+    return lines[0]
+
+
+def _role_statements() -> dict:
+    role = json.loads((REPO / "deploy/iam/harness_execution_role.json").read_text())
+    return {st["Sid"]: st for st in role["permissionsPolicy"]["Statement"]}
+
+
+def _as_list(v):
+    return [v] if isinstance(v, str) else list(v)
+
+
+def test_the_sweep_is_told_to_find_memory_orphans():
+    """The 7 orphans were found by a person calling AWS by hand, which is the work the
+    pipeline exists to do. A grant nothing instructs the agent to use is the failure
+    test_the_sweep_can_characterise_an_orphan_it_may_not_touch already records: the live
+    sweep never took an AccessDenied, because it was never told to make the call."""
+    clause = _sweep_clause()
+    for cmd in ("aws bedrock-agentcore-control list-memories",
+                "aws bedrock-agentcore-control list-harnesses",
+                "aws bedrock-agentcore-control get-harness"):
+        assert cmd in clause, f"the sweep clause never runs '{cmd}'"
+    for token in ("harness_llmops_", "llmops_", "memory_orphans", "permission_gaps",
+                  "do NOT delete any memory", "not assessed"):
+        assert token in clause, f"the sweep clause lost {token!r}"
+
+
+def test_the_memory_inventory_grant_reads_no_contents_and_no_foreign_config():
+    """Enumerate account-wide, read config of OUR harnesses only, read no memory contents.
+
+    The width is the argument, as for SageMakerList: an orphan is by definition something no
+    harness of ours points at, so enumeration has to be account-wide. But GetHarness returns
+    a whole config, env vars included, so it stays on harness/llmops_*; and nothing that
+    reads inside a memory, or deletes one, is granted on a wildcard.
+    """
+    st = _role_statements()
+    inv = st["AgentCoreInventoryForSweep"]
+    assert set(_as_list(inv["Action"])) == {"bedrock-agentcore:ListMemories",
+                                           "bedrock-agentcore:ListHarnesses"}
+    own = st["AgentCoreHarnessReadOwn"]
+    assert _as_list(own["Action"]) == ["bedrock-agentcore:GetHarness"]
+    assert _as_list(own["Resource"]) == [
+        "arn:aws:bedrock-agentcore:<REGION>:<ACCOUNT_ID>:harness/llmops_*"]
+
+    content_or_mutation = {
+        "bedrock-agentcore:GetMemory", "bedrock-agentcore:ListActors",
+        "bedrock-agentcore:ListMemoryRecords", "bedrock-agentcore:GetMemoryRecord",
+        "bedrock-agentcore:RetrieveMemoryRecords", "bedrock-agentcore:ListEvents",
+        "bedrock-agentcore:GetEvent", "bedrock-agentcore:DeleteMemory",
+        "bedrock-agentcore:UpdateMemory", "bedrock-agentcore:UpdateHarness",
+        "bedrock-agentcore:DeleteHarness", "bedrock-agentcore:GetHarness"}
+    wide = [sid for sid, s in st.items() if s.get("Effect") == "Allow"
+            and any(r == "*" or r.endswith(":memory/*") or r.endswith(":harness/*")
+                    for r in _as_list(s.get("Resource", [])))
+            and (set(_as_list(s["Action"])) & content_or_mutation
+                 or any(a in ("bedrock-agentcore:*", "*") for a in _as_list(s["Action"])))]
+    assert not wide, f"statements grant memory contents, harness config or mutation wide: {wide}"

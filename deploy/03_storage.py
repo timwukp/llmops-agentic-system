@@ -610,7 +610,16 @@ def ensure_pii_scan(macie, bucket, account_id, dry, enable=False, prefix=CUSTOME
     ours, foreign, undecidable = None, [], []
     try:
         for item in macie.list_classification_jobs().get("items", []):
-            covers = macie_job_covers(item.get("s3JobDefinition"), bucket, account_id, prefix)
+            # A list item carries `bucketDefinitions` at its top level and NO scoping, and no
+            # `s3JobDefinition` at all (live, 2026-10-15). Reading that key from the item made
+            # every job "not covering", including our own correctly scoped one, which the deploy
+            # then told the operator to cancel. The scope is only in describe_classification_job.
+            try:
+                defn = macie.describe_classification_job(jobId=item["jobId"]).get("s3JobDefinition")
+                covers = macie_job_covers(defn, bucket, account_id, prefix)
+            except Exception:  # noqa: BLE001 -- an unreadable job is undecidable, not uncovered
+                defn, covers = None, None
+            item = {**item, "s3JobDefinition": defn}
             if item.get("name") == job_name:
                 ours = item
             elif covers:
@@ -631,7 +640,9 @@ def ensure_pii_scan(macie, bucket, account_id, dry, enable=False, prefix=CUSTOME
         status = ours.get("jobStatus")
         res["coverage"] = f"job exists ({ours.get('jobType')}, {status})"
         res["job_id"] = ours.get("jobId")
-        if not macie_job_covers(ours.get("s3JobDefinition"), bucket, account_id, prefix):
+        if ours["s3JobDefinition"] is None:
+            res["coverage"] += " -- its scope could not be read (describe_classification_job failed)"
+        elif not macie_job_covers(ours["s3JobDefinition"], bucket, account_id, prefix):
             # The name matches but the scope does not, and no API can fix that in place.
             res["coverage"] = (f"job {job_name} exists but does NOT cover "
                                f"{prefix}/ -- a job's scope is immutable "
