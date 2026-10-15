@@ -5,6 +5,21 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
 ## [Unreleased]
 
+### Console role: S3 reads scoped to what the console reads
+
+`LlmopsAdminLambdaRole` had `s3:GetObject` + `s3:ListBucket` on `"*"`, which is every bucket in the
+account. It now reads `runs/*`, `tasks/*`, `customer-data/*`, the rate-card key, and the Data tab's
+`lakehouse/reports/*/*` and `lakehouse/landing/*/manifest.json` (not the landing data). It lists
+`runs/`, `customer-data/`, `models-mirror/` and `lakehouse/reports/`, all in the data bucket.
+`tests/test_console_s3_scope.py` derives those globs from `lambda_function.py`'s AST and fails when the
+policy and the code disagree in either direction, including a grant wider than the read it serves. Keys computed from data go through `_scoped_key(uri, <prefixes>)`. An intake URI outside
+those prefixes is `unverified` with the reason; it used to come back `verified` for objects the pipeline
+cannot read. Accept refuses a plan_uri outside `runs/` / `tasks/`; it used to read the data bucket plus
+the URI's key and ignore the URI's bucket. Live, on the merged tree: 25/25 `simulate_principal_policy`
+cases, and the Data tab and run detail served by the deployed role
+(`deploy/evidence/VERIFICATION_console_s3_scope.md`). That file also records that two earlier deploys
+from a pre-#162 branch removed the live Data tab until it was redeployed from `main`.
+
 ### Console: a read-only Data tab
 
 A new **Data** tab, the read-only version the owner asked for right after PR-07. It shows:
