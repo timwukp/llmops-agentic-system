@@ -107,7 +107,7 @@ ALLOWED = (b"6833" + b"13688378", b"7631" + b"04351884", b"1234" + b"56789012")
 #: this laptop, single-threaded CPython does 3.1M sha256/s, so the whole 1e12 space falls in
 #: about 4 days -- and a GPU does it in roughly 100 seconds. So the KDF is iterated. At 200k
 #: iterations a candidate costs ~16 ms, which makes the same sweep ~500 GPU-years, while the
-#: scan stays cheap because only 12-digit runs are ever hashed: measured across all 334
+#: scan stays cheap because only 12-digit runs are ever hashed: measured across all 339
 #: tracked files there are 81 such runs, 11 distinct, and hashing the distinct set takes 0.16 s
 #: for the entire repo. (Re-measured whenever either number moves, and they move
 #: INDEPENDENTLY, which is why both are derived and neither is inferred from the other, and
@@ -224,7 +224,9 @@ ALLOWED = (b"6833" + b"13688378", b"7631" + b"04351884", b"1234" + b"56789012")
 #: its intent chain). No 12-digit run; the runs held at 81.
 #: Then 328 files went to 331 (the sweep-unheard-calls live record's intent chain). No 12-digit
 #: run; the runs held at 81.
-#: Then 331 files became 334 (the #168 redeploy record's intent chain). No 12-digit run; the runs
+#: Then 331 files went to 336 (the orchestrator intake-scope probe tool, its evidence and intent
+#: chain). No 12-digit run; the runs held at 81.
+#: Then 336 files became 339 (the #168 redeploy record's intent chain). No 12-digit run; the runs
 #: held at 81.
 #: Dollar limits and percentages only -- no 12-digit run, so the runs held at 74 again.
 #: For EIGHT commits

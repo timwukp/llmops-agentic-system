@@ -166,6 +166,10 @@ data bucket, `s3:prefix` in `runs/*`, `customer-data/*`, `models-mirror/*/`, `la
 `llmops-admin` was redeployed from `main` at `7349dc6` (incl. the Data tab) plus this change. No
 resources were created or deleted.
 
+**Orchestrator prompt v20 (2026-10-15).** `llmops_orchestrator` updated to harness version 20 (the
+intake-scope prompt). The probe left 22+ memory records under the `probe-orchestrator-intake-scope`
+actor in the shared memory (not deleted; see `deploy/evidence/VERIFICATION_orchestrator_intake_scope.md`).
+
 ## Harness versions & endpoint pins
 
 Harnesses run DEFAULT endpoints (latest version). No student-model endpoint is
