@@ -55,6 +55,11 @@ TASKS = ("sweep",)
 #: bury the account-level answer inside whichever run happened to look.
 SWEEP_PREFIX = "monitoring"
 
+#: The sk of a sweep's outcome row in EVENTS_TABLE. Written here as `invoked` at dispatch,
+#: and named in the payload as `outcome_sk` so the driver settles the SAME row with the real
+#: outcome. One template in one place: the driver must not derive it from the run_id.
+OUTCOME_SK = "sweep#{task}"
+
 
 def _clients():
     region = os.environ.get("AWS_REGION", "us-east-1")
@@ -102,6 +107,7 @@ def build_payload(project: str, bucket: str, region: str, run_id: str,
         "task": "sweep",
         "harness_id": "llmops_monitor",
         "manifest_uri": f"s3://{bucket}/{SWEEP_PREFIX}/manifests/{run_id}.json",
+        "outcome_sk": OUTCOME_SK.format(task="sweep"),
         "params": params,
     }
 
@@ -112,10 +118,16 @@ def record_outcome(ddb, run_id: str, result: dict) -> None:
     Same reasoning as finops_reconcile's reserved ``#audit#`` key: the failure mode worth
     engineering against is not a sweep that reports badly, it is a sweep that silently
     stopped happening. A cost control nobody can tell has stopped is not a control.
+
+    This row alone did not deliver that. Dispatch is async, so it is written as `invoked`
+    before the driver has run a turn, and nothing ever wrote it again: four sweeps that
+    never completed (2026-08-18, -08-31, -10-06, -10-07) still read `invoked`. The payload
+    now names this row (`outcome_sk`), and the driver settles it -- and pages the owner --
+    when the sweep ends; see _settle_scheduled_outcome in the driver.
     """
     ddb.Table(os.environ["EVENTS_TABLE"]).put_item(Item={
         "run_id": run_id,
-        "sk": f"sweep#{result.get('task', 'sweep')}",
+        "sk": OUTCOME_SK.format(task=result.get("task", "sweep")),
         "stage": "monitor",
         "status": str(result.get("status", "unknown")),
         "detail": json.dumps(result, default=str)[:8000],

@@ -13645,3 +13645,278 @@ class TestVisionPromptClauses:
         t = self._prompt("data-prep")
         assert "never write synthetic rows" in t
         assert "VALIDATE, not synthesise" in t
+
+
+# ── sweeps that called stage_complete and were not heard ──────────────────────
+#
+# Sweeps 2026-08-18, -08-31, -10-06 and -10-07 each wrote their report to S3 and settled
+# UnclaimedStageOutputs with serviced_turns=0. In every one the agent DID call
+# stage_complete, in a shape the driver could not see:
+#   * 10-06/07: a real call, answered `Unknown tool: stage_complete` by the HARNESS
+#     (registry: shell, skills), then shell, then end_turn -- the one-slot capture kept the
+#     shell block, and `if not tu` kept the typed-call parser from reading the
+#     `stage_complete({...})` the agent then typed.
+#   * 08-18/31: `<inline-function name="stage_complete">{...}</inline-function>`, a
+#     spelling the parser did not know.
+# And none of it reached a person: PipelineFailed has no rule, the sweep#sweep row read
+# `invoked`. See deploy/evidence/VERIFICATION_sweep_unheard_calls.md.
+
+SWEEP_BUCKET = "llmops-data-test"
+SWEEP_REPORT = f"s3://{SWEEP_BUCKET}/monitoring/sweeps/sweep-2026-10-07.json"
+SWEEP_MANIFEST = f"s3://{SWEEP_BUCKET}/monitoring/manifests/sweep-2026-10-07.json"
+
+
+def sweep_driver_event(**over):
+    """What llmops-monitor-sweep hands the driver: no task token, an outcome row."""
+    base = sweep.build_payload("llmops-agentic-system", SWEEP_BUCKET, "us-east-1",
+                               "sweep-2026-10-07")
+    base.update(over)
+    return base
+
+
+def shadowed_call_stream(name, args, then="shell", text="STAGE_COMPLETE: emitted."):
+    """The 10-07 turn shape: a serviced call, then a harness-run tool, then end_turn.
+
+    In production the harness answered the first block itself (`Unknown tool`) and the
+    agent's next move was the shell call; the driver's stream carries both blocks."""
+    return [
+        {"contentBlockStart": {"start": {"toolUse": {"toolUseId": "tu-sc", "name": name}}}},
+        {"contentBlockDelta": {"delta": {"toolUse": {"input": json.dumps(args)}}}},
+        {"contentBlockStart": {"start": {"toolUse": {"toolUseId": "tu-sh", "name": then}}}},
+        {"contentBlockDelta": {"delta": {"toolUse": {"input": json.dumps(
+            {"command": "aws s3 cp /tmp/stage_complete.json s3://x/y.stage_complete.json"})}}}},
+        {"contentBlockDelta": {"delta": {"text": text}}},
+        {"messageStop": {"stopReason": "end_turn"}},
+    ]
+
+
+def shell_then_text_stream(text):
+    """The 10-06 last-turn shape: shell ran, then the call was TYPED, then end_turn."""
+    return [
+        {"contentBlockStart": {"start": {"toolUse": {"toolUseId": "tu-sh", "name": "shell"}}}},
+        {"contentBlockDelta": {"delta": {"toolUse": {"input": json.dumps(
+            {"command": "echo STAGE_COMPLETE"})}}}},
+        {"contentBlockDelta": {"delta": {"text": text}}},
+        {"messageStop": {"stopReason": "end_turn"}},
+    ]
+
+
+#: Sweep 2026-10-06's final turn text, verbatim but for the bucket name.
+TYPED_PYCALL_1006 = (
+    'stage_complete({"stage": "monitor", "outputs": ["s3://llmops-data-test/monitoring/'
+    'sweeps/sweep-2026-10-07.json", "s3://llmops-data-test/monitoring/manifests/'
+    'sweep-2026-10-07.json"], "metrics": {"endpoints_total": 0, "idle_flagged_endpoints": '
+    '[], "orphan_endpoint_configs": 4, "orphan_models": 10, "deletions": 0, '
+    '"permission_gaps": []}, "evidence": {"report_artifact": "s3://llmops-data-test/'
+    'monitoring/sweeps/sweep-2026-10-07.json"}})')
+
+#: Sweep 2026-08-31's second turn, trimmed to the call (metrics shortened), same layout.
+TYPED_TAGCALL_0831 = (
+    "The sweep work is already complete and all artifacts were uploaded to S3 in the prior "
+    "turn. Re-issuing the completion call:\n\n"
+    '<inline-function name="stage_complete">\n{\n  "stage": "monitor",\n  "outputs": [\n'
+    '    "s3://llmops-data-test/monitoring/sweeps/sweep-2026-10-07.json",\n'
+    '    "s3://llmops-data-test/monitoring/manifests/sweep-2026-10-07.json"\n  ],\n'
+    '  "metrics": {\n    "live_endpoints_total": 0,\n    "idle_endpoints_flagged": 0,\n'
+    '    "live_cost_per_hr_usd": 0.0\n  },\n  "evidence": {\n    "endpoints": "aws sagemaker '
+    'list-endpoints (us-east-1) returned Endpoints: [] -- $0.00/hr measured"\n  }\n}\n'
+    "</inline-function>")
+
+
+def _protocol_row(c):
+    return next(r for r in c["ddb"].Table(ENV["EVENTS_TABLE"]).items
+                if str(r.get("sk", "")).startswith(driver.PROTOCOL_SK))
+
+
+def _outcome_row(c):
+    rows = [r for r in c["ddb"].Table(ENV["EVENTS_TABLE"]).items
+            if r.get("sk") == "sweep#sweep"]
+    return rows[-1] if rows else None
+
+
+def test_a_stage_complete_followed_by_shell_in_the_same_turn_is_serviced():
+    """The 10-06/10-07 death, replayed: the call is not the turn's last block.
+
+    Before the fix this turn read `tool=shell`, counted as prose, and three of them settled
+    UnclaimedStageOutputs with the report sitting in S3."""
+    ac = FakeAgentCore([shadowed_call_stream(
+        "stage_complete", {"stage": "monitor", "task": "sweep",
+                           "outputs": [SWEEP_REPORT, SWEEP_MANIFEST]})])
+    c = clients(ac, FakeS3(existing=[SWEEP_REPORT, SWEEP_MANIFEST]))
+    out = driver.handler(sweep_driver_event(), clients=c)
+    assert out["status"] == "completed", (
+        f"a stage_complete followed by a shell block was still unheard: {out}")
+    row = _protocol_row(c)
+    assert (row["serviced_turns"], row["prose_turns"]) == (1, 0), row
+    assert row["recovered_shadowed_calls"] == 1 and row["recovered_ending_in_prose"] == 1, (
+        "the recovery happened but the protocol row cannot tell it from a clean call")
+
+
+def test_a_shadowed_call_is_answered_as_text_because_the_harness_already_answered_it():
+    """The harness answered the call's id with `Unknown tool`, and later messages followed.
+    Echoing that id back as a toolUse/toolResult pair would put an answered call into
+    history again, so the answer is text -- checked on the NON-terminal path, a rejected
+    claim, where the reply becomes the next turn's input rather than a courtesy ack."""
+    missing = f"s3://{SWEEP_BUCKET}/monitoring/sweeps/never-written.json"
+    ac = FakeAgentCore([
+        shadowed_call_stream("stage_complete", {"stage": "monitor", "outputs": [missing]}),
+        tool_use_stream("stage_complete", {"stage": "monitor", "outputs": [SWEEP_REPORT]}),
+    ])
+    c = clients(ac, FakeS3(existing=[SWEEP_REPORT]))
+    out = driver.handler(sweep_driver_event(), clients=c)
+    assert out["status"] == "completed", out
+    reply = ac.calls[1]["messages"]
+    assert len(reply) == 1 and reply[0]["role"] == "user", (
+        f"the shadowed call was answered with a toolUse/toolResult pair: {reply}")
+    blob = json.dumps(reply)
+    assert "toolUse" not in blob and "toolResult" not in blob
+    assert "rejected" in blob and "never-written" in blob, (
+        "the agent was not told its claim was rejected, or which output was missing")
+    assert "unknown tool" in blob, "the agent was not told the error it saw was not the answer"
+
+
+def test_a_real_call_still_wins_over_a_typed_one_when_shell_follows_it():
+    """Widening the typed-call gate must not let prose outrank a real call: the turn below
+    makes a real stage_complete, runs shell, and then TYPES a stage_complete naming a file
+    that does not exist. The real block's claim is the one serviced."""
+    typed_missing = ('stage_complete({"stage": "monitor", "outputs": '
+                     '["s3://llmops-data-test/monitoring/sweeps/typed-only.json"]})')
+    ac = FakeAgentCore([shadowed_call_stream(
+        "stage_complete", {"stage": "monitor", "outputs": [SWEEP_REPORT]},
+        text=typed_missing)])
+    c = clients(ac, FakeS3(existing=[SWEEP_REPORT]))
+    out = driver.handler(sweep_driver_event(), clients=c)
+    assert out["status"] == "completed", (
+        f"the typed call displaced the real one that preceded the shell block: {out}")
+    assert _protocol_row(c)["recovered_typed_calls"] == 0
+
+
+def test_a_call_typed_after_a_shell_block_is_recovered():
+    """10-06's last two turns: shell ran, then the agent typed `stage_complete({...})`, a
+    spelling parse_typed_call already handled. It never ran, because the gate was
+    `if not tu` and the shell block was a `tu`."""
+    ac = FakeAgentCore([shell_then_text_stream(TYPED_PYCALL_1006)])
+    c = clients(ac, FakeS3(existing=[SWEEP_REPORT, SWEEP_MANIFEST]))
+    out = driver.handler(sweep_driver_event(), clients=c)
+    assert out["status"] == "completed", (
+        f"a typed call was still invisible because shell ran earlier in the turn: {out}")
+    assert _protocol_row(c)["recovered_typed_calls"] == 1
+
+
+def test_the_inline_function_tag_spelling_is_recovered():
+    """08-18 and 08-31 died typing this. Parsed into a real outputs list, so the claim
+    still goes through verify_outputs like any other."""
+    call = driver.parse_typed_call(TYPED_TAGCALL_0831)
+    assert call and call["name"] == "stage_complete", call
+    assert call["input"]["outputs"] == [SWEEP_REPORT, SWEEP_MANIFEST]
+    ac = FakeAgentCore([text_stream(TYPED_TAGCALL_0831)])
+    c = clients(ac, FakeS3(existing=[SWEEP_REPORT, SWEEP_MANIFEST]))
+    assert driver.handler(sweep_driver_event(), clients=c)["status"] == "completed"
+
+
+def test_the_tag_spelling_is_held_to_one_json_object_and_a_serviced_name():
+    """The same bar as the Python spelling. A tag around a sentence, an object followed by
+    more text, an unclosed tag, and a tag naming a harness tool all stay prose."""
+    for text in (
+            '<inline-function name="stage_complete">I will call it with {"outputs": []} '
+            'soon</inline-function>',
+            '<inline-function name="stage_complete">{"outputs": []} and then more'
+            '</inline-function>',
+            '<inline-function name="stage_complete">{"outputs": []}',
+            '<inline-function name="shell">{"command": "rm -rf /"}</inline-function>'):
+        assert driver.parse_typed_call(text) is None, f"recovered from prose: {text!r}"
+
+
+def test_the_last_typed_call_wins_across_all_four_spellings():
+    """Position decides across every spelling, the tag one included."""
+    text = ('<invoke name="checkpoint"><parameter name="progress_uri">s3://b/p</parameter>'
+            '</invoke> then stage_complete({"outputs": ["s3://b/x"]}) and finally '
+            '<inline-function name="escalate_human">{"reason": "r", "details": "d"}'
+            '</inline-function>')
+    assert driver.parse_typed_call(text)["name"] == "escalate_human"
+    text2 = ('<inline-function name="escalate_human">{"reason": "r", "details": "d"}'
+             '</inline-function> later: **checkpoint**')
+    assert driver.parse_typed_call(text2)["name"] == "checkpoint"
+
+
+def test_a_sweep_that_does_not_complete_settles_its_row_and_pages_once():
+    """The visibility half. Four turns of prose with nothing verifiable: the sweep fails,
+    and the row its dispatcher wrote as `invoked` must say so, and the owner must hear."""
+    ac = FakeAgentCore([text_stream("done, see the report")] * 4)
+    c = clients(ac, FakeS3(existing=[]))
+    c["ddb"].Table(ENV["EVENTS_TABLE"]).put_item(Item={
+        "run_id": "sweep-2026-10-07", "sk": "sweep#sweep", "status": "invoked"})
+    out = driver.handler(sweep_driver_event(), clients=c)
+    assert out["status"] == "failed"
+    row = _outcome_row(c)
+    assert row["status"] == "failed" and "missing stage_complete" in row["driver_outcome"], (
+        f"the outcome row still does not say the sweep failed: {row}")
+    assert row.get("settled_at")
+    assert len(c["sns"].published) == 1, c["sns"].published
+    assert "sweep-2026-10-07" in c["sns"].published[0]["Subject"]
+
+
+def test_a_completed_sweep_settles_its_row_without_paging():
+    ac = FakeAgentCore([tool_use_stream("stage_complete",
+                                        {"stage": "monitor", "outputs": [SWEEP_REPORT]})])
+    c = clients(ac, FakeS3(existing=[SWEEP_REPORT]))
+    driver.handler(sweep_driver_event(), clients=c)
+    assert _outcome_row(c)["status"] == "completed"
+    assert c["sns"].published == [], "a successful sweep paged the owner"
+
+
+def test_an_escalated_sweep_is_paged_once_not_twice():
+    """handle_escalate already publishes to the same topic, so the settle must not."""
+    ac = FakeAgentCore([tool_use_stream("escalate_human",
+                                        {"reason": "describe denied", "details": "x"})])
+    c = clients(ac)
+    driver.handler(sweep_driver_event(), clients=c)
+    assert _outcome_row(c)["status"] == "escalated"
+    assert len(c["sns"].published) == 1, c["sns"].published
+
+
+def test_a_crashed_sweep_settles_its_row_and_still_raises():
+    class _Boom(FakeAgentCore):
+        def invoke_harness(self, **kw):
+            raise RuntimeError("control plane down")
+
+    c = clients(_Boom([]))
+    with pytest.raises(RuntimeError):
+        driver.handler(sweep_driver_event(), clients=c)
+    assert _outcome_row(c)["status"] == "crashed"
+    assert len(c["sns"].published) == 1
+
+
+def test_only_an_invocation_that_names_its_outcome_row_gets_one():
+    """A pipeline stage holds a task token and has its own settle; a token-less invocation
+    that did not ask for an outcome row gets none. Neither may grow a sweep#sweep row."""
+    for event in (driver_event(outcome_sk="sweep#sweep"),
+                  sweep_driver_event(outcome_sk=None)):
+        ac = FakeAgentCore([text_stream("prose")] * 4)
+        c = clients(ac, FakeS3(existing=[]))
+        driver.handler(event, clients=c)
+        assert _outcome_row(c) is None, f"an outcome row was written for {event}"
+        assert c["sns"].published == []
+
+
+def test_the_outcome_row_the_driver_settles_is_the_one_the_sweep_wrote(sweep_env):
+    """One template, two writers: the dispatcher's `invoked` row and the driver's settle
+    must address the same key, or the settle mints a second row beside the stale one."""
+    ddb = FakeDDB()
+    out = sweep.handler({}, clients=_sweep_clients(ddb=ddb))
+    written = ddb.Table("llmops-stage-events").items
+    assert len(written) == 1
+    p = sweep.build_payload("p", "b", "us-east-1", out["run_id"])
+    assert written[0]["sk"] == p["outcome_sk"], (written[0]["sk"], p["outcome_sk"])
+
+
+def test_the_monitor_prompt_says_a_file_or_an_echo_is_not_the_call():
+    """The agent wrote `*.stage_complete.json` to S3 on at least seven days and echoed
+    STAGE_COMPLETE from shell; the prompt never said either is not the call, nor what to do
+    when the harness answers one `Unknown tool`."""
+    h = json.loads((REPO / "agents/monitor/harness.json").read_text())
+    prompt = "".join(b["text"] for b in h["systemPrompt"])
+    i = prompt.find("TURN-END INVARIANT")
+    clause = prompt[i:i + 1400]
+    assert "TOOL CALLS, not files or commands" in clause
+    assert "Unknown tool" in clause and "make no further tool calls" in clause
