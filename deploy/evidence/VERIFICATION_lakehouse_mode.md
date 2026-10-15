@@ -93,12 +93,16 @@ the same bytes.
 new `S3GoldExtractsRead` grant, verified by simulation below; the job has not reached its download
 step yet (next paragraph).
 
-**Training status at the time of writing.** The probe has been `Pending` since 15:02 with SageMaker's
-own message, *"Training job waiting for capacity"* (ml.g5.2xlarge, us-east-1). Nothing in PR-09 is
-involved in that wait. The pipeline's existing capacity handling covers it: a stop with $0 billed is a
-capacity relaunch, not a failure, up to `CAPACITY_RETRY_CAP`. The run is left to proceed through the
-pipeline rather than nudged by hand. Its training, eval and gate outcome will be recorded when it ends,
-as PR-11's live end-to-end evidence if it ends after this PR merges.
+**Training status at the time of writing.** Capacity arrived about an hour later, and the probe
+completed. Its metrics were 0.91 s/step at p50 steady state, peak VRAM 10%, 0 rows dropped as
+overlong, 251 train rows, and preflight PASS. The full job `…-i0` launched at 16:02 and is in
+progress, while the run has moved on to `EvalGenerate → EvalScore`.
+
+**Open question, outside this PR.** That ordering is the existing probe → full-launch path:
+`finetune/analyze` records `launched_job_status: InProgress` and completes, and the run row
+still tracks the probe's job name. Whether eval waits for the full job's artifact, rather than
+judging something earlier, is being checked against this run. Nothing in it is lakehouse code: the
+lakehouse path ends where finetune reads the extract, and that part held.
 
 ## Least privilege
 

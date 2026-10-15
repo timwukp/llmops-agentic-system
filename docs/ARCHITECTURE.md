@@ -637,6 +637,7 @@ is why p̂ = 0.8421 had to be counted by hand out of logs. The driver now writes
 stage epoch into `llmops-stage-events` under `sk = protocol#<stage>#<task>#e<epoch>`
 (zero new IAM, zero new resources) carrying `turns`, `serviced_turns`, `prose_turns`,
 `filtered_turns_total`, `recovered_typed_calls`, `recovered_ending_in_prose`,
+`recovered_shadowed_calls` (the recovered call was not the turn's last block),
 `infra_error_turns_total` and `deadline_cuts`. It is written **after** the stop-reason
 override and the typed-call recovery, not before — that ordering is the defect in the
 `[driver] turn` log line, which prints early and so reports `tool=None` for turns that were

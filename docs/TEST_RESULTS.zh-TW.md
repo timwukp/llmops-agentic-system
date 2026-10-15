@@ -26,14 +26,15 @@
 | Harness 記憶體 —— 建立時的預設值 | 每個 harness 掛的是哪個記憶體，以及每次建立實際配置了什麼（唯讀） | ⚠️ 發現 —— 7 個都掛共享 BYO 記憶體；但每次建立都另外留下一個空的、無人使用的 MANAGED 記憶體。現在建立時一律宣告 `{"disabled": {}}` | [VERIFICATION_harness_memory_audit.md](../deploy/evidence/VERIFICATION_harness_memory_audit.md) |
 | 殘留 memory 的 sweep —— 線上 | 排程 sweep 透過 pipeline 找出沒有任何 harness 使用的 AgentCore memory，只讀 metadata | ✅ PASSED —— 0 個殘留（與獨立的 ListMemories 一致），未讀取內容、無權限缺口；以執行角色模擬 10/10 | [VERIFICATION_memory_orphan_sweep.md](../deploy/evidence/VERIFICATION_memory_orphan_sweep.md) |
 | Console IAM —— S3 讀取範圍 | `LlmopsAdminLambdaRole` 只能讀 `lambda_function.py` 實際讀取的路徑（由其 AST 推導）；以 `simulate_principal_policy` 驗證兩個方向 | ✅ 25/25：11 個推導出的路徑皆「允許」（含 Data 分頁的報告與 landing manifest）；7 個不讀的前綴（含 landing 原始資料本身）、其他 bucket、不帶前綴的 list、3 個不列出的前綴皆「拒絕」。原本是 `"*"` 上的 `s3:GetObject` + `s3:ListBucket`。經由已部署的 Lambda：Data 分頁正常載入（6 個資料集、283 筆配對、8 條規則），不存在的 run manifest 回 `NoSuchKey` | [VERIFICATION_console_s3_scope.md](../deploy/evidence/VERIFICATION_console_s3_scope.md) |
+| Monitor sweep —— 未被聽見的 `stage_complete` | 為何 08-18、08-31、10-06、10-07 的 sweep 從未送達終止呼叫（唯讀：stage events、driver 與 runtime 日誌、S3、bus 規則） | ⚠️ 已發現，離線修正 —— agent 每次都呼叫了 `stage_complete`；harness 回 `Unknown tool`，driver 也沒接到（只保留最後一個 block、shell 關掉了手打呼叫的解析、不認得 `<inline-function>` 寫法）。沒有任何告警。14 個重播測試，未修正的 driver 有 9 個失敗；線上 sweep 待部署 | [VERIFICATION_sweep_unheard_calls.md](../deploy/evidence/VERIFICATION_sweep_unheard_calls.md) |
 
 ## 靜態與離線檢查（可重複，CI 強制）
 
 | 檢查 | 結果 | 復現方式 |
 |---|---|---|
-| 單元測試（契約、成本模型、driver 迴圈、Lambda、狀態機文檔） | **2049/2049 通過** | `.venv/bin/python -m pytest tests/ -q --ignore=tests/golden` |
+| 單元測試（契約、成本模型、driver 迴圈、Lambda、狀態機文檔） | **2063/2063 通過** | `.venv/bin/python -m pytest tests/ -q --ignore=tests/golden` |
 | Shell 測試套件 —— N 路 capacity race guard（`tests/test_capacity_race_guard.sh`） | **10/10 斷言** | `bash tests/test_capacity_race_guard.sh` |
-| 反向控制 —— 逐一破壞每道 guard，確認它會失敗 | **392/392 反向控制** | `.venv/bin/python tests/negative_controls/monitor_dispatch.py` |
+| 反向控制 —— 逐一破壞每道 guard，確認它會失敗 | **399/399 反向控制** | `.venv/bin/python tests/negative_controls/monitor_dispatch.py` |
 | Harness 配置驗證（5 個專家 + 指揮家 + 審計員） | **7/7 `RESULT: OK`** | `python deploy/validate_config.py --config agents/<a>/harness.json` |
 | 架構 SVG 幾何檢查（虛線零交叉、零穿框） | **CLEAN** | `python tests/test_svg_geometry.py docs/architecture-*.svg` |
 | 遮蔽掃描（帳號 ID、憑證、帶帳號的 ARN） | CLEAN | `.github/workflows/redaction-check.yml` |
@@ -131,13 +132,13 @@ endpoint、五輪 e2e 迭代 —— 花費比這個帳戶單日花在一個沒�
 
 | 檢查 | 結果 | 重現方式 |
 |---|---|---|
-| 單元測試(全部套件,含 `test_cost_model.py` + `test_finops.py`) | **2049 passed** | `.venv/bin/python -m pytest tests/ -q` |
+| 單元測試(全部套件,含 `test_cost_model.py` + `test_finops.py`) | **2063 passed** | `.venv/bin/python -m pytest tests/ -q` |
 | Harness 配置驗證,7 個 agent | **`RESULT: OK`** | `python deploy/validate_config.py --config agents/finops/harness.json` |
 | 線上艦隊 | **7 個 harness READY** | 用 repo 內建 boto3 呼叫 `list_harnesses` |
 | 正典模組有散佈路徑 | 印出 `would upload 4 contract files` | `python deploy/03_storage.py --region us-east-1 --account-id 123456789012 --dry-run` |
 
 本次新增的每一道 guard 都做過 **mutation check**:逐一還原被斷言的行為,確認測試會
-失敗 —— **392/392 反向控制**,338 個 mutation 斷言 392 組（guard, mutation）配對,runner 各印
+失敗 —— **399/399 反向控制**,343 個 mutation 斷言 399 組（guard, mutation）配對,runner 各印
 一行 PASS。一個「有這行為也過、沒這行為也過」的測試,不是測試。
 
 這個數字是刻意寫進句子裡的。「做過 mutation check」是一個形容詞,而形容詞不會過期:

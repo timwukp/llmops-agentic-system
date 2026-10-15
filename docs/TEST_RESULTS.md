@@ -27,14 +27,15 @@ page is its ledger.
 | Harness memory — create-time default | which memory each harness is on, and what each create provisioned (read-only) | ⚠️ FOUND — all 7 on the shared BYO memory; each create also left an empty orphaned MANAGED memory. Creates now declare `{"disabled": {}}` | [VERIFICATION_harness_memory_audit.md](../deploy/evidence/VERIFICATION_harness_memory_audit.md) |
 | Memory-orphan sweep — live | the scheduled sweep finds orphaned AgentCore memories through the pipeline, reading metadata only | ✅ PASSED — 0 orphans (matches an independent ListMemories), no contents read, no permission gaps; role simulation 10/10 | [VERIFICATION_memory_orphan_sweep.md](../deploy/evidence/VERIFICATION_memory_orphan_sweep.md) |
 | Console IAM — S3 read scope | `LlmopsAdminLambdaRole` reads only what `lambda_function.py` reads (derived from its AST); `simulate_principal_policy` both directions | ✅ 25/25: allowed for the 11 derived globs (incl. the Data tab's reports and landing manifest); denied for 7 unread prefixes (incl. the landing data itself), other buckets, an unprefixed list and 3 unlisted prefixes. Was `s3:GetObject` + `s3:ListBucket` on `"*"`. Through the deployed Lambda: the Data tab loaded (6 datasets, 283 pairs, 8 rules) and a missing run manifest returned `NoSuchKey` | [VERIFICATION_console_s3_scope.md](../deploy/evidence/VERIFICATION_console_s3_scope.md) |
+| Monitor sweep — unheard `stage_complete` | why sweeps 08-18, 08-31, 10-06, 10-07 never serviced a terminal call (read-only: stage events, driver + runtime logs, S3, bus rules) | ⚠️ FOUND, fixed offline — each agent called `stage_complete`; the harness answered `Unknown tool`, and the driver missed the call (one-slot capture, a typed-call gate that shell switched off, an unknown `<inline-function>` spelling). Nothing alerted. 14 replay tests, 9 fail on the unfixed driver; live sweep pending deploy | [VERIFICATION_sweep_unheard_calls.md](../deploy/evidence/VERIFICATION_sweep_unheard_calls.md) |
 
 ## Static and offline checks (repeatable, CI-enforced)
 
 | Check | Result | How to reproduce |
 |---|---|---|
-| Unit tests (contracts, cost model, driver loop, Lambdas, state machine document) | **2049/2049 passed** | `.venv/bin/python -m pytest tests/ -q --ignore=tests/golden` |
+| Unit tests (contracts, cost model, driver loop, Lambdas, state machine document) | **2063/2063 passed** | `.venv/bin/python -m pytest tests/ -q --ignore=tests/golden` |
 | Shell suite — N-way capacity race guard (`tests/test_capacity_race_guard.sh`) | **10/10 assertions** | `bash tests/test_capacity_race_guard.sh` |
-| Negative controls — every guard broken in turn, confirmed to fail | **392/392 negative controls** | `.venv/bin/python tests/negative_controls/monitor_dispatch.py` |
+| Negative controls — every guard broken in turn, confirmed to fail | **399/399 negative controls** | `.venv/bin/python tests/negative_controls/monitor_dispatch.py` |
 | Harness config validation (5 specialists + conductor + auditor) | **7/7 `RESULT: OK`** | `python deploy/validate_config.py --config agents/<a>/harness.json` |
 | Architecture SVG geometry (no wire crossings, no wire through a card) | **CLEAN** | `python tests/test_svg_geometry.py docs/architecture-*.svg` |
 | Redaction scan (account IDs, credentials, account-bearing ARNs) | CLEAN | `.github/workflows/redaction-check.yml` |
@@ -143,14 +144,14 @@ Full record: [VERIFICATION_finops.md](../deploy/evidence/VERIFICATION_finops.md)
 
 | Check | Result | How to reproduce |
 |---|---|---|
-| Unit tests (all suites, incl. `test_cost_model.py` + `test_finops.py`) | **2049 passed** | `.venv/bin/python -m pytest tests/ -q` |
+| Unit tests (all suites, incl. `test_cost_model.py` + `test_finops.py`) | **2063 passed** | `.venv/bin/python -m pytest tests/ -q` |
 | Harness config validation, 7 agents | **`RESULT: OK`** | `python deploy/validate_config.py --config agents/finops/harness.json` |
 | Live fleet | **7 harnesses READY** | `list_harnesses` via the repo's vendored boto3 |
 | Canonical module has a distribution path | prints `would upload 4 contract files` | `python deploy/03_storage.py --region us-east-1 --account-id 123456789012 --dry-run` |
 
 Every guard added in this work was **mutation-checked**: the asserted behaviour was
-reverted one at a time and the test confirmed to fail — **392/392 negative controls**, 338
-mutations asserting 392 (guard, mutation) pairs, one printed PASS line each. A test that
+reverted one at a time and the test confirmed to fail — **399/399 negative controls**, 343
+mutations asserting 399 (guard, mutation) pairs, one printed PASS line each. A test that
 passes both with and against the behaviour it names is not a test.
 
 The count is in the sentence on purpose. "Mutation-checked" is an adjective, and an
