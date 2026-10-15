@@ -170,8 +170,11 @@ resources were created or deleted.
 
 Harnesses run DEFAULT endpoints (latest version). No student-model endpoint is
 live (torn down after eval per cost rule).
-`llmops_monitor` is at v14 since 2026-10-15 (the sweep's memory-orphan check, #164;
-deploy/evidence/VERIFICATION_memory_orphan_sweep.md).
+`llmops_monitor` is at v15 since 2026-10-15 (the TURN-END INVARIANT's inline-function clause,
+#167; deploy/evidence/VERIFICATION_sweep_unheard_calls.md). v14 was the sweep's memory-orphan
+check (#164). `llmops-harness-driver` and `llmops-monitor-sweep` were redeployed from #167 the same
+day, 08:16Z — the driver's first deploy since 2026-08-17, so it also shipped #154 (manifest
+schema) and #165 (Gold export) driver changes, which had merged without one.
 
 ## Model lineage
 

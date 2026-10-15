@@ -2,10 +2,9 @@
 
 - **Date:** 2026-10-15
 - **Change:** `intent/sweep-unheard-calls/`
-- **Mode:** read-only investigation (DynamoDB `llmops-stage-events`, CloudWatch
+- **Mode:** §1–4 read-only investigation (DynamoDB `llmops-stage-events`, CloudWatch
   `/aws/lambda/llmops-harness-driver` and the `llmops_monitor` runtime log group, S3 `monitoring/`,
-  EventBridge rules). Nothing was dispatched, written or deleted. Fix verified offline; live
-  verification waits for the owner's go-ahead to deploy.
+  EventBridge rules). §5 offline. §6 deployed and verified live on the owner's go-ahead.
 
 ## 1. Which sweeps did not complete
 
@@ -98,9 +97,35 @@ None:
 Full new set: 14 tests, 9 of which fail on the unfixed driver. The 5 that pass there are the guards
 that must hold either way (prose stays prose, the dispatcher's row key, the prompt clause).
 
-## 6. Pending (owner's go-ahead)
+## 6. Deployed and verified live (2026-10-15)
 
-1. `deploy/07_lambdas.py` for `llmops-harness-driver` and `llmops-monitor-sweep`;
-   `deploy/05_harnesses.py` for `llmops_monitor` (prompt clause).
-2. One sweep through `llmops-monitor-sweep`. Then confirm that `protocol#` shows a serviced
-   `stage_complete`, and that `sweep#sweep` reads `completed` with `settled_at`.
+`deploy/preflight.py` READY. Then:
+- `deploy/07_lambdas.py --only driver --only monitor_sweep`: both `updated`, `Successful`, 08:16Z.
+- `deploy/05_harnesses.py --agent monitor`: `llmops_monitor` v15, READY, config read back. Its warm-up
+  turn did not run (sandbox egress), and was not retried: that is a direct InvokeHarness, and work is
+  dispatched only through the pipeline.
+
+**A fifth failure, on the old code, the same morning.** The scheduled `sweep-2026-10-15` (08:00Z,
+before the deploy) ended `UnclaimedStageOutputs` 4/4/0 at 08:08:18Z, `sweep#sweep` left at `invoked`.
+Its runtime log has every inline function answered `Unknown tool`: `stage_complete` 8 times,
+`checkpoint` once, `escalate_human` once. Its last turn: "STAGE_COMPLETE emitted via the only
+registered tool (shell)". So not even `escalate_human` can reach the driver natively while the
+registry is in this state, which is the case for driver-side recovery rather than prompt-side.
+
+**The sweep, through the pipeline.** `lambda:Invoke llmops-monitor-sweep` (async, as the scheduler does)
+with `run_id = sweep-2026-10-15-unheard-calls-verify`, 08:19:16Z:
+
+| Check | Result |
+|---|---|
+| `protocol#monitor#sweep#e0` | turns 1, serviced 1, prose 0, `recovered_ending_in_prose` 1, `recovered_shadowed_calls` 0. The new counter is present, so the new driver ran |
+| `…#monitor#stage_complete` | 08:23:27Z, outputs `monitoring/sweeps/…verify.json` (7,133 B) + manifest, both verified |
+| `sweep#sweep` | `status: completed`, `settled_at 2026-10-15T08:23:27Z`, `driver_outcome` set (was `invoked` forever before) |
+| `*.stage_complete.json` in S3 | none written (the scheduled run on the old prompt wrote one at 08:06Z) |
+| runtime log | `stage_complete` still answered `Unknown tool` in-harness. The agent then: "Per protocol, I will not re-send it through the shell, write it to S3, or retype it" and ended the turn |
+
+What this proves and what it does not. Live, the run was saved by the **prompt clause** plus the
+existing end_turn recovery: the agent stopped after the error, so the call was the last block. The
+**shadowed-call path** (a harness tool after the call) and the **typed-call fixes** were not exercised
+live (`recovered_shadowed_calls 0`, `recovered_typed_calls 0`); they are proven by the replay tests in
+§5 only. The failure-page path (SNS on a non-completed sweep) was likewise not triggered, because the
+sweep completed. The next scheduled sweeps are the live sample for both.
