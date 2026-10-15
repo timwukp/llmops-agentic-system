@@ -170,6 +170,8 @@ resources were created or deleted.
 
 Harnesses run DEFAULT endpoints (latest version). No student-model endpoint is
 live (torn down after eval per cost rule).
+`llmops_monitor` is at v14 since 2026-10-15 (the sweep's memory-orphan check, #164;
+deploy/evidence/VERIFICATION_memory_orphan_sweep.md).
 
 ## Model lineage
 
