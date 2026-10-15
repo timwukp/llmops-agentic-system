@@ -5,6 +5,27 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
 ## [Unreleased]
 
+### The daily sweep reports orphaned AgentCore memories
+
+The 7 orphaned managed memories deleted on 2026-10-14 were found by a person calling AWS directly.
+Under the project's rule (work goes through the pipeline), finding them is now the scheduled `sweep`'s
+job: `llmops_monitor` lists every memory and harness, reads `GetHarness` on `llmops_*` harnesses only,
+and reports every `harness_llmops_*` / `llmops_*` memory that no llmops harness references as
+`memory_orphans` in its sweep.json. Other projects' memories are counted as "not assessed", never
+called orphans. The sweep reads no memory contents and deletes nothing.
+
+- `deploy/iam/harness_execution_role.json`: `AgentCoreInventoryForSweep` (`ListMemories`,
+  `ListHarnesses` on `*`) and `AgentCoreHarnessReadOwn` (`GetHarness` on `harness/llmops_*` only,
+  because a harness config carries env vars and another project's may carry secrets). Action names
+  checked with Access Analyzer `ValidatePolicy`, which flagged a deliberately misspelt control.
+- Guards: the existing prompt-command → IAM-action test now maps the three commands; new tests pin
+  the clause and prove no statement grants memory contents, harness config or mutation on a wildcard.
+- AGENTS.md: #157 said a harness "deleted or re-pointed" leaves the residue. Only re-pointing is
+  evidenced; whether deleting a harness removes its managed memory is not established. Corrected.
+
+Not yet deployed: needs `01_iam.py` (role) and `05_harnesses.py --agent monitor` (prompt), then one
+sweep through `llmops-monitor-sweep`.
+
 ### Console: a read-only Data tab
 
 A new **Data** tab, the read-only version the owner asked for right after PR-07. It shows:

@@ -74,7 +74,10 @@ versions and introspects the live CreateHarness/UpdateHarness schemas.
   (`deploy/evidence/VERIFICATION_harness_memory_audit.md`), each of the 7 llmops harnesses had
   an orphaned managed memory created in the same second as the harness — **UpdateHarness does
   not delete the memory it replaces**. All 7 were empty (0 actors / 0 records) and were deleted
-  2026-10-14 after a re-check; a harness deleted or re-pointed later leaves the same residue. The name
+  2026-10-14 after a re-check. A harness re-pointed away from a managed memory later leaves the
+  same residue; whether DELETING a harness removes its managed memory is not established. The
+  daily `sweep` (`llmops_monitor`) now reports such memories as `memory_orphans`, reading
+  metadata only: `GetHarness` is scoped to `harness/llmops_*`, and no memory contents. The name
   pattern has changed: `harness_<name>_<4hex>-<10>` for creates through 2026-08-04,
   `<harnessName>-<10>` from 2026-08-11 (and a 2026-10-13 probe, whose create called
   `CreateMemory` on `memory/<harnessName>-*` and reached READY only with `{"disabled": {}}`).
