@@ -21,13 +21,14 @@ page is its ledger.
 | Phase 1 PR-04 — lakehouse storage | 2 SSE-KMS table buckets, 10 Iceberg v2 tables, Athena workgroup, Glue role; read back live | ✅ 36/36 `--verify` checks (encryption, format/columns/partitions, Athena per table, Glue role allowed **and** denied by simulation, retention) | [VERIFICATION_lakehouse_storage.md](../deploy/evidence/VERIFICATION_lakehouse_storage.md) |
 | Phase 1 PR-06 — lakehouse source generator | seeded zh-TW/EN conversations, CRM/ERP CDC, web events with 8 planted defect kinds; same seed on two machines | ✅ identical `dataset_sha256` on macOS (Python 3.12.12) and the AL2023 runner (3.12.14), both scales; 42 tests re-detect every plant with an independent oracle | [VERIFICATION_lakehouse_generator.md](../deploy/evidence/VERIFICATION_lakehouse_generator.md) |
 | Phase 1 PR-07 — lakehouse medallion | 3 Glue 5 jobs land → Bronze → Silver → Gold as `llmops-lakehouse-glue`; 8 rules held to the generator's plants; Glue DQ; Athena counts | ✅ 16/16 at small and demo scale. Every rule's catch equals the plant exactly, names via the live guardrail. Found: Glue 5's boto3 lacks `apply_guardrail`; Guardrails reads store names as people (fixed with an org-entity reference list) | [VERIFICATION_lakehouse_medallion.md](../deploy/evidence/VERIFICATION_lakehouse_medallion.md) |
+| Console — Data tab (read-only) | live portal `/?tab=data` after a demo smoke: datasets, 10 tables with rows/snapshots, rules vs plants, DQ | ✅ 8/8 rules exact, 16/16 DQ shown; bad dataset id → 400; older datasets degrade to `–`/`n/a`. Found and fixed: stale table cells on dataset switch. Reports and metadata only, never the tables | [VERIFICATION_console_data_tab.md](../deploy/evidence/VERIFICATION_console_data_tab.md) |
 | Harness memory — create-time default | which memory each harness is on, and what each create provisioned (read-only) | ⚠️ FOUND — all 7 on the shared BYO memory; each create also left an empty orphaned MANAGED memory. Creates now declare `{"disabled": {}}` | [VERIFICATION_harness_memory_audit.md](../deploy/evidence/VERIFICATION_harness_memory_audit.md) |
 
 ## Static and offline checks (repeatable, CI-enforced)
 
 | Check | Result | How to reproduce |
 |---|---|---|
-| Unit tests (contracts, cost model, driver loop, Lambdas, state machine document) | **1949/1949 passed** | `.venv/bin/python -m pytest tests/ -q --ignore=tests/golden` |
+| Unit tests (contracts, cost model, driver loop, Lambdas, state machine document) | **1963/1963 passed** | `.venv/bin/python -m pytest tests/ -q --ignore=tests/golden` |
 | Shell suite — N-way capacity race guard (`tests/test_capacity_race_guard.sh`) | **10/10 assertions** | `bash tests/test_capacity_race_guard.sh` |
 | Negative controls — every guard broken in turn, confirmed to fail | **389/389 negative controls** | `.venv/bin/python tests/negative_controls/monitor_dispatch.py` |
 | Harness config validation (5 specialists + conductor + auditor) | **7/7 `RESULT: OK`** | `python deploy/validate_config.py --config agents/<a>/harness.json` |
@@ -138,7 +139,7 @@ Full record: [VERIFICATION_finops.md](../deploy/evidence/VERIFICATION_finops.md)
 
 | Check | Result | How to reproduce |
 |---|---|---|
-| Unit tests (all suites, incl. `test_cost_model.py` + `test_finops.py`) | **1949 passed** | `.venv/bin/python -m pytest tests/ -q` |
+| Unit tests (all suites, incl. `test_cost_model.py` + `test_finops.py`) | **1963 passed** | `.venv/bin/python -m pytest tests/ -q` |
 | Harness config validation, 7 agents | **`RESULT: OK`** | `python deploy/validate_config.py --config agents/finops/harness.json` |
 | Live fleet | **7 harnesses READY** | `list_harnesses` via the repo's vendored boto3 |
 | Canonical module has a distribution path | prints `would upload 4 contract files` | `python deploy/03_storage.py --region us-east-1 --account-id 123456789012 --dry-run` |

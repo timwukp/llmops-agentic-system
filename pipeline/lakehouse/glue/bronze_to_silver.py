@@ -11,6 +11,7 @@ console's Data tab and the smoke check read it.
 
 Arguments: --account_id --raw_bucket --curated_bucket --eval_prompts_uri --report_uri
            --guardrail_id --guardrail_version --dq_run_id --org_entities_uri
+           --expected_defects_uri (a generated dataset's plants; absent for real data)
 """
 import datetime
 import json
@@ -27,7 +28,7 @@ import transform
 
 args = getResolvedOptions(sys.argv, ["account_id", "raw_bucket", "curated_bucket", "eval_prompts_uri",
                                      "report_uri", "guardrail_id", "guardrail_version", "dq_run_id",
-                                     "org_entities_uri"])
+                                     "org_entities_uri", "expected_defects_uri"])
 spark = SparkSession.builder.config(
     "spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
 for name, bucket in (("raw", args["raw_bucket"]), ("cur", args["curated_bucket"])):
@@ -80,6 +81,19 @@ outcomes = [r.asDict() for r in dq.toDF().collect()]
 report["dq"] = {"ruleset": transform.SILVER_DQDL,
                 "outcomes": [{"rule": o.get("Rule"), "outcome": o.get("Outcome")} for o in outcomes]}
 report["dq_run_id"] = args["dq_run_id"]
+snap = spark.sql("SELECT snapshot_id FROM cur.silver.instruction_pairs.snapshots "
+                 "ORDER BY committed_at DESC LIMIT 1").collect()
+report["tables"] = {"silver.instruction_pairs": {"rows": report["pairs"],
+                                                 "snapshot_id": str(snap[0][0]) if snap else None}}
+# Only a generated dataset carries its plants; for real data there is nothing to compare with.
+try:
+    eb, _, ek = args["expected_defects_uri"][len("s3://"):].partition("/")
+    expected = json.loads(boto3.client("s3").get_object(Bucket=eb, Key=ek)["Body"].read())
+    report["plant_check"] = {rule: {"passed": ok, "detail": detail} for rule, (ok, detail)
+                             in transform.compare_to_plants(report["rules"], expected).items()}
+except Exception as e:  # noqa: BLE001 -- the comparison is optional, the report is not
+    report["plant_check"] = None
+    report["plant_check_note"] = f"no plants to compare with: {type(e).__name__}"
 
 bucket, _, key = args["report_uri"][len("s3://"):].partition("/")
 boto3.client("s3").put_object(Bucket=bucket, Key=key, ContentType="application/json",
