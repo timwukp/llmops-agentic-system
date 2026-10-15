@@ -93,16 +93,38 @@ the same bytes.
 new `S3GoldExtractsRead` grant, verified by simulation below; the job has not reached its download
 step yet (next paragraph).
 
-**Training status at the time of writing.** Capacity arrived about an hour later, and the probe
-completed. Its metrics were 0.91 s/step at p50 steady state, peak VRAM 10%, 0 rows dropped as
-overlong, 251 train rows, and preflight PASS. The full job `…-i0` launched at 16:02 and is in
-progress, while the run has moved on to `EvalGenerate → EvalScore`.
+**Outcome: the run ended at the gate, by protocol, and the measurement is the finding.**
+Three jobs ran in total, and remediation launched no retraining:
+- the probe;
+- the full job `…-i0`, Completed;
+- eval inference `…-i0-evalinf`, Completed.
 
-**Open question, outside this PR.** That ordering is the existing probe → full-launch path:
-`finetune/analyze` records `launched_job_status: InProgress` and completes, and the run row
-still tracks the probe's job name. Whether eval waits for the full job's artifact, rather than
-judging something earlier, is being checked against this run. Nothing in it is lakehouse code: the
-lakehouse path ends where finetune reads the extract, and that part held.
+Eval used the lakehouse fallback exactly as written: no `customer_eval_uri`, so it scored against
+`val_uri` = `gold.qlora_eval` (32 items, `c891df2b…`, re-verified), against the reference answers in
+the file.
+
+| Gate (owner-chosen) | Score | Wilson 95% CI | Verdict |
+|---|---|---|---|
+| `answer_match` ≥ 0.6 | 32/32 | [0.893, 1.000] | decisive pass |
+| `format_validity` ≥ 0.95 | 32/32 | [0.893, 1.000] | **borderline**: at zero failures the lower bound clears 0.95 only from n = 73 |
+
+The gate therefore emitted no `gate_passed` and paged for an owner directive, as the borderline
+protocol requires. That page went unanswered, so the remediation iterations re-verified the same
+facts and the run escalated at iteration 3 (`FAILED`).
+
+What this shows:
+- **The lakehouse path works end to end:** extract → review → finetune on the pinned files →
+  eval on the pinned eval split.
+- **The demo scale's 32-item eval split cannot carry a 0.95 gate.** That is a sizing fact about the
+  dataset, not a defect in the pipeline. The gate threshold was proposed in this session, and the
+  interval rule makes it unreachable at that n.
+- **The perfect `answer_match` needs reading with care:** the generator's conversations are
+  template-built, so a 1.7B student reproducing them is expected, and proves the plumbing, not the
+  model.
+
+The agent's recorded options are (A) accept, (B) export an eval split of n ≥ 73 (prefer ≥ 100) and
+re-judge the same `…-i0` artifact, or (C) retrain, which every stage recommends against. Choosing
+among them is the owner's decision.
 
 ## Least privilege
 
