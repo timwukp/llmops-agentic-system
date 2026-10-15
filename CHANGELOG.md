@@ -53,6 +53,18 @@ While writing it, a field-name defect was caught: describe returns `BillableTime
 event's `BillingSecondsUsed`. Reading the wrong field would have made every late-delivered real stop
 a free capacity relaunch; a test now holds the driver's event to the resume handler's
 `_is_capacity_stop`.
+### #168 deployed on top of #167, and two claims corrected
+
+The driver, start-pipeline, state machine (35 states) and console are live at `main` (#168's merge),
+deployed 10:01–10:04Z on 2026-10-15. CloudTrail shows #167's 08:16Z driver deploy had replaced the
+driver #168's branch shipped at 06:00Z with a tree that lacks its `lakehouse_review` event mapping.
+No lakehouse review ran in that window. #168's IAM, lakehouse jobs and prompts were checked live
+(`01_iam.py --dry-run` no change, `10_lakehouse.py --verify` 59/59) and not re-pushed.
+
+Corrected: PROJECT_STATE no longer calls #167's deploy the driver's first since August. AGENTS.md no
+longer says pipeline stages avoid the end_turn recovery: every stage of the 10-15 lakehouse run went
+through it. Evidence: `deploy/evidence/VERIFICATION_sweep_unheard_calls.md` §7.
+
 ### Orchestrator prompt: the data scope the platform actually enforces
 
 Two sentences in the consult prompt described a platform that does not exist. Step 0 told the agent to

@@ -176,11 +176,13 @@ Harnesses run DEFAULT endpoints (latest version). No student-model endpoint is
 live (torn down after eval per cost rule).
 `llmops_monitor` is at v15 since 2026-10-15 (the TURN-END INVARIANT's inline-function clause,
 #167; deploy/evidence/VERIFICATION_sweep_unheard_calls.md). v14 was the sweep's memory-orphan
-check (#164). `llmops-harness-driver` and `llmops-monitor-sweep` were redeployed from #167 the same
-day, 08:16Z — the driver's first deploy since 2026-08-17, so it also shipped #154 (manifest
-schema) and #165 (Gold export) driver changes, which had merged without one. #168 (lakehouse PR-09)
-merged afterwards with its own driver, start-pipeline, state-machine and IAM changes; those are not
-deployed by this record.
+check (#164). The driver, start-pipeline, state machine and console are at `main` as of #168's merge
+(`1c3c7c8`), deployed 10:01–10:04Z on 2026-10-15; `llmops-monitor-sweep` at #167 (08:16Z). Order that
+day, from CloudTrail: #168's branch deployed the driver at 06:00Z; #167 redeployed it at 08:16Z from a
+tree without #168's `lakehouse_review` event mapping; `main` restored both at 10:01Z. No lakehouse
+review ran in that window. #168's IAM (`01_iam.py --dry-run`: no change pending), lakehouse jobs
+(`10_lakehouse.py --verify` 59/59) and data-prep/finetune/eval prompts (last UpdateHarness 06:01–06:04Z,
+its own deploy) were checked live, not re-pushed.
 
 ## Model lineage
 
