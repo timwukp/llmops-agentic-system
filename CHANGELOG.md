@@ -54,8 +54,11 @@ called orphans. The sweep reads no memory contents and deletes nothing.
 - AGENTS.md: #157 said a harness "deleted or re-pointed" leaves the residue. Only re-pointing is
   evidenced; whether deleting a harness removes its managed memory is not established. Corrected.
 
-Not yet deployed: needs `01_iam.py` (role) and `05_harnesses.py --agent monitor` (prompt), then one
-sweep through `llmops-monitor-sweep`.
+Deployed 2026-10-15 (role, then `llmops_monitor` v14) and verified with one sweep through
+`llmops-monitor-sweep`: 0 orphans, which matches an independent ListMemories; no contents read, no
+deletions, no permission gaps; `simulate_principal_policy` as the role 10/10
+(`deploy/evidence/VERIFICATION_memory_orphan_sweep.md`). The same check found that the 2026-10-06 and
+10-07 scheduled sweeps never completed (4 prose turns, no `stage_complete`); pre-existing, recorded there.
 
 ### Console role: S3 reads scoped to what the console reads
 
