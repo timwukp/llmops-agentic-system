@@ -58,6 +58,9 @@ KEY_ALIAS = {RAW: "alias/llmops-lakehouse-raw", CURATED: "alias/llmops-lakehouse
 NAMESPACES = {RAW: ("bronze",), CURATED: ("silver", "gold")}
 WORKGROUP = "llmops-lakehouse"
 GLUE_ROLE = "llmops-lakehouse-glue"
+#: PR-09: the generator writes landing, which the transforms' role is denied, so it runs as a role
+#: of its own. Neither job can then rewrite the other's input.
+GENERATOR_ROLE = "llmops-lakehouse-generator"
 GLUE_PREFIX = "lakehouse/glue"
 LANDING_PREFIX = "lakehouse/landing"
 REPORT_PREFIX = "lakehouse/reports"
@@ -66,19 +69,23 @@ ATHENA_PREFIX = "athena/lakehouse"
 #: by checksum regex, names by Guardrails). Both directions enabled explicitly -- with only
 #: `action` set, ApplyGuardrail(source="INPUT") detected nothing (S4 run 1).
 GUARDRAIL_NAME = "llmops-lakehouse-pii"
-JOBS = {"land": ("llmops-lakehouse-land-bronze", "land_bronze.py"),
+JOBS = {"generate": ("llmops-lakehouse-generate", "generate_landing.py"),
+        "land": ("llmops-lakehouse-land-bronze", "land_bronze.py"),
         "silver": ("llmops-lakehouse-bronze-to-silver", "bronze_to_silver.py"),
         "gold": ("llmops-lakehouse-silver-to-gold", "silver_to_gold.py"),
         "export": ("llmops-lakehouse-export", "export_gold.py")}
 #: PR-08: Gold extracts live under their own top-level prefix so one Macie job can cover them
 #: (Macie scopes by key prefix only).
 EXTRACTS_PREFIX = "lakehouse/extracts"
-#: The export only drives Athena and S3; a Python-shell job at 1/16 DPU, not a Spark cluster.
-PYTHON_SHELL_JOBS = {"export_gold.py"}
+#: The export only drives Athena and S3, and the generator is stdlib Python: Python-shell jobs at
+#: 1/16 DPU, not Spark clusters. Each ships the one module it imports.
+PYTHON_SHELL_JOBS = {"export_gold.py", "generate_landing.py"}
+SHELL_JOB_MODULE = {"export_gold.py": "export.py", "generate_landing.py": "generate.py"}
 REPO = __import__("pathlib").Path(__file__).resolve().parents[1]
 GLUE_SRC = REPO / "pipeline" / "lakehouse" / "glue"
 TRANSFORM_SRC = REPO / "pipeline" / "lakehouse" / "transform.py"
 EXPORT_SRC = REPO / "pipeline" / "lakehouse" / "export.py"
+GENERATE_SRC = REPO / "pipeline" / "lakehouse" / "generate.py"
 ORG_ENTITIES_SRC = REPO / "pipeline" / "lakehouse" / "reference" / "org_entities.json"
 SSM_PREFIX = "/llmops/lakehouse"
 KEY_DELETION_DAYS = 30
@@ -272,6 +279,23 @@ def glue_role_policy(region: str, account_id: str, data_bucket: str, key_arns: d
            "Resource": guardrail_arn}] if guardrail_arn else [])}
 
 
+def generator_role_policy(region: str, account_id: str, data_bucket: str) -> dict:
+    """Write landing, read its own script and module, write its logs. No table, no key, no
+    report: it produces source files and nothing downstream of them."""
+    return {"Version": "2012-10-17", "Statement": [
+        {"Sid": "ScriptsRead", "Effect": "Allow", "Action": "s3:GetObject",
+         "Resource": f"arn:aws:s3:::{data_bucket}/{GLUE_PREFIX}/*"},
+        {"Sid": "LandingWrite", "Effect": "Allow", "Action": "s3:PutObject",
+         "Resource": f"arn:aws:s3:::{data_bucket}/{LANDING_PREFIX}/*"},
+        {"Sid": "LandingList", "Effect": "Allow", "Action": "s3:ListBucket",
+         "Resource": f"arn:aws:s3:::{data_bucket}",
+         "Condition": {"StringLike": {"s3:prefix": [f"{LANDING_PREFIX}/*"]}}},
+        {"Sid": "OwnLogs", "Effect": "Allow",
+         "Action": ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"],
+         "Resource": f"arn:aws:logs:{region}:{account_id}:log-group:/aws-glue/*"},
+    ]}
+
+
 def workgroup_config(data_bucket: str) -> dict:
     """No EncryptionConfiguration, on purpose. With one set (SSE_S3, or SSE_KMS even naming the
     table's own key), every Athena INSERT into a CMK-encrypted S3 Table fails with
@@ -363,6 +387,18 @@ def ensure_table(s3t, arn, t) -> str:
         return "created"
 
 
+def ensure_generator_role(iam, region, account_id, data_bucket) -> str:
+    try:
+        arn = iam.get_role(RoleName=GENERATOR_ROLE)["Role"]["Arn"]
+    except iam.exceptions.NoSuchEntityException:
+        arn = iam.create_role(RoleName=GENERATOR_ROLE, AssumeRolePolicyDocument=json.dumps(
+            glue_trust_policy(account_id)), Tags=_tags_list(),
+            Description="llmops lakehouse source generator (writes landing only)")["Role"]["Arn"]
+    iam.put_role_policy(RoleName=GENERATOR_ROLE, PolicyName="lakehouse-generator",
+                        PolicyDocument=json.dumps(generator_role_policy(region, account_id, data_bucket)))
+    return arn
+
+
 def ensure_role(iam, region, account_id, data_bucket, key_arns, guardrail_arn=None) -> str:
     try:
         arn = iam.get_role(RoleName=GLUE_ROLE)["Role"]["Arn"]
@@ -406,14 +442,51 @@ def ensure_guardrail(bedrock) -> tuple[str, str, str, str]:
 JOB_PYTHON_MODULES = {"bronze_to_silver.py": "boto3==1.43.57,botocore==1.43.57"}
 
 
-def job_definition(name, script, role_arn, data_bucket) -> dict:
+def run_arguments(step: str, data_bucket: str, dataset: str, **kw) -> dict:
+    """The per-run arguments of each job: the one place the lakehouse's S3 layout is spelled out
+    for a run. The smoke passes exactly this, and the state machine builds the same strings with
+    States.Format (tests/test_lakehouse_mode.py renders the ASL and compares)."""
+    landing = f"s3://{data_bucket}/{LANDING_PREFIX}/{dataset}/"
+    reports = f"s3://{data_bucket}/{REPORT_PREFIX}/{dataset}/"
+    return {
+        "generate": lambda: {"--dataset": dataset, "--seed": str(kw["seed"]), "--scale": kw["scale"]},
+        "land": lambda: {"--landing_uri": landing, "--report_uri": reports + "land.json"},
+        "silver": lambda: {"--eval_prompts_uri": landing + "eval_prompts.jsonl",
+                           "--report_uri": reports + "silver.json", "--dq_run_id": dataset,
+                           "--expected_defects_uri": landing + "expected_defects.json"},
+        "gold": lambda: {"--report_uri": reports + "gold.json"},
+        "export": lambda: {"--dataset": dataset, "--gold_report_uri": reports + "gold.json",
+                           "--pii_report_uri": reports + "silver.json",
+                           "--report_uri": reports + kw.get("export_report", "export.json"),
+                           "--run_id": kw["run_id"]},
+    }[step]()
+
+
+def static_arguments(script: str, account_id: str, data_bucket: str, guardrail_id: str = "",
+                     guardrail_version: str = "") -> dict:
+    """What every run of a job shares, set as the job's DefaultArguments at deploy time: the
+    state machine cannot carry them (07_lambdas substitutes only two placeholders, and the
+    account id may not appear in this public repo), and a run's own arguments override them."""
+    return {
+        "generate_landing.py": {"--data_bucket": data_bucket},
+        "land_bronze.py": {"--account_id": account_id, "--raw_bucket": RAW},
+        "bronze_to_silver.py": {"--account_id": account_id, "--raw_bucket": RAW, "--curated_bucket": CURATED,
+                                "--guardrail_id": guardrail_id, "--guardrail_version": guardrail_version,
+                                "--org_entities_uri": f"s3://{data_bucket}/{GLUE_PREFIX}/org_entities.json"},
+        "silver_to_gold.py": {"--account_id": account_id, "--curated_bucket": CURATED},
+        "export_gold.py": {"--data_bucket": data_bucket, "--curated_bucket": CURATED, "--workgroup": WORKGROUP},
+    }[script]
+
+
+def job_definition(name, script, role_arn, data_bucket, static=None) -> dict:
     extra = ({"--additional-python-modules": JOB_PYTHON_MODULES[script]} if script in JOB_PYTHON_MODULES else {})
+    static = static or {}
     if script in PYTHON_SHELL_JOBS:
         return {"Name": name, "Role": role_arn, "GlueVersion": "3.0", "MaxCapacity": 0.0625, "Timeout": 30,
                 "Command": {"Name": "pythonshell", "PythonVersion": "3.9",
                             "ScriptLocation": f"s3://{data_bucket}/{GLUE_PREFIX}/{script}"},
-                "DefaultArguments": {"--extra-py-files": f"s3://{data_bucket}/{GLUE_PREFIX}/export.py",
-                                     "--TempDir": f"s3://{data_bucket}/{GLUE_PREFIX}/tmp/"}}
+                "DefaultArguments": {"--extra-py-files": f"s3://{data_bucket}/{GLUE_PREFIX}/{SHELL_JOB_MODULE[script]}",
+                                     "--TempDir": f"s3://{data_bucket}/{GLUE_PREFIX}/tmp/", **static}}
     return {"Name": name, "Role": role_arn, "GlueVersion": "5.0", "WorkerType": "G.1X",
             "NumberOfWorkers": 2, "Timeout": 30,
             "Command": {"Name": "glueetl", "PythonVersion": "3",
@@ -421,18 +494,21 @@ def job_definition(name, script, role_arn, data_bucket) -> dict:
             "DefaultArguments": {"--datalake-formats": "iceberg",
                                  "--extra-py-files": f"s3://{data_bucket}/{GLUE_PREFIX}/transform.py",
                                  "--TempDir": f"s3://{data_bucket}/{GLUE_PREFIX}/tmp/",
-                                 "--enable-glue-datacatalog": "true", **extra}}
+                                 "--enable-glue-datacatalog": "true", **extra, **static}}
 
 
-def ensure_jobs(glue, s3, role_arn, data_bucket) -> dict:
-    """Upload the scripts and transform.py, then create or update each job (idempotent)."""
+def ensure_jobs(glue, s3, role_arn, data_bucket, generator_role_arn=None, statics=None) -> dict:
+    """Upload the scripts and their modules, then create or update each job (idempotent). An update
+    rewrites DefaultArguments, so a newly published guardrail version reaches the next run."""
     out = {}
     s3.put_object(Bucket=data_bucket, Key=f"{GLUE_PREFIX}/transform.py", Body=TRANSFORM_SRC.read_bytes())
     s3.put_object(Bucket=data_bucket, Key=f"{GLUE_PREFIX}/org_entities.json", Body=ORG_ENTITIES_SRC.read_bytes())
     s3.put_object(Bucket=data_bucket, Key=f"{GLUE_PREFIX}/export.py", Body=EXPORT_SRC.read_bytes())
+    s3.put_object(Bucket=data_bucket, Key=f"{GLUE_PREFIX}/generate.py", Body=GENERATE_SRC.read_bytes())
     for name, script in JOBS.values():
         s3.put_object(Bucket=data_bucket, Key=f"{GLUE_PREFIX}/{script}", Body=(GLUE_SRC / script).read_bytes())
-        d = job_definition(name, script, role_arn, data_bucket)
+        role = generator_role_arn if script == "generate_landing.py" and generator_role_arn else role_arn
+        d = job_definition(name, script, role, data_bucket, (statics or {}).get(script))
         try:
             glue.get_job(JobName=name)
             glue.update_job(JobName=name, JobUpdate={k: v for k, v in d.items() if k != "Name"})
@@ -498,7 +574,11 @@ def deploy(session, region, account_id, data_bucket) -> dict:
     gid, garn, gver, out["guardrail"] = ensure_guardrail(session.client("bedrock", region_name=region))
     role_arn = ensure_role(session.client("iam"), region, account_id, data_bucket, keys, garn)
     out["role"] = role_arn.rsplit("/", 1)[-1]
-    out["jobs"] = ensure_jobs(glue, session.client("s3", region_name=region), role_arn, data_bucket)
+    gen_arn = ensure_generator_role(session.client("iam"), region, account_id, data_bucket)
+    out["generator_role"] = gen_arn.rsplit("/", 1)[-1]
+    statics = {script: static_arguments(script, account_id, data_bucket, gid, gver) for _, script in JOBS.values()}
+    out["jobs"] = ensure_jobs(glue, session.client("s3", region_name=region), role_arn, data_bucket,
+                              gen_arn, statics)
     values = {"raw_bucket_arn": arns[RAW], "curated_bucket_arn": arns[CURATED],
               "raw_kms_key_arn": keys[RAW], "curated_kms_key_arn": keys[CURATED],
               "workgroup": WORKGROUP, "glue_role_arn": role_arn,
@@ -549,6 +629,14 @@ def verify(session, region, account_id, data_bucket) -> dict:
     checks.update(simulate_glue_role(session.client("iam"), region, account_id, data_bucket, arns,
                                      _key_arns(session.client("kms", region_name=region)),
                                      g["arn"] if g else None))
+    checks.update(simulate_generator_role(session.client("iam"), region, account_id, data_bucket, arns,
+                                          _key_arns(session.client("kms", region_name=region))))
+    jobs = {n: session.client("glue", region_name=region).get_job(JobName=n)["Job"] for n, _ in JOBS.values()}
+    gen_job = jobs[JOBS["generate"][0]]
+    checks["generator job runs as the generator role"] = gen_job["Role"].endswith(f"/{GENERATOR_ROLE}")
+    checks["every job carries its static arguments"] = all(
+        static_arguments(script, account_id, data_bucket).keys() <= jobs[name]["DefaultArguments"].keys()
+        for name, script in JOBS.values()) or {n: sorted(j["DefaultArguments"]) for n, j in jobs.items()}
     snap = s3t.get_table_maintenance_configuration(tableBucketARN=arns[RAW], namespace="bronze",
                                                    name="conversation_events")["configuration"]
     sm = snap.get("icebergSnapshotManagement", {}).get("settings", {}).get("icebergSnapshotManagement", {})
@@ -585,6 +673,34 @@ def glue_role_cases(region, account_id, data_bucket, arns, keys, guardrail_arn=N
     ] + ([("bedrock:ApplyGuardrail", guardrail_arn, True),
           ("bedrock:ApplyGuardrail", f"arn:aws:bedrock:{region}:{account_id}:guardrail/someone-elses", False)]
          if guardrail_arn else [])
+
+
+def generator_role_cases(region, account_id, data_bucket, arns, keys) -> list[tuple[str, str, bool]]:
+    """The generator may write landing and must not touch anything downstream of it."""
+    bronze = f"{arns[RAW]}/table/{'0' * 8}-0000-0000-0000-{'0' * 12}"
+    return [
+        ("s3:PutObject", f"arn:aws:s3:::{data_bucket}/{LANDING_PREFIX}/d/bronze_feedback.jsonl", True),
+        ("s3:GetObject", f"arn:aws:s3:::{data_bucket}/{GLUE_PREFIX}/generate.py", True),
+        ("s3:PutObject", f"arn:aws:s3:::{data_bucket}/{REPORT_PREFIX}/d/silver.json", False),
+        ("s3:PutObject", f"arn:aws:s3:::{data_bucket}/{EXTRACTS_PREFIX}/d/1/train.jsonl", False),
+        ("s3:PutObject", f"arn:aws:s3:::{data_bucket}/{GLUE_PREFIX}/land_bronze.py", False),
+        ("s3:GetObject", f"arn:aws:s3:::{data_bucket}/customer-data/x", False),
+        ("s3:DeleteObject", f"arn:aws:s3:::{data_bucket}/{LANDING_PREFIX}/d/bronze_feedback.jsonl", False),
+        ("s3tables:PutTableData", bronze, False),
+        ("kms:Decrypt", keys[RAW], False),
+    ]
+
+
+def simulate_generator_role(iam, region, account_id, data_bucket, arns, keys) -> dict:
+    role = f"arn:aws:iam::{account_id}:role/{GENERATOR_ROLE}"
+    out = {}
+    for action, resource, want in generator_role_cases(region, account_id, data_bucket, arns, keys):
+        got = iam.simulate_principal_policy(PolicySourceArn=role, ActionNames=[action], ResourceArns=[resource]
+                                            )["EvaluationResults"][0]["EvalDecision"] == "allowed"
+        label = (resource.split(":::", 1)[1].split("/", 1)[-1] if resource.startswith("arn:aws:s3:::")
+                 else resource.split(":")[-1])[:60]
+        out[f"generator role may{'' if want else ' NOT'} {action} on {label}"] = got == want or f"got {got}"
+    return out
 
 
 def simulate_glue_role(iam, region, account_id, data_bucket, arns, keys, guardrail_arn=None) -> dict:
@@ -642,12 +758,13 @@ def teardown(session, region, account_id) -> dict:
         bedrock.delete_guardrail(guardrailIdentifier=g["id"])
     out["guardrail"] = "deleted" if g else "absent"
     iam = session.client("iam")
-    try:
-        iam.delete_role_policy(RoleName=GLUE_ROLE, PolicyName="lakehouse")
-        iam.delete_role(RoleName=GLUE_ROLE)
-        out["role"] = "deleted"
-    except iam.exceptions.NoSuchEntityException:
-        out["role"] = "absent"
+    for key, role, policy in (("role", GLUE_ROLE, "lakehouse"), ("generator_role", GENERATOR_ROLE, "lakehouse-generator")):
+        try:
+            iam.delete_role_policy(RoleName=role, PolicyName=policy)
+            iam.delete_role(RoleName=role)
+            out[key] = "deleted"
+        except iam.exceptions.NoSuchEntityException:
+            out[key] = "absent"
     athena = session.client("athena", region_name=region)
     try:
         athena.delete_work_group(WorkGroup=WORKGROUP, RecursiveDeleteOption=True)
@@ -714,46 +831,39 @@ def _run_job(glue, name, arguments, timeout_s=1800, sleep=time.sleep) -> tuple[s
 
 
 def smoke(session, region, account_id, data_bucket, seed=7, scale="small") -> dict:
-    """Generate → land → Bronze→Silver → Silver→Gold through the deployed jobs, then hold the
-    Silver rule report to the generator's plants exactly. The deploy's live proof that the jobs,
-    the role's grants and the rules agree; the pipeline step that runs this is PR-09."""
+    """Generate → land → Bronze→Silver → Silver→Gold → export through the deployed jobs, then hold
+    the Silver rule report to the generator's plants exactly. Every job gets only its per-run
+    arguments (`run_arguments`, the layout the state machine mirrors); everything else must come
+    from the job's DefaultArguments, so a smoke that passes proves those are deployed. The
+    pipeline mode that runs the same chain is `lakehouse_ingest` (PR-09)."""
     import tempfile
-    gen = _load_module("lh_generate", REPO / "pipeline" / "lakehouse" / "generate.py")
+    gen = _load_module("lh_generate", GENERATE_SRC)
     tf = _load_module("lh_transform", TRANSFORM_SRC)
-    ssm = session.client("ssm", region_name=region)
-    p = {k: ssm.get_parameter(Name=f"{SSM_PREFIX}/{k}")["Parameter"]["Value"] for k in SSM_KEYS}
     s3, glue = session.client("s3", region_name=region), session.client("glue", region_name=region)
     stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
     dataset = f"seed{seed}-{scale}-{stamp}"
     ds = gen.generate(seed, scale)
     with tempfile.TemporaryDirectory() as tmp:
-        manifest = gen.write(ds, __import__("pathlib").Path(tmp))
-        for f in sorted(__import__("pathlib").Path(tmp).iterdir()):
-            s3.put_object(Bucket=data_bucket, Key=f"{LANDING_PREFIX}/{dataset}/{f.name}", Body=f.read_bytes())
-    landing = f"s3://{data_bucket}/{LANDING_PREFIX}/{dataset}/"
+        local = gen.write(ds, __import__("pathlib").Path(tmp))  # the 3.12 digest the job must match
+    checks = {"dataset": dataset, "dataset_sha256": local["dataset_sha256"]}
     reports = f"s3://{data_bucket}/{REPORT_PREFIX}/{dataset}/"
-    checks = {"dataset": dataset, "dataset_sha256": manifest["dataset_sha256"]}
-    common = {"--account_id": account_id}
-    steps = [("land", {"--raw_bucket": RAW, "--landing_uri": landing, "--report_uri": reports + "land.json"}),
-             ("silver", {"--raw_bucket": RAW, "--curated_bucket": CURATED,
-                         "--eval_prompts_uri": landing + "eval_prompts.jsonl",
-                         "--report_uri": reports + "silver.json", "--guardrail_id": p["guardrail_id"],
-                         "--guardrail_version": p["guardrail_version"], "--dq_run_id": dataset,
-                         "--org_entities_uri": f"s3://{data_bucket}/{GLUE_PREFIX}/org_entities.json",
-                         "--expected_defects_uri": landing + "expected_defects.json"}),
-             ("gold", {"--curated_bucket": CURATED, "--report_uri": reports + "gold.json"})]
-    for key, extra in steps:
-        state, err = _run_job(glue, JOBS[key][0], {**common, **extra})
+    state, err = _run_job(glue, JOBS["generate"][0], run_arguments("generate", data_bucket, dataset,
+                                                                   seed=seed, scale=scale))
+    checks[f"job {JOBS['generate'][0]}"] = True if state == "SUCCEEDED" else f"{state}: {err}"
+    if state != "SUCCEEDED":
+        return checks
+    landed = json.loads(s3.get_object(Bucket=data_bucket, Key=f"{LANDING_PREFIX}/{dataset}/manifest.json")["Body"].read())
+    checks["generator job digest = local digest (Python 3.9 vs 3.12)"] = (
+        landed["dataset_sha256"] == local["dataset_sha256"] or landed["dataset_sha256"][:16])
+    for key in ("land", "silver", "gold"):
+        state, err = _run_job(glue, JOBS[key][0], run_arguments(key, data_bucket, dataset))
         checks[f"job {JOBS[key][0]}"] = True if state == "SUCCEEDED" else f"{state}: {err}"
         if state != "SUCCEEDED":
             return checks
     exports = []
     for attempt in (1, 2):  # twice: the second must reproduce the first byte for byte
-        state, err = _run_job(glue, JOBS["export"][0], {
-            "--data_bucket": data_bucket, "--curated_bucket": CURATED, "--workgroup": WORKGROUP,
-            "--dataset": dataset, "--gold_report_uri": reports + "gold.json",
-            "--pii_report_uri": reports + "silver.json", "--report_uri": reports + f"export-{attempt}.json",
-            "--run_id": f"smoke-{dataset}"})
+        state, err = _run_job(glue, JOBS["export"][0], run_arguments(
+            "export", data_bucket, dataset, run_id=f"smoke-{dataset}", export_report=f"export-{attempt}.json"))
         checks[f"job {JOBS['export'][0]} (run {attempt})"] = True if state == "SUCCEEDED" else f"{state}: {err}"
         if state != "SUCCEEDED":
             return checks

@@ -911,7 +911,8 @@ def _readable_prefixes():
     return (_prefixes("S3PipelineObjects")
             | _prefixes("S3CustomerDataReadOnly")
             | _prefixes("S3SkillsReadOnly")
-            | _prefixes("S3CanonicalCodeReadOnly"))
+            | _prefixes("S3CanonicalCodeReadOnly")
+            | _prefixes("S3LakehouseReadOnly"))
 
 
 def test_every_s3_prefix_the_auditor_writes_is_one_its_role_can_write():
@@ -950,11 +951,15 @@ def test_every_s3_prefix_any_agent_prompt_uses_is_one_the_role_can_reach():
     known = granted | {"customer-data", "models-mirror"}
     for harness in sorted((REPO / "agents").glob("*/harness.json")):
         text = harness.read_text()
-        used = {u.split("/")[3] for u in re.findall(r"s3://<bucket>/\S+", text)}
-        used |= {m for m in known if f"{m}/" in text}
-        for prefix in used:
-            assert prefix in granted, \
-                f"{harness.parent.name} prompt uses {prefix}/ but the role cannot reach it"
+        # Whole key paths, matched against each granted prefix: the lakehouse grant is two
+        # levels deep (lakehouse/reports/, lakehouse/extracts/) on purpose, and comparing only
+        # a URI's first segment would have demanded all of lakehouse/ -- the Glue jobs'
+        # scripts and landing included -- to pass.
+        used = {u.split("/", 3)[3] for u in re.findall(r"s3://<bucket>/\S+", text)}
+        used |= {f"{m}/" for m in known if f"{m}/" in text}
+        for path in used:
+            assert any(path == g or path.startswith(g + "/") for g in granted), \
+                f"{harness.parent.name} prompt uses {path} but the role cannot reach it"
 
 
 def test_the_list_prefixes_match_the_object_prefixes():

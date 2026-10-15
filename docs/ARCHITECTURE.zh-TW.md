@@ -61,7 +61,7 @@ DataPrepGenerate → DataPrepCurate → FinetuneLaunch → FinetuneAnalyze → E
              Deploy → SmokeTest → MonitorHealth → Teardown → MonitorReport
 ```
 
-**四種入口模式，由 `StartAt` 的一個 `Choice` 讀執行輸入裡的 `pipeline_mode` 決定**（它讀不到
+**七種入口模式，由 `StartAt` 的一個 `Choice` 讀執行輸入裡的 `pipeline_mode` 決定**（它讀不到
 S3 上的 manifest，這正是模式必須搭在輸入裡的原因）。`full` 就是上面那條 `Default`。
 `data_audit` 是指揮家最便宜的開胃菜：稽核客戶資料，然後在任何 GPU 出現之前停下。
 **`eval_only`** 從 `EvalGenerate` 進場，重新評判一個先前 run 已經產出、也已經付過錢的 artifact，
@@ -122,6 +122,35 @@ approval status 註冊模型，而 `model_package_approval_status` 在
 這個模式**不是**繞過門檻的方法。`gate_passed` 從未為真是另一個獨立、未解的問題 ——
 是 r6c/r6d 量到的 transfer floor，不是管線問題 —— 而這裡沒有任何一處為了讓排練通道
 能跑而軟化門檻。
+
+**`vision`** 與 `full` 走到同一個狀態 `DataPrepGenerate`，這條 Choice 規則只是讓模式顯式化。
+各 agent 的 VISION MODE 條款把同一組 stage 變成物件偵測模型的微調。除非 plan 指名
+`source_uri`（已標註的偵測資料集；沒有 teacher 可以合成），派發時就會拒絕。plan 還必須指名
+`customer_eval_uri`（mAP 門檻所錨定的保留集）、student，以及它自己的 `gates` 和 `dataset`，
+因為沿用 ARC 的預設值，就會拿語言基準去評判一個偵測模型。
+
+**`lakehouse_ingest` 與 `lakehouse`**（Phase 1 PR-09）把 lakehouse 接上 pipeline。
+`lakehouse_ingest` 跑 `LakehouseGenerate → LakehouseLand → LakehouseSilver → LakehouseGold`
+後停下。它需要 generator 的 seed 與 scale，用 run 本身為資料集命名，不經過任何 harness，也不用 GPU。
+`lakehouse` 用一個 ingest 已經建好的資料集訓練，資料集由 `params.lakehouse_dataset` 指名。它先跑
+`LakehouseExport`（釘在該資料集 snapshot 上、以 sha256 命名的 Gold extract），再跑
+`LakehouseReview`，然後走一般的 `FinetuneLaunch → … → QualityGateChoice`。五個 Glue 狀態都是
+`glue:startJobRun.sync`，由 Step Functions 自己執行，不由 agent 啟動：
+- 這些 job 的工作完全由 job 與參數決定，agent 的一次 turn 不會做出任何判斷。
+- 由 agent 啟動，就得把 `glue:StartJobRun` 加到七個 harness 共用的 role 上。
+- 也還得為 job 完成另做一條 wake chain。
+
+每個 job 的單次參數由 state machine 用 `States.Format` 組出來，來源是 start-pipeline 放進執行輸入
+和 manifest 的 `lakehouse` 物件。每次執行都相同的參數，則是 job 的 `DefaultArguments`。
+
+job 失敗一律 escalate，絕不進入 remediation。DQ 規則失敗也一樣：Silver 與 Gold 的 job 會在寫完報告後
+讓自己失敗，而 DQ 失敗是資料本身的事實，重跑改變不了它。唯一的 agent turn 是 data-prep 的
+`lakehouse_review`：它讀 export、Gold、Silver 的報告，任何一項失敗都 escalate，並宣告 train extract。
+這個宣告進 manifest 之前，driver 會先從 S3 重新計算那個 extract 的 hash。之後 finetune 原封不動地
+用 extract 的檔案訓練，不重新切分。
+
+以下情況在派發時就會被拒絕：缺少必要參數；dataset id、seed 或 scale 不合法；沒有明確指定 student
+模型與 gates。沿用預設的 ARC gate 不適用於客服語料。
 
 兩個 monitor 狀態的位置是由工作本身的形狀決定的，不是喜好問題。**`MonitorHealth`** 必須在
 端點還存在時讀 CloudWatch，而 `Teardown` 在每條路徑上都會刪掉它（包含 `SmokeTest` 的
@@ -509,7 +538,8 @@ write-first 規則（artifact 先落 S3，宣稱它的呼叫在後）—— 有�
 靠人工翻日誌數出來的原因。driver 現在為每個 stage epoch 在 `llmops-stage-events` 寫一列
 （`sk = protocol#<stage>#<task>#e<epoch>`，零新 IAM、零新資源），帶 `turns`、
 `serviced_turns`、`prose_turns`、`filtered_turns_total`、`recovered_typed_calls`、
-`recovered_ending_in_prose`、`infra_error_turns_total`、`deadline_cuts`。它寫在 stop_reason
+`recovered_ending_in_prose`、`recovered_shadowed_calls`（被救回的呼叫不是該回合最後一個 block）、
+`infra_error_turns_total`、`deadline_cuts`。它寫在 stop_reason
 覆寫與 typed-call 救援**之後**，而不是之前 —— 那個順序正是 `[driver] turn` 那行日誌的缺陷：
 它印得太早，所以實際上被服務的回合會顯示 `tool=None`。寫**絕對值**而非 `ADD`，並帶
 `ConditionExpression="attribute_not_exists(turns) OR turns <= :turns"`，讓遲到的重播無法把

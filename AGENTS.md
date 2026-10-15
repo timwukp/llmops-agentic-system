@@ -282,6 +282,20 @@ versions and introspects the live CreateHarness/UpdateHarness schemas.
   nothing (measured 2026-10-15). `llmops-lakehouse` therefore sets none, and the data bucket's default
   encryption covers results and extracts. `10_lakehouse.py --verify` checks both halves, and
   `ensure_workgroup` removes an override it finds rather than reporting the workgroup `exists`.
+- **The harness can answer an inline function `Unknown tool` itself, and the call is then not the
+  turn's last block.** In the monitor runtime log, a `stage_complete` call often gets
+  `tool not found in registry` with `available_tools=<['shell', 'skills']>`, and the model receives
+  an error toolResult. What the agent does next decides whether the driver hears the call. If it
+  ends the turn, the call is the last block and the end_turn override services it: 33 of the 56
+  serviced sweep turns on record, and every sweep since 2026-09-22. If it runs shell first
+  (uploading a `stage_complete.json`, echoing `STAGE_COMPLETE`), or types the call, the driver sees
+  only `tool=shell`. Sweeps 2026-08-18, -08-31, -10-06 and -10-07 died that way with their reports
+  in S3, and their `PipelineFailed` matched no rule. So read every serviced block in the stream, not
+  the last one (`serviced_tool_use` in `_drain`). Never gate typed-call recovery on "no block at
+  all". Answer such a call as text, since its id has already been answered. Why the registry omits
+  the inline functions is not established. The pipeline stages on record have
+  `recovered_ending_in_prose = 0`, while both scheduled jobs depend on it (the sweep, and
+  `finops/reconcile` at 16 of 93). `deploy/evidence/VERIFICATION_sweep_unheard_calls.md`.
 - **Observability**: `OTEL_TRACES_SAMPLER=always_on` env var is mandatory or
   evaluations/insights sit at zero forever. X-Ray delivery takes no `outputFormat`.
 - **Turn budget**: harness `timeoutSeconds` is 840 here (driver Lambda caps at 900s).

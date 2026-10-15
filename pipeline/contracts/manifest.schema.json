@@ -116,6 +116,17 @@
         "additionalProperties": true
       }
     },
+    "lakehouse": {
+      "type": ["object", "null"],
+      "description": "The lakehouse dataset this run builds (lakehouse_ingest: named after the run, with the generator's seed and scale) or trains on (lakehouse: params.lakehouse_dataset); null in every other mode (start_pipeline.lakehouse_input). Written at seeding because the Glue states write nothing to the manifest, and it is the same object the state machine formats the jobs' arguments from.",
+      "required": ["dataset", "data_bucket"],
+      "properties": {
+        "dataset": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,79}$"},
+        "data_bucket": {"type": "string"},
+        "seed": {"type": "string", "pattern": "^[0-9]+$"},
+        "scale": {"type": "string"}
+      }
+    },
     "models": {
       "type": "object",
       "description": "The resolved record of model CONSENT: role -> model id, signed plan > trigger params > DEFAULT_MODELS (start_pipeline._resolve_models). Immutable after seeding. Where an open-weight model came from (hf_repo, revision, ...) is plan content, not a role, and is not copied here.",

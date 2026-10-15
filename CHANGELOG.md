@@ -17,6 +17,83 @@ S1 3/3 and S2 3/3; the live prompt passed 0/2 each: it offered a cross-account g
 exist, and it said the console had "checked" a URI it never examined. Deployed as `llmops_orchestrator`
 version 20 and re-checked live (`deploy/evidence/VERIFICATION_orchestrator_intake_scope.md`).
 
+### Phase 1 PR-09: the pipeline runs the lakehouse
+
+Two new pipeline modes, both routed only from `PipelineModeChoice`:
+- **`lakehouse_ingest`** generates a dataset and builds Bronze → Silver → Gold, then stops. It
+  reaches no harness and no GPU.
+- **`lakehouse`** trains on a dataset an ingest built, named by `params.lakehouse_dataset`. It
+  exports the dataset's Gold snapshots, has data-prep review the export (`lakehouse_review`), then
+  runs the ordinary finetune → eval → gate path.
+
+**How it runs.** At the owner's choice, the five Glue states are `glue:startJobRun.sync`, run by
+Step Functions itself. The state machine builds each job's per-run arguments with `States.Format`,
+from a `lakehouse` object start-pipeline writes to both the execution input and the manifest.
+Run-invariant arguments became each job's `DefaultArguments`, and `run_arguments()` in
+`10_lakehouse.py` is the one place the layout is spelled out; a test renders the ASL against it.
+
+**Failure handling.** A failed job, including a failed DQ rule, escalates and never reaches
+remediation. Only `Glue.ConcurrentRunsExceededException` is retried.
+
+**The generator.** It now runs as a Glue Python-shell job (`llmops-lakehouse-generate`). Its digest is
+identical on Python 3.9 and 3.12. It runs as a role of its own that may write landing and nothing
+else, so the transforms still cannot write their own input.
+
+**The review.** `lakehouse_review` writes `stats.json` with `source: "lakehouse"` and claims the
+train extract, which the driver re-hashes. Finetune uses the extract's files verbatim as its
+channels; eval falls back to the extract's `val_uri`.
+
+**Dispatch** refuses missing params, an invalid dataset id, seed or scale, an unnamed student, and
+inherited gates.
+
+**Grants**, each simulated as its role:
+- SFN: may run `job/llmops-lakehouse-*`.
+- Harness: Get-only on `lakehouse/reports/*` and `lakehouse/extracts/*`.
+- SageMaker: Get on extracts.
+
+**Live:**
+- `lakehouse_ingest` run SUCCEEDED in 9 min: 8/8 plants, 16/16 DQ.
+- A `lakehouse` run's review was re-verified by the driver (`verified: true`, 251 rows). Its finetune
+  channels are the two extract files.
+- Smoke 24/24; `--verify` 59/59.
+
+**Also fixed:**
+- The prompt-prefix guard compared only a URI's first segment.
+- ARCHITECTURE said "Four entry modes" for six, and never documented `vision`. Both languages now
+  name all seven, guarded.
+- Two negative controls were uncaught: m189, which this PR's eval clause had disarmed, and the
+  COST.md budget control, already uncaught on `main` while the documented count said 389/389.
+  Both guards were tightened, and all 392 controls now catch their break.
+### Monitor sweep: a stage_complete the agent made is heard, and a failed sweep is seen
+
+Four scheduled sweeps never completed: 2026-08-18, 08-31, 10-06 and 10-07. Each one wrote its report
+and ended `UnclaimedStageOutputs` with 0 serviced turns. The agent called `stage_complete` every
+time; the driver missed it.
+- 10-06 and 10-07: the harness answered the real call `Unknown tool` (its registry held only shell
+  and skills). The agent then ran shell, and `_drain` kept only that last block. Typed-call recovery
+  ran only when no block at all arrived, so the shell block also hid the `stage_complete({...})` the
+  agent typed next.
+- 08-18 and 08-31: the agent typed `<inline-function name="stage_complete">{…}</inline-function>`,
+  a spelling the parser did not know.
+
+The driver now services the last serviced call in a turn even when a harness tool followed it. Such
+a call is answered as text, because the harness already answered its id, and counted as
+`recovered_shadowed_calls`. Typed recovery runs whenever no serviced call arrived. The tag spelling
+is recovered under the same one-JSON-object bar as the Python spelling.
+
+The failures were also silent. `PipelineFailed` has no rule on the bus, and the `sweep#sweep` row
+kept reading `invoked`. The sweep payload now names that row (`outcome_sk`). The driver settles the
+row with the real outcome and publishes to `llmops-escalations` unless the sweep completed or
+escalated. No IAM change. The monitor prompt now says a file, an echo or typed text is not the call,
+and that after an `Unknown tool` error the agent should end the turn.
+
+14 tests replay the live shapes; 9 fail on the unfixed driver. Deployed 2026-10-15 (driver,
+monitor-sweep, `llmops_monitor` v15), and one sweep through `llmops-monitor-sweep` completed in one
+turn with its outcome row settled `completed`. The harness still answered the call `Unknown tool`; the
+agent followed the new prompt clause and ended the turn, so the shadowed-call and typed-call paths were
+not exercised live and stay proven offline only. That morning's pre-deploy scheduled sweep was a fifth
+failure: `stage_complete` 8×, `checkpoint` and `escalate_human` once each, all `Unknown tool`. Evidence: `deploy/evidence/VERIFICATION_sweep_unheard_calls.md`.
+
 ### Phase 1 PR-08: Gold export, reproducible and re-verified by the driver
 
 Training will read a **file** pinned to one Gold snapshot, never the Iceberg table. The new Glue

@@ -3,12 +3,13 @@
 - **Spec:** ./spec.md
 - **Author:** Claude (AI agent)
 - **Accepted-by:** Tim WU
-- **Accepted-for:** 321d4728d53cf155e0327e9d74e521c18ed24bdb
+- **Accepted-for:** 1cc72e2b8ffe7002b4083111ab2a93df767dc818
 - **Status:** accepted
 
-`Accepted-for` is the merge base with `main` (PR #166's merge). It was first written against #164's, then
-re-bound when #165 (Gold export) and then #166 (memory-orphan sweep evidence) landed and `main` was
-merged in. Neither touches this change's source files.
+`Accepted-for` is the merge base with `main` (PR #170's merge). It was first written against #164's, then
+re-bound each time `main` was merged in: #165 (Gold export), #166, and #167-#170 (the monitor sweep fix
+and lakehouse PR-09). None touches this change's source files. #168 changed data-prep's prompt; its
+`source_uri` rule, which step 0 restates, is unchanged.
 
 ## Files changed
 

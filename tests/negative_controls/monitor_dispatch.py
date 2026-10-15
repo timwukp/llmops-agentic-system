@@ -3389,10 +3389,10 @@ case("prompt: the gate goes back to scoring the val split whatever the plan name
 #      between runs cannot be compared across runs, and nothing in the report would say so.
 def m189(t):
     old = ('Fall back to the 10% val split from distillation/curated.jsonl only when no '
-           'customer set was named, and say in the report which set was used')
+           'customer set was named')
     assert t.count(old) == 1, f"the fallback ranking has moved; found {t.count(old)}"
     return t.replace(old, 'The 10% val split from distillation/curated.jsonl is also '
-                          'available, and say in the report which set was used', 1)
+                          'available', 1)
 
 
 case("prompt: the val split stops being labelled the fallback and becomes an equal option",
@@ -3676,7 +3676,10 @@ case("contracts: a JSON-quoted single URI keeps its quote and is never verified"
 #      (442 billable seconds) with no parked token, so nothing would ever have settled it.
 #      Measured: `tool=job_launched` appears ZERO times in 25 days of driver logs.
 def m203(t):
-    old = re.search(r'\n        if not tu:\n            typed = parse_typed_call'
+    # The gate's condition is matched up to its colon rather than spelled out: it widened
+    # from `if not tu` to "no SERVICED call in hand" (sweep-unheard-calls), and a literal
+    # anchor expired the moment it was correctly updated.
+    old = re.search(r'\n        if not tu\b[^:]*?:\n            typed = parse_typed_call'
                     r'\(out\["text"\]\).*?\n                out = \{\*\*out, '
                     r'"stop_reason": "tool_use"\}\n', t, re.S)
     assert old, "the typed-call dispatch hook no longer matches; re-anchor this mutation"
@@ -3743,9 +3746,9 @@ case("driver: a recovered call is echoed back with a null toolUseId the runtime 
 #      talked about instead of what it did, which is the whole failure mode the `serviced`
 #      gate in 204 exists to bound, arriving by a different door.
 def m207(t):
-    old = "        if not tu:\n            typed = parse_typed_call"
-    assert t.count(old) == 1, f"the typed-call precondition has moved; found {t.count(old)}"
-    return t.replace(old, "        if True:\n            typed = parse_typed_call", 1)
+    found = re.findall(r'\n        if not tu\b[^:]*?:\n            typed = parse_typed_call', t)
+    assert len(found) == 1, f"the typed-call precondition has moved; found {len(found)}"
+    return t.replace(found[0], "\n        if True:\n            typed = parse_typed_call", 1)
 
 
 case("driver: a typed call in the same turn's text displaces the real tool call",
@@ -6004,6 +6007,119 @@ case("vision: the gate's instrument becomes self-authored",
      _EVAL_HARNESS, m345,
      [f"{_TO}TestVisionPromptClauses::"
       "test_the_eval_scorer_is_canonical_and_self_authoring_is_forbidden"])
+
+
+# ── sweep-unheard-calls: the stage_complete four sweeps made and nobody heard ─────────
+#
+# Sweeps 2026-08-18, -08-31, -10-06 and -10-07 each called stage_complete and settled
+# UnclaimedStageOutputs. Each control below restores one of the four ways that happened.
+
+# 346. The shadowed-call recovery is deleted: a stage_complete the harness answered
+#      `Unknown tool`, followed by shell, is counted as prose again (10-06 / 10-07).
+def m346(t):
+    old = re.search(r'\n        shadowed = out\.get\("serviced_tool_use"\)\n.*?'
+                    r'"recovered": "shadowed"\}\n', t, re.S)
+    assert old, "the shadowed-call recovery no longer matches; re-anchor this mutation"
+    return t.replace(old.group(0), "\n", 1)
+
+
+case("driver: a stage_complete followed by shell in the same turn is prose again",
+     _DRIVER, m346,
+     [f"{_TO}test_a_stage_complete_followed_by_shell_in_the_same_turn_is_serviced",
+      f"{_TO}test_a_shadowed_call_is_answered_as_text_because_the_harness_already_answered_it"])
+
+# 347. The typed-call gate narrows back to `if not tu`, so a shell block switches the parser
+#      off and 10-06's typed `stage_complete({...})` is never read.
+def m347(t):
+    found = re.findall(r'\n        if not tu\b[^:]*?:\n            typed = parse_typed_call', t)
+    assert len(found) == 1, f"the typed-call gate has moved; found {len(found)}"
+    return t.replace(found[0], "\n        if not tu:\n            typed = parse_typed_call", 1)
+
+
+case("driver: a shell block in the turn hides a typed call from the parser",
+     _DRIVER, m347,
+     [f"{_TO}test_a_call_typed_after_a_shell_block_is_recovered"])
+
+# 348. The shadowed call keeps its toolUseId, so it is echoed back as a toolUse/toolResult
+#      pair for an id the harness already answered.
+def m348(t):
+    old = 'tu = {**shadowed, "toolUseId": None, "recovered": "shadowed"}'
+    assert t.count(old) == 1, f"the shadowed-call id drop has moved; found {t.count(old)}"
+    return t.replace(old, 'tu = {**shadowed}', 1)
+
+
+case("driver: a shadowed call is echoed back under an id the harness already answered",
+     _DRIVER, m348,
+     [f"{_TO}test_a_shadowed_call_is_answered_as_text_because_the_harness_already_answered_it"])
+
+# 349. The <inline-function> spelling loses its closing-tag check, so a tag around an object
+#      followed by more prose is recovered as a call (08-18 / 08-31's spelling, loosened).
+def m349(t):
+    old = "if body is None or not _TAGCALL_CLOSE_RE.match(text, match.start(2) + len(body)):"
+    assert t.count(old) == 1, f"the tag close check has moved; found {t.count(old)}"
+    return t.replace(old, "if body is None:", 1)
+
+
+case("driver: an <inline-function> tag wrapping an object plus prose is recovered",
+     _DRIVER, m349,
+     [f"{_TO}test_the_tag_spelling_is_held_to_one_json_object_and_a_serviced_name"])
+
+# 350. The scheduled-outcome settle is never called, so a failed sweep's row reads `invoked`
+#      forever and nobody is paged -- the silence all four failures had.
+def m350(t):
+    old = "        _settle_scheduled_outcome(c, event, result)\n"
+    assert t.count(old) == 1, f"the outcome settle call has moved; found {t.count(old)}"
+    return t.replace(old, "", 1)
+
+
+case("driver: a scheduled sweep that fails leaves its row at `invoked` and pages no one",
+     _DRIVER, m350,
+     [f"{_TO}test_a_sweep_that_does_not_complete_settles_its_row_and_pages_once",
+      f"{_TO}test_a_completed_sweep_settles_its_row_without_paging"])
+# ── PR-09: the lakehouse modes ─────────────────────────────────────────────────────
+_LM = "tests/test_lakehouse_mode.py::"
+
+
+def m351(t):
+    # The state machine's Silver report path drifts from the layout the smoke proved: the
+    # job writes silver.json where the export (and the review) will never look for it.
+    old = "s3://{}/lakehouse/reports/{}/silver.json', $.lakehouse.data_bucket, $.lakehouse.dataset)\",\n"
+    assert t.count(old) >= 1, "the Silver report argument moved"
+    return t.replace(old, old.replace("silver.json", "silver-report.json"), 1)
+
+
+case("lakehouse: an ASL job argument drifts from the smoke-proven layout",
+     "orchestration/state_machine.asl.json", m351,
+     [f"{_LM}test_every_glue_state_passes_exactly_the_layout_the_deploy_smoke_uses"])
+
+
+def m352(t):
+    # Agents gain write on the extracts: a model's training bytes become replaceable after
+    # the driver hashed them, and every attestation reads true about a file that changed.
+    old = """        "Sid": "S3LakehouseReadOnly","""
+    assert t.count(old) == 1, "the lakehouse read-only statement moved"
+    head, _, tail = t.partition(old)
+    act = '"s3:GetObject"\n        ]'
+    assert act in tail, "its action list moved"
+    return head + old + tail.replace(act, '"s3:GetObject",\n          "s3:PutObject"\n        ]', 1)
+
+
+case("lakehouse: agents may write the Gold extracts",
+     "deploy/iam/harness_execution_role.json", m352,
+     [f"{_LM}test_agents_read_reports_and_extracts_and_can_neither_write_them_nor_run_a_job"])
+
+
+def m353(t):
+    # Dispatch stops checking the values: a dataset id like ../customer-data reaches a Glue
+    # job's S3 arguments, and a bad seed fails a GPU-less job one stage later instead of here.
+    old = "    _check_lakehouse_values(merged)\n"
+    assert t.count(old) == 1, "the lakehouse value check moved"
+    return t.replace(old, "", 1)
+
+
+case("lakehouse: dispatch stops refusing bad lakehouse values",
+     "orchestration/start_pipeline/handler.py", m353,
+     [f"{_LM}test_dispatch_refuses_what_a_glue_job_would_fail_on_a_stage_later"])
 
 
 #: Where the pristine text of the file currently mutated is parked, so a kill -9 -- which
