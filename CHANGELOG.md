@@ -5,6 +5,18 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
 ## [Unreleased]
 
+### Console role: S3 reads scoped to what the console reads
+
+`LlmopsAdminLambdaRole` had `s3:GetObject` + `s3:ListBucket` on `"*"`, which is every bucket in the
+account. It now reads `runs/*`, `tasks/*`, `customer-data/*` and the rate-card key, and lists `runs/`,
+`customer-data/` and `models-mirror/`, all in the data bucket. `tests/test_console_s3_scope.py` derives
+those patterns from `lambda_function.py`'s AST and fails when the policy and the code disagree in either
+direction. Keys computed from data go through `_scoped_key(uri, <prefixes>)`. An intake URI outside
+those prefixes is `unverified` with the reason; it used to come back `verified` for objects the pipeline
+cannot read. Accept refuses a plan_uri outside `runs/` / `tasks/`; it used to read the data bucket plus
+the URI's key and ignore the URI's bucket. Live: 19/19 `simulate_principal_policy` cases
+(`deploy/evidence/VERIFICATION_console_s3_scope.md`). `deploy.sh` now stages under `$TMPDIR`.
+
 ### Spike S7, Unified Studio part: lineage and price PASS, visibility FAIL
 
 `LLMOPS_S7_PART=domain` adds one spike project to the account's shared V2 domain (`demo`, owner decision),
