@@ -100,11 +100,35 @@ def test_the_live_role_check_asks_both_directions():
     assert sum(1 for *_, w in cases if not w) >= 5, "the denials are the half that proves scoping"
 
 
-def test_the_workgroup_enforces_its_result_location_and_encryption():
+def test_the_workgroup_enforces_its_result_location_and_leaves_encryption_to_the_bucket():
+    """An explicit result encryption makes every Athena INSERT into a CMK table fail (PR-08), so
+    the workgroup sets none and the data bucket's default encrypts results and extracts."""
     cfg = lh.workgroup_config(DATA)
     assert cfg["EnforceWorkGroupConfiguration"] is True
-    assert cfg["ResultConfiguration"]["OutputLocation"] == f"s3://{DATA}/{lh.ATHENA_PREFIX}/"
-    assert cfg["ResultConfiguration"]["EncryptionConfiguration"]["EncryptionOption"] == "SSE_S3"
+    assert cfg["ResultConfiguration"] == {"OutputLocation": f"s3://{DATA}/{lh.ATHENA_PREFIX}/"}
+
+
+class _Athena:
+    class exceptions:
+        InvalidRequestException = type("InvalidRequestException", (Exception,), {})
+
+    def __init__(self, cfg):
+        self.cfg, self.updates = cfg, []
+
+    def get_work_group(self, WorkGroup):
+        return {"WorkGroup": {"Configuration": self.cfg}}
+
+    def update_work_group(self, WorkGroup, ConfigurationUpdates):
+        self.updates.append(ConfigurationUpdates)
+
+
+def test_an_existing_workgroup_with_the_override_is_reconciled_not_reported_as_fine():
+    a = _Athena({"ResultConfiguration": {"OutputLocation": "s3://d/x/",
+                                         "EncryptionConfiguration": {"EncryptionOption": "SSE_S3"}}})
+    assert lh.ensure_workgroup(a, DATA).startswith("updated")
+    assert a.updates == [{"ResultConfigurationUpdates": {"RemoveEncryptionConfiguration": True}}]
+    a = _Athena(lh.workgroup_config(DATA))
+    assert lh.ensure_workgroup(a, DATA) == "exists" and a.updates == []
 
 
 def test_raw_retention_is_short_and_curated_is_left_at_the_defaults():
@@ -213,9 +237,10 @@ class _Client:
     def _athena_get_work_group(self, **_):
         if not self.a.workgroup:
             raise _NotFound()
+        return {"WorkGroup": {"Configuration": self.a.workgroup}}
 
-    def _athena_create_work_group(self, **_):
-        self.a.workgroup = True
+    def _athena_create_work_group(self, Configuration, **_):
+        self.a.workgroup = Configuration
 
     def _athena_delete_work_group(self, **_):
         if not self.a.workgroup:
@@ -339,7 +364,7 @@ def test_the_offline_dry_run_makes_no_aws_call(capsys, monkeypatch):
 
 
 
-def test_deploy_creates_a_numbered_guardrail_version_and_the_three_jobs():
+def test_deploy_creates_a_numbered_guardrail_version_and_every_job():
     acct = FakeAccount()
     lh.deploy(acct, REGION, ACCOUNT, DATA)
     (g,) = acct.guardrails.values()
@@ -348,7 +373,8 @@ def test_deploy_creates_a_numbered_guardrail_version_and_the_three_jobs():
     for name, script in lh.JOBS.values():
         assert f"{lh.GLUE_PREFIX}/{script}" in acct.objects
         args = acct.jobs[name]["DefaultArguments"]
-        assert args["--extra-py-files"].endswith(f"{lh.GLUE_PREFIX}/transform.py")
+        shipped = "export.py" if script in lh.PYTHON_SHELL_JOBS else "transform.py"
+        assert args["--extra-py-files"].endswith(f"{lh.GLUE_PREFIX}/{shipped}"), (script, args)
     assert acct.objects[f"{lh.GLUE_PREFIX}/transform.py"] == lh.TRANSFORM_SRC.read_bytes()
     lh.deploy(acct, REGION, ACCOUNT, DATA)
     assert g["versions"] == ["1"], "a second deploy must reuse the published version"
@@ -369,7 +395,9 @@ def test_every_job_script_exists_and_imports_transform():
     for _, script in lh.JOBS.values():
         src = (lh.GLUE_SRC / script).read_text()
         assert "getResolvedOptions" in src
-        if script != "land_bronze.py":
+        if script in lh.PYTHON_SHELL_JOBS:
+            assert "import export" in src, script
+        elif script != "land_bronze.py":
             assert "import transform" in src, script
 
 
@@ -389,3 +417,40 @@ def test_every_job_report_carries_rows_and_snapshots_for_the_data_tab():
     smoke = __import__("inspect").getsource(lh.smoke)
     assert '"--report_uri": reports + "land.json"' in smoke
     assert '"--expected_defects_uri": landing + "expected_defects.json"' in smoke
+
+
+class _Glue:
+    class exceptions:
+        ConcurrentRunsExceededException = type("ConcurrentRunsExceededException", (Exception,), {})
+        EntityNotFoundException = type("EntityNotFoundException", (Exception,), {})
+
+    def __init__(self, refusals, error=None):
+        self.refusals, self.error, self.starts = refusals, error, 0
+
+    def start_job_run(self, JobName, Arguments):
+        self.starts += 1
+        if self.error:
+            raise self.error
+        if self.starts <= self.refusals:
+            raise self.exceptions.ConcurrentRunsExceededException()
+        return {"JobRunId": "jr_1"}
+
+    def get_job_run(self, JobName, RunId):
+        return {"JobRun": {"JobRunState": "SUCCEEDED"}}
+
+
+def test_a_back_to_back_run_waits_out_the_previous_runs_concurrency_slot():
+    g, slept = _Glue(refusals=2), []
+    assert lh._run_job(g, "j", {}, sleep=slept.append) == ("SUCCEEDED", "")
+    assert g.starts == 3 and slept == [15, 30]
+
+
+def test_only_the_concurrency_refusal_is_retried():
+    g = _Glue(refusals=0, error=_Glue.exceptions.EntityNotFoundException())
+    with pytest.raises(_Glue.exceptions.EntityNotFoundException):
+        lh._run_job(g, "j", {}, sleep=lambda s: None)
+    assert g.starts == 1
+    g = _Glue(refusals=99)
+    with pytest.raises(_Glue.exceptions.ConcurrentRunsExceededException):
+        lh._run_job(g, "j", {}, sleep=lambda s: None)
+    assert g.starts == 6

@@ -68,10 +68,17 @@ ATHENA_PREFIX = "athena/lakehouse"
 GUARDRAIL_NAME = "llmops-lakehouse-pii"
 JOBS = {"land": ("llmops-lakehouse-land-bronze", "land_bronze.py"),
         "silver": ("llmops-lakehouse-bronze-to-silver", "bronze_to_silver.py"),
-        "gold": ("llmops-lakehouse-silver-to-gold", "silver_to_gold.py")}
+        "gold": ("llmops-lakehouse-silver-to-gold", "silver_to_gold.py"),
+        "export": ("llmops-lakehouse-export", "export_gold.py")}
+#: PR-08: Gold extracts live under their own top-level prefix so one Macie job can cover them
+#: (Macie scopes by key prefix only).
+EXTRACTS_PREFIX = "lakehouse/extracts"
+#: The export only drives Athena and S3; a Python-shell job at 1/16 DPU, not a Spark cluster.
+PYTHON_SHELL_JOBS = {"export_gold.py"}
 REPO = __import__("pathlib").Path(__file__).resolve().parents[1]
 GLUE_SRC = REPO / "pipeline" / "lakehouse" / "glue"
 TRANSFORM_SRC = REPO / "pipeline" / "lakehouse" / "transform.py"
+EXPORT_SRC = REPO / "pipeline" / "lakehouse" / "export.py"
 ORG_ENTITIES_SRC = REPO / "pipeline" / "lakehouse" / "reference" / "org_entities.json"
 SSM_PREFIX = "/llmops/lakehouse"
 KEY_DELETION_DAYS = 30
@@ -245,7 +252,18 @@ def glue_role_policy(region: str, account_id: str, data_bucket: str, key_arns: d
          "Resource": f"arn:aws:s3:::{data_bucket}/{LANDING_PREFIX}/*"},
         {"Sid": "ListOwnPrefixes", "Effect": "Allow", "Action": "s3:ListBucket",
          "Resource": f"arn:aws:s3:::{data_bucket}",
-         "Condition": {"StringLike": {"s3:prefix": [f"{p}/*" for p in (GLUE_PREFIX, LANDING_PREFIX, REPORT_PREFIX)]}}},
+         "Condition": {"StringLike": {"s3:prefix": [f"{p}/*" for p in (
+             GLUE_PREFIX, LANDING_PREFIX, REPORT_PREFIX, EXTRACTS_PREFIX, ATHENA_PREFIX)]}}},
+        {"Sid": "ExtractsReadWrite", "Effect": "Allow", "Action": ["s3:GetObject", "s3:PutObject"],
+         "Resource": [f"arn:aws:s3:::{data_bucket}/{EXTRACTS_PREFIX}/*",
+                      f"arn:aws:s3:::{data_bucket}/{ATHENA_PREFIX}/*"]},
+        {"Sid": "ResultBucketLocation", "Effect": "Allow", "Action": "s3:GetBucketLocation",
+         "Resource": f"arn:aws:s3:::{data_bucket}"},
+        {"Sid": "ExportQueries", "Effect": "Allow",
+         "Action": ["athena:StartQueryExecution", "athena:GetQueryExecution", "athena:GetQueryResults"],
+         "Resource": f"arn:aws:athena:{region}:{account_id}:workgroup/{WORKGROUP}"},
+        {"Sid": "ReportsRead", "Effect": "Allow", "Action": "s3:GetObject",
+         "Resource": f"arn:aws:s3:::{data_bucket}/{REPORT_PREFIX}/*"},
         {"Sid": "ReportsWrite", "Effect": "Allow", "Action": "s3:PutObject",
          "Resource": f"arn:aws:s3:::{data_bucket}/{REPORT_PREFIX}/*"},
         {"Sid": "PublishDataQuality", "Effect": "Allow", "Action": "glue:PublishDataQuality",
@@ -255,9 +273,12 @@ def glue_role_policy(region: str, account_id: str, data_bucket: str, key_arns: d
 
 
 def workgroup_config(data_bucket: str) -> dict:
-    return {"ResultConfiguration": {
-                "OutputLocation": f"s3://{data_bucket}/{ATHENA_PREFIX}/",
-                "EncryptionConfiguration": {"EncryptionOption": "SSE_S3"}},
+    """No EncryptionConfiguration, on purpose. With one set (SSE_S3, or SSE_KMS even naming the
+    table's own key), every Athena INSERT into a CMK-encrypted S3 Table fails with
+    INTERNAL_ERROR_QUERY_ENGINE, while the same INSERT into an SSE-S3 table succeeds (measured
+    2026-10-15, PR-08). Results and UNLOAD extracts still land encrypted: the data bucket's default
+    encryption applies, and verify() checks that it is there."""
+    return {"ResultConfiguration": {"OutputLocation": f"s3://{data_bucket}/{ATHENA_PREFIX}/"},
             "EnforceWorkGroupConfiguration": True,
             "EngineVersion": {"SelectedEngineVersion": "Athena engine version 3"},
             "PublishCloudWatchMetricsEnabled": True}
@@ -387,6 +408,12 @@ JOB_PYTHON_MODULES = {"bronze_to_silver.py": "boto3==1.43.57,botocore==1.43.57"}
 
 def job_definition(name, script, role_arn, data_bucket) -> dict:
     extra = ({"--additional-python-modules": JOB_PYTHON_MODULES[script]} if script in JOB_PYTHON_MODULES else {})
+    if script in PYTHON_SHELL_JOBS:
+        return {"Name": name, "Role": role_arn, "GlueVersion": "3.0", "MaxCapacity": 0.0625, "Timeout": 30,
+                "Command": {"Name": "pythonshell", "PythonVersion": "3.9",
+                            "ScriptLocation": f"s3://{data_bucket}/{GLUE_PREFIX}/{script}"},
+                "DefaultArguments": {"--extra-py-files": f"s3://{data_bucket}/{GLUE_PREFIX}/export.py",
+                                     "--TempDir": f"s3://{data_bucket}/{GLUE_PREFIX}/tmp/"}}
     return {"Name": name, "Role": role_arn, "GlueVersion": "5.0", "WorkerType": "G.1X",
             "NumberOfWorkers": 2, "Timeout": 30,
             "Command": {"Name": "glueetl", "PythonVersion": "3",
@@ -402,6 +429,7 @@ def ensure_jobs(glue, s3, role_arn, data_bucket) -> dict:
     out = {}
     s3.put_object(Bucket=data_bucket, Key=f"{GLUE_PREFIX}/transform.py", Body=TRANSFORM_SRC.read_bytes())
     s3.put_object(Bucket=data_bucket, Key=f"{GLUE_PREFIX}/org_entities.json", Body=ORG_ENTITIES_SRC.read_bytes())
+    s3.put_object(Bucket=data_bucket, Key=f"{GLUE_PREFIX}/export.py", Body=EXPORT_SRC.read_bytes())
     for name, script in JOBS.values():
         s3.put_object(Bucket=data_bucket, Key=f"{GLUE_PREFIX}/{script}", Body=(GLUE_SRC / script).read_bytes())
         d = job_definition(name, script, role_arn, data_bucket)
@@ -417,7 +445,11 @@ def ensure_jobs(glue, s3, role_arn, data_bucket) -> dict:
 
 def ensure_workgroup(athena, data_bucket) -> str:
     try:
-        athena.get_work_group(WorkGroup=WORKGROUP)
+        cfg = athena.get_work_group(WorkGroup=WORKGROUP)["WorkGroup"]["Configuration"]
+        if "EncryptionConfiguration" in cfg.get("ResultConfiguration", {}):
+            athena.update_work_group(WorkGroup=WORKGROUP, ConfigurationUpdates={
+                "ResultConfigurationUpdates": {"RemoveEncryptionConfiguration": True}})
+            return "updated (result encryption override removed; bucket default applies)"
         return "exists"
     except athena.exceptions.InvalidRequestException:
         athena.create_work_group(Name=WORKGROUP, Configuration=workgroup_config(data_bucket),
@@ -489,6 +521,12 @@ def verify(session, region, account_id, data_bucket) -> dict:
     for b, arn in arns.items():
         enc = s3t.get_table_bucket_encryption(tableBucketARN=arn)["encryptionConfiguration"]
         checks[f"{b} encryption"] = enc["sseAlgorithm"] == "aws:kms" and bool(enc.get("kmsKeyArn"))
+    rules = s3.get_bucket_encryption(Bucket=data_bucket)["ServerSideEncryptionConfiguration"]["Rules"]
+    checks["athena results encrypted by bucket default"] = any(
+        r.get("ApplyServerSideEncryptionByDefault", {}).get("SSEAlgorithm") in ("AES256", "aws:kms", "aws:kms:dsse")
+        for r in rules)
+    wg = athena.get_work_group(WorkGroup=WORKGROUP)["WorkGroup"]["Configuration"]
+    checks["workgroup sets no result encryption"] = "EncryptionConfiguration" not in wg.get("ResultConfiguration", {})
     for t in TABLES:
         loc = s3t.get_table_metadata_location(tableBucketARN=arns[t["bucket"]],
                                               namespace=t["namespace"], name=t["name"])["metadataLocation"]
@@ -540,6 +578,10 @@ def glue_role_cases(region, account_id, data_bucket, arns, keys, guardrail_arn=N
         ("s3:GetObject", f"arn:aws:s3:::{data_bucket}/{LANDING_PREFIX}/d/bronze_feedback.jsonl", True),
         ("s3:PutObject", f"arn:aws:s3:::{data_bucket}/{REPORT_PREFIX}/d/silver.json", True),
         ("s3:PutObject", f"arn:aws:s3:::{data_bucket}/{LANDING_PREFIX}/d/x", False),
+        ("athena:StartQueryExecution", f"arn:aws:athena:{region}:{account_id}:workgroup/{WORKGROUP}", True),
+        ("athena:StartQueryExecution", f"arn:aws:athena:{region}:{account_id}:workgroup/primary", False),
+        ("s3:PutObject", f"arn:aws:s3:::{data_bucket}/{EXTRACTS_PREFIX}/d/1/train.jsonl", True),
+        ("s3:DeleteObject", f"arn:aws:s3:::{data_bucket}/{EXTRACTS_PREFIX}/d/1/train.jsonl", False),
     ] + ([("bedrock:ApplyGuardrail", guardrail_arn, True),
           ("bedrock:ApplyGuardrail", f"arn:aws:bedrock:{region}:{account_id}:guardrail/someone-elses", False)]
          if guardrail_arn else [])
@@ -552,7 +594,9 @@ def simulate_glue_role(iam, region, account_id, data_bucket, arns, keys, guardra
         r = iam.simulate_principal_policy(PolicySourceArn=role, ActionNames=[action],
                                           ResourceArns=[resource])["EvaluationResults"][0]
         allowed = r["EvalDecision"] == "allowed"
-        label = resource.split(":")[-1][:60]  # the resource part only: an ARN carries the account
+        # The resource part only: an ARN carries the account, and an S3 ARN's bucket name embeds it.
+        label = (resource.split(":::", 1)[1].split("/", 1)[-1] if resource.startswith("arn:aws:s3:::")
+                 else resource.split(":")[-1])[:60]
         out[f"glue role {'may' if want else 'may NOT'} {action} on {label}"] = (
             True if allowed == want else f"{r['EvalDecision']} on {resource.rsplit(':', 1)[-1]}")
     return out
@@ -648,14 +692,24 @@ def _load_module(name, path):
     return mod
 
 
-def _run_job(glue, name, arguments, timeout_s=1800) -> tuple[str, str]:
-    run_id = glue.start_job_run(JobName=name, Arguments=arguments)["JobRunId"]
+def _run_job(glue, name, arguments, timeout_s=1800, sleep=time.sleep) -> tuple[str, str]:
+    """A run that has just reported SUCCEEDED can still count against the job's concurrency for a
+    while: the smoke's back-to-back exports met ConcurrentRunsExceeded on the second start. Only
+    that error is retried; anything else is the job's problem and propagates."""
+    for attempt in range(6):
+        try:
+            run_id = glue.start_job_run(JobName=name, Arguments=arguments)["JobRunId"]
+            break
+        except glue.exceptions.ConcurrentRunsExceededException:
+            if attempt == 5:
+                raise
+            sleep(15 * (attempt + 1))
     deadline = time.time() + timeout_s
     while time.time() < deadline:
         jr = glue.get_job_run(JobName=name, RunId=run_id)["JobRun"]
         if jr["JobRunState"] in ("SUCCEEDED", "FAILED", "ERROR", "TIMEOUT", "STOPPED"):
             return jr["JobRunState"], jr.get("ErrorMessage", "")[:300]
-        time.sleep(20)
+        sleep(20)
     return "TIMEOUT", ""
 
 
@@ -693,6 +747,26 @@ def smoke(session, region, account_id, data_bucket, seed=7, scale="small") -> di
         checks[f"job {JOBS[key][0]}"] = True if state == "SUCCEEDED" else f"{state}: {err}"
         if state != "SUCCEEDED":
             return checks
+    exports = []
+    for attempt in (1, 2):  # twice: the second must reproduce the first byte for byte
+        state, err = _run_job(glue, JOBS["export"][0], {
+            "--data_bucket": data_bucket, "--curated_bucket": CURATED, "--workgroup": WORKGROUP,
+            "--dataset": dataset, "--gold_report_uri": reports + "gold.json",
+            "--pii_report_uri": reports + "silver.json", "--report_uri": reports + f"export-{attempt}.json",
+            "--run_id": f"smoke-{dataset}"})
+        checks[f"job {JOBS['export'][0]} (run {attempt})"] = True if state == "SUCCEEDED" else f"{state}: {err}"
+        if state != "SUCCEEDED":
+            return checks
+        exports.append(json.loads(s3.get_object(
+            Bucket=data_bucket, Key=f"{REPORT_PREFIX}/{dataset}/export-{attempt}.json")["Body"].read()))
+    checks["export reproducible (same sha256 twice)"] = all(
+        exports[0]["files"][k]["sha256"] == exports[1]["files"][k]["sha256"] for k in ("train", "eval")) or [
+        (e["files"]["train"]["sha256"][:12], e["files"]["eval"]["sha256"][:12]) for e in exports]
+    driver = _load_module("lh_driver", REPO / "orchestration" / "harness_driver" / "handler.py")
+    for split in ("train", "eval"):
+        f = exports[1]["files"][split]
+        att = driver._verify_gold_extract(s3, data_bucket, {"extract_uri": f["uri"], "extract_sha256": f["sha256"]})
+        checks[f"driver re-verifies the {split} extract"] = att["verified"] is True or att
     silver = json.loads(s3.get_object(Bucket=data_bucket, Key=f"{REPORT_PREFIX}/{dataset}/silver.json")["Body"].read())
     gold = json.loads(s3.get_object(Bucket=data_bucket, Key=f"{REPORT_PREFIX}/{dataset}/gold.json")["Body"].read())
     for rule, (ok, detail) in tf.compare_to_plants(silver["rules"], ds["expected_defects"]).items():
@@ -700,6 +774,8 @@ def smoke(session, region, account_id, data_bucket, seed=7, scale="small") -> di
     checks["silver dq"] = all(o["outcome"] == "Passed" for o in silver["dq"]["outcomes"]) or silver["dq"]
     checks["gold dq"] = all(o["outcome"] == "Passed" for v in gold["dq"].values() for o in v) or gold["dq"]
     athena = session.client("athena", region_name=region)
+    checks["export rows = gold rows"] = (exports[1]["files"]["train"]["rows"], exports[1]["files"]["eval"]["rows"]) == (
+        gold["train"], gold["eval"]) or exports[1]["files"]
     for bucket, ns, table, want in ((CURATED, "silver", "instruction_pairs", silver["pairs"]),
                                     (CURATED, "gold", "qlora_train", gold["train"]),
                                     (CURATED, "gold", "qlora_eval", gold["eval"])):
@@ -711,6 +787,7 @@ def smoke(session, region, account_id, data_bucket, seed=7, scale="small") -> di
                if state == "SUCCEEDED" else state)
         checks[f"athena {ns}.{table} rows"] = True if got == want else f"{got} != {want}"
     checks["silver pairs"], checks["gold train/eval"] = silver["pairs"], f"{gold['train']}/{gold['eval']}"
+    checks["extract"] = f"{exports[1]['prefix']} train {exports[1]['files']['train']['sha256'][:16]}…"
     return checks
 
 
@@ -754,9 +831,9 @@ def main(argv=None) -> int:
             if isinstance(v, bool):
                 print(f"{'PASS' if v else 'FAIL'}  {k}")
             else:
-                print(f"{'INFO' if k in ('dataset', 'dataset_sha256', 'silver pairs', 'gold train/eval') else 'FAIL'}  {k}: {v}")
+                print(f"{'INFO' if k in ('dataset', 'dataset_sha256', 'silver pairs', 'gold train/eval', 'extract') else 'FAIL'}  {k}: {v}")
         return 0 if all(v is True for k, v in checks.items()
-                        if k not in ("dataset", "dataset_sha256", "silver pairs", "gold train/eval")) else 1
+                        if k not in ("dataset", "dataset_sha256", "silver pairs", "gold train/eval", "extract")) else 1
     if args.verify:
         checks = verify(session, args.region, account_id, data_bucket)
         for k, v in checks.items():

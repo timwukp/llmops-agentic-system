@@ -2362,6 +2362,9 @@ def data_run(dataset):
         raise ValueError("dataset must be a lowercase id such as seed7-demo-20261014-110922")
     base = f"{LAKEHOUSE_REPORTS}{dataset}/"
     land, silver, gold = (_s3_json(base + f) for f in ("land.json", "silver.json", "gold.json"))
+    # The pipeline writes export.json; the smoke check writes export-1/-2 (it exports twice to
+    # prove the bytes reproduce). The latest one is shown.
+    export = next((r for r in (_s3_json(base + f) for f in ("export.json", "export-2.json", "export-1.json")) if r), None)
     manifest = _s3_json(f"{LAKEHOUSE_LANDING}{dataset}/manifest.json")
     tables = {}
     for rep in (land, silver, gold):
@@ -2375,7 +2378,11 @@ def data_run(dataset):
             "tables": tables, "rules": rules, "plant_check": (silver or {}).get("plant_check"),
             "pairs": (silver or {}).get("pairs"), "train": (gold or {}).get("train"),
             "eval": (gold or {}).get("eval"), "dq": dq,
-            "stages": {"land": land is not None, "silver": silver is not None, "gold": gold is not None}}
+            "export": {"prefix": export.get("prefix"), "files": {
+                k: {f: v.get(f) for f in ("uri", "sha256", "rows", "snapshot_id", "table")}
+                for k, v in (export.get("files") or {}).items()}} if export else None,
+            "stages": {"land": land is not None, "silver": silver is not None, "gold": gold is not None,
+                       "export": export is not None}}
 
 
 def cost_budgets():

@@ -444,7 +444,7 @@
   <div data-tab-panel="data" class="card col-6"><h2>Rules &middot; planted vs caught</h2><div id="dataRules"><span class="sub">loading&hellip;</span></div></div>
   <div data-tab-panel="data" class="card col-6"><h2>Data quality outcomes</h2><div id="dataDqList"><span class="sub">loading&hellip;</span></div></div>
   <div data-tab-panel="data" class="card col-6"><h2>Exports &middot; Lineage</h2>
-    <div class="row"><span>Gold export (UNLOAD + sha256)</span><span class="pill warn">Phase 1 PR-08</span></div>
+    <div id="dataExport"><span class="sub">loading&hellip;</span></div>
     <div class="row"><span>Unified Studio catalog &amp; lineage</span><span class="pill warn">Phase 1 PR-05</span></div>
     <div class="sub" style="margin-top:6px">lineage events already reach the domain (spike S7); catalog visibility waits on the S3 Tables integration-mode decision</div>
   </div>
@@ -2390,7 +2390,7 @@ async function loadDataRun(){
   document.querySelectorAll('[id^="rows-"],[id^="snap-"]').forEach(el=>el.textContent="–");
   $("dataPlantsSub").textContent="each rule's catch = what the generator planted";
   const m=r.manifest||{};
-  $("dataMeta").innerHTML=`<span class="mono">${esc(r.dataset)}</span> · seed ${esc(m.seed)} · ${esc(m.scale)} · sha256 <span class="mono">${esc((m.dataset_sha256||"").slice(0,16))}…</span> · stages ${["land","silver","gold"].map(s=>`<span class="pill ${r.stages[s]?"ok":"warn"}">${s}</span>`).join(" ")}`;
+  $("dataMeta").innerHTML=`<span class="mono">${esc(r.dataset)}</span> · seed ${esc(m.seed)} · ${esc(m.scale)} · sha256 <span class="mono">${esc((m.dataset_sha256||"").slice(0,16))}…</span> · stages ${["land","silver","gold","export"].map(s=>`<span class="pill ${r.stages[s]?"ok":"warn"}">${s}</span>`).join(" ")}`;
   $("dataPairs").textContent=r.pairs==null?"–":fmtN(r.pairs);
   $("dataGold").textContent=r.train==null?"–":`${fmtN(r.train)} / ${fmtN(r.eval)}`;
   const pc=r.plant_check;
@@ -2404,6 +2404,10 @@ async function loadDataRun(){
   $("dataDq").innerHTML=dq.length?`<span style="color:${pass===dq.length?"var(--green)":"var(--red)"}">${pass}/${dq.length}</span>`:"–";
   $("dataDqList").innerHTML=dq.length?`<table><tr><th>table</th><th>rule</th><th>outcome</th></tr>${dq.map(([t,o])=>
     `<tr><td class="mono">${esc(t)}</td><td class="mono sub">${esc(o.rule)}</td><td><span class="pill ${o.outcome==="Passed"?"ok":"err"}">${esc(o.outcome)}</span></td></tr>`).join("")}</table>`:`<div class="sub">no DQ results in this dataset's reports</div>`;
+  const ex=r.export;
+  $("dataExport").innerHTML=ex?`<div class="sub mono" style="margin-bottom:4px">${esc(ex.prefix)}</div><table><tr><th>split</th><th style="text-align:right">rows</th><th>sha256</th><th>snapshot</th></tr>${Object.entries(ex.files||{}).map(([k,f])=>
+    `<tr><td>${esc(k)} <span class="sub mono">${esc(f.table)}</span></td><td style="text-align:right">${fmtN(f.rows)}</td><td class="mono">${esc((f.sha256||"").slice(0,16))}…</td><td class="mono sub">${esc(String(f.snapshot_id||"").slice(0,10))}…</td></tr>`).join("")}</table>`
+    :`<div class="row"><span>Gold export (UNLOAD + sha256)</span><span class="pill warn">not exported yet</span></div>`;
   Object.entries(r.tables||{}).forEach(([full,v])=>{ const [ns,name]=full.split(".");
     const rc=$("rows-"+ns+"-"+name), sc=$("snap-"+ns+"-"+name);
     if(rc) rc.textContent=v.rows==null?"–":fmtN(v.rows); if(sc) sc.textContent=v.snapshot_id?String(v.snapshot_id).slice(0,10)+"…":"–"; });

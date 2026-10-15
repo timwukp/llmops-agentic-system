@@ -888,6 +888,46 @@ def _verify_judge_instrument(s3, bucket: str, metrics: dict) -> dict:
     return att
 
 
+#: A stage that trained on (or exported) a Gold extract claims it with these metrics. The driver
+#: does not take the digest on trust: it re-reads the object and hashes the bytes itself.
+GOLD_EXTRACT_CLAIM_KEYS = ("extract_uri", "extract_sha256")
+GOLD_EXTRACTS_PREFIX = "lakehouse/extracts/"
+
+
+def _verify_gold_extract(s3, bucket: str, metrics: dict) -> dict:
+    """Recompute a Gold extract's sha256 and line count from S3 and compare with the claim.
+
+    The same reason as the judge instrument above: a digest written by the stage that produced the
+    data is an attestation of the same standing as the data, so it cannot corroborate it. The
+    extract is what training reads, the file a reproducibility claim ("trained on gold.qlora_train
+    at snapshot N") rests on, so the driver measures it.
+
+    Only `s3://<DATA_BUCKET>/lakehouse/extracts/...` is read. An agent-supplied URI anywhere else
+    -- another bucket, another prefix -- is refused, not fetched: the driver's role must not
+    become a reader of whatever a stage names. Returns a record always ("could not check" and
+    "checked and wrong" are different findings)."""
+    uri = str(metrics.get("extract_uri") or "")
+    claimed = str(metrics.get("extract_sha256") or "")
+    att = {"kind": "gold_extract", "uri": uri, "claimed_sha256": claimed, "computed_sha256": "",
+           "verified": False, "checked_at": datetime.now(timezone.utc).isoformat()}
+    if metrics.get("extract_snapshot_id") is not None:
+        att["snapshot_id"] = str(metrics["extract_snapshot_id"])
+    prefix = f"s3://{bucket}/{GOLD_EXTRACTS_PREFIX}"
+    if not bucket or not uri.startswith(prefix) or ".." in uri:
+        att["error"] = f"refused: an extract must live under {prefix}"
+        return att
+    key = uri[len(f"s3://{bucket}/"):]
+    try:
+        body = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+    except Exception as exc:  # noqa: BLE001 -- an unreadable extract is a finding, not a raise
+        att["error"] = f"{type(exc).__name__}: {exc}"
+        return att
+    att["computed_sha256"] = hashlib.sha256(body).hexdigest()
+    att["rows"] = body.count(b"\n")
+    att["verified"] = bool(claimed) and claimed == att["computed_sha256"]
+    return att
+
+
 def _load_manifest(s3, manifest_uri: str) -> dict:
     bucket, _, key = manifest_uri[5:].partition("/")
     try:
@@ -981,10 +1021,13 @@ def _save_manifest(s3, manifest_uri: str, manifest: Optional[dict],
         current["stages"] = manifest.get("stages", {})
     for field, record in (("stage_history", history_record), ("escalations", escalation),
                           ("attestations", attestation)):
-        if record:
-            existing = current.get(field)
-            current[field] = ([*existing, record] if isinstance(existing, list)
-                              else [record])
+        # One stage can carry more than one measurement (a judge digest AND a Gold extract),
+        # so `attestation` may be a list; each record is appended on its own.
+        for one in (record if isinstance(record, list) else [record]):
+            if one:
+                existing = current.get(field)
+                current[field] = ([*existing, one] if isinstance(existing, list)
+                                  else [one])
     s3.put_object(Bucket=bucket, Key=key,
                   Body=json.dumps(current, indent=2, default=str).encode(),
                   ContentType="application/json")
@@ -1508,12 +1551,17 @@ def handle_stage_complete(c, event, args) -> dict:
     # claim that decides whether two runs' scores mean the same thing was taken on trust.
     stage_metrics = norm.get("metrics", {})
     attestation = None
+    measured = []
     if any(k in stage_metrics for k in JUDGE_CLAIM_KEYS):
-        attestation = {**_verify_judge_instrument(
-            c["s3"], os.environ.get("DATA_BUCKET", ""), stage_metrics),
-            "stage": stage, "task": task,
-            "iteration": event.get("iteration", manifest.get("iteration"))}
-        manifest.setdefault("attestations", []).append(attestation)
+        measured.append(_verify_judge_instrument(
+            c["s3"], os.environ.get("DATA_BUCKET", ""), stage_metrics))
+    if all(k in stage_metrics for k in GOLD_EXTRACT_CLAIM_KEYS):
+        measured.append(_verify_gold_extract(
+            c["s3"], os.environ.get("DATA_BUCKET", ""), stage_metrics))
+    attestation = [{**m, "stage": stage, "task": task,
+                    "iteration": event.get("iteration", manifest.get("iteration"))} for m in measured] or None
+    for one in attestation or []:
+        manifest.setdefault("attestations", []).append(one)
     try:
         # The manifest goes BACK to S3, which it never used to. Every prompt is told
         # "the S3 manifest at manifest_uri is the single source of truth; read it first,

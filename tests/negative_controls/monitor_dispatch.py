@@ -727,11 +727,11 @@ case("test: the readiness guard restates the checklist instead of deriving it",
 #     buckets read as coverage everywhere anyone looked, and the deploy output is the only
 #     place the absence is visible.
 def m53(t):
-    old = '        res["coverage"] = (\n            f"NO JOB SCANS {CUSTOMER_DATA_PREFIX}/ -- '
+    old = '        res["coverage"] = (\n            f"NO JOB SCANS {prefix}/ -- '
     assert old in t, "the no-coverage report has moved; re-anchor this mutation"
     return t.replace(
         old,
-        '        res["coverage"] = (\n            f"no llmops job for {CUSTOMER_DATA_PREFIX}/ -- ', 1)
+        '        res["coverage"] = (\n            f"no llmops job for {prefix}/ -- ', 1)
 case("storage: the deploy stops naming the missing PII scan",
      "deploy/03_storage.py", m53,
      ["tests/test_console_tasks.py::test_the_deploy_reports_the_gap_loudly_when_nothing_scans",
@@ -767,7 +767,7 @@ case("storage: an unverified criteria job is counted as PII coverage",
 def m56(t):
     old = ('            "scoping": {"includes": {"and": [{"simpleScopeTerm": {\n'
            '                "comparator": "STARTS_WITH", "key": "OBJECT_KEY",\n'
-           '                "values": [f"{CUSTOMER_DATA_PREFIX}/"]}}]}},\n')
+           '                "values": [f"{prefix}/"]}}]}},\n')
     assert old in t, "the created job's scoping has moved; re-anchor this mutation"
     return t.replace(old, "", 1)
 case("storage: the new scan job reads the whole bucket instead of customer-data/",
