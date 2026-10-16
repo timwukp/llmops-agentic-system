@@ -3328,12 +3328,17 @@ INTAKE_ALIASES = {
     "sample_count": ("sample_count", "samples"),
     "labels_format": ("labels_format", "annotation_format", "label_format"),
     "classes": ("classes", "class_names", "categories"),
+    # The lakehouse modes (PR-09). A dataset id is a lakehouse_ingest run's id lowercased, or
+    # a smoke dataset's; intake verifies it from its reports before any plan names it.
+    "lakehouse_dataset": ("lakehouse_dataset", "lakehouse_dataset_id", "gold_dataset"),
+    "generator_seed": ("generator_seed",),
+    "generator_scale": ("generator_scale",),
 }
 _INTAKE_CANON = {a: c for c, al in INTAKE_ALIASES.items() for a in al}
 _INTAKE_URI_PARAMS = {"source_uri", "customer_eval_uri", "ood_eval_uri",
                       "model_artifact_uri", "readiness_report_uri"}
 _INTAKE_NUM_PARAMS = {"retrieval_k", "retrieval_distractors", "kb_ocu_hours",
-                      "budget_usd", "max_iterations", "sample_count"}
+                      "budget_usd", "max_iterations", "sample_count", "generator_seed"}
 #: the prompt's RAFT clause: name all of these at plan top level, or none of them.
 _RAFT_PARAMS = ("retrieval_kb_id", "retrieval_k", "retrieval_distractors",
                 "kb_ocu_hours")
@@ -3495,6 +3500,45 @@ TASK_TYPE_REGISTRY = (
          _rf("datasheet.pii_disposition"),
          _rf("datasheet.consent"),
          _rf("decontamination"),
+     )},
+    {"key": "lakehouse-ingest",
+     "label": "Build a governed lakehouse dataset (synthetic store copilot)",
+     "description": "The seeded generator writes zh-TW/EN customer-service conversations with "
+                    "planted defects. Bronze → Silver → Gold applies PII redaction, "
+                    "decontamination and dedup, and every rule is held to the plants exactly. "
+                    "Glue Data Quality gates both layers. No model and no GPU: the run stops at "
+                    "Gold, and the dataset id it builds is its run id, lowercased (Data tab).",
+     "supported": True, "pipeline_mode": "lakehouse_ingest",
+     "fields": (
+         _pf("generator_seed", "Generator seed", "number", True,
+             "the same seed and scale give byte-identical source files on any machine"),
+         _pf("generator_scale", "Scale (small or demo)", "string", True,
+             "demo: 300 conversations and a 120-item held-out acceptance set; small: 80 and 40"),
+         _pf("budget_usd", "Budget reference (USD)", "number", False,
+             "a reference, not a ceiling"),
+     )},
+    {"key": "finetune-lakehouse",
+     "label": "Fine-tune a small model on a lakehouse Gold dataset",
+     "description": "Trains on a pinned, sha256-named extract of a Gold dataset that a lakehouse "
+                    "ingest built. The gate is judged on that dataset's held-out acceptance set: "
+                    "phrasings the training never saw, each item with a reference answer. The "
+                    "deploy then follows the same sign-off chain as every other run.",
+     "supported": True, "pipeline_mode": "lakehouse",
+     "fields": (
+         _pf("lakehouse_dataset", "Lakehouse dataset id", "string", True,
+             "from the Data tab; the console verifies its Gold report and held-out "
+             "acceptance set before the plan is written"),
+         _pf("student_model_id", "Student model to fine-tune", "string", True,
+             "e.g. Qwen/Qwen3-1.7B; required because the platform's default student was "
+             "chosen for a different corpus"),
+         _pf("budget_usd", "Budget reference (USD)", "number", False,
+             "a reference, not a ceiling — the plan is priced against it"),
+         _pf("training_instance", "Training instance", "string", False,
+             "e.g. ml.g5.2xlarge; leave blank to let the plan choose"),
+         _pf("max_iterations", "Max training iterations", "number", False,
+             "remediation retries before the run stops trying"),
+         _pf("keep_endpoint", "Keep the smoke endpoint", "bool", False,
+             "false tears the endpoint down after the smoke hour — the safe default"),
      )},
     {"key": "finetune-yolo",
      "label": "Fine-tune an open-source YOLO vision model (deprecated)",
@@ -3804,7 +3848,49 @@ def _verify_mirror(hf_repo):
         return _fact("hf_repo", hf_repo, "unverified", str(e), "s3")
 
 
+_LAKEHOUSE_DATASET_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,79}$")
+
+
+def _verify_lakehouse_dataset(ds):
+    """A lakehouse dataset a plan may train on: it has a Gold report AND a held-out acceptance set.
+
+    The second half is PR-11's lesson. A generator-v1 dataset has a Gold split but no acceptance set,
+    so a lakehouse gate would fall back to a val split drawn from the training phrasings: a gate
+    that measures recall. Measured live, a v1 eval row sat at a median similarity of 0.935 to
+    training. Refusing it here costs one form message. Accepting it costs a GPU run whose verdict
+    means nothing. Reads only the two report objects the console's S3ConsoleRead already grants;
+    the tables themselves are never read."""
+    ds = str(ds).strip()
+    if not _LAKEHOUSE_DATASET_ID.match(ds):
+        return _fact("lakehouse_dataset", ds, "failed",
+                     "not a lakehouse dataset id (lowercase letters, digits and dashes)", "none")
+    try:
+        gold = json.loads(s3.get_object(Bucket=data_bucket(),
+                                        Key=f"lakehouse/reports/{ds}/gold.json")["Body"].read())
+    except Exception as e:  # noqa: BLE001
+        if "NoSuchKey" in f"{type(e).__name__}{e}":
+            return _fact("lakehouse_dataset", ds, "failed",
+                         "no Gold report: run lakehouse_ingest for it first", "s3")
+        return _fact("lakehouse_dataset", ds, "unverified", str(e), "s3")
+    try:
+        man = json.loads(s3.get_object(Bucket=data_bucket(),
+                                       Key=f"lakehouse/landing/{ds}/manifest.json")["Body"].read())
+    except Exception as e:  # noqa: BLE001
+        return _fact("lakehouse_dataset", ds, "unverified", f"no landing manifest: {e}", "s3")
+    n_acc = (man.get("counts") or {}).get("eval_prompts")
+    if str(man.get("generator_version")) != "2":
+        return _fact("lakehouse_dataset", ds, "failed",
+                     f"generator v{man.get('generator_version') or 1} dataset: no held-out acceptance "
+                     "set, so a gate would score recall of the training phrasings -- ingest a new one",
+                     "s3")
+    return _fact("lakehouse_dataset", ds, "verified",
+                 f"Gold train/eval {gold.get('train')}/{gold.get('eval')}; held-out acceptance set "
+                 f"{n_acc} items (generator v2, seed {man.get('seed')}, {man.get('scale')})", "s3")
+
+
 def _verify_candidate(name, value):
+    if name == "lakehouse_dataset":
+        return _verify_lakehouse_dataset(value)
     if name in _INTAKE_URI_PARAMS or name == "s3_uri":
         return _verify_s3_uri(name, value)
     if name == "retrieval_kb_id":
