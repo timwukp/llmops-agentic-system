@@ -5,6 +5,25 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
 ## [Unreleased]
 
+### Console: start a lakehouse run from a task
+
+The catalog gains two entries:
+- **`lakehouse-ingest`** (build a governed dataset; seed and scale required);
+- **`finetune-lakehouse`** (train on a Gold dataset; the dataset id and the student required).
+
+Both forms are guarded against the dispatcher's own `MODE_REQUIRED_PARAMS` and `MODE_REQUIRED_ROLES`.
+Intake verifies a named dataset from its Gold report and landing manifest, and **refuses a
+generator-v1 dataset**: it has no held-out acceptance set, so its gate would score recall (PR-11).
+The orchestrator's menu gains both modes, with their required plan keys and the gate-decidability
+arithmetic (a 0.95 gate needs n ≥ 73 at zero failures).
+
+Verified live:
+- the deployed console serves both entries;
+- the verifier is right on the v2, v1 and missing datasets;
+- the console role reaches exactly the two report objects (no new grant).
+
+New control m356.
+
 ### Phase 1 PR-11: a held-out acceptance set, so a lakehouse gate measures the model
 
 PR-09's live run ended borderline: 32/32 on `gold.qlora_eval`, but n=32 cannot clear a 0.95 Wilson

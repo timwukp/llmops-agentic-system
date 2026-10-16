@@ -6148,6 +6148,19 @@ case("lakehouse: Gold trains on rows that still carry redaction tokens",
      ["tests/test_lakehouse_transform.py::test_gold_promotes_no_pair_that_carries_a_redaction_token"])
 
 
+def m356(t):
+    # Intake stops checking the generator version: a v1 dataset, with no held-out acceptance set,
+    # verifies -- and the plan it unlocks trains a model whose gate scores recall of its own data.
+    old = '    if str(man.get("generator_version")) != "2":\n'
+    assert t.count(old) == 1, "the generator-version check moved"
+    return t.replace(old, '    if False:\n', 1)
+
+
+case("console: intake verifies a lakehouse dataset that has no held-out acceptance set",
+     "deploy/console/lambda_function.py", m356,
+     ["tests/test_console_lakehouse_intake.py::test_a_generator_v1_dataset_is_refused_because_it_has_no_acceptance_set"])
+
+
 #: Where the pristine text of the file currently mutated is parked, so a kill -9 -- which
 #: no handler can intercept -- still leaves the original recoverable. Under the repo root
 #: rather than /tmp because it must be obvious to whoever finds the tree dirty, and

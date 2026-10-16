@@ -6105,7 +6105,7 @@ def test_every_mode_the_console_offers_asks_for_what_the_dispatcher_demands(cons
             f"the dispatcher refuses {t['pipeline_mode']} without "
             f"{required - form_required} — the {t['key']} form must ask for it")
         checked.add(t["pipeline_mode"])
-    assert {"eval_only", "deploy_only"} <= checked, (
+    assert {"eval_only", "deploy_only", "lakehouse_ingest", "lakehouse"} <= checked, (
         f"only checked {sorted(checked)}; a mode with prerequisites that the console does "
         "not offer at all is how this guard silently stops guarding")
 
