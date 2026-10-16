@@ -29,7 +29,8 @@ glue_ctx = GlueContext(spark.sparkContext)
 
 pairs = [r.asDict() for r in spark.table("cur.silver.instruction_pairs").collect()]
 train, ev = transform.silver_to_gold(pairs)
-report = {"silver_pairs": len(pairs), "train": len(train), "eval": len(ev), "dq": {}, "tables": {}}
+report = {"silver_pairs": len(pairs), "train": len(train), "eval": len(ev),
+          "excluded_redacted": sum(1 for p in pairs if transform.carries_redaction(p)), "dq": {}, "tables": {}}
 for table, rows in (("qlora_train", train), ("qlora_eval", ev)):
     target = spark.table(f"cur.gold.{table}")
     df = spark.createDataFrame(rows, schema=None if rows else target.schema)

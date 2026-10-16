@@ -335,7 +335,7 @@
     },
     "LakehouseExport": {
       "Type": "Task",
-      "Comment": "lakehouse starts here: UNLOAD the named dataset's Gold tables FOR VERSION AS OF the snapshots its Gold report recorded, into lakehouse/extracts/<dataset>/<snapshot>/ with a sha256 per file (PR-08). A missing dataset fails this job and escalates.",
+      "Comment": "lakehouse starts here: UNLOAD the named dataset's Gold tables FOR VERSION AS OF the snapshots its Gold report recorded, into lakehouse/extracts/<dataset>/<snapshot>/ with a sha256 per file (PR-08). A missing dataset fails this job and escalates. The held-out acceptance set (the generator's eval_prompts.jsonl, with reference answers) is copied into the same bundle and hashed, so the set the gate is anchored to is as checkable as the training data.",
       "Resource": "arn:aws:states:::glue:startJobRun.sync",
       "Parameters": {
         "JobName": "llmops-lakehouse-export",
@@ -344,7 +344,8 @@
           "--gold_report_uri.$": "States.Format('s3://{}/lakehouse/reports/{}/gold.json', $.lakehouse.data_bucket, $.lakehouse.dataset)",
           "--pii_report_uri.$": "States.Format('s3://{}/lakehouse/reports/{}/silver.json', $.lakehouse.data_bucket, $.lakehouse.dataset)",
           "--report_uri.$": "States.Format('s3://{}/lakehouse/reports/{}/export.json', $.lakehouse.data_bucket, $.lakehouse.dataset)",
-          "--run_id.$": "$.run_id"
+          "--run_id.$": "$.run_id",
+          "--acceptance_uri.$": "States.Format('s3://{}/lakehouse/landing/{}/eval_prompts.jsonl', $.lakehouse.data_bucket, $.lakehouse.dataset)"
         }
       },
       "ResultPath": null,
@@ -459,7 +460,7 @@
         }
       },
       "ResultPath": "$.training_analysis",
-      "TimeoutSeconds": 3600,
+      "TimeoutSeconds": 86400,
       "Catch": [
         {
           "ErrorEquals": [

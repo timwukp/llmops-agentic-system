@@ -126,7 +126,8 @@ def test_gold_split_is_deterministic_and_disjoint(run):
     train2, ev2 = tf.silver_to_gold(list(reversed(rows)))
     assert {r["pair_id"] for r in train} == {r["pair_id"] for r in train2}
     assert not {r["pair_id"] for r in train} & {r["pair_id"] for r in ev}
-    assert len(train) + len(ev) == len(rows) and ev, "an empty eval split would gate on nothing"
+    excluded = [r for r in rows if tf.carries_redaction(r)]
+    assert len(train) + len(ev) + len(excluded) == len(rows) and ev, "an empty eval split would gate on nothing"
     assert all(r["split"] == "train" for r in train) and all(r["split"] == "eval" for r in ev)
 
 
@@ -201,3 +202,23 @@ def test_the_keep_list_protects_only_where_the_entity_is_actually_present():
     keep = tf.org_entities(REF)
     out, found = tf.redact("我是前鎮，訂單出問題", lambda t: ["前鎮"], keep)  # no store in this text
     assert out == "我是[NAME]，訂單出問題" and found == ["[NAME]"]
+
+
+
+# ── redacted text is still training text (PR-11) ────────────────────────────
+def test_gold_promotes_no_pair_that_carries_a_redaction_token(run):
+    """Silver keeps every redacted pair (the audited record); Gold, where training data is chosen,
+    takes none. Live, 27 such rows taught a 1.7B student to coin `[ORDERID]` in held-out answers."""
+    ds, rows, report = run
+    train, ev = tf.silver_to_gold(rows)
+    redacted = {r["pair_id"] for r in rows if tf.carries_redaction(r)}
+    assert redacted, "the fixture must plant PII for this to test anything"
+    assert not redacted & {r["pair_id"] for r in train + ev}
+    assert all(not tf.carries_redaction(r) for r in train + ev)
+    assert len(redacted) <= report["rules"]["redact_pii"]["count"]
+
+
+def test_the_gold_dq_rule_names_every_token_the_redaction_writes():
+    for token in tf.redaction_tokens():
+        assert f"instruction LIKE '%{token}%'" in tf.GOLD_DQDL and f"output LIKE '%{token}%'" in tf.GOLD_DQDL
+    assert tf.GOLD_DQDL.startswith("Rules = [") and tf.GOLD_DQDL.endswith(" = 0 ]")

@@ -197,3 +197,39 @@ def test_macie_coverage_of_extracts_is_a_job_of_its_own():
     assert "also_covered_by" not in res, "a customer-data job must not count as extract coverage"
     res = storage.ensure_pii_scan(_Macie(), "data", "1", dry=True, enable=True, prefix=storage.GOLD_EXTRACTS_PREFIX)
     assert res["coverage"] == "would create SCHEDULED daily job over lakehouse/extracts/"
+
+
+# ── the acceptance set in the bundle (PR-11) ─────────────────────────────────
+def _acc_rows():
+    return gen.generate(7, "small")["eval_prompts"]
+
+
+def test_the_acceptance_set_is_exported_canonically_whatever_its_input_order():
+    rows = _acc_rows()
+    a = "\n".join(json.dumps(r, ensure_ascii=False) for r in rows).encode()
+    b = "\n".join(json.dumps(r) for r in reversed(rows)).encode()
+    (ba, na, why), (bb, nb, _) = ex.acceptance_jsonl(a), ex.acceptance_jsonl(b)
+    assert why == "ok" and ba == bb and na == nb == len(rows)
+    assert all(set(json.loads(line)) == set(ex.ACCEPTANCE_KEYS) for line in ba.decode().splitlines())
+
+
+@pytest.mark.parametrize("mutate,why", [
+    (lambda rs: [{k: v for k, v in r.items() if k != "reference"} for r in rs], "lack"),  # a v1 dataset
+    (lambda rs: rs + [rs[0]], "duplicate"),
+    (lambda rs: [], "empty"),
+])
+def test_a_set_that_cannot_anchor_a_gate_is_reported_absent_not_exported(mutate, why):
+    body = "\n".join(json.dumps(r) for r in mutate(_acc_rows())).encode()
+    out, _, reason = ex.acceptance_jsonl(body)
+    assert out is None and why in reason
+
+
+def test_the_driver_attests_the_acceptance_set_beside_the_extract():
+    acc_key = "lakehouse/extracts/seed7-demo-x/42/acceptance.jsonl"
+    s3 = _S3({("data", KEY): BODY, ("data", acc_key): b"a\nb\n"})
+    claim = {**_claim(), "acceptance_uri": f"s3://data/{acc_key}",
+             "acceptance_sha256": hashlib.sha256(b"a\nb\n").hexdigest()}
+    att = {**driver._verify_gold_extract(s3, "data", {"extract_uri": claim["acceptance_uri"],
+                                                      "extract_sha256": claim["acceptance_sha256"]})}
+    assert att["verified"] is True and att["rows"] == 2
+    assert driver.ACCEPTANCE_CLAIM_KEYS == ("acceptance_uri", "acceptance_sha256")

@@ -5,6 +5,69 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
 ## [Unreleased]
 
+### Phase 1 PR-11: a held-out acceptance set, so a lakehouse gate measures the model
+
+PR-09's live run ended borderline: 32/32 on `gold.qlora_eval`, but n=32 cannot clear a 0.95 Wilson
+lower bound. Measuring before rerunning showed why more rows alone would not help. The generator built
+every conversation from one or two templates per intent, so every eval row was a near-copy of a
+training row (median closest-match similarity 0.935 within a dataset, 0.95 across seeds). A larger
+eval would have measured template recall.
+
+**Generator v2** (`generator_version: "2"`). Each intent has one policy answer and two kinds of
+question phrasing:
+- **train** phrasings, which conversations use;
+- **held-out** phrasings, which only the acceptance set (`eval_prompts.jsonl`) uses, each row with a
+  reference answer. It has 120 items at demo scale and 40 at small.
+
+The acceptance set's median closest-match similarity to training is **0.538**, with zero exact
+matches.
+
+**Pipeline.** The export copies the acceptance set into the hashed extract bundle, refusing a set
+without references. The review checks it against training and claims it. The driver attests it
+(`acceptance_set`), and eval anchors a lakehouse gate to it, falling back to the val split only when
+it is absent.
+
+**Live:**
+- smoke 25/25 on v2 (generator digest 3.9 = 3.12);
+- a `lakehouse_ingest` run SUCCEEDED in 11 min;
+- the training run's review has both the extract and the acceptance set attested `verified: true`
+  (257 and 120 rows).
+- **The gate**, on the 120 held-out items:
+  - `answer_match` **0.70** (84/120, CI [0.613, 0.775]) passes 0.6 decisively.
+  - `format_validity` **0.983** (118/120, CI [0.941, 0.995]) is **borderline** at 0.95. The two
+    failures are a coined `[ORDERID]` token, in the style of the bracketed redaction tokens that 27
+    training rows carry.
+  - The page went unanswered, so the run escalated without a deploy. The owner decides.
+
+  On template recall the same kind of model had scored 32/32. This is the first gate number here
+  that measures the model.
+
+**The owner ruled the format gate a failure. Data-layer fix, retrain: gate passed.**
+- **Gold now promotes no pair that carries a redaction token.** Silver keeps them as the audited
+  record, and Gold DQ asserts none.
+- **Fresh ingest:** 30 redacted pairs were held back; train/eval 230/23.
+- **The retrain was judged on the same 120 held-out items:**
+  - `format_validity` **1.000** (120/120, CI [0.969, 1.0]);
+  - `answer_match` **0.725** (87/120, CI [0.639, 0.797]).
+- **Through the gated path:** `QualityGateChoice → Deploy` (smoke 3/3, p50 473 ms; model package at
+  `PendingManualApproval`), then `Teardown` (endpoint deleted, 0 orphans). This is the platform's
+  first `gate_passed: true`.
+
+A first retrain failed on `FinetuneAnalyze`'s 3600 s ceiling while the full job waited in a capacity
+queue, so the ceiling is now 86400 s (analyze holds no endpoint). The probe → full protocol is filed
+separately.
+
+**Fixed (found live): a job that finished before its token was parked was never resumed.**
+`job_launched` is serviced when the agent's turn ends. A probe that completed during the turn sent
+its state-change event to a row with no token, and the run sat on a token nothing would settle.
+After parking, the driver now describes the job, and if it is already terminal it hands the resume
+Lambda the same event. New grant `LateJobDelivery`: describe `training-job/llmops-*` and invoke the
+resume function only.
+
+While writing it, a field-name defect was caught: describe returns `BillableTimeInSeconds`, not the
+event's `BillingSecondsUsed`. Reading the wrong field would have made every late-delivered real stop
+a free capacity relaunch; a test now holds the driver's event to the resume handler's
+`_is_capacity_stop`.
 ### #168 deployed on top of #167, and two claims corrected
 
 The driver, start-pipeline, state machine (35 states) and console are live at `main` (#168's merge),
