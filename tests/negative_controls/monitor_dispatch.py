@@ -6135,6 +6135,19 @@ case("driver: a job that finished before its token was parked is never resumed",
      [f"{_LM}test_servicing_job_launched_checks_the_job_and_delivers_a_finished_one"])
 
 
+def m355(t):
+    # Gold promotes redacted pairs again: bracket tokens return to the training text, and the student
+    # learns to coin its own (`[ORDERID]`, the 2 format failures of PR-11's first gate).
+    old = "        if carries_redaction(p):\n            continue\n"
+    assert t.count(old) == 1, "the Gold redaction exclusion moved"
+    return t.replace(old, "", 1)
+
+
+case("lakehouse: Gold trains on rows that still carry redaction tokens",
+     "pipeline/lakehouse/transform.py", m355,
+     ["tests/test_lakehouse_transform.py::test_gold_promotes_no_pair_that_carries_a_redaction_token"])
+
+
 #: Where the pristine text of the file currently mutated is parked, so a kill -9 -- which
 #: no handler can intercept -- still leaves the original recoverable. Under the repo root
 #: rather than /tmp because it must be obvious to whoever finds the tree dirty, and

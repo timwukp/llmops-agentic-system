@@ -107,15 +107,59 @@ A double delivery is the existing path: the first clears the token, the second f
   the fix was deployed. It sent the exact payload the fix would have sent had it been live at 11:05.
   The token was cleared, `last_job_status` is `Completed`, and the run moved to `FinetuneAnalyze`.
 
-## Owner decision
+## Owner decision, the data-layer fix, and the retrain: **gate passed**
 
-`format_validity` is borderline at 0.983 (118/120), with a lower bound of 0.941, against 0.95.
-`answer_match` passes decisively. The run is escalated and nothing was deployed. The owner's
-options are recorded with the run:
-- accept the model;
-- treat the gate as failed and fix the placeholder leak at the data layer (for example, drop or
-  rephrase redacted rows rather than training on bracket tokens), then retrain;
-- change the scorer.
+The owner ruled the borderline format gate a **failure** and asked for the placeholder leak to be fixed
+at the data layer, then a retrain.
+
+**The fix.** Silver keeps every redacted pair: it is the governed, audited record of what redaction
+did. Gold, where training data is chosen, now promotes **no pair that still carries a redaction
+token** (`transform.carries_redaction`), and `GOLD_DQDL` gained a rule asserting that no
+`[CARD]`/`[EMAIL]`/`[NAME]`/`[PHONE]`/`[TW_ID]`/`[UBN]` appears in Gold instructions or outputs. That rule
+uses LIKE over the exact token list, because Spark's LIKE treats brackets literally. The demo smoke
+passed 25/25, Gold DQ included.
+
+**Fresh ingest** (`run-20261015T125141Z-bcb61189`, SUCCEEDED): of 283 Silver pairs, **30 redacted pairs
+were held back** from Gold. Train/eval is 230/23, and Gold DQ passed 12/12.
+
+**First retrain** (`run-20261015T130703Z-f5d05255`): FAILED for a reason unrelated to the data.
+- **Cause.** The full job sat in the ml.g5.2xlarge capacity queue past `FinetuneAnalyze`'s 3600 s
+  ceiling. Under the probe → full protocol the full job is launched from analyze, which has no
+  handoff, so analyze waited and timed out.
+- **Fix.** `FinetuneAnalyze` moved to the 86400 s class: the one-hour ceiling protects states that
+  hold an endpoint, and analyze holds none.
+- **Follow-up.** The protocol itself is filed as its own task.
+- **The orphaned job** was stopped before it started: 0 billable seconds.
+
+**Retrain** (`run-20261015T142928Z-fbcd65dc`): SUCCEEDED, through the gated path. The probe waited
+about 8 hours for capacity (22:32 → 06:45); after that the run went
+`FinetuneAnalyze → EvalGenerate → EvalScore → EvalGate → QualityGateChoice → Deploy → SmokeTest →
+MonitorHealth → Teardown → MonitorReport → Complete`.
+- **Driver attestations:**
+  - `gold_extract`: verified, 230 rows;
+  - `acceptance_set`: verified, 120 rows.
+- **The gate**, on the 120 held-out acceptance items:
+
+| Gate | Before the fix (257 train rows) | After the fix (230 train rows) | Threshold | Verdict |
+|---|---|---|---|---|
+| `format_validity` | 0.983 (118/120), CI [0.941, 0.995] | **1.000 (120/120), CI [0.969, 1.000]** | 0.95 | **pass** |
+| `answer_match` | 0.700 (84/120), CI [0.613, 0.775] | **0.725 (87/120), CI [0.639, 0.797]** | 0.6 | **pass** |
+
+- **What changed.** Zero format failures: no coined placeholder token in any answer. That is the
+  defect the fix targeted, gone. `answer_match` held up and rose slightly, even with 27 fewer
+  training rows.
+- **Remaining misses (33).** They are concentrated in promo (15) and complaint (11); return_request
+  (4), stock_check (3) and order_status (0) have few or none. The scorer is still strict
+  reference matching.
+- **Serving, then teardown:**
+  - **Smoke** passed 3/3 canaries, at p50 latency 473 ms.
+  - **Registration:** the model package is `llmops-store-copilot-lakehouse-student/1` at
+    **`PendingManualApproval`**. A passing gate is not an approval: that stays a human decision.
+  - **Teardown:** the endpoint is deleted, with 2 endpoint configs and 2 models removed and
+    `orphans_remaining: 0`. `list-endpoints` shows nothing for the run.
+
+This is the first run on this platform to produce `gate_passed: true` and reach `Deploy` through
+`QualityGateChoice`. ARCHITECTURE's 2026-08-15 measurement had found that no run had ever done so.
 
 ## Not done in this PR (from the Phase 1 plan)
 

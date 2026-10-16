@@ -42,6 +42,21 @@ it is absent.
   On template recall the same kind of model had scored 32/32. This is the first gate number here
   that measures the model.
 
+**The owner ruled the format gate a failure. Data-layer fix, retrain: gate passed.**
+- **Gold now promotes no pair that carries a redaction token.** Silver keeps them as the audited
+  record, and Gold DQ asserts none.
+- **Fresh ingest:** 30 redacted pairs were held back; train/eval 230/23.
+- **The retrain was judged on the same 120 held-out items:**
+  - `format_validity` **1.000** (120/120, CI [0.969, 1.0]);
+  - `answer_match` **0.725** (87/120, CI [0.639, 0.797]).
+- **Through the gated path:** `QualityGateChoice → Deploy` (smoke 3/3, p50 473 ms; model package at
+  `PendingManualApproval`), then `Teardown` (endpoint deleted, 0 orphans). This is the platform's
+  first `gate_passed: true`.
+
+A first retrain failed on `FinetuneAnalyze`'s 3600 s ceiling while the full job waited in a capacity
+queue, so the ceiling is now 86400 s (analyze holds no endpoint). The probe → full protocol is filed
+separately.
+
 **Fixed (found live): a job that finished before its token was parked was never resumed.**
 `job_launched` is serviced when the agent's turn ends. A probe that completed during the turn sent
 its state-change event to a row with no token, and the run sat on a token nothing would settle.

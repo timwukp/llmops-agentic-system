@@ -460,7 +460,7 @@
         }
       },
       "ResultPath": "$.training_analysis",
-      "TimeoutSeconds": 3600,
+      "TimeoutSeconds": 86400,
       "Catch": [
         {
           "ErrorEquals": [

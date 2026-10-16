@@ -3832,10 +3832,14 @@ class TestStateMachine:
         is always safe and should not need this test edited.
         """
         CLEANUP = {"Teardown", "MonitorHealth", "MonitorReport", "SmokeTest",
-                   "Deploy", "DataAudit", "FinetuneAnalyze"}
+                   "Deploy", "DataAudit"}
+        # FinetuneAnalyze moved here from CLEANUP (PR-11, live): under the probe -> full protocol
+        # the full training job is launched from analyze, and run-20261015T130703Z-f5d05255's
+        # analyze waited on it through an ml.g5.2xlarge capacity queue until the 3600 s ceiling
+        # failed the run. Analyze holds no endpoint, so the cost argument above does not reach it.
         LONG_WORK = {"DataPrepGenerate", "DataPrepCurate", "FinetuneLaunch",
                      "EvalGenerate", "EvalScore", "EvalGate", "RemediateFinetune",
-                     "LakehouseReview"}
+                     "LakehouseReview", "FinetuneAnalyze"}
         # The lakehouse Glue states wait on a job with its own Timeout, and that one must fire
         # first: a job that times out ends FAILED with its error, while a state that times out
         # around a running job leaves .sync to stop it and the cause unrecorded. Derived from

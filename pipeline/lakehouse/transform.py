@@ -45,8 +45,7 @@ EVAL_MODULO = 10  # 1 in 10 pairs goes to eval
 SILVER_DQDL = ('Rules = [ IsComplete "pair_id", IsComplete "instruction", IsComplete "output", '
                'Uniqueness "pair_id" = 1.0, RowCount > 0, '
                'CustomSql "SELECT COUNT(*) FROM primary WHERE output LIKE \'%<think>%\'" = 0 ]')
-GOLD_DQDL = ('Rules = [ IsComplete "instruction", IsComplete "output", Uniqueness "pair_id" = 1.0, '
-             'ColumnValues "split" in ["train", "eval"], RowCount > 0 ]')
+GOLD_DQDL = None  # built below, once the redaction tokens are defined
 
 
 # ── PII: structured identifiers (S4's validated layer) ───────────────────────
@@ -227,10 +226,28 @@ def split_of(pid: str) -> str:
     return "eval" if int(pid[:8], 16) % EVAL_MODULO == 0 else "train"
 
 
+def redaction_tokens() -> list[str]:
+    """Every placeholder the Silver redaction writes."""
+    return sorted({token for token, _, _ in STRUCTURED} | {"[NAME]"})
+
+
+def carries_redaction(pair: dict) -> bool:
+    text = " ".join(str(pair.get(k) or "") for k in ("instruction", "input", "output"))
+    return any(t in text for t in redaction_tokens())
+
+
 def silver_to_gold(pairs: list[dict]) -> tuple[list[dict], list[dict]]:
-    """(train, eval) rows in the Gold contract: pair_id, instruction, input, output, split."""
+    """(train, eval) rows in the Gold contract: pair_id, instruction, input, output, split.
+
+    A pair that still carries a redaction placeholder stays in Silver (the governed, audited record
+    of what redaction did) and is NOT promoted to Gold. Redacted text is still training text: live
+    (PR-11) a student trained on 27 such rows coined an `[ORDERID]` of its own in 2 of 120 held-out
+    answers, the bracket style learned as output, and the format gate failed on exactly those. Gold
+    is where training data is chosen, so that is where the exclusion lives, and GOLD_DQDL asserts it."""
     train, ev = [], []
     for p in pairs:
+        if carries_redaction(p):
+            continue
         row = {"pair_id": p["pair_id"], "instruction": p["instruction"], "input": p["input"] or "",
                "output": p["output"], "split": split_of(p["pair_id"])}
         (ev if row["split"] == "eval" else train).append(row)
@@ -269,3 +286,15 @@ def compare_to_plants(rules: dict, expected: dict) -> dict:
             ok = caught == {i["conversation_id"] for i in plant["items"]}
         out[rule] = (ok, f"caught {rules[rule]['count']}, planted {plant['count']}")
     return out
+
+
+def _gold_dqdl() -> str:
+    """LIKE over the exact token list rather than a regex: Spark's LIKE treats brackets literally
+    (only % and _ are special, and an `_` matching any character only widens the check)."""
+    hits = " OR ".join(f"{col} LIKE '%{t}%'" for t in redaction_tokens() for col in ("instruction", "output"))
+    return ('Rules = [ IsComplete "instruction", IsComplete "output", Uniqueness "pair_id" = 1.0, '
+            'ColumnValues "split" in ["train", "eval"], RowCount > 0, '
+            f'CustomSql "SELECT COUNT(*) FROM primary WHERE {hits}" = 0 ]')
+
+
+GOLD_DQDL = _gold_dqdl()
