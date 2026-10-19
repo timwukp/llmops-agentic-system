@@ -38,11 +38,13 @@ try:
     from pipeline.contracts import events as ev
     from pipeline.contracts.report import normalize_stage_complete, write_run_report
     from pipeline.contracts.task_tokens import is_task_gone
+    from pipeline.contracts import tasks as task_contracts
     from orchestration import conductor_tools
 except ImportError:  # Lambda bundle layout (contracts vendored alongside)
     import events as ev  # type: ignore
     from report import normalize_stage_complete, write_run_report  # type: ignore
     from task_tokens import is_task_gone  # type: ignore
+    import tasks as task_contracts  # type: ignore
     import conductor_tools  # type: ignore
 
 # (stage, task) -> EventBridge detail-type. eval/gate resolved dynamically.
@@ -1687,7 +1689,7 @@ def handle_stage_complete(c, event, args) -> dict:
             **({"report_error": report_error} if report_error else {})}
 
 
-def handle_job_launched(c, event, args) -> dict:
+def handle_job_launched(c, event, args, kind: str = "") -> dict:
     """Launch-and-release: park the token keyed by job name; resume λ settles it.
 
     Stage-generic: finetune parks its training job here and eval parks its student
@@ -1697,12 +1699,16 @@ def handle_job_launched(c, event, args) -> dict:
     current_stage says whose it is."""
     run_id = event["run_id"]
     table = c["ddb"].Table(os.environ["RUNS_TABLE"])
+    # job_kind: which kind of job this token waits on, so the resume Lambda can keep a probe's
+    # completion off the timeline as ModelTrained. Written on EVERY handoff, "unverified" when the
+    # check could not read the job: skipping the write would leave the previous handoff's
+    # "probe" on the row, and the full job's completion would then go unannounced.
     table.update_item(
         Key={"run_id": run_id},
-        UpdateExpression="SET job_name = :j, task_token = :t, current_stage = :s",
+        UpdateExpression="SET job_name = :j, task_token = :t, current_stage = :s, job_kind = :k",
         ExpressionAttributeValues={":j": args.get("job_name", ""),
                                    ":t": event.get("task_token", ""),
-                                   ":s": event["stage"]})
+                                   ":s": event["stage"], ":k": kind or "unverified"})
     ev.emit_event(os.environ["EVENT_BUS"], ev.TRAINING_STARTED,
                   {"run_id": run_id, "job_name": args.get("job_name", "")},
                   client=c["events"])
@@ -1755,6 +1761,63 @@ def _deliver_if_already_terminal(c, run_id: str, job_name: str) -> dict:
         print(f"[driver] {job_name} is {status} but the late delivery failed for {run_id}: "
               f"{type(exc).__name__}: {exc}")
         return {"terminal_check": status, "late_delivery": False}
+
+
+def check_handoff(c, event, job_name: str) -> tuple:
+    """(rejection reason or None, job kind or "", note) for a job_launched about to be parked.
+
+    A parked token is a promise that the NEXT state runs when this job ends, so which job it is
+    decides what runs next. task_contracts.JOB_HANDOFFS says which tasks may hand off at all and
+    on which kind of job; the kind is read off the job itself (its max_steps), never off its name
+    or the agent's word, because the prompt said the right thing on all three runs that named the
+    probe where the full job belonged (2026-10-15).
+
+    Rejections go back into the turn, like a stage_complete with missing outputs: the agent can
+    still launch the right job, which a parked token on the wrong one can no longer undo.
+
+      * no handoff for this task -- FinetuneAnalyze is the case that mattered: a job started there
+        is one nothing resumes on, and the state either completes without it or waits in-session;
+      * no such training job -- the resume Lambda keys on the name, so a typo is a token nothing
+        ever settles;
+      * the wrong kind -- a probe where the full job belongs resumes analyze on a measurement, and
+        a full job where the probe belongs leaves launch_full nothing to measure.
+
+    Any OTHER failure to read the job accepts it, with the check recorded as unverified: refusing
+    on a throttle or a missing grant would turn a lost check into a run that cannot hand off.
+    """
+    key = (event.get("stage"), event.get("task"))
+    want = task_contracts.JOB_HANDOFFS.get(key)
+    if want is None:
+        return (f"{key[0]}/{key[1]} has no launch-and-release handoff: the state that runs it "
+                "does not wait for a job, so a job launched here is one the pipeline never "
+                "resumes on. Do not launch training from this task. If a job is needed, the "
+                "protocol broke upstream -- escalate_human with what you found.", "", "no-handoff")
+    sm = c.get("sagemaker")
+    if sm is None:
+        return None, "", "unverified: no sagemaker client"
+    try:
+        desc = sm.describe_training_job(TrainingJobName=job_name)
+    except Exception as exc:  # noqa: BLE001 -- classified below
+        err = getattr(exc, "response", {}).get("Error", {}) if hasattr(exc, "response") else {}
+        if (err.get("Code") == "ValidationException"
+                and "not found" in str(err.get("Message", "")).lower()):
+            return (f"no SageMaker training job named {job_name!r} exists, so nothing would ever "
+                    "resume this run. Name the job you actually created (DescribeTrainingJob to "
+                    "confirm it) and call job_launched again.", "", "not-found")
+        print(f"[driver] handoff check could not read {job_name}: {type(exc).__name__}: {exc}; "
+              "accepting it unverified")
+        return None, "", f"unverified: {type(exc).__name__}"
+    kind = task_contracts.job_kind(desc.get("HyperParameters") or {})
+    if want != task_contracts.ANY and kind != want:
+        if want == task_contracts.PROBE:
+            why = ("this task hands off on the 20-step PROBE (max_steps > 0); the full job is "
+                   "launch_full's, in a fresh session after the probe has finished")
+        else:
+            why = ("this task hands off on the FULL job (max_steps 0); handing off a probe here "
+                   "would resume analyze on a measurement instead of a trained model")
+        return (f"{job_name!r} is a {kind} job, but {key[0]}/{key[1]} must name a {want} job: "
+                f"{why}. Launch the right job and call job_launched with its name.", kind, "wrong-kind")
+    return None, kind, "verified"
 
 
 #: The finops agent is the one harness that is NOT a pipeline stage: it is invoked by
@@ -3220,10 +3283,16 @@ def _run_stage(event, context=None, c=None):
                                   "created (DescribeTrainingJob to confirm it), or "
                                   "fix the launch and call again."})
                     continue
-                handle_job_launched(c, event, args)
+                refusal, kind, handoff = check_handoff(c, event, str(args["job_name"]).strip())
+                if refusal:
+                    messages = _tool_result_content(tu, {"status": "rejected",
+                                                         "reason": refusal})
+                    continue
+                handle_job_launched(c, event, args, kind)
                 _ack_terminal(c, event, sess, tu, {"status": "released"},
                               "the task token was parked for EventBridge to settle")
-                return {"status": "released", "job_name": args.get("job_name")}
+                return {"status": "released", "job_name": args.get("job_name"),
+                        "job_kind": kind, "handoff_check": handoff}
             if name == "checkpoint":
                 # Just answer it and let the loop-top _out_of_time() check own the
                 # reinvoke. This branch used to reinvoke itself with {"_resumed": True}

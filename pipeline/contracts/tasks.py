@@ -83,8 +83,8 @@ TASKS_WITHOUT_A_DISPATCH_SITE: dict = {
         "mirrored yet and all 19 skill sources are still git, so nothing has called it -- "
         "tracked with the git->s3 source switch."),
     ("finetune", "prepare"): (
-        "BY DESIGN, absorbed by `launch`: the ASL goes FinetuneLaunch -> FinetuneAnalyze "
-        "with no prepare state, and the launch prompt reads curated.jsonl and writes "
+        "BY DESIGN, absorbed by `launch`: the ASL goes FinetuneLaunch -> FinetuneLaunchFull "
+        "-> FinetuneAnalyze with no prepare state, and the launch prompt reads curated.jsonl and writes "
         "training/config.json itself. The clause stays because `remediate` writes a REVISED "
         "training/config.json and is told to 'proceed exactly as launch' -- both share "
         "prepare's contract, so deleting it would delete the description of what they do."),
@@ -99,6 +99,50 @@ TASKS_WITHOUT_A_DISPATCH_SITE: dict = {
         "TASK, so the rollup only ever happens as a side-effect of somebody chatting. The "
         "shape wants what finops has -- a schedule plus an on-demand console route."),
 }
+
+
+#: The kinds of SageMaker training job a launch-and-release handoff can name.
+PROBE, FULL, ANY = "probe", "full", "any"
+
+#: (stage, task) -> the kind of job that task's ``job_launched`` must name. A task absent from
+#: this dict has no launch-and-release handoff, and the driver rejects its ``job_launched``.
+#:
+#: The probe and the full job are two handoffs, not one, because the pipeline waits on each of
+#: them. Until 2026-10-15 the `launch` task was told to run a 20-step probe, read its measured
+#: s/step, launch the full job, AND "call job_launched and END YOUR TURN" -- one handoff for two
+#: jobs. Live the agent named the probe three times out of three; the state machine resumed into
+#: FinetuneAnalyze on the probe's completion, and the full job was launched from analyze, which
+#: nothing resumes. run-20261015T130703Z-f5d05255's analyze then sat in-session through a
+#: capacity queue until its 3600 s timeout failed the run. So each job gets its own state, and the
+#: kind is checked on the job itself rather than taken from the prompt: the prompt said the right
+#: thing every time, and the agent did the other thing every time.
+#:
+#: The test derives the key set from the prompt bullets that promise job_launched, both ways, so
+#: a launch task cannot be added to a prompt without being declared here, or declared here
+#: without the prompt saying so.
+JOB_HANDOFFS: dict = {
+    ("finetune", "launch"): PROBE,
+    ("finetune", "remediate"): PROBE,
+    ("finetune", "launch_full"): FULL,
+    # Student inference rides the training-job rail (same EventBridge rule, same resume
+    # Lambda); it is neither kind, so any job will do.
+    ("eval", "evaluate"): ANY,
+}
+
+
+def job_kind(hyperparameters: dict) -> str:
+    """``probe`` for a step-capped measurement, ``full`` for everything else.
+
+    Read from the job's own HyperParameters, which DescribeTrainingJob returns as strings the SDK
+    may have JSON-encoded (``'"20"'``), hence the strip. ``--max_steps`` is the trainer's one
+    step cap and the probe recipe is the one job that sets it (a real run leaves it at 0), so it
+    is the discriminator the job carries whatever the agent called it.
+    """
+    raw = str((hyperparameters or {}).get("max_steps", "0")).strip().strip('"')
+    try:
+        return PROBE if int(float(raw or 0)) > 0 else FULL
+    except ValueError:
+        return FULL
 
 
 def declared_tasks(prompt_text: str) -> set:

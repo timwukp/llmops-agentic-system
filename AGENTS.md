@@ -304,6 +304,21 @@ versions and introspects the live CreateHarness/UpdateHarness schemas.
   launch-and-release (`job_launched` → Step Functions `waitForTaskToken` →
   EventBridge SageMaker state-change rule → resume in a FRESH session).
   State lives in the S3 manifest + DynamoDB, never in the session.
+- **One handoff per job the pipeline waits on, and the driver checks which job.** Finetune's
+  `launch` used to run a 20-step probe, read its s/step, launch the full job, *and* "call
+  job_launched and END YOUR TURN". That is one handoff for two jobs. On 2026-10-15 the agent named
+  the probe three runs out of three. The machine resumed into `FinetuneAnalyze` on the probe, and
+  the full job was launched from analyze, which nothing resumes; one run waited there through a
+  capacity queue until the stage timed out. Raising analyze's timeout (PR-11's stopgap) only
+  lengthens that wait.
+
+  Now `launch`/`remediate` hand off the probe and `FinetuneLaunchFull` (task `launch_full`) hands
+  off the full job; analyze waits on nothing. `JOB_HANDOFFS` in `pipeline/contracts/tasks.py` says
+  which task hands off which kind. The driver reads the kind off the job's own `max_steps`
+  (DescribeTrainingJob) and rejects a wrong-kind, nonexistent or no-handoff `job_launched` back
+  into the turn. The prompt said the right thing every time, so the check is on the job, not the
+  words. A new launch task needs an entry there, and the test derives the key set from the prompt
+  bullets both ways.
 - **DeepSeek-R1 output contains `<think>...</think>`** — the data-prep agent strips
   it by default (sequence-level KD keeps final answers only).
 

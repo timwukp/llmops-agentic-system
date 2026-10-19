@@ -2108,13 +2108,14 @@ def test_the_card_does_not_list_the_whole_account_once_per_stage_box(console, mo
 
 
 def test_the_remediation_stage_reports_both_states_it_can_run_as(console, monkeypatch):
-    """RemediateFinetune and FinetuneLaunch map to ONE box. Whichever the dict happens
-    to visit second must not overwrite the first, or the card names the wrong state for
-    half the runs -- silently, since both are plausible."""
+    """RemediateFinetune, FinetuneLaunch and FinetuneLaunchFull map to ONE box. Whichever
+    the dict happens to visit later must not overwrite the earlier, or the card names the
+    wrong state for most runs -- silently, since all three are plausible."""
     console._STAGE_CFG_CACHE.clear()
     monkeypatch.setattr(console, "sfn", _fake_sfn_history([], "SUCCEEDED"))
     cfg = console.stage_config()["finetune-launch"]
-    assert set(cfg["states"]) == {"FinetuneLaunch", "RemediateFinetune"}, cfg["states"]
+    assert set(cfg["states"]) == {"FinetuneLaunch", "FinetuneLaunchFull",
+                                  "RemediateFinetune"}, cfg["states"]
 
 
 def test_a_hover_card_never_breaks_the_flow_diagram(console, monkeypatch):

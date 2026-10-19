@@ -6159,6 +6159,251 @@ def m356(t):
 case("console: intake verifies a lakehouse dataset that has no held-out acceptance set",
      "deploy/console/lambda_function.py", m356,
      ["tests/test_console_lakehouse_intake.py::test_a_generator_v1_dataset_is_refused_because_it_has_no_acceptance_set"])
+# --- probe -> full: two launch-and-release handoffs (probe-full-handoff) ------------------
+#
+# Numbered from m360 so they cannot collide with PR-11's m354 when both land.
+_PF = "tests/test_orchestration.py::TestProbeFullHandoff::"
+_ASL = "orchestration/state_machine.asl.json"
+
+
+def m360(t):
+    # The driver parks whatever job it is handed: the 2026-10-15 shape, three runs out of three.
+    old = 'refusal, kind, handoff = check_handoff(c, event, str(args["job_name"]).strip())'
+    assert t.count(old) == 1, "the handoff check call moved"
+    return t.replace(old, 'refusal, kind, handoff = None, "", "skipped"', 1)
+
+
+case("handoff: the driver parks any job_launched without checking it", _DRIVER, m360,
+     [f"{_PF}test_launch_rejects_a_full_job_and_hears_the_probe_after",
+      f"{_PF}test_launch_full_rejects_the_probe_and_hears_the_full_job_after",
+      f"{_PF}test_analyze_cannot_hand_off_at_all",
+      f"{_PF}test_a_job_that_does_not_exist_is_refused"])
+
+
+def m361(t):
+    # The kind is read and then ignored: a probe resumes analyze again.
+    old = "    if want != task_contracts.ANY and kind != want:\n"
+    assert t.count(old) == 1, "the kind comparison moved"
+    return t.replace(old, "    if False:\n", 1)
+
+
+case("handoff: a job of the wrong kind is parked anyway", _DRIVER, m361,
+     [f"{_PF}test_launch_rejects_a_full_job_and_hears_the_probe_after",
+      f"{_PF}test_launch_full_rejects_the_probe_and_hears_the_full_job_after"])
+
+
+def m362(t):
+    # A task with no handoff is treated as one that takes any job: analyze can park a token again.
+    old = "    want = task_contracts.JOB_HANDOFFS.get(key)\n"
+    assert t.count(old) == 1, "the handoff lookup moved"
+    return t.replace(old, "    want = task_contracts.JOB_HANDOFFS.get(key, task_contracts.ANY)\n", 1)
+
+
+case("handoff: a task with no handoff (analyze) may park a token", _DRIVER, m362,
+     [f"{_PF}test_analyze_cannot_hand_off_at_all"])
+
+
+def m363(t):
+    # A typo'd job name is parked: the resume Lambda keys on the name, so nothing ever settles it.
+    old = 'and "not found" in str(err.get("Message", "")).lower()):'
+    assert t.count(old) == 1, "the not-found discrimination moved"
+    return t.replace(old, 'and "never matches" in str(err.get("Message", "")).lower()):', 1)
+
+
+case("handoff: a job that does not exist is parked", _DRIVER, m363,
+     [f"{_PF}test_a_job_that_does_not_exist_is_refused"])
+
+
+def m364(t):
+    # Fail closed on any read error: a throttle or a missing grant becomes a run that cannot hand off.
+    old = '        return None, "", f"unverified: {type(exc).__name__}"'
+    assert t.count(old) == 1, "the unverified-accept moved"
+    return t.replace(old, '        return (f"cannot read {job_name}", "", "unreadable")', 1)
+
+
+case("handoff: an unreadable job is refused instead of accepted unverified", _DRIVER, m364,
+     [f"{_PF}test_an_unreadable_job_is_accepted_unverified_not_refused"])
+
+
+def m365(t):
+    # An unverified handoff leaves the previous handoff's job_kind on the row.
+    old = '":s": event["stage"], ":k": kind or "unverified"})'
+    assert t.count(old) == 1, "the job_kind write moved"
+    return t.replace(old, '":s": event["stage"], ":k": kind})', 1)
+
+
+case("handoff: an unclassified handoff keeps the previous job_kind", _DRIVER, m365,
+     [f"{_PF}test_an_unreadable_job_is_accepted_unverified_not_refused"])
+
+
+def m366(t):
+    # job_kind reads a key the job does not carry: every probe reads as a full job.
+    old = 'raw = str((hyperparameters or {}).get("max_steps", "0"))'
+    assert t.count(old) == 1, "job_kind's read moved"
+    return t.replace(old, old.replace('"max_steps"', '"max_step"'), 1)
+
+
+case("handoff: job_kind misreads the step cap", "pipeline/contracts/tasks.py", m366,
+     [f"{_PF}test_job_kind_reads_the_step_cap_off_the_job_itself",
+      f"{_PF}test_launch_parks_the_probe_and_records_its_kind"])
+
+
+def m367(t):
+    # launch_full is undeclared: the prompt sends it to job_launched and the driver refuses it.
+    old = '    ("finetune", "launch_full"): FULL,\n'
+    assert t.count(old) == 1, "the launch_full handoff moved"
+    return t.replace(old, "", 1)
+
+
+case("handoff: launch_full's handoff is not declared", "pipeline/contracts/tasks.py", m367,
+     [f"{_PF}test_the_handoff_contract_is_exactly_the_prompt_bullets_that_promise_job_launched",
+      f"{_PF}test_launch_full_rejects_the_probe_and_hears_the_full_job_after"])
+
+
+def _asl_edit(fn):
+    def mutate(t):
+        d = json.loads(t)
+        fn(d["States"])
+        return json.dumps(d, indent=2, ensure_ascii=False) + "\n"
+    return mutate
+
+
+def _back_to_one_handoff(s):
+    # The original defect: the probe's completion resumes analyze.
+    assert s["FinetuneLaunch"]["Next"] == "FinetuneLaunchFull", "FinetuneLaunch's Next moved"
+    s["FinetuneLaunch"]["Next"] = "FinetuneAnalyze"
+
+
+case("handoff: FinetuneLaunch goes straight to analyze again", _ASL, _asl_edit(_back_to_one_handoff),
+     [f"{_PF}test_a_probe_handoff_is_followed_by_the_full_jobs_own_handoff",
+      f"{_PF}test_analyze_is_entered_only_after_a_full_handoff"])
+
+
+def _remediate_skips_full(s):
+    assert s["RemediateFinetune"]["Next"] == "FinetuneLaunchFull", "RemediateFinetune's Next moved"
+    s["RemediateFinetune"]["Next"] = "FinetuneAnalyze"
+
+
+case("handoff: a remediation's probe resumes analyze", _ASL, _asl_edit(_remediate_skips_full),
+     [f"{_PF}test_a_probe_handoff_is_followed_by_the_full_jobs_own_handoff",
+      f"{_PF}test_analyze_is_entered_only_after_a_full_handoff",
+      "tests/test_orchestration.py::TestStateMachine::test_remediation_loop_wiring"])
+
+
+def _analyze_waits_a_day(s):
+    # PR-11's stopgap, which lets analyze hold a session for a day instead of failing.
+    assert s["FinetuneAnalyze"]["TimeoutSeconds"] <= 7200, "analyze's timeout moved"
+    s["FinetuneAnalyze"]["TimeoutSeconds"] = 86400
+
+
+case("handoff: FinetuneAnalyze gets a day-long ceiling", _ASL, _asl_edit(_analyze_waits_a_day),
+     [f"{_PF}test_analyze_waits_on_no_job_so_it_keeps_a_short_ceiling"])
+
+
+def _capacity_buys_a_probe(s):
+    cat = next(c for c in s["FinetuneLaunchFull"]["Catch"] if c["ErrorEquals"] == ["CapacityStopped"])
+    cat["Next"] = "FinetuneLaunch"
+
+
+case("handoff: a capacity stop of the full job re-enters FinetuneLaunch", _ASL,
+     _asl_edit(_capacity_buys_a_probe),
+     [f"{_PF}test_the_full_jobs_capacity_stop_does_not_buy_a_second_probe",
+      "tests/test_orchestration.py::TestStateMachine::"
+      "test_a_capacity_stop_relaunches_the_same_state_without_incrementing_iteration"])
+
+
+def _full_job_failure_escalates(s):
+    before = len(s["FinetuneLaunchFull"]["Catch"])
+    s["FinetuneLaunchFull"]["Catch"] = [c for c in s["FinetuneLaunchFull"]["Catch"]
+                                        if c["ErrorEquals"] != ["TrainingJobFailed"]]
+    assert len(s["FinetuneLaunchFull"]["Catch"]) == before - 1, "the TrainingJobFailed catch moved"
+
+
+case("handoff: a failed full job skips the remediation budget", _ASL,
+     _asl_edit(_full_job_failure_escalates),
+     ["tests/test_orchestration.py::TestStateMachine::test_a_job_launching_state_can_survive_a_failed_job"])
+
+
+def _probe_lands_in_training(s):
+    assert s["FinetuneLaunch"]["ResultPath"] == "$.probe", "FinetuneLaunch's ResultPath moved"
+    s["FinetuneLaunch"]["ResultPath"] = "$.training"
+
+
+case("handoff: the probe's settle lands in $.training", _ASL, _asl_edit(_probe_lands_in_training),
+     [f"{_PF}test_a_probe_handoff_is_followed_by_the_full_jobs_own_handoff"])
+
+
+def m368(t):
+    # The launch bullet hands off on the full job again.
+    old = "then call job_launched naming the PROBE and END YOUR TURN"
+    assert t.count(old) == 1, "launch's handoff sentence moved"
+    return t.replace(old, "then call job_launched naming the job and END YOUR TURN", 1)
+
+
+case("handoff: the launch prompt stops naming the probe", _FT, m368,
+     [f"{_PF}test_the_finetune_prompt_names_one_job_per_handoff"])
+
+
+def m369(t):
+    # launch_full ends in stage_complete: no state hands off the full job.
+    old = "then call job_launched naming the FULL job and END YOUR TURN"
+    assert t.count(old) == 1, "launch_full's handoff sentence moved"
+    return t.replace(old, "then call stage_complete naming the FULL job and END YOUR TURN", 1)
+
+
+case("handoff: the launch_full prompt stops handing off", _FT, m369,
+     [f"{_PF}test_the_finetune_prompt_names_one_job_per_handoff"])
+
+
+def m370(t):
+    # analyze is told to hand off a job it launches: the live behaviour, written down.
+    old = "and never launch or wait for a training job from here."
+    assert t.count(old) == 1, "analyze's no-launch sentence moved"
+    return t.replace(old, "and if you launch the full job here, call job_launched with it.", 1)
+
+
+case("handoff: the analyze prompt promises job_launched", _FT, m370,
+     [f"{_PF}test_the_handoff_contract_is_exactly_the_prompt_bullets_that_promise_job_launched",
+      f"{_PF}test_the_finetune_prompt_names_one_job_per_handoff"])
+
+
+def m371(t):
+    # A probe's completion is announced as a trained model.
+    old = '            if run.get("current_stage") != "eval" and kind != "probe":\n'
+    assert t.count(old) == 1, "the probe exemption moved"
+    return t.replace(old, '            if run.get("current_stage") != "eval":\n', 1)
+
+
+case("handoff: resume announces a probe as ModelTrained", "orchestration/resume_pipeline/handler.py",
+     m371, [f"{_PF}test_a_probe_completion_resumes_without_announcing_a_trained_model"])
+
+
+def m372(t):
+    # The full job's own state has no card: the console shows a run with no live stage.
+    old = '"FinetuneLaunchFull": "finetune-launch",'
+    assert t.count(old) == 1, "the console mapping moved"
+    return t.replace(old, "", 1)
+
+
+case("handoff: the console does not map FinetuneLaunchFull", _CN, m372,
+     [f"{_TC}test_the_remediation_stage_reports_both_states_it_can_run_as"])
+
+
+def m373(t):
+    # The driver role loses the read: every handoff check reports unverified, silently.
+    d = json.loads(t)
+    stripped = 0
+    for s in d["roles"]["driver"]["permissionsPolicy"]["Statement"]:
+        acts = [s["Action"]] if isinstance(s.get("Action"), str) else list(s.get("Action") or [])
+        if "sagemaker:DescribeTrainingJob" in acts:
+            s["Action"] = [a for a in acts if a != "sagemaker:DescribeTrainingJob"]
+            stripped += 1
+    assert stripped, "no driver statement grants DescribeTrainingJob any more"
+    return json.dumps(d, indent=2, ensure_ascii=False) + "\n"
+
+
+case("handoff: the driver role cannot DescribeTrainingJob", _ROLES, m373,
+     [f"{_PF}test_the_driver_role_can_read_the_job_it_classifies"])
 
 
 #: Where the pristine text of the file currently mutated is parked, so a kill -9 -- which

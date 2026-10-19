@@ -3488,7 +3488,10 @@ class TestStateMachine:
         # asserted FinetuneAnalyze["Next"] == "EvalGate" and broke when EvalGenerate was
         # inserted between them, though the guarantee -- remediation returns to analysis
         # and reaches the gate again -- held throughout.
-        assert states["RemediateFinetune"]["Next"] == "FinetuneAnalyze"
+        # Via FinetuneLaunchFull: a remediation hands off on a fresh probe, and the full job
+        # gets its own handoff before analysis (TestProbeFullHandoff).
+        assert states["RemediateFinetune"]["Next"] == "FinetuneLaunchFull"
+        assert states["FinetuneLaunchFull"]["Next"] == "FinetuneAnalyze"
         assert _reaches(states, "FinetuneAnalyze", "EvalGate")
         # budget exhausted -> escalate, never silent fail; escalation closes the run
         # record (MarkRunFailed) and the conductor's task (MarkTaskFailed) on the way
@@ -3833,13 +3836,12 @@ class TestStateMachine:
         """
         CLEANUP = {"Teardown", "MonitorHealth", "MonitorReport", "SmokeTest",
                    "Deploy", "DataAudit"}
-        # FinetuneAnalyze moved here from CLEANUP (PR-11, live): under the probe -> full protocol
-        # the full training job is launched from analyze, and run-20261015T130703Z-f5d05255's
-        # analyze waited on it through an ml.g5.2xlarge capacity queue until the 3600 s ceiling
-        # failed the run. Analyze holds no endpoint, so the cost argument above does not reach it.
         LONG_WORK = {"DataPrepGenerate", "DataPrepCurate", "FinetuneLaunch",
-                     "EvalGenerate", "EvalScore", "EvalGate", "RemediateFinetune",
-                     "LakehouseReview", "FinetuneAnalyze"}
+                     "FinetuneLaunchFull", "EvalGenerate", "EvalScore", "EvalGate",
+                     "RemediateFinetune", "LakehouseReview"}
+        # Waits on no job by construction, so a long ceiling there only ever buys a longer
+        # in-session wait: TestProbeFullHandoff::test_analyze_waits_on_no_job_so_it_keeps_a_short_ceiling.
+        NO_WAIT = {"FinetuneAnalyze"}
         # The lakehouse Glue states wait on a job with its own Timeout, and that one must fire
         # first: a job that times out ends FAILED with its error, while a state that times out
         # around a running job leaves .sync to stop it and the cause unrecorded. Derived from
@@ -3856,8 +3858,8 @@ class TestStateMachine:
                 f"{n}: TimeoutSeconds {st['TimeoutSeconds']} must sit above its job's own "
                 f"{limit}s and within 7200")
         timed = {n for n, st in asl["States"].items() if "TimeoutSeconds" in st}
-        assert timed == CLEANUP | LONG_WORK | GLUE, (
-            f"the timeout policy names {sorted(CLEANUP | LONG_WORK | GLUE)} but the ASL times "
+        assert timed == CLEANUP | LONG_WORK | GLUE | NO_WAIT, (
+            f"the timeout policy names {sorted(CLEANUP | LONG_WORK | GLUE | NO_WAIT)} but the ASL times "
             f"{sorted(timed)}; a new timed state must be classified, not defaulted -- "
             "an unclassified state is how a cleanup stage inherits a 24-hour ceiling")
         for n in sorted(CLEANUP):
@@ -12228,7 +12230,10 @@ def test_a_job_launched_without_a_name_is_rejected_not_crashed():
         tool_use_stream("job_launched", {"job_name": "llmops-qlora-run-test-1-i0"}),
         text_stream("ack")])
     c = clients(ac)
-    out = driver.handler(driver_event(), clients=c)
+    # A task with a handoff: data-prep/generate, this test's old event, has none, and its
+    # job_launched is now rejected for that reason before the name is ever looked at.
+    out = driver.handler(driver_event(stage="finetune", task="remediate",
+                                      harness_id="llmops_finetune"), clients=c)
     assert out["status"] == "released" and out["job_name"] == "llmops-qlora-run-test-1-i0", (
         f"the empty job_launched was not rejected-and-retried: {out}")
     written = [u["ExpressionAttributeValues"].get(":j")
@@ -13960,3 +13965,278 @@ def test_the_monitor_prompt_says_a_file_or_an_echo_is_not_the_call():
     clause = prompt[i:i + 1400]
     assert "TOOL CALLS, not files or commands" in clause
     assert "Unknown tool" in clause and "make no further tool calls" in clause
+
+
+# ---------------------------------------------------------------------------
+# Probe -> full: two launch-and-release handoffs, not one
+# ---------------------------------------------------------------------------
+from pipeline.contracts import tasks as task_contracts  # noqa: E402
+
+
+class FakeSageMaker:
+    """DescribeTrainingJob over a dict of job name -> HyperParameters.
+
+    A name not in the dict raises the real not-found shape (ClientError, ValidationException,
+    "Requested resource not found."), because that code + message pair is what the driver's
+    handoff check discriminates on. ``error`` replaces every answer with that exception, for
+    the read-failure paths."""
+
+    def __init__(self, jobs=None, error=None):
+        self.jobs, self.error, self.calls = dict(jobs or {}), error, []
+
+    def describe_training_job(self, TrainingJobName):
+        from botocore.exceptions import ClientError
+        self.calls.append(TrainingJobName)
+        if self.error is not None:
+            raise self.error
+        if TrainingJobName not in self.jobs:
+            raise ClientError({"Error": {"Code": "ValidationException",
+                                         "Message": "Requested resource not found."}},
+                              "DescribeTrainingJob")
+        return {"TrainingJobName": TrainingJobName, "TrainingJobStatus": "InProgress",
+                "HyperParameters": self.jobs[TrainingJobName]}
+
+
+PROBE_JOB = "llmops-qlora-run-test-1-i0-probe"
+FULL_JOB = "llmops-qlora-run-test-1-i0"
+#: As DescribeTrainingJob returns them: strings, some still JSON-quoted by the SDK.
+PROBE_HP = {"max_steps": "20", "save_steps": "0", "merge_adapters": '"false"'}
+FULL_HP = {"max_steps": "0", "save_steps": "25", "merge_adapters": '"true"'}
+
+
+def _states_dispatching(asl, stage, task) -> set:
+    return {n for n, st in asl["States"].items()
+            if ((st.get("Parameters") or {}).get("Payload") or {}).get("stage") == stage
+            and st["Parameters"]["Payload"].get("task") == task}
+
+
+def _handoff_kind(st: dict):
+    p = (st.get("Parameters") or {}).get("Payload") or {}
+    return task_contracts.JOB_HANDOFFS.get((p.get("stage"), p.get("task")))
+
+
+def _entrants(asl, target: str) -> set:
+    """Every state that can transition into ``target``, by Next, Choice, Default or Catch."""
+    out = set()
+    for n, st in asl["States"].items():
+        nexts = [st.get("Next"), st.get("Default")]
+        nexts += [c.get("Next") for c in st.get("Choices", [])]
+        nexts += [c.get("Next") for c in st.get("Catch", [])]
+        if target in nexts:
+            out.add(n)
+    return out
+
+
+class TestProbeFullHandoff:
+    """The 2026-10-15 defect: one handoff for two jobs.
+
+    `launch` told the agent to run a 20-step probe, read its s/step, launch the full job AND
+    "call job_launched and END YOUR TURN". Live, three runs out of three named the probe, the
+    machine resumed into FinetuneAnalyze on the probe's completion, and the full job was launched
+    from analyze, which has no handoff. run-20261015T065307Z-97655783's analyze completed at once
+    and eval waited for the artifact; run-20261015T130703Z-f5d05255's analyze waited in-session
+    through a capacity queue until its 3600 s timeout failed the run. Each job the pipeline waits
+    on now has its own state, and the driver checks the job against the task."""
+
+    # ---- the contract is the prompt's, both ways ------------------------------------------
+    def test_the_handoff_contract_is_exactly_the_prompt_bullets_that_promise_job_launched(self):
+        declared = set(task_contracts.JOB_HANDOFFS)
+        promised = _job_launching_tasks()
+        assert declared == promised, (
+            f"JOB_HANDOFFS declares {sorted(declared)} but the prompts promise job_launched in "
+            f"{sorted(promised)}. A task the prompt sends to job_launched without a declared "
+            "handoff is rejected by the driver at runtime; a declared handoff no prompt names is a "
+            "rule about a task nothing performs.")
+
+    def test_every_handoff_task_is_dispatched_by_a_state(self, asl):
+        for (stage, task), kind in sorted(task_contracts.JOB_HANDOFFS.items()):
+            assert _states_dispatching(asl, stage, task), (
+                f"{stage}/{task} hands off a {kind} job but no state dispatches it")
+
+    def test_job_kind_reads_the_step_cap_off_the_job_itself(self):
+        assert task_contracts.job_kind(PROBE_HP) == task_contracts.PROBE
+        assert task_contracts.job_kind({"max_steps": '"20"'}) == task_contracts.PROBE
+        assert task_contracts.job_kind(FULL_HP) == task_contracts.FULL
+        # A full job need not pass max_steps at all; the trainer's default is 0.
+        assert task_contracts.job_kind({}) == task_contracts.FULL
+        assert task_contracts.job_kind({"max_steps": "bogus"}) == task_contracts.FULL
+
+    # ---- the state machine ------------------------------------------------------------------
+    def test_a_probe_handoff_is_followed_by_the_full_jobs_own_handoff(self, asl):
+        probes = {n for n, st in asl["States"].items()
+                  if _handoff_kind(st) == task_contracts.PROBE}
+        assert {"FinetuneLaunch", "RemediateFinetune"} <= probes, (
+            f"the probe handoffs are {sorted(probes)}; the derivation is broken")
+        for n in sorted(probes):
+            nxt = asl["States"][n]["Next"]
+            assert _handoff_kind(asl["States"][nxt]) == task_contracts.FULL, (
+                f"{n} hands off on the probe and then goes to {nxt}, which does not hand off on "
+                "the full job -- the full job would again be launched from a state nothing "
+                "resumes, the exact 2026-10-15 defect")
+            assert asl["States"][n]["ResultPath"] != "$.training", (
+                f"{n}'s probe settle lands in $.training, where the full job's result belongs")
+        for n, st in asl["States"].items():
+            if _handoff_kind(st) == task_contracts.FULL:
+                assert st["ResultPath"] == "$.training", n
+
+    def test_analyze_is_entered_only_after_a_full_handoff(self, asl):
+        analyzers = _states_dispatching(asl, "finetune", "analyze")
+        assert analyzers == {"FinetuneAnalyze"}, analyzers
+        for a in sorted(analyzers):
+            ins = _entrants(asl, a)
+            assert ins, f"nothing enters {a}"
+            wrong = sorted(n for n in ins
+                           if _handoff_kind(asl["States"][n]) != task_contracts.FULL)
+            assert not wrong, (
+                f"{a} can be entered from {wrong}, which do not hand off on the FULL job: analyze "
+                "would read a probe (or nothing) and launch the full job itself")
+
+    def test_analyze_waits_on_no_job_so_it_keeps_a_short_ceiling(self, asl):
+        """PR-11 raised it to 86400 s after f5d05255 waited out a capacity queue here. With the
+        full job handed off upstream, a wait in analyze IS the defect, and a day-long ceiling
+        turns the next one into a day of agent turns instead of a failed stage."""
+        for n in sorted(_states_dispatching(asl, "finetune", "analyze")):
+            assert asl["States"][n]["TimeoutSeconds"] <= 7200, (
+                f"{n} has TimeoutSeconds {asl['States'][n]['TimeoutSeconds']}; it waits on no job")
+
+    def test_the_full_jobs_capacity_stop_does_not_buy_a_second_probe(self, asl):
+        st = asl["States"]["FinetuneLaunchFull"]
+        routes = {e: c["Next"] for c in st["Catch"] for e in c["ErrorEquals"]}
+        assert routes["CapacityStopped"] == "FinetuneLaunchFull", (
+            "a $0-billed stop of the full job must re-enter launch_full: the probe's measurement "
+            "still holds, and re-entering FinetuneLaunch would pay for another probe")
+        assert st["TimeoutSeconds"] == 86400, "launch_full waits on a full job's capacity queue"
+
+    # ---- the prompt -------------------------------------------------------------------------
+    def test_the_finetune_prompt_names_one_job_per_handoff(self):
+        text = json.loads((REPO / "agents/finetune/harness.json").read_text())["systemPrompt"][0]["text"]
+        cut = text[:text.index("\nRules:")]
+        bullets = dict(re.findall(r'(?ms)^- "([a-z_]+)": (.*?)(?=^- "|\Z)', cut))
+        assert "job_launched naming the PROBE" in bullets["launch"]
+        assert "job_launched naming the PROBE" in bullets["remediate"]
+        assert "job_launched naming the FULL" in bullets["launch_full"]
+        assert "p50_steady" in bullets["launch_full"] and "--sec-per-it" in bullets["launch_full"]
+        assert "validate_job_config.py <payload.json>" not in bullets["launch"], (
+            "launch runs the preflight again: it cannot, the measurement it needs is the probe's")
+        assert "launches nothing and waits on nothing" in bullets["analyze"]
+        assert "job_launched" not in bullets["analyze"], (
+            "the analyze bullet mentions job_launched; analyze has no handoff, and a prompt that "
+            "names the call there is how the full job came to be launched from it")
+
+    # ---- the driver -------------------------------------------------------------------------
+    def _run(self, task, scripts, sm):
+        ac = FakeAgentCore(scripts)
+        c = clients(ac)
+        c["sagemaker"] = sm
+        out = driver.handler(driver_event(stage="finetune", task=task,
+                                          harness_id="llmops_finetune"), clients=c)
+        parked = [u["ExpressionAttributeValues"] for u in c["ddb"].Table(ENV["RUNS_TABLE"]).updates
+                  if ":j" in (u.get("ExpressionAttributeValues") or {})]
+        return out, parked, ac, c
+
+    def test_launch_parks_the_probe_and_records_its_kind(self):
+        out, parked, _, c = self._run("launch", [
+            tool_use_stream("job_launched", {"job_name": PROBE_JOB}), text_stream("ok")],
+            FakeSageMaker({PROBE_JOB: PROBE_HP}))
+        assert out["status"] == "released" and out["job_kind"] == "probe", out
+        assert out["handoff_check"] == "verified"
+        assert [p[":j"] for p in parked] == [PROBE_JOB]
+        assert parked[0][":k"] == "probe"
+        assert not c["sfn"].successes and not c["sfn"].failures
+
+    def test_launch_rejects_a_full_job_and_hears_the_probe_after(self):
+        out, parked, ac, _ = self._run("launch", [
+            tool_use_stream("job_launched", {"job_name": FULL_JOB}),
+            tool_use_stream("job_launched", {"job_name": PROBE_JOB}), text_stream("ok")],
+            FakeSageMaker({PROBE_JOB: PROBE_HP, FULL_JOB: FULL_HP}))
+        assert out["status"] == "released" and out["job_name"] == PROBE_JOB, out
+        assert [p[":j"] for p in parked] == [PROBE_JOB], (
+            f"the full job was parked from launch: {parked}")
+        told = json.dumps(ac.calls[1]["messages"])
+        assert "rejected" in told and "PROBE" in told and "launch_full" in told, told[:400]
+
+    def test_launch_full_rejects_the_probe_and_hears_the_full_job_after(self):
+        out, parked, ac, _ = self._run("launch_full", [
+            tool_use_stream("job_launched", {"job_name": PROBE_JOB}),
+            tool_use_stream("job_launched", {"job_name": FULL_JOB}), text_stream("ok")],
+            FakeSageMaker({PROBE_JOB: PROBE_HP, FULL_JOB: FULL_HP}))
+        assert out["status"] == "released" and out["job_name"] == FULL_JOB, out
+        assert [(p[":j"], p[":k"]) for p in parked] == [(FULL_JOB, "full")], (
+            f"launch_full parked a probe, so analyze would resume on a measurement: {parked}")
+        assert "FULL job" in json.dumps(ac.calls[1]["messages"])
+
+    def test_analyze_cannot_hand_off_at_all(self):
+        """The live shape: the full job launched from analyze. Nothing resumes on it, so the
+        call is refused whatever the job is -- before the job is even looked at."""
+        sm = FakeSageMaker({FULL_JOB: FULL_HP})
+        out, parked, ac, c = self._run("analyze", [
+            tool_use_stream("job_launched", {"job_name": FULL_JOB}),
+            text_stream("understood")], sm)
+        assert out["status"] != "released", out
+        assert not parked, f"analyze parked a token on {parked}"
+        assert sm.calls == [], "the no-handoff refusal should not need the job at all"
+        told = json.dumps(ac.calls[1]["messages"])
+        assert "no launch-and-release handoff" in told, told[:400]
+
+    def test_a_job_that_does_not_exist_is_refused(self):
+        out, parked, ac, _ = self._run("launch", [
+            tool_use_stream("job_launched", {"job_name": "llmops-qlora-typo"}),
+            tool_use_stream("job_launched", {"job_name": PROBE_JOB}), text_stream("ok")],
+            FakeSageMaker({PROBE_JOB: PROBE_HP}))
+        assert out["job_name"] == PROBE_JOB and [p[":j"] for p in parked] == [PROBE_JOB], out
+        assert "no SageMaker training job named" in json.dumps(ac.calls[1]["messages"])
+
+    def test_an_unreadable_job_is_accepted_unverified_not_refused(self):
+        """A throttle or a missing grant must not turn into a run that cannot hand off."""
+        from botocore.exceptions import ClientError
+        denied = ClientError({"Error": {"Code": "AccessDeniedException", "Message": "no"}},
+                             "DescribeTrainingJob")
+        out, parked, _, _ = self._run("launch_full", [
+            tool_use_stream("job_launched", {"job_name": FULL_JOB}), text_stream("ok")],
+            FakeSageMaker(error=denied))
+        assert out["status"] == "released", out
+        assert out["handoff_check"].startswith("unverified"), out
+        assert parked[0][":k"] == "unverified", (
+            "an unclassified handoff must overwrite the row's job_kind, or the previous "
+            "handoff's 'probe' keeps the full job's completion off the timeline")
+
+    def test_eval_hands_off_any_kind_of_job(self):
+        ac = FakeAgentCore([tool_use_stream("job_launched", {"job_name": "llmops-eval-infer-1"}),
+                            text_stream("ok")])
+        c = clients(ac)
+        c["sagemaker"] = FakeSageMaker({"llmops-eval-infer-1": {}})
+        out = driver.handler(driver_event(stage="eval", task="evaluate",
+                                          harness_id="llmops_eval"), clients=c)
+        assert out["status"] == "released" and out["handoff_check"] == "verified", out
+
+    def test_the_driver_role_can_read_the_job_it_classifies(self):
+        src = (REPO / "orchestration/harness_driver/handler.py").read_text()
+        assert "sm.describe_training_job(" in src, "the check no longer reads the job"
+        doc = json.loads((REPO / "deploy/iam/lambda_roles.json").read_text())
+        grants = [st for st in doc["roles"]["driver"]["permissionsPolicy"]["Statement"]
+                  if "sagemaker:DescribeTrainingJob" in json.dumps(st.get("Action"))]
+        assert grants, "llmops-lambda-driver cannot DescribeTrainingJob; every check is unverified"
+        for st in grants:
+            assert "training-job/llmops-*" in json.dumps(st["Resource"]), st["Resource"]
+        assert not {"sagemaker:StopTrainingJob", "sagemaker:CreateTrainingJob"} & _allowed_actions("driver"), (
+            "the driver classifies jobs; it must not be able to start or stop them")
+
+    # ---- the resume Lambda ------------------------------------------------------------------
+    def test_a_probe_completion_resumes_without_announcing_a_trained_model(self):
+        c = TestResumePipeline()._clients({"run_id": "run-1", "task_token": "tok-9",
+                                            "current_stage": "finetune", "job_kind": "probe"})
+        out = resume_pipeline.handler(
+            sm_event("Completed", job=PROBE_JOB,
+                     ModelArtifacts={"S3ModelArtifacts": "s3://b/probe/model.tar.gz"}), clients=c)
+        assert out["outcome"] == "resumed" and c["sfn"].successes, out
+        settled = json.loads(c["sfn"].successes[0]["output"])
+        assert settled["job_kind"] == "probe" and settled["status"] == "measured", settled
+        assert not any(e["DetailType"] == ev.MODEL_TRAINED for e in c["events"].entries), (
+            "a 20-step measurement was announced as a trained model")
+
+    def test_the_full_jobs_completion_still_announces_the_model(self):
+        c = TestResumePipeline()._clients({"run_id": "run-1", "task_token": "tok-9",
+                                            "current_stage": "finetune", "job_kind": "full"})
+        resume_pipeline.handler(sm_event("Completed", job=FULL_JOB), clients=c)
+        assert any(e["DetailType"] == ev.MODEL_TRAINED for e in c["events"].entries)
+        assert json.loads(c["sfn"].successes[0]["output"])["status"] == "trained"
