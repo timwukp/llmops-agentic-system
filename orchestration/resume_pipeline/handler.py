@@ -137,14 +137,19 @@ def handler(event, context=None, clients=None):
             # An eval-stage job is student INFERENCE riding the training-job rail;
             # announcing MODEL_TRAINED for it would put a lie on the timeline. The
             # eval score task emits MODEL_EVALUATED moments later, so eval jobs get
-            # no bus event here at all.
-            if run.get("current_stage") != "eval":
+            # no bus event here at all. A finetune PROBE is the same lie from the other
+            # side: a 20-step measurement, whose "model" no stage may promote, and whose
+            # completion now resumes launch_full rather than analyze. job_kind is written
+            # by the driver's handoff check; a row without it keeps the old behaviour.
+            kind = run.get("job_kind") or ""
+            if run.get("current_stage") != "eval" and kind != "probe":
                 _audit(c["events"], ev.MODEL_TRAINED,
                        {"run_id": run_id, "job_name": job_name,
                         "model_artifacts": model_uri})
             c["sfn"].send_task_success(taskToken=token, output=json.dumps({
-                "run_id": run_id, "job_name": job_name, "status": "trained",
-                "model_artifacts": model_uri}))
+                "run_id": run_id, "job_name": job_name,
+                "status": "measured" if kind == "probe" else "trained",
+                "job_kind": kind, "model_artifacts": model_uri}))
             outcome = "resumed"
         elif (_is_capacity_stop(detail)
               and int(run.get("capacity_retries") or 0) < CAPACITY_RETRY_CAP):

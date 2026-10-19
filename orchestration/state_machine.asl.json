@@ -402,7 +402,7 @@
     },
     "FinetuneLaunch": {
       "Type": "Task",
-      "Comment": "Carried HeartbeatSeconds: 18000 until 2026-08-03, and it was a second, SHORTER deadline rather than the liveness signal it looks like: nothing in this platform ever calls SendTaskHeartbeat (grep the repo -- zero sites; the only reader of the field is the console's hover card, which merely displays it). So the first heartbeat never arrived and this state actually died at 18000s while its TimeoutSeconds said 21600. Removed rather than kept, because a heartbeat interval with no sender is a deadline nobody can see: the number in the ASL was not the number that fired. If a real heartbeat is ever implemented in the driver's continuation loop, this field comes back WITH it, and test_a_heartbeat_interval_requires_something_to_send_heartbeats is what will let it back in.",
+      "Comment": "Hands off on the 20-step PROBE only (task launch), so the full job gets a handoff of its own in FinetuneLaunchFull. Until 2026-10-15 this one state covered both jobs, and live the agent named the probe in job_launched three runs out of three: the machine resumed into FinetuneAnalyze on the probe's completion and the full job was launched from analyze, which nothing resumes -- run-20261015T130703Z-f5d05255 then waited in-session through a capacity queue until analyze's timeout. The probe's settle lands in $.probe, so $.training describes the job that trained. Carried HeartbeatSeconds: 18000 until 2026-08-03, and it was a second, SHORTER deadline rather than the liveness signal it looks like: nothing in this platform ever calls SendTaskHeartbeat (grep the repo -- zero sites; the only reader of the field is the console's hover card, which merely displays it). So the first heartbeat never arrived and this state actually died at 18000s while its TimeoutSeconds said 21600. Removed rather than kept, because a heartbeat interval with no sender is a deadline nobody can see: the number in the ASL was not the number that fired. If a real heartbeat is ever implemented in the driver's continuation loop, this field comes back WITH it, and test_a_heartbeat_interval_requires_something_to_send_heartbeats is what will let it back in.",
       "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
       "Parameters": {
         "FunctionName": "${HarnessDriverArn}",
@@ -416,7 +416,7 @@
           "iteration.$": "$.iteration"
         }
       },
-      "ResultPath": "$.training",
+      "ResultPath": "$.probe",
       "TimeoutSeconds": 86400,
       "Catch": [
         {
@@ -442,10 +442,55 @@
           "Next": "EscalateFail"
         }
       ],
+      "Next": "FinetuneLaunchFull"
+    },
+    "FinetuneLaunchFull": {
+      "Type": "Task",
+      "Comment": "Reads the probe's measured s/step and VRAM, runs the preflight, launches the FULL job and hands off on it (task launch_full). Entered from FinetuneLaunch and RemediateFinetune, both of which hand off on a probe, and the only way into FinetuneAnalyze -- so analyze runs after the full job has finished, never after the probe. The driver rejects a job_launched here that names a step-capped job. TimeoutSeconds is the day every job-waiting state carries: a capacity queue for ml.g5.2xlarge ran 54 minutes on 2026-10-15.",
+      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+      "Parameters": {
+        "FunctionName": "${HarnessDriverArn}",
+        "Payload": {
+          "run_id.$": "$.run_id",
+          "manifest_uri.$": "$.manifest_uri",
+          "stage": "finetune",
+          "task": "launch_full",
+          "harness_id": "llmops_finetune",
+          "task_token.$": "$$.Task.Token",
+          "iteration.$": "$.iteration"
+        }
+      },
+      "ResultPath": "$.training",
+      "TimeoutSeconds": 86400,
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "CapacityStopped"
+          ],
+          "ResultPath": "$.error",
+          "Comment": "A $0-billed stop of the full job re-enters THIS state, not FinetuneLaunch: the probe's measurement still holds, so a capacity stop must not buy a second probe. $.iteration is unchanged; resume_pipeline's capacity_retries cap is the loop guard.",
+          "Next": "FinetuneLaunchFull"
+        },
+        {
+          "ErrorEquals": [
+            "TrainingJobFailed"
+          ],
+          "ResultPath": "$.error",
+          "Next": "RemediationChoice"
+        },
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "EscalateFail"
+        }
+      ],
       "Next": "FinetuneAnalyze"
     },
     "FinetuneAnalyze": {
       "Type": "Task",
+      "Comment": "Entered only from FinetuneLaunchFull, i.e. after the FULL job has finished. Launches nothing and waits on nothing, so it keeps a short ceiling: a wait here is the protocol defect PR-11 papered over with 86400 s (run-20261015T130703Z-f5d05255 waited out a capacity queue in this state), and a day-long timeout would turn the next one into a day of agent turns instead of a failed stage.",
       "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
       "Parameters": {
         "FunctionName": "${HarnessDriverArn}",
@@ -460,7 +505,7 @@
         }
       },
       "ResultPath": "$.training_analysis",
-      "TimeoutSeconds": 86400,
+      "TimeoutSeconds": 3600,
       "Catch": [
         {
           "ErrorEquals": [
@@ -672,7 +717,7 @@
           "Next": "EscalateFail"
         }
       ],
-      "Next": "FinetuneAnalyze"
+      "Next": "FinetuneLaunchFull"
     },
     "Deploy": {
       "Type": "Task",

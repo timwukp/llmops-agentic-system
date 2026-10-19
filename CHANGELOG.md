@@ -5,6 +5,27 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
 ## [Unreleased]
 
+### Finetune: probe and full job are two launch-and-release handoffs
+
+The `launch` task told the agent to probe, measure, launch the full job, and hand off, which is one
+`job_launched` for two jobs. Live on 2026-10-15 it named the probe every time, so the full job was
+launched from `FinetuneAnalyze`, which has no handoff. `run-20261015T130703Z-f5d05255` waited there
+through a capacity queue until the stage timed out.
+
+Now:
+- `FinetuneLaunch` and `RemediateFinetune` hand off the probe.
+- A new `FinetuneLaunchFull` (task `launch_full`) reads the probe's metrics, runs the preflight, and
+  hands off the full job.
+- `FinetuneAnalyze` runs only after the full job, launches nothing, and keeps its short ceiling.
+  This supersedes PR-11's 86400 s stopgap.
+- The driver checks each `job_launched` against `JOB_HANDOFFS` (`pipeline/contracts/tasks.py`),
+  reading the job's own `max_steps`. A wrong-kind, nonexistent or no-handoff call is rejected back
+  into the turn.
+- A probe's completion no longer announces `ModelTrained`.
+
+36 states; 2123 unit tests; 433/433 negative controls. Evidence:
+`deploy/evidence/VERIFICATION_probe_full_handoff.md`.
+
 ### Console: start a lakehouse run from a task
 
 The catalog gains two entries:

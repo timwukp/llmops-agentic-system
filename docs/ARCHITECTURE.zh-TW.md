@@ -49,16 +49,16 @@ LLM 判斷。因此編排採用 **Step Functions Standard 狀態機**，智能�
 讓 LLM 決定「下一個階段是什麼」只會給系統中唯一不需要不確定性的部分添加不確定性、
 成本和故障模式。
 
-狀態機（`orchestration/state_machine.asl.json`）在正常路徑上有 **12 個 harness 任務狀態**
+狀態機（`orchestration/state_machine.asl.json`）在正常路徑上有 **13 個 harness 任務狀態**
 —— 每個都是帶 `waitForTaskToken` 的 harness driver Lambda 調用 —— 外加只在迴路中出現的
 `RemediateFinetune`、只在審計模式出現的 `DataAudit`，以及兩個從這同一條路徑中途進場的
 入口：`eval_only` 在 eval 階段進場，`deploy_only` 在服務階段進場：
 
 ```
-DataPrepGenerate → DataPrepCurate → FinetuneLaunch → FinetuneAnalyze → EvalGenerate → EvalScore → EvalGate
-                                                        │（門檻失敗）
-                              RemediateFinetune ←───────┘   …門檻通過則：
-             Deploy → SmokeTest → MonitorHealth → Teardown → MonitorReport
+DataPrepGenerate → DataPrepCurate → FinetuneLaunch → FinetuneLaunchFull → FinetuneAnalyze → EvalGenerate → EvalScore → EvalGate
+                                     （探測）          （完整作業）  ▲                                          │（門檻失敗）
+                                         RemediateFinetune（探測）─┘ ←─────────────────────────────────────────┘
+             …門檻通過則：Deploy → SmokeTest → MonitorHealth → Teardown → MonitorReport
 ```
 
 **七種入口模式，由 `StartAt` 的一個 `Choice` 讀執行輸入裡的 `pipeline_mode` 決定**（它讀不到
@@ -666,8 +666,26 @@ finetune agent 發起 SageMaker 訓練作業 —— eval agent 的學生推論�
    永遠修不好「到不了」的事。** 現在只吸收「task 已不存在」這一種錯 —— 限流或 5xx 仍然
    重拋而且**不刪除**，因為那個 token 是管線唯一能得知該階段已完成的途徑 —— 而刪除本身
    失敗則是拋出而非吞掉，因為那正是當初「traceback 講的是別的事」的那個失敗。
-4. 之後 `FinetuneAnalyze` 在**全新 session** 中運行，從 AWS 狀態
+4. 之後下一個 state 在**全新 session** 中運行，從 AWS 狀態
    （describe-training-job + S3 + manifest）重建全部上下文。
+
+**Finetune 會走這個循環兩次，每個作業一次。** `FinetuneLaunch`（或 `RemediateFinetune`）
+只交接 20 步的探測作業。探測完成後恢復的是 `FinetuneLaunchFull`：它讀取探測量到的
+`sec_per_step.p50_steady` 與 VRAM，跑 preflight，再交接完整作業。只有完整作業完成才會恢復
+`FinetuneAnalyze`，而它不啟動任何作業，並保留短的 timeout。2026-10-15 之前，一個 state 涵蓋了
+兩個作業。實際運行中，agent 三次 run 都在 `job_launched` 裡交出探測作業，完整作業則從 analyze
+啟動，而那裡沒有任何東西會恢復它。`run-20261015T130703Z-f5d05255` 就在那裡等過一整段容量排隊，
+直到該 stage 逾時。
+
+因此 driver 在停放 token 之前會檢查每一次 `job_launched`（`check_handoff`，依據
+`pipeline/contracts/tasks.py` 的 `JOB_HANDOFFS`）：
+- **該 task 沒有交接**（例如 analyze）：拒絕。
+- **作業不存在**：拒絕。
+- **作業種類不對**，從作業自己的 `max_steps` 讀出：拒絕。例如 `launch_full` 交出探測作業，
+  或 `launch` 交出完整作業。
+- **拒絕會回到同一回合**，agent 仍能啟動正確的作業。
+- **driver 讀不到的作業**以「未驗證」接受，所以限流不會擋住交接。
+- **探測作業完成時不宣告 `ModelTrained`。**
 
 **已死的 token 是一個答案，不是一個錯誤 —— 兩個 Lambda 都是。** 上面這個判讀有十天
 只存在於 resume，driver 為此付了四次代價：`TaskTimedOut` 從「re-ask 用盡」那次結算拋出，
@@ -846,8 +864,8 @@ Knowledge Base**（`deploy/09_retrieval.py`，逐 run、由人部署、eval 結�
 ## 8. 補救迴路（≤ 3 次迭代）
 
 `QualityGateChoice` 失敗 → `RemediationChoice`：只要 `iteration < 3`，就
-`IncrementIteration` → `RemediateFinetune` → 回到 `FinetuneAnalyze` → `EvalGenerate`
-→ `EvalGate`。迴路是接回產生器**之上**，而不是接在產生器與門檻之間：接在下面的話，
+`IncrementIteration` → `RemediateFinetune`（新的探測作業）→ `FinetuneLaunchFull` →
+`FinetuneAnalyze` → `EvalGenerate` → `EvalGate`。迴路是接回產生器**之上**，而不是接在產生器與門檻之間：接在下面的話，
 第 2 輪會拿第 1 輪的報告去過門檻，一次什麼都沒改的補救也可能「通過」。
 預算耗盡 → `EscalateFail`。同一預算也寫進 agent 的任務 prompt（「診斷、修正、重試 ——
 最多 3 次；然後 `escalate_human`」），機器層與 agent 層的預算一致。
@@ -948,9 +966,9 @@ Lambda 硬上限 **900 秒**，而 harness 回合預算（`timeoutSeconds`）是
 | 狀態機 `TimeoutSeconds` | 做長工作的 state **86400 秒**，其餘 3600–7200 秒 | **stage** 本身：`.waitForTaskToken` 的 token 能活多久 |
 
 因為 driver 會把對話跨調用交給自己，Lambda 的 900 秒並不是「一個 stage 能跑多久」的限制
-—— **task token 的壽命**才是，而那就是 `TimeoutSeconds`。六個等待真實 agent 工作的 state
-（`DataPrepGenerate`、`DataPrepCurate`、`FinetuneLaunch`、`EvalGenerate`、`EvalGate`、
-`RemediateFinetune`）帶著 **86400 秒 —— 整整一天**，於 2026-08-03 依平台所有者的指示
+—— **task token 的壽命**才是，而那就是 `TimeoutSeconds`。等待真實 agent 工作或訓練作業的 state
+（`DataPrepGenerate`、`DataPrepCurate`、`FinetuneLaunch`、`FinetuneLaunchFull`、`EvalGenerate`、
+`EvalGate`、`RemediateFinetune` 等）帶著 **86400 秒 —— 整整一天**，於 2026-08-03 依平台所有者的指示
 自 7200／21600 調高，起因是一個 480 次 teacher 呼叫的生成 run 在 7200 秒被工作中途切斷。
 
 其餘七個記帳 state 刻意保留一到兩小時。`Teardown` 是刪除 endpoint 的那一個，而
@@ -958,7 +976,9 @@ Lambda 硬上限 **900 秒**，而 harness 回合預算（`timeoutSeconds`）是
 86400 秒，會讓一台 `ml.g5.2xlarge` 以 $1.515/hr 的價格 InService 整整一天 —— 那正是這個
 專案已經付過一次的、843 天零調用孤兒 endpoint 的形狀。這個切分由
 `tests/test_orchestration.py::TestStateMachine::test_a_stage_that_deletes_the_endpoint_keeps_a_short_timeout`
-斷言，而它對一個**未分類的新 state 會失敗**，而不是把它默默歸進任一邊。
+斷言，而它對一個**未分類的新 state 會失敗**，而不是把它默默歸進任一邊。`FinetuneAnalyze`
+保持短 timeout 的理由不同：它不等待任何作業，所以長的上限只會換來更長的 session 內等待
+（`test_analyze_waits_on_no_job_so_it_keeps_a_short_ceiling`）。
 
 `FinetuneLaunch` 與 `RemediateFinetune` 在同一次改動之前還帶著 `HeartbeatSeconds: 18000`。
 那個欄位要成為活性訊號，前提是有東西在送心跳 —— 而這個平台從來沒有任何地方呼叫

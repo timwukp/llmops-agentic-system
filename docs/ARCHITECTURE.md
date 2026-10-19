@@ -55,17 +55,17 @@ and intelligence lives *inside* each stage. An LLM deciding "what stage comes ne
 add nondeterminism, cost, and failure modes to the one part of the system that benefits
 from having none.
 
-The state machine (`orchestration/state_machine.asl.json`) has **12 harness-task states
+The state machine (`orchestration/state_machine.asl.json`) has **13 harness-task states
 on the happy path** — each a `waitForTaskToken` Lambda invocation of the harness driver
 — plus the loop-only `RemediateFinetune`, the audit-only `DataAudit`, and two entries that
 start partway down this same path: `eval_only` at the eval stage and `deploy_only` at the
 serving stage:
 
 ```
-DataPrepGenerate → DataPrepCurate → FinetuneLaunch → FinetuneAnalyze → EvalGenerate → EvalScore → EvalGate
-                                                        │ (gate fail)
-                              RemediateFinetune ←───────┘   … then, on gate pass:
-             Deploy → SmokeTest → MonitorHealth → Teardown → MonitorReport
+DataPrepGenerate → DataPrepCurate → FinetuneLaunch → FinetuneLaunchFull → FinetuneAnalyze → EvalGenerate → EvalScore → EvalGate
+                                     (probe)          (full job)    ▲                                          │ (gate fail)
+                                         RemediateFinetune (probe) ─┘ ←─────────────────────────────────────────┘
+             … then, on gate pass: Deploy → SmokeTest → MonitorHealth → Teardown → MonitorReport
 ```
 
 **Seven entry modes, decided by one `Choice` at `StartAt`** reading `pipeline_mode` out of
@@ -795,8 +795,28 @@ fresh session after the job completes.) The chain that resumes the pipeline:
    since that token is the pipeline's only way to learn the stage finished — and a
    failure of the clear itself is raised rather than swallowed, because that is precisely
    the failure whose traceback was about something else.
-4. `FinetuneAnalyze` then runs in a **fresh session**, reconstructing all context from AWS
+4. The next state runs in a **fresh session**, reconstructing all context from AWS
    state (describe-training-job + S3 + manifest).
+
+**Finetune goes round this cycle twice, once per job.** `FinetuneLaunch` (or
+`RemediateFinetune`) hands off on the 20-step probe. Its completion resumes
+`FinetuneLaunchFull`, which reads the probe's measured `sec_per_step.p50_steady` and VRAM, runs
+the preflight, and hands off on the full job. Only that job's completion resumes
+`FinetuneAnalyze`, which launches nothing and keeps a short timeout. Until 2026-10-15 one state
+covered both jobs. Live, the agent named the probe in `job_launched` three runs out of three, and
+the full job was launched from analyze, which nothing resumes. `run-20261015T130703Z-f5d05255`
+waited there through a capacity queue until the stage timed out.
+
+The driver therefore checks every `job_launched` before it parks the token
+(`check_handoff`, against `JOB_HANDOFFS` in `pipeline/contracts/tasks.py`):
+- **No handoff for this task** (analyze, for one): the call is rejected.
+- **The job does not exist:** rejected.
+- **The wrong kind of job**, read off the job's own `max_steps`: rejected. A probe in
+  `launch_full`, or a full job in `launch`.
+- **Rejections go back into the turn**, so the agent can still launch the right job.
+- **A job the driver cannot read** is accepted as unverified, so a throttle cannot block a
+  handoff.
+- **A probe's completion does not announce `ModelTrained`.**
 
 **A dead token is an answer, not an error — on both Lambdas.** The reading above was
 resume-only for ten days, and the driver paid for it four times: `TaskTimedOut` out of the
@@ -1002,8 +1022,8 @@ closed-book plan omits them and runs the classic path untouched):
 ## 8. The remediation loop (≤ 3 iterations)
 
 `QualityGateChoice` fail → `RemediationChoice`: while `iteration < 3`,
-`IncrementIteration` → `RemediateFinetune` → back to `FinetuneAnalyze` →
-`EvalGenerate` → `EvalGate`. The loop rejoins **above** the generator, not between it
+`IncrementIteration` → `RemediateFinetune` (a fresh probe) → `FinetuneLaunchFull` →
+`FinetuneAnalyze` → `EvalGenerate` → `EvalGate`. The loop rejoins **above** the generator, not between it
 and the gate: rejoining below would have iteration 2 re-gate iteration 1's report, and a
 remediation that changed nothing could "pass".
 Budget exhausted → `EscalateFail`. The same budget appears inside the agents' task
@@ -1121,8 +1141,9 @@ Three timeouts are stacked here and only one of them is a ceiling on the *work*:
 
 Because the driver hands itself the conversation across invocations, the Lambda's 900 s is
 not a limit on how long a stage may run — the **task token's** lifetime is, and that is
-`TimeoutSeconds`. The six states that wait on real agent work (`DataPrepGenerate`,
-`DataPrepCurate`, `FinetuneLaunch`, `EvalGenerate`, `EvalGate`, `RemediateFinetune`) carry
+`TimeoutSeconds`. The states that wait on real agent work or a training job (`DataPrepGenerate`,
+`DataPrepCurate`, `FinetuneLaunch`, `FinetuneLaunchFull`, `EvalGenerate`, `EvalGate`,
+`RemediateFinetune`, among others) carry
 **86400 s — a full day**, raised from 7200/21600 on 2026-08-03 on the platform owner's
 instruction after a 480-teacher-call generation run was cut off at 7200 s mid-work.
 
@@ -1133,7 +1154,8 @@ is the precise shape of the 843-day, 0-invocation orphan this project already pa
 split is asserted by
 `tests/test_orchestration.py::TestStateMachine::test_a_stage_that_deletes_the_endpoint_keeps_a_short_timeout`,
 which also **fails on an unclassified new state** rather than defaulting it into either
-bucket.
+bucket. `FinetuneAnalyze` is short for a different reason: it waits on no job, so a long ceiling
+there could only ever buy a longer in-session wait (`test_analyze_waits_on_no_job_so_it_keeps_a_short_ceiling`).
 
 `FinetuneLaunch` and `RemediateFinetune` also carried `HeartbeatSeconds: 18000` until the
 same change. That field is a liveness signal only if something sends heartbeats — and

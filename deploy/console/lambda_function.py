@@ -426,14 +426,15 @@ STAGE_FLOW = [
     ("complete", "Complete"),
 ]
 # SFN state name -> logical stage (same mapping pattern as the source repo's
-# GitHub step-name -> stage table). RemediateFinetune re-enters finetune-launch.
+# GitHub step-name -> stage table). RemediateFinetune re-enters finetune-launch, and
+# FinetuneLaunchFull (the full job's own handoff, after the probe's) is the same card.
 #: LakehouseReview shares the curate card: in a lakehouse run it is the step that hands finetune
 #: its dataset. The five lakehouse Glue states have no card; the Data tab shows their reports.
 STATE_TO_STAGE = {
     "DataPrepGenerate": "data-prep-generate", "DataPrepCurate": "data-prep-curate",
     "LakehouseReview": "data-prep-curate",
-    "FinetuneLaunch": "finetune-launch", "FinetuneAnalyze": "finetune-analyze",
-    "RemediateFinetune": "finetune-launch", "EvalGate": "eval-gate",
+    "FinetuneLaunch": "finetune-launch", "FinetuneLaunchFull": "finetune-launch",
+    "FinetuneAnalyze": "finetune-analyze", "RemediateFinetune": "finetune-launch", "EvalGate": "eval-gate",
     "Deploy": "deploy", "SmokeTest": "smoke", "Teardown": "teardown",
     "Complete": "complete",
 }
@@ -1422,7 +1423,8 @@ def evaluations():
 # Session-id source differs from the source repo: the pipeline's session ids are
 # deterministic <run_id>-<stage>-<task>, so we reconstruct them from recent run ids.
 STAGE_TASKS = [("data-prep", "generate"), ("data-prep", "curate"),
-               ("finetune", "launch"), ("finetune", "analyze"), ("finetune", "remediate"),
+               ("finetune", "launch"), ("finetune", "launch_full"), ("finetune", "analyze"),
+               ("finetune", "remediate"),
                ("eval", "gate"), ("deploy", "deploy"), ("deploy", "smoke"), ("deploy", "teardown")]
 
 
