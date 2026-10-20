@@ -742,7 +742,8 @@
             "States.ALL"
           ],
           "ResultPath": "$.error",
-          "Next": "EscalateFail"
+          "Comment": "Through a teardown, never straight to EscalateFail: a Deploy can fail with its endpoint already InService. Live, run-20261016T012010Z-9de45cbf's Deploy created llmops-student-...-i0 (ml.g5.xlarge, InService 02:14Z), never settled, and this Catch went to EscalateFail, which skips Teardown -- the endpoint billed until an escalation-triage agent session deleted it at 03:12Z. Not to Teardown itself, whose Next is MonitorReport: that would report a failed deploy as a finished run.",
+          "Next": "TeardownAfterDeployFailed"
         }
       ],
       "Next": "SmokeTest"
@@ -834,6 +835,35 @@
         }
       ],
       "Next": "MonitorReport"
+    },
+    "TeardownAfterDeployFailed": {
+      "Type": "Task",
+      "Comment": "Deploy's failure path: the same deploy/teardown task as Teardown, then EscalateFail, so the run still ends FAILED. Runs whether or not Deploy got as far as creating an endpoint -- the agent deletes what exists, and an empty teardown costs one turn where a stranded ml.g5.xlarge costs every hour until someone notices. Its Catch writes $.teardown_error, not $.error, so Deploy's own error is what the failed run still carries.",
+      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+      "Parameters": {
+        "FunctionName": "${HarnessDriverArn}",
+        "Payload": {
+          "run_id.$": "$.run_id",
+          "manifest_uri.$": "$.manifest_uri",
+          "stage": "deploy",
+          "task": "teardown",
+          "harness_id": "llmops_deploy",
+          "task_token.$": "$$.Task.Token",
+          "iteration.$": "$.iteration"
+        }
+      },
+      "ResultPath": "$.teardown",
+      "TimeoutSeconds": 3600,
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.teardown_error",
+          "Next": "EscalateFail"
+        }
+      ],
+      "Next": "EscalateFail"
     },
     "MonitorReport": {
       "Type": "Task",

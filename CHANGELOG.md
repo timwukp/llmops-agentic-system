@@ -5,6 +5,33 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
 ## [Unreleased]
 
+### A rejected stage_complete is heard, and a failed Deploy is torn down
+
+The Deploy of `run-20261016T012010Z-9de45cbf` never settled, and the run failed with an InService
+ml.g5.xlarge endpoint that the state machine did not delete. A read-only diagnosis
+(`deploy/evidence/VERIFICATION_deploy_settle_and_teardown.md`) found three defects.
+
+- **The rejection never reached the agent.** The agent claimed the prefix
+  `deployment/model/merged/` as an output, and `head_object` cannot verify a prefix, so the driver
+  rejected the claim, correctly. But the harness had already answered the call `Unknown tool` and
+  the turn had ended. The end_turn override replied with a `toolResult` for that answered id, and
+  the runtime refused it (`Inline function callback has no pending handoff in this session`). The
+  salvage prompt never said why, so the agent re-sent the identical claim ~25 times and then
+  escalated. A call serviced through the override is now marked `ended_turn` and answered as text,
+  including the ack, which had been hiding the same refusal on every successful end_turn call.
+- **Rejections were silent.** A rejected claim is now logged, and the reason names a prefix as a
+  prefix, so the agent knows to list the objects under it.
+- **A failed Deploy stranded its endpoint.** Deploy's Catch went straight to `EscalateFail`. It
+  now goes through `TeardownAfterDeployFailed` and then `EscalateFail`, so the endpoint is
+  deleted and the run still ends FAILED.
+
+New guards cover the whole state machine:
+- every exit from a state that can leave an endpoint alive must reach a teardown;
+- every path out of Deploy's Catch must end at `Fail`.
+
+Negative controls m374–m377 break each guard in turn. m86 is re-anchored, and the guard m348 verifies is tightened: the new marking had made it pass under its break. Offline only. Not
+deployed.
+
 ### Finetune: probe and full job are two launch-and-release handoffs
 
 The `launch` task told the agent to probe, measure, launch the full job, and hand off, which is one

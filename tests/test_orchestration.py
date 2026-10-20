@@ -3834,8 +3834,8 @@ class TestStateMachine:
         Asserted as an upper bound rather than an equality: tightening a cleanup timeout
         is always safe and should not need this test edited.
         """
-        CLEANUP = {"Teardown", "MonitorHealth", "MonitorReport", "SmokeTest",
-                   "Deploy", "DataAudit"}
+        CLEANUP = {"Teardown", "TeardownAfterDeployFailed", "MonitorHealth", "MonitorReport",
+                   "SmokeTest", "Deploy", "DataAudit"}
         LONG_WORK = {"DataPrepGenerate", "DataPrepCurate", "FinetuneLaunch",
                      "FinetuneLaunchFull", "EvalGenerate", "EvalScore", "EvalGate",
                      "RemediateFinetune", "LakehouseReview"}
@@ -13817,7 +13817,12 @@ def test_a_shadowed_call_is_answered_as_text_because_the_harness_already_answere
     assert "toolUse" not in blob and "toolResult" not in blob
     assert "rejected" in blob and "never-written" in blob, (
         "the agent was not told its claim was rejected, or which output was missing")
-    assert "unknown tool" in blob, "the agent was not told the error it saw was not the answer"
+    # The shadowed wording, not just "unknown tool": the ended_turn reply (the end_turn
+    # override's) also mentions it and is also text, so without this a shadowed call that
+    # lost its classification would still pass -- m348 went uncaught exactly that way.
+    assert "your session answered it as an unknown tool" in blob, (
+        "the agent was not told the error it saw was not the answer, or the call was not "
+        "classified as shadowed")
 
 
 def test_a_real_call_still_wins_over_a_typed_one_when_shell_follows_it():
@@ -14240,3 +14245,193 @@ class TestProbeFullHandoff:
         resume_pipeline.handler(sm_event("Completed", job=FULL_JOB), clients=c)
         assert any(e["DetailType"] == ev.MODEL_TRAINED for e in c["events"].entries)
         assert json.loads(c["sfn"].successes[0]["output"])["status"] == "trained"
+# A rejected stage_complete is heard, and a failed Deploy is torn down
+# ---------------------------------------------------------------------------
+# run-20261016T012010Z-9de45cbf, deploy stage, 02:25-03:08Z. The agent claimed a prefix
+# (`deployment/model/merged/`), the harness answered the call `Unknown tool`, and the turn
+# ended. The driver serviced it through the end_turn override and rejected the prefix,
+# correctly -- then sent the rejection as a toolResult for an id the runtime had already
+# answered. Refused: "Inline function callback has no pending handoff in this session". The
+# salvage prompt never said why, so the agent re-sent the same claim ~25 times and escalated.
+# Deploy's Catch then skipped Teardown and left an ml.g5.xlarge endpoint billing.
+# See deploy/evidence/VERIFICATION_deploy_settle_and_teardown.md.
+
+DEPLOY_PREFIX = "s3://llmops-data-test/runs/run-test-1/deployment/model/merged/"
+DEPLOY_OBJECTS = ["s3://llmops-data-test/runs/run-test-1/deployment/model/serving.properties",
+                  "s3://llmops-data-test/runs/run-test-1/deployment/model/merged/config.json",
+                  "s3://llmops-data-test/runs/run-test-1/deployment/pending_endpoint.json"]
+NO_PENDING_HANDOFF = ("EventStreamError: An error occurred (runtimeClientError) when calling the "
+                      "InvokeHarness operation: Inline function callback has no pending handoff "
+                      "in this session.")
+
+
+class _NoPendingHandoffStream:
+    """What the runtime streamed back for a toolResult whose call the turn had already closed."""
+
+    def __iter__(self):
+        raise RuntimeError(NO_PENDING_HANDOFF)
+        yield  # pragma: no cover -- makes this a generator
+
+
+class _DeployAgentAfterUnknownTool(FakeAgentCore):
+    """The live deploy agent, as far as the driver could see it.
+
+    It refuses a toolResult the way the runtime did, and it re-sends the SAME claim (prefix
+    included) unless something it was told names the prefix as the problem -- which is what
+    ~25 identical claims say it did. A fake that fixed its claim whatever it was told would
+    pass whether or not the reason ever reached it. Bounded, so the broken path ends in a
+    failed stage rather than a hang."""
+
+    def __init__(self, limit=8):
+        super().__init__([])
+        self.limit = limit
+
+    def invoke_harness(self, **kw):
+        self.calls.append(kw)
+        msgs = kw["messages"]
+        if any("toolResult" in b for m in msgs for b in m["content"]):
+            return {"stream": _NoPendingHandoffStream()}
+        if len(self.calls) > self.limit:
+            return {"stream": text_stream("I cannot close this stage.")}
+        told = "S3 prefix" in json.dumps(msgs)
+        outputs = DEPLOY_OBJECTS if told else DEPLOY_OBJECTS + [DEPLOY_PREFIX]
+        return {"stream": tool_use_stream_ending_in_prose(
+            "stage_complete", {"stage": "deploy", "outputs": outputs},
+            text="Deploy stage complete.")}
+
+
+@pytest.fixture
+def deploy_env(monkeypatch):
+    monkeypatch.setenv("HARNESS_ARN_LLMOPS_DEPLOY",
+                       ENV["HARNESS_ARN_LLMOPS_MONITOR"].replace("llmops_monitor", "llmops_deploy"))
+    monkeypatch.setattr(driver.time, "sleep", lambda s: None)
+
+
+def _deploy_event():
+    return driver_event(stage="deploy", task="deploy", harness_id="llmops_deploy")
+
+
+def test_a_rejected_end_turn_stage_complete_reaches_the_agent_and_the_stage_settles(deploy_env):
+    """The live deploy loop, replayed. Before the fix the rejection died as a stream error
+    every time, the agent never learned the prefix was the problem, and the stage never
+    settled."""
+    ac = _DeployAgentAfterUnknownTool()
+    c = clients(ac, FakeS3(existing=DEPLOY_OBJECTS))
+    out = driver.handler(_deploy_event(), clients=c)
+    assert out["status"] == "completed", (
+        f"the rejection of an end_turn stage_complete never reached the agent: {out}")
+    assert c["sfn"].successes and not c["sfn"].failures
+    reply = ac.calls[1]["messages"]
+    blob = json.dumps(reply)
+    assert len(reply) == 1 and "toolResult" not in blob and "toolUse" not in blob, (
+        f"the rejection was sent as a toolUse/toolResult pair the runtime refuses: {reply}")
+    assert "rejected" in blob and "merged/" in blob and "S3 prefix" in blob, (
+        "the agent was not told its claim was rejected, or that the prefix was why")
+
+
+def test_a_succeeding_end_turn_stage_complete_is_acked_as_text(deploy_env):
+    """The success path had the same flaw and hid it: _ack_terminal swallowed the refusal.
+    The ack is the agent's next input, so it goes as text too."""
+    ac = _DeployAgentAfterUnknownTool()
+    c = clients(ac, FakeS3(existing=DEPLOY_OBJECTS + [DEPLOY_PREFIX]))
+    out = driver.handler(_deploy_event(), clients=c)
+    assert out["status"] == "completed", out
+    ack = ac.calls[-1]["messages"]
+    assert "toolResult" not in json.dumps(ack), f"the ack was a toolResult again: {ack}"
+    assert "acknowledged" in json.dumps(ack)
+
+
+def test_a_rejected_claim_names_a_prefix_as_a_prefix(deploy_env, capsys):
+    """head_object can only miss on a prefix and the driver role has no ListBucket, so
+    "write them" cannot help: the agent has to be told to name the objects. The rejection is
+    also logged, which the live run's ~25 rejections never were."""
+    ac = _DeployAgentAfterUnknownTool()
+    driver.handler(_deploy_event(), clients=clients(ac, FakeS3(existing=DEPLOY_OBJECTS)))
+    reason = json.dumps(ac.calls[1]["messages"])
+    assert "is an S3 prefix" in reason and "head_object" in reason, reason
+    assert "stage_complete REJECTED stage=deploy task=deploy" in capsys.readouterr().out
+
+
+#: Tasks during which a run can have a live endpoint, and the one that deletes it.
+ENDPOINT_ALIVE_TASKS = {("deploy", "deploy"), ("deploy", "smoke"), ("monitor", "health")}
+TEARDOWN_TASK = ("deploy", "teardown")
+
+
+def _dispatches(st: dict):
+    p = (st.get("Parameters") or {}).get("Payload") or {}
+    return (p.get("stage"), p.get("task"))
+
+
+def test_every_exit_from_a_live_endpoint_state_reaches_a_teardown(asl):
+    """The #1 cost risk, stated over the whole machine instead of one state's Catch.
+
+    SmokeTest's and MonitorHealth's exits already reached Teardown, and a test checked
+    SmokeTest's. Deploy's Catch went to EscalateFail, which nothing checked, and live it
+    stranded an ml.g5.xlarge endpoint for ~58 minutes. States are found by the task they
+    dispatch rather than by name, so a renamed or added endpoint state is covered too."""
+    states = asl["States"]
+    alive = [n for n, st in states.items() if _dispatches(st) in ENDPOINT_ALIVE_TASKS]
+    assert {_dispatches(states[n]) for n in alive} == ENDPOINT_ALIVE_TASKS, (
+        f"an endpoint-alive task is no longer dispatched, so this guard checks less: {alive}")
+
+    def reaches_teardown(name, seen):
+        if _dispatches(states[name]) == TEARDOWN_TASK:
+            return True
+        if name in seen:
+            return False
+        nxt = _exits(states[name])
+        return bool(nxt) and all(reaches_teardown(n, seen | {name}) for n in nxt)
+
+    leaks = [(n, x) for n in alive for x in _exits(states[n])
+             if not reaches_teardown(x, {n})]
+    assert not leaks, f"exits that can end a run with its endpoint alive: {leaks}"
+
+
+def test_a_failed_deploy_is_torn_down_and_still_fails_the_run(asl):
+    """Teardown on the way out must not turn a failure into a success: every path from
+    Deploy's Catch has to visit a teardown and end at Fail, never at MonitorReport or
+    Complete. Reusing the happy-path Teardown, whose Next is MonitorReport, would do that."""
+    states = asl["States"]
+    deploy = next(n for n, st in states.items() if _dispatches(st) == ("deploy", "deploy"))
+    terminals = set()
+
+    def walk(name, path):
+        if name in path:
+            return
+        path = path + [name]
+        st = states[name]
+        nxt = _exits(st)
+        if not nxt:
+            terminals.add(name)
+            assert any(_dispatches(states[p]) == TEARDOWN_TASK for p in path), (
+                f"a failed Deploy reaches {name} without a teardown: {path}")
+            assert st["Type"] == "Fail", f"a failed Deploy ends at {name} ({st['Type']}): {path}"
+            return
+        assert name not in ("MonitorReport", "Complete"), (
+            f"a failed Deploy is reported as a finished run: {path}")
+        for n in nxt:
+            walk(n, path)
+
+    for c in states[deploy]["Catch"]:
+        walk(c["Next"], [deploy])
+    assert terminals, "no terminal state reached from Deploy's Catch"
+
+
+def test_a_handoff_refused_on_an_end_turn_call_still_reaches_the_agent_as_text():
+    """check_handoff (probe/full) refuses a job_launched into the turn; the end_turn override
+    services job_launched too. Both together: a wrong-kind job named on an end_turn call must
+    come back as a rejection the agent can read -- plain text, since the runtime refuses a
+    toolResult for a call whose turn has closed -- and the right job named next is parked."""
+    ac = FakeAgentCore([
+        tool_use_stream_ending_in_prose("job_launched", {"job_name": FULL_JOB}),
+        tool_use_stream("job_launched", {"job_name": PROBE_JOB}), text_stream("ok")])
+    c = clients(ac)
+    c["sagemaker"] = FakeSageMaker({PROBE_JOB: PROBE_HP, FULL_JOB: FULL_HP})
+    out = driver.handler(driver_event(stage="finetune", task="launch",
+                                      harness_id="llmops_finetune"), clients=c)
+    assert out["status"] == "released" and out["job_name"] == PROBE_JOB, out
+    reply = ac.calls[1]["messages"]
+    blob = json.dumps(reply)
+    assert len(reply) == 1 and "toolResult" not in blob, (
+        f"the refusal went back as a toolResult the runtime would refuse: {reply}")
+    assert "rejected" in blob and "PROBE" in blob, blob[:400]

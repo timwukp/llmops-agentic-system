@@ -340,12 +340,12 @@ def _ack_terminal(c, event, sess, tu, payload, effect: str) -> None:
     stage that had genuinely finished -- token already settled, artifacts already in S3
     -- into a failed invocation, leaving the state machine with a settled token AND a
     Lambda error for the same stage. Every _invoke can fail on throttling or a 5xx
-    alone, and the override above adds a shape with no production record either way:
-    servicing a call that arrived with stopReason=end_turn now sends a resume for a turn
-    the runtime has already closed. _tool_result_content echoes the toolUse alongside
-    the result, so that resume carries its own matching call and MAY be accepted -- but
-    it is untested, and the failure mode if it is not (see the rejection quoted in
-    _tool_result_content) would land exactly here, one state after the effect.
+    alone. The override in _run_stage added a second source: a call that arrived with
+    stopReason=end_turn used to be acked with an echo plus toolResult for a turn the runtime
+    had already closed, and live that is refused ("Inline function callback has no pending
+    handoff in this session", run-20261016T012010Z-9de45cbf). It landed here, one state after
+    the effect, and was swallowed. Such a call is now answered as text (`ended_turn`), but the
+    point below does not depend on it.
 
     Which is the point: a courtesy message must not be able to un-complete a stage,
     whatever the reason it fails. Nothing downstream reads the ack.
@@ -552,11 +552,22 @@ def _tool_result_content(tool_use: dict, payload: dict) -> list:
     already answered it, so there is no pending call, and an echo of that id after the
     later messages would put an answered toolUse back into history. Its wording says what
     happened, because the agent saw an error and has to learn the error was not the answer.
+
+    An ENDED-TURN call (the end_turn override in _run_stage) is the same case with no later
+    block: the turn stopped without waiting for the result, so the runtime has no pending
+    call and refuses a toolResult for it ("Inline function callback has no pending handoff
+    in this session"). Text again.
     """
     if tool_use.get("recovered") == "shadowed":
         return _user_text(f"Result of your {tool_use.get('name')} call (your session "
                           f"answered it as an unknown tool, but the driver received it and "
                           f"serviced it -- do not re-send it through shell or S3): "
+                          f"{json.dumps(payload, default=str)}")
+    if tool_use.get("recovered") == "ended_turn":
+        return _user_text(f"Result of your {tool_use.get('name')} call (your turn ended "
+                          f"without a result for it; if your session said unknown tool, that "
+                          f"was not the answer -- the driver received the call and serviced "
+                          f"it. Do not re-send it through shell or S3): "
                           f"{json.dumps(payload, default=str)}")
     if not tool_use.get("toolUseId"):
         return _user_text(f"Result of your {tool_use.get('name')} call "
@@ -3201,6 +3212,15 @@ def _run_stage(event, context=None, c=None):
                   f"{out['stop_reason']}; servicing it anyway -- the harness cannot "
                   "have serviced a call only this driver can answer")
             prot["recovered_ending_in_prose"] += 1
+            # The turn is over, so the runtime holds no pending call for this id: a
+            # toolResult for it is refused ("Inline function callback has no pending
+            # handoff in this session"). The ack path swallowed that; a REJECTION path did
+            # not. Live, run-20261016T012010Z-9de45cbf's deploy claimed a prefix, every
+            # rejection died that way, the salvage prompt said only "call your pending
+            # inline function", and the agent re-sent the same claim ~25 times without
+            # ever hearing why. Answered as text, like a shadowed call.
+            if tu.get("recovered") != "shadowed":
+                tu = {**tu, "toolUseId": None, "recovered": "ended_turn"}
             out = {**out, "stop_reason": "tool_use"}
         # The turn may instead have WRITTEN the call out: `<invoke name="job_launched">`
         # as literal text, which no structured reader can see. Recovered only when no
@@ -3260,9 +3280,27 @@ def _run_stage(event, context=None, c=None):
             if name == "stage_complete":
                 result = handle_stage_complete(c, event, args)
                 if not result["ok"]:
+                    # .get: a rejection for another reason (a contract check) may carry no
+                    # missing_outputs, and a KeyError here would crash the turn, not reject it.
+                    missing = result.get("missing_outputs") or []
+                    # Said out loud: run-20261016T012010Z-9de45cbf rejected ~25 claims and
+                    # CloudWatch never said which output, so the log could not tell a
+                    # rejection from a settle that failed.
+                    print(f"[driver] stage_complete REJECTED stage={event.get('stage')} "
+                          f"task={event.get('task')}: missing {missing}")
+                    # A prefix is what that run's deploy claimed (deployment/model/merged/).
+                    # head_object can only miss on one, and this role has no ListBucket to
+                    # look inside it, so the agent has to be told to name objects -- "write
+                    # them" is advice it cannot act on for something already written.
+                    prefixes = [u for u in missing if u.endswith("/")]
+                    hint = (f" {prefixes} {'is an S3 prefix' if len(prefixes) == 1 else 'are S3 prefixes'}, "
+                            "not an object: the driver verifies outputs with head_object, "
+                            "which cannot see a prefix. List the objects under it instead "
+                            "(for a model directory, e.g. its config.json and weights)."
+                            if prefixes else "")
                     messages = _tool_result_content(tu, {
                         "status": "rejected",
-                        "reason": f"claimed outputs missing from S3: {result['missing_outputs']}. "
+                        "reason": f"claimed outputs missing from S3: {missing}.{hint} "
                                   "Write them and call stage_complete again."})
                     continue
                 _ack_terminal(c, event, sess, tu, {"status": "acknowledged"},
