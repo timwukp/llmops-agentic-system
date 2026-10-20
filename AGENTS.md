@@ -297,6 +297,21 @@ versions and introspects the live CreateHarness/UpdateHarness schemas.
   August pipeline rows show `recovered_ending_in_prose = 0`, but every stage of the 2026-10-15
   lakehouse run `run-20261015T065307Z-97655783` was serviced through it (EvalGate 13 times). Treat
   the end_turn path as the normal one, not a fallback. `deploy/evidence/VERIFICATION_sweep_unheard_calls.md`.
+- **An end_turn call has no pending handoff either, so ANY reply to it goes as text.** The
+  "answer as text" rule above was applied to the shadowed call only. The end_turn override kept
+  the `toolUseId` and replied with an echo plus `toolResult`, and the runtime refuses that:
+  `runtimeClientError: Inline function callback has no pending handoff in this session`. On the
+  success path `_ack_terminal` swallowed the refusal, so 33 serviced sweeps never showed it. A
+  *rejection* is not swallowed. It becomes the next turn's input, dies as a stream error, and
+  the salvage prompt ("call your pending inline function") never says why. Live,
+  run-20261016T012010Z-9de45cbf's deploy claimed the prefix `deployment/model/merged/`, which
+  `head_object` can only miss. The agent re-sent the identical claim ~25 times, then escalated,
+  saying the tool was "unregistered". The override now marks the call `ended_turn`. The driver
+  logs every rejected claim, and a rejection names a prefix as a prefix (the driver role has
+  `HeadObject` and no `ListBucket`, so the agent has to name objects). The same run showed the
+  other half: **Deploy's Catch went straight to `EscalateFail` and stranded an InService
+  endpoint**. It now goes through `TeardownAfterDeployFailed`.
+  `deploy/evidence/VERIFICATION_deploy_settle_and_teardown.md`.
 - **Observability**: `OTEL_TRACES_SAMPLER=always_on` env var is mandatory or
   evaluations/insights sit at zero forever. X-Ray delivery takes no `outputFormat`.
 - **Turn budget**: harness `timeoutSeconds` is 840 here (driver Lambda caps at 900s).

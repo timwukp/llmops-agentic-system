@@ -309,7 +309,12 @@ prompt 明文禁止它刪東西的 agent。
   真正送出的任務做差集，剩下的孤兒是一份明列的白名單，而不是一個數字。
 - **deploy 之後必然執行 `Teardown`** —— 即使 `SmokeTest` 失敗，其 `Catch` 也先路由到
   `Teardown`。孤兒 endpoint 是第一大成本風險（Phase 4 就在帳號裡發現一個無關的
-  endpoint 自 2024-04 起一直 InService）。
+  endpoint 自 2024-04 起一直 InService）。失敗的 `Deploy` 也會被拆除：它的 `Catch` 先到
+  `TeardownAfterDeployFailed`（同一個 `teardown` 任務），再到 `EscalateFail`，所以
+  run 仍以 FAILED 結束。2026-10-16 之前它直接走 `EscalateFail`，
+  run-20261016T012010Z-9de45cbf 那台 InService 的 `ml.g5.xlarge` 因此計費約 58 分鐘，直到
+  一個 agent session 把它刪掉。守門測試涵蓋整台狀態機：任何可能讓 endpoint 還活著的
+  state，其每一個出口都必須走到 `teardown` 任務。
 - 主幹同時是**確定性後備**：Phase 3 一次 Bedrock 短暫故障期間，agent 不可達，
   orchestrator 直接提交了訓練作業 `-r5`（標記
   `launched_by: orchestrator-fallback-bedrock-5xx`）。

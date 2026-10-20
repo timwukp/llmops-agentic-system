@@ -1296,9 +1296,14 @@ def m86(t):
     843-day orphan this project already paid for once. Nothing about the state's own
     definition objects: 86400 is a legal TimeoutSeconds and the machine deploys fine.
     """
+    # Anchored inside Teardown's own block: TeardownAfterDeployFailed carries the same two
+    # lines, so a whole-file count of them is 2 and says nothing about which state moved.
+    head, sep, tail = t.partition('    "Teardown": {\n')
+    assert sep, "the Teardown state has moved"
     old = '"ResultPath": "$.teardown",\n      "TimeoutSeconds": 3600,'
-    assert t.count(old) == 1, f"Teardown's timeout has moved; found {t.count(old)}"
-    return t.replace(old, '"ResultPath": "$.teardown",\n      "TimeoutSeconds": 86400,', 1)
+    body = tail[:tail.index('\n    },\n')]
+    assert body.count(old) == 1, f"Teardown's timeout has moved; found {body.count(old)}"
+    return head + sep + tail.replace(old, '"ResultPath": "$.teardown",\n      "TimeoutSeconds": 86400,', 1)
 
 
 case("ASL: Teardown inherits the 24-hour ceiling meant for long-work states",
@@ -6146,6 +6151,74 @@ def m355(t):
 case("lakehouse: Gold trains on rows that still carry redaction tokens",
      "pipeline/lakehouse/transform.py", m355,
      ["tests/test_lakehouse_transform.py::test_gold_promotes_no_pair_that_carries_a_redaction_token"])
+# ── a rejected stage_complete is heard, and a failed Deploy is torn down ──────────
+
+
+def m374(t):
+    # The end_turn override keeps the call's toolUseId again: every reply becomes a toolResult
+    # the runtime refuses ("no pending handoff"), and a rejection never reaches the agent --
+    # run-20261016T012010Z-9de45cbf's deploy loop.
+    old = '                tu = {**tu, "toolUseId": None, "recovered": "ended_turn"}\n'
+    assert t.count(old) == 1, f"the ended_turn marking has moved; found {t.count(old)}"
+    return t.replace(old, "                pass\n", 1)
+
+
+case("driver: an end_turn call is answered with a toolResult the runtime refuses",
+     _DRIVER, m374,
+     [f"{_TO}test_a_rejected_end_turn_stage_complete_reaches_the_agent_and_the_stage_settles",
+      f"{_TO}test_a_succeeding_end_turn_stage_complete_is_acked_as_text"])
+
+
+def m375(t):
+    # The prefix hint is dropped: the rejection says "write them" about an output that is
+    # already written, and the agent cannot tell what to change.
+    old = "                    prefixes = [u for u in missing if u.endswith(\"/\")]\n"
+    assert t.count(old) == 1, f"the prefix detection has moved; found {t.count(old)}"
+    return t.replace(old, "                    prefixes = []\n", 1)
+
+
+case("driver: a rejected claim stops naming a prefix as a prefix",
+     _DRIVER, m375,
+     [f"{_TO}test_a_rejected_claim_names_a_prefix_as_a_prefix",
+      f"{_TO}test_a_rejected_end_turn_stage_complete_reaches_the_agent_and_the_stage_settles"])
+
+
+def _deploy_state(d):
+    return next(n for n, st in d["States"].items()
+                if (st.get("Parameters") or {}).get("Payload", {}).get("task") == "deploy"
+                and st["Parameters"]["Payload"].get("stage") == "deploy")
+
+
+def m376(t):
+    # Deploy's Catch goes straight to EscalateFail again: a Deploy that fails with its endpoint
+    # InService ends the run with the endpoint still billing.
+    d = json.loads(t)
+    catches = d["States"][_deploy_state(d)]["Catch"]
+    assert any(c["Next"] != "EscalateFail" for c in catches), "Deploy's Catch already escalates"
+    for c in catches:
+        c["Next"] = "EscalateFail"
+    return json.dumps(d, indent=2, ensure_ascii=False)
+
+
+case("ASL: a failed Deploy escalates without a teardown",
+     "orchestration/state_machine.asl.json", m376,
+     [f"{_TO}test_every_exit_from_a_live_endpoint_state_reaches_a_teardown",
+      f"{_TO}test_a_failed_deploy_is_torn_down_and_still_fails_the_run"])
+
+
+def m377(t):
+    # Deploy's failure-path teardown continues to MonitorReport: the endpoint is deleted, and a
+    # failed deploy is reported as a finished run.
+    d = json.loads(t)
+    st = d["States"]["TeardownAfterDeployFailed"]
+    assert st["Next"] == "EscalateFail", "the failure-path teardown no longer escalates"
+    st["Next"] = "MonitorReport"
+    return json.dumps(d, indent=2, ensure_ascii=False)
+
+
+case("ASL: a failed Deploy is torn down and then reported as a finished run",
+     "orchestration/state_machine.asl.json", m377,
+     [f"{_TO}test_a_failed_deploy_is_torn_down_and_still_fails_the_run"])
 
 
 def m356(t):

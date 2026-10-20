@@ -364,7 +364,13 @@ Two spine details that are policy, not plumbing:
   rather than a count.
 - **`Teardown` always runs after deploy** — even when `SmokeTest` fails, its `Catch`
   routes to `Teardown` first. Orphaned endpoints are the #1 cost risk (Phase 4 found an
-  unrelated endpoint in the account that had been InService since 2024-04).
+  unrelated endpoint in the account that had been InService since 2024-04). A failed
+  `Deploy` is torn down too: its `Catch` goes to `TeardownAfterDeployFailed` (the same
+  `teardown` task), then `EscalateFail`, so the run still ends FAILED. Until
+  2026-10-16 it went straight to `EscalateFail`, and run-20261016T012010Z-9de45cbf's
+  InService `ml.g5.xlarge` billed ~58 min until an agent session deleted it. Guarded over
+  the whole machine: every exit from a state that can leave an endpoint alive must reach a
+  `teardown` task.
 - The spine is also the **deterministic fallback**: during a transient Bedrock outage in
   Phase 3, the orchestrator submitted training job `-r5` directly (tagged
   `launched_by: orchestrator-fallback-bedrock-5xx`) while the agent was unreachable.
