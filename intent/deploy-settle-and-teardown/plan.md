@@ -23,8 +23,8 @@ call reaches the agent as text).
    guards. `tests/negative_controls/monitor_dispatch.py`: m374–m377.
 4. `AGENTS.md`, `CHANGELOG.md`, `PROJECT_STATE.md`, `docs/ARCHITECTURE.md`,
    `docs/ARCHITECTURE.zh-TW.md`, `docs/TEST_RESULTS.md`, `docs/TEST_RESULTS.zh-TW.md`, and
-   `deploy/evidence/VERIFICATION_deploy_settle_and_teardown.md`. Plus whatever count guards
-   `tests/test_docs_claims.py` derives (tracked-file count in the redaction scan, state counts).
+   `deploy/evidence/VERIFICATION_deploy_settle_and_teardown.md`.
+   `tests/redaction_scan.py` and `tests/test_redaction_scan.py` (tracked-file count).
 5. `intent/deploy-settle-and-teardown/{intent,spec,plan}.md` and `.sdlc/active`.
 
 ## Not in this change
