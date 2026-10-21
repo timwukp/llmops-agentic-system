@@ -7972,6 +7972,9 @@ def test_only_a_literal_true_announces_drift(metrics):
         f"metrics={metrics!r} announced drift; only a literal True may")
 
 
+_SWEEP_EXAMPLE = json.loads((REPO / "pipeline/contracts/sweep.example.json").read_text())
+
+
 @pytest.mark.parametrize("echoed, dispatched", [
     ({}, "sweep"),                                   # the field simply omitted -- both live sweeps
     ({"task": ""}, "sweep"),                         # ...or present and empty
@@ -7998,7 +8001,11 @@ def test_the_event_row_records_the_task_that_was_dispatched_not_the_one_echoed(e
         tool_use_stream("stage_complete",
                         {"outputs": [uri], "metrics": {"endpoints_total": 1}, **echoed}),
         text_stream("ack")])
-    c = clients(ac, FakeS3(existing=[uri]))
+    s3 = FakeS3(existing=[uri])
+    # A sweep stage_complete is now checked against pipeline/contracts/sweep.schema.json, so
+    # the file has to exist with a conforming body, not just answer head_object.
+    s3.objects[uri] = json.dumps(dict(_SWEEP_EXAMPLE, run_id="run-test-1"))
+    c = clients(ac, s3)
     driver.handler(driver_event(stage="monitor", task=dispatched,
                                harness_id="llmops_monitor"), clients=c)
     rows = [i for i in c["ddb"].tables["llmops-stage-events"].items
@@ -13711,6 +13718,17 @@ SWEEP_REPORT = f"s3://{SWEEP_BUCKET}/monitoring/sweeps/sweep-2026-10-07.json"
 SWEEP_MANIFEST = f"s3://{SWEEP_BUCKET}/monitoring/manifests/sweep-2026-10-07.json"
 
 
+def sweep_s3(existing):
+    """FakeS3 whose sweep file has a body that satisfies pipeline/contracts/sweep.schema.json.
+
+    These tests are about whether the driver HEARS a stage_complete; since the sweep contract,
+    hearing it also means reading the file, and a head_object-only double would now be
+    rejected for a reason unrelated to what each test asserts."""
+    s3 = FakeS3(existing=existing)
+    s3.objects[SWEEP_REPORT] = json.dumps(dict(_SWEEP_EXAMPLE, run_id="sweep-2026-10-07"))
+    return s3
+
+
 def sweep_driver_event(**over):
     """What llmops-monitor-sweep hands the driver: no task token, an outcome row."""
     base = sweep.build_payload("llmops-agentic-system", SWEEP_BUCKET, "us-east-1",
@@ -13787,7 +13805,7 @@ def test_a_stage_complete_followed_by_shell_in_the_same_turn_is_serviced():
     ac = FakeAgentCore([shadowed_call_stream(
         "stage_complete", {"stage": "monitor", "task": "sweep",
                            "outputs": [SWEEP_REPORT, SWEEP_MANIFEST]})])
-    c = clients(ac, FakeS3(existing=[SWEEP_REPORT, SWEEP_MANIFEST]))
+    c = clients(ac, sweep_s3(existing=[SWEEP_REPORT, SWEEP_MANIFEST]))
     out = driver.handler(sweep_driver_event(), clients=c)
     assert out["status"] == "completed", (
         f"a stage_complete followed by a shell block was still unheard: {out}")
@@ -13807,7 +13825,7 @@ def test_a_shadowed_call_is_answered_as_text_because_the_harness_already_answere
         shadowed_call_stream("stage_complete", {"stage": "monitor", "outputs": [missing]}),
         tool_use_stream("stage_complete", {"stage": "monitor", "outputs": [SWEEP_REPORT]}),
     ])
-    c = clients(ac, FakeS3(existing=[SWEEP_REPORT]))
+    c = clients(ac, sweep_s3(existing=[SWEEP_REPORT]))
     out = driver.handler(sweep_driver_event(), clients=c)
     assert out["status"] == "completed", out
     reply = ac.calls[1]["messages"]
@@ -13834,7 +13852,7 @@ def test_a_real_call_still_wins_over_a_typed_one_when_shell_follows_it():
     ac = FakeAgentCore([shadowed_call_stream(
         "stage_complete", {"stage": "monitor", "outputs": [SWEEP_REPORT]},
         text=typed_missing)])
-    c = clients(ac, FakeS3(existing=[SWEEP_REPORT]))
+    c = clients(ac, sweep_s3(existing=[SWEEP_REPORT]))
     out = driver.handler(sweep_driver_event(), clients=c)
     assert out["status"] == "completed", (
         f"the typed call displaced the real one that preceded the shell block: {out}")
@@ -13846,7 +13864,7 @@ def test_a_call_typed_after_a_shell_block_is_recovered():
     spelling parse_typed_call already handled. It never ran, because the gate was
     `if not tu` and the shell block was a `tu`."""
     ac = FakeAgentCore([shell_then_text_stream(TYPED_PYCALL_1006)])
-    c = clients(ac, FakeS3(existing=[SWEEP_REPORT, SWEEP_MANIFEST]))
+    c = clients(ac, sweep_s3(existing=[SWEEP_REPORT, SWEEP_MANIFEST]))
     out = driver.handler(sweep_driver_event(), clients=c)
     assert out["status"] == "completed", (
         f"a typed call was still invisible because shell ran earlier in the turn: {out}")
@@ -13860,7 +13878,7 @@ def test_the_inline_function_tag_spelling_is_recovered():
     assert call and call["name"] == "stage_complete", call
     assert call["input"]["outputs"] == [SWEEP_REPORT, SWEEP_MANIFEST]
     ac = FakeAgentCore([text_stream(TYPED_TAGCALL_0831)])
-    c = clients(ac, FakeS3(existing=[SWEEP_REPORT, SWEEP_MANIFEST]))
+    c = clients(ac, sweep_s3(existing=[SWEEP_REPORT, SWEEP_MANIFEST]))
     assert driver.handler(sweep_driver_event(), clients=c)["status"] == "completed"
 
 
@@ -13909,7 +13927,7 @@ def test_a_sweep_that_does_not_complete_settles_its_row_and_pages_once():
 def test_a_completed_sweep_settles_its_row_without_paging():
     ac = FakeAgentCore([tool_use_stream("stage_complete",
                                         {"stage": "monitor", "outputs": [SWEEP_REPORT]})])
-    c = clients(ac, FakeS3(existing=[SWEEP_REPORT]))
+    c = clients(ac, sweep_s3(existing=[SWEEP_REPORT]))
     driver.handler(sweep_driver_event(), clients=c)
     assert _outcome_row(c)["status"] == "completed"
     assert c["sns"].published == [], "a successful sweep paged the owner"
@@ -14435,3 +14453,38 @@ def test_a_handoff_refused_on_an_end_turn_call_still_reaches_the_agent_as_text()
     assert len(reply) == 1 and "toolResult" not in blob, (
         f"the refusal went back as a toolResult the runtime would refuse: {reply}")
     assert "rejected" in blob and "PROBE" in blob, blob[:400]
+
+
+def test_a_sweep_whose_file_breaks_the_contract_is_rejected_then_accepted_after_a_rewrite():
+    """End to end through the turn loop: the agent hears WHY, rewrites, and only then settles.
+
+    The drift is a live one (10-15's verification run filed its memory findings under
+    `memory_sweep`). The fake agent "rewrites" by having the file corrected between its two
+    stage_complete calls -- what the driver must prove is that the first call was refused with
+    the contract's own words and the second was accepted, not that it can edit S3.
+    """
+    drifted = dict(_SWEEP_EXAMPLE, run_id="sweep-2026-10-07")
+    drifted["memory_sweep"] = drifted.pop("agentcore")
+    s3 = sweep_s3(existing=[SWEEP_REPORT, SWEEP_MANIFEST])
+    s3.objects[SWEEP_REPORT] = json.dumps(drifted)
+
+    class _Rewriting(FakeAgentCore):
+        def invoke_harness(self, **kw):
+            if len(self.calls) == 1:  # the agent read the rejection and rewrote the file
+                s3.objects[SWEEP_REPORT] = json.dumps(
+                    dict(_SWEEP_EXAMPLE, run_id="sweep-2026-10-07"))
+            return super().invoke_harness(**kw)
+
+    claim = {"outputs": [SWEEP_REPORT], "metrics": {"memory_orphans_count": 0}}
+    ac = _Rewriting([tool_use_stream("stage_complete", claim),
+                     tool_use_stream("stage_complete", claim), text_stream("ack")])
+    c = clients(ac, s3)
+    out = driver.handler(sweep_driver_event(), clients=c)
+    rejection = json.loads(ac.calls[1]["messages"][-1]["content"][0]["toolResult"]
+                           ["content"][0]["text"])
+    assert rejection["status"] == "rejected"
+    assert "sweep/1" in rejection["reason"] and "'agentcore'" in rejection["reason"], rejection
+    assert out["status"] == "completed", out
+    rows = [i for i in c["ddb"].tables["llmops-stage-events"].items
+            if str(i.get("sk", "")).endswith("stage_complete")]
+    assert len(rows) == 1, "the drifted claim must not have been recorded as a completion"

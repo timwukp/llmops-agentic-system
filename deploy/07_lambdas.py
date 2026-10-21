@@ -147,7 +147,9 @@ VENDOR_DIRS = (CONTRACTS, REPO / "orchestration")
 #: Bundled although no handler imports it: the manifest schema is data, not a module, and
 #: the schema is the artifact contract every stage writes against. Listed by hand because
 #: an import scan cannot see a file nothing imports.
-VENDOR_DATA = ("manifest.schema.json",)
+#: sweep.schema.json is read at import time by sweep_contract (the driver's sweep check), so a
+#: bundle without it fails on the first import, not on the first sweep.
+VENDOR_DATA = ("manifest.schema.json", "sweep.schema.json")
 
 def flat_imports(text: str) -> list:
     """Module names imported inside an `except ImportError:` handler, in source order.

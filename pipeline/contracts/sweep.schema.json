@@ -1,0 +1,90 @@
+{
+  "$comment": "The daily monitor sweep's output (monitoring/sweeps/<run_id>.json). Free-form until 2026-10-17, and it drifted every run: four live files named the same facts four ways. The driver validates every sweep stage_complete against this file (pipeline/contracts/sweep_contract.py) and rejects one that does not match, with the errors, so the agent rewrites it in the same session. Extra keys are allowed -- the agent may add detail -- but the keys below may not vary. A count the agent could not measure is null, never 0, and must come with a permission_gaps entry.",
+  "type": "object",
+  "required": ["schema_version", "run_id", "stage", "task", "region", "generated_at", "idle_rule",
+               "endpoints", "orphan_endpoint_configs", "orphan_models", "agentcore",
+               "permission_gaps", "deletions_performed", "open_findings"],
+  "properties": {
+    "schema_version": {"enum": ["sweep/1"]},
+    "run_id": {"type": "string"},
+    "stage": {"enum": ["monitor"]},
+    "task": {"enum": ["sweep"]},
+    "region": {"type": "string"},
+    "generated_at": {"type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?Z$"},
+    "idle_rule": {
+      "type": "object",
+      "required": ["metric", "window_hours", "threshold"],
+      "properties": {
+        "metric": {"type": "string"},
+        "window_hours": {"type": "number", "minimum": 0},
+        "threshold": {"type": ["string", "number"]}
+      }
+    },
+    "endpoints": {
+      "type": "object",
+      "required": ["total", "ours", "other_projects", "untagged", "idle_flagged", "hourly_cost_usd"],
+      "properties": {
+        "total": {"type": ["integer", "null"], "minimum": 0},
+        "ours": {"type": "array"},
+        "other_projects": {"type": "array"},
+        "untagged": {"type": "array"},
+        "idle_flagged": {"type": "array"},
+        "hourly_cost_usd": {"type": ["number", "null"], "minimum": 0}
+      }
+    },
+    "orphan_endpoint_configs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "creation_time", "owning_run", "classification"],
+        "properties": {
+          "name": {"type": "string"},
+          "creation_time": {"type": "string"},
+          "owning_run": {"type": ["string", "null"]},
+          "classification": {"type": "string"}
+        }
+      }
+    },
+    "orphan_models": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "creation_time", "owning_run", "classification"],
+        "properties": {
+          "name": {"type": "string"},
+          "creation_time": {"type": "string"},
+          "owning_run": {"type": ["string", "null"]},
+          "classification": {"type": "string"}
+        }
+      }
+    },
+    "agentcore": {
+      "type": "object",
+      "required": ["memories_total", "harnesses_total", "llmops_harnesses_inspected", "memory_orphans",
+                   "memory_orphans_count", "other_project_memories_count", "contents_read"],
+      "properties": {
+        "memories_total": {"type": ["integer", "null"], "minimum": 0},
+        "harnesses_total": {"type": ["integer", "null"], "minimum": 0},
+        "llmops_harnesses_inspected": {"type": ["integer", "null"], "minimum": 0},
+        "memory_orphans": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "createdAt", "status"],
+            "properties": {
+              "id": {"type": "string"},
+              "createdAt": {"type": "string"},
+              "status": {"type": "string"}
+            }
+          }
+        },
+        "memory_orphans_count": {"type": ["integer", "null"], "minimum": 0},
+        "other_project_memories_count": {"type": ["integer", "null"], "minimum": 0},
+        "contents_read": {"enum": [false]}
+      }
+    },
+    "permission_gaps": {"type": "array", "items": {"type": ["string", "object"]}},
+    "deletions_performed": {"enum": [0]},
+    "open_findings": {"type": "array", "items": {"type": "string"}}
+  }
+}
