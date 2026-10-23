@@ -5,6 +5,16 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
 ## [Unreleased]
 
+### A call refused every turn stops buying turns
+
+`triage-run-20261016T012010Z-9de45cbf` re-sent `resolve_escalation` for a run that could not hear it
+96 times in four hours, until the driver was stopped by hand. Every serviced call re-armed the prose
+budget, so nothing bounded a call the driver refused every time. Now five consecutive refused calls
+(rejected, undeliverable, unsupported) end the invocation before the next turn: a stage settles
+`RejectedCallsExhausted`, a triage is paged by the backstop. Any accepted call resets the count, and
+the count rides the continuation. The live loop, replayed against a runtime that refuses toolResults,
+now ends in five turns with every reply in text.
+
 ### Deployed: a rejected stage_complete is heard; a failed Deploy is torn down
 
 #176 is live since 2026-10-21: the driver and state machine (37 states) were deployed from a fresh `ecc2e50`
