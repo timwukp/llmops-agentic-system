@@ -455,7 +455,13 @@ def _check_mode_prerequisites(merged: dict, named_roles=(), chosen_keys=()) -> N
     set, before DEFAULT_PARAMS filled the rest. See MODE_REQUIRED_CHOSEN.
     """
     mode = merged.get("pipeline_mode", "full")
-    missing = [(f"params.{k}", why) for k, why in MODE_REQUIRED_PARAMS.get(mode, ())
+    required = MODE_REQUIRED_PARAMS.get(mode, ())
+    if mode == "lakehouse" and lakehouse_builds(merged):
+        # A build-then-train run names no existing dataset: it builds one, so it needs what an
+        # ingest needs instead. Which of the two it is, and that it is not both, is
+        # _check_lakehouse_values' question.
+        required = MODE_REQUIRED_PARAMS["lakehouse_ingest"]
+    missing = [(f"params.{k}", why) for k, why in required
                if not merged.get(k)]
     missing += [(f"an explicitly named {r} model", why)
                 for r, why in MODE_REQUIRED_ROLES.get(mode, ())
@@ -480,6 +486,18 @@ LAKEHOUSE_SCALES = ("demo", "small")
 LAKEHOUSE_DATASET_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,79}$")
 
 
+def lakehouse_builds(merged: dict) -> bool:
+    """A lakehouse run that builds its own dataset first: it was given a generator seed or scale.
+
+    One dispatch then goes from raw (generated) customer data to a judged model: Generate →
+    Bronze → Silver → Gold → export → review → finetune → eval, in a single execution. The
+    alternative, an existing dataset id, keeps today's train-only path.
+    """
+    return (merged.get("pipeline_mode") == "lakehouse"
+            and (merged.get("generator_seed") not in (None, "")
+                 or merged.get("generator_scale") not in (None, "")))
+
+
 def _check_lakehouse_values(merged: dict) -> None:
     """Presence is MODE_REQUIRED_PARAMS' question; this is whether the values are usable.
 
@@ -488,16 +506,42 @@ def _check_lakehouse_values(merged: dict) -> None:
     and a PipelineStarted event already describe work that cannot happen.
     """
     mode = merged.get("pipeline_mode", "full")
-    if mode == "lakehouse_ingest":
+    if mode == "lakehouse" and lakehouse_builds(merged) and merged.get("lakehouse_dataset"):
+        raise ValueError(
+            "a lakehouse run takes EITHER params.lakehouse_dataset (train on a dataset an ingest "
+            "built) OR params.generator_seed + params.generator_scale (build one, then train), "
+            "not both: with both, which data trained the model is not a fact the dispatch fixed")
+    if mode == "lakehouse_ingest" or (mode == "lakehouse" and lakehouse_builds(merged)):
         seed = merged.get("generator_seed")
         if isinstance(seed, bool) or not str(seed).isdigit():
             raise ValueError(f"params.generator_seed must be a non-negative integer, got {seed!r}")
         if merged.get("generator_scale") not in LAKEHOUSE_SCALES:
             raise ValueError(f"params.generator_scale must be one of {LAKEHOUSE_SCALES}, "
                              f"got {merged.get('generator_scale')!r}")
-    if mode == "lakehouse" and not LAKEHOUSE_DATASET_ID.match(str(merged.get("lakehouse_dataset"))):
+    if (mode == "lakehouse" and not lakehouse_builds(merged)
+            and not LAKEHOUSE_DATASET_ID.match(str(merged.get("lakehouse_dataset")))):
         raise ValueError("params.lakehouse_dataset must match ^[a-z0-9][a-z0-9-]{0,79}$, got "
                          f"{merged.get('lakehouse_dataset')!r}")
+
+
+#: What an eval_only run may name as the model to judge: a model.tar.gz a run already produced, or
+#: an untrained base model pinned to a commit (a BASELINE: the same prompts and scorers on the model
+#: before fine-tuning, which is what makes a fine-tuned score mean anything). The revision is a
+#: full 40-hex sha because a branch name ("main") re-resolves on every download, and a baseline
+#: that can silently become a different model cannot be compared to anything.
+EVAL_ARTIFACT_URI = re.compile(
+    r"^(s3://\S+|hf://[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*@[0-9a-f]{40})$")
+
+
+def _check_eval_artifact(merged: dict) -> None:
+    if merged.get("pipeline_mode") != "eval_only":
+        return
+    uri = str(merged.get("model_artifact_uri") or "")
+    if not EVAL_ARTIFACT_URI.match(uri):
+        raise ValueError(
+            "params.model_artifact_uri must be an s3:// model artifact or an untrained base model "
+            "pinned as hf://<org>/<repo>@<40-hex commit sha>, got " + repr(uri) + ". A branch or "
+            "tag re-resolves on every download, so a baseline named by one is not reproducible")
 
 
 def lakehouse_input(params: dict, run_id: str, bucket: str):
@@ -509,7 +553,7 @@ def lakehouse_input(params: dict, run_id: str, bucket: str):
     the export all take lowercase ids), so two ingests can never write one landing prefix.
     """
     mode = params.get("pipeline_mode", "full")
-    if mode == "lakehouse_ingest":
+    if mode == "lakehouse_ingest" or lakehouse_builds(params):
         return {"dataset": run_id.lower(), "data_bucket": bucket,
                 "seed": str(int(params["generator_seed"])), "scale": params["generator_scale"]}
     if mode == "lakehouse":
@@ -529,6 +573,7 @@ def seed_manifest(run_id: str, trigger_source: str, params, plan,
         | set(_role_assignments(params or {}, "params")),
         set(params or {}) | set(_plan_params(plan or {})))
     _check_lakehouse_values(merged)
+    _check_eval_artifact(merged)
     return {
         "run_id": run_id,
         "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -559,6 +604,11 @@ def handler(event, context=None, clients=None):
     # manifest, so without this an ingest run's only record of the dataset it built is the
     # convention that names the dataset after the run.
     manifest["lakehouse"] = lakehouse_input(manifest["params"], run_id, bucket)
+    if lakehouse_builds(manifest["params"]):
+        # A build-then-train run's agents read params.lakehouse_dataset exactly as a train-only
+        # run's do (data-prep's lakehouse_review, the console's Data tab), so the dataset it is
+        # about to build is named there too: one field, one meaning, in both shapes of the mode.
+        manifest["params"]["lakehouse_dataset"] = manifest["lakehouse"]["dataset"]
 
     c["s3"].put_object(
         Bucket=bucket, Key=f"runs/{run_id}/manifest.json",

@@ -1789,13 +1789,14 @@ def test_the_lifecycle_flow_renders_every_terminal_status_the_pipeline_writes():
 
 # ── the stage flow must not call a budget stop a failure ──────────────────────
 
-def _fake_sfn_history(events, exec_status, run_id="run-x", definition=None):
+def _fake_sfn_history(events, exec_status, run_id="run-x", definition=None, execution_input=None):
     asl = definition if definition is not None else json.dumps(
         json.loads((REPO / "orchestration/state_machine.asl.json").read_text()))
+    inp = {"run_id": run_id, **(execution_input or {})}
 
     class _Sfn:
         def describe_execution(self, executionArn):
-            return {"status": exec_status, "input": json.dumps({"run_id": run_id}),
+            return {"status": exec_status, "input": json.dumps(inp),
                     "startDate": "s", "stopDate": "e"}
 
         def get_execution_history(self, **kw):
@@ -2194,6 +2195,14 @@ def test_every_field_the_hover_card_renders_is_supplied_by_the_api(console, monk
         _stub_identity(console, monkeypatch, **kw)
         for s in console.pipeline_detail("run-asked")["stages"]:
             every_cfg |= set(s["config"])
+    # ...and across the run shapes: the lakehouse cards (and their glueJob) exist only on a
+    # lakehouse run's flow, which a full run's history never draws.
+    console._STAGE_CFG_CACHE.clear()
+    _stub_identity(console, monkeypatch)
+    monkeypatch.setattr(console, "sfn", _fake_sfn_history([], "RUNNING", execution_input={
+        "pipeline_mode": "lakehouse", "lakehouse": {"seed": "7", "dataset": "d"}}))
+    for s in console.pipeline_detail("run-build")["stages"]:
+        every_cfg |= set(s["config"])
     missing = sorted(f for f in cfg_fields if f not in every_cfg)
     assert not missing, f"the card renders config.{missing} but stage_config never sets it"
 

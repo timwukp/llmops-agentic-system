@@ -5,6 +5,33 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
 ## [Unreleased]
 
+### M1: one run from raw customer data to a judged model, and a pipeline you can see
+
+- **One dispatch, raw data → outcome.** A `lakehouse` run given a generator seed and scale, with no
+  dataset id, builds its own dataset and then trains on it, all in one execution:
+  Generate → Bronze → Silver → Gold → extract → review → QLoRA → gate → deploy → monitor → teardown.
+  Until now that took two runs and a dataset id copied from the Data tab.
+- **Routing.** `PipelineModeChoice` routes the run on `lakehouse.seed`. After Gold,
+  `LakehouseThenTrainChoice` stops an ingest and sends the build run on to the export. The Choice is
+  written as a stop rule, because the decision to train is the dispatch's.
+- **Dispatch takes one or the other.** It refuses a run that names a dataset and a seed both, and
+  names the built dataset in `params.lakehouse_dataset`, so no agent prompt changes.
+- **Console.** A one-click "Demo: raw data → model" button. The pipeline view now draws each run's
+  own stages, including Raw → Bronze → Silver → Gold → extract, with each card showing its Glue job.
+  It used to draw the full pipeline's cards for every run.
+- **Outcome tab.** One run's result in one page:
+  - the gate and its scores with Wilson intervals, against the **untrained baseline**;
+  - the data journey Raw → Bronze → Silver → Gold → extract;
+  - the training numbers and the compute cost;
+  - the answers side by side.
+
+  The baseline is an `eval_only` run of the base model pinned to a commit
+  (`hf://<org>/<repo>@<sha>`, refused unpinned). Live on the 2026-10-16 model: answer match **0.0% →
+  72.5%** and format validity **39.2% → 100%** on 120 held-out questions.
+- **Console shell:** a left sidebar grouped Get started / Build / Data & models / Observe / Govern, a
+  slim top bar, neutral dark surfaces and quieter headings.
+- **38 states.** Evidence: `deploy/evidence/VERIFICATION_m1_lakehouse_e2e.md`.
+
 ### A call refused every turn stops buying turns
 
 `triage-run-20261016T012010Z-9de45cbf` re-sent `resolve_escalation` for a run that could not hear it

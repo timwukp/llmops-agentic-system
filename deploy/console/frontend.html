@@ -6,29 +6,27 @@
 <title>LLMOps Admin</title>
 <style>
   :root {
-    --bg:#0b1020; --panel:#141b33; --panel2:#1b2444; --line:#26305a;
-    --text:#e7ecff; --muted:#8592c0; --accent:#5b8cff; --green:#3ecf8e;
-    --amber:#f5b342; --red:#ff6b6b; --crit:#ff4d6d;
+    --bg:#0d0d0d; --panel:#1a1a19; --panel2:#242423; --line:rgba(255,255,255,.10);
+    --text:#f2f2ef; --muted:#a8a79c; --accent:#4f86e6; --green:#3ecf8e;
+    --amber:#f5b342; --red:#ff6b6b; --crit:#ff4d6d; --nav:218px;
   }
   * { box-sizing:border-box; }
   body { margin:0; font:14px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
          background:var(--bg); color:var(--text); }
-  header { display:flex; align-items:center; gap:12px; padding:16px 24px;
-           border-bottom:1px solid var(--line); background:var(--panel); }
-  header .logo { width:28px; height:28px; border-radius:7px;
-                 background:linear-gradient(135deg,var(--accent),#9d5bff); }
-  header h1 { font-size:16px; margin:0; font-weight:650; }
-  header .sub { color:var(--muted); font-size:12px; }
-  header .spacer { flex:1; }
+  header.topbar { display:flex; align-items:center; gap:12px; height:58px; padding:0 24px;
+           margin-left:var(--nav); border-bottom:1px solid var(--line); background:var(--panel);
+           position:sticky; top:0; z-index:5; }
+  header.topbar h1 { font-size:15px; margin:0; font-weight:600; }
+  header.topbar .sub { color:var(--muted); font-size:12px; }
+  header.topbar .spacer { flex:1; }
   button { font:inherit; cursor:pointer; border:1px solid var(--line);
            background:var(--panel2); color:var(--text); border-radius:8px; padding:7px 13px; }
-  button:hover { border-color:var(--accent); }
-  button.primary { background:var(--accent); border-color:var(--accent); color:#001; font-weight:600; }
-  .wrap { padding:20px 24px; display:grid; gap:16px;
-          grid-template-columns:repeat(12,1fr); max-width:1400px; margin:0 auto; }
+  button:hover { border-color:rgba(255,255,255,.28); }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; font-weight:600; }
+  .wrap { padding:20px 24px; display:grid; gap:16px; margin-left:var(--nav);
+          grid-template-columns:repeat(12,1fr); max-width:calc(1400px + var(--nav)); }
   .card { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:16px; }
-  .card h2 { font-size:12px; text-transform:uppercase; letter-spacing:.06em;
-             color:var(--muted); margin:0 0 12px; font-weight:600; }
+  .card h2 { font-size:13px; color:var(--text); margin:0 0 12px; font-weight:600; }
   .col-3 { grid-column:span 3; } .col-4 { grid-column:span 4; }
   .col-5 { grid-column:span 5; } .col-6 { grid-column:span 6; }
   .col-7 { grid-column:span 7; } .col-8 { grid-column:span 8; }
@@ -45,7 +43,7 @@
   .mono { font-family:ui-monospace,Menlo,monospace; font-size:12px; color:var(--muted); }
   table { width:100%; border-collapse:collapse; }
   td,th { text-align:left; padding:7px 6px; border-bottom:1px solid var(--line); vertical-align:top; }
-  th { color:var(--muted); font-size:11px; text-transform:uppercase; }
+  th { color:var(--muted); font-size:12px; font-weight:500; }
   input,select,textarea { font:inherit; background:var(--bg); color:var(--text);
                    border:1px solid var(--line); border-radius:7px; padding:7px; width:100%; }
   label { display:block; color:var(--muted); font-size:12px; margin:8px 0 3px; }
@@ -144,14 +142,56 @@
     width:100%; box-sizing:border-box; }
   .intakeform .iferr { color:var(--amber); font-size:11px; min-height:1px; }
   .flex { display:flex; gap:8px; align-items:center; }
-  .stat { font-size:26px; font-weight:700; } .stat small { font-size:12px; color:var(--muted); font-weight:400; }
-  nav.tabs { display:flex; gap:6px; padding:10px 24px 0; background:var(--panel);
-             border-bottom:1px solid var(--line); }
-  nav.tabs button { border:1px solid var(--line); border-bottom:none;
-                    border-radius:8px 8px 0 0; background:transparent; color:var(--muted);
-                    padding:8px 16px; }
-  nav.tabs button.active { background:var(--bg); color:var(--text);
-                           border-color:var(--accent); font-weight:600; }
+  .stat { font-size:30px; font-weight:600; letter-spacing:-.01em; } .stat small { font-size:12px; color:var(--muted); font-weight:400; }
+  /* Left sidebar, grouped by purpose (owner request 2026-10-23, after the Kiro Telemetry
+     dashboard): one place to navigate, so the content area is all content. */
+  nav.tabs { position:fixed; left:0; top:0; bottom:0; width:var(--nav); background:var(--panel);
+             border-right:1px solid var(--line); padding:14px 10px; overflow-y:auto; z-index:6;
+             display:flex; flex-direction:column; gap:2px; }
+  nav.tabs .brand { display:flex; align-items:center; gap:10px; padding:2px 8px 14px; font-weight:600; }
+  nav.tabs .brand .logo { width:22px; height:22px; border-radius:6px; background:var(--accent); }
+  nav.tabs .navgroup { font-size:11px; letter-spacing:.06em; text-transform:uppercase;
+                       color:var(--muted); padding:14px 10px 4px; font-weight:600; }
+  nav.tabs button { border:0; background:transparent; color:#d6d5cc; text-align:left;
+                    border-radius:8px; padding:8px 10px; font-size:13.5px; width:100%; }
+  nav.tabs button { display:flex; align-items:center; gap:10px; white-space:nowrap; overflow:hidden; }
+  /* Icons as CSS masks, so each button's markup stays `<button data-tab=…>Label</button>`: the tests
+     and the diagram generator read the label as the text right after the tag. */
+  nav.tabs button::before { content:""; flex:0 0 16px; height:16px; background:currentColor;
+                            -webkit-mask:var(--ic) center/16px no-repeat; mask:var(--ic) center/16px no-repeat; }
+  nav.tabs button[data-tab="intro"] { --ic:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><circle cx='12' cy='12' r='10'/><polygon points='10 8 16 12 10 16 10 8'/></svg>"); }
+  nav.tabs button[data-tab="architecture"] { --ic:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><polygon points='12 2 2 7 12 12 22 7 12 2'/><polyline points='2 17 12 22 22 17'/><polyline points='2 12 12 17 22 12'/></svg>"); }
+  nav.tabs button[data-tab="tasks"] { --ic:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z'/></svg>"); }
+  nav.tabs button[data-tab="pipeline"] { --ic:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><circle cx='6' cy='6' r='3'/><circle cx='18' cy='18' r='3'/><path d='M6 9v3a6 6 0 0 0 6 6h3'/></svg>"); }
+  nav.tabs button[data-tab="outcome"] { --ic:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><circle cx='12' cy='12' r='10'/><circle cx='12' cy='12' r='6'/><circle cx='12' cy='12' r='2'/></svg>"); }
+  nav.tabs button[data-tab="data"] { --ic:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><ellipse cx='12' cy='5' rx='9' ry='3'/><path d='M21 12c0 1.66-4 3-9 3s-9-1.34-9-3'/><path d='M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5'/></svg>"); }
+  nav.tabs button[data-tab="fleet"] { --ic:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><rect x='4' y='4' width='16' height='16' rx='2'/><rect x='9' y='9' width='6' height='6'/><path d='M9 1v3M15 1v3M9 20v3M15 20v3M20 9h3M20 14h3M1 9h3M1 14h3'/></svg>"); }
+  nav.tabs button[data-tab="obs"] { --ic:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><polyline points='22 12 18 12 15 21 9 3 6 12 2 12'/></svg>"); }
+  nav.tabs button[data-tab="evals"] { --ic:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M22 11.08V12a10 10 0 1 1-5.93-9.14'/><polyline points='22 4 12 14.01 9 11.01'/></svg>"); }
+  nav.tabs button[data-tab="opts"] { --ic:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6'/></svg>"); }
+  nav.tabs button[data-tab="cost"] { --ic:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M12 1v22M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6'/></svg>"); }
+  nav.tabs button:hover { background:var(--panel2); }
+  nav.tabs button.active { background:rgba(79,134,230,.14); color:#fff; font-weight:600; }
+  nav.tabs .navtoggle { margin-left:auto; width:26px; height:26px; padding:0; border-radius:6px; font-size:15px;
+                        line-height:1; display:inline-flex; align-items:center; justify-content:center;
+                        color:var(--muted); background:transparent; border:1px solid transparent; }
+  nav.tabs .navtoggle::before { display:none; }
+  nav.tabs .navtoggle:hover { border-color:var(--line); color:var(--text); }
+  /* Collapsed: icons only (owner request 2026-10-23). The labels stay in the DOM -- each button's
+     title carries it as a tooltip -- so nothing that reads the nav changes. */
+  body.navc { --nav:60px; }
+  body.navc nav.tabs { padding:14px 8px; }
+  body.navc nav.tabs button { font-size:0; gap:0; justify-content:center; padding:9px 0; }
+  body.navc nav.tabs .brand { font-size:0; justify-content:center; padding:2px 0 14px; }
+  body.navc nav.tabs .brand .logo { display:none; }
+  body.navc nav.tabs .navtoggle { margin:0; font-size:15px; }
+  body.navc nav.tabs .navgroup { font-size:0; padding:0; height:1px; background:var(--line); margin:10px 6px; }
+  @media (max-width:900px){
+    nav.tabs { position:static; width:auto; flex-direction:row; flex-wrap:wrap; }
+    nav.tabs .navgroup, nav.tabs .brand, nav.tabs .navtoggle { display:none; }
+    body.navc { --nav:218px; } body.navc nav.tabs button { font-size:13.5px; }
+    nav.tabs button { width:auto; }
+    header.topbar, .wrap { margin-left:0; } }
   .obsgrid { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px; margin-bottom:14px; }
   .tile { background:var(--panel2); border:1px solid var(--line); border-radius:10px; padding:10px 12px; }
   .tile .tlabel { font-size:11px; color:var(--muted); display:flex; align-items:center; gap:6px; }
@@ -165,17 +205,17 @@
   .meter { height:10px; border-radius:5px; background:rgba(62,207,142,.15); overflow:hidden; margin-top:6px; }
   .meter i { display:block; height:100%; border-radius:5px; }
   .flow { width:100%; height:auto; display:block; }
-  .flow .node rect { fill:#1b2444; stroke:#26305a; stroke-width:1.5; rx:10; transition:all .2s; }
-  .flow .node text { fill:#e7ecff; font:600 12px system-ui,-apple-system,sans-serif; }
-  .flow .node .nsub { fill:#8592c0; font:400 10.5px system-ui,-apple-system,sans-serif; }
-  .flow .wire { stroke:#3a4577; stroke-width:2; fill:none; stroke-dasharray:6 5; animation:flowdash 1.2s linear infinite; }
-  .flow .arrow { fill:#3a4577; }
+  .flow .node rect { fill:#242423; stroke:rgba(255,255,255,.14); stroke-width:1.5; rx:10; transition:all .2s; }
+  .flow .node text { fill:#f2f2ef; font:600 12px system-ui,-apple-system,sans-serif; }
+  .flow .node .nsub { fill:#a8a79c; font:400 10.5px system-ui,-apple-system,sans-serif; }
+  .flow .wire { stroke:#5a5a55; stroke-width:2; fill:none; stroke-dasharray:6 5; animation:flowdash 1.2s linear infinite; }
+  .flow .arrow { fill:#5a5a55; }
   @keyframes flowdash { to { stroke-dashoffset:-11; } }
   .flow .pulse { animation:pipepulse 1.1s ease-in-out infinite; }
   @keyframes pipepulse { 0%,100%{ opacity:1; } 50%{ opacity:.25; } }
-  .flow .looplbl { fill:#8592c0; font:600 11px system-ui,-apple-system,sans-serif; letter-spacing:.04em; }
+  .flow .looplbl { fill:#a8a79c; font:600 11px system-ui,-apple-system,sans-serif; letter-spacing:.04em; }
   /* hover affordance: without it the card appears with no hint the box was hoverable */
-  .flow .node:hover rect, .flow .node:focus rect { fill:#222d55; stroke-width:2.5; }
+  .flow .node:hover rect, .flow .node:focus rect { fill:#2e2e2c; stroke-width:2.5; }
   .flow .node:focus { outline:none; }
   /* fixed, not absolute: the flow card scrolls horizontally on narrow screens and an
      absolutely-positioned card would be clipped by its overflow container. */
@@ -198,38 +238,41 @@
 </style>
 </head>
 <body>
-<header>
-  <div class="logo"></div>
-  <div>
-    <h1>LLMOps Admin</h1>
-    <div class="sub">Operator console for the llmops-agentic-system pipeline</div>
-  </div>
+<header class="topbar">
+  <h1 id="pageTitle">Pipeline</h1>
   <div class="spacer"></div>
   <span id="clock" class="sub"></span>
   <button id="loginBtn" onclick="signIn()">Sign in</button>
   <button onclick="refresh()">&#8635; Refresh</button>
 </header>
 
-<nav class="tabs">
+<nav class="tabs" aria-label="Sections">
+  <div class="brand"><div class="logo"></div>LLMOps Admin<button class="navtoggle" id="navToggle" onclick="toggleNav()" aria-label="Collapse sidebar" title="Collapse sidebar">&lsaquo;</button></div>
+  <div class="navgroup">Get started</div>
   <button data-tab="intro" onclick="showTab('intro')">Introduction</button>
   <button data-tab="architecture" onclick="showTab('architecture')">Architecture</button>
+  <div class="navgroup">Build</div>
   <button data-tab="tasks" onclick="showTab('tasks')">Tasks</button>
   <button data-tab="pipeline" class="active" onclick="showTab('pipeline')">Pipeline</button>
+  <button data-tab="outcome" onclick="showTab('outcome')">Outcome</button>
+  <div class="navgroup">Data &amp; models</div>
   <button data-tab="data" onclick="showTab('data')">Data</button>
   <button data-tab="fleet" onclick="showTab('fleet')">Fleet</button>
+  <div class="navgroup">Observe</div>
   <button data-tab="obs" onclick="showTab('obs')">Observability</button>
   <button data-tab="evals" onclick="showTab('evals')">Evaluations</button>
   <button data-tab="opts" onclick="showTab('opts')">Optimizations</button>
+  <div class="navgroup">Govern</div>
   <button data-tab="cost" onclick="showTab('cost')">Cost</button>
 </nav>
 
 <div class="wrap">
   <!-- KPIs -->
-  <div data-tab-panel="all" class="card col-4"><h2>Harness fleet</h2>
+  <div data-tab-panel="pipeline" class="card col-4"><h2>Harness fleet</h2>
     <div class="stat" id="kpiFleet">&ndash;</div><small>llmops harnesses (target: 7 READY)</small></div>
-  <div data-tab-panel="all" class="card col-4"><h2>Pipeline runs</h2>
+  <div data-tab-panel="pipeline" class="card col-4"><h2>Pipeline runs</h2>
     <div class="stat" id="kpiRuns">&ndash;</div><small id="kpiRunsSub">recent runs in DynamoDB</small></div>
-  <div data-tab-panel="all" class="card col-4"><h2>Executions</h2>
+  <div data-tab-panel="pipeline" class="card col-4"><h2>Executions</h2>
     <div class="stat" id="kpiExec">&ndash;</div><small id="kpiExecSub">Step Functions llmops-pipeline</small></div>
 
   <!-- Tasks: goal-driven entry — consult the orchestrator, sign the plan.
@@ -356,15 +399,16 @@
       <span id="pipeHead" class="sub">loading&hellip;</span>
     </div>
     <div id="pipeViz"></div>
-    <div class="sub" style="margin-top:8px">Hover (or tab to) any stage box for the live
-      configuration behind it &mdash; AgentCore runtime, harness id, timeout, retry and
-      error routing, read from the <b>deployed</b> state machine definition.</div>
+    <div class="sub" style="margin-top:8px">Hover a stage for its live configuration (from the deployed state machine).</div>
   </div>
   <div id="stageTip" role="tooltip"></div>
 
   <!-- Pipeline: recent runs + start run -->
   <div data-tab-panel="pipeline" class="card col-8"><h2>Recent runs &middot; click for detail</h2><div id="runsList"><span class="sub">loading&hellip;</span></div></div>
   <div data-tab-panel="pipeline" class="card col-4"><h2>Start run</h2>
+    <div class="sub" style="margin-bottom:6px"><b>End-to-end demo</b>: synthetic customer raw data &rarr; Bronze &rarr; Silver (cleaning + PII redaction) &rarr; Gold &rarr; QLoRA fine-tune &rarr; judged quality gate &rarr; deploy &rarr; monitor, in one run.</div>
+    <div class="flex"><button class="primary" onclick="startDemo()">&#9654; Demo: raw data &rarr; model</button></div>
+    <div id="demoMsg" class="sub" style="margin:6px 0 12px"></div>
     <label>Task count</label><input id="taskCount" type="number" min="1" placeholder="pipeline default" />
     <label>Sample count</label><input id="sampleCount" type="number" min="1" placeholder="2000" />
     <label>Note</label><input id="runNote" placeholder="optional annotation" />
@@ -426,6 +470,24 @@
        answers "where did the money go"; Governance answers "what stops it". Every figure
        carries its basis badge, because an account-wide number summed into an attributed
        one is the commonest way a cost page lies. -->
+  <!-- Outcome: what one run produced, raw data -> judged model (M1). Read-only, from the run's own
+       artifacts in S3; the baseline is an eval_only run of the untrained model on the same prompts. -->
+  <div data-tab-panel="outcome" class="card col-12" style="padding:10px 14px">
+    <div class="flex" style="justify-content:space-between;align-items:center">
+      <span><b>Run outcome</b> <span class="sub">customer raw data &rarr; lakehouse &rarr; fine-tuned model &rarr; judged on held-out questions</span></span>
+      <span class="flex"><span class="sub">run</span> <select id="ocRun" onchange="loadOutcomeRun()" style="max-width:320px"></select>
+        <button onclick="loadOutcome()" style="padding:4px 10px;font-size:12px">&#8635;</button></span>
+    </div>
+    <div id="ocMeta" class="sub" style="margin-top:4px">loading&hellip;</div>
+  </div>
+  <div data-tab-panel="outcome" class="card col-3"><h2>Quality gate</h2><div class="stat" id="ocGate">&ndash;</div><small id="ocGateSub">held-out acceptance set</small></div>
+  <div data-tab-panel="outcome" class="card col-3"><h2>Answer match</h2><div class="stat" id="ocAnswer">&ndash;</div><small id="ocAnswerSub">untrained &rarr; fine-tuned</small></div>
+  <div data-tab-panel="outcome" class="card col-3"><h2>Format validity</h2><div class="stat" id="ocFormat">&ndash;</div><small id="ocFormatSub">untrained &rarr; fine-tuned</small></div>
+  <div data-tab-panel="outcome" class="card col-3"><h2>Compute cost</h2><div class="stat" id="ocCost">&ndash;</div><small id="ocCostSub">SageMaker jobs of this run</small></div>
+  <div data-tab-panel="outcome" class="card col-7"><h2>Data journey</h2><div id="ocJourney"><span class="sub">&ndash;</span></div></div>
+  <div data-tab-panel="outcome" class="card col-5"><h2>Training</h2><div id="ocTraining"><span class="sub">&ndash;</span></div></div>
+  <div data-tab-panel="outcome" class="card col-12"><h2>Answers &middot; untrained vs fine-tuned, same question</h2>
+    <div id="ocSamplesSub" class="sub" style="margin:-6px 0 8px"></div><div id="ocSamples"><span class="sub">&ndash;</span></div></div>
   <!-- Data: the lakehouse, read-only. Every number comes from a Glue job's report; the console
        never reads the tables (SSE-KMS; Bronze holds PII). -->
   <div data-tab-panel="data" class="card col-12" style="padding:10px 14px">
@@ -789,8 +851,10 @@ function waitingBlock(w){
     `</span></div>`;
 }
 
-// ── stage-flow diagram: 9 logical stages + remediation loop ──────────────────
-const STAGE_SUBS = {"data-prep-generate":"teacher generates","data-prep-curate":"curate + split",
+// ── stage-flow diagram: the stages of the run's own mode + remediation loop ───────
+const STAGE_SUBS = {"lakehouse-raw":"customer raw data","lakehouse-bronze":"Iceberg, as landed",
+  "lakehouse-silver":"clean · DQ · PII","lakehouse-gold":"training-ready","lakehouse-extract":"pinned + sha256",
+  "data-prep-generate":"teacher generates","data-prep-curate":"curate / review",
   "finetune-launch":"QLoRA on SageMaker","finetune-analyze":"loss curves","eval-gate":"quality gates",
   "deploy":"student endpoint","smoke":"live inference","teardown":"cost hygiene","complete":"event out"};
 function stageColor(st){
@@ -801,7 +865,7 @@ function stageColor(st){
   // gate it will not cross unattended). Waiting on us, not broken. Falling through
   // to the default would have painted it as "pending" — the opposite of urgent.
   if (st==="escalated") return "#f5b342";
-  if (st==="skipped") return "#3a4577";
+  if (st==="skipped") return "#5a5a55";
   return "#5a6491";  // pending
 }
 // Hover card for a stage node: what is actually behind this box. The operator's
@@ -829,6 +893,7 @@ function stageTipRows(st){
   add("harness version", c.harnessVersion);
   add("stage · task", c.stage && c.task ? c.stage+" · "+c.task : null);
   add("SFN state", (c.states||[]).join(" | "));
+  add("Glue job", c.glueJob);
   add("driver λ", c.lambda);
   // Seconds are what the ASL says; hours are what a human reasons in. An 86400 that
   // the operator has to divide is a number they will misread once and never trust.
@@ -884,7 +949,9 @@ function renderPipe(d){
   window._PIPE_STAGES = stages;   // the hover handlers read the same objects, not a copy
   const NW=128, GAP=18, Y=40, H=72, STEP=NW+GAP;
   const W = stages.length*STEP-GAP+20, VH=205;
-  let svg = `<svg class="flow" viewBox="0 0 ${W} ${VH}" role="img" aria-label="LLMOps pipeline stage flow">`+
+  // Never wider than its natural size: a 2-stage flow (eval_only) stretched to the card's width drew
+  // boxes several times their designed size; a 13-stage flow still shrinks to fit.
+  let svg = `<svg class="flow" viewBox="0 0 ${W} ${VH}" style="max-width:${W}px" role="img" aria-label="LLMOps pipeline stage flow">`+
     `<defs><marker id="pah" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L8,4 L0,8 Z" class="arrow"/></marker></defs>`;
   const xs = stages.map((_,i)=>10+i*STEP);
   stages.forEach((st,i)=>{
@@ -906,7 +973,7 @@ function renderPipe(d){
   const ei = stages.findIndex(s=>s.key==="eval-gate"), fi = stages.findIndex(s=>s.key==="finetune-launch");
   if (ei>=0 && fi>=0){
     const ex = xs[ei]+NW/2, fx = xs[fi]+NW/2;
-    const loopC = (+d.iteration||0) > 0 ? "#f5b342" : "#3a4577";
+    const loopC = (+d.iteration||0) > 0 ? "#f5b342" : "#5a5a55";
     svg += `<path class="wire" style="stroke:${loopC}" d="M${ex},${Y+H} V${Y+H+46} H${fx} V${Y+H+8}" marker-end="url(#pah)"/>`+
       `<text class="looplbl" x="${(ex+fx)/2}" y="${Y+H+40}" text-anchor="middle">gate failed → remediate finetune (iteration ${+d.iteration||0})</text>`;
   }
@@ -1036,6 +1103,18 @@ async function loadRun(runId){
     }
     $("runDetail").innerHTML = html;
   } catch(e){ $("runDetail").innerHTML = `<span class="sub">error: ${esc(e)}</span>`; }
+}
+
+async function startDemo(){
+  if (!await ensureToken()) { $("demoMsg").textContent = "sign-in required"; return; }
+  $("demoMsg").textContent = "starting…";
+  const r = await fetch(API+"/api/start-run",{method:"POST",
+    headers:{"content-type":"application/json",...authHeaders()},
+    body:JSON.stringify({preset:"lakehouse-e2e"})}).then(x=>x.json()).catch(e=>({error:String(e)}));
+  const rid = r.ok && r.result && r.result.run_id;
+  $("demoMsg").textContent = rid ? "✓ started "+rid+" — it appears in Recent runs; click it for the live pipeline"
+                                 : "error: "+(r.error||JSON.stringify(r)).slice(0,160);
+  setTimeout(refresh, 4000);
 }
 
 async function startRun(){
@@ -2367,6 +2446,78 @@ async function saveBudget(){
 const RULE_LABEL = {dedup_event_id:"duplicate resends", tolerate_drift:"schema drift (tolerated)",
   order_by_turn:"out-of-order turns", strip_think:"leaked <think> stripped", drop_toxic:"toxic turns dropped",
   redact_pii:"PII redacted", decontaminate:"eval contamination dropped", near_dup:"near-duplicates dropped"};
+// ── outcome: one run, raw data -> judged model ────────────────────────────────
+async function loadOutcome(){
+  $("ocMeta").textContent="loading…";
+  try {
+    const o = await fetch(API+"/api/overview").then(r=>r.json());
+    const sel=$("ocRun"), keep=sel.value || new URLSearchParams(location.search).get("run") || "";
+    const runs=(o.runs||[]).filter(r=>(r.pipeline_mode||"full")!=="eval_only");
+    sel.innerHTML=runs.map(r=>`<option value="${esc(r.run_id)}">${esc(r.run_id)} · ${esc(r.pipeline_mode||"full")} · ${esc(r.status||"")}</option>`).join("")||`<option value="">no runs yet</option>`;
+    if (keep && ![...sel.options].some(op=>op.value===keep)) sel.insertAdjacentHTML("afterbegin",`<option value="${esc(keep)}">${esc(keep)}</option>`);
+    if (keep) sel.value=keep;
+    if (sel.value) await loadOutcomeRun(); else $("ocMeta").textContent="no runs yet";
+  } catch(e){ $("ocMeta").textContent="failed: "+e; }
+}
+function ocPct(v){ return v==null ? "–" : (100*v).toFixed(1)+"%"; }
+function ocMetric(id, name, r){
+  const t=(r.tuned&&r.tuned.metrics||{})[name], b=(r.baseline&&r.baseline.gate&&r.baseline.gate.metrics||{})[name];
+  if (!t){ $(id).textContent="–"; return; }
+  const ci=`CI ${ocPct(t.ci_low)}–${ocPct(t.ci_high)} · gate ≥ ${ocPct(t.threshold)} · n=${esc(t.n)}`;
+  $(id).innerHTML = (b ? `<span class="sub" style="font-size:.6em">${ocPct(b.value)} &rarr;</span> ` : "")+
+    `<span style="color:${t.ci_low>=t.threshold?"var(--green)":"var(--red)"}">${ocPct(t.value)}</span>`;
+  $(id+"Sub").textContent = (b ? "untrained → fine-tuned · " : "no baseline yet · ")+ci;
+}
+async function loadOutcomeRun(){
+  const id=$("ocRun").value; if(!id) return;
+  $("ocMeta").textContent="loading "+id+"…";
+  const r = await fetch(API+"/api/outcome?run_id="+encodeURIComponent(id)).then(x=>x.json()).catch(e=>({error:String(e)}));
+  if (r.error){ $("ocMeta").textContent=r.error; return; }
+  const es=r.eval_set||{};
+  $("ocMeta").innerHTML=`<span class="mono">${esc(r.run_id)}</span> · ${esc(r.mode)} · student <span class="mono">${esc(r.student||"–")}</span> · dataset <span class="mono">${esc(r.dataset||"–")}</span>`+
+    (es.rows?` · judged on ${esc(es.rows)} held-out questions <span class="mono sub">sha256 ${esc((es.sha256||"").slice(0,12))}…</span>`:"")+
+    (r.baseline?` · baseline <span class="mono">${esc(r.baseline.run_id)}</span> (${esc(r.baseline.status||"")})`:` · <span class="pill warn">no untrained baseline yet</span>`);
+  const g=r.tuned;
+  $("ocGate").innerHTML = !g ? "–" : g.gate_passed ? `<span style="color:var(--green)">PASSED</span>` : `<span style="color:var(--red)">NOT PASSED</span>`;
+  $("ocGateSub").textContent = g ? Object.keys(g.metrics||{}).length+" gates · Wilson 95% interval vs threshold" : "no gate verdict for this run";
+  ocMetric("ocAnswer","answer_match",r); ocMetric("ocFormat","format_validity",r);
+  const c=r.cost||{};
+  $("ocCost").textContent = c.total_usd==null ? "–" : "$"+Number(c.total_usd).toFixed(2);
+  $("ocCostSub").textContent = (c.jobs||[]).length+" SageMaker job(s), incl. the baseline · "+(c.error?"cost source unavailable":"endpoint hours + tokens: Cost tab");
+  const d=r.data;
+  if (d){
+    const t=d.tables||{}, bronze=Object.entries(t).filter(([k])=>k.startsWith("bronze.")), rules=d.rules||{}, pc=d.plant_check||{};
+    const plantsOk=Object.values(pc).filter(v=>v.passed).length, plantsN=Object.keys(pc).length;
+    const dq=Object.values(d.dq||{}).flat(), dqOk=dq.filter(o=>o.outcome==="Passed").length;
+    const steps=[
+      ["Raw data", `${fmtN((d.manifest&&d.manifest.counts&&Object.values(d.manifest.counts).reduce((a,b)=>a+(+b||0),0))||0)} source records · seed ${esc(d.manifest&&d.manifest.seed)} · ${esc(d.manifest&&d.manifest.scale)}`],
+      ["Bronze", bronze.map(([k,v])=>`${esc(k.slice(7))} ${fmtN(v.rows)}`).join(" · ")||"–"],
+      ["Silver", `${fmtN(d.pairs)} instruction pairs · PII redacted ${fmtN(rules.redact_pii)} · duplicates ${fmtN((rules.dedup_event_id||0)+(rules.near_dup||0))} · toxic dropped ${fmtN(rules.drop_toxic)} · eval leakage removed ${fmtN(rules.decontaminate)}`+
+        (plantsN?` · <span class="pill ${plantsOk===plantsN?"ok":"err"}">${plantsOk}/${plantsN} planted defects caught exactly</span>`:"")],
+      ["Gold", `${fmtN(d.train)} train / ${fmtN(d.eval)} eval`+(dq.length?` · <span class="pill ${dqOk===dq.length?"ok":"err"}">data quality ${dqOk}/${dq.length}</span>`:"")],
+      ["Extract", Object.entries((d.export&&d.export.files)||{}).map(([k,f])=>`${esc(k)} ${fmtN(f.rows)} <span class="mono sub">${esc((f.sha256||"").slice(0,10))}…</span>`).join(" · ")||"–"]];
+    $("ocJourney").innerHTML=`<table>${steps.map(([k,v])=>`<tr><td style="white-space:nowrap"><b>${k}</b></td><td>${v}</td></tr>`).join("")}</table>`;
+  } else $("ocJourney").innerHTML=`<span class="sub">this run did not train on a lakehouse dataset</span>`;
+  const tr=r.training;
+  $("ocTraining").innerHTML = !tr ? `<span class="sub">no training metrics</span>` : `<table>`+[
+    ["base model", `<span class="mono">${esc(tr.model_id)}</span> <span class="sub mono">@${esc((tr.model_revision||"").slice(0,8))}</span>`],
+    ["method", `QLoRA r=${esc(tr.lora&&tr.lora.r)} · max_length ${esc(tr.max_length)}`],
+    ["data", `${fmtN(tr.train_rows || (r.data && r.data.train))} rows · ${esc(tr.epochs_completed)} epochs · ${fmtN(tr.global_step)} steps`],
+    ["loss", `train ${tr.final_train_loss==null?"–":Number(tr.final_train_loss).toFixed(3)} · eval ${tr.final_eval_loss==null?"–":Number(tr.final_eval_loss).toFixed(3)}`],
+    ["speed", `${tr.sec_per_step_p50==null?"–":Number(tr.sec_per_step_p50).toFixed(2)} s/step p50 · ${tr.train_runtime_seconds==null?"–":Math.round(tr.train_runtime_seconds)} s training`],
+    ["compute", `${esc(tr.instance||"–")}${tr.billable_seconds?" · "+Math.round(tr.billable_seconds)+" s billed":""}`],
+    ["loss curve", tr.loss_verdict ? esc(tr.loss_verdict) : "–"]
+  ].map(([k,v])=>`<tr><td class="sub" style="white-space:nowrap">${k}</td><td>${v}</td></tr>`).join("")+`</table>`;
+  const f=r.flips||{}, s=r.samples||[];
+  $("ocSamplesSub").textContent = r.baseline
+    ? `${f.flipped_to_match||0} question(s) the fine-tune turned from a miss into a match, ${f.flipped_to_miss||0} the other way · showing those first`
+    : "the untrained baseline has not run for this run yet, so only the fine-tuned answers are shown";
+  const v=(a)=>!a?`<span class="sub">–</span>`:`<span class="pill ${a.verdict==="match"?"ok":"err"}">${esc(a.verdict||"?")}</span>${a.format_valid===false?' <span class="pill warn">format</span>':""}<div style="margin-top:4px;white-space:pre-wrap">${esc(a.answer||"")}</div>`;
+  $("ocSamples").innerHTML = s.length ? `<table><tr><th style="width:22%">question</th><th style="width:22%">reference</th><th style="width:28%">untrained</th><th style="width:28%">fine-tuned</th></tr>${s.map(x=>
+    `<tr style="vertical-align:top"><td><span class="sub">${esc(x.intent)} · ${esc(x.lang)}</span><div>${esc(x.prompt)}</div></td><td>${esc(x.reference)}</td><td>${v(x.baseline)}</td><td>${v(x.tuned)}</td></tr>`).join("")}</table>`
+    : `<span class="sub">no evaluated answers for this run</span>`;
+}
+
 async function loadData(){
   $("dataMeta").textContent="loading…";
   try {
@@ -2413,10 +2564,24 @@ async function loadDataRun(){
     if(rc) rc.textContent=v.rows==null?"–":fmtN(v.rows); if(sc) sc.textContent=v.snapshot_id?String(v.snapshot_id).slice(0,10)+"…":"–"; });
 }
 
+function toggleNav(force){
+  const c = force===undefined ? !document.body.classList.contains("navc") : !!force;
+  document.body.classList.toggle("navc", c);
+  const b=$("navToggle");
+  if (b){ b.innerHTML = c ? "&rsaquo;" : "&lsaquo;"; b.title = c ? "Expand sidebar" : "Collapse sidebar";
+          b.setAttribute("aria-label", b.title); b.setAttribute("aria-expanded", String(!c)); }
+  localStorage.setItem("navCollapsed", c ? "1" : "0");
+}
+// A collapsed sidebar shows icons only, so every section button carries its label as a tooltip.
+document.querySelectorAll("nav.tabs button[data-tab]").forEach(b=>{ b.title = b.textContent.trim(); });
+toggleNav(localStorage.getItem("navCollapsed")==="1");
+
 function showTab(t){
   document.querySelectorAll("[data-tab-panel]").forEach(el=>{
     el.style.display = (el.dataset.tabPanel===t || el.dataset.tabPanel==="all") ? "" : "none"; });
   document.querySelectorAll("nav.tabs button").forEach(b=>b.classList.toggle("active", b.dataset.tab===t));
+  const _nb=document.querySelector(`nav.tabs button[data-tab="${t}"]`);
+  if (_nb && $("pageTitle")) $("pageTitle").textContent=_nb.textContent;
   localStorage.setItem("adminTab", t);
   pipePoll(t==="pipeline");
   // The intro page is loaded lazily and only once: it is ~85 KB with two inlined SVGs,
@@ -2442,6 +2607,7 @@ function showTab(t){
   if (t==="opts") loadOpts();
   if (t==="cost") loadCostV2();
   if (t==="data") loadData();
+  if (t==="outcome") loadOutcome();
 }
 
 // tab on load: ?tab= URL param > localStorage > intro for first-time visitors. The
@@ -2449,7 +2615,7 @@ function showTab(t){
 // the diagrams show a reader HOW the system is wired, the narration tells them WHY it
 // exists and what it cost. Someone arriving for the first time needs the second one
 // first. A returning operator still lands on whatever tab they left.
-const KNOWN_TABS = ["intro","architecture","tasks","pipeline","data","fleet","obs","evals","opts","cost"];
+const KNOWN_TABS = ["intro","architecture","tasks","pipeline","outcome","data","fleet","obs","evals","opts","cost"];
 const _urlTab = new URLSearchParams(location.search).get("tab");
 const _memTab = localStorage.getItem("adminTab");
 showTab(KNOWN_TABS.includes(_urlTab) ? _urlTab

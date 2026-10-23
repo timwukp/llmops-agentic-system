@@ -6520,6 +6520,197 @@ case("driver: the refused-call count restarts at every Lambda handoff",
      [f"{_TO}test_the_refusal_count_rides_the_continuation"])
 
 
+# ── M1: one run from raw customer data to a judged model (m1-lakehouse-e2e) ──────────────
+_LMD = "tests/test_lakehouse_mode.py::"
+_E2E = "tests/test_console_e2e_demo.py::"
+_SP = "orchestration/start_pipeline/handler.py"
+
+
+def _m1_asl(fn):
+    def mutate(t):
+        d = json.loads(t)
+        fn(d["States"])
+        return json.dumps(d, indent=2, ensure_ascii=False) + "\n"
+    return mutate
+
+
+def _no_build_branch(s):
+    ch = s["PipelineModeChoice"]["Choices"]
+    keep = [c for c in ch if not any(r.get("Variable") == "$.lakehouse.seed" for r in c.get("And", []))]
+    assert len(keep) == len(ch) - 1, "the build branch moved"
+    s["PipelineModeChoice"]["Choices"] = keep
+
+
+case("M1: a seeded lakehouse run is no longer routed to the generator", "orchestration/state_machine.asl.json",
+     _m1_asl(_no_build_branch),
+     [f"{_LMD}test_a_lakehouse_run_given_a_seed_builds_its_dataset_then_trains_on_it"])
+
+
+def _gold_always_stops(s):
+    assert s["LakehouseThenTrainChoice"]["Default"] == "LakehouseExport", "the continuation moved"
+    s["LakehouseThenTrainChoice"]["Default"] = "Complete"
+
+
+case("M1: a build run stops at Gold instead of training", "orchestration/state_machine.asl.json",
+     _m1_asl(_gold_always_stops),
+     [f"{_LMD}test_a_lakehouse_run_given_a_seed_builds_its_dataset_then_trains_on_it"])
+
+
+def m381(t):
+    # Both a dataset id and a seed are accepted: which data trained the model is no longer fixed.
+    old = '    if mode == "lakehouse" and lakehouse_builds(merged) and merged.get("lakehouse_dataset"):\n'
+    assert t.count(old) == 1, "the either-or check moved"
+    return t.replace(old, '    if False:\n', 1)
+
+
+case("M1: a lakehouse run may name a dataset AND a seed", _SP, m381,
+     [f"{_LMD}test_a_build_run_is_refused_when_its_data_is_not_fixed_by_the_dispatch"])
+
+
+def m382(t):
+    # The built dataset is not named in params: data-prep's review reads an empty field.
+    old = '        manifest["params"]["lakehouse_dataset"] = manifest["lakehouse"]["dataset"]\n'
+    assert t.count(old) == 1, "the dataset naming moved"
+    return t.replace(old, '        pass\n', 1)
+
+
+case("M1: a build run does not name its dataset where the agents read it", _SP, m382,
+     [f"{_LMD}test_a_build_runs_execution_input_routes_it_to_the_generator"])
+
+
+def m383(t):
+    # A build run is given the train-only input object: no seed, so the machine never generates.
+    old = '    if mode == "lakehouse_ingest" or lakehouse_builds(params):\n'
+    assert t.count(old) == 1, "the build input moved"
+    return t.replace(old, '    if mode == "lakehouse_ingest":\n', 1)
+
+
+case("M1: a build run's execution input carries no seed", _SP, m383,
+     [f"{_LMD}test_a_build_run_names_its_dataset_after_itself_where_the_agents_read_it",
+      f"{_LMD}test_a_build_runs_execution_input_routes_it_to_the_generator"])
+
+
+def m384(t):
+    # Every run draws the full pipeline's cards again, whatever path it took.
+    old = '    mode = (execution_input or {}).get("pipeline_mode") or "full"\n'
+    assert t.count(old) == 1, "stage_flow_for moved"
+    return t.replace(old, '    return STAGE_FLOW\n' + old, 1)
+
+
+case("M1: the pipeline view ignores the run's own mode", _CN, m384,
+     [f"{_E2E}test_each_run_shape_draws_its_own_stages",
+      f"{_E2E}test_a_running_build_shows_the_data_stages_live"])
+
+
+def m385(t):
+    # The Glue states lose their cards: the data engineering half disappears from the view.
+    old = '    "LakehouseGenerate": "lakehouse-raw", "LakehouseLand": "lakehouse-bronze",\n'
+    assert t.count(old) == 1, "the Glue card mapping moved"
+    return t.replace(old, '', 1)
+
+
+case("M1: the lakehouse Glue states have no card", _CN, m385,
+     [f"{_E2E}test_every_lakehouse_state_has_a_card_in_the_flow_of_the_modes_that_reach_it"])
+
+
+def m386(t):
+    # An unknown preset falls through to a FULL run with default params.
+    old = '''    if body.get("preset"):
+        return {"error": f"unknown preset {body.get('preset')!r}"}
+'''
+    assert t.count(old) == 1, "the preset refusal moved"
+    return t.replace(old, '', 1)
+
+
+case("M1: an unknown start preset starts a full run", _CN, m386,
+     [f"{_E2E}test_an_unknown_preset_is_refused_not_ignored"])
+
+
+def m387(t):
+    # The preset stops setting the scale: the dispatcher refuses the button's own run.
+    old = '    "generator_scale": "demo",\n'
+    assert t.count(old) == 1, "the preset's scale moved"
+    return t.replace(old, '', 1)
+
+
+case("M1: the demo preset no longer passes dispatch", _CN, m387,
+     [f"{_E2E}test_the_demo_preset_passes_the_dispatch_rules_it_will_meet"])
+
+
+
+# ── M1: the Outcome tab and the untrained baseline ──────────────────────────────────────
+_OC = "tests/test_console_outcome.py::"
+
+
+def m388(t):
+    # A re-judge of the TRAINED artifact is taken as the "untrained" baseline.
+    old = '''        if p.get("source_run_id") == run_id and str(p.get("model_artifact_uri", "")).startswith("hf://"):'''
+    assert t.count(old) == 1, "the baseline match moved"
+    return t.replace(old, '''        if p.get("source_run_id") == run_id:''', 1)
+
+
+case("M1: the outcome page compares against a re-judge instead of the untrained model", _CN, m388,
+     [f"{_OC}test_the_outcome_compares_the_fine_tune_with_its_own_untrained_baseline"])
+
+
+def m389(t):
+    # Answer pairs lose the "what the fine-tune changed" ordering.
+    old = '''    for r in flipped + rest:'''
+    assert t.count(old) == 1, "the sample ordering moved"
+    return t.replace(old, '''    for r in rest + flipped:''', 1)
+
+
+case("M1: the outcome page buries the questions the fine-tune changed", _CN, m389,
+     [f"{_OC}test_answer_pairs_join_on_the_prompt_and_show_what_the_fine_tune_changed_first"])
+
+
+def m390(t):
+    # Every run's jobs are summed into this run's cost.
+    old = '''                if j.get("run_id") in (run_id, base_id)]'''
+    assert t.count(old) == 1, "the cost filter moved"
+    return t.replace(old, ''']''', 1)
+
+
+case("M1: the outcome page sums other runs' jobs into this run's cost", _CN, m390,
+     [f"{_OC}test_the_data_journey_and_cost_come_from_this_run_and_its_baseline_only"])
+
+
+def m391(t):
+    # The run id check goes: a query parameter chooses the S3 key.
+    old = '''    if not _OUTCOME_RUN_ID.match(run_id or ""):
+        raise ValueError("run_id must look like run-20261016T012010Z-9de45cbf")
+'''
+    assert t.count(old) == 1, "the run id check moved"
+    return t.replace(old, '', 1)
+
+
+case("M1: the outcome page reads any key a run_id names", _CN, m391,
+     [f"{_OC}test_a_bad_run_id_is_refused_before_any_read"])
+
+
+def m392(t):
+    # An unpinned base model (a branch) is accepted as a baseline.
+    old = '[A-Za-z0-9_.-]*@[0-9a-f]{40})$")'
+    assert t.count(old) == 1, "the pinned-revision pattern moved"
+    return t.replace(old, '[A-Za-z0-9_.-]*(@\\\\S+)?)$")', 1)
+
+
+case("M1: a baseline may name a moving branch", _SP, m392,
+     [f"{_OC}test_a_baseline_that_can_silently_change_is_refused"])
+
+
+def m393(t):
+    # The eval prompt stops saying the baseline is judged exactly like the trained model.
+    old = "and change nothing else: the same prompts"
+    assert t.count(old) == 1, "the baseline clause moved"
+    return t.replace(old, "and adapt as needed: the same prompts", 1)
+
+
+case("M1: the eval prompt lets the baseline be judged differently", _EV, m393,
+     [f"{_OC}test_the_eval_prompt_judges_the_baseline_exactly_like_the_trained_model"])
+
+
+
 #: Where the pristine text of the file currently mutated is parked, so a kill -9 -- which
 #: no handler can intercept -- still leaves the original recoverable. Under the repo root
 #: rather than /tmp because it must be obvious to whoever finds the tree dirty, and
