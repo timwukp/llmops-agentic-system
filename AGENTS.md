@@ -310,7 +310,8 @@ versions and introspects the live CreateHarness/UpdateHarness schemas.
   logs every rejected claim, and a rejection names a prefix as a prefix (the driver role has
   `HeadObject` and no `ListBucket`, so the agent has to name objects). The same run showed the
   other half: **Deploy's Catch went straight to `EscalateFail` and stranded an InService
-  endpoint**. It now goes through `TeardownAfterDeployFailed`.
+  endpoint**. It now goes through `TeardownAfterDeployFailed`. Both are live since 2026-10-21
+  (#176, `ecc2e50`; the driver is now at #177's `7f3d0ee`, which keeps it), and neither path has run live yet.
   `deploy/evidence/VERIFICATION_deploy_settle_and_teardown.md`.
 - **Observability**: `OTEL_TRACES_SAMPLER=always_on` env var is mandatory or
   evaluations/insights sit at zero forever. X-Ray delivery takes no `outputFormat`.
