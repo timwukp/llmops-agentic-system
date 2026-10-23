@@ -1,0 +1,25 @@
+{
+  "schema_version": "sweep/1",
+  "run_id": "sweep-2026-10-17",
+  "stage": "monitor",
+  "task": "sweep",
+  "region": "us-east-1",
+  "generated_at": "2026-10-17T08:03:12Z",
+  "idle_rule": {"metric": "AWS/SageMaker Invocations (Sum)", "window_hours": 2, "threshold": "0 invocations"},
+  "endpoints": {"total": 1, "ours": [], "other_projects": [], "untagged": [
+    {"name": "example-untagged-endpoint", "instance_type": "ml.g5.xlarge", "instance_count": 1,
+     "idle": true, "hourly_cost_usd": 1.41}],
+    "idle_flagged": ["example-untagged-endpoint"], "hourly_cost_usd": 1.41},
+  "orphan_endpoint_configs": [
+    {"name": "llmops-ep-run-20260729T095515Z-52b8c566", "creation_time": "2026-07-29T10:21:04Z",
+     "owning_run": "run-20260729T095515Z-52b8c566", "classification": "ours"}],
+  "orphan_models": [
+    {"name": "llmops-model-unnamed", "creation_time": "2026-08-02T03:10:00Z", "owning_run": null,
+     "classification": "untagged"}],
+  "agentcore": {"memories_total": 17, "harnesses_total": 18, "llmops_harnesses_inspected": 8,
+    "memory_orphans": [], "memory_orphans_count": 0, "other_project_memories_count": 15,
+    "contents_read": false},
+  "permission_gaps": [],
+  "deletions_performed": 0,
+  "open_findings": ["1 untagged endpoint idle for 2 h (0 invocations), ~$1.41/h; reported for teardown."]
+}

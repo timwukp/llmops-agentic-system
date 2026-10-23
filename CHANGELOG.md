@@ -5,6 +5,26 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
 ## [Unreleased]
 
+### sweep.json has one shape, and the driver enforces it
+
+The daily sweep's file was free-form and drifted every run: four live files named the same facts four
+ways (`live_endpoints`/`endpoints`, `orphaned_endpoint_configs`/`orphan_endpoint_configs`,
+`timestamp_utc`/`generated_at`, `memory_sweep`/`agentcore`, …), and a reader of them counted an absent
+field as "0 memory orphans". Now:
+
+- `pipeline/contracts/sweep.schema.json` (`schema_version: "sweep/1"`) fixes the required keys and their
+  names; extra keys stay allowed. `sweep_contract.check()` adds what a schema cannot say: the run_id is
+  the dispatched one, `endpoints.total` equals the endpoints listed, `memory_orphans_count` equals the
+  orphans listed, and a count that could not be measured is `null` **with** a `permission_gaps` entry.
+  `deletions_performed` must be 0 and `contents_read` false.
+- The driver checks the file in `handle_stage_complete` for (monitor, sweep) only, after the existing
+  head_object, and rejects the call with the errors (first 20) so the agent rewrites it in the same
+  session. An unreadable or non-JSON file is a rejection, never a pass.
+- The monitor prompt states the shape; a test derives every required key from the schema and fails
+  if the prompt stops naming one. `sweep.example.json` is both documentation and the shared fixture.
+- `tests/test_sweep_contract.py` (35 tests) uses the ten live renames as its cases; mutation-checked
+  (6/6). Not yet deployed: driver + `llmops_monitor`, in the order a40836 coordinates.
+
 ### A rejected stage_complete is heard, and a failed Deploy is torn down
 
 The Deploy of `run-20261016T012010Z-9de45cbf` never settled, and the run failed with an InService

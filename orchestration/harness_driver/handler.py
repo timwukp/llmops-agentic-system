@@ -39,12 +39,14 @@ try:
     from pipeline.contracts.report import normalize_stage_complete, write_run_report
     from pipeline.contracts.task_tokens import is_task_gone
     from pipeline.contracts import tasks as task_contracts
+    from pipeline.contracts import sweep_contract
     from orchestration import conductor_tools
 except ImportError:  # Lambda bundle layout (contracts vendored alongside)
     import events as ev  # type: ignore
     from report import normalize_stage_complete, write_run_report  # type: ignore
     from task_tokens import is_task_gone  # type: ignore
     import tasks as task_contracts  # type: ignore
+    import sweep_contract  # type: ignore
     import conductor_tools  # type: ignore
 
 # (stage, task) -> EventBridge detail-type. eval/gate resolved dynamically.
@@ -1528,6 +1530,43 @@ def _stamp_dispatch(norm: dict, stage: str, task: str) -> dict:
             "task": task or norm.get("task", "")}
 
 
+#: How many contract errors go back to the agent in one rejection. Enough to fix a file in one
+#: rewrite; not so many that a wholly wrong file buries the first error under fifty.
+SWEEP_ERRORS_SHOWN = 20
+
+
+def _sweep_contract_rejection(errs: list) -> str:
+    """What a sweep whose file breaks the contract is told: what is wrong, and that the fix is
+    a rewrite. Capped, so a wholly wrong file does not bury its first error under fifty."""
+    more = len(errs) - SWEEP_ERRORS_SHOWN
+    return ("the sweep file does not match the sweep contract (schema_version sweep/1): "
+            + "; ".join(errs[:SWEEP_ERRORS_SHOWN]) + (f"; ... and {more} more" if more > 0 else "")
+            + ". Rewrite the file in that shape -- every required key, with exactly those names -- "
+            "and call stage_complete again.")
+
+
+def check_sweep_output(s3, event, outputs) -> list:
+    """The sweep's file against pipeline/contracts/sweep.schema.json; [] when it conforms.
+
+    head_object (verify_outputs) proves the file exists. It said nothing about what was in it,
+    and what was in it changed every day -- four live sweeps, four spellings of the same facts,
+    one of them read by a human as "0 orphans" because the field was simply not there. A file
+    nothing can rely on is a file nothing will ever build on, so it is checked at the one point
+    the agent can still fix it: before its stage_complete is accepted.
+    """
+    uri = sweep_contract.sweep_uri_from(event.get("params") or {}, outputs)
+    if not uri:
+        return ["no sweep file: write it to params.sweep_uri and list it in outputs"]
+    bucket, _, key = uri[5:].partition("/")
+    try:
+        doc = json.loads(s3.get_object(Bucket=bucket, Key=key)["Body"].read())
+    except ValueError as exc:
+        return [f"{uri} is not JSON: {exc}"]
+    except Exception as exc:  # noqa: BLE001 -- unreadable is a rejection, never a pass
+        return [f"{uri} could not be read back: {type(exc).__name__}: {str(exc)[:200]}"]
+    return sweep_contract.check(doc, run_id=event.get("run_id"))
+
+
 def handle_stage_complete(c, event, args) -> dict:
     """Verify → normalize → canonical publish → events → settle token."""
     run_id, stage, task = event["run_id"], event["stage"], event["task"]
@@ -1536,6 +1575,10 @@ def handle_stage_complete(c, event, args) -> dict:
     missing = verify_outputs(c["s3"], norm["outputs"])
     if missing:
         return {"ok": False, "missing_outputs": missing}
+    if stage == "monitor" and task == "sweep":
+        invalid = check_sweep_output(c["s3"], event, norm["outputs"])
+        if invalid:
+            return {"ok": False, "invalid_outputs": invalid}
 
     _record_stage_event(c["ddb"], run_id, stage, "stage_complete",
                         _stamp_dispatch(norm, stage, task))
@@ -3280,6 +3323,17 @@ def _run_stage(event, context=None, c=None):
             if name == "stage_complete":
                 result = handle_stage_complete(c, event, args)
                 if not result["ok"]:
+                    if result.get("invalid_outputs"):
+                        # The sweep contract (pipeline/contracts/sweep.schema.json). Its own
+                        # branch, ending in `continue`, so the missing-outputs path below never
+                        # sees a result that has no missing_outputs key.
+                        print(f"[driver] stage_complete REJECTED stage={event.get('stage')} "
+                              f"task={event.get('task')}: sweep contract, "
+                              f"{len(result['invalid_outputs'])} error(s)")
+                        messages = _tool_result_content(tu, {
+                            "status": "rejected",
+                            "reason": _sweep_contract_rejection(result["invalid_outputs"])})
+                        continue
                     # .get: a rejection for another reason (a contract check) may carry no
                     # missing_outputs, and a KeyError here would crash the turn, not reject it.
                     missing = result.get("missing_outputs") or []
