@@ -6479,6 +6479,47 @@ case("handoff: the driver role cannot DescribeTrainingJob", _ROLES, m373,
      [f"{_PF}test_the_driver_role_can_read_the_job_it_classifies"])
 
 
+# ── refused calls: the loop that re-sent an undeliverable verdict 96 times ────────────
+
+# 378. The REJECTED_CALL_BUDGET check is skipped, so a call refused every turn buys turns
+#      forever again (triage-run-20261016T012010Z-9de45cbf).
+def m378(t):
+    old = "        if rejected_calls >= REJECTED_CALL_BUDGET:\n"
+    assert t.count(old) == 1, f"the refused-call check has moved; found {t.count(old)}"
+    return t.replace(old, "        if False:\n", 1)
+
+
+case("driver: a call refused every turn is re-asked forever",
+     _DRIVER, m378,
+     [f"{_TO}test_a_triage_that_keeps_resending_an_undeliverable_verdict_stops_and_pages",
+      f"{_TO}test_a_stage_whose_claim_is_refused_every_turn_settles_under_its_own_name"])
+
+# 379. An accepted call no longer resets the count, so it becomes a lifetime total and a
+#      claim rejected a few times and later accepted dies before it is heard.
+def m379(t):
+    old = "                          if (payload or {}).get(\"status\") in REFUSAL_STATUSES else 0)"
+    assert t.count(old) == 1, f"the refusal reset has moved; found {t.count(old)}"
+    return t.replace(old, "                          if (payload or {}).get(\"status\") in REFUSAL_STATUSES\n"
+                          "                          else rejected_calls + 1)", 1)
+
+
+case("driver: an accepted call does not reset the refused-call count",
+     _DRIVER, m379,
+     [f"{_TO}test_an_accepted_call_resets_the_refusal_count"])
+
+# 380. The count is not carried into the continuation, so a refusal that spans a Lambda
+#      handoff -- the live loop handed off between every one -- never exhausts the budget.
+def m380(t):
+    old = "        rejected_calls = int(event.get(\"_rejected_calls\", 0))\n"
+    assert t.count(old) == 1, f"the continuation read has moved; found {t.count(old)}"
+    return t.replace(old, "        rejected_calls = 0\n", 1)
+
+
+case("driver: the refused-call count restarts at every Lambda handoff",
+     _DRIVER, m380,
+     [f"{_TO}test_the_refusal_count_rides_the_continuation"])
+
+
 #: Where the pristine text of the file currently mutated is parked, so a kill -9 -- which
 #: no handler can intercept -- still leaves the original recoverable. Under the repo root
 #: rather than /tmp because it must be obvious to whoever finds the tree dirty, and

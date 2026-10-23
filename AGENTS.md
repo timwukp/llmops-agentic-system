@@ -296,7 +296,9 @@ versions and introspects the live CreateHarness/UpdateHarness schemas.
   the inline functions is not established, and it is not confined to the scheduled jobs: the
   August pipeline rows show `recovered_ending_in_prose = 0`, but every stage of the 2026-10-15
   lakehouse run `run-20261015T065307Z-97655783` was serviced through it (EvalGate 13 times). Treat
-  the end_turn path as the normal one, not a fallback. `deploy/evidence/VERIFICATION_sweep_unheard_calls.md`.
+  the end_turn path as the normal one, not a fallback. And bound what it can re-buy: a serviced call re-arms the
+  prose budget, so a call refused every turn needs its own cap (`REJECTED_CALL_BUDGET`), or an agent
+  that hears the refusal and re-sends anyway runs forever. `deploy/evidence/VERIFICATION_sweep_unheard_calls.md`.
 - **An end_turn call has no pending handoff either, so ANY reply to it goes as text.** The
   "answer as text" rule above was applied to the shadowed call only. The end_turn override kept
   the `toolUseId` and replied with an echo plus `toolResult`, and the runtime refuses that:

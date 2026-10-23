@@ -14488,3 +14488,109 @@ def test_a_sweep_whose_file_breaks_the_contract_is_rejected_then_accepted_after_
     rows = [i for i in c["ddb"].tables["llmops-stage-events"].items
             if str(i.get("sk", "")).endswith("stage_complete")]
     assert len(rows) == 1, "the drifted claim must not have been recorded as a completion"
+
+# ── refused calls: a call answered "no" every time must not buy turns forever ───────────
+#
+# triage-run-20261016T012010Z-9de45cbf: the conductor re-sent resolve_escalation for a run
+# that could not hear it, 96 times in four hours. Each answer was a toolUse/toolResult pair
+# for a turn the runtime had closed, refused "Inline function callback has no pending
+# handoff in this session"; the good turn in between reset the error budget, and the
+# serviced call reset the prose budget. 945982's ended_turn marker makes the refusal
+# audible. REJECTED_CALL_BUDGET is what stops an agent that hears it and re-sends anyway.
+
+class _RuntimeThatClosedTheTurn(FakeAgentCore):
+    """Refuses a toolResult the way the live runtime did: mid-stream, by error event."""
+
+    def invoke_harness(self, **kw):
+        self.calls.append(kw)
+        if any("toolResult" in block for m in kw["messages"] for block in m["content"]):
+            def _refused():
+                raise RuntimeError("EventStreamError: An error occurred (runtimeClientError) "
+                                   "when calling the InvokeHarness operation: Inline function "
+                                   "callback has no pending handoff in this session.")
+                yield  # pragma: no cover
+            return {"stream": _refused()}
+        return {"stream": self.scripts.pop(0) if self.scripts else []}
+
+
+def _bus_triage_event(subject):
+    return {"run_id": f"triage-{subject}", "stage": "orchestrator", "task": "triage",
+            "harness_id": "llmops_orchestrator",
+            "manifest_uri": f"s3://llmops-data-test/runs/{subject}/manifest.json",
+            "params": {"escalation": {"run_id": subject, "stage": "deploy",
+                                      "reason": "deploy never settled"}}}
+
+
+def test_a_triage_that_keeps_resending_an_undeliverable_verdict_stops_and_pages():
+    """The live loop, replayed: resolve_escalation for an escalated run, arriving with
+    end_turn, every turn. It must end -- failed, and paged by the backstop -- within the
+    budget, and no reply may be the pair the runtime refuses."""
+    call = tool_use_stream_ending_in_prose(
+        "resolve_escalation", {"run_id": "run-dead-9", "decision": "relaunch",
+                               "rationale": "retry with a named object"})
+    ac = _RuntimeThatClosedTheTurn([call] * (driver.REJECTED_CALL_BUDGET + 10))
+    c = clients(ac)
+    c["ddb"].Table("llmops-pipeline-runs").put_item(
+        Item={"run_id": "run-dead-9", "status": "escalated"})
+    out = driver.handler(_bus_triage_event("run-dead-9"), clients=c)
+    assert out["status"] == "failed" and out["reason"] == "rejected calls exhausted", out
+    assert len(ac.calls) == driver.REJECTED_CALL_BUDGET, (
+        f"{len(ac.calls)} turns for {driver.REJECTED_CALL_BUDGET} refusals: the budget did "
+        "not bound the loop")
+    replies = [kw["messages"] for kw in ac.calls[1:]]
+    assert all("toolResult" not in json.dumps(m) for m in replies), (
+        "a refusal went back as a toolUse/toolResult pair, which the runtime refuses")
+    assert all("undeliverable" in json.dumps(m) for m in replies), \
+        "the agent was not told the verdict was undeliverable"
+    assert out.get("backstop_paged") and c["sns"].published, (
+        "a triage that ended on refused calls reached no one")
+
+
+def test_a_stage_whose_claim_is_refused_every_turn_settles_under_its_own_name():
+    missing = "s3://llmops-data-test/runs/run-test-1/distillation/never-written.jsonl"
+    ac = FakeAgentCore([tool_use_stream("stage_complete", {"outputs": [missing]})]
+                       * (driver.REJECTED_CALL_BUDGET + 3))
+    c = clients(ac, FakeS3(existing=[]))
+    out = driver.handler(driver_event(), clients=c)
+    assert out["status"] == "failed", out
+    assert len(ac.calls) == driver.REJECTED_CALL_BUDGET
+    errors = [f["error"] for f in c["sfn"].failures]
+    assert errors == [driver.REJECTED_CALLS_ERROR], (
+        f"settled as {errors}: an agent refused every turn is not a missing stage_complete")
+    assert any(str(i.get("sk", "")).endswith(f"#{driver.REJECTED_CALLS_ERROR}")
+               for i in c["ddb"].Table(ENV["EVENTS_TABLE"]).items)
+
+
+def test_an_accepted_call_resets_the_refusal_count():
+    """Consecutive, not lifetime. Four refusals, an ACCEPTED non-terminal call (checkpoint),
+    four more refusals, then an accepted claim: that stage must complete. Nine refusals in
+    all, so a count that an accepted call does not reset dies at the fifth."""
+    uri = "s3://llmops-data-test/runs/run-test-1/distillation/generated.jsonl"
+    missing = "s3://llmops-data-test/runs/run-test-1/distillation/not-yet.jsonl"
+    refused = tool_use_stream("stage_complete", {"outputs": [missing]})
+    n = driver.REJECTED_CALL_BUDGET - 1
+    ac = FakeAgentCore([refused] * n
+                       + [tool_use_stream("checkpoint", {"progress_uri": uri,
+                                                         "next_action": "write it"})]
+                       + [refused] * n
+                       + [tool_use_stream("stage_complete", {"outputs": [uri]})])
+    c = clients(ac, FakeS3(existing=[uri]))
+    out = driver.handler(driver_event(), clients=c)
+    assert out["status"] == "completed", (
+        f"{out}: the checkpoint between the two runs of refusals did not reset the count")
+
+
+def test_the_refusal_count_rides_the_continuation():
+    """Reset at a Lambda boundary, the budget would never run out for a refusal that spans
+    the handoff every turn -- the live loop handed off between every refusal."""
+    missing = "s3://llmops-data-test/runs/run-test-1/distillation/never-written.jsonl"
+    ac = FakeAgentCore([tool_use_stream("stage_complete", {"outputs": [missing]})] * 3)
+    c = clients(ac, FakeS3(existing=[]))
+    out = driver.handler(driver_event(_continuation=driver._user_text("continue"),
+                                      _rejected_calls=driver.REJECTED_CALL_BUDGET - 1),
+                         clients=c)
+    assert out["status"] == "failed" and len(ac.calls) == 1, (out, len(ac.calls))
+    src = (REPO / "orchestration/harness_driver/handler.py").read_text()
+    reinvoke = src[src.index("def _self_reinvoke"):src.index("def _answer")]
+    assert '"_rejected_calls": rejected_calls' in reinvoke, \
+        "the count is read from the continuation but never written into it"

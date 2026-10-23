@@ -2585,6 +2585,27 @@ NO_ARG_RECOVERY_CAP = 2
 #: to reach the same place.
 UNCLAIMED_OUTPUTS_ERROR = "UnclaimedStageOutputs"
 
+#: Consecutive inline-function calls the driver answered with a refusal -- rejected,
+#: undeliverable or unsupported -- before the stage stops asking.
+#:
+#: Every serviced call re-arms the prose budget (see re_asks), which is right for a call
+#: that was ACCEPTED and leaves nothing to bound a call that is refused every time. Live,
+#: triage-run-20261016T012010Z-9de45cbf re-sent resolve_escalation for a run that could not
+#: hear it 96 times in four hours, each reply refused by the runtime, the error budget
+#: reset by the good turn in between; and on 2026-08-01 a conductor told "undeliverable"
+#: re-called resolve_escalation instead of taking either exit it was given. Answering the
+#: refusal as text lets the agent hear it; this is what stops an agent that hears it and
+#: sends the same call anyway. FIVE, because a stage_complete legitimately rejected for an
+#: output it then writes needs one or two, and a refusal repeated five times is not
+#: going to be the one that changes.
+REJECTED_CALL_BUDGET = 5
+#: The settle name for that exhaustion, distinct from MissingStageComplete for the reason
+#: the other splits exist: the agent spoke protocol every turn, and was refused every turn.
+REJECTED_CALLS_ERROR = "RejectedCallsExhausted"
+#: The reply statuses that count against REJECTED_CALL_BUDGET. Anything else a non-terminal
+#: branch answers (continue, directive, recorded, paged) is an accepted call and resets it.
+REFUSAL_STATUSES = ("rejected", "undeliverable", "unsupported")
+
 #: The evidence-backed re-ask: the driver quotes back the URIs IT verified and asks for
 #: the terminal call naming them. Deliberately not a nudge -- an agent that ended three
 #: turns in prose has already ignored two nudges. What is new here is information the
@@ -2880,6 +2901,9 @@ def _run_stage(event, context=None, c=None):
         # first probe has nothing to have grown from.
         claim_bytes = int(event.get("_claim_bytes", -1))
         no_arg_recoveries = int(event.get("_no_arg_recoveries", 0))
+        # A stage-attempt property like the grants above: reset at a Lambda boundary, the
+        # budget would never run out for a refusal that spans the handoff every turn.
+        rejected_calls = int(event.get("_rejected_calls", 0))
     else:
         messages = _user_text(json.dumps(payload, default=str))
         stream_retried = False
@@ -2898,6 +2922,7 @@ def _run_stage(event, context=None, c=None):
         progress_reasks = 0  # up to PROGRESS_REASK_CAP, each paid for by new S3 bytes
         claim_bytes = -1  # sentinel: this stage attempt has not probed durable state yet
         no_arg_recoveries = 0  # consecutive argument-less recovered calls
+        rejected_calls = 0  # consecutive refused inline-function calls
 
     def _out_of_time() -> bool:
         return bool(context) and context.get_remaining_time_in_millis() < 850_000
@@ -2915,6 +2940,7 @@ def _run_stage(event, context=None, c=None):
                                 "_progress_reasks": progress_reasks,
                                 "_claim_bytes": claim_bytes,
                                 "_no_arg_recoveries": no_arg_recoveries,
+                                "_rejected_calls": rejected_calls,
                                 "_paged_at": paged_at,
                                 "_wait_turns": wait_turns,
                                 "_session_epoch": epoch,
@@ -2922,6 +2948,13 @@ def _run_stage(event, context=None, c=None):
                                 **{f"_{k}": v for k, v in prot.items()}},
                                default=str))
         return {"status": "self_reinvoked_between_turns"}
+
+    def _answer(tu, payload):
+        """Every non-terminal reply to a serviced call, counted. See REJECTED_CALL_BUDGET."""
+        nonlocal rejected_calls
+        rejected_calls = (rejected_calls + 1
+                          if (payload or {}).get("status") in REFUSAL_STATUSES else 0)
+        return _tool_result_content(tu, payload)
 
     def _roll_session():
         """Start the next session epoch for this stage.
@@ -3079,6 +3112,29 @@ def _run_stage(event, context=None, c=None):
         if time.time() - session_started_at >= SESSION_ROLLOVER_S:
             _roll_session()
         _heartbeat()
+        if rejected_calls >= REJECTED_CALL_BUDGET:
+            # Before the next turn, not after it: the refusal is already in `messages`, and
+            # another turn only buys another identical call.
+            cause = (f"{rejected_calls} consecutive inline-function calls were refused "
+                     f"(rejected, undeliverable or unsupported); the agent kept re-sending "
+                     f"instead of changing the call or taking another exit")
+            print(f"[driver] {cause} -- ending stage={event.get('stage')} "
+                  f"task={event.get('task')}")
+            if event.get("task_token"):
+                settle_token(c["sfn"], event["task_token"],
+                             error=REJECTED_CALLS_ERROR, cause=cause[:250])
+            try:
+                _record_stage_event(c["ddb"], event["run_id"], event["stage"],
+                                    REJECTED_CALLS_ERROR,
+                                    {"task": event.get("task", ""),
+                                     "rejected_calls": rejected_calls})
+            except Exception as exc:  # noqa: BLE001 -- telemetry, not the settle
+                print(f"[driver] could not record the refused-call exhaustion: {exc}")
+            ev.emit_event(os.environ["EVENT_BUS"], ev.PIPELINE_FAILED,
+                          {"run_id": event["run_id"], "stage": event["stage"],
+                           "reason": "rejected calls exhausted"}, client=c["events"])
+            return {"status": "failed", "reason": "rejected calls exhausted",
+                    "rejected_calls": rejected_calls}
         if not first_turn and _out_of_time():
             # Said out loud for the same reason as the per-turn line below (#24: "a stage
             # that can fail must say how"), which covered only turns that COMPLETED. The
@@ -3330,7 +3386,7 @@ def _run_stage(event, context=None, c=None):
                         print(f"[driver] stage_complete REJECTED stage={event.get('stage')} "
                               f"task={event.get('task')}: sweep contract, "
                               f"{len(result['invalid_outputs'])} error(s)")
-                        messages = _tool_result_content(tu, {
+                        messages = _answer(tu, {
                             "status": "rejected",
                             "reason": _sweep_contract_rejection(result["invalid_outputs"])})
                         continue
@@ -3352,7 +3408,7 @@ def _run_stage(event, context=None, c=None):
                             "which cannot see a prefix. List the objects under it instead "
                             "(for a model directory, e.g. its config.json and weights)."
                             if prefixes else "")
-                    messages = _tool_result_content(tu, {
+                    messages = _answer(tu, {
                         "status": "rejected",
                         "reason": f"claimed outputs missing from S3: {missing}.{hint} "
                                   "Write them and call stage_complete again."})
@@ -3368,7 +3424,7 @@ def _run_stage(event, context=None, c=None):
                 # infra failure blamed on the driver. Rejected into the same turn
                 # instead, like a stage_complete with missing outputs.
                 if not str(args.get("job_name") or "").strip():
-                    messages = _tool_result_content(tu, {
+                    messages = _answer(tu, {
                         "status": "rejected",
                         "reason": "job_launched carried no job_name, so nothing can "
                                   "ever wake this run. Name the job you actually "
@@ -3377,7 +3433,7 @@ def _run_stage(event, context=None, c=None):
                     continue
                 refusal, kind, handoff = check_handoff(c, event, str(args["job_name"]).strip())
                 if refusal:
-                    messages = _tool_result_content(tu, {"status": "rejected",
+                    messages = _answer(tu, {"status": "rejected",
                                                          "reason": refusal})
                     continue
                 handle_job_launched(c, event, args, kind)
@@ -3423,7 +3479,7 @@ def _run_stage(event, context=None, c=None):
                     # The answer arrived. Stop marking, so the next page starts a new
                     # wait instead of inheriting this one's turn count.
                     paged_at, wait_turns = "", 0
-                messages = _tool_result_content(tu, {
+                messages = _answer(tu, {
                     "status": "directive", "directive": directive} if directive
                     else {"status": "continue"})
                 continue
@@ -3476,7 +3532,7 @@ def _run_stage(event, context=None, c=None):
                     # than skipped: the old `if subject:` fell through to
                     # {"status": "resolved"}, reporting a resolution that never happened
                     # and satisfying the backstop on the way out.
-                    messages = _tool_result_content(tu, {
+                    messages = _answer(tu, {
                         "status": "rejected",
                         "reason": ("this invocation names no run to resolve, so the "
                                    "verdict has no mailbox and would change nothing. "
@@ -3500,7 +3556,7 @@ def _run_stage(event, context=None, c=None):
                     # so the conductor was handed two doors of which one was painted
                     # on. Live: 4 of 9 triaged escalations produced no page at all.
                     can_dispatch = dispatch_is_possible(event)
-                    messages = _tool_result_content(tu, {
+                    messages = _answer(tu, {
                         "status": "undeliverable",
                         "run_status": parked["run_status"],
                         "can_dispatch": can_dispatch,
@@ -3537,7 +3593,7 @@ def _run_stage(event, context=None, c=None):
                 # keep deciding after it just said it could not.
                 result = handle_page_human(c, event, args)
                 if not result["ok"]:
-                    messages = _tool_result_content(tu, {
+                    messages = _answer(tu, {
                         "status": "rejected", "reason": result["reason"]})
                     continue
                 if event.get("task_token"):
@@ -3552,7 +3608,7 @@ def _run_stage(event, context=None, c=None):
                     # up, terminal) with the consequence spelled out.
                     paged_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
                     wait_turns = 0
-                    messages = _tool_result_content(tu, {
+                    messages = _answer(tu, {
                         "status": "paged",
                         "delivered": "SNS to the run owner, plus a HumanPaged row in "
                                      "this run's own timeline",
@@ -3571,7 +3627,7 @@ def _run_stage(event, context=None, c=None):
                 # trust-but-verify, same as every artifact claim
                 missing = verify_outputs(c["s3"], [args.get("report_uri", "")])
                 if missing:
-                    messages = _tool_result_content(tu, {
+                    messages = _answer(tu, {
                         "status": "rejected",
                         "reason": f"report_uri not in S3: {missing}. Write it first."})
                     continue
@@ -3590,7 +3646,7 @@ def _run_stage(event, context=None, c=None):
                     os.environ.get("START_FN", "llmops-start-pipeline"),
                     expected=(event.get("params") or {}).get("approval_context"))
                 if not result["ok"]:
-                    messages = _tool_result_content(tu, {
+                    messages = _answer(tu, {
                         "status": "rejected", "reason": result["reason"]})
                     continue
                 _ack_terminal(c, event, sess, tu,
@@ -3602,20 +3658,20 @@ def _run_stage(event, context=None, c=None):
             if name in FINOPS_TERMINAL_TOOLS and _is_finops(event):
                 result = handle_finops_tool(c, event, name, args)
                 if not result["ok"]:
-                    messages = _tool_result_content(tu, {
+                    messages = _answer(tu, {
                         "status": "rejected", "reason": result["reason"]})
                     continue
                 # flag_variance is a FINDING, not the end of the task: an audit can
                 # flag several runs in one turn, so acknowledge and let it continue.
                 # The report/rate-card calls are terminal.
                 if name == "flag_variance":
-                    messages = _tool_result_content(tu, {"status": "recorded"})
+                    messages = _answer(tu, {"status": "recorded"})
                     continue
                 _ack_terminal(c, event, sess, tu, {"status": "recorded"},
                               f"{name} was serviced and its artifact verified")
                 return {"status": "completed", "tool": name, **result["args"]}
             # unknown tool — acknowledge and continue rather than dying
-            messages = _tool_result_content(tu, {"status": "unsupported"})
+            messages = _answer(tu, {"status": "unsupported"})
             continue
 
         # A platform-suppressed turn is not the agent's answer. Live: EvalGate of
