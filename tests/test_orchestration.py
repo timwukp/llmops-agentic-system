@@ -3224,7 +3224,23 @@ def _mode_of(choice: dict):
     return None
 
 
-def _reachable_in_mode(asl: dict, mode: str, start=None, seen=None) -> set:
+def _presence_ok(choice: dict, present) -> bool:
+    """Every IsPresent test in a mode branch, other than pipeline_mode's own, against `present`.
+
+    The lakehouse mode has two shapes that differ only by an input field: a run that carries
+    lakehouse.seed builds its dataset first, and one that does not trains on an existing one.
+    A walk that ignored the field would reach both paths for either shape.
+    """
+    for r in choice.get("And", [choice]):
+        var = r.get("Variable")
+        if var and var != "$.pipeline_mode" and "IsPresent" in r:
+            if bool(r["IsPresent"]) != (var in present):
+                return False
+    return True
+
+
+def _reachable_in_mode(asl: dict, mode: str, start=None, seen=None,
+                       present=frozenset()) -> set:
     """Reachability with `$.pipeline_mode`-testing Choices resolved to `mode`.
 
     A plain reachability walk sees BOTH branches of every Choice, so it reaches states a
@@ -3248,10 +3264,12 @@ def _reachable_in_mode(asl: dict, mode: str, start=None, seen=None) -> set:
     if st.get("Type") == "Choice":
         mode_branches = [c for c in st.get("Choices", []) if _tests_pipeline_mode(c)]
         if mode_branches:
-            taken = [c["Next"] for c in mode_branches if _mode_of(c) == mode]
+            # Step Functions takes the FIRST matching rule, so only the first match is followed.
+            taken = [c["Next"] for c in mode_branches
+                     if _mode_of(c) == mode and _presence_ok(c, present)][:1]
             exits = taken or ([st["Default"]] if "Default" in st else [])
     for nxt in exits:
-        _reachable_in_mode(asl, mode, nxt, seen)
+        _reachable_in_mode(asl, mode, nxt, seen, present)
     return seen
 
 

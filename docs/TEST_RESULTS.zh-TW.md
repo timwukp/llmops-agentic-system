@@ -29,6 +29,7 @@
 | 殘留 memory 的 sweep —— 線上 | 排程 sweep 透過 pipeline 找出沒有任何 harness 使用的 AgentCore memory，只讀 metadata | ✅ PASSED —— 0 個殘留（與獨立的 ListMemories 一致），未讀取內容、無權限缺口；以執行角色模擬 10/10 | [VERIFICATION_memory_orphan_sweep.md](../deploy/evidence/VERIFICATION_memory_orphan_sweep.md) |
 | Console IAM —— S3 讀取範圍 | `LlmopsAdminLambdaRole` 只能讀 `lambda_function.py` 實際讀取的路徑（由其 AST 推導）；以 `simulate_principal_policy` 驗證兩個方向 | ✅ 25/25：11 個推導出的路徑皆「允許」（含 Data 分頁的報告與 landing manifest）；7 個不讀的前綴（含 landing 原始資料本身）、其他 bucket、不帶前綴的 list、3 個不列出的前綴皆「拒絕」。原本是 `"*"` 上的 `s3:GetObject` + `s3:ListBucket`。經由已部署的 Lambda：Data 分頁正常載入（6 個資料集、283 筆配對、8 條規則），不存在的 run manifest 回 `NoSuchKey` | [VERIFICATION_console_s3_scope.md](../deploy/evidence/VERIFICATION_console_s3_scope.md) |
 | Finetune —— 探測與完整作業，兩次交接 | 經 start-pipeline Lambda 實跑 `lakehouse`：`FinetuneLaunch` 交接探測作業，`FinetuneLaunchFull` 交接完整作業，之後才是 `FinetuneAnalyze` | ✅ `run-20261016T012010Z-9de45cbf`。探測作業（`max_steps` 20）在 `FinetuneLaunch` 內建立並結算；完整作業（`max_steps` 0）在 `FinetuneLaunchFull` 內、以量到的 p50 0.923 s/step 跑 preflight PASS 後建立。完整作業結束 4 秒後進入 analyze，歷時 5 分鐘，未啟動任何作業。run row 的 `job_kind` 由 probe 變為 full，表示 driver 讀過兩個作業。拒絕路徑線上未觸發（以離線測試與反向控制涵蓋）。發現：同一缺陷第 4 次出現在 PR-11 的 run（analyze 佔住 session 52 分鐘） | [VERIFICATION_probe_full_handoff.md](../deploy/evidence/VERIFICATION_probe_full_handoff.md) |
+| M1 —— 原始數據 → 通過評判的模型、成果頁、console | 經 start-pipeline Lambda 實跑未訓練模型（固定 `hf://…@sha`）的 `eval_only` 基線；Outcome 分頁與新的 console 外殼，從已部署的 console 讀取 | ✅ 基線 `run-20261023T101023Z-5e8b449b` SUCCEEDED。同 120 題 held-out：answer match **0.0% → 72.5%**、format validity **39.2% → 100%**（未訓練 → 微調後），87 題由錯變對、沒有一題由對變錯。Outcome 分頁顯示門檻、信賴區間、數據旅程（30 筆 PII 遮罩、8/8 植入缺陷）、花費 $0.60 與並排答案。在線上頁面發現：agent 寫的 `gate.json` 與 `metrics.json` 格式會變，兩種都讀。一鍵建庫加訓練已部署，尚未實跑 | [VERIFICATION_m1_lakehouse_e2e.md](../deploy/evidence/VERIFICATION_m1_lakehouse_e2e.md) |
 | Orchestrator prompt —— intake 範圍 | consult prompt 說明哪些資料可以就地使用，以及「not checked」的 intake 項目代表什麼；**部署前**先測試：以單次呼叫覆蓋 prompt，與線上 prompt 對照 | ✅ 新 prompt：S1 3/3、S2 3/3、S3 對照組有效的 2/2 全過（1 次因測試資料設計問題作廢）；線上 prompt：S1 0/2（提出不存在的跨帳號存取方式）、S2 0/2（說 console「檢查過」一個根本沒檢查的 URI）。覆蓋 prompt 確認不影響結果：4 個 skill 相同，僅多 198 tokens。已部署為 v20，不覆蓋 prompt 的線上 S1、S2 皆通過 | [VERIFICATION_orchestrator_intake_scope.md](../deploy/evidence/VERIFICATION_orchestrator_intake_scope.md) |
 | Deploy —— 被拒絕的 stage_complete 傳得到 agent；失敗的 Deploy 會被拆除 | 唯讀診斷 run-20261016T012010Z-9de45cbf（driver 與 runtime 日誌、stage events、S3、DescribeEndpoint）；離線重播實際的 turn 形狀 | ✅ 已診斷：約 25 次被服務的 `stage_complete` 因宣告了 prefix 而被拒，每次拒絕都以「回覆一個已被回答的 id 的 `toolResult`」送出而遭 runtime 拒收，因此從未到達 agent；Deploy 的 Catch 跳過 Teardown。已確認 endpoint 不存在。離線修正（5 道 guard、4 個反向控制）。live 重跑待擁有者決定 | [VERIFICATION_deploy_settle_and_teardown.md](../deploy/evidence/VERIFICATION_deploy_settle_and_teardown.md) |
 | Monitor sweep —— 未被聽見的 `stage_complete` | 為何 08-18、08-31、10-06、10-07 的 sweep 從未送達終止呼叫（唯讀：stage events、driver 與 runtime 日誌、S3、bus 規則） | ⚠️ 已發現，離線修正 —— agent 每次都呼叫了 `stage_complete`；harness 回 `Unknown tool`，driver 也沒接到（只保留最後一個 block、shell 關掉了手打呼叫的解析、不認得 `<inline-function>` 寫法）。沒有任何告警。14 個重播測試，未修正的 driver 有 9 個失敗。**部署後線上：✅** 1 回合即被服務，outcome 列為 `completed`；同日早上部署前的 sweep 是第 5 次失敗 | [VERIFICATION_sweep_unheard_calls.md](../deploy/evidence/VERIFICATION_sweep_unheard_calls.md) |
@@ -37,9 +38,9 @@
 
 | 檢查 | 結果 | 復現方式 |
 |---|---|---|
-| 單元測試（契約、成本模型、driver 迴圈、Lambda、狀態機文檔） | **2169/2169 通過** | `.venv/bin/python -m pytest tests/ -q --ignore=tests/golden` |
+| 單元測試（契約、成本模型、driver 迴圈、Lambda、狀態機文檔） | **2206/2206 通過** | `.venv/bin/python -m pytest tests/ -q --ignore=tests/golden` |
 | Shell 測試套件 —— N 路 capacity race guard（`tests/test_capacity_race_guard.sh`） | **10/10 斷言** | `bash tests/test_capacity_race_guard.sh` |
-| 反向控制 —— 逐一破壞每道 guard，確認它會失敗 | **444/444 反向控制** | `.venv/bin/python tests/negative_controls/monitor_dispatch.py` |
+| 反向控制 —— 逐一破壞每道 guard，確認它會失敗 | **461/461 反向控制** | `.venv/bin/python tests/negative_controls/monitor_dispatch.py` |
 | Harness 配置驗證（5 個專家 + 指揮家 + 審計員） | **7/7 `RESULT: OK`** | `python deploy/validate_config.py --config agents/<a>/harness.json` |
 | 架構 SVG 幾何檢查（虛線零交叉、零穿框） | **CLEAN** | `python tests/test_svg_geometry.py docs/architecture-*.svg` |
 | 遮蔽掃描（帳號 ID、憑證、帶帳號的 ARN） | CLEAN | `.github/workflows/redaction-check.yml` |
@@ -137,13 +138,13 @@ endpoint、五輪 e2e 迭代 —— 花費比這個帳戶單日花在一個沒�
 
 | 檢查 | 結果 | 重現方式 |
 |---|---|---|
-| 單元測試(全部套件,含 `test_cost_model.py` + `test_finops.py`) | **2169 passed** | `.venv/bin/python -m pytest tests/ -q` |
+| 單元測試(全部套件,含 `test_cost_model.py` + `test_finops.py`) | **2206 passed** | `.venv/bin/python -m pytest tests/ -q` |
 | Harness 配置驗證,7 個 agent | **`RESULT: OK`** | `python deploy/validate_config.py --config agents/finops/harness.json` |
 | 線上艦隊 | **7 個 harness READY** | 用 repo 內建 boto3 呼叫 `list_harnesses` |
 | 正典模組有散佈路徑 | 印出 `would upload 4 contract files` | `python deploy/03_storage.py --region us-east-1 --account-id 123456789012 --dry-run` |
 
 本次新增的每一道 guard 都做過 **mutation check**:逐一還原被斷言的行為,確認測試會
-失敗 —— **444/444 反向控制**,373 個 mutation 斷言 444 組（guard, mutation）配對,runner 各印
+失敗 —— **461/461 反向控制**,388 個 mutation 斷言 461 組（guard, mutation）配對,runner 各印
 一行 PASS。一個「有這行為也過、沒這行為也過」的測試,不是測試。
 
 這個數字是刻意寫進句子裡的。「做過 mutation check」是一個形容詞,而形容詞不會過期:

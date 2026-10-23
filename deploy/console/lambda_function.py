@@ -425,12 +425,49 @@ STAGE_FLOW = [
     ("teardown", "Teardown"),
     ("complete", "Complete"),
 ]
+#: The lakehouse cards, in data order. Raw is the generator writing the landing zone (the
+#: "customer raw data" of a demo run); Bronze/Silver/Gold are the three Glue medallion jobs; the
+#: extract is the pinned, sha256-named export a model trains on.
+LAKEHOUSE_FLOW = [
+    ("lakehouse-raw", "Raw data"),
+    ("lakehouse-bronze", "Bronze"),
+    ("lakehouse-silver", "Silver"),
+    ("lakehouse-gold", "Gold"),
+]
+LAKEHOUSE_TRAIN_FLOW = [("lakehouse-extract", "Gold extract"),
+                        ("data-prep-curate", "Data Prep · Review")] + STAGE_FLOW[2:]
+
+
+def stage_flow_for(execution_input: dict) -> list:
+    """The cards an execution actually has, from its own input: (mode, lakehouse.seed).
+
+    One fixed list drew the full pipeline's cards for every run, so a lakehouse run showed two
+    teacher-generation cards it never had and none of the data engineering it did. The same
+    two fields PipelineModeChoice routes on decide the list, so the picture cannot disagree with
+    the path the machine took.
+    """
+    mode = (execution_input or {}).get("pipeline_mode") or "full"
+    builds = bool(((execution_input or {}).get("lakehouse") or {}).get("seed"))
+    if mode == "lakehouse_ingest":
+        return LAKEHOUSE_FLOW + [("complete", "Complete")]
+    if mode == "lakehouse":
+        return (LAKEHOUSE_FLOW if builds else []) + LAKEHOUSE_TRAIN_FLOW
+    if mode == "eval_only":       # re-judges an existing artifact and stops at the verdict
+        return [("eval-gate", "Eval Gate"), ("complete", "Complete")]
+    if mode == "deploy_only":     # the serving tail, entered at Deploy
+        return [k for k in STAGE_FLOW if k[0] in ("deploy", "smoke", "teardown", "complete")]
+    return STAGE_FLOW
+
 # SFN state name -> logical stage (same mapping pattern as the source repo's
 # GitHub step-name -> stage table). RemediateFinetune re-enters finetune-launch, and
 # FinetuneLaunchFull (the full job's own handoff, after the probe's) is the same card.
 #: LakehouseReview shares the curate card: in a lakehouse run it is the step that hands finetune
-#: its dataset. The five lakehouse Glue states have no card; the Data tab shows their reports.
+#: its dataset. The five lakehouse Glue states have their own cards (LAKEHOUSE_FLOW); the Data tab
+#: shows their reports.
 STATE_TO_STAGE = {
+    "LakehouseGenerate": "lakehouse-raw", "LakehouseLand": "lakehouse-bronze",
+    "LakehouseSilver": "lakehouse-silver", "LakehouseGold": "lakehouse-gold",
+    "LakehouseExport": "lakehouse-extract",
     "DataPrepGenerate": "data-prep-generate", "DataPrepCurate": "data-prep-curate",
     "LakehouseReview": "data-prep-curate",
     "FinetuneLaunch": "finetune-launch", "FinetuneLaunchFull": "finetune-launch",
@@ -609,6 +646,8 @@ def stage_config():
                 cfg.setdefault(dst, pay[src])
         if st.get("TimeoutSeconds"):
             cfg.setdefault("timeoutSeconds", st["TimeoutSeconds"])
+        if (st.get("Parameters") or {}).get("JobName"):
+            cfg.setdefault("glueJob", st["Parameters"]["JobName"])
         fn = (st.get("Parameters") or {}).get("FunctionName") or ""
         if fn:
             cfg.setdefault("lambda", fn.rsplit(":", 1)[-1])
@@ -638,9 +677,10 @@ def pipeline_detail(execution=None):
     arn = _exec_arn(execution)
     d = sfn.describe_execution(executionArn=arn)
     exec_status = d["status"]  # RUNNING | SUCCEEDED | FAILED | TIMED_OUT | ABORTED
-    run_id = ""
+    run_id, exec_input = "", {}
     try:
-        run_id = json.loads(d.get("input", "{}")).get("run_id", "")
+        exec_input = json.loads(d.get("input", "{}"))
+        run_id = exec_input.get("run_id", "")
     except Exception:
         pass
 
@@ -718,7 +758,7 @@ def pipeline_detail(execution=None):
             else "failed"
 
     stages = []
-    for key, label in STAGE_FLOW:
+    for key, label in stage_flow_for(exec_input):
         n_in, n_out = entered.get(key, 0), exited.get(key, 0)
         if n_in == 0:
             status = "skipped" if terminal else "pending"
@@ -1791,7 +1831,33 @@ def apply_optimization(opt_id, now_iso):
 
 
 # ── start a pipeline run ──────────────────────────────────────────────────────
+#: The one-click demo: raw (generated) customer data → Bronze → Silver → Gold → extract → review →
+#: QLoRA → judged gate → deploy → monitor → teardown, in one execution (M1). The settings are the
+#: ones the 2026-10-16 verification run passed its gate with. The seed is the only free choice,
+#: so two clicks build two different datasets rather than racing for one landing prefix.
+LAKEHOUSE_E2E_PRESET = {
+    "pipeline_mode": "lakehouse",
+    "generator_scale": "demo",
+    "dataset": "store-copilot-lakehouse",
+    "models": {"student": "Qwen/Qwen3-1.7B"},
+    "gates": {"format_validity": 0.95, "answer_match": 0.6},
+}
+
+
+def _demo_params(body):
+    try:
+        seed = int(body.get("seed")) if body.get("seed") not in (None, "") else int(time.time()) % 100000
+    except (TypeError, ValueError):
+        seed = -1  # start-pipeline refuses it with a message naming the field
+    return {**LAKEHOUSE_E2E_PRESET, "models": dict(LAKEHOUSE_E2E_PRESET["models"]),
+            "gates": dict(LAKEHOUSE_E2E_PRESET["gates"]), "generator_seed": seed}
+
+
 def start_run(body):
+    if body.get("preset") == "lakehouse-e2e":
+        return _start(_demo_params(body), trigger_source="console-demo")
+    if body.get("preset"):
+        return {"error": f"unknown preset {body.get('preset')!r}"}
     params = {}
     for k in ("task_count", "sample_count"):
         if body.get(k) not in (None, ""):
@@ -1802,10 +1868,14 @@ def start_run(body):
     if body.get("note"):
         params["note"] = str(body["note"])[:200]
 
+    return _start(params, trigger_source="console")
+
+
+def _start(params, trigger_source):
     # Budget enforcement for a launch is budget_gate() at the router (the Cost tab's
     # "Block launches over budget" switch). The v1 estimate_id gate went with the v1
     # estimator: nothing produces an estimate_id any more.
-    payload = {"trigger_source": "console", "params": params}
+    payload = {"trigger_source": trigger_source, "params": params}
     r = lam.invoke(FunctionName=START_FN, InvocationType="RequestResponse",
                    Payload=json.dumps(payload).encode())
     try:
@@ -2388,6 +2458,175 @@ def data_run(dataset):
                 for k, v in (export.get("files") or {}).items()}} if export else None,
             "stages": {"land": land is not None, "silver": silver is not None, "gold": gold is not None,
                        "export": export is not None}}
+
+
+# ── /api/outcome: what one run produced, from raw data to a judged model (M1) ──────────
+_OUTCOME_RUN_ID = re.compile(r"^run-\d{8}T\d{6}Z-[0-9a-f]{8}$")
+#: How many answer pairs the page shows. Disagreements first: an item the fine-tune turned from a
+#: miss into a match (or the reverse) is the evidence a reader is looking for; agreeing items only
+#: fill the rest.
+OUTCOME_SAMPLES = 12
+
+
+def _s3_jsonl(key, limit=2000):
+    try:
+        body = s3.get_object(Bucket=data_bucket(), Key=key)["Body"].read().decode("utf-8", "replace")
+    except Exception:  # noqa: BLE001 -- absent output is shown as absent
+        return []
+    out = []
+    for line in body.splitlines()[:limit]:
+        try:
+            out.append(json.loads(line))
+        except ValueError:
+            continue
+    return out
+
+
+def _eval_files(run_id):
+    """Where under runs/<id>/evaluation/ the newest predictions.jsonl and judge_details.jsonl are.
+
+    Returned as the part AFTER that prefix: the caller rebuilds the key from the literal prefix, so
+    the S3 read stays inside the runs/* grant whatever a listing returns.
+    """
+    base, found = f"runs/{run_id}/evaluation/", {}
+    try:
+        page = s3.list_objects_v2(Bucket=data_bucket(), Prefix=f"runs/{run_id}/evaluation/")
+        for o in sorted(page.get("Contents", []), key=lambda o: str(o.get("LastModified", ""))):
+            for name in ("predictions.jsonl", "judge_details.jsonl"):
+                if o["Key"].endswith("/" + name) or o["Key"] == base + name:
+                    found[name] = o["Key"][len(base):]
+    except Exception:  # noqa: BLE001
+        pass
+    return found
+
+
+def _gate_view(gate):
+    """A gate verdict in one shape, whichever of the shapes the eval agent wrote.
+
+    gate.json is written by the agent, and two runs of the same prompt wrote it two ways: a
+    trained run as gate_results with wilson95_ci_low/high, the 2026-10-23 baseline as decisions
+    with ci_low/ci_high and "47/120" counts. Both are read; a page that understood only one showed
+    the baseline as missing on the day it first existed.
+    """
+    if not gate:
+        return None
+    metrics = {}
+    for name, g in {**(gate.get("decisions") or {}), **(gate.get("gate_results") or {})}.items():
+        if not (isinstance(g, dict) and "value" in g):
+            continue
+        n = g.get("n")
+        if n is None and isinstance(g.get("counts"), str) and "/" in g["counts"]:
+            n = g["counts"].split("/", 1)[1]
+        metrics[name] = {"value": g.get("value"), "threshold": g.get("threshold"),
+                         "ci_low": g.get("wilson95_ci_low", g.get("ci_low")),
+                         "ci_high": g.get("wilson95_ci_high", g.get("ci_high")),
+                         "n": n, "verdict": g.get("verdict")}
+    return {"gate_passed": gate.get("gate_passed"), "metrics": metrics,
+            "decided_at": gate.get("decided_at")}
+
+
+def _baseline_run_for(run_id):
+    """The untrained-baseline eval_only run judged on this run's prompts, if one exists.
+
+    Found by its own manifest (params.source_run_id + an hf:// model), not by a naming convention:
+    a baseline is only comparable if it says, in the record, which run it is the baseline of.
+    """
+    rows, _ = _runs_ordered()
+    for r in rows:
+        if r.get("pipeline_mode") != "eval_only":
+            continue
+        m = _s3_json(f"runs/{r.get('run_id')}/manifest.json") or {}
+        p = m.get("params") or {}
+        if p.get("source_run_id") == run_id and str(p.get("model_artifact_uri", "")).startswith("hf://"):
+            return r.get("run_id"), p.get("model_artifact_uri"), r.get("status")
+    return None, None, None
+
+
+def _answers(run_id):
+    files = _eval_files(run_id)
+    preds = {p.get("prompt_id"): p for p in _s3_jsonl(
+        f"runs/{run_id}/evaluation/{files['predictions.jsonl']}")} if "predictions.jsonl" in files else {}
+    judged = {j.get("item_id"): j for j in _s3_jsonl(
+        f"runs/{run_id}/evaluation/{files['judge_details.jsonl']}")} if "judge_details.jsonl" in files else {}
+    return preds, judged
+
+
+def _samples(tuned, baseline):
+    t_preds, t_judged = tuned
+    b_preds, b_judged = baseline
+    rows = []
+    for pid, p in t_preds.items():
+        tj, bj, bp = t_judged.get(pid, {}), b_judged.get(pid, {}), b_preds.get(pid, {})
+        rows.append({"prompt_id": pid, "intent": p.get("intent"), "lang": p.get("lang"),
+                     "prompt": p.get("prompt"), "reference": p.get("reference"),
+                     "tuned": {"answer": (p.get("answer") or "")[:600], "verdict": tj.get("verdict"),
+                               "format_valid": tj.get("format_valid")},
+                     "baseline": ({"answer": (bp.get("answer") or "")[:600], "verdict": bj.get("verdict"),
+                                   "format_valid": bj.get("format_valid")} if bp else None)})
+    flipped = [r for r in rows if r["baseline"] and r["baseline"]["verdict"] != r["tuned"]["verdict"]]
+    rest = [r for r in rows if r not in flipped]
+    picked, seen = [], set()
+    for r in flipped + rest:
+        if len(picked) >= OUTCOME_SAMPLES:
+            break
+        if r["prompt_id"] not in seen:
+            picked.append(r)
+            seen.add(r["prompt_id"])
+    return picked, {"items": len(rows), "flipped_to_match": sum(
+        1 for r in flipped if r["tuned"]["verdict"] == "match"), "flipped_to_miss": sum(
+        1 for r in flipped if r["tuned"]["verdict"] != "match")}
+
+
+def outcome(run_id):
+    """One run's outcome: the data journey, training, the gate, a baseline, answers and cost."""
+    if not _OUTCOME_RUN_ID.match(run_id or ""):
+        raise ValueError("run_id must look like run-20261016T012010Z-9de45cbf")
+    manifest = _s3_json(f"runs/{run_id}/manifest.json")
+    if manifest is None:
+        return {"run_id": run_id, "error": "no manifest for this run"}
+    params = manifest.get("params") or {}
+    dataset = params.get("lakehouse_dataset") or ((manifest.get("lakehouse") or {}).get("dataset"))
+    raw_metrics = _s3_json(f"runs/{run_id}/training/metrics.json") or {}
+    # The analyze agent writes the trainer's metrics.json wrapped (trainer_metrics, beside
+    # training_job and loss_curve_assessment); an unwrapped copy is the trainer's own. Read both.
+    metrics = raw_metrics.get("trainer_metrics") or raw_metrics
+    job = raw_metrics.get("training_job") or {}
+    report = _s3_json(f"runs/{run_id}/evaluation/report.json") or {}
+    base_id, base_uri, base_status = _baseline_run_for(run_id)
+    tuned = _answers(run_id)
+    baseline = _answers(base_id) if base_id else ({}, {})
+    samples, flips = _samples(tuned, baseline)
+    try:
+        jobs = [j for j in _training_job_costs((_rate_card_doc() or {}).get("rates") or {}, 30)
+                if j.get("run_id") in (run_id, base_id)]
+    except Exception as e:  # noqa: BLE001 -- the page still renders without a cost line
+        jobs, cost_error = [], f"{type(e).__name__}"
+    else:
+        cost_error = None
+    return {
+        "run_id": run_id, "mode": params.get("pipeline_mode", "full"),
+        "student": (manifest.get("models") or {}).get("student"),
+        "created_at": manifest.get("created_at"), "trigger_source": manifest.get("trigger_source"),
+        "dataset": dataset, "data": data_run(dataset) if dataset and _DATASET_ID.match(dataset) else None,
+        "training": {k: metrics.get(k) for k in (
+            "final_train_loss", "final_eval_loss", "epochs_completed", "global_step", "train_rows",
+            "train_runtime_seconds", "model_id", "model_revision", "max_length", "lora")}
+        | {"sec_per_step_p50": (metrics.get("sec_per_step") or {}).get("p50_steady"),
+           "instance": job.get("instance_type"), "billable_seconds": job.get("billable_time_seconds"),
+           "loss_verdict": (raw_metrics.get("loss_curve_assessment") or {}).get("verdict")}
+        if metrics else None,
+        "eval_set": {k: (report.get("eval_set") or {}).get(k) for k in ("which", "rows", "sha256")},
+        "tuned": _gate_view(_s3_json(f"runs/{run_id}/evaluation/gate.json")),
+        "baseline": {"run_id": base_id, "model": base_uri, "status": base_status,
+                     "gate": _gate_view(_s3_json(f"runs/{base_id}/evaluation/gate.json"))}
+        if base_id else None,
+        "samples": samples, "flips": flips,
+        "cost": {"jobs": [{k: j.get(k) for k in ("resource_id", "instance", "quantity", "cost_usd", "run_id")}
+                          for j in jobs],
+                 "total_usd": round(sum(j.get("cost_usd") or 0 for j in jobs), 2), "error": cost_error,
+                 "scope": "SageMaker training and eval-inference jobs; endpoint hours and Bedrock tokens "
+                          "are on the Cost tab"},
+    }
 
 
 def cost_budgets():
@@ -5087,6 +5326,11 @@ def handler(event, context):
         if method == "GET" and path == "/api/data/run":
             try:
                 return _resp(200, data_run(qs.get("dataset", "")))
+            except ValueError as e:
+                return _resp(400, {"error": str(e)})
+        if method == "GET" and path == "/api/outcome":
+            try:
+                return _resp(200, outcome(qs.get("run_id", "")))
             except ValueError as e:
                 return _resp(400, {"error": str(e)})
         # The task-type catalog is registry data, not customer data: the same class of

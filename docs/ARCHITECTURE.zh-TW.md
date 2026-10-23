@@ -134,7 +134,21 @@ approval status 註冊模型，而 `model_package_approval_status` 在
 後停下。它需要 generator 的 seed 與 scale，用 run 本身為資料集命名，不經過任何 harness，也不用 GPU。
 `lakehouse` 用一個 ingest 已經建好的資料集訓練，資料集由 `params.lakehouse_dataset` 指名。它先跑
 `LakehouseExport`（釘在該資料集 snapshot 上、以 sha256 命名的 Gold extract），再跑
-`LakehouseReview`，然後走一般的 `FinetuneLaunch → … → QualityGateChoice`。五個 Glue 狀態都是
+`LakehouseReview`，然後走一般的 `FinetuneLaunch → … → QualityGateChoice`。
+
+`lakehouse` run 也可以不給資料集 id，改給 generator 的 seed 與 scale。這時它會先自己建資料集，
+一次執行就從原始（模擬的）客戶數據走到通過評判的模型：
+- **路徑：** `PipelineModeChoice` 把帶有 `lakehouse.seed` 的 `lakehouse` run 送到
+  `LakehouseGenerate`。Gold 之後，`LakehouseThenTrainChoice` 讓 ingest 停下，讓這種 run 繼續走
+  `LakehouseExport`。
+- **要不要訓練，在 dispatch 時就決定了。** 那個 Choice 寫成停止規則：run 中途讀取模式只能讓 run
+  提早結束，不能開始新的花費。
+- **dispatch 只接受其中一種。** 同時指定資料集與 seed 會被拒絕。建出的資料集 id 會寫進
+  `params.lakehouse_dataset`，也就是每個 agent 原本就讀的欄位。
+- **Console** 有一鍵「Demo: raw data → model」按鈕啟動這種 run。Pipeline 畫面依 run 自己的模式
+  畫出階段，所以資料工程那一半（Raw → Bronze → Silver → Gold → extract）會和訓練並排顯示。
+
+五個 Glue 狀態都是
 `glue:startJobRun.sync`，由 Step Functions 自己執行，不由 agent 啟動：
 - 這些 job 的工作完全由 job 與參數決定，agent 的一次 turn 不會做出任何判斷。
 - 由 agent 啟動，就得把 `glue:StartJobRun` 加到七個 harness 共用的 role 上。
@@ -1123,7 +1137,7 @@ AGPL-3.0 連微調權重與嵌入應用都涵蓋，所以目錄大聲說明、or
 ![Console 架構](architecture-console.svg)
 
 Dashboard 是**單一個 Lambda**
-同時供應 HTML 與全部 **34 個路由 handler**、共 **10 tabs**，**沒有 build step、沒有 CDN**：`frontend.html` 在冷啟動時
+同時供應 HTML 與全部 **35 個路由 handler**、共 **11 tabs**，**沒有 build step、沒有 CDN**：`frontend.html` 在冷啟動時
 內嵌，頁面帶著 `CSP connect-src 'self'` 加上上傳路徑所需的 S3 origin。單一產物意味著 UI 永遠
 不可能比它呼叫的 API 舊一個版本 —— 那正是「前端後端分開部署」會招來的故障模式。
 

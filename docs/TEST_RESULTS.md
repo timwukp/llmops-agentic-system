@@ -31,6 +31,7 @@ page is its ledger.
 | Console IAM — S3 read scope | `LlmopsAdminLambdaRole` reads only what `lambda_function.py` reads (derived from its AST); `simulate_principal_policy` both directions | ✅ 25/25: allowed for the 11 derived globs (incl. the Data tab's reports and landing manifest); denied for 7 unread prefixes (incl. the landing data itself), other buckets, an unprefixed list and 3 unlisted prefixes. Was `s3:GetObject` + `s3:ListBucket` on `"*"`. Through the deployed Lambda: the Data tab loaded (6 datasets, 283 pairs, 8 rules) and a missing run manifest returned `NoSuchKey` | [VERIFICATION_console_s3_scope.md](../deploy/evidence/VERIFICATION_console_s3_scope.md) |
 | Orchestrator prompt — intake scope | the consult prompt says where data can be used in place, and what a "not checked" intake fact means; tested **before** deploying, by a per-call prompt override vs the live prompt | ✅ new prompt S1 3/3, S2 3/3, S3 control 2/2 valid (1 invalid: fixture); live prompt S1 0/2 (offered a non-existent cross-account path), S2 0/2 (said the console "checked" a URI it never examined). Override faithful: same 4 skills, +198 tokens. Deployed v20; S1 and S2 pass live with no override | [VERIFICATION_orchestrator_intake_scope.md](../deploy/evidence/VERIFICATION_orchestrator_intake_scope.md) |
 | Finetune — probe and full job, two handoffs | live `lakehouse` run through the start-pipeline Lambda: the probe handed off from `FinetuneLaunch`, the full job from `FinetuneLaunchFull`, then `FinetuneAnalyze` | ✅ `run-20261016T012010Z-9de45cbf`. Probe (`max_steps` 20) created and settled in `FinetuneLaunch`; full job (`max_steps` 0) created in `FinetuneLaunchFull` after a preflight PASS at the measured p50 0.923 s/step. Analyze entered 4 s after the full job ended, 5 min, launched nothing. Run row `job_kind` probe → full, so the driver read both jobs. Rejection paths not exercised live (offline + negative controls). Found: the same defect a 4th time, on PR-11's run (analyze held a session 52 min) | [VERIFICATION_probe_full_handoff.md](../deploy/evidence/VERIFICATION_probe_full_handoff.md) |
+| M1 — raw data → judged model, its outcome, the console | live `eval_only` baseline of the untrained model (pinned `hf://…@sha`) through the start-pipeline Lambda; the Outcome tab and the new console shell read from the deployed console | ✅ baseline `run-20261023T101023Z-5e8b449b` SUCCEEDED. Same 120 held-out questions: answer match **0.0% → 72.5%**, format validity **39.2% → 100%** (untrained → fine-tuned), 87 items miss → match and none back. Outcome tab shows gate, intervals, data journey (30 PII redactions, 8/8 plants), cost $0.60 and side-by-side answers. Found on the live page: agent-written `gate.json` and `metrics.json` shapes vary, so both are read. The one-click build-then-train run is deployed, not yet run | [VERIFICATION_m1_lakehouse_e2e.md](../deploy/evidence/VERIFICATION_m1_lakehouse_e2e.md) |
 | Deploy — a rejected stage_complete is heard; a failed Deploy is torn down | read-only diagnosis of run-20261016T012010Z-9de45cbf (driver + runtime logs, stage events, S3, DescribeEndpoint); offline replay of the live turn shape | ✅ diagnosed: ~25 serviced `stage_complete` calls rejected for a prefix output, each rejection refused by the runtime as a `toolResult` for an already-answered id, so it never reached the agent; Deploy's Catch skipped Teardown. Endpoint confirmed gone. Fixed offline (5 guards, 4 negative controls). Live re-run pending the owner | [VERIFICATION_deploy_settle_and_teardown.md](../deploy/evidence/VERIFICATION_deploy_settle_and_teardown.md) |
 | Monitor sweep — unheard `stage_complete` | why sweeps 08-18, 08-31, 10-06, 10-07 never serviced a terminal call (read-only: stage events, driver + runtime logs, S3, bus rules) | ⚠️ FOUND, fixed offline — each agent called `stage_complete`; the harness answered `Unknown tool`, and the driver missed the call (one-slot capture, a typed-call gate that shell switched off, an unknown `<inline-function>` spelling). Nothing alerted. 14 replay tests, 9 fail on the unfixed driver. **Live after deploy: ✅** 1 turn, serviced, outcome row `completed`; the same morning's pre-deploy sweep was a 5th failure | [VERIFICATION_sweep_unheard_calls.md](../deploy/evidence/VERIFICATION_sweep_unheard_calls.md) |
 
@@ -38,9 +39,9 @@ page is its ledger.
 
 | Check | Result | How to reproduce |
 |---|---|---|
-| Unit tests (contracts, cost model, driver loop, Lambdas, state machine document) | **2169/2169 passed** | `.venv/bin/python -m pytest tests/ -q --ignore=tests/golden` |
+| Unit tests (contracts, cost model, driver loop, Lambdas, state machine document) | **2206/2206 passed** | `.venv/bin/python -m pytest tests/ -q --ignore=tests/golden` |
 | Shell suite — N-way capacity race guard (`tests/test_capacity_race_guard.sh`) | **10/10 assertions** | `bash tests/test_capacity_race_guard.sh` |
-| Negative controls — every guard broken in turn, confirmed to fail | **444/444 negative controls** | `.venv/bin/python tests/negative_controls/monitor_dispatch.py` |
+| Negative controls — every guard broken in turn, confirmed to fail | **461/461 negative controls** | `.venv/bin/python tests/negative_controls/monitor_dispatch.py` |
 | Harness config validation (5 specialists + conductor + auditor) | **7/7 `RESULT: OK`** | `python deploy/validate_config.py --config agents/<a>/harness.json` |
 | Architecture SVG geometry (no wire crossings, no wire through a card) | **CLEAN** | `python tests/test_svg_geometry.py docs/architecture-*.svg` |
 | Redaction scan (account IDs, credentials, account-bearing ARNs) | CLEAN | `.github/workflows/redaction-check.yml` |
@@ -149,14 +150,14 @@ Full record: [VERIFICATION_finops.md](../deploy/evidence/VERIFICATION_finops.md)
 
 | Check | Result | How to reproduce |
 |---|---|---|
-| Unit tests (all suites, incl. `test_cost_model.py` + `test_finops.py`) | **2169 passed** | `.venv/bin/python -m pytest tests/ -q` |
+| Unit tests (all suites, incl. `test_cost_model.py` + `test_finops.py`) | **2206 passed** | `.venv/bin/python -m pytest tests/ -q` |
 | Harness config validation, 7 agents | **`RESULT: OK`** | `python deploy/validate_config.py --config agents/finops/harness.json` |
 | Live fleet | **7 harnesses READY** | `list_harnesses` via the repo's vendored boto3 |
 | Canonical module has a distribution path | prints `would upload 4 contract files` | `python deploy/03_storage.py --region us-east-1 --account-id 123456789012 --dry-run` |
 
 Every guard added in this work was **mutation-checked**: the asserted behaviour was
-reverted one at a time and the test confirmed to fail — **444/444 negative controls**, 373
-mutations asserting 444 (guard, mutation) pairs, one printed PASS line each. A test that
+reverted one at a time and the test confirmed to fail — **461/461 negative controls**, 388
+mutations asserting 461 (guard, mutation) pairs, one printed PASS line each. A test that
 passes both with and against the behaviour it names is not a test.
 
 The count is in the sentence on purpose. "Mutation-checked" is an adjective, and an

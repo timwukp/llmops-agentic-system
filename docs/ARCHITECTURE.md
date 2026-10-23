@@ -152,7 +152,23 @@ and stops. It needs a generator seed and scale, names its dataset after the run,
 harness and no GPU. `lakehouse` trains on a dataset an ingest already built, named by
 `params.lakehouse_dataset`. It runs `LakehouseExport` (a Gold extract pinned to the dataset's
 snapshots and named by its sha256), then `LakehouseReview`, then the ordinary
-`FinetuneLaunch → … → QualityGateChoice` path. The five Glue states are
+`FinetuneLaunch → … → QualityGateChoice` path.
+
+A `lakehouse` run can instead be given a generator seed and scale, with no dataset id. It then
+builds its own dataset first, so one execution goes from raw (generated) customer data to a judged
+model:
+- **Routing:** `PipelineModeChoice` sends a `lakehouse` run that carries `lakehouse.seed` to
+  `LakehouseGenerate`. After Gold, `LakehouseThenTrainChoice` stops an ingest and sends this run on
+  to `LakehouseExport`.
+- **The decision to train is made at dispatch.** That Choice is written as a stop rule: a mode read
+  mid-run may only end a run early, never start new spend.
+- **Dispatch takes one or the other.** It refuses a run that names a dataset and a seed both, and
+  writes the built dataset's id to `params.lakehouse_dataset`, the field every agent already reads.
+- **The console** has a one-click "Demo: raw data → model" button for this run. Its pipeline view
+  draws the stages of the run's own mode, so the data engineering half (Raw → Bronze → Silver →
+  Gold → extract) appears beside training.
+
+The five Glue states are
 `glue:startJobRun.sync`, run by Step Functions itself rather than launched by an agent:
 - The jobs' work is fixed by the job and its arguments, so an agent turn would decide nothing.
 - An agent launch would need `glue:StartJobRun` on the role all seven harnesses share.
@@ -1326,7 +1342,7 @@ variance to argue about.
 ![Console architecture](architecture-console.svg)
 
 The dashboard is a single
-Lambda serving the HTML and all **34 route handlers** across **10 tabs**, with **no build step
+Lambda serving the HTML and all **35 route handlers** across **11 tabs**, with **no build step
 and no CDN**:
 `frontend.html` is embedded at cold start and the page ships with `CSP connect-src 'self'`
 plus the S3 origin the upload path needs. One artifact means the UI can never be a version

@@ -74,6 +74,7 @@ def _arguments(state, execution_input):
 @pytest.mark.parametrize("mode,params", [
     ("lakehouse_ingest", {"pipeline_mode": "lakehouse_ingest", "generator_seed": 7, "generator_scale": "demo"}),
     ("lakehouse", {"pipeline_mode": "lakehouse", "lakehouse_dataset": "seed7-demo-20261015-034233"}),
+    ("lakehouse", {"pipeline_mode": "lakehouse", "generator_seed": 7, "generator_scale": "demo"}),
 ])
 def test_every_glue_state_passes_exactly_the_layout_the_deploy_smoke_uses(mode, params):
     """run_arguments() is what --smoke passed when the jobs went green live. The ASL spells the
@@ -81,7 +82,8 @@ def test_every_glue_state_passes_exactly_the_layout_the_deploy_smoke_uses(mode, 
     generator never wrote, and it would fail only in a pipeline run."""
     run_id = "run-20261015T050000Z-0a1b2c3d"
     inp = {"run_id": run_id, "lakehouse": sp.lakehouse_input(params, run_id, "data-bucket")}
-    reached = _reachable_in_mode(ASL, mode) & set(GLUE_STATES)
+    present = {"$.lakehouse.seed"} if inp["lakehouse"].get("seed") else set()
+    reached = _reachable_in_mode(ASL, mode, present=present) & set(GLUE_STATES)
     assert reached, f"{mode} reaches no Glue state"
     for name in sorted(reached):
         st = GLUE_STATES[name]
@@ -277,6 +279,70 @@ def test_the_execution_input_carries_the_lakehouse_object(monkeypatch):
                                 "seed": "7", "scale": "demo"}
     sp.handler({"trigger_source": "test", "params": {}}, clients=clients)
     assert json.loads(clients["sfn"].calls[-1][1]["input"])["lakehouse"] is None
+
+
+# ── build then train: one run from raw data to a judged model (M1) ─────────────
+BUILD = {"pipeline_mode": "lakehouse", "generator_seed": 7, "generator_scale": "demo",
+         "models": {"student": "Qwen/Qwen3-1.7B"}, **GATES}
+
+
+def test_a_lakehouse_run_given_a_seed_builds_its_dataset_then_trains_on_it():
+    reached = _reachable_in_mode(ASL, "lakehouse", present={"$.lakehouse.seed"})
+    assert {"LakehouseGenerate", "LakehouseLand", "LakehouseSilver", "LakehouseGold",
+            "LakehouseExport", "LakehouseReview", "FinetuneLaunch", "QualityGateChoice"} <= reached
+    assert not reached & {"DataPrepGenerate", "DataPrepCurate"}, (
+        "a lakehouse run's data comes from the lakehouse it built, never from teacher generation")
+    # The ingest it shares Bronze -> Gold with still stops at Gold and spends nothing.
+    ingest = _reachable_in_mode(ASL, "lakehouse_ingest", present={"$.lakehouse.seed"})
+    assert "LakehouseExport" not in ingest and not _harnesses_of(STATES, ingest)
+
+
+def test_a_lakehouse_run_without_a_seed_still_trains_on_an_existing_dataset_only():
+    reached = _reachable_in_mode(ASL, "lakehouse")
+    assert "LakehouseExport" in reached and "LakehouseGenerate" not in reached
+
+
+def test_a_build_run_names_its_dataset_after_itself_where_the_agents_read_it():
+    m = sp.seed_manifest("run-20261023T000000Z-0a1b2c3d", "test", dict(BUILD), {})
+    assert sp.lakehouse_builds(m["params"])
+    lake = sp.lakehouse_input(m["params"], "run-20261023T000000Z-0a1b2c3d", "b")
+    assert lake == {"dataset": "run-20261023t000000z-0a1b2c3d", "data_bucket": "b",
+                    "seed": "7", "scale": "demo"}
+
+
+@pytest.mark.parametrize("extra,why", [
+    ({"lakehouse_dataset": "seed7-demo-x"}, "not both"),
+    ({"generator_scale": None}, "generator_scale"),
+    ({"generator_seed": None}, "generator_seed"),
+    ({"generator_scale": "huge"}, "scale"),
+    ({"generator_seed": "7; rm"}, "integer"),
+])
+def test_a_build_run_is_refused_when_its_data_is_not_fixed_by_the_dispatch(extra, why):
+    params = {k: v for k, v in {**BUILD, **extra}.items() if v is not None}
+    with pytest.raises(ValueError, match=why):
+        _seed(params)
+
+
+def test_a_build_run_still_needs_the_student_and_gates_a_training_run_needs():
+    for drop, why in (("models", "student"), ("gates", "gates")):
+        with pytest.raises(ValueError, match=why):
+            _seed({k: v for k, v in BUILD.items() if k != drop})
+
+
+def test_a_build_runs_execution_input_routes_it_to_the_generator(monkeypatch):
+    for k, v in {"DATA_BUCKET": "data-bucket", "RUNS_TABLE": "runs", "EVENT_BUS": "bus",
+                 "STATE_MACHINE_ARN": "arn:sm"}.items():
+        monkeypatch.setenv(k, v)
+    clients = {"s3": _Rec(), "ddb": _Rec(), "events": _Rec(), "sfn": _Rec()}
+    out = sp.handler({"trigger_source": "test", "params": dict(BUILD)}, clients=clients)
+    (op, kw), = [c for c in clients["sfn"].calls if c[0] == "start_execution"]
+    inp = json.loads(kw["input"])
+    assert inp["pipeline_mode"] == "lakehouse"
+    assert inp["lakehouse"]["seed"] == "7" and inp["lakehouse"]["dataset"] == out["run_id"].lower()
+    (op, kw), = [c for c in clients["s3"].calls if c[0] == "put_object"]
+    manifest = json.loads(kw["Body"])
+    assert manifest["params"]["lakehouse_dataset"] == out["run_id"].lower(), (
+        "data-prep's review reads params.lakehouse_dataset; a build run must name the dataset there")
 
 
 # ── the review ───────────────────────────────────────────────────────────────
