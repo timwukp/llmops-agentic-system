@@ -5,6 +5,15 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
 ## [Unreleased]
 
+### Deployed: a rejected stage_complete is heard; a failed Deploy is torn down
+
+#176 is live since 2026-10-21: the driver and state machine (37 states) were deployed from a fresh `ecc2e50`
+checkout on the owner's go-ahead, after a drift audit showed only this change pending and 0 executions
+were RUNNING. Read back: the live definition routes Deploy's Catch through `TeardownAfterDeployFailed`, all
+seven files of the live driver bundle are byte-identical to `ecc2e50`, and the drift audit shows 0 drift on
+the state machine. The driver was redeployed on 2026-10-23 with #177, which keeps this change. Neither new
+path has run live yet. Record only; no code change.
+
 ### sweep.json has one shape, and the driver enforces it
 
 The daily sweep's file was free-form and drifted every run: four live files named the same facts four

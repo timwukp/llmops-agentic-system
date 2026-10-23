@@ -106,11 +106,67 @@ Results in this sandbox:
 
 Totals are in `docs/TEST_RESULTS.md`.
 
+## Deploy (2026-10-21)
+
+#176 merged as `ecc2e50`, whose tree (`ad057f0`) is exactly the PR's head tree. The deploy ran on
+the owner's go-ahead, from a fresh detached checkout of `origin/main` at `ecc2e50`, in the slot the
+coordinating session assigned (after #175's probe/full handoff, which was live and already on `main`).
+
+**Before.** All checks were read-only and ran from that checkout.
+
+- `tools/audit_drift.py`:
+  - **state machine:** 2 findings, both this change: `TeardownAfterDeployFailed` absent live, and
+    Deploy's `Catch` differs.
+  - **driver bundle:** only `handler.py` differed, first at line 343 (this change, +2,989 bytes).
+    Every other bundled file matched. The first pass could not compare the driver (`IncompleteRead`
+    while downloading the live zip); the second pass did.
+  - **IAM** (10), **harnesses** (7) and **Lambda configuration** (14): 0 drift.
+  - **Other Lambdas**, not touched by this change: `start-pipeline`, `resurrector`, `webhook`,
+    `monitor-sweep` and `finops-reconcile` bundle a stale `manifest.schema.json` and no `tasks.py`.
+- **Executions:** `list-executions --status-filter RUNNING` on `llmops-pipeline` returned 0.
+  Re-checked immediately before the deploy, a day after the first check: still 0, with `origin/main`
+  still at `ecc2e50` and the live driver still at its 2026-10-16T01:16:59Z deploy.
+- **Dry run:** `07_lambdas.py --only driver --only state_machine --dry-run`: ASL `OK`, no
+  diagnostics.
+
+**Deploy.** `07_lambdas.py --region us-east-1 --only driver --only state_machine`: exit 0.
+
+| Target | Result |
+|---|---|
+| `llmops-harness-driver` | `updated`; LastModified 2026-10-21T02:02:03Z, `Active`, `Successful` |
+| `llmops-pipeline` | `updated`, `definition_confirmed: true`, `states_live: 37` |
+
+**Read-back.**
+
+- **Live definition** (`DescribeStateMachine`): 37 states. Deploy's `Catch` →
+  `TeardownAfterDeployFailed`, which dispatches `deploy`/`teardown` and continues to `EscalateFail`,
+  with its own `Catch` → `EscalateFail`.
+- **Driver bytes:** the drift audit's driver leg hit `IncompleteRead` again, so the live zip was
+  downloaded directly and every file compared with `ecc2e50`. All seven match:
+
+  | File | Size |
+  |---|---|
+  | `handler.py` | 224,790 B |
+  | `conductor_tools.py` | 9,407 B |
+  | `events.py` | 10,938 B |
+  | `manifest.schema.json` | 8,891 B |
+  | `report.py` | 17,678 B |
+  | `task_tokens.py` | 2,844 B |
+  | `tasks.py` | 10,553 B |
+
+- **Drift audit afterwards:** 0 drift on the state machine, IAM, harnesses and Lambda
+  configuration. The remaining Lambda-code findings are the five other Lambdas listed above.
+
+**Superseded driver, 2026-10-23.** #177 (the sweep contract) redeployed the driver from `7f3d0ee` at
+06:30:46Z. That tree keeps this change and adds the sweep check (54 lines in `handler.py`). It changed
+neither this change's lines nor the state machine. Read back on 2026-10-23: live still has 37 states,
+and Deploy's `Catch` still goes to `TeardownAfterDeployFailed`.
+
 ## Not done
 
-- **Live.** Nothing is deployed yet. Live equals `main` at #175 (the probe/full handoff) for the
-  driver and the state machine. This change deploys after it merges, from a fresh `origin/main`,
-  with `07_lambdas.py --only driver --only state_machine` and the owner's go-ahead.
+- **Exercised live.** Deployed 2026-10-21 (see "Deploy (2026-10-21)" above), but no run has yet
+  taken either new path: an `ended_turn` rejection, or a failed Deploy's teardown. The first run
+  that hits one is the first live evidence.
 - **A separate defect, seen and not fixed:** for this run, `llmops-stage-events` holds 34
   `EscalationResolved` directives from the orchestrator between 03:12:12 and 03:30:34Z, several
   of them labelled "FINAL RESOLUTION". The escalation triage looped.
