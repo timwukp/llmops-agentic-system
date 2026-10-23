@@ -244,9 +244,7 @@ ALLOWED = (b"6833" + b"13688378", b"7631" + b"04351884", b"1234" + b"56789012")
 #: run; the runs held at 81.
 #: Then 366 files went to 369 (the refused-call budget: its tests, controls and intent chain). No 12-digit run; the runs
 #: held at 81.
-#: Then 369 files went to 375 (M1: the build-then-train demo, the Outcome tab, their tests, evidence and intent chain). No 12-digit run; the runs
-#: held at 81.
-#: Then 375 files became 375 (M1: the build-then-train demo, the Outcome tab, their tests, evidence and intent chain). No 12-digit run; the runs
+#: Then 369 files became 375 (M1: the build-then-train demo, the Outcome tab, their tests, evidence and intent chain). No 12-digit run; the runs
 #: held at 81.
 #: Dollar limits and percentages only -- no 12-digit run, so the runs held at 74 again.
 #: For EIGHT commits
