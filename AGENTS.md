@@ -337,6 +337,21 @@ versions and introspects the live CreateHarness/UpdateHarness schemas.
   into the turn. The prompt said the right thing every time, so the check is on the job, not the
   words. A new launch task needs an entry there, and the test derives the key set from the prompt
   bullets both ways.
+- **Registering S3 Tables with Lake Formation revokes the pipeline's IAM access; there is no
+  "keep IAM" mode.** AWS's migration page (`change-access-iam-to-lf.html`) says the register step
+  "will revoke all existing IAM-based access", and says to keep hybrid access false. Every pipeline
+  principal reads the tables through IAM, so Unified Studio is IAM-governed instead: an IAM-based
+  domain reads through its execution role (`deploy/11_studio.py`). That role must carry
+  `SageMakerStudioAdminIAMDefaultExecutionPolicy`, which ALLOWS `glue:DeleteCatalog` on
+  `s3tablescatalog`, `lakeformation:RegisterResource`/`PutDataLakeSettings` and `iam:PassRole` of any
+  role (measured with `simulate_custom_policy`, v27), so the scoping is explicit Deny, and the tests
+  require every refused case to be an explicit Deny of ours. An IAM-based domain is a console step:
+  its `CreateDomain` carries `preferences.DOMAIN_MODE=EXPRESS` and `iamSignIns`, then
+  `ProvisionDomain` and `StartAccountBootstrapAction`, none in the public SDK/CLI (CloudTrail,
+  2026-10-24). It stores the execution role as `serviceRole` with `domainExecutionRole` null and an
+  id `dzd-…`, so look it up by either field. Under IAM, a Bronze schema is very likely as hidden as its
+  rows: S3 Tables reads the Iceberg metadata file with `GetTableData`, and a denied read surfaces in
+  Athena as `TABLE_NOT_FOUND` while every metadata API call is allowed (inferred from CloudTrail).
 - **DeepSeek-R1 output contains `<think>...</think>`** — the data-prep agent strips
   it by default (sequence-level KD keeps final answers only).
 

@@ -60,10 +60,29 @@ Read from the deployed console for `run-20261016T012010Z-9de45cbf`:
 Both are agent-written files whose shape varies between runs, so the reader accepts both shapes, and
 `tests/test_console_outcome.py` holds the live shapes.
 
+## Live: the one-click build-then-train run, from the console button
+
+`run-20261023T160741Z-65fec5d8`, `trigger_source: console-demo`, generator seed 71659, started
+16:07:41Z 2026-10-23 by the owner's click, **SUCCEEDED** at 00:08:18Z (8 h 0 min wall clock, most of it
+the SageMaker jobs and their queues). Path, read from the execution history:
+
+PipelineModeChoice → LakehouseGenerate → LakehouseLand → LakehouseSilver → LakehouseGold →
+LakehouseThenTrainChoice → LakehouseExport → LakehouseReview → FinetuneLaunch → FinetuneLaunchFull →
+FinetuneAnalyze → EvalGenerate → EvalScore → EvalGate → EvalOnlyStopChoice → QualityGateChoice →
+Deploy → SmokeTest → MonitorHealth → Teardown → MonitorReport → Complete.
+
+| | This run |
+|---|---|
+| Data | Silver 283 pairs, 30 PII redactions; Gold 234 train / 19 eval, its own dataset `run-20261023t160741z-65fec5d8` |
+| answer_match | **72.5%** (87/120; Wilson 95% [63.9%, 79.7%]), decisive pass at 0.6 |
+| format_validity | **100%** (120/120; [96.9%, 100%]), decisive pass at 0.95 |
+| Model | registered in the SageMaker Model Registry; visible in SageMaker Unified Studio Discover as `llmops-student-store-copilot-lakehouse` |
+
+**The same 87/120 as the 2026-10-16 run is a coincidence, checked rather than assumed:** the eval set
+(`sha256 bce1c370…` vs `72253cab…`), the model artifact (this run's own `training/` prefix) and the
+inference job all differ between the two runs.
+
 ## Not yet verified live
 
-- **The one-click build-then-train run, started from the console button.** It is deployed. Its routing
-  is covered offline by `tests/test_lakehouse_mode.py` and its negative controls, but it has not run
-  live yet: it waits for the owner's click.
-- **The console after the training-card, `eval_only`-flow and flow-colour fixes.** These are in the
-  branch; the console needs one more `deploy.sh`.
+- **The console after the training-card, `eval_only`-flow and flow-colour fixes** shipped with #180;
+  re-read on the live console, not separately recorded here.
