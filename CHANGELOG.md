@@ -5,6 +5,29 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
 ## [Unreleased]
 
+### Unified Studio: sign in and see the lakehouse, governed by IAM
+
+- **Lake Formation is not used, on purpose.** Registering the S3 Tables catalog with Lake Formation
+  revokes every IAM principal's access at the register step (AWS's migration page), and hybrid mode is
+  not offered for S3 Tables; the whole pipeline reads through IAM. An IAM-based domain reads through
+  one execution role, so that role's policy is the governance.
+- **`deploy/11_studio.py`: role `llmops-studio-execution`.** Silver and Gold readable; Bronze tables
+  and columns visible, rows explicitly denied. The managed policy the console requires allows
+  `glue:DeleteCatalog` on `s3tablescatalog`, Lake Formation `RegisterResource` and passing the
+  pipeline's roles; the inline policy denies each explicitly. Checked live with
+  `simulate_custom_policy` before the role existed, then `--verify` as the role: 23/23 once the owner
+  created the domain in the console. In Studio a Silver query returns rows and a Bronze query is
+  refused (`TABLE_NOT_FOUND`).
+- **The console's own setup API is not public.** CloudTrail shows `CreateDomain` with
+  `DOMAIN_MODE: EXPRESS` and `iamSignIns`, then `ProvisionDomain` and `StartAccountBootstrapAction`,
+  none of which the SDK or CLI expose, so the domain stays a console step. An IAM-based domain carries
+  its role as `serviceRole` (id `dzd-…`); the lookup now reads that field.
+- **Catalog listing:** Studio's recursive `GetCatalogs` failed on the AWS-managed `aws-s3` table
+  bucket; its metadata is now readable, and rows outside Silver and Gold are explicitly denied.
+- **M1, live:** the console's "Demo: raw data → model" run SUCCEEDED end to end (answer match 72.5%,
+  format 100%, both decisive passes) and registered its model.
+- 72 offline tests and negative controls m394–m400.
+
 ### M1: one run from raw customer data to a judged model, and a pipeline you can see
 
 - **One dispatch, raw data → outcome.** A `lakehouse` run given a generator seed and scale, with no
