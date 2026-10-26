@@ -337,6 +337,13 @@ versions and introspects the live CreateHarness/UpdateHarness schemas.
   into the turn. The prompt said the right thing every time, so the check is on the job, not the
   words. A new launch task needs an entry there, and the test derives the key set from the prompt
   bullets both ways.
+- **The SMUS model version page renders two fields of the model card, and no notes.** Its Custom
+  metrics shows `training_details.training_job_details.training_metrics` and its Hyperparameters
+  shows `...hyper_parameters`; the `user_provided_*` twins, `evaluation_details`, ModelMetrics
+  statistics, `MetadataProperties` and `CustomerMetadataProperties` are not shown (probe version,
+  2026-10-24). A metric's notes never appear, so anything the approver must see is a row of its own.
+  `UpdateModelPackage` takes `ModelCardStatus` with the content only on a package's FIRST card; once
+  one exists, both together are a `ValidationException` (`deploy/evidence/VERIFICATION_provenance_card.md`).
 - **DeepSeek-R1 output contains `<think>...</think>`** — the data-prep agent strips
   it by default (sequence-level KD keeps final answers only).
 

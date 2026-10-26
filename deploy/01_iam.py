@@ -15,6 +15,7 @@ dry-runs), then create-or-updates:
   llmops-lambda-resurrector       <- iam/lambda_roles.json roles.resurrector
   llmops-lambda-monitor_sweep     <- iam/lambda_roles.json roles.monitor_sweep
   llmops-lambda-finops_reconcile  <- iam/lambda_roles.json roles.finops_reconcile
+  llmops-lambda-publish_provenance <- iam/lambda_roles.json roles.publish_provenance
   llmops-sfn-execution         <- iam/sfn_execution_role.json (the state machine itself)
 
 (This list is prose; ROLE_NAMES below is derived from iam/ and is the authoritative set.)

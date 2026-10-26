@@ -5,6 +5,26 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
 ## [Unreleased]
 
+### The provenance card: the gate's evidence on the model's page in Unified Studio
+
+- **Where the approver looks.** SageMaker Unified Studio renders a model version from its model card
+  and shows none of the `CustomerMetadataProperties` the deploy agent wrote. A new state,
+  `PublishProvenance` (after `MonitorReport`, Lambda `llmops-publish-provenance`), writes a card built
+  by code from the run's artifacts: gate metrics with Wilson intervals and the eval set's sha256, the
+  untrained baseline beside them, the Gold extract's sha256 and snapshot per split, the data journey,
+  the run's SageMaker cost, and every artifact cited by URI and sha256.
+- **One reader for drifting shapes.** Three `gate.json` shapes and two `metrics.json` shapes are on
+  record. The card and the console's Outcome tab now read through `pipeline/contracts/provenance.py`,
+  which names every shape it accepts and reports one it does not know. This fixes the Outcome tab,
+  which showed no tuned scores for the 2026-10-23 demo run (its `gate.json` was the third shape)
+  and no instance or billable seconds (its `metrics.json` was the second).
+- **Writes a card, never an approval.** The function's role denies `UpdateModelPackage` whenever the
+  request sets `sagemaker:ModelApprovalStatus`; a card that cannot be written completes the run.
+- **Measured, not assumed:** a probe version showed that SMUS renders the card's `training_metrics`
+  and `hyper_parameters` only, and no notes, so the interval, threshold, PII redactions and cost are
+  rows of their own. Live on the demo run's page: 12 metric rows and 17 hyperparameters.
+- 37 offline tests; 12 negative controls.
+
 ### M1: one run from raw customer data to a judged model, and a pipeline you can see
 
 - **One dispatch, raw data → outcome.** A `lakehouse` run given a generator seed and scale, with no

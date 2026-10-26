@@ -179,7 +179,7 @@ call) are in [`deploy/console/README.md`](deploy/console/README.md).
 
 ```
 agents/           7 harness configs (5 specialists + conductor + finops auditor) + prompts
-orchestration/    state machine + 7 Lambdas (driver / start / resume / resurrector / webhook / finops / monitor-sweep)
+orchestration/    state machine + 8 Lambdas (driver / start / resume / resurrector / webhook / finops / monitor-sweep / publish-provenance)
 deploy/           numbered idempotent provisioning scripts + least-priv IAM + evidence
 pipeline/         training entry point + contracts (manifest schema, events, report)
 tests/            unit tests · golden agent tests · e2e driver · SVG geometry check
