@@ -6743,6 +6743,14 @@ case("Provenance: metrics written to a field SMUS does not render", _PV,
 case("Provenance: the interval is a note again, not a row", _PV,
      _swap('        row(f"gate.{name}.wilson95_low", m["ci_low"], note)\n', ''),
      [f"{_PCT}test_the_interval_threshold_cost_and_pii_are_rows_the_page_shows"])
+# The demo run's answer file forgotten: its page says "no evaluated answers" over 120 judged ones.
+case("Provenance: an answer-file shape dropped", _PV,
+     _swap('ANSWER_FILES = ("predictions.jsonl", "student_answers.jsonl")', 'ANSWER_FILES = ("predictions.jsonl",)'),
+     [f"{_PCT}test_both_answer_shapes_read_as_one"])
+# The string "False" read as truthy: every miss becomes a match.
+case("Provenance: a 'False' string is a match", _PV,
+     _swap('    return v is True or str(v).strip().lower() == "true"', '    return bool(v)'),
+     [f"{_PCT}test_a_false_string_is_a_miss_not_a_match"])
 # The publisher approves what it documents.
 case("Provenance: the publisher sets an approval", _PUB,
      _swap('        ModelPackageArn=package["ModelPackageArn"],\n',

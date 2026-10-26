@@ -245,6 +245,43 @@ def test_the_outcome_tab_and_the_card_read_a_gate_alike(console, shape):
         f"the {shape} shape reads differently on the page than on the card")
 
 
+ANSWERS = {  # the two answer-file shapes on record, same question
+    "predictions.jsonl": ({"prompt_id": "q1", "answer": "A", "reference": "R", "prompt": "P", "lang": "en"},
+                          {"item_id": "q1", "verdict": "match", "format_valid": True}),
+    "student_answers.jsonl": ({"item_id": "q1", "student_answer": "A", "reference": "R", "prompt": "P", "lang": "en"},
+                              {"item_id": "q1", "answer_match": "True", "format_valid": "True"}),
+}
+
+
+@pytest.mark.parametrize("name", sorted(ANSWERS))
+def test_both_answer_shapes_read_as_one(name):
+    pred, judge = ANSWERS[name]
+    assert pv.prediction_view(pred) == {"prompt_id": "q1", "intent": None, "lang": "en", "prompt": "P",
+                                        "reference": "R", "answer": "A"}
+    assert pv.judgement_view(judge) == {"item_id": "q1", "verdict": "match", "format_valid": True}
+    assert name in pv.ANSWER_FILES
+
+
+def test_a_false_string_is_a_miss_not_a_match():
+    assert pv.judgement_view({"item_id": "q", "answer_match": "False", "format_valid": "False"}) == {
+        "item_id": "q", "verdict": "no_match", "format_valid": False}
+
+
+def test_the_outcome_tab_finds_answers_in_either_file(console, monkeypatch):
+    for name, (pred, judge) in ANSWERS.items():
+        files = {name: name, "judge_details.jsonl": "judge_details.jsonl"}
+        monkeypatch.setattr(console, "_eval_files", lambda run_id, f=files: f)
+        monkeypatch.setattr(console, "_s3_jsonl", lambda key, p=pred, j=judge: [j] if key.endswith("judge_details.jsonl") else [p])
+        preds, judged = console._answers(RUN)
+        assert preds["q1"]["answer"] == "A" and judged["q1"]["verdict"] == "match", (
+            f"{name}: the Outcome tab said 'no evaluated answers' over 120 judged answers in this shape")
+
+
+def test_the_cost_line_mentions_a_baseline_only_when_there_is_one():
+    html = (REPO / "deploy/console/frontend.html").read_text()
+    assert '(r.baseline?", incl. the baseline":"")' in html and 'job(s), incl. the baseline · "' not in html
+
+
 def test_the_console_bundle_carries_the_reader():
     sh = (REPO / "deploy/console/deploy.sh").read_text()
     assert 'pipeline/contracts/provenance.py" "$BUILD/provenance.py"' in sh

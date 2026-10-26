@@ -113,6 +113,33 @@ def training_view(raw: dict | None) -> dict | None:
     }
 
 
+#: The eval agent's answer files, as written:
+#:   evaluation/i0/predictions.jsonl  prompt_id, answer        + judge verdict "match"/"no_match"  (2026-10-16)
+#:   evaluation/student_answers.jsonl item_id, student_answer  + judge answer_match "True"/"False" (2026-10-23)
+ANSWER_FILES = ("predictions.jsonl", "student_answers.jsonl")
+
+
+def _truthy(v):
+    return v is True or str(v).strip().lower() == "true"
+
+
+def prediction_view(row: dict) -> dict:
+    """One answered question in one shape, from either answers file."""
+    return {"prompt_id": row.get("prompt_id") or row.get("item_id"), "intent": row.get("intent"),
+            "lang": row.get("lang"), "prompt": row.get("prompt"), "reference": row.get("reference"),
+            "answer": row.get("answer") if row.get("answer") is not None else row.get("student_answer")}
+
+
+def judgement_view(row: dict) -> dict:
+    """A judged answer in one shape: `verdict` is "match"/"no_match" whichever field carried it."""
+    verdict = row.get("verdict")
+    if verdict is None and "answer_match" in row:
+        verdict = "match" if _truthy(row["answer_match"]) else "no_match"
+    fv = row.get("format_valid")
+    return {"item_id": row.get("item_id") or row.get("prompt_id"), "verdict": verdict,
+            "format_valid": None if fv is None else _truthy(fv)}
+
+
 # ── the card ─────────────────────────────────────────────────────────────────
 def _metric_note(m: dict, eval_sha: str | None) -> str:
     ci = (f"Wilson 95% [{_pct(m['ci_low'])}, {_pct(m['ci_high'])}]"

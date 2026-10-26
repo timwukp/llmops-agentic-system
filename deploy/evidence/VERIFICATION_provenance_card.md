@@ -112,8 +112,26 @@ the failure reached production.
   epochs, steps, LoRA alpha/dropout/r, and for train, eval and acceptance the extract's sha256, rows
   and Gold snapshot id.
 
+## Live: the console's Outcome tab, after `deploy/console/deploy.sh`
+
+The deployed package was downloaded and compared: `provenance.py` byte-equal to the branch, and the
+live `lambda_function.py` reads gates through `provenance.gate_view`. The owner's reading of the
+Outcome tab for `run-20261023T160741Z-65fec5d8`: gate PASSED; answer match 72.5% (CI 63.9%–79.7%,
+gate ≥ 60.0%, n=120); format validity 100.0% (96.9%–100.0%); training ml.g5.2xlarge, 408 s billed,
+loss curve healthy; cost $0.45, the same figure as the card. Before the change the page had none of
+the tuned scores or the job details for this run.
+
+The same reading showed two more defects, fixed in a second commit:
+- **"no evaluated answers for this run":** a third file whose shape drifted. The demo run wrote
+  `evaluation/student_answers.jsonl` (`item_id`, `student_answer`) and judged with
+  `answer_match: "True"`. The 2026-10-16 run wrote `evaluation/i0/predictions.jsonl` (`prompt_id`,
+  `answer`) and `verdict: "match"`. Both shapes are now read through `provenance.prediction_view` /
+  `judgement_view`.
+- **"3 SageMaker job(s), incl. the baseline"** on a run with no baseline: the clause now appears only
+  when there is one.
+
 ## Not yet verified live
 
-- The console's Outcome tab on the demo run after `deploy/console/deploy.sh` (owner's terminal).
+- The Outcome tab's answers for the demo run after the second commit's console deploy.
 - `PublishProvenance` inside a fresh pipeline run (deployed; the next run that deploys exercises it).
 - Artifacts and Performance metrics on the SMUS page: no field tried fills them.

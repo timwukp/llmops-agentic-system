@@ -2483,7 +2483,7 @@ async function loadOutcomeRun(){
   ocMetric("ocAnswer","answer_match",r); ocMetric("ocFormat","format_validity",r);
   const c=r.cost||{};
   $("ocCost").textContent = c.total_usd==null ? "–" : "$"+Number(c.total_usd).toFixed(2);
-  $("ocCostSub").textContent = (c.jobs||[]).length+" SageMaker job(s), incl. the baseline · "+(c.error?"cost source unavailable":"endpoint hours + tokens: Cost tab");
+  $("ocCostSub").textContent = (c.jobs||[]).length+" SageMaker job(s)"+(r.baseline?", incl. the baseline":"")+" · "+(c.error?"cost source unavailable":"endpoint hours + tokens: Cost tab");
   const d=r.data;
   if (d){
     const t=d.tables||{}, bronze=Object.entries(t).filter(([k])=>k.startsWith("bronze.")), rules=d.rules||{}, pc=d.plant_check||{};

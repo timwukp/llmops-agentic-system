@@ -2500,7 +2500,7 @@ def _eval_files(run_id):
     try:
         page = s3.list_objects_v2(Bucket=data_bucket(), Prefix=f"runs/{run_id}/evaluation/")
         for o in sorted(page.get("Contents", []), key=lambda o: str(o.get("LastModified", ""))):
-            for name in ("predictions.jsonl", "judge_details.jsonl"):
+            for name in (*provenance.ANSWER_FILES, "judge_details.jsonl"):
                 if o["Key"].endswith("/" + name) or o["Key"] == base + name:
                     found[name] = o["Key"][len(base):]
     except Exception:  # noqa: BLE001
@@ -2543,11 +2543,21 @@ def _baseline_run_for(run_id):
 
 
 def _answers(run_id):
+    """Answers and verdicts by prompt id, from whichever of the two answer-file shapes the eval
+    agent wrote (provenance.ANSWER_FILES). With only predictions.jsonl known, the 2026-10-23 demo
+    run's page said "no evaluated answers" over 120 judged answers in student_answers.jsonl."""
     files = _eval_files(run_id)
-    preds = {p.get("prompt_id"): p for p in _s3_jsonl(
-        f"runs/{run_id}/evaluation/{files['predictions.jsonl']}")} if "predictions.jsonl" in files else {}
-    judged = {j.get("item_id"): j for j in _s3_jsonl(
-        f"runs/{run_id}/evaluation/{files['judge_details.jsonl']}")} if "judge_details.jsonl" in files else {}
+    name = next((n for n in provenance.ANSWER_FILES if n in files), None)
+    preds = {}
+    if name:
+        for row in _s3_jsonl(f"runs/{run_id}/evaluation/{files[name]}"):
+            v = provenance.prediction_view(row)
+            preds[v["prompt_id"]] = v
+    judged = {}
+    if "judge_details.jsonl" in files:
+        for row in _s3_jsonl(f"runs/{run_id}/evaluation/{files['judge_details.jsonl']}"):
+            v = provenance.judgement_view(row)
+            judged[v["item_id"]] = v
     return preds, judged
 
 
