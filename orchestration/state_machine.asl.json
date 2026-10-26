@@ -925,8 +925,44 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Comment": "A report that failed to write must not fail a run whose pipeline succeeded. The narrative is a deliverable; the run's terminal state is a fact. Complete still emits PipelineCompleted and MarkRunDone still closes the record.",
+          "Comment": "A report that failed to write must not fail a run whose pipeline succeeded. The narrative is a deliverable; the run's terminal state is a fact. PublishProvenance still writes the model's card, Complete still emits PipelineCompleted and MarkRunDone still closes the record.",
           "ResultPath": "$.error",
+          "Next": "PublishProvenance"
+        }
+      ],
+      "Next": "PublishProvenance"
+    },
+    "PublishProvenance": {
+      "Type": "Task",
+      "Comment": "Writes the provenance card onto the model version Deploy registered (pipeline/contracts/provenance.py, by code from the run's artifacts, never retyped by an agent), so the evidence is on the page SageMaker Unified Studio shows the approver. After MonitorReport because it is the last thing that reads a finished run; a plain invoke, not a harness task: it holds no judgment. A card that cannot be written must not fail a run that succeeded, so its catch completes the run with the error kept in $.provenance.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "llmops-publish-provenance",
+        "Payload": {
+          "run_id.$": "$.run_id"
+        }
+      },
+      "ResultPath": "$.provenance",
+      "TimeoutSeconds": 300,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.TooManyRequestsException",
+            "Lambda.SdkClientException"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 2,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "The card is evidence about a run that already succeeded; its failure is recorded, not promoted to the run's state.",
+          "ResultPath": "$.provenance",
           "Next": "Complete"
         }
       ],

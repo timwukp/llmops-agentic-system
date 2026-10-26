@@ -135,7 +135,10 @@
             "_comment": "PR-11: job_launched is serviced when the agent's turn ENDS, and a job can reach a terminal state before that (live: run-20261015T104050Z-c7a2c9d8's probe completed at 11:01:51, its job_launched was serviced at 11:05:44, the completion event found no parked token and was skipped, and the run sat on a token nothing would ever settle). So after parking, the driver describes the job and, if it is already terminal, hands the resume Lambda the state-change event SageMaker already sent -- the same settle code, not a second copy of it. Read-only on llmops-* training jobs; invoke on the resume function only. The same DescribeTrainingJob is also what the probe/full handoff check (check_handoff) reads, to learn whether a job_launched names the 20-step probe (max_steps > 0) or the full job: removing it here silently downgrades every handoff check to unverified.",
             "Sid": "LateJobDelivery",
             "Effect": "Allow",
-            "Action": ["sagemaker:DescribeTrainingJob", "lambda:InvokeFunction"],
+            "Action": [
+              "sagemaker:DescribeTrainingJob",
+              "lambda:InvokeFunction"
+            ],
             "Resource": [
               "arn:aws:sagemaker:<REGION>:<ACCOUNT_ID>:training-job/llmops-*",
               "arn:aws:lambda:<REGION>:<ACCOUNT_ID>:function:llmops-resume-pipeline"
@@ -422,6 +425,76 @@
             "Effect": "Allow",
             "Action": "lambda:InvokeFunction",
             "Resource": "arn:aws:lambda:<REGION>:<ACCOUNT_ID>:function:llmops-start-pipeline"
+          }
+        ]
+      }
+    },
+    "publish_provenance": {
+      "_comment": "publish_provenance: the PublishProvenance state (after MonitorReport) and the backfill. Reads a finished run's artifacts and writes ONE thing outside S3: the model card of the model package the run registered. UpdateModelPackage is scoped to the llmops-student-* groups, the only ones the deploy agent registers into; a card is evidence, so this role can neither approve a package (the approval status is in the same API, but an approval by this role would be an approval by no one -- denied explicitly) nor delete one.",
+      "permissionsPolicy": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Sid": "ReadRunArtifacts",
+            "Effect": "Allow",
+            "Action": "s3:GetObject",
+            "Resource": [
+              "arn:aws:s3:::<DATA_BUCKET>/runs/*",
+              "arn:aws:s3:::<DATA_BUCKET>/lakehouse/reports/*",
+              "arn:aws:s3:::<DATA_BUCKET>/finops/rates/*"
+            ]
+          },
+          {
+            "Sid": "WriteCardCopy",
+            "Effect": "Allow",
+            "Action": "s3:PutObject",
+            "Resource": "arn:aws:s3:::<DATA_BUCKET>/runs/*/provenance/*"
+          },
+          {
+            "Sid": "FindPackageAndJobs",
+            "Effect": "Allow",
+            "Action": [
+              "sagemaker:ListModelPackageGroups",
+              "sagemaker:ListModelPackages",
+              "sagemaker:ListTrainingJobs"
+            ],
+            "Resource": "*"
+          },
+          {
+            "Sid": "DescribePackagesAndJobs",
+            "Effect": "Allow",
+            "Action": [
+              "sagemaker:DescribeModelPackage",
+              "sagemaker:DescribeTrainingJob"
+            ],
+            "Resource": [
+              "arn:aws:sagemaker:<REGION>:<ACCOUNT_ID>:model-package/*",
+              "arn:aws:sagemaker:<REGION>:<ACCOUNT_ID>:training-job/llmops-*"
+            ]
+          },
+          {
+            "Sid": "WriteTheCard",
+            "Effect": "Allow",
+            "Action": "sagemaker:UpdateModelPackage",
+            "Resource": "arn:aws:sagemaker:<REGION>:<ACCOUNT_ID>:model-package/llmops-student-*/*"
+          },
+          {
+            "_comment": "UpdateModelPackage also carries ModelApprovalStatus. A grant scoped to the card cannot be expressed by action, so the approval is refused by condition: sagemaker:ModelApprovalStatus is set only when a request changes it.",
+            "Sid": "NeverApprove",
+            "Effect": "Deny",
+            "Action": "sagemaker:UpdateModelPackage",
+            "Resource": "*",
+            "Condition": {
+              "Null": {
+                "sagemaker:ModelApprovalStatus": "false"
+              }
+            }
+          },
+          {
+            "Sid": "FindBaselineRuns",
+            "Effect": "Allow",
+            "Action": "dynamodb:Scan",
+            "Resource": "arn:aws:dynamodb:<REGION>:<ACCOUNT_ID>:table/llmops-pipeline-runs"
           }
         ]
       }

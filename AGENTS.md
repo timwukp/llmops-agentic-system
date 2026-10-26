@@ -352,6 +352,13 @@ versions and introspects the live CreateHarness/UpdateHarness schemas.
   id `dzd-…`, so look it up by either field. Under IAM, a Bronze schema is very likely as hidden as its
   rows: S3 Tables reads the Iceberg metadata file with `GetTableData`, and a denied read surfaces in
   Athena as `TABLE_NOT_FOUND` while every metadata API call is allowed (inferred from CloudTrail).
+- **The SMUS model version page renders two fields of the model card, and no notes.** Its Custom
+  metrics shows `training_details.training_job_details.training_metrics` and its Hyperparameters
+  shows `...hyper_parameters`; the `user_provided_*` twins, `evaluation_details`, ModelMetrics
+  statistics, `MetadataProperties` and `CustomerMetadataProperties` are not shown (probe version,
+  2026-10-24). A metric's notes never appear, so anything the approver must see is a row of its own.
+  `UpdateModelPackage` takes `ModelCardStatus` with the content only on a package's FIRST card; once
+  one exists, both together are a `ValidationException` (`deploy/evidence/VERIFICATION_provenance_card.md`).
 - **DeepSeek-R1 output contains `<think>...</think>`** — the data-prep agent strips
   it by default (sequence-level KD keeps final answers only).
 

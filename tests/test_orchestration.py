@@ -3859,7 +3859,9 @@ class TestStateMachine:
                      "RemediateFinetune", "LakehouseReview"}
         # Waits on no job by construction, so a long ceiling there only ever buys a longer
         # in-session wait: TestProbeFullHandoff::test_analyze_waits_on_no_job_so_it_keeps_a_short_ceiling.
-        NO_WAIT = {"FinetuneAnalyze"}
+        NO_WAIT = {"FinetuneAnalyze",
+                   # A plain Lambda invoke that reads a finished run and writes one model card.
+                   "PublishProvenance"}
         # The lakehouse Glue states wait on a job with its own Timeout, and that one must fire
         # first: a job that times out ends FAILED with its error, while a state that times out
         # around a running job leaves .sync to stop it and the cause unrecorded. Derived from
@@ -4053,9 +4055,15 @@ class TestStateMachine:
         payload = report["Parameters"]["Payload"]
         assert (payload["stage"], payload["task"]) == ("monitor", "report")
         assert states["Teardown"]["Next"] == "MonitorReport"
-        assert report["Next"] == "Complete"
-        assert [c["Next"] for c in report["Catch"]] == ["Complete"], \
+        # The provenance card follows the report, on success and on a failed report alike, and
+        # neither can fail the run: both reach Complete.
+        assert report["Next"] == "PublishProvenance"
+        assert [c["Next"] for c in report["Catch"]] == ["PublishProvenance"], \
             "a failed report must not fail a run whose pipeline succeeded"
+        card = states["PublishProvenance"]
+        assert card["Next"] == "Complete" and [c["Next"] for c in card["Catch"]] == ["Complete"], \
+            "a card that cannot be written must not fail a run that succeeded"
+        assert card.get("ResultPath") == "$.provenance" and card["Catch"][0].get("ResultPath") == "$.provenance"
         assert report.get("ResultPath", "").startswith("$."), \
             "report must not replace the state: MarkRunDone still reads $.run_id"
 

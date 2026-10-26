@@ -173,6 +173,11 @@ cp "$(dirname "$0")/../../pipeline/contracts/cost_model.py" "$BUILD/cost_model.p
 # module the harness driver uses — vendored, like cost_model, so the two callers
 # cannot drift apart.
 cp "$(dirname "$0")/../../orchestration/conductor_tools.py" "$BUILD/conductor_tools.py"
+# The run reader the provenance card uses: imported at load, so a zip without it fails cold
+# start rather than rendering an Outcome tab that reads gates differently from the card.
+cp "$(dirname "$0")/../../pipeline/contracts/provenance.py" "$BUILD/provenance.py"
+"$PY_FOR_BUILD" -c "import sys; sys.path.insert(0,'$BUILD'); import provenance; \
+  assert hasattr(provenance,'gate_view'), 'provenance missing gate_view'; print('bundled provenance OK')"
 "$PY_FOR_BUILD" -c "import sys; sys.path.insert(0,'$BUILD'); import conductor_tools; \
   assert hasattr(conductor_tools,'service_launch_run'), 'conductor_tools missing service_launch_run'; \
   print('bundled conductor_tools OK')"

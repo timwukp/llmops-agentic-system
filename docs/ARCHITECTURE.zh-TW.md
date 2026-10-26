@@ -612,7 +612,7 @@ Query 留下的痕跡一模一樣：開始、結束、寂靜。印出的計數�
 2026-08-12 之間，Lambda **丟掉了 19 次非同步 invoke**（driver 11、resume 8）——每一次
 都是一個 stage 停住、token 還被 park 著——而這個系統的所有函式上，CloudWatch alarm
 一個都沒有：那次九小時的死亡是人翻執行歷史發現的，resume 少掉 `events:PutEvents` 授權
-是人隔了一天翻 log 發現的。`deploy/06_observability.py --alarms` 現在建立十三個 alarm，
+是人隔了一天翻 log 發現的。`deploy/06_observability.py --alarms` 現在建立十四個 alarm，
 分三族，每一族偵測的東西另外兩族看不到。**`<fn>-errors`**（*任何一支* deploy script 建立
 的每一個函式，而且是從每一支推導出來的，所以新增一個 Lambda 不可能沒人看）是主偵測器：
 那 19 次丟棄全部落在當天也有 function error 的日子，而 resume 的比例正好是 3——一次嘗試
@@ -879,6 +879,28 @@ Knowledge Base**（`deploy/09_retrieval.py`，逐 run、由人部署、eval 結�
   檢索失敗＝空上下文區塊，計數且照常評分，永不算 unscorable。
 - **eval `score`**：**judge 對檢索全盲**——裸工單、只有答案。0.45 的 bar 先於檢索
   存在，必須繼續量同一件事，否則 r6d 的數字無法與 r6c 的 0.223 比較。
+
+### 7c. 溯源卡：把 gate 的證據放在核准者打開的那個模型上
+
+模型版本在 SageMaker Model Registry 裡停在 `PendingManualApproval`，核准的人會在 SageMaker
+Unified Studio 打開它的頁面。那個頁面是從版本的 model card 畫出來的，而且**不顯示**
+`CustomerMetadataProperties`，也就是 deploy agent 原本寫 run id 和兩個分數的地方。所以狀態機在
+`MonitorReport` 之後跑 `PublishProvenance`：一個單純的 Lambda invoke（`llmops-publish-provenance`），
+寫入一張由程式碼（`pipeline/contracts/provenance.py`）從 run 自己的產物組出來的卡：
+- **Custom metrics：** 每個 gate 指標附上 Wilson 區間、計數、門檻、判定，以及評測集的 sha256；
+  有未訓練基線時，基線分數放在旁邊。
+- **Hyperparameters：** 基礎模型和它的 revision、LoRA 設定，以及每個切分的 Gold 匯出 sha256、
+  列數和 snapshot。
+- **觀察與細節：** 資料旅程（Silver 配對數、PII 遮蔽數、Gold 列數）、這次 run 的 SageMaker 作業
+  成本，以及讀過的每個產物的 URI 和 sha256。
+
+它讀的檔案是 agent 寫的，同一個 prompt 跑出來的形狀會變（目前有三種 `gate.json`、兩種
+`metrics.json` 的紀錄）。所以讀取器明列它接受的每一種形狀，卡上記錄讀到的是哪一種，console 的
+Outcome 分頁也透過同一組函式讀。在這之前，Outcome 分頁讀不到 2026-10-23 demo run 的微調分數。
+
+這個函式的角色可以寫卡，但永遠不能核准：`UpdateModelPackage` 同時帶著 `ModelApprovalStatus`，
+所以有一條以這個 key 為條件的明確 Deny，拒絕任何設定它的請求。卡寫不進去時，run 照樣完成，
+錯誤保留在 `$.provenance`。
 
 ## 8. 補救迴路（≤ 3 次迭代）
 

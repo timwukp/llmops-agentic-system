@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""07_lambdas.py — package and deploy the 7 spine Lambdas + the state machine.
+"""07_lambdas.py — package and deploy the 8 spine Lambdas + the state machine.
 
 Each Lambda bundle = its handler.py + the contracts (events.py, report.py,
 manifest.schema.json) vendored flat so the `except ImportError` fallback path
@@ -134,6 +134,17 @@ LAMBDAS = {
         "timeout": 60, "memory": 256,
         # Additive: PROJECT is a defaulted read, pinned for the same reason as finops.
         "env_keys": ["PROJECT"],
+    },
+    # The provenance card's writer: the PublishProvenance state, and the backfill for a run that
+    # finished before the state existed. A plain invoke from the state machine (no task token):
+    # it reads a finished run and writes the model card of the package that run registered.
+    "provenance": {
+        "fn": "llmops-publish-provenance",
+        "src": REPO / "orchestration" / "publish_provenance" / "handler.py",
+        "role_param": "/llmops/iam/lambda_publish_provenance_arn",
+        # 120 s: a dozen S3 reads, one runs-table scan, a few SageMaker describes, one update.
+        "timeout": 120, "memory": 256,
+        "env_keys": [],
     },
 }
 

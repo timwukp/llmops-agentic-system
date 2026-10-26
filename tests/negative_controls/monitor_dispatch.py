@@ -219,7 +219,7 @@ case("PROJECT_STATE: sweep schedule unlisted", "PROJECT_STATE.md", m14,
 
 # 15. Lambda count drifts from the deployer.
 def m15(t):
-    old = "| Lambdas ×7 |"
+    old = "| Lambdas ×8 |"
     assert old in t, "PROJECT_STATE's Lambda count row has moved; re-anchor this mutation"
     return t.replace(old, "| Lambdas ×5 |", 1)
 case("PROJECT_STATE: Lambda count drifted", "PROJECT_STATE.md", m15,
@@ -984,7 +984,7 @@ def m70(t):
     it is the only file the failure names. This mutation restores the stale digit in a file
     the guard did not used to read.
     """
-    old = "state machine + 7 Lambdas"
+    old = "state machine + 8 Lambdas"
     assert old in t, "the README's Lambda line has moved; re-anchor this mutation"
     return t.replace(old, "state machine + 5 Lambdas", 1)
 
@@ -1003,9 +1003,9 @@ def m71(t):
     exist. So the names beside the number are asserted too, and this mutation breaks only
     the names.
     """
-    old = "(driver / start / resume / resurrector / webhook / finops / monitor-sweep)"
+    old = "(driver / start / resume / resurrector / webhook / finops / monitor-sweep / publish-provenance)"
     assert old in t, "the README's Lambda name list has moved; re-anchor this mutation"
-    return t.replace(old, "(driver / start / resume / resurrector / webhook / finops)", 1)
+    return t.replace(old, "(driver / start / resume / resurrector / webhook / finops / monitor-sweep)", 1)
 
 
 case("docs: the README's Lambda list omits monitor-sweep while the count still reads 7",
@@ -6795,6 +6795,77 @@ case("Studio: rows readable outside curated", _ST, m400,
       f"{_STT}test_the_catalog_browser_can_list_the_aws_managed_bucket_but_not_its_rows"])
 
 
+
+
+_PV, _PUB, _PCT = "pipeline/contracts/provenance.py", "orchestration/publish_provenance/handler.py", \
+    "tests/test_provenance_card.py::"
+
+
+def _swap(old, new):
+    def mutate(t):
+        assert t.count(old) == 1, f"anchor moved: {old[:60]!r}"
+        return t.replace(old, new, 1)
+    return mutate
+
+
+# The third gate shape forgotten: the demo run's card (and its Outcome tab) would show no scores.
+case("Provenance: a gate shape dropped from the reader", _PV,
+     _swap('GATE_SHAPES = ("gate_results", "decisions", "results")', 'GATE_SHAPES = ("gate_results", "decisions")'),
+     [f"{_PCT}test_the_reader_knows_every_shape_it_claims_to"])
+# An evaluation group past the schema's 50 metrics: the registry rejects the card.
+case("Provenance: metric groups uncapped", _PV,
+     _swap('if m["value"] is not None][: LIMITS["metrics"]]}', 'if m["value"] is not None]}'),
+     [f"{_PCT}test_every_value_is_within_the_schema_limits_even_from_a_long_artifact"])
+# The interval left off the gate metric's note: the card shows a bare number again.
+case("Provenance: the Wilson interval dropped from the note", _PV,
+     _swap('ci = (f"Wilson 95% [{_pct(m[\'ci_low\'])}, {_pct(m[\'ci_high\'])}]"', 'ci = ("no interval"'),
+     [f"{_PCT}test_the_gate_metric_carries_its_interval_count_threshold_verdict_and_eval_set"])
+# The metrics written where SMUS does not look (the field this card first used).
+case("Provenance: metrics written to a field SMUS does not render", _PV,
+     _swap('        "training_metrics": metrics[: LIMITS["metrics"]],', '        "user_provided_training_metrics": metrics[: LIMITS["metrics"]],'),
+     [f"{_PCT}test_the_card_writes_the_fields_the_smus_page_renders"])
+# The interval back inside a note only, where the page never shows it.
+case("Provenance: the interval is a note again, not a row", _PV,
+     _swap('        row(f"gate.{name}.wilson95_low", m["ci_low"], note)\n', ''),
+     [f"{_PCT}test_the_interval_threshold_cost_and_pii_are_rows_the_page_shows"])
+# The demo run's answer file forgotten: its page says "no evaluated answers" over 120 judged ones.
+case("Provenance: an answer-file shape dropped", _PV,
+     _swap('ANSWER_FILES = ("predictions.jsonl", "student_answers.jsonl")', 'ANSWER_FILES = ("predictions.jsonl",)'),
+     [f"{_PCT}test_both_answer_shapes_read_as_one"])
+# The string "False" read as truthy: every miss becomes a match.
+case("Provenance: a 'False' string is a match", _PV,
+     _swap('    return v is True or str(v).strip().lower() == "true"', '    return bool(v)'),
+     [f"{_PCT}test_a_false_string_is_a_miss_not_a_match"])
+# The publisher approves what it documents.
+case("Provenance: the publisher sets an approval", _PUB,
+     _swap('        ModelPackageArn=package["ModelPackageArn"],\n',
+           '        ModelPackageArn=package["ModelPackageArn"], ModelApprovalStatus="Approved",\n'),
+     [f"{_PCT}test_the_publisher_writes_the_card_and_never_an_approval"])
+# A partial cost summed onto the card as if it were the run's.
+case("Provenance: an unpriced job still yields a total", _PUB,
+     _swap('"total_usd": None if unpriced else round(', '"total_usd": round('),
+     [f"{_PCT}test_a_job_the_rate_card_cannot_price_withholds_the_total"])
+# A re-judge of the trained artifact taken as the untrained baseline.
+case("Provenance: any eval_only run is a baseline", _PUB,
+     _swap('and str(p.get("model_artifact_uri", "")).startswith("hf://"):', ':'),
+     [f"{_PCT}test_the_baseline_is_the_untrained_eval_only_run_that_names_this_run"])
+# The read-back skipped: a card the registry does not hold reads as published.
+case("Provenance: the read-back no longer fails the call", _PUB,
+     _swap('    if out.get("published") and not out.get("confirmed"):', '    if False:'),
+     [f"{_PCT}test_a_card_the_registry_does_not_hold_fails_loudly"])
+# The role's approval Deny removed.
+case("Provenance: the role may approve", "deploy/iam/lambda_roles.json",
+     _swap('"Sid": "NeverApprove",\n            "Effect": "Deny"', '"Sid": "NeverApprove",\n            "Effect": "Allow"'),
+     [f"{_PCT}test_the_role_can_update_only_student_packages_and_can_never_approve"])
+# The console back on a reader of its own that knows two shapes.
+case("Provenance: the Outcome tab reads gates on its own", "deploy/console/lambda_function.py",
+     _swap('    v = provenance.gate_view(gate)\n', '    v = provenance.gate_view({k: x for k, x in (gate or {}).items() if k != "results"} or None)\n'),
+     [f"{_PCT}test_the_outcome_tab_and_the_card_read_a_gate_alike"])
+# A failed card promoted to a failed run.
+case("Provenance: the card's catch fails the run", "orchestration/state_machine.asl.json",
+     lambda t: (lambda d: (d["States"]["PublishProvenance"]["Catch"][0].__setitem__("Next", "EscalateFail"),
+                           json.dumps(d, indent=2, ensure_ascii=False) + "\n")[1])(json.loads(t)),
+     ["tests/test_orchestration.py::TestStateMachine::test_monitor_report_runs_after_teardown_on_the_finished_manifest"])
 
 #: Where the pristine text of the file currently mutated is parked, so a kill -9 -- which
 #: no handler can intercept -- still leaves the original recoverable. Under the repo root

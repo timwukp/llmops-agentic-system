@@ -730,7 +730,7 @@ Printing is not noticing, though, and for a long time nothing did. Between 2026-
 stage that stopped with its token parked — and there was not one CloudWatch alarm on any
 function in this system: the nine-hour death was found by a human reading an execution
 history, the resume Lambda's missing `events:PutEvents` grant by a human reading logs a
-day later. `deploy/06_observability.py --alarms` now creates thirteen, in three families
+day later. `deploy/06_observability.py --alarms` now creates fourteen, in three families
 that each detect something the others cannot. **`<fn>-errors`** (every function *any*
 deploy script creates, derived from each of them so a new Lambda cannot ship unwatched)
 is the primary detector: every one of those 19 drops landed on a day that also had function
@@ -1040,6 +1040,30 @@ closed-book plan omits them and runs the classic path untouched):
 - **eval `score`**: **the judge stays blind to retrieval** — bare ticket, answers alone.
   The 0.45 bar predates retrieval and must go on measuring the same thing, or r6d's number
   cannot be compared to r6c's 0.223.
+
+### 7c. The provenance card: the gate's evidence on the model the approver opens
+
+A model version waits in the SageMaker Model Registry at `PendingManualApproval`, and the person
+approving it opens its page in SageMaker Unified Studio. That page renders from the version's
+model card. It does not show `CustomerMetadataProperties`, where the deploy agent had been writing a
+run id and two scores. So after `MonitorReport` the state machine runs `PublishProvenance`, a plain
+Lambda invoke (`llmops-publish-provenance`), which writes a card built by code
+(`pipeline/contracts/provenance.py`) from the run's own artifacts:
+- **Custom metrics:** each gate metric with its Wilson interval, count, threshold, verdict and the
+  eval set's sha256; the untrained baseline's score beside it when one exists.
+- **Hyperparameters:** the base model and its revision, LoRA settings, and the Gold extract's sha256,
+  rows and snapshot for each split.
+- **Observations and details:** the data journey (Silver pairs, PII redactions, Gold rows), the cost
+  of the run's SageMaker jobs, and every artifact read, by URI and sha256.
+
+The files it reads are agent-written, and their shapes drift between runs of the same prompt (three
+`gate.json` shapes and two `metrics.json` shapes are on record). So the reader names every shape it
+accepts, the card records the shape it met, and the console's Outcome tab reads through the same
+functions. Before that, the Outcome tab showed no fine-tuned scores for the 2026-10-23 demo run.
+
+The function's role can write a card and can never approve: `UpdateModelPackage` also carries
+`ModelApprovalStatus`, so an explicit Deny conditioned on that key refuses any request that sets it.
+A card that cannot be written completes the run; the error is kept in `$.provenance`.
 
 ## 8. The remediation loop (≤ 3 iterations)
 

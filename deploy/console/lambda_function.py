@@ -135,6 +135,14 @@ except ImportError:  # repo layout (unit tests)
                                      "..", "..", "orchestration"))
     import conductor_tools  # type: ignore
 
+try:
+    import provenance  # vendored into the zip: the model card and the Outcome tab read runs alike
+except ImportError:  # repo layout (unit tests)
+    import sys as _sys
+    _sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                     "..", "..", "pipeline", "contracts"))
+    import provenance  # type: ignore
+
 EVAL_RESULTS_LG_PREFIX = "/aws/bedrock-agentcore/evaluations/results/"
 
 # The 7 harnesses. Runtime name = "harness_" + harnessName. llmops_finops is the audit
@@ -2492,7 +2500,7 @@ def _eval_files(run_id):
     try:
         page = s3.list_objects_v2(Bucket=data_bucket(), Prefix=f"runs/{run_id}/evaluation/")
         for o in sorted(page.get("Contents", []), key=lambda o: str(o.get("LastModified", ""))):
-            for name in ("predictions.jsonl", "judge_details.jsonl"):
+            for name in (*provenance.ANSWER_FILES, "judge_details.jsonl"):
                 if o["Key"].endswith("/" + name) or o["Key"] == base + name:
                     found[name] = o["Key"][len(base):]
     except Exception:  # noqa: BLE001
@@ -2503,26 +2511,18 @@ def _eval_files(run_id):
 def _gate_view(gate):
     """A gate verdict in one shape, whichever of the shapes the eval agent wrote.
 
-    gate.json is written by the agent, and two runs of the same prompt wrote it two ways: a
-    trained run as gate_results with wilson95_ci_low/high, the 2026-10-23 baseline as decisions
-    with ci_low/ci_high and "47/120" counts. Both are read; a page that understood only one showed
-    the baseline as missing on the day it first existed.
+    gate.json is written by the agent, and runs of the same prompt wrote it three ways
+    (gate_results / decisions / results, see pipeline/contracts/provenance.py). The reader is
+    the provenance card's, so the Outcome tab and the model's card cannot disagree about a run:
+    with a reader of its own this page showed no tuned scores for the 2026-10-23 demo run, whose
+    gate.json was the third shape.
     """
-    if not gate:
+    v = provenance.gate_view(gate)
+    if v is None:
         return None
-    metrics = {}
-    for name, g in {**(gate.get("decisions") or {}), **(gate.get("gate_results") or {})}.items():
-        if not (isinstance(g, dict) and "value" in g):
-            continue
-        n = g.get("n")
-        if n is None and isinstance(g.get("counts"), str) and "/" in g["counts"]:
-            n = g["counts"].split("/", 1)[1]
-        metrics[name] = {"value": g.get("value"), "threshold": g.get("threshold"),
-                         "ci_low": g.get("wilson95_ci_low", g.get("ci_low")),
-                         "ci_high": g.get("wilson95_ci_high", g.get("ci_high")),
-                         "n": n, "verdict": g.get("verdict")}
-    return {"gate_passed": gate.get("gate_passed"), "metrics": metrics,
-            "decided_at": gate.get("decided_at")}
+    return {"gate_passed": v["gate_passed"], "decided_at": v["decided_at"], "shape": v["shape"],
+            "metrics": {k: {f: m[f] for f in ("value", "threshold", "ci_low", "ci_high", "n", "verdict")}
+                        for k, m in v["metrics"].items()}}
 
 
 def _baseline_run_for(run_id):
@@ -2543,11 +2543,21 @@ def _baseline_run_for(run_id):
 
 
 def _answers(run_id):
+    """Answers and verdicts by prompt id, from whichever of the two answer-file shapes the eval
+    agent wrote (provenance.ANSWER_FILES). With only predictions.jsonl known, the 2026-10-23 demo
+    run's page said "no evaluated answers" over 120 judged answers in student_answers.jsonl."""
     files = _eval_files(run_id)
-    preds = {p.get("prompt_id"): p for p in _s3_jsonl(
-        f"runs/{run_id}/evaluation/{files['predictions.jsonl']}")} if "predictions.jsonl" in files else {}
-    judged = {j.get("item_id"): j for j in _s3_jsonl(
-        f"runs/{run_id}/evaluation/{files['judge_details.jsonl']}")} if "judge_details.jsonl" in files else {}
+    name = next((n for n in provenance.ANSWER_FILES if n in files), None)
+    preds = {}
+    if name:
+        for row in _s3_jsonl(f"runs/{run_id}/evaluation/{files[name]}"):
+            v = provenance.prediction_view(row)
+            preds[v["prompt_id"]] = v
+    judged = {}
+    if "judge_details.jsonl" in files:
+        for row in _s3_jsonl(f"runs/{run_id}/evaluation/{files['judge_details.jsonl']}"):
+            v = provenance.judgement_view(row)
+            judged[v["item_id"]] = v
     return preds, judged
 
 
@@ -2587,10 +2597,10 @@ def outcome(run_id):
     params = manifest.get("params") or {}
     dataset = params.get("lakehouse_dataset") or ((manifest.get("lakehouse") or {}).get("dataset"))
     raw_metrics = _s3_json(f"runs/{run_id}/training/metrics.json") or {}
-    # The analyze agent writes the trainer's metrics.json wrapped (trainer_metrics, beside
-    # training_job and loss_curve_assessment); an unwrapped copy is the trainer's own. Read both.
-    metrics = raw_metrics.get("trainer_metrics") or raw_metrics
-    job = raw_metrics.get("training_job") or {}
+    # The analyze agent wraps the trainer's metrics.json, in two shapes so far (training_job +
+    # loss_curve_assessment, then job + health_assessment); read through the card's reader.
+    tview = provenance.training_view(raw_metrics) or {"trainer": {}, "job": {}}
+    metrics = tview["trainer"]
     report = _s3_json(f"runs/{run_id}/evaluation/report.json") or {}
     base_id, base_uri, base_status = _baseline_run_for(run_id)
     tuned = _answers(run_id)
@@ -2612,8 +2622,8 @@ def outcome(run_id):
             "final_train_loss", "final_eval_loss", "epochs_completed", "global_step", "train_rows",
             "train_runtime_seconds", "model_id", "model_revision", "max_length", "lora")}
         | {"sec_per_step_p50": (metrics.get("sec_per_step") or {}).get("p50_steady"),
-           "instance": job.get("instance_type"), "billable_seconds": job.get("billable_time_seconds"),
-           "loss_verdict": (raw_metrics.get("loss_curve_assessment") or {}).get("verdict")}
+           "instance": tview["job"].get("instance"), "billable_seconds": tview["job"].get("billable_seconds"),
+           "loss_verdict": tview.get("loss_verdict")}
         if metrics else None,
         "eval_set": {k: (report.get("eval_set") or {}).get(k) for k in ("which", "rows", "sha256")},
         "tuned": _gate_view(_s3_json(f"runs/{run_id}/evaluation/gate.json")),
