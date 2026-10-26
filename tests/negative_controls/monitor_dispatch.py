@@ -6710,6 +6710,91 @@ case("M1: the eval prompt lets the baseline be judged differently", _EV, m393,
      [f"{_OC}test_the_eval_prompt_judges_the_baseline_exactly_like_the_trained_model"])
 
 
+_ST, _STT = "deploy/11_studio.py", "tests/test_studio.py::"
+
+
+def m394(t):
+    # The PII barrier: Bronze rows become readable. Two Denies cover a Bronze read (NoBronzeRows
+    # and NoRowsOutsideCurated), so breaking one is not a break -- both go, as a widened policy would.
+    for sid in ("NoBronzeRows", "NoRowsOutsideCurated"):
+        old = f'{{"Sid": "{sid}", "Effect": "Deny"'
+        assert t.count(old) == 1, f"{sid} moved"
+        t = t.replace(old, f'{{"Sid": "{sid}", "Effect": "Allow"', 1)
+    return t
+
+
+case("Studio: Bronze rows readable", _ST, m394,
+     [f"{_STT}test_no_bronze_row_can_be_read_or_written"])
+
+
+def m395(t):
+    # Lake Formation can be rewired from Studio (registering S3 Tables revokes the pipeline's IAM access).
+    old = '{"Sid": "NoLakeFormationRewiring", "Effect": "Deny"'
+    assert t.count(old) == 1, "NoLakeFormationRewiring moved"
+    return t.replace(old, '{"Sid": "NoLakeFormationRewiring", "Effect": "Allow"', 1)
+
+
+case("Studio: Lake Formation rewiring allowed", _ST, m395,
+     [f"{_STT}test_lake_formation_cannot_be_rewired"])
+
+
+def m396(t):
+    # The role may pass any role (e.g. llmops-lakehouse-glue) instead of only itself.
+    old = '{"Sid": "NoOtherRoles", "Effect": "Deny"'
+    assert t.count(old) == 1, "NoOtherRoles moved"
+    return t.replace(old, '{"Sid": "NoOtherRoles", "Effect": "Allow"', 1)
+
+
+case("Studio: other roles passable", _ST, m396,
+     [f"{_STT}test_no_other_role_can_be_passed"])
+
+
+def m397(t):
+    # The federated catalog the pipeline reads becomes deletable.
+    old = '"glue:Create*", "glue:Update*", "glue:Delete*", '
+    assert t.count(old) == 1, "NoCatalogWrites actions moved"
+    return t.replace(old, '"glue:Create*", "glue:Update*", ', 1)
+
+
+case("Studio: catalog deletable", _ST, m397,
+     [f"{_STT}test_the_federated_catalog_cannot_be_changed"])
+
+
+def m398(t):
+    # Bronze becomes invisible (describe-only lost): the owner asked to see Bronze's columns.
+    old = '{"Sid": "DescribeBronze", "Effect": "Allow", "Action": READ,'
+    assert t.count(old) == 1, "DescribeBronze moved"
+    return t.replace(old, '{"Sid": "DescribeBronze", "Effect": "Allow", "Action": READ[:1],', 1)
+
+
+case("Studio: Bronze columns hidden", _ST, m398,
+     [f"{_STT}test_bronze_tables_and_columns_stay_visible"])
+
+
+def m399(t):
+    # A deny case is dropped from the live contract: verify() would stop asking IAM about it.
+    old = '        ("lakeformation:RegisterResource", "*", False, None),\n'
+    assert t.count(old) == 1, "the RegisterResource case moved"
+    return t.replace(old, "", 1).replace(
+        '        ("s3tables:GetTableData", bronze_table, False, None),\n', "", 1)
+
+
+case("Studio: the PII case dropped from verify", _ST, m399,
+     [f"{_STT}test_the_cases_cover_both_directions_for_bronze"])
+
+
+def m400(t):
+    # Rows outside Silver/Gold fall back to whatever the managed policy grants (Permissive: all).
+    old = '{"Sid": "NoRowsOutsideCurated", "Effect": "Deny"'
+    assert t.count(old) == 1, "NoRowsOutsideCurated moved"
+    return t.replace(old, '{"Sid": "NoRowsOutsideCurated", "Effect": "Allow"', 1)
+
+
+case("Studio: rows readable outside curated", _ST, m400,
+     [f"{_STT}test_silver_and_gold_rows_are_readable_and_nothing_else_in_the_account_is",
+      f"{_STT}test_the_catalog_browser_can_list_the_aws_managed_bucket_but_not_its_rows"])
+
+
 
 
 _PV, _PUB, _PCT = "pipeline/contracts/provenance.py", "orchestration/publish_provenance/handler.py", \

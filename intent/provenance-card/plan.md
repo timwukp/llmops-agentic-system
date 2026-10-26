@@ -3,10 +3,12 @@
 - **Spec:** ./spec.md
 - **Author:** Claude (AI agent)
 - **Accepted-by:** Tim WU
-- **Accepted-for:** 972848bd2f74d4b5351c5dc14bf8670461788f2b
+- **Accepted-for:** 31e5a95f42dd8f942b367b6375962ef6ec19cb41
 - **Status:** accepted
 
-`Accepted-for` is the merge base with `main` (PR #180's merge). Based on `main`, not on #181.
+`Accepted-for` is the merge base with `main`: PR #181's merge. The plan was first accepted against
+#180's merge (`972848b`) and re-bound when #181 merged first; the scope did not change, and the
+owner's merge of this PR is the re-acceptance.
 
 ## Files changed
 
