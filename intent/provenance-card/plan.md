@@ -25,8 +25,9 @@
      SVGs it regenerates;
    - `docs/TEST_RESULTS.md`, `docs/TEST_RESULTS.zh-TW.md`;
    - `deploy/README.md`, `PROJECT_STATE.md`, `CHANGELOG.md`, `AGENTS.md`, `README.md`,
-     `README.zh-TW.md`; `deploy/console/lambda_function.py` and `deploy/console/deploy.sh` (the
-     Outcome tab reads runs through the same module); `deploy/01_iam.py` (role list prose);
+     `README.zh-TW.md`; `deploy/console/lambda_function.py`, `deploy/console/deploy.sh` and
+     `deploy/console/frontend.html` (the Outcome tab reads runs through the same module; its cost
+     line names a baseline only when there is one); `deploy/01_iam.py` (role list prose);
    - `deploy/evidence/VERIFICATION_provenance_card.md` (new);
    - `intent/provenance-card/{intent,spec,plan}.md`, `.sdlc/active`.
 

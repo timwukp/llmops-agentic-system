@@ -63,9 +63,15 @@ metadata the deploy agent writes today is invisible in Studio. `UpdateModelPacka
    list/describe on model packages and training jobs, `UpdateModelPackage` on
    `model-package/llmops-student-*/*` only; DynamoDB `Scan` on the runs table. The state machine
    role may invoke it.
-6. **Tests and controls:** the builder against the live artifact shapes (two gate shapes, wrapped
+6. **The console reads runs the way the card does.** The Outcome tab
+   (`deploy/console/lambda_function.py`) reads gates, training metrics and answers through
+   `pipeline/contracts/provenance.py`, bundled by `deploy/console/deploy.sh`, so the page and the card
+   cannot disagree about a run; both answer-file shapes (`predictions.jsonl` with `verdict`,
+   `student_answers.jsonl` with `answer_match`) are read. Its cost line
+   (`deploy/console/frontend.html`) names a baseline only when the run has one.
+7. **Tests and controls:** the builder against the live artifact shapes (two gate shapes, wrapped
    metrics, with and without a baseline), schema keys and limits, the gate reader agreeing with the
    console's, the Lambda's package lookup and read-back, ASL placement and catch; negative controls;
    counts re-derived.
-7. **Live:** deploy, backfill the demo run, and read the card back from the registry and on the
+8. **Live:** deploy, backfill the demo run, and read the card back from the registry and on the
    SMUS page; recorded in `deploy/evidence/VERIFICATION_provenance_card.md`.
