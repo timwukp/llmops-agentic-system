@@ -21,7 +21,10 @@ run，讓超支被指名，而不是在帳單上才被發現。整套生命週�
 
 → 完整記錄（失敗全部保留）：[docs/CASE_STUDY.zh-TW.md](docs/CASE_STUDY.zh-TW.md)
 
-## 看五分鐘導覽（有旁白）
+## 看導覽（有旁白）
+
+下面的錄影是第一版（2026-08）。console 的 Introduction 分頁播放的是目前的版本：v2（2026-10-27），
+英文約四分鐘，共五種語言，主題是從原始資料到核准模型的資料與 AI 治理。
 
 https://github.com/user-attachments/assets/f189afb1-c326-49b6-b023-785da5ed3e6a
 

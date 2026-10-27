@@ -19,7 +19,7 @@ is how the Introduction row below got written on the same commit as the tab itse
 
 | Tab | What it shows |
 |---|---|
-| Introduction | A narrated five-minute walkthrough of the problem, the build and the measured cost, in an iframe (`GET /intro`) with narration in five languages (`GET /intro/audio/<lang>/<scene>.mp3`, 35 clips bundled in the zip). **The default landing tab** for a first-time visitor; a returning operator still lands on whatever tab they left |
+| Introduction | A narrated four-minute walkthrough (v2): a model that passed every gate and was still wrong, the four planes, and what was proven, in an iframe (`GET /intro`) with narration in five languages (`GET /intro/audio/<lang>/<scene>.mp3`, 35 clips bundled in the zip). **The default landing tab** for a first-time visitor; a returning operator still lands on whatever tab they left |
 | Architecture | The generated diagrams (`docs/architecture-*.svg`), served from the same Lambda so the picture cannot lag the deployment |
 | Tasks | **The customer-facing plane** — one consultation thread per engagement with `llmops_orchestrator`: chat, presigned `customer-data/` upload, priced plan, KMS-signed acceptance, lifecycle strip |
 | Pipeline | Animated stage flow (Step Functions `llmops-pipeline`) drawing the stages of each run's own mode — a lakehouse build-then-train run shows Raw → Bronze → Silver → Gold → extract before training — with remediation-loop arrow, execution picker, run detail (gates / metrics / evidence / training job), Start Run, the one-click **Demo: raw data → model** (`POST /api/start-run {"preset": "lakehouse-e2e"}`), and the verdicts panel (delivered / parked / never delivered) |

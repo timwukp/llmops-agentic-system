@@ -2056,7 +2056,7 @@ def m121b(t):
     video-tag guard, not incidentally break the player guard as well and make it ambiguous which
     assertion caught it.
     """
-    old = "## Watch it — five minutes, narrated\n"
+    old = "## Watch it — the narrated introduction\n"
     assert t.count(old) == 1, f"the EN walkthrough heading has moved; found {t.count(old)}"
     tag = ('\n<video src="https://github.com/user-attachments/assets/'
            'f189afb1-c326-49b6-b023-785da5ed3e6a" controls></video>\n')
@@ -2085,7 +2085,7 @@ def m122(t):
     caption bolted onto the heading is a realistic place for a figure to reappear now that there
     is no prose left to put one in.
     """
-    old = "## 看五分鐘導覽（有旁白）"
+    old = "## 看導覽（有旁白）"
     assert t.count(old) == 1, f"the zh-TW walkthrough heading has moved; found {t.count(old)}"
     return t.replace(old, old + "：包含超過兩萬美元基準的 run 如何被指名", 1)
 
@@ -2342,7 +2342,7 @@ def m131(t):
     section and a paragraph above the link still mentioned 10.7 MB. Presence anywhere in a section
     is satisfied by the sentence ABOUT a number, which is not the sentence a reader acts on.
     """
-    old = "## Watch it — five minutes, narrated"
+    old = "## Watch it — the narrated introduction"
     assert t.count(old) == 1, f"the EN walkthrough heading has moved; found {t.count(old)}"
     return t.replace(old, old + " (10.7 MB)", 1)
 
@@ -2367,7 +2367,7 @@ def m132(t):
     on purpose: m131 covers the MB half in English, the pattern's two branches are different code
     paths, and the two READMEs are only equal while something checks both.
     """
-    old = "## 看五分鐘導覽（有旁白）"
+    old = "## 看導覽（有旁白）"
     assert t.count(old) == 1, f"the zh-TW walkthrough heading has moved; found {t.count(old)}"
     return t.replace(old, old + "，CRF 26 錄製", 1)
 
@@ -6943,6 +6943,38 @@ case("Architecture: the governance band dropped", _HSVG,
 case("Architecture: a stale state count", _HSVG,
      _swa("before Complete (39 states)", "before Complete (38 states)"),
      [f"{_APT}test_the_governance_plane_states_the_live_state_count"])
+
+_NJ, _TPL, _INT = "deploy/console/intro/narration.json", "deploy/console/intro/page.template.html", \
+    "tests/test_intro_narration.py::"
+
+
+def _swi(old, new):
+    def mutate(t):
+        assert t.count(old) == 1, f"anchor moved: {old[:60]!r}"
+        return t.replace(old, new, 1)
+    return mutate
+
+
+# The narration speaks a state count the state machine does not have.
+case("Intro: a stale state count spoken", _NJ,
+     _swi("spine, thirty nine states,", "spine, thirty eight states,"),
+     [f"{_INT}test_counts_spoken_match_the_system"])
+# A translation drops the number the English says.
+case("Intro: the Mandarin loses the state count", _NJ,
+     _swi("共三十九个状态", "共很多个状态"),
+     [f"{_INT}test_counts_spoken_match_the_system"])
+# The scene shows a model id no harness runs (v1 showed claude-opus-5).
+case("Intro: the scene shows the wrong model", _TPL,
+     _swi('"global.anthropic.claude-fable-5"', '"global.anthropic.claude-opus-5"'),
+     [f"{_INT}test_the_config_shown_is_the_model_the_harnesses_run"])
+# A displayed result drifts from the evidence.
+case("Intro: the scene shows a different identifier result", _TPL,
+     _swi('data-t="34.6" style="color:var(--green)">120/120</div>', 'data-t="34.6" style="color:var(--green)">119/120</div>'),
+     [f"{_INT}test_the_identifier_results_are_the_recorded_ones"])
+# The pager framing comes back in one language.
+case("Intro: the Japanese frames the agents as holding the pager", _NJ,
+     _swi('"s2-solution": "すべての段階に証拠を、決めるのは人"', '"s2-solution": "ポケベルを持つエージェント"'),
+     ["tests/test_intro_narration.py::test_no_language_frames_the_agents_as_replacing_people"])
 
 #: Where the pristine text of the file currently mutated is parked, so a kill -9 -- which
 #: no handler can intercept -- still leaves the original recoverable. Under the repo root

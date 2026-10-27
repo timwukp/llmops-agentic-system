@@ -5,6 +5,16 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
 ## [Unreleased]
 
+### The Introduction tells the platform as it is now (v2)
+
+- **New script, five languages:** a model that passed every gate and was still wrong; evidence at
+  every step and a person decides; four planes; what was proven (0% → 72.5%, 0/120 → 120/120, a
+  person rejected v1 and approved v2). No sentence frames the agents as replacing people.
+- **35 new clips** (Polly, ≈ $0.32) and all seven scenes redrawn, every beat on its sentence.
+- **Fixed on the way:** v1 spoke "six Lambdas" and showed `claude-opus-5` as the harness model, and
+  its comment cited a test that never existed. `tests/test_intro_narration.py` now exists and
+  re-derives every number. English runs 4.3 min, so the page says four minutes.
+
 ### The Architecture page shows the system as it is now
 
 - **Four planes on the high-level diagram:** two rows added below every existing one, the DATA

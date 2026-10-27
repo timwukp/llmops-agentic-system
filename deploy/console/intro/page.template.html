@@ -212,124 +212,90 @@
 <div class="stagewrap" id="wrap">
   <div class="stage" id="stage">
 
-  <!-- ── 1 · the problem ─────────────────────────────────────────────────── -->
+  <!-- ── 1 · a model that passed, and was still wrong ────────────────────── -->
+  <!-- Beats are in ENGLISH seconds, placed on the sentence each one illustrates (sentence start =
+       its character offset x the measured English clip length, durations.json). -->
   <section class="scene" id="s1-problem">
     <div class="stitle beat" data-t="0.3" data-title></div>
-    <div class="lede beat" data-t="1.5">Most of an ML team's time is not research.<br />
-      It is glue work — and being on call.</div>
-    <div class="cols">
-      <div class="card rounds beat" data-t="8.5">
-        <h4>One fine-tuning job → <span style="color:var(--red)">6 rounds of failure</span></h4>
-        <div class="rd beat" data-t="9.5"><span class="n">0</span>
-          <span class="why mono">ImportError: torch&gt;=2.1.1</span><span class="pill err">fail</span></div>
-        <div class="rd beat" data-t="11"><span class="n">1</span>
-          <span class="why mono">CUDA OOM · 7.31 GiB at step 0</span><span class="pill err">fail</span></div>
-        <div class="rd beat" data-t="12.5"><span class="n">2</span>
-          <span class="why mono">liger needs transformers ≥ 4.52</span><span class="pill err">fail</span></div>
-        <div class="rd beat" data-t="14"><span class="n">3</span>
-          <span class="why mono">NameError: torch <i>inside</i> transformers</span><span class="pill err">fail</span></div>
-        <div class="rd beat" data-t="15.5"><span class="n">4</span>
-          <span class="why mono">bitsandbytes ≥ 0.46.1 required</span><span class="pill err">fail</span></div>
-        <div class="rd beat" data-t="17"><span class="n">5</span>
-          <span class="why mono">431 s billable · train_loss 0.5013</span><span class="pill ok">Completed</span></div>
-        <div class="sub beat" data-t="18.5" style="margin-top:9px">Every round: a human reads a log,
-          changes one pin, resubmits.</div>
+    <div class="lede beat" data-t="1">A model that passed every gate.</div>
+    <div class="cols" style="margin-top:14px;align-items:flex-start">
+      <div class="card beat" data-t="2.5" style="width:330px">
+        <h4>Fine-tuned on a store's conversations</h4>
+        <div class="kv beat" data-t="5"><span>Answer match · 120 held-out questions</span>
+          <b>0% → <span style="color:var(--green)">72.5%</span></b></div>
+        <div class="kv beat" data-t="8"><span>Format validity</span><b>100%</b></div>
+        <div class="beat" data-t="9.5" style="margin-top:9px"><span class="pill ok">gate PASSED</span></div>
       </div>
-      <div class="card beat" data-t="22.5" style="width:440px">
-        <h4>Meanwhile, on the same AWS account</h4>
-        <div class="beat" data-t="26" style="display:flex;align-items:baseline;gap:9px">
-          <span class="big" style="color:var(--red)">$36.36</span>
-          <span class="sub">/ day · one inference endpoint</span>
-        </div>
-        <div style="margin-top:11px">
-          <div class="kv beat" data-t="28.5"><span>Invocations</span><b>0</b></div>
-          <div class="kv beat" data-t="28.5"><span>GPU utilization</span><b>0.0%</b></div>
-          <div class="kv beat" data-t="30.5"><span>Running for</span><b>90 days</b></div>
-          <div class="kv beat" data-t="32"><span>Owner tag</span>
-            <b style="color:var(--red)">none</b></div>
-        </div>
-        <div class="beat" data-t="34.5" style="margin-top:11px">
-          <span class="pill err">≈ $1,100 / month, for nothing</span>
-        </div>
+      <div class="card beat" data-t="11" style="flex:1;border-color:var(--red)">
+        <h4>…and every answer ended like this</h4>
+        <div class="msg">可以，電動牙刷的週年慶折扣與會員點數可以同時使用。<b style="color:var(--red)">（案件編號 C00089）</b></div>
+        <div class="msg">A return is filed and a courier will collect it. <b style="color:var(--red)">(case C00148)</b></div>
+        <div class="beat" data-t="15" style="margin-top:8px">
+          <span class="pill err">a number the customer never gave · invented</span></div>
+        <div class="sub beat" data-t="16.2" style="margin-top:8px">The gate checked only that the right
+          answer was <b style="color:var(--text)">contained</b> somewhere in the reply.</div>
       </div>
     </div>
-    <div class="lede sm beat" data-t="39.5" style="margin-top:16px;color:var(--muted)">
-      Nobody did anything wrong. <b style="color:var(--text)">Nobody was looking.</b></div>
+    <div class="card beat" data-t="20.9" style="margin-top:12px">
+      <h4>The training data had taught it</h4>
+      <div class="kv beat" data-t="22.5"><span>Training answers ending in a case number</span><b>234 / 234</b></div>
+      <div class="kv beat" data-t="22.5"><span>Questions that contained one</span><b>0</b></div>
+    </div>
+    <div class="lede sm beat" data-t="26.6" style="margin-top:14px">Not training a model —
+      <b>knowing whether to trust one</b>, and being able to show why.</div>
   </section>
 
-  <!-- ── 2 · agents that hold the pager ──────────────────────────────────── -->
+  <!-- ── 2 · evidence at every step, and a person decides ────────────────── -->
   <section class="scene" id="s2-solution">
     <div class="stitle beat" data-t="0.3" data-title></div>
-    <div class="cols" style="margin-bottom:16px">
-      <div class="card beat" data-t="1" style="width:250px">
-        <h4>An assistant</h4>
-        <div class="mono" style="font-size:12.5px;color:var(--muted)">
-          “Try:<br />&nbsp;&nbsp;aws sagemaker create-…”</div>
-        <div class="beat" data-t="7" style="margin-top:9px">
-          <span class="pill err strike" style="text-decoration-color:var(--red)">still needs hands</span></div>
-      </div>
-      <div class="beat" data-t="7" style="align-self:center;font-size:22px;color:var(--muted)">→</div>
-      <div class="card beat" data-t="7" style="width:250px;border-color:var(--accent)">
-        <h4>An agent</h4>
-        <div class="mono" style="font-size:12.5px;color:var(--green)">
-          probes IAM · rebuilds the tarball<br />submits the job · releases</div>
-        <div style="margin-top:9px"><span class="pill ok">acts</span></div>
-      </div>
-      <div class="lede sm beat" data-t="7" style="flex:1;margin:0;align-self:center">
-        A correct diagnosis with no hands still waits for a human.</div>
+    <div class="lede sm beat" data-t="0.8">Governance for the whole path: from a customer's raw
+      data to a model <b>a person approves</b>.</div>
+    <div class="chain" style="margin:10px 0 4px">
+      <span class="st beat" data-t="6.5">raw data</span><span class="arw beat" data-t="6.5">›</span>
+      <span class="st beat" data-t="8.6">prepare</span><span class="arw beat" data-t="8.6">›</span>
+      <span class="st beat" data-t="9.2">train</span><span class="arw beat" data-t="9.2">›</span>
+      <span class="st beat" data-t="9.8">evaluate</span><span class="arw beat" data-t="9.8">›</span>
+      <span class="st beat" data-t="10.4">deploy</span><span class="arw beat" data-t="10.4">›</span>
+      <span class="st beat" data-t="11">monitor</span>
     </div>
-    <div class="fleet beat" data-t="11" style="width:100%">
-      <div class="ag cond beat" data-t="14.8"><div class="an">llmops_orchestrator</div>
-        <div class="ar">conductor · plans, triages, pages</div></div>
-      <div class="ag beat" data-t="17"><div class="an">llmops_data_prep</div>
-        <div class="ar">teacher traces · curation</div></div>
-      <div class="ag beat" data-t="19"><div class="an">llmops_finetune</div>
-        <div class="ar">QLoRA on SageMaker</div></div>
-      <div class="ag beat" data-t="20"><div class="an">llmops_eval</div>
-        <div class="ar">quality gates · hold-out</div></div>
-      <div class="ag beat" data-t="21"><div class="an">llmops_deploy</div>
-        <div class="ar">endpoint · smoke · teardown</div></div>
-      <div class="ag beat" data-t="22"><div class="an">llmops_monitor</div>
-        <div class="ar">drift · orphan sweep</div></div>
-      <div class="ag audit beat" data-t="25"><div class="an">llmops_finops</div>
-        <div class="ar">read-only auditor · prices every run</div></div>
-      <div class="card beat" data-t="31" style="grid-column:span 2;padding:11px 13px">
-        <h4>Every task prompt grants an explicit budget</h4>
-        <div class="mono" style="font-size:12.5px">
-          diagnose → fix → retry &nbsp;<span style="color:var(--amber)">max 3</span>
-          &nbsp;→&nbsp;<span class="beat" data-t="35" style="color:var(--red)">escalate_human</span></div>
-        <div class="sub beat" data-t="35" style="margin-top:6px">At the edge of the budget it
-          escalates instead of guessing.</div>
+    <div class="cols" style="margin-top:12px;align-items:stretch">
+      <div class="card beat" data-t="11.6" style="flex:1">
+        <h4>Each agent works inside written limits</h4>
+        <div class="kv beat" data-t="13.6"><span>Retries</span><b>a stated budget</b></div>
+        <div class="kv beat" data-t="15.5"><span>Permissions</span><b>its own stage only</b></div>
+        <div class="kv beat" data-t="17.5"><span>Unsure</span><b>escalate, never guess</b></div>
+      </div>
+      <div class="card beat" data-t="20.1" style="flex:1">
+        <h4>Every stage leaves evidence a reviewer can check</h4>
+        <div class="kv beat" data-t="24.1"><span>Which data</span><b class="mono">extract sha256</b></div>
+        <div class="kv beat" data-t="25.3"><span>What the rules removed</span><b>PII · duplicates · ids</b></div>
+        <div class="kv beat" data-t="26.5"><span>Which scores</span><b>with a Wilson interval</b></div>
+        <div class="kv beat" data-t="27.8"><span>At what cost</span><b>per run</b></div>
+      </div>
+      <div class="card beat" data-t="29.3" style="flex:1;border-color:var(--green)">
+        <h4>The last step belongs to a person</h4>
+        <div class="kv beat" data-t="31.6"><span>Register a model</span><span class="pill ok">allowed</span></div>
+        <div class="kv beat" data-t="33.7"><span>Approve a model</span><span class="pill err">denied</span></div>
+        <div class="sub beat" data-t="35" style="margin-top:7px">…by the pipeline's own IAM role.</div>
       </div>
     </div>
-    <div class="lede sm beat" data-t="38.5" style="margin-top:14px">
-      Real authority · a stated limit · an honest exit.</div>
   </section>
 
-  <!-- ── 3 · architecture (the repo's real high-level diagram) ───────────── -->
+  <!-- ── 3 · four planes (the repo's real high-level diagram) ─────────────── -->
   <section class="scene" id="s3-architecture">
     <div class="stitle beat" data-t="0.3" data-title></div>
-    <div class="cols">
+    <div class="cols" style="align-items:flex-start">
       <div class="dia beat" data-t="1" style="width:730px;height:560px">__SVG_HIGH__</div>
-      <div class="callouts">
-        <div class="co beat" data-t="7"><b>The order never changes</b>
-          So the spine needs no language model at all.</div>
-        <div class="co beat" data-t="12"><b>Step Functions · the deterministic spine</b>
-          11 harness task states on the happy path.</div>
-        <div class="co beat" data-t="17"><b>wait-for-task-token</b>
-          Each state hands off to the harness-driver Lambda and blocks until the agent
-          reports back.</div>
-        <div class="co beat" data-t="21"><b>6 Lambdas · the serverless edge</b>
-          driver · start · resume · webhook · cost reconciler · scheduled sweep</div>
-        <div class="co beat" data-t="28" style="border-left-color:var(--amber)">
-          <b>Intelligence inside the stage, never above it</b>
-          The spine decides order. The agent decides how.</div>
-        <div class="co beat" data-t="31" style="border-left-color:var(--green)">
-          <b>Manifest in S3 · single source of truth</b>
-          Every agent reads it first and only appends.</div>
-        <div class="co beat" data-t="36" style="border-left-color:var(--red)">
-          <b>When the model provider had a bad hour</b>
-          The agent was unreachable, so the spine submitted the final training job itself.</div>
+      <div class="callouts" style="flex:1">
+        <div class="co beat" data-t="1.6"><b>Pipeline</b> · a deterministic Step Functions spine,
+          39 states, hands each stage to an agent and waits · 8 Lambdas</div>
+        <div class="co beat" data-t="10.1" style="border-left-color:var(--green)"><b>Data</b> · an
+          S3 Tables medallion: Bronze (raw, PII stays) → Silver (named rules) → Gold → a sha256-pinned
+          extract the model learns from</div>
+        <div class="co beat" data-t="27.4" style="border-left-color:var(--amber)"><b>Governance</b> ·
+          gates with intervals → a provenance card on the registered model → Unified Studio → a person</div>
+        <div class="co beat" data-t="38" style="border-left-color:var(--red)"><b>Audit</b> · what
+          every run actually cost</div>
       </div>
     </div>
   </section>
@@ -337,35 +303,31 @@
   <!-- ── 4 · built on AgentCore (the repo's real low-level diagram) ──────── -->
   <section class="scene" id="s4-build">
     <div class="stitle beat" data-t="0.3" data-title></div>
-    <div class="lede sm beat" data-t="1">None of these agent loops are hand-written.
-      Each agent is an <b>Amazon Bedrock AgentCore Harness</b>.</div>
-    <div class="cols">
-      <div class="card beat" data-t="1" style="width:400px">
-        <h4>harness.json — you declare, AWS runs the loop</h4>
+    <div class="lede sm beat" data-t="0.8">No agent loop here is hand-written.</div>
+    <div class="cols" style="align-items:flex-start;margin-top:10px">
+      <div class="card beat" data-t="2" style="width:400px">
+        <h4>One harness = configuration</h4>
         <div class="cfg">
-          <div class="beat" data-t="6"><span class="k">"model"</span>: <span class="s">"global.anthropic.claude-opus-5"</span>,</div>
+          <div class="beat" data-t="5.7"><span class="k">"model"</span>: <span class="s">"global.anthropic.claude-fable-5"</span>,</div>
           <div class="beat" data-t="7"><span class="k">"systemPrompt"</span>: <span class="s">"…stage contract…"</span>,</div>
-          <div class="beat" data-t="8"><span class="k">"tools"</span>: [ code_interpreter, browser, … ],</div>
-          <div class="beat" data-t="9"><span class="k">"skills"</span>: [ 19 sources, all <span class="s">s3</span> ],</div>
-          <div class="beat" data-t="10"><span class="k">"maxIterations"</span>, <span class="k">"timeout"</span>, <span class="k">"memory"</span></div>
-          <div class="beat" data-t="12" style="margin-top:9px"><span class="c">// per-session microVM:</span></div>
-          <div class="beat" data-t="12"><span class="c">// own shell + filesystem</span></div>
+          <div class="beat" data-t="8"><span class="k">"tools"</span>: [ shell, code interpreter, … ],</div>
+          <div class="beat" data-t="9"><span class="k">"skills"</span>: [ 19 mounts, all <span class="s">s3</span> ],</div>
+          <div class="beat" data-t="10"><span class="k">"limits"</span>: timeout · iterations · memory</div>
+          <div class="beat" data-t="12" style="margin-top:9px"><span class="c">// a session of its own:</span></div>
+          <div class="beat" data-t="12"><span class="c">// shell + file system</span></div>
         </div>
-        <div class="beat" data-t="18.5" style="margin-top:10px">
-          <span class="pill ok">acts, rather than advises</span></div>
+        <div class="beat" data-t="15.6" style="margin-top:10px">
+          <span class="pill ok">runs the job instead of describing it</span></div>
       </div>
       <div style="flex:1">
         <div class="dia beat" data-t="1" style="height:270px">__SVG_LOW__</div>
-        <div class="co beat" data-t="22" style="margin-top:11px;border-left-color:var(--green)">
-          <b>19 skill sources · pinned S3 mirror</b>
-          Mounted at session start. <span class="beat" data-t="25">A skill repository moving on
-          its own cannot change what ran.</span></div>
-        <div class="co beat" data-t="31" style="margin-top:9px">
-          <b>Changing behaviour is a config change, not a redeploy</b>
-          <span class="beat mono" data-t="34">Fable 5 → Opus 5 · ~15 s · one UpdateHarness
-          · live sessions survived</span></div>
-        <div class="sub beat" data-t="34" style="margin-top:7px">…after one provider threw ~12 bursts
-          of 5xx in a single day.</div>
+        <div class="co beat" data-t="19.2" style="margin-top:11px;border-left-color:var(--green)">
+          <b>19 skill mounts, from a pinned copy in S3</b> · a library moving on its own cannot
+          change what ran</div>
+        <div class="co beat" data-t="27.2" style="margin-top:9px"><b>Behaviour is configuration</b>
+          · reviewed like code</div>
+        <div class="co beat" data-t="30.9" style="margin-top:9px;border-left-color:var(--amber)">
+          <b>A provider's bad hour</b> · switch models, no redeploy</div>
       </div>
     </div>
   </section>
@@ -373,45 +335,29 @@
   <!-- ── 5 · design decisions ────────────────────────────────────────────── -->
   <section class="scene" id="s5-design">
     <div class="stitle beat" data-t="0.3" data-title></div>
-    <div class="cols beat" data-t="2">
-      <div class="card beat" data-t="3" style="flex:1">
-        <h4>1 · Gates are fail-closed</h4>
-        <div class="cfg beat" data-t="6">
-          <div><span class="c"># only a literal true passes</span></div>
-          <div>if r.get(<span class="s">"gate_passed"</span>) <span class="k">is True</span>:</div>
-        </div>
-        <div class="beat" data-t="10" style="margin-top:10px">
-          <div class="cfg strike" style="font-size:12px">.get("gate_passed", True)</div>
-          <div class="sub" style="margin-top:4px">An agent emitted an empty result; an old
-            default promoted it to a pass.</div>
-        </div>
-        <div class="beat" data-t="14" style="margin-top:9px">
-          <span class="pill ok">default deleted · regression test in its place</span></div>
+    <div class="beat" data-t="0.8" style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+      <div class="card beat" data-t="1.8">
+        <h4>1 · Gates fail closed</h4>
+        <div class="kv beat" data-t="3.1"><span>Passes</span><b>only a literal pass</b></div>
+        <div class="kv beat" data-t="5.5"><span>Decided on</span><b>the confidence interval</b></div>
       </div>
-      <div class="card beat" data-t="15.8" style="flex:1.25">
-        <h4>2 · Honesty is enforced structurally</h4>
+      <div class="card beat" data-t="8.8">
+        <h4>2 · The measuring instrument is fixed</h4>
+        <div class="kv beat" data-t="11.1"><span>A canonical scorer</span><b>downloaded, run unchanged</b></div>
+        <div class="kv beat" data-t="14.5"><span>Its sha256</span><b>recorded with the score</b></div>
+      </div>
+      <div class="card beat" data-t="18.2">
+        <h4>3 · Every claim is derived from its source</h4>
         <table class="der">
-          <tr class="beat" data-t="20"><td>agent count</td><td>agents/*/harness.json</td></tr>
-          <tr class="beat" data-t="23"><td>Lambda count</td><td>deploy/07_lambdas.py</td></tr>
-          <tr class="beat" data-t="25"><td>state count</td><td>state_machine.asl.json</td></tr>
+          <tr class="beat" data-t="20.7"><td>agent count</td><td>agents/*/harness.json</td></tr>
+          <tr class="beat" data-t="22.5"><td>state count</td><td>state_machine.asl.json</td></tr>
+          <tr class="beat" data-t="24.5"><td>diagram's Silver rules</td><td>lakehouse/transform.py</td></tr>
         </table>
-        <div class="sub beat" data-t="27.5" style="margin-top:8px">Every number in the docs is
-          re-derived from the file that produces it.</div>
-        <div class="beat" data-t="29.2" style="margin-top:10px">
-          <span class="pill warn">A number measured once looks measured forever —
-            that is how documentation lies.</span></div>
       </div>
-      <div class="card beat" data-t="34.4" style="flex:1">
-        <h4>3 · Every guard has been watched to fail</h4>
-        <div class="sub">A guard nobody has seen fail is a guard nobody has tested.</div>
-        <div class="beat" data-t="36.8" style="margin-top:11px">
-          <div class="kv"><span class="mono">break the claim</span>
-            <span class="pill err">guard fires</span></div>
-          <div class="kv"><span class="mono">restore it</span>
-            <span class="pill ok">guard passes</span></div>
-        </div>
-        <div class="sub beat" data-t="36.8" style="margin-top:8px">Negative controls break each
-          guard in turn and require it to catch the break.</div>
+      <div class="card beat" data-t="28.2">
+        <h4>4 · Every guard has been watched to fail</h4>
+        <div class="kv beat" data-t="30.7"><span class="mono">break it</span><span class="pill err">guard fires</span></div>
+        <div class="kv beat" data-t="30.7"><span class="mono">restore it</span><span class="pill ok">guard passes</span></div>
       </div>
     </div>
   </section>
@@ -420,56 +366,42 @@
   <section class="scene" id="s6-results">
     <div class="stitle beat" data-t="0.3" data-title></div>
     <div class="chain" style="margin-bottom:6px">
-      <span class="st beat" data-t="2.5">trigger</span><span class="arw beat" data-t="2.5">›</span>
-      <span class="st beat" data-t="3.1">plan</span><span class="arw beat" data-t="3.1">›</span>
-      <span class="st beat" data-t="3.7">generate</span><span class="arw beat" data-t="3.7">›</span>
-      <span class="st beat" data-t="4.3">curate</span><span class="arw beat" data-t="4.3">›</span>
-      <span class="st beat" data-t="4.9">train</span><span class="arw beat" data-t="4.9">›</span>
-      <span class="st beat" data-t="5.5">evaluate</span><span class="arw beat" data-t="5.5">›</span>
-      <span class="st beat" data-t="6.1">deploy</span><span class="arw beat" data-t="6.1">›</span>
-      <span class="st beat" data-t="6.7">smoke</span><span class="arw beat" data-t="6.7">›</span>
-      <span class="st beat" data-t="7.3">teardown</span>
-      <span class="pill ok beat" data-t="9" style="margin-left:8px">hands-off</span>
+      <span class="st beat" data-t="2.9">raw records</span><span class="arw beat" data-t="2.9">›</span>
+      <span class="st beat" data-t="4">Bronze</span><span class="arw beat" data-t="4">›</span>
+      <span class="st beat" data-t="4.6">Silver</span><span class="arw beat" data-t="4.6">›</span>
+      <span class="st beat" data-t="5.2">Gold</span><span class="arw beat" data-t="5.2">›</span>
+      <span class="st beat" data-t="8.5">train</span><span class="arw beat" data-t="8.5">›</span>
+      <span class="st beat" data-t="9.5">judge</span><span class="arw beat" data-t="9.5">›</span>
+      <span class="st beat" data-t="10.3">deploy</span><span class="arw beat" data-t="10.3">›</span>
+      <span class="st beat" data-t="11">test</span><span class="arw beat" data-t="11">›</span>
+      <span class="st beat" data-t="11.7">teardown</span>
     </div>
-    <div class="cols" style="margin-top:14px">
-      <div style="width:360px">
-        <div class="card beat" data-t="11">
-          <h4>The same training job, the next run</h4>
-          <div style="display:flex;align-items:baseline;gap:9px">
-            <span class="big" style="color:var(--green)">1</span>
-            <span class="sub">try — from a recipe the agent<br />wrote into shared memory</span></div>
-          <div class="sub beat" data-t="17.5" style="margin-top:10px">
-            6 failures became <b style="color:var(--text)">one organizational learning</b>.</div>
-        </div>
-        <div class="card beat" data-t="45.5" style="margin-top:12px">
-          <h4>Cost of proving the whole lifecycle</h4>
-          <div style="display:flex;align-items:baseline;gap:9px">
-            <span class="big">≈ $12–15</span>
-            <span class="sub">total · less than one day<br />of that idle endpoint</span></div>
-        </div>
+    <div class="beat" data-t="6" style="margin:6px 0 10px">
+      <span class="pill ok">30 pieces of personal data redacted</span>
+      <span class="pill beat" data-t="13">≈ $0.45 of compute</span></div>
+    <div class="cols" style="align-items:stretch">
+      <div class="card beat" data-t="16.2" style="flex:1">
+        <h4>120 held-out questions · answer match</h4>
+        <div style="display:flex;align-items:baseline;gap:14px">
+          <span class="big">0%</span><span class="sub">untrained</span>
+          <span class="huge beat" data-t="20" style="color:var(--green)">72.5%</span>
+          <span class="sub beat" data-t="20">trained</span></div>
       </div>
-      <div class="card beat" data-t="20.5" style="flex:1;border-color:var(--red)">
-        <h4>And the most important result is a failure</h4>
-        <div style="display:flex;align-items:center;gap:20px">
-          <div class="beat" data-t="23">
-            <div class="huge" style="color:var(--red)">0/16</div>
-            <div class="sub beat" data-t="28">held-out tasks · <b style="color:var(--text)">twice</b></div>
-          </div>
-          <div style="flex:1">
-            <div class="kv beat" data-t="30"><span>Lenient re-scan</span><b>still 0</b></div>
-            <div class="kv beat" data-t="30"><span>Control prompts, same path</span>
-              <b style="color:var(--green)">well-formed</b></div>
-            <div class="kv beat" data-t="33"><span class="mono">closed_think_rate</span>
-              <b style="color:var(--red)">0%</b></div>
-            <div class="kv beat" data-t="36"><span>Hit the context limit</span><b>12 / 16</b></div>
-          </div>
-        </div>
-        <div class="lede sm beat" data-t="42" style="margin:14px 0 0">
-          It had learned to <b>start</b> reasoning and never to <b>converge</b>.</div>
-        <div class="beat" data-t="44" style="margin-top:10px">
-          <span class="pill err">Nothing was fixed into a pass. The verdict stood.</span></div>
+      <div class="card beat" data-t="23.7" style="flex:1;border-color:var(--red)">
+        <h4>The gate checks identifiers · same model</h4>
+        <div class="huge beat" data-t="27.6" style="color:var(--red)">0/120</div>
+        <div class="sub beat" data-t="27.6">answers free of invented numbers · <b>gate failed</b></div>
+      </div>
+      <div class="card beat" data-t="31.7" style="flex:1;border-color:var(--green)">
+        <h4>The rule added to the data · new model</h4>
+        <div class="huge beat" data-t="34.6" style="color:var(--green)">120/120</div>
+        <div class="sub beat" data-t="34.6">answer match 70.8% · inside the same interval</div>
       </div>
     </div>
+    <div class="beat" data-t="39.3" style="margin-top:12px">
+      <span class="pill err">version 1 · rejected</span>
+      <span class="pill ok">version 2 · approved</span>
+      <span class="sub">— by a person, in Unified Studio</span></div>
   </section>
 
   <!-- ── 7 · this console ────────────────────────────────────────────────── -->
@@ -479,63 +411,55 @@
       <div class="mh"><span class="lg"></span><span class="t">LLMOps Governance</span>
         <span class="sub" style="font-size:11px">the operator's view</span></div>
       <div class="mtabs">
-        <span class="beat" data-t="3.5">Introduction</span>
-        <span class="beat" data-t="3.5">Architecture</span>
-        <span class="beat act" data-t="4.5">Pipeline</span>
-        <span class="beat" data-t="5.5">Fleet</span>
-        <span class="beat" data-t="5.5">Observability</span>
-        <span class="beat" data-t="6.5">Evaluations</span>
-        <span class="beat" data-t="6.5">Optimizations</span>
-        <span class="beat" data-t="7.5">Cost</span>
+        <span class="beat" data-t="1.4">Introduction</span>
+        <span class="beat" data-t="1.4">Architecture</span>
+        <span class="beat act" data-t="4.4">Pipeline</span>
+        <span class="beat" data-t="9.1">Outcome</span>
+        <span class="beat" data-t="18.4">Data</span>
+        <span class="beat" data-t="1.4">Fleet</span>
+        <span class="beat" data-t="1.4">Observability</span>
+        <span class="beat" data-t="20.7">Cost</span>
       </div>
       <div class="mbody" style="flex-direction:column;gap:12px">
-        <div class="flow beat" data-t="9.5">
-          <span class="fs done">data_prep</span><span class="arw">›</span>
-          <span class="fs done">curate</span><span class="arw">›</span>
+        <div class="flow beat" data-t="4.4">
+          <span class="fs done">Bronze</span><span class="arw">›</span>
+          <span class="fs done">Silver</span><span class="arw">›</span>
+          <span class="fs done">Gold</span><span class="arw">›</span>
+          <span class="fs done">extract</span><span class="arw">›</span>
           <span class="fs act">finetune</span><span class="arw">›</span>
-          <span class="fs">evaluate</span><span class="arw">›</span>
-          <span class="fs">deploy</span><span class="arw">›</span>
-          <span class="fs">smoke</span><span class="arw">›</span>
-          <span class="fs">teardown</span>
+          <span class="fs">eval gate</span><span class="arw">›</span>
+          <span class="fs">deploy</span>
         </div>
         <div style="display:flex;gap:12px">
-          <div class="card beat" data-t="12" style="flex:1;background:var(--panel)">
-            <h4>Cost · the auditor prices every run</h4>
-            <div class="kv"><span>Estimated, at approval</span><b>$41.80</b></div>
-            <div class="kv"><span>Actual, reconciled</span><b>$38.94</b></div>
-            <div class="kv"><span>Reporting reference</span>
-              <b class="sub">set by each team</b></div>
-            <div class="beat" data-t="16" style="margin-top:9px">
-              <span class="pill warn">named while it is happening — not discovered on a bill</span></div>
+          <div class="card beat" data-t="9.1" style="flex:1.3;background:var(--panel)">
+            <h4>Outcome · trained vs untrained, same questions</h4>
+            <div class="kv"><span>Answer match</span><b>0.0% → 72.5%</b></div>
+            <div class="kv"><span>Format validity</span><b>39.2% → 100%</b></div>
+            <div class="kv"><span>Compute</span><b>$0.45</b></div>
           </div>
           <div class="card beat" data-t="18.4" style="flex:1;background:var(--panel)">
-            <h4>Escalations arrive as a task you answer</h4>
-            <div class="msg">Budget for the 80-sample run exceeds the reference. Approve?</div>
-            <div class="msg me">Approved — proceed at 80 samples.</div>
-            <div class="beat" data-t="21.2">
-              <span class="pill ok mono">KMS-signed · appended to a hash chain</span>
-              <div class="sub" style="margin-top:5px">Who approved what cannot be quietly
-                rewritten.</div>
-            </div>
+            <h4>Data · what each rule caught</h4>
+            <div class="kv"><span>PII redacted</span><b>30</b></div>
+            <div class="kv beat" data-t="20.7"><span>Cost</span><b>every run priced</b></div>
+          </div>
+          <div class="card beat" data-t="22.3" style="flex:1.2;background:var(--panel);border-color:var(--green)">
+            <h4>Unified Studio · the model's own page</h4>
+            <div class="kv"><span>Custom metrics</span><b>gates · intervals · PII · cost</b></div>
+            <div class="beat" data-t="25" style="margin-top:7px"><span class="pill ok">approved here, by a person</span></div>
           </div>
         </div>
       </div>
     </div>
-    <div class="cols beat" data-t="27.7" style="margin-top:13px;align-items:center">
-      <span class="pill ok">the whole test suite · negative controls · shell assertions —
-        offline, on every pull request</span>
-      <div class="lede sm beat" data-t="33.5" style="margin:0;flex:1">
-        Not an assistant that suggests commands — a team of agents with real authority,
-        stated limits, and <b>gates hard enough to fail their own builders</b>.</div>
-    </div>
+    <div class="lede sm beat" data-t="27.5" style="margin-top:14px">Not a faster way to train a
+      model — <b>a way to know which model to trust</b>, and to show why.</div>
   </section>
 
   </div><!-- /stage -->
 
   <div class="gate" id="gate">
-    <h1>An autonomous LLMOps pipeline, run by agents</h1>
-    <p>Five minutes, narrated: what the problem is, how seven AgentCore agents were given
-       real authority and hard limits, and what that actually proved on a live AWS account.</p>
+    <h1>Data + AI governance, from raw data to an approved model</h1>
+    <p>Four minutes, narrated: a model that passed every gate and was still wrong, how the platform
+       catches that and fixes it at the source, and what was proven on a live AWS account.</p>
     <div class="pickrow">
       <label for="gateLang">Narration language</label>
       <select id="gateLang"></select>
