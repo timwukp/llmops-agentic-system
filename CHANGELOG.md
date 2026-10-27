@@ -5,6 +5,14 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
 ## [Unreleased]
 
+### A changed narration clip reaches the listener
+
+- **The English the owner heard was v1, from the browser's cache.** The deployed clips were v2 byte
+  for byte, and every clip's synthesis stamp matches the v2 text. But the page asked for the same
+  `/intro/audio/<lang>/<scene>.mp3` in every version, and the route allows a day of caching, so a
+  browser that had played v1 kept playing it. Each clip URL now carries the first 12 hex of the
+  clip's sha256 (`?v=`), so a changed clip is a new URL. Two guards derive the hash from the mp3s.
+
 ### The English Introduction shows each picture on its own words
 
 - **Measured, not estimated:** beats were placed at each sentence's character offset, which assumes an

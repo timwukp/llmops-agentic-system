@@ -100,6 +100,9 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         pass
 
     def do_GET(self):
+        # The page puts `?v=<clip hash>` on every clip URL; the Lambda route ignores it, so
+        # does this.
+        self.path = self.path.split("?", 1)[0]
         if self.path in ("/intro", "/intro/"):
             return self._send(self._page.read_bytes(), "text/html; charset=utf-8")
         if self.path.startswith("/intro/audio/"):

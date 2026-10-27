@@ -126,6 +126,13 @@ const html = fs.readFileSync(PAGE, "utf8");
 const DURS = JSON.parse(fs.readFileSync(
   path.join(__dirname, "..", "deploy", "console", "intro", "durations.json"), "utf8"));
 const total = lang => Object.values(DURS[lang]).reduce((a, b) => a + b, 0);
+// The URL the page must request for a clip: its path plus the first 12 hex of the committed
+// mp3's sha256, computed here from the file rather than read from the page, so a page that
+// carried a stale hash (or none) asks for a URL a browser may already hold the old clip under.
+const clipUrl = (lang, sid) => `/intro/audio/${lang}/${sid}.mp3?v=` + require("crypto")
+  .createHash("sha256").update(fs.readFileSync(path.join(
+    __dirname, "..", "deploy", "console", "intro", "audio", lang, sid + ".mp3")))
+  .digest("hex").slice(0, 12);
 const clock = s => { s = Math.max(0, Math.round(s));
                      return Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0"); };
 const scenes = parseScenes(html);
@@ -283,7 +290,7 @@ AUDIO_MODE = "ok";
 P.go(0, true);
 eq(P.idx, 0, "go(0) selects scene 1");
 ok($("gate").classList.contains("off"), "the gate is dismissed on play");
-eq(audioSrcs[audioSrcs.length - 1], "/intro/audio/en/s1-problem.mp3",
+eq(audioSrcs[audioSrcs.length - 1], clipUrl("en", "s1-problem"),
    "requests the English scene-1 clip from the bundled path");
 eq($("playBtn").textContent, "❚❚ Pause", "the button shows Pause while playing");
 
@@ -336,7 +343,7 @@ const interrupted = audioLive;
 P.go(5, true);                 // user clicks segment 6 while scene 3 is playing
 if (interrupted) interrupted.endNow();   // the old handler, if still attached, fires here
 eq(P.idx, 5, "the interrupted clip's onended cannot drag the page back a scene");
-eq(audioSrcs[audioSrcs.length - 1], "/intro/audio/en/s6-results.mp3",
+eq(audioSrcs[audioSrcs.length - 1], clipUrl("en", "s6-results"),
    "the new scene's clip is the one loaded");
 
 // ── 4 · pause / resume ───────────────────────────────────────────────────────
@@ -386,7 +393,7 @@ stepFrames(4000);
 P.setLang("ja");
 eq(P.LANG, "ja", "language changed");
 eq(P.idx, 3, "the scene is kept across a language change");
-eq(audioSrcs[audioSrcs.length - 1], "/intro/audio/ja/s4-build.mp3",
+eq(audioSrcs[audioSrcs.length - 1], clipUrl("ja", "s4-build"),
    "the Japanese clip for the SAME scene is loaded");
 eq(localStore.get("introLang"), "ja", "the choice is remembered");
 eq(document.documentElement.lang, "ja-JP", "<html lang> follows the narration");

@@ -23,6 +23,7 @@ Run: .venv/bin/python -m pytest tests/test_intro_bundle.py -q
 from __future__ import annotations
 
 import base64
+import hashlib
 import importlib.util
 import json
 import pathlib
@@ -356,6 +357,36 @@ def test_every_clip_the_page_will_request_is_served(console):
                 f"{lang}/{scene} was returned without isBase64Encoded. API Gateway sends "
                 "the body as UTF-8 without it, so MP3 bytes arrive corrupted under a 200 "
                 "status and the browser reports only a decode error.")
+
+
+def test_every_clip_url_changes_when_its_clip_does(built_page):
+    """The page asks for each clip under its own content hash, for all 35.
+
+    A browser caches by URL. When every version of a scene's clip had the same URL, the owner's
+    browser went on playing the v1 English after v2 was deployed (2026-10-27): the deployed clips
+    were v2, byte for byte, and nothing on the server could show what the listener heard. The hash
+    is computed here from the committed mp3, not read back from the page.
+    """
+    html = built_page.read_text(encoding="utf-8")
+    m = re.search(r"const AUDIO_V = (\{.*?\}\});", html)
+    assert m, "the page carries no clip versions, so a changed clip keeps its old URL"
+    versions = json.loads(m.group(1))
+    for lang in LANGS:
+        for scene in SCENES:
+            want = hashlib.sha256((INTRO / "audio" / lang / f"{scene}.mp3").read_bytes()).hexdigest()[:12]
+            assert versions.get(lang, {}).get(scene) == want, f"{lang}/{scene} is requested under a stale URL"
+    assert "new Audio(clipUrl(LANG, sid))" in html and '"?v=" + v' in html
+
+
+def test_the_versioned_clip_url_is_served(console):
+    """API Gateway hands the route the path without the query, so `?v=` must not change which clip
+    it serves. The event below is the shape an HTTP API sends for `<scene>.mp3?v=<hash>`."""
+    r = console.handler({"requestContext": {"http": {"method": "GET",
+                                                     "path": "/intro/audio/en/s1-problem.mp3"}},
+                         "rawQueryString": "v=0123456789ab",
+                         "queryStringParameters": {"v": "0123456789ab"}}, None)
+    assert r["statusCode"] == 200 and base64.b64decode(r["body"]) == (
+        INTRO / "audio/en/s1-problem.mp3").read_bytes()
 
 
 def test_the_served_bytes_are_the_committed_bytes(console):

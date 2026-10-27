@@ -5241,10 +5241,11 @@ def intro_audio(path):
     headers = {"content-type": "audio/mpeg"}
     headers.update(_SEC_HEADERS)
     headers["content-security-policy"] = _csp(upload=False)
-    # The clips are immutable for the life of a deployment — the filename does not change
-    # when the text does, so the cache is keyed on the deployment, not the content. A day
-    # is short enough that a redeploy is picked up by the next visitor rather than being
-    # served stale for a week, and long enough that replaying a scene is free.
+    # A browser keys this cache on the URL, not on the deployment. The page asks for
+    # `<scene>.mp3?v=<sha256 prefix of the clip>` (build_intro.py), so a re-synthesized clip
+    # is a new URL and a day of caching can never serve the old one. Before that the URL was
+    # the same in every version, and the v1 English kept playing from the owner's browser
+    # after v2 was deployed (2026-10-27). The query is ignored here: the path names the clip.
     headers["cache-control"] = "public, max-age=86400"
     return {"statusCode": 200, "headers": headers,
             "body": base64.b64encode(data).decode("ascii"), "isBase64Encoded": True}

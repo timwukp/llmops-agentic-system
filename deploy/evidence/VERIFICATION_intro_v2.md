@@ -64,3 +64,19 @@ the app; then "好，照這個方向，翻譯成另外三種語言" after review
   `durations.json`, and `tests/test_intro_timing.py` runs it. Against main's page its new check
   fails ("English scene 6 at 12 s ... is not the data-t schedule: 19 vs 19"); against this branch,
   76 of 76 pass.
+
+## The English the owner heard was v1 (`intent/intro-audio-cache`)
+
+- **Reported** after the timing fix was deployed (2026-10-27 08:27 UTC): the English script is not
+  updated; use the updated script and cross-check with Mandarin and Cantonese.
+- **What was deployed was v2.** The live clips are byte-identical to the repo's (35/35). Every clip's
+  synthesis stamp (sha256 of text, voice and engine) matches the current text: 7/7 in each of en,
+  zh, yue, ja, ko. All 7 English clips differ from v1's. v2's English scene 1 opens on the model
+  that passed every gate (33.2 s); v1's opened on "glue work" (42.5 s).
+- **Cause.** The page requested `/intro/audio/<lang>/<scene>.mp3`, one URL per scene in every
+  version, and the route sends `cache-control: public, max-age=86400`. A browser keys that cache on
+  the URL, so one that had played v1 within the day kept playing v1. The route's comment said the
+  cache was keyed on the deployment.
+- **Fix.** The page requests `<scene>.mp3?v=<first 12 hex of the clip's sha256>`; the route reads
+  the path only and is unchanged. Against the deployed page (no version), the player test fails 3
+  assertions naming the unversioned URLs; against this branch it passes.

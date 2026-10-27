@@ -42,6 +42,13 @@ Two things this does beyond substitution, both of which are silent bugs otherwis
    English only; the other four languages keep scaling `data-t`, unchanged. A beat
    after ANCHOR_FROM seconds with no anchor is refused, and so is a clauses.json
    measured from a different clip or text than the one being shipped.
+
+4. **Clip URLs that change when the clip does.** The page asks for
+   `/intro/audio/<lang>/<scene>.mp3?v=<sha256 prefix of that mp3>`. The URL used to be the
+   same in every version, and the route lets a browser keep a clip for a day, so after v2
+   shipped the owner's browser went on playing the v1 English it had cached while the
+   deployed clips were v2 (2026-10-27). The server ignores the query; it only has to make
+   a changed clip a different URL.
 """
 import argparse
 import hashlib
@@ -184,6 +191,12 @@ def anchor_english(html: str, spec: dict, durations: dict, clauses: dict) -> tup
     return out, bad
 
 
+def clip_versions(langs, scenes) -> dict:
+    """{lang: {scene: first 12 hex of the clip's sha256}}, for the clip URLs."""
+    return {l: {s: hashlib.sha256((AUDIO / l / f"{s}.mp3").read_bytes()).hexdigest()[:12]
+                for s in scenes if (AUDIO / l / f"{s}.mp3").exists()} for l in langs}
+
+
 def build() -> str:
     spec = json.loads(NARRATION.read_text(encoding="utf-8"))
     durations = json.loads(DURATIONS.read_text(encoding="utf-8"))
@@ -232,6 +245,7 @@ def build() -> str:
         "__TITLES__": json.dumps(spec["titles"], ensure_ascii=False),
         "__NARR__": json.dumps(spec["text"], ensure_ascii=False),
         "__DUR__": json.dumps(durations),
+        "__AUDIO_V__": json.dumps(clip_versions(langs, scenes)),
     }
     for ph, (prefix, rel) in DIAGRAMS.items():
         subs[ph] = load_svg(rel, prefix)
