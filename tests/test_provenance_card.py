@@ -54,6 +54,9 @@ GATES = {
                             "format_validity": {"value": 1.0, "threshold": 0.95, "ci_low": 0.969, "ci_high": 1.0,
                                                 "count": "120/120", "verdict": "decisive_pass"}}},
 }
+GATES["gates_applied"] = {"gate_passed": True, "gates_applied": {"answer_match": {
+    "value": 0.725, "threshold": 0.6, "ci_low": 0.639, "ci_high": 0.797, "n": 120, "verdict": "pass_decisive",
+    "detail": "87/120 matched; lower bound 0.6390 >= 0.60"}}}
 METRICS = {
     "2026-10-16": {"trainer_metrics": {"final_train_loss": 0.24, "final_eval_loss": 0.3, "model_id": "Qwen/Qwen3-1.7B"},
                    "training_job": {"instance_type": "ml.g5.2xlarge", "billable_time_seconds": 410},

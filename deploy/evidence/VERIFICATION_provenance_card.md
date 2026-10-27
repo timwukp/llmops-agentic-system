@@ -130,8 +130,19 @@ The same reading showed two more defects, fixed in a second commit:
 - **"3 SageMaker job(s), incl. the baseline"** on a run with no baseline: the clause now appears only
   when there is one.
 
-## Not yet verified live
+## Live: the Outcome tab after the second commit's console deploy
 
-- The Outcome tab's answers for the demo run after the second commit's console deploy.
+The deployed package was again compared byte for byte (`provenance.py`, `lambda_function.py`,
+`frontend.html`: all equal to the branch). The owner's reading for `run-20261023T160741Z-65fec5d8`:
+- **Cost:** "3 SageMaker job(s) · endpoint hours + tokens: Cost tab", with no baseline clause.
+- **Answers:** 12 questions with the fine-tuned answer and its verdict (8 match, 4 no_match among
+  the 12 shown); the untrained column shows "–" because the run has no baseline.
+
+**Observed in those answers:** every fine-tuned answer ends in a case number the question never gave
+("（案件編號 C00089）", "(case C00148)"), and `answer_match` (reference containment) still scores it a
+match. Taken up as its own change: `deploy/evidence/VERIFICATION_identifier_grounding.md`. (Recorded
+here with that change, because this paragraph's own commit did not reach `main` before #182 merged.)
+
+## Not yet verified live
 - `PublishProvenance` inside a fresh pipeline run (deployed; the next run that deploys exercises it).
 - Artifacts and Performance metrics on the SMUS page: no field tried fills them.

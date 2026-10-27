@@ -11643,7 +11643,9 @@ def _eval_instrument_mirror():
     # (r6d): the same mirror carries it because data-prep and eval must read ONE key.
     # The vision mAP scorer joined for finetune-vision: the eval prompt's VISION MODE
     # clause names code/eval/vision_map_scorer.py as the gate's canonical instrument.
-    assert files == ["judge_prompt_pairwise.md", "raft_context_format.md",
+    # identifier_grounding.py joined 2026-10-26: the eval prompt runs it on every text run,
+    # because answer_match scored invented case numbers as matches.
+    assert files == ["identifier_grounding.py", "judge_prompt_pairwise.md", "raft_context_format.md",
                      "vision_map_scorer.py"], (
         f"pipeline/eval/ holds {files}; this guard pins the canonical instrument set and "
         "the prompts name each member by name -- teach the prompts and this list together")

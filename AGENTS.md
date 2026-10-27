@@ -359,6 +359,16 @@ versions and introspects the live CreateHarness/UpdateHarness schemas.
   2026-10-24). A metric's notes never appear, so anything the approver must see is a row of its own.
   `UpdateModelPackage` takes `ModelCardStatus` with the content only on a package's FIRST card; once
   one exists, both together are a `ValidationException` (`deploy/evidence/VERIFICATION_provenance_card.md`).
+- **A containment metric scores a fabricated identifier as a match, and the data is where it comes
+  from.** On 2026-10-23 every fine-tuned answer ended in a case number the question never gave
+  ("（案件編號 C00089）"): all 234 training answers ended in one, because the CRM appends it to every
+  agent reply, and `answer_match` (reference contained in the answer) passed them all. Silver now
+  strips a reference the customer never gave (`strip_ungrounded_ids`, AFTER `near_dup`, which keys on
+  it), and the pairs it makes identical are kept once (the case number was the only difference between
+  template-mates: 283 pairs, 266 distinct). `pipeline/eval/identifier_grounding.py` measures the
+  result; bound identifiers by ASCII letters and digits, not `\b`, because a CJK character is a word
+  character to Python's `re`. And gate a proportion at a threshold its sample can pass: 120/120 has a
+  Wilson lower bound of 0.969, so a 0.99 gate on 120 items is never a decisive pass.
 - **DeepSeek-R1 output contains `<think>...</think>`** — the data-prep agent strips
   it by default (sequence-level KD keeps final answers only).
 

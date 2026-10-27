@@ -346,6 +346,11 @@ def generate(seed: int = 7, scale: str = "demo") -> dict:
         "duplicate_resend": {"count": len(resend), "items": sorted(e["event_id"] for e in resend)},
         "schema_drift": {"count": len(drift), "field": "raw_meta.channel_detail",
                          "first_conversation_index": plant["schema_drift_from"]},
+        # Not an accident of the plant: every agent reply ends in the CRM's case reference, which the
+        # customer never gave (see _conversation). Recorded so strip_ungrounded_ids is held to it.
+        "system_assigned_id": {"count": len(convs), "items": sorted(
+            ({"conversation_id": c["conversation_id"]} for c in convs.values()),
+            key=lambda i: i["conversation_id"])},
     }
     return {"tables": {"conversation_events": events, "crm_cdc": crm, "erp_cdc": erp,
                        "web_events": web},
