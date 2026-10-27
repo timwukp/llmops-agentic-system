@@ -319,7 +319,7 @@
     <div id="taskActions" class="flex" style="margin-top:10px;flex-wrap:wrap"></div>
   </div>
 
-  <!-- Introduction: a narrated five-minute walkthrough, before any of the operator
+  <!-- Introduction: a narrated four-minute walkthrough, before any of the operator
        surfaces. It is a separate document served at /intro rather than markup in this
        file: it carries ~700 lines of its own CSS animation and a media player, and
        inlining that here would put a 5-minute demo's stylesheet in front of every
@@ -328,7 +328,7 @@
 
        The src is set LAZILY in showTab(), not here: the page is ~85 KB with two inlined
        SVGs, and an operator who never opens this tab should never pay for it. -->
-  <div data-tab-panel="intro" class="card col-12"><h2>Introduction &middot; a five-minute walkthrough</h2>
+  <div data-tab-panel="intro" class="card col-12"><h2>Introduction &middot; a four-minute walkthrough</h2>
     <div class="sub" style="max-width:920px;margin-bottom:10px">What the problem is, what was built, and what it
       actually cost &mdash; narrated, with a language picker (English, 普通話, 粵語, 日本語, 한국어). Every number
       spoken is one this repository recorded, not an estimate. Press play; use the segment bar to jump.</div>
@@ -338,7 +338,7 @@
       <!-- allow="autoplay" so the player's own gesture-gated play() is not blocked a
            second time by the iframe's permission policy. The page still asks for a
            click first: a blocked autoplay looks exactly like a broken page. -->
-      <iframe id="introFrame" title="LLMOps agentic system — five-minute introduction"
+      <iframe id="introFrame" title="LLMOps Governance — four-minute introduction"
               allow="autoplay" style="width:100%;height:100%;border:0;display:block"></iframe>
     </div>
     <div class="sub" style="margin-top:8px">Prefer to read? The same ground is covered in

@@ -25,7 +25,11 @@ discovered on a bill. The whole lifecycle, proven end to end, cost **≈ $12–1
 
 → The full record, failures kept in: [docs/CASE_STUDY.md](docs/CASE_STUDY.md)
 
-## Watch it — five minutes, narrated
+## Watch it — the narrated introduction
+
+The recording below is the first version (2026-08). The console's Introduction tab plays the
+current one: v2 (2026-10-27), about four minutes in English, in five languages, on data + AI
+governance from raw data to an approved model.
 
 https://github.com/user-attachments/assets/f189afb1-c326-49b6-b023-785da5ed3e6a
 
