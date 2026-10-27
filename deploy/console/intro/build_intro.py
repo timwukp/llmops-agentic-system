@@ -7,6 +7,7 @@ Inputs, all committed:
     intro/page.template.html   the scenes, the player, the styling
     intro/narration.json       the script and the language/voice table
     intro/durations.json       MEASURED clip seconds, written by synth_narration.py
+    intro/clauses.json         MEASURED English clause starts, written by measure_clauses.py
     docs/architecture-*.svg    the three real diagrams, inlined
 
 Output: ONE file with no external reference except its own audio under
@@ -32,8 +33,18 @@ Two things this does beyond substitution, both of which are silent bugs otherwis
    whose `data-t` is past the end of the English clip never fires in ANY language -- the
    content simply never appears, on a page nobody can diff. Every beat is checked
    against the measured English duration here, at build time, where it is cheap.
+
+3. **English beats on the English voice.** Proportional scaling assumes a voice that
+   speaks at an even rate. The English one does not, and the owner reported it as the
+   one language whose pictures did not match the words (2026-10-27). So a beat names
+   the English clause it illustrates, `data-at="<clause>"` or `"<clause>+<seconds>"`,
+   and this writes the clause's MEASURED start as `data-en`, which the player uses for
+   English only; the other four languages keep scaling `data-t`, unchanged. A beat
+   after ANCHOR_FROM seconds with no anchor is refused, and so is a clauses.json
+   measured from a different clip or text than the one being shipped.
 """
 import argparse
+import hashlib
 import json
 import pathlib
 import re
@@ -44,6 +55,13 @@ REPO = HERE.parent.parent.parent
 TEMPLATE = HERE / "page.template.html"
 NARRATION = HERE / "narration.json"
 DURATIONS = HERE / "durations.json"
+CLAUSES = HERE / "clauses.json"
+AUDIO = HERE / "audio"
+
+#: Beats before this many seconds (titles, the first line) appear as the clip starts in
+#: every language and need no anchor.
+ANCHOR_FROM = 1.5
+_BEAT = re.compile(r'(?:data-at="([0-9]+)(?:\+([0-9.]+))?" )?data-t="([0-9.]+)"')
 
 #: placeholder -> repo-relative diagram. The prefix is also the id namespace.
 #:
@@ -126,6 +144,46 @@ def check_beats(html: str, en_durations: dict) -> list:
     return bad
 
 
+def anchor_english(html: str, spec: dict, durations: dict, clauses: dict) -> tuple:
+    """(html with data-en on every anchored beat, complaints)."""
+    bad = []
+
+    def scene(m):
+        sid, body = m.group(1), m.group(2)
+        rec = clauses.get(sid)
+        if rec is None:
+            bad.append(f"{sid}: clauses.json has no English clauses; run measure_clauses.py")
+            return m.group(0)
+        clip = (AUDIO / "en" / f"{sid}.mp3").read_bytes()
+        text = spec["text"]["en"][sid].encode("utf-8")
+        if (rec["mp3_sha256"] != hashlib.sha256(clip).hexdigest()
+                or rec["text_sha256"] != hashlib.sha256(text).hexdigest()):
+            bad.append(f"{sid}: clauses.json was measured from a different clip or text "
+                       "than the one shipped; run measure_clauses.py")
+            return m.group(0)
+        starts = rec["clauses"]
+
+        def beat(b):
+            idx, plus, t = b.group(1), b.group(2), float(b.group(3))
+            if idx is None:
+                if t >= ANCHOR_FROM:
+                    bad.append(f"{sid}: beat at {t}s names no English clause (data-at), so "
+                               "in English it would fire at a proportional estimate")
+                return b.group(0)
+            if int(idx) >= len(starts):
+                bad.append(f"{sid}: data-at={idx} but the scene has {len(starts)} clauses")
+                return b.group(0)
+            en = round(starts[int(idx)][1] + float(plus or 0), 2)
+            if en >= durations["en"][sid]:
+                bad.append(f"{sid}: clause {idx} resolves to {en}s, past the English clip")
+            return f'{b.group(0)} data-en="{en}"'
+
+        return m.group(0).replace(body, _BEAT.sub(beat, body), 1)
+
+    out = re.sub(r'<section class="scene" id="([^"]+)"([\s\S]*?)</section>', scene, html)
+    return out, bad
+
+
 def build() -> str:
     spec = json.loads(NARRATION.read_text(encoding="utf-8"))
     durations = json.loads(DURATIONS.read_text(encoding="utf-8"))
@@ -160,6 +218,11 @@ def build() -> str:
     bad = check_beats(html, durations["en"])
     if bad:
         raise SystemExit("FATAL: unreachable animation beats:\n  " + "\n  ".join(bad))
+    html, bad = anchor_english(html, spec, durations,
+                               json.loads(CLAUSES.read_text(encoding="utf-8"))["en"])
+    if bad:
+        raise SystemExit("FATAL: English beats not on the English voice:\n  "
+                         + "\n  ".join(bad))
 
     subs = {
         "__SCENES__": json.dumps(scenes),

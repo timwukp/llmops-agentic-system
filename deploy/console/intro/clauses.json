@@ -1,0 +1,716 @@
+{
+ "_comment": [
+  "MEASURED start of every English clause, written by measure_clauses.py; do not edit.",
+  "Beats name a clause with data-at=\"<index>\" or \"<index>+<seconds>\" and build_intro.py",
+  "writes the resolved time as data-en, which the player uses for English only."
+ ],
+ "en": {
+  "s1-problem": {
+   "mp3_sha256": "10f7d2fe74d0228ea0456e263f54559e95921eebb988c2e4a4749a1718ef836f",
+   "text_sha256": "a9eb8191e6df67d786d81ba54bd5379293e2aa0365e489ce853438bc5d3c46d1",
+   "clauses": [
+    [
+     0,
+     0.0,
+     "Here is a model that passed every gate."
+    ],
+    [
+     40,
+     2.02,
+     "Fine-tuned on a store's customer conversations,"
+    ],
+    [
+     88,
+     4.55,
+     "it answered seventy-two point five percent of a held-out test correctly,"
+    ],
+    [
+     161,
+     8.02,
+     "up from zero before training,"
+    ],
+    [
+     191,
+     9.66,
+     "and every answer was well formed."
+    ],
+    [
+     225,
+     11.36,
+     "And every one of its answers ended with a case number the customer had never given."
+    ],
+    [
+     309,
+     15.32,
+     "It was making them up."
+    ],
+    [
+     332,
+     16.6,
+     "The gate could not see it,"
+    ],
+    [
+     359,
+     17.88,
+     "because it only checked that the right answer was in there somewhere."
+    ],
+    [
+     429,
+     20.82,
+     "The training data had taught it:"
+    ],
+    [
+     462,
+     22.3,
+     "every reply in the transcripts ended with a number the support system had assigned."
+    ],
+    [
+     546,
+     26.41,
+     "This is the problem this platform is built around."
+    ],
+    [
+     597,
+     28.89,
+     "Not training a model,"
+    ],
+    [
+     619,
+     30.1,
+     "but knowing whether to trust one,"
+    ],
+    [
+     653,
+     31.64,
+     "and being able to show why."
+    ]
+   ]
+  },
+  "s2-solution": {
+   "mp3_sha256": "6d0033d64f57453abfd7899e95777802410804e4e76ca331da978776b4966f97",
+   "text_sha256": "2ccad422160bc2cba575347389662159778e4474114569d28c96a81380f7b211",
+   "clauses": [
+    [
+     0,
+     0.0,
+     "So this is a governance platform for the whole path,"
+    ],
+    [
+     53,
+     2.91,
+     "from a customer's raw data to a model a person approves."
+    ],
+    [
+     110,
+     6.16,
+     "Agents do the work at every stage:"
+    ],
+    [
+     145,
+     8.1,
+     "prepare the data,"
+    ],
+    [
+     163,
+     9.26,
+     "train,"
+    ],
+    [
+     170,
+     9.93,
+     "evaluate,"
+    ],
+    [
+     180,
+     10.69,
+     "deploy,"
+    ],
+    [
+     188,
+     11.41,
+     "monitor."
+    ],
+    [
+     197,
+     12.12,
+     "Each works inside written limits:"
+    ],
+    [
+     231,
+     13.99,
+     "a budget for retries,"
+    ],
+    [
+     253,
+     15.43,
+     "permissions for its own stage only,"
+    ],
+    [
+     289,
+     17.31,
+     "and an instruction to escalate instead of guessing."
+    ],
+    [
+     341,
+     19.85,
+     "Every stage leaves evidence behind,"
+    ],
+    [
+     377,
+     22.19,
+     "in a form a reviewer can check:"
+    ],
+    [
+     409,
+     24.01,
+     "which data,"
+    ],
+    [
+     421,
+     24.93,
+     "which rules removed what,"
+    ],
+    [
+     447,
+     26.46,
+     "which scores,"
+    ],
+    [
+     461,
+     27.36,
+     "with what confidence,"
+    ],
+    [
+     483,
+     28.51,
+     "at what cost."
+    ],
+    [
+     497,
+     29.57,
+     "And the last step belongs to a person."
+    ],
+    [
+     536,
+     31.62,
+     "The pipeline can register a model."
+    ],
+    [
+     571,
+     33.49,
+     "It cannot approve one."
+    ],
+    [
+     594,
+     35.11,
+     "Its own permissions deny it."
+    ]
+   ]
+  },
+  "s3-architecture": {
+   "mp3_sha256": "edd5f8dbca25dfb57e1955e542ef9fcd4f8484632657e56472afbbdf75a71da1",
+   "text_sha256": "dc8055c95db1340062e3b94bc655bfcd812aca863d10f23a609f2b57b3c49a15",
+   "clauses": [
+    [
+     0,
+     0.0,
+     "It is built as four planes."
+    ],
+    [
+     28,
+     1.8,
+     "The pipeline plane is a deterministic Step Functions spine,"
+    ],
+    [
+     88,
+     5.1,
+     "thirty nine states,"
+    ],
+    [
+     108,
+     6.3,
+     "that hands each stage to an agent and waits;"
+    ],
+    [
+     153,
+     8.84,
+     "eight Lambdas sit around it."
+    ],
+    [
+     182,
+     10.29,
+     "The data plane is a lakehouse in S3 Tables:"
+    ],
+    [
+     226,
+     12.97,
+     "raw data lands in Bronze,"
+    ],
+    [
+     252,
+     14.51,
+     "where personal data stays;"
+    ],
+    [
+     279,
+     16.01,
+     "Silver applies named rules,"
+    ],
+    [
+     307,
+     17.68,
+     "redacting personal data,"
+    ],
+    [
+     332,
+     19.29,
+     "removing duplicates,"
+    ],
+    [
+     353,
+     20.58,
+     "and stripping identifiers the customer never gave;"
+    ],
+    [
+     404,
+     23.3,
+     "Gold splits it for training,"
+    ],
+    [
+     433,
+     24.82,
+     "and a fingerprinted extract is what the model learns from."
+    ],
+    [
+     492,
+     27.48,
+     "The governance plane turns a judged model into evidence:"
+    ],
+    [
+     549,
+     30.44,
+     "gates with confidence intervals,"
+    ],
+    [
+     582,
+     32.21,
+     "a provenance card on the registered model,"
+    ],
+    [
+     625,
+     34.45,
+     "and SageMaker Unified Studio,"
+    ],
+    [
+     655,
+     36.69,
+     "where a person reviews it."
+    ],
+    [
+     682,
+     38.02,
+     "The audit plane reconciles what every run actually cost."
+    ]
+   ]
+  },
+  "s4-build": {
+   "mp3_sha256": "f30d1b1e8204c5b804fc9703c543f3496e26f3a1fa9a71d406a97a7bddab1b92",
+   "text_sha256": "3239bc97a4c8d3d6f23544d19bce4bd28014404ebae6535ccfdc21d19371732e",
+   "clauses": [
+    [
+     0,
+     0.0,
+     "No agent loop here is hand-written."
+    ],
+    [
+     36,
+     2.01,
+     "Each of the seven agents is an Amazon Bedrock AgentCore Harness:"
+    ],
+    [
+     101,
+     5.8,
+     "the model,"
+    ],
+    [
+     112,
+     6.54,
+     "the instructions,"
+    ],
+    [
+     130,
+     7.61,
+     "the tools,"
+    ],
+    [
+     141,
+     8.43,
+     "the skills and the limits are declared as configuration,"
+    ],
+    [
+     198,
+     11.33,
+     "and AWS runs the loop in a session of its own,"
+    ],
+    [
+     245,
+     14.29,
+     "with a shell and a file system."
+    ],
+    [
+     277,
+     16.14,
+     "That is what lets an agent run the job instead of describing it."
+    ],
+    [
+     342,
+     19.13,
+     "Nineteen skill mounts across the seven harnesses come from a pinned copy in S3,"
+    ],
+    [
+     422,
+     23.67,
+     "so a skill library moving on its own cannot change what ran."
+    ],
+    [
+     483,
+     27.22,
+     "Changing behaviour is a configuration change,"
+    ],
+    [
+     529,
+     29.87,
+     "reviewed like code."
+    ],
+    [
+     549,
+     31.19,
+     "And when a model provider has a bad hour,"
+    ],
+    [
+     591,
+     33.4,
+     "the harnesses can switch models without a redeploy."
+    ]
+   ]
+  },
+  "s5-design": {
+   "mp3_sha256": "b6d36f3199bf891997cf2c5f171895d579215fbd331451077920895fa2ec24d7",
+   "text_sha256": "458cffff05e2895fcff6253524f71a1b7ebc118b65c4869ed4db3879b1dcc8e4",
+   "clauses": [
+    [
+     0,
+     0.0,
+     "Four decisions carry the design."
+    ],
+    [
+     33,
+     1.85,
+     "First,"
+    ],
+    [
+     40,
+     2.43,
+     "gates fail closed:"
+    ],
+    [
+     59,
+     3.76,
+     "only a literal pass passes,"
+    ],
+    [
+     87,
+     5.64,
+     "and a score decides on its confidence interval,"
+    ],
+    [
+     135,
+     8.02,
+     "not on a lucky point estimate."
+    ],
+    [
+     166,
+     9.62,
+     "Second,"
+    ],
+    [
+     174,
+     10.35,
+     "the measuring instrument is fixed."
+    ],
+    [
+     209,
+     12.08,
+     "For the checks that matter,"
+    ],
+    [
+     237,
+     13.32,
+     "the agent must download a canonical scorer and run it unchanged,"
+    ],
+    [
+     302,
+     16.73,
+     "so a measure cannot drift between runs."
+    ],
+    [
+     342,
+     19.12,
+     "Third,"
+    ],
+    [
+     349,
+     19.7,
+     "every claim is derived from its source:"
+    ],
+    [
+     389,
+     21.67,
+     "the agent count from the configs,"
+    ],
+    [
+     423,
+     23.52,
+     "the state count from the state machine,"
+    ],
+    [
+     463,
+     25.54,
+     "the rules on the architecture diagram from the code that runs them."
+    ],
+    [
+     531,
+     28.64,
+     "Fourth,"
+    ],
+    [
+     539,
+     29.2,
+     "every guard has been watched to fail:"
+    ],
+    [
+     577,
+     31.14,
+     "each one is deliberately broken in turn,"
+    ],
+    [
+     618,
+     33.34,
+     "to prove it would have caught the break."
+    ]
+   ]
+  },
+  "s6-results": {
+   "mp3_sha256": "219edbae0160b09751919811c996dfe53fac0b3c1a8509956a77a7c4546b7862",
+   "text_sha256": "c9654590e5f46bcea5a8b7fa02b1f578bc587589f0b50fe0630b5437bc3e20ab",
+   "clauses": [
+    [
+     0,
+     0.0,
+     "Here is what ran,"
+    ],
+    [
+     18,
+     1.17,
+     "end to end,"
+    ],
+    [
+     30,
+     2.18,
+     "through the pipeline."
+    ],
+    [
+     52,
+     3.23,
+     "Raw records for a store were generated,"
+    ],
+    [
+     92,
+     5.48,
+     "built into Bronze,"
+    ],
+    [
+     111,
+     6.71,
+     "Silver and Gold,"
+    ],
+    [
+     128,
+     8.17,
+     "with thirty pieces of personal data redacted,"
+    ],
+    [
+     174,
+     10.68,
+     "and a model was trained on the extract,"
+    ],
+    [
+     214,
+     12.7,
+     "judged,"
+    ],
+    [
+     222,
+     13.33,
+     "deployed,"
+    ],
+    [
+     232,
+     14.13,
+     "tested and torn down,"
+    ],
+    [
+     254,
+     15.72,
+     "for about forty-five cents of compute."
+    ],
+    [
+     293,
+     17.76,
+     "On one hundred and twenty held-out questions,"
+    ],
+    [
+     339,
+     20.03,
+     "the untrained model matched zero;"
+    ],
+    [
+     373,
+     22.02,
+     "the trained one matched seventy-two point five percent."
+    ],
+    [
+     429,
+     24.96,
+     "Then the gate learned to check identifiers,"
+    ],
+    [
+     473,
+     27.09,
+     "and the same model failed:"
+    ],
+    [
+     500,
+     28.62,
+     "zero answers out of one hundred and twenty were free of invented numbers."
+    ],
+    [
+     574,
+     32.28,
+     "With the rule added to the data,"
+    ],
+    [
+     607,
+     33.95,
+     "a new model passed:"
+    ],
+    [
+     627,
+     35.24,
+     "one hundred and twenty out of one hundred and twenty,"
+    ],
+    [
+     681,
+     37.56,
+     "with answer quality unchanged."
+    ],
+    [
+     712,
+     39.42,
+     "A person rejected the first and approved the second."
+    ]
+   ]
+  },
+  "s7-console": {
+   "mp3_sha256": "a51f0cda576c41aca48f5ea961ccda9942329aa3f738fe6df7dfb43f4e42a1e4",
+   "text_sha256": "4617ffbf9086ea23797e7b5c171425f0c9875d6c4e4afed2fb2f57562c43972c",
+   "clauses": [
+    [
+     0,
+     0.0,
+     "And you can see all of it."
+    ],
+    [
+     27,
+     1.29,
+     "This console is LLMOps Governance,"
+    ],
+    [
+     62,
+     3.4,
+     "the operator's view."
+    ],
+    [
+     83,
+     4.53,
+     "The pipeline tab shows every stage of a run as it happens,"
+    ],
+    [
+     142,
+     7.57,
+     "including the data stages."
+    ],
+    [
+     169,
+     9.14,
+     "The outcome tab puts a trained model next to its untrained baseline on the same questions,"
+    ],
+    [
+     260,
+     13.61,
+     "with the data journey,"
+    ],
+    [
+     283,
+     14.75,
+     "the training numbers,"
+    ],
+    [
+     305,
+     15.86,
+     "the cost and the answers side by side."
+    ],
+    [
+     344,
+     18.01,
+     "The data tab shows what each rule caught."
+    ],
+    [
+     386,
+     20.23,
+     "The cost tab prices every run."
+    ],
+    [
+     417,
+     22.18,
+     "And the same evidence is on the model's own page in Unified Studio,"
+    ],
+    [
+     485,
+     25.68,
+     "where the approval happens."
+    ],
+    [
+     513,
+     27.17,
+     "That is the takeaway:"
+    ],
+    [
+     535,
+     28.4,
+     "not a faster way to train a model,"
+    ],
+    [
+     570,
+     30.35,
+     "but a way to know which model to trust,"
+    ],
+    [
+     610,
+     32.35,
+     "and to show why."
+    ]
+   ]
+  }
+ }
+}

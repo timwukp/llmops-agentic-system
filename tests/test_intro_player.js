@@ -110,12 +110,24 @@ function parseScenes(html) {
       beat.dataset.t = b[1];
       return beat;
     });
+    // data-en, where build_intro.py resolved one, is the same element's English time.
+    [...m[2].matchAll(/data-t="[0-9.]+"( data-en="([0-9.]+)")?/g)].forEach((b, i) => {
+      if (b[2]) el.beats[i].dataset.en = b[2];
+    });
     out.set(m[1], el);
   }
   return out;
 }
 
 const html = fs.readFileSync(PAGE, "utf8");
+// The measured clip lengths the page was built from. Every duration, total and ratio below
+// is derived from this file: the v1 literals (5:04, 43.61, 64.18) outlived the v1 audio and
+// failed five assertions for as long as nothing ran this file.
+const DURS = JSON.parse(fs.readFileSync(
+  path.join(__dirname, "..", "deploy", "console", "intro", "durations.json"), "utf8"));
+const total = lang => Object.values(DURS[lang]).reduce((a, b) => a + b, 0);
+const clock = s => { s = Math.max(0, Math.round(s));
+                     return Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0"); };
 const scenes = parseScenes(html);
 
 // ── virtual clock + rAF ──────────────────────────────────────────────────────
@@ -256,7 +268,8 @@ eq($("segs").children.length, 7, "one progress segment per scene");
 ok($(P.SCENES[0]).classList.contains("on"), "scene 1 is visible behind the gate");
 ok(!$("gate").classList.contains("off"), "the gate is up: no audio without a gesture");
 eq(P.idx, -1, "nothing is playing yet");
-ok($("clock").textContent.endsWith("/ 5:04"), `clock shows the English total (${$("clock").textContent})`);
+ok($("clock").textContent.endsWith("/ " + clock(total("en"))),
+   `clock shows the English total (${$("clock").textContent})`);
 
 // The segments must be proportional to real measured durations, not equal width: a
 // 68s Japanese scene and a 41s English one are not the same slice of five minutes.
@@ -280,14 +293,32 @@ ok($("cap").innerHTML.length > 10, "a caption is showing");
 ok($("clock").textContent.startsWith("0:2"), `clock tracks the audio (${$("clock").textContent})`);
 
 const seg0 = $("segs").children[0].firstChild;
-ok(parseFloat(seg0.style.width) > 40 && parseFloat(seg0.style.width) < 55,
-   `scene 1's segment is ~47% full at 20s of 42.5s (${seg0.style.width})`);
+const want0 = 100 * 20 / DURS.en["s1-problem"];
+ok(Math.abs(parseFloat(seg0.style.width) - want0) < 5,
+   `scene 1's segment is ~${want0.toFixed(0)}% full at 20s of ${DURS.en["s1-problem"]}s (${seg0.style.width})`);
+
+// English beats fire on the measured English clause (data-en), not on the proportional
+// data-t: at 20s the beats that are in are exactly those whose English time has passed.
+const s1 = byId.get("s1-problem").beats;
+const enDue = s1.filter(b => parseFloat(b.dataset.en || b.dataset.t) <= 20).length;
+eq(beatsIn("s1-problem"), enDue, "at 20s exactly the beats whose English clause has started are in");
+
 
 // Every beat must be IN by the end of the clip -- that is the whole contract of
 // authoring beats in English seconds.
 stepFrames(23000);
 eq(beatsIn("s1-problem"), byId.get("s1-problem").beats.length,
    "every scene-1 beat has fired by the end of the clip");
+
+// Scene 6 is where the proportional times were furthest from the voice ("deploy" 3 s
+// early), so it is where the two schedules disagree enough to tell them apart.
+P.go(5, true);
+stepFrames(12000);
+const s6 = byId.get("s6-results").beats;
+const due = (key, t) => s6.filter(b => parseFloat(b.dataset[key] || b.dataset.t) <= t).length;
+eq(beatsIn("s6-results"), due("en", 12), "English scene 6 at 12s follows the measured clauses");
+ok(due("en", 12) !== due("t", 12),
+   `which is not the data-t schedule (${due("en", 12)} vs ${due("t", 12)} beats due)`);
 
 P.go(0, true);            // reset for the advance test
 stepFrames(1000);
@@ -380,22 +411,27 @@ eq(wrongScene.length, 0,
 // happen, because a total that stayed English would mean the whole progress model still
 // thought the narration was 5:04 long.
 stepFrames(20);
-ok($("clock").textContent.endsWith("/ 7:27"), `the total is Japanese, not English (${$("clock").textContent})`);
+ok($("clock").textContent.endsWith("/ " + clock(total("ja"))),
+   `the total is Japanese, not English (${$("clock").textContent})`);
 
-// Beat scaling: Japanese s4 is 64.18s against English 43.61s, so a beat authored at
-// 20s must fire ~29.4s in. Without scaling, the last beat of a Japanese scene would
-// land 20 seconds before the sentence that describes it.
+// Beat scaling: every other language scales data-t by its clip length over the English
+// one, so a Japanese beat lands as far into its longer clip as the authored time is into
+// the English. Without scaling, the last beat of a Japanese scene would land seconds
+// before the sentence that describes it. data-en is English-only and must be ignored here.
 const k = P.beatScale("s4-build");
-ok(k > 1.4 && k < 1.5, `Japanese beats are scaled by ${k.toFixed(3)}`);
-eq(P.sceneDur("s4-build", "en"), 43.61, "English s4 duration is the measured one");
-eq(P.sceneDur("s4-build", "ja"), 64.18, "Japanese s4 duration is the measured one");
+const wantK = DURS.ja["s4-build"] / DURS.en["s4-build"];
+ok(Math.abs(k - wantK) < 1e-9, `Japanese beats are scaled by ${k.toFixed(3)}`);
+eq(P.sceneDur("s4-build", "en"), DURS.en["s4-build"], "English s4 duration is the measured one");
+eq(P.sceneDur("s4-build", "ja"), DURS.ja["s4-build"], "Japanese s4 duration is the measured one");
 
 P.go(3, true);
 stepFrames(21000);
-const enBeatsAt21 = 12;   // authored beats at or before 21s in s4
-ok(beatsIn("s4-build") < enBeatsAt21,
-   `at 21s the Japanese scene is behind the English beat schedule (${beatsIn("s4-build")} in)`);
-stepFrames(31000);        // 52s: past 34s * 1.47
+const s4 = byId.get("s4-build").beats;
+eq(beatsIn("s4-build"), s4.filter(b => parseFloat(b.dataset.t) * k <= 21).length,
+   "at 21s the Japanese scene is on the scaled data-t schedule, not on data-en");
+ok(beatsIn("s4-build") < s4.filter(b => parseFloat(b.dataset.t) <= 21).length,
+   `and behind the unscaled schedule (${beatsIn("s4-build")} in)`);
+stepFrames(Math.ceil(DURS.ja["s4-build"] * 1000) - 21000 + 500);
 eq(beatsIn("s4-build"), byId.get("s4-build").beats.length,
    "and every beat has still fired by the end of the longer Japanese clip");
 

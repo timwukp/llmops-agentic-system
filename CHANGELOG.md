@@ -5,6 +5,16 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
 ## [Unreleased]
 
+### The English Introduction shows each picture on its own words
+
+- **Measured, not estimated:** beats were placed at each sentence's character offset, which assumes an
+  even speaking rate; the English (generative) voice does not have one, and scene 6 drew "deploy",
+  "test" and "teardown" about 3 s early. Each beat now names its English clause, and
+  `intro/measure_clauses.py` measures every clause's start from the clip (`intro/clauses.json`).
+  English uses that time; Mandarin, Cantonese, Japanese and Korean are unchanged.
+- **A test nothing ran:** `tests/test_intro_player.js` was not in the suite and had been failing five
+  assertions on v1 durations. `tests/test_intro_timing.py` runs it, and its numbers are now derived.
+
 ### The Introduction tells the platform as it is now (v2)
 
 - **New script, five languages:** a model that passed every gate and was still wrong; evidence at

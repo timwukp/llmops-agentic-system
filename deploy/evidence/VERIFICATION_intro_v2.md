@@ -34,6 +34,33 @@ the app; then "好，照這個方向，翻譯成另外三種語言" after review
   in all five languages, and checks that no language frames the agents as replacing people; five
   negative controls, each caught.
 
-## Not yet verified live
+## Verified live (2026-10-27)
 
-- The Introduction played in the deployed console (owner), after the merge and a deploy from main.
+- **Deployed from main** (`f26bc9b`, PR #186's merge) with `deploy/console/deploy.sh`; the function's
+  code was updated at 07:23:53 UTC. The deployed package, downloaded back, is the build from main:
+  `intro.html` sha256 `ca72ca0e…` on both sides, `frontend.html` `aced8e85…` on both sides, and the
+  35 clips byte-identical to the repo's, each compared by its language folder.
+- **Played by the owner, all five languages.** Mandarin and Cantonese: pictures and narration match.
+  **English: they do not**, and the owner asked for English to follow the Mandarin and Cantonese
+  versions.
+
+## English timing (the fix, `intent/intro-en-timing`)
+
+- **Cause, measured.** The beats sat at each sentence's character offset x the clip length, which
+  assumes an even speaking rate. The other four languages scale the same times by their clip length
+  and were judged right. The English voice (generative) pauses at lists and slows on numbers.
+  Against the clause starts measured from the English clips, the old times were early by up to
+  3.2 s in scene 6 ("judge" 9.5 s against 12.70 s spoken, "deploy" 10.3 s against 13.33 s, "$0.45"
+  13 s against 15.72 s) and by 1-2.2 s through scene 5.
+- **Measured how.** `measure_clauses.py` takes ffmpeg's silencedetect pauses (-40 dB, 80 ms) and
+  assigns one to each clause by dynamic programming on clause length. Taking the pause nearest each
+  clause's estimate instead moved scene 6 by one clause from "with thirty pieces" on, because the
+  voice pauses inside "Silver and Gold". 133 clauses across 7 scenes.
+- **Fixed how.** 108 beats name their clause (`data-at`); the build writes the measured start as
+  `data-en`, which only English reads. Mandarin, Cantonese, Japanese and Korean are byte-for-byte
+  the same schedule as before (`data-t` untouched).
+- **A test that was not running.** `tests/test_intro_player.js` was outside pytest and CI and failed
+  5 of 72 assertions on main (v1 durations: 5:04, 43.61 s, 64.18 s). It now derives them from
+  `durations.json`, and `tests/test_intro_timing.py` runs it. Against main's page its new check
+  fails ("English scene 6 at 12 s ... is not the data-t schedule: 19 vs 19"); against this branch,
+  76 of 76 pass.
