@@ -5,6 +5,13 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
 ## [Unreleased]
 
+### The console is LLMOps Governance
+
+- "LLMOps Admin" becomes **LLMOps Governance** (中文：LLMOps 治理) in the page title, the sidebar, the intro
+  page, the console docs and the generated console diagram. Display names only: the repo, the
+  `llmops-*` resources and every API are unchanged. The sidebar brand is one line at 13px so the longer
+  name fits beside its toggle.
+
 ### Identifier grounding: no answer states a number the question never gave
 
 - **Found on the Outcome tab.** Every fine-tuned answer of the 2026-10-23 demo run ended in an invented

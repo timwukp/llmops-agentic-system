@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Deploy the LLMOps Admin dashboard: Lambda + HTTP API Gateway + DynamoDB + Cognito.
+# Deploy the LLMOps Governance console: Lambda + HTTP API Gateway + DynamoDB + Cognito.
 # Ported from bedrock-agentcore-agent-ops-console/deploy/deploy.sh.
 # Idempotent-ish: safe to re-run for code updates (skips resources that already exist).
 #
