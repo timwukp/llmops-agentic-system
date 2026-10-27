@@ -490,7 +490,7 @@ svg.append(wire(f"M{660+CW+40},{260+CH/2} L{982},{260+CH/2}", "wireG", "ahG"))
 svg.append('</svg>')
 open(os.path.join(OUT, "architecture-low-level.svg"), "w").write("\n".join(svg))
 
-# ================= CONSOLE: the LLMOps Admin dashboard's own plumbing (1240 x 760) =================
+# ================= CONSOLE: the LLMOps Governance console's own plumbing (1240 x 760) =================
 #
 # Layout law here is a band-per-plane, because the dashboard's whole design claim
 # is that the three planes have different rules: GETs are public, every POST is
@@ -518,7 +518,7 @@ CH2 = 760
 svg = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1240 {CH2}" font-family="system-ui,-apple-system,\'Segoe UI\',Roboto,sans-serif">']
 svg.append(STYLE)
 svg.append(f'  <rect class="bg" x="0" y="0" width="1240" height="{CH2}" rx="16"/>')
-svg.append('  <text class="title" x="30" y="40" font-size="18">LLMOps Admin console — one Lambda, read-mostly, server-enforced gates</text>')
+svg.append('  <text class="title" x="30" y="40" font-size="18">LLMOps Governance console — one Lambda, read-mostly, server-enforced gates</text>')
 svg.append(f'  <text class="sub" x="30" y="60">deploy/console/ · {TAB_N} tabs · self-contained HTML from cold start · public GETs · Cognito on every POST except the 3 session routes that establish it</text>')
 
 # ---- the operator path in (left column, top to bottom) ----

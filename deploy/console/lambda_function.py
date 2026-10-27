@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-LLMOps Admin — AWS Lambda handler (HTTP API Gateway).
+LLMOps Governance console — AWS Lambda handler (HTTP API Gateway).
 
 Operator dashboard for the llmops-agentic-system pipeline: one Lambda serves the
 dashboard HTML (GET /) and the JSON API (GET/POST /api/*). Design and most of the

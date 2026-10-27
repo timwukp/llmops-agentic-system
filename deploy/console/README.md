@@ -1,4 +1,4 @@
-# LLMOps Admin Console
+# LLMOps Governance Console
 
 Operator dashboard for the llmops-agentic-system pipeline: one Lambda serves both the
 dashboard HTML (`GET /`) and the JSON API (`GET/POST /api/*`) behind an HTTP API Gateway.

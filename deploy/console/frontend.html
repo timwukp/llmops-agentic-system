@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>LLMOps Admin</title>
+<title>LLMOps Governance</title>
 <style>
   :root {
     --bg:#0d0d0d; --panel:#1a1a19; --panel2:#242423; --line:rgba(255,255,255,.10);
@@ -148,7 +148,8 @@
   nav.tabs { position:fixed; left:0; top:0; bottom:0; width:var(--nav); background:var(--panel);
              border-right:1px solid var(--line); padding:14px 10px; overflow-y:auto; z-index:6;
              display:flex; flex-direction:column; gap:2px; }
-  nav.tabs .brand { display:flex; align-items:center; gap:10px; padding:2px 8px 14px; font-weight:600; }
+  nav.tabs .brand { display:flex; align-items:center; gap:10px; padding:2px 8px 14px; font-weight:600;
+                   font-size:13px; white-space:nowrap; }  /* "LLMOps Governance" in the 218px rail, beside the toggle */
   nav.tabs .brand .logo { width:22px; height:22px; border-radius:6px; background:var(--accent); }
   nav.tabs .navgroup { font-size:11px; letter-spacing:.06em; text-transform:uppercase;
                        color:var(--muted); padding:14px 10px 4px; font-weight:600; }
@@ -247,7 +248,7 @@
 </header>
 
 <nav class="tabs" aria-label="Sections">
-  <div class="brand"><div class="logo"></div>LLMOps Admin<button class="navtoggle" id="navToggle" onclick="toggleNav()" aria-label="Collapse sidebar" title="Collapse sidebar">&lsaquo;</button></div>
+  <div class="brand"><div class="logo"></div>LLMOps Governance<button class="navtoggle" id="navToggle" onclick="toggleNav()" aria-label="Collapse sidebar" title="Collapse sidebar">&lsaquo;</button></div>
   <div class="navgroup">Get started</div>
   <button data-tab="intro" onclick="showTab('intro')">Introduction</button>
   <button data-tab="architecture" onclick="showTab('architecture')">Architecture</button>
