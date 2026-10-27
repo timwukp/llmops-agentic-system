@@ -107,7 +107,7 @@ ALLOWED = (b"6833" + b"13688378", b"7631" + b"04351884", b"1234" + b"56789012")
 #: this laptop, single-threaded CPython does 3.1M sha256/s, so the whole 1e12 space falls in
 #: about 4 days -- and a GPU does it in roughly 100 seconds. So the KDF is iterated. At 200k
 #: iterations a candidate costs ~16 ms, which makes the same sweep ~500 GPU-years, while the
-#: scan stays cheap because only 12-digit runs are ever hashed: measured across all 397
+#: scan stays cheap because only 12-digit runs are ever hashed: measured across all 402
 #: tracked files there are 84 such runs, 11 distinct, and hashing the distinct set takes 0.16 s
 #: for the entire repo. (Re-measured whenever either number moves, and they move
 #: INDEPENDENTLY, which is why both are derived and neither is inferred from the other, and
@@ -252,8 +252,10 @@ ALLOWED = (b"6833" + b"13688378", b"7631" + b"04351884", b"1234" + b"56789012")
 #: 12-digit runs, tests/test_provenance_card.py's documentation account: runs 82 -> 84, distinct held at 11.
 #: Then 388 files went to 394 (identifier grounding: the scorer, its tests, evidence and intent chain). No
 #: 12-digit run; the runs held at 84.
-#: Then 394 files became 397 (the console display name: its intent chain). No 12-digit run; the runs held
+#: Then 394 files went to 397 (the console display name: its intent chain). No 12-digit run; the runs held
 #: at 84.
+#: Then 397 files became 402 (the Architecture refresh: its guard, evidence and intent chain). No 12-digit
+#: run; the runs held at 84.
 #: Dollar limits and percentages only -- no 12-digit run, so the runs held at 74 again.
 #: For EIGHT commits
 #: running, the file count moved and the run count did not move once, and then one commit moved

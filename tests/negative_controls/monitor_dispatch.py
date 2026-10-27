@@ -6915,6 +6915,35 @@ case("Identifiers: the prompt drops 'do NOT author your own'", "agents/eval/harn
          "record its sha256 in report.json as identifier_scorer_sha256."),
      ["tests/test_identifier_grounding.py::test_the_eval_prompt_runs_this_scorer_verbatim_and_gates_it"])
 
+# The SVG, not the generator: the runner does not regenerate, and the page shows the SVG. That the
+# SVG is what the generator emits is test_svg_geometry::test_the_svgs_match_their_generator's job.
+_HSVG, _APT = "docs/architecture-high-level.svg", "tests/test_architecture_page.py::"
+
+
+def _swa(old, new):
+    def mutate(t):
+        assert t.count(old) == 1, f"anchor moved: {old[:60]!r}"
+        return t.replace(old, new, 1)
+    return mutate
+
+
+# The page's caption says git again while every mount is s3.
+case("Architecture: the caption says git again", "deploy/console/frontend.html",
+     _swa("skills mounted from a pinned S3 mirror", "skills mounted from git"),
+     [f"{_APT}test_the_page_caption_names_the_real_skill_source_kind"])
+# The data plane names a hand-typed rule list that has drifted from transform.py.
+case("Architecture: the diagram drops a Silver rule", _HSVG,
+     _swa(" · strip_ungrounded_ids · exact_dup_after_strip</text>", "</text>"),
+     [f"{_APT}test_the_data_plane_lists_the_silver_rules_that_run"])
+# The governance band dropped: the picture ends at the gate again.
+case("Architecture: the governance band dropped", _HSVG,
+     _swa("GOVERNANCE PLANE — the evidence goes where the approver looks", "the evidence goes where the approver looks"),
+     [f"{_APT}test_the_diagram_draws_all_four_planes"])
+# The state count typed instead of derived.
+case("Architecture: a stale state count", _HSVG,
+     _swa("before Complete (39 states)", "before Complete (38 states)"),
+     [f"{_APT}test_the_governance_plane_states_the_live_state_count"])
+
 #: Where the pristine text of the file currently mutated is parked, so a kill -9 -- which
 #: no handler can intercept -- still leaves the original recoverable. Under the repo root
 #: rather than /tmp because it must be obvious to whoever finds the tree dirty, and
