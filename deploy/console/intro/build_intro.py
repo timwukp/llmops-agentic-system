@@ -49,6 +49,20 @@ Two things this does beyond substitution, both of which are silent bugs otherwis
    shipped the owner's browser went on playing the v1 English it had cached while the
    deployed clips were v2 (2026-10-27). The server ignores the query; it only has to make
    a changed clip a different URL.
+
+5. **Captions that show the same sentences in every language.** The caption used to be a
+   150-character window centred on the clip's proportional position. 150 characters is
+   two thirds of a Chinese scene and a fifth of an English one, so at 0:06 of scene 1 the
+   Mandarin and Cantonese showed the opening sentences while the English showed a slice
+   that began mid-word ("… ned on a store's"), and the owner read it as an English script
+   that had not been updated (2026-10-27). Each scene is now CAPTION_PAGES pages that
+   break between sentences. Mandarin chooses the breaks (the sentence start nearest each
+   third of its text); a language whose sentence at the same index starts at about the
+   same fraction of its text (within PAGE_MATCH) breaks at that same sentence, so English,
+   Mandarin and Cantonese show the same sentences on the same page; Japanese and Korean,
+   which split sentences differently, break at the sentence start nearest Mandarin's
+   fraction unless narration.json's `caption_breaks` names the sentence. A page turns when the voice reaches its first sentence: measured for English
+   (clauses.json), proportional for the rest.
 """
 import argparse
 import hashlib
@@ -56,6 +70,7 @@ import json
 import pathlib
 import re
 import sys
+import unicodedata
 
 HERE = pathlib.Path(__file__).resolve().parent
 REPO = HERE.parent.parent.parent
@@ -68,6 +83,15 @@ AUDIO = HERE / "audio"
 #: Beats before this many seconds (titles, the first line) appear as the clip starts in
 #: every language and need no anchor.
 ANCHOR_FROM = 1.5
+
+#: Caption pages per scene, the reference language that chooses where they break, and how
+#: far (as a fraction of the text) a language's same-numbered sentence may sit from the
+#: reference's before it is judged not to be the same sentence.
+CAPTION_PAGES, CAPTION_REF, PAGE_MATCH = 3, "zh", 0.08
+#: A page may not be wider than this many columns (CJK counts two): two caption lines at
+#: the page's 1180 px width and 13.5 px type.
+PAGE_COLS = 350
+_SENTENCE = re.compile(r"[^.?!。？！]+[.?!。？！]+[”」\"')]*\s*")
 _BEAT = re.compile(r'(?:data-at="([0-9]+)(?:\+([0-9.]+))?" )?data-t="([0-9.]+)"')
 
 #: placeholder -> repo-relative diagram. The prefix is also the id namespace.
@@ -191,6 +215,67 @@ def anchor_english(html: str, spec: dict, durations: dict, clauses: dict) -> tup
     return out, bad
 
 
+def sentence_starts(text: str) -> list:
+    return [m.start() for m in _SENTENCE.finditer(text)]
+
+
+def columns(text: str) -> int:
+    return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in text)
+
+
+def caption_pages(spec: dict, clauses: dict) -> tuple:
+    """({lang: {scene: [[start char, end char, English start seconds or None], ...]}}, complaints)."""
+    out, bad = {lang: {} for lang in spec["langs"]}, []
+    for sid in spec["scenes"]:
+        ref = spec["text"][CAPTION_REF][sid]
+        rs = sentence_starts(ref)
+        idx = [0]
+        for k in range(1, CAPTION_PAGES):
+            nxt = min((i for i in range(1, len(rs)) if i > idx[-1]),
+                      key=lambda i: abs(rs[i] - len(ref) * k / CAPTION_PAGES), default=None)
+            if nxt is not None:
+                idx.append(nxt)
+        fracs = [rs[i] / len(ref) for i in idx]
+        for lang in spec["langs"]:
+            text = spec["text"][lang][sid]
+            ss = sentence_starts(text)
+            if all(i < len(ss) and abs(ss[i] / len(text) - f) <= PAGE_MATCH
+                   for i, f in zip(idx, fracs)):
+                starts = [ss[i] for i in idx]
+            else:
+                starts = [0]
+                for f in fracs[1:]:
+                    starts.append(min((a for a in ss if a > starts[-1]),
+                                      key=lambda a: abs(a / len(text) - f)))
+            for k, prefix in enumerate(
+                    spec.get("caption_breaks", {}).get(sid, {}).get(lang) or [], start=1):
+                if prefix is None:
+                    continue
+                at = [x for x in ss if text.startswith(prefix, x)]
+                if not at or k >= len(starts):
+                    bad.append(f"{lang}/{sid}: caption break {prefix!r} begins no sentence")
+                    continue
+                starts[k] = at[0]
+            if starts != sorted(set(starts)):
+                bad.append(f"{lang}/{sid}: caption pages out of order: {starts}")
+            ends = starts[1:] + [len(text)]
+            pages = []
+            for a, b in zip(starts, ends):
+                if columns(text[a:b].strip()) > PAGE_COLS:
+                    bad.append(f"{lang}/{sid}: a caption page is {columns(text[a:b].strip())} "
+                               f"columns, over the {PAGE_COLS} two lines hold")
+                t = None
+                if lang == "en":
+                    hit = [c[1] for c in clauses[sid]["clauses"] if c[0] == a]
+                    if not hit:
+                        bad.append(f"en/{sid}: a caption page starts at character {a}, "
+                                   "which begins no measured clause")
+                    t = hit[0] if hit else None
+                pages.append([a, b, t])
+            out[lang][sid] = pages
+    return out, bad
+
+
 def clip_versions(langs, scenes) -> dict:
     """{lang: {scene: first 12 hex of the clip's sha256}}, for the clip URLs."""
     return {l: {s: hashlib.sha256((AUDIO / l / f"{s}.mp3").read_bytes()).hexdigest()[:12]
@@ -231,11 +316,15 @@ def build() -> str:
     bad = check_beats(html, durations["en"])
     if bad:
         raise SystemExit("FATAL: unreachable animation beats:\n  " + "\n  ".join(bad))
-    html, bad = anchor_english(html, spec, durations,
-                               json.loads(CLAUSES.read_text(encoding="utf-8"))["en"])
+    clauses = json.loads(CLAUSES.read_text(encoding="utf-8"))["en"]
+    html, bad = anchor_english(html, spec, durations, clauses)
     if bad:
         raise SystemExit("FATAL: English beats not on the English voice:\n  "
                          + "\n  ".join(bad))
+
+    pages, bad = caption_pages(spec, clauses)
+    if bad:
+        raise SystemExit("FATAL: captions:\n  " + "\n  ".join(bad))
 
     subs = {
         "__SCENES__": json.dumps(scenes),
@@ -246,6 +335,7 @@ def build() -> str:
         "__NARR__": json.dumps(spec["text"], ensure_ascii=False),
         "__DUR__": json.dumps(durations),
         "__AUDIO_V__": json.dumps(clip_versions(langs, scenes)),
+        "__CAPS__": json.dumps(pages),
     }
     for ph, (prefix, rel) in DIAGRAMS.items():
         subs[ph] = load_svg(rel, prefix)

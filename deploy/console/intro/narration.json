@@ -105,6 +105,12 @@
       "bcp47": "ko-KR"
     }
   },
+  "_caption_breaks_comment": "Where a caption page starts, when the sentence build_intro.py would pick by position is not the one Mandarin breaks at. Each list is pages 2 and 3; null keeps the automatic choice. Japanese and Korean split sentences differently from the other three, so position alone put three breaks one sentence early or late. Not part of the synthesis stamp: editing this re-synthesizes nothing.",
+  "caption_breaks": {
+    "s3-architecture": {"ja": ["データのプレーンは", null]},
+    "s5-design": {"ko": ["중요한 검사에서는", null]},
+    "s6-results": {"ja": [null, "次にゲートが識別子を"]}
+  },
   "titles": {
     "en": {
       "s1-problem": "A model that passed, and was still wrong",

@@ -5,6 +5,15 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
 ## [Unreleased]
 
+### The captions show the same sentences in every language
+
+- **What the owner saw:** English scene 1 at 0:06 captioned "… ned on a store's customer
+  conversations …" while Mandarin and Cantonese showed the scene from its first sentence. The caption
+  was a 150-character window, which is two thirds of a Chinese scene and a fifth of an English one.
+- **Now:** three caption pages per scene, breaking between sentences, at the same sentence in English,
+  Mandarin and Cantonese in every scene, and at a named sentence for three Japanese/Korean breaks.
+  English turns the page on the measured clause. No spoken text changed, so no clip was re-made.
+
 ### A changed narration clip reaches the listener
 
 - **The English the owner heard was v1, from the browser's cache.** The deployed clips were v2 byte

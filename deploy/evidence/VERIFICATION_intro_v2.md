@@ -80,3 +80,19 @@ the app; then "好，照這個方向，翻譯成另外三種語言" after review
 - **Fix.** The page requests `<scene>.mp3?v=<first 12 hex of the clip's sha256>`; the route reads
   the path only and is unchanged. Against the deployed page (no version), the player test fails 3
   assertions naming the unversioned URLs; against this branch it passes.
+
+## The English caption was a slice (`intent/intro-captions`)
+
+- **Reported** with screenshots of scene 1 at 0:06 (2026-10-27): Mandarin and Cantonese captioned
+  the scene from its first sentence; English captioned "… ned on a store's customer conversations,
+  it answered seventy-two point five percent … and ev …". Read as an English script not updated.
+- **What was live was v2** (#188 deployed at 08:48 UTC: the package and the page served over HTTP
+  both equal the build from main, sha256 `4761bb8a…`; 35/35 clips identical). The caption was the
+  defect: a 150-character window centred on the proportional position. English scene 1 is 680
+  characters and Mandarin 226, so the same window was a fifth of one and two thirds of the other.
+- **Fix.** Three pages per scene that break between sentences. Every page in all five languages was
+  printed and compared: English and Cantonese break at Mandarin's sentence in all 7 scenes (21
+  pages); position alone put three Japanese/Korean breaks one sentence off (ja s3, ko s5, ja s6),
+  which `caption_breaks` now names. English turns pages on the measured clause.
+- **Checked.** The player test reproduces the screenshot against the deployed page ("… ed on a
+  store's customer conversations") and passes on this branch in all five languages at 0:06.
