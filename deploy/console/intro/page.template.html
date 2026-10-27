@@ -612,20 +612,28 @@ function buildSegs(){
 }
 
 // ── captions ────────────────────────────────────────────────────────────────
-// A sliding window rather than the whole paragraph: 800 characters of Korean under a
-// 664px stage pushes the stage off screen, and a caption that never moves gives no
-// signal that the audio is still advancing.
+// Pages rather than the whole paragraph: 800 characters of Korean under a 664px stage
+// pushes the stage off screen, and a caption that never moves gives no signal that the
+// audio is still advancing. Each scene is three pages that break between sentences, at the
+// same sentence in English, Mandarin and Cantonese (build_intro.py), so every language
+// shows the same sentences at the same moment. It used to be a 150-character window: two
+// thirds of a Chinese scene, a fifth of an English one, cut mid-word.
+// [start char, end char, English start seconds]: English turns the page on the measured
+// clause; every other language, and English read by the TTS fallback, on its share of
+// the clip.
+const CAPS = __CAPS__;
 function setCaption(sid, t){
   const txt = (NARR[LANG] && NARR[LANG][sid]) || "";
   if (!txt) { $("cap").textContent = ""; return; }
-  const frac = Math.min(1, Math.max(0, t / sceneDur(sid)));
-  const win = 150, mid = Math.round(txt.length * frac);
-  let a = Math.max(0, mid - Math.round(win / 2));
-  let b = Math.min(txt.length, a + win);
-  a = Math.max(0, b - win);
-  $("cap").innerHTML = (a > 0 ? "… " : "")
-    + txt.slice(a, b).replace(/[<>&]/g, c => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;" }[c]))
-    + (b < txt.length ? " …" : "");
+  const pages = (CAPS[LANG] && CAPS[LANG][sid]) || [[0, txt.length, null]];
+  const pos = txt.length * Math.min(1, Math.max(0, t / sceneDur(sid)));
+  let p = pages[0];
+  for (const q of pages) {
+    if (LANG === "en" && audio && q[2] != null ? t >= q[2] : pos >= q[0]) p = q;
+  }
+  $("cap").innerHTML = (p[0] > 0 ? "… " : "")
+    + txt.slice(p[0], p[1]).trim().replace(/[<>&]/g, c => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;" }[c]))
+    + (p[1] < txt.length ? " …" : "");
 }
 
 // ── clock ────────────────────────────────────────────────────────────────────

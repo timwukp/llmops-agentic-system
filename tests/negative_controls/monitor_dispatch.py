@@ -7010,6 +7010,18 @@ case("Intro audio: the clip version is not the clip's hash", "deploy/console/int
      _swi('.read_bytes()).hexdigest()[:12]\n', '.read_bytes()).hexdigest()[-12:]\n'),
      [f"{_BND}test_every_clip_url_changes_when_its_clip_does", f"{_TIM}test_the_player_script_passes"])
 
+# Captions that show the same sentences in every language (intro-captions).
+_CAP = "tests/test_intro_captions.py::"
+# The page never turns: English shows its first third for the whole scene.
+case("Intro captions: the page never turns", _TPL,
+     _swi("if (LANG === \"en\" && audio && q[2] != null ? t >= q[2] : pos >= q[0]) p = q;",
+          "if (false) p = q;"),
+     [f"{_TIM}test_the_player_script_passes"])
+# A named break that no longer begins a sentence (a translation edited under it).
+case("Intro captions: a named break begins no sentence", _NJ,
+     _swi('"s6-results": {"ja": [null, "次にゲートが識別子を"]}', '"s6-results": {"ja": [null, "次にゲートは識別子を"]}'),
+     [f"{_CAP}test_the_captions_build_with_no_complaint"])
+
 #: Where the pristine text of the file currently mutated is parked, so a kill -9 -- which
 #: no handler can intercept -- still leaves the original recoverable. Under the repo root
 #: rather than /tmp because it must be obvious to whoever finds the tree dirty, and

@@ -327,6 +327,19 @@ eq(beatsIn("s6-results"), due("en", 12), "English scene 6 at 12s follows the mea
 ok(due("en", 12) !== due("t", 12),
    `which is not the data-t schedule (${due("en", 12)} vs ${due("t", 12)} beats due)`);
 
+// Captions: the owner's screenshot (2026-10-27) was English scene 1 at 0:06 showing
+// "… ned on a store's customer conversations …" while Mandarin and Cantonese showed the
+// scene from its first sentence. A caption page starts on a sentence, and English turns
+// to page 2 on the measured clause that begins it.
+P.go(0, true);
+stepFrames(6000);
+const firstSentence = lang => P.NARR[lang]["s1-problem"].split(/(?<=[.。])\s*/)[0];
+ok($("cap").innerHTML.startsWith(firstSentence("en")),
+   `English scene 1 at 0:06 captions from its first sentence (${$("cap").innerHTML.slice(0, 50)})`);
+stepFrames(6500);
+ok($("cap").innerHTML.startsWith("… And every one of its answers"),
+   `and at 12.5s has turned to the sentence the voice is on (${$("cap").innerHTML.slice(0, 50)})`);
+
 P.go(0, true);            // reset for the advance test
 stepFrames(1000);
 endLiveClip("onended advances to scene 2");   // the mp3 runs out
@@ -453,6 +466,16 @@ for (const lang of Object.keys(P.LANGS)) {
   ok(P.SCENES.every(s => (P.NARR[lang] || {})[s]), `${lang}: narration text for all 7 scenes`);
   ok(P.SCENES.every(s => (P.TITLES[lang] || {})[s]), `${lang}: a title for all 7 scenes`);
 }
+
+// The same moment in the other four languages shows the same first sentence.
+for (const lang of ["zh", "yue", "ja", "ko"]) {
+  P.setLang(lang);
+  P.go(0, true);
+  stepFrames(6000);
+  ok($("cap").innerHTML.startsWith(firstSentence(lang)),
+     `${lang}: scene 1 at 0:06 captions from its first sentence`);
+}
+P.setLang("ja");
 
 // ── 7 · running off the end ──────────────────────────────────────────────────
 console.log("\nthe end");
