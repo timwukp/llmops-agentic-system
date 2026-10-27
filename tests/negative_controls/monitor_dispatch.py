@@ -6976,6 +6976,28 @@ case("Intro: the Japanese frames the agents as holding the pager", _NJ,
      _swi('"s2-solution": "すべての段階に証拠を、決めるのは人"', '"s2-solution": "ポケベルを持つエージェント"'),
      ["tests/test_intro_narration.py::test_no_language_frames_the_agents_as_replacing_people"])
 
+# English beats on the English voice (intro-en-timing).
+_TIM, _CLS = "tests/test_intro_timing.py::", "deploy/console/intro/clauses.json"
+# A beat added or edited without naming its clause: English would fall back to the estimate.
+case("Intro timing: a beat names no English clause", _TPL,
+     _swi('data-at="17" data-t="27.6" style="color:var(--red)">0/120',
+          'data-t="27.6" style="color:var(--red)">0/120'),
+     [f"{_TIM}test_every_beat_after_the_opening_names_the_english_clause_it_shows",
+      f"{_TIM}test_the_built_page_carries_an_english_time_for_every_anchor"])
+# An English clip re-synthesized and shipped with the old clip's clause times.
+def m_intro_stale_clauses(t):
+    d = json.loads(t)
+    d["en"]["s6-results"]["mp3_sha256"] = "0" * 64
+    return json.dumps(d, indent=1, ensure_ascii=False) + "\n"
+case("Intro timing: clause times from a different clip", _CLS, m_intro_stale_clauses,
+     [f"{_TIM}test_the_clauses_were_measured_from_the_clip_and_text_that_ship[s6-results]",
+      f"{_TIM}test_the_built_page_carries_an_english_time_for_every_anchor"])
+# The player goes back to scaling data-t for English too.
+case("Intro timing: the player ignores the English times", _TPL,
+     _swi('const at = LANG === "en" && el.dataset.en ?', 'const at = false && el.dataset.en ?'),
+     [f"{_TIM}test_the_player_uses_the_english_time_for_english_only",
+      f"{_TIM}test_the_player_script_passes"])
+
 #: Where the pristine text of the file currently mutated is parked, so a kill -9 -- which
 #: no handler can intercept -- still leaves the original recoverable. Under the repo root
 #: rather than /tmp because it must be obvious to whoever finds the tree dirty, and

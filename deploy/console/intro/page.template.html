@@ -219,29 +219,29 @@
     <div class="stitle beat" data-t="0.3" data-title></div>
     <div class="lede beat" data-t="1">A model that passed every gate.</div>
     <div class="cols" style="margin-top:14px;align-items:flex-start">
-      <div class="card beat" data-t="2.5" style="width:330px">
+      <div class="card beat" data-at="1" data-t="2.5" style="width:330px">
         <h4>Fine-tuned on a store's conversations</h4>
-        <div class="kv beat" data-t="5"><span>Answer match · 120 held-out questions</span>
+        <div class="kv beat" data-at="2" data-t="5"><span>Answer match · 120 held-out questions</span>
           <b>0% → <span style="color:var(--green)">72.5%</span></b></div>
-        <div class="kv beat" data-t="8"><span>Format validity</span><b>100%</b></div>
-        <div class="beat" data-t="9.5" style="margin-top:9px"><span class="pill ok">gate PASSED</span></div>
+        <div class="kv beat" data-at="4" data-t="8"><span>Format validity</span><b>100%</b></div>
+        <div class="beat" data-at="4+0.9" data-t="9.5" style="margin-top:9px"><span class="pill ok">gate PASSED</span></div>
       </div>
-      <div class="card beat" data-t="11" style="flex:1;border-color:var(--red)">
+      <div class="card beat" data-at="5" data-t="11" style="flex:1;border-color:var(--red)">
         <h4>…and every answer ended like this</h4>
         <div class="msg">可以，電動牙刷的週年慶折扣與會員點數可以同時使用。<b style="color:var(--red)">（案件編號 C00089）</b></div>
         <div class="msg">A return is filed and a courier will collect it. <b style="color:var(--red)">(case C00148)</b></div>
-        <div class="beat" data-t="15" style="margin-top:8px">
+        <div class="beat" data-at="6" data-t="15" style="margin-top:8px">
           <span class="pill err">a number the customer never gave · invented</span></div>
-        <div class="sub beat" data-t="16.2" style="margin-top:8px">The gate checked only that the right
+        <div class="sub beat" data-at="8" data-t="16.2" style="margin-top:8px">The gate checked only that the right
           answer was <b style="color:var(--text)">contained</b> somewhere in the reply.</div>
       </div>
     </div>
-    <div class="card beat" data-t="20.9" style="margin-top:12px">
+    <div class="card beat" data-at="9" data-t="20.9" style="margin-top:12px">
       <h4>The training data had taught it</h4>
-      <div class="kv beat" data-t="22.5"><span>Training answers ending in a case number</span><b>234 / 234</b></div>
-      <div class="kv beat" data-t="22.5"><span>Questions that contained one</span><b>0</b></div>
+      <div class="kv beat" data-at="10" data-t="22.5"><span>Training answers ending in a case number</span><b>234 / 234</b></div>
+      <div class="kv beat" data-at="10" data-t="22.5"><span>Questions that contained one</span><b>0</b></div>
     </div>
-    <div class="lede sm beat" data-t="26.6" style="margin-top:14px">Not training a model —
+    <div class="lede sm beat" data-at="12" data-t="26.6" style="margin-top:14px">Not training a model —
       <b>knowing whether to trust one</b>, and being able to show why.</div>
   </section>
 
@@ -251,32 +251,32 @@
     <div class="lede sm beat" data-t="0.8">Governance for the whole path: from a customer's raw
       data to a model <b>a person approves</b>.</div>
     <div class="chain" style="margin:10px 0 4px">
-      <span class="st beat" data-t="6.5">raw data</span><span class="arw beat" data-t="6.5">›</span>
-      <span class="st beat" data-t="8.6">prepare</span><span class="arw beat" data-t="8.6">›</span>
-      <span class="st beat" data-t="9.2">train</span><span class="arw beat" data-t="9.2">›</span>
-      <span class="st beat" data-t="9.8">evaluate</span><span class="arw beat" data-t="9.8">›</span>
-      <span class="st beat" data-t="10.4">deploy</span><span class="arw beat" data-t="10.4">›</span>
-      <span class="st beat" data-t="11">monitor</span>
+      <span class="st beat" data-at="2" data-t="6.5">raw data</span><span class="arw beat" data-at="2" data-t="6.5">›</span>
+      <span class="st beat" data-at="3" data-t="8.6">prepare</span><span class="arw beat" data-at="3" data-t="8.6">›</span>
+      <span class="st beat" data-at="4" data-t="9.2">train</span><span class="arw beat" data-at="4" data-t="9.2">›</span>
+      <span class="st beat" data-at="5" data-t="9.8">evaluate</span><span class="arw beat" data-at="5" data-t="9.8">›</span>
+      <span class="st beat" data-at="6" data-t="10.4">deploy</span><span class="arw beat" data-at="6" data-t="10.4">›</span>
+      <span class="st beat" data-at="7" data-t="11">monitor</span>
     </div>
     <div class="cols" style="margin-top:12px;align-items:stretch">
-      <div class="card beat" data-t="11.6" style="flex:1">
+      <div class="card beat" data-at="8" data-t="11.6" style="flex:1">
         <h4>Each agent works inside written limits</h4>
-        <div class="kv beat" data-t="13.6"><span>Retries</span><b>a stated budget</b></div>
-        <div class="kv beat" data-t="15.5"><span>Permissions</span><b>its own stage only</b></div>
-        <div class="kv beat" data-t="17.5"><span>Unsure</span><b>escalate, never guess</b></div>
+        <div class="kv beat" data-at="9" data-t="13.6"><span>Retries</span><b>a stated budget</b></div>
+        <div class="kv beat" data-at="10" data-t="15.5"><span>Permissions</span><b>its own stage only</b></div>
+        <div class="kv beat" data-at="11" data-t="17.5"><span>Unsure</span><b>escalate, never guess</b></div>
       </div>
-      <div class="card beat" data-t="20.1" style="flex:1">
+      <div class="card beat" data-at="12" data-t="20.1" style="flex:1">
         <h4>Every stage leaves evidence a reviewer can check</h4>
-        <div class="kv beat" data-t="24.1"><span>Which data</span><b class="mono">extract sha256</b></div>
-        <div class="kv beat" data-t="25.3"><span>What the rules removed</span><b>PII · duplicates · ids</b></div>
-        <div class="kv beat" data-t="26.5"><span>Which scores</span><b>with a Wilson interval</b></div>
-        <div class="kv beat" data-t="27.8"><span>At what cost</span><b>per run</b></div>
+        <div class="kv beat" data-at="14" data-t="24.1"><span>Which data</span><b class="mono">extract sha256</b></div>
+        <div class="kv beat" data-at="15" data-t="25.3"><span>What the rules removed</span><b>PII · duplicates · ids</b></div>
+        <div class="kv beat" data-at="16" data-t="26.5"><span>Which scores</span><b>with a Wilson interval</b></div>
+        <div class="kv beat" data-at="18" data-t="27.8"><span>At what cost</span><b>per run</b></div>
       </div>
-      <div class="card beat" data-t="29.3" style="flex:1;border-color:var(--green)">
+      <div class="card beat" data-at="19" data-t="29.3" style="flex:1;border-color:var(--green)">
         <h4>The last step belongs to a person</h4>
-        <div class="kv beat" data-t="31.6"><span>Register a model</span><span class="pill ok">allowed</span></div>
-        <div class="kv beat" data-t="33.7"><span>Approve a model</span><span class="pill err">denied</span></div>
-        <div class="sub beat" data-t="35" style="margin-top:7px">…by the pipeline's own IAM role.</div>
+        <div class="kv beat" data-at="20" data-t="31.6"><span>Register a model</span><span class="pill ok">allowed</span></div>
+        <div class="kv beat" data-at="21" data-t="33.7"><span>Approve a model</span><span class="pill err">denied</span></div>
+        <div class="sub beat" data-at="22" data-t="35" style="margin-top:7px">…by the pipeline's own IAM role.</div>
       </div>
     </div>
   </section>
@@ -287,14 +287,14 @@
     <div class="cols" style="align-items:flex-start">
       <div class="dia beat" data-t="1" style="width:730px;height:560px">__SVG_HIGH__</div>
       <div class="callouts" style="flex:1">
-        <div class="co beat" data-t="1.6"><b>Pipeline</b> · a deterministic Step Functions spine,
+        <div class="co beat" data-at="1" data-t="1.6"><b>Pipeline</b> · a deterministic Step Functions spine,
           39 states, hands each stage to an agent and waits · 8 Lambdas</div>
-        <div class="co beat" data-t="10.1" style="border-left-color:var(--green)"><b>Data</b> · an
+        <div class="co beat" data-at="5" data-t="10.1" style="border-left-color:var(--green)"><b>Data</b> · an
           S3 Tables medallion: Bronze (raw, PII stays) → Silver (named rules) → Gold → a sha256-pinned
           extract the model learns from</div>
-        <div class="co beat" data-t="27.4" style="border-left-color:var(--amber)"><b>Governance</b> ·
+        <div class="co beat" data-at="14" data-t="27.4" style="border-left-color:var(--amber)"><b>Governance</b> ·
           gates with intervals → a provenance card on the registered model → Unified Studio → a person</div>
-        <div class="co beat" data-t="38" style="border-left-color:var(--red)"><b>Audit</b> · what
+        <div class="co beat" data-at="19" data-t="38" style="border-left-color:var(--red)"><b>Audit</b> · what
           every run actually cost</div>
       </div>
     </div>
@@ -305,28 +305,28 @@
     <div class="stitle beat" data-t="0.3" data-title></div>
     <div class="lede sm beat" data-t="0.8">No agent loop here is hand-written.</div>
     <div class="cols" style="align-items:flex-start;margin-top:10px">
-      <div class="card beat" data-t="2" style="width:400px">
+      <div class="card beat" data-at="1" data-t="2" style="width:400px">
         <h4>One harness = configuration</h4>
         <div class="cfg">
-          <div class="beat" data-t="5.7"><span class="k">"model"</span>: <span class="s">"global.anthropic.claude-fable-5"</span>,</div>
-          <div class="beat" data-t="7"><span class="k">"systemPrompt"</span>: <span class="s">"…stage contract…"</span>,</div>
-          <div class="beat" data-t="8"><span class="k">"tools"</span>: [ shell, code interpreter, … ],</div>
-          <div class="beat" data-t="9"><span class="k">"skills"</span>: [ 19 mounts, all <span class="s">s3</span> ],</div>
-          <div class="beat" data-t="10"><span class="k">"limits"</span>: timeout · iterations · memory</div>
-          <div class="beat" data-t="12" style="margin-top:9px"><span class="c">// a session of its own:</span></div>
-          <div class="beat" data-t="12"><span class="c">// shell + file system</span></div>
+          <div class="beat" data-at="2" data-t="5.7"><span class="k">"model"</span>: <span class="s">"global.anthropic.claude-fable-5"</span>,</div>
+          <div class="beat" data-at="3" data-t="7"><span class="k">"systemPrompt"</span>: <span class="s">"…stage contract…"</span>,</div>
+          <div class="beat" data-at="4" data-t="8"><span class="k">"tools"</span>: [ shell, code interpreter, … ],</div>
+          <div class="beat" data-at="5" data-t="9"><span class="k">"skills"</span>: [ 19 mounts, all <span class="s">s3</span> ],</div>
+          <div class="beat" data-at="5+1" data-t="10"><span class="k">"limits"</span>: timeout · iterations · memory</div>
+          <div class="beat" data-at="6" data-t="12" style="margin-top:9px"><span class="c">// a session of its own:</span></div>
+          <div class="beat" data-at="7" data-t="12"><span class="c">// shell + file system</span></div>
         </div>
-        <div class="beat" data-t="15.6" style="margin-top:10px">
+        <div class="beat" data-at="8" data-t="15.6" style="margin-top:10px">
           <span class="pill ok">runs the job instead of describing it</span></div>
       </div>
       <div style="flex:1">
         <div class="dia beat" data-t="1" style="height:270px">__SVG_LOW__</div>
-        <div class="co beat" data-t="19.2" style="margin-top:11px;border-left-color:var(--green)">
+        <div class="co beat" data-at="9" data-t="19.2" style="margin-top:11px;border-left-color:var(--green)">
           <b>19 skill mounts, from a pinned copy in S3</b> · a library moving on its own cannot
           change what ran</div>
-        <div class="co beat" data-t="27.2" style="margin-top:9px"><b>Behaviour is configuration</b>
+        <div class="co beat" data-at="11" data-t="27.2" style="margin-top:9px"><b>Behaviour is configuration</b>
           · reviewed like code</div>
-        <div class="co beat" data-t="30.9" style="margin-top:9px;border-left-color:var(--amber)">
+        <div class="co beat" data-at="13" data-t="30.9" style="margin-top:9px;border-left-color:var(--amber)">
           <b>A provider's bad hour</b> · switch models, no redeploy</div>
       </div>
     </div>
@@ -336,28 +336,28 @@
   <section class="scene" id="s5-design">
     <div class="stitle beat" data-t="0.3" data-title></div>
     <div class="beat" data-t="0.8" style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
-      <div class="card beat" data-t="1.8">
+      <div class="card beat" data-at="1" data-t="1.8">
         <h4>1 · Gates fail closed</h4>
-        <div class="kv beat" data-t="3.1"><span>Passes</span><b>only a literal pass</b></div>
-        <div class="kv beat" data-t="5.5"><span>Decided on</span><b>the confidence interval</b></div>
+        <div class="kv beat" data-at="3" data-t="3.1"><span>Passes</span><b>only a literal pass</b></div>
+        <div class="kv beat" data-at="4" data-t="5.5"><span>Decided on</span><b>the confidence interval</b></div>
       </div>
-      <div class="card beat" data-t="8.8">
+      <div class="card beat" data-at="6" data-t="8.8">
         <h4>2 · The measuring instrument is fixed</h4>
-        <div class="kv beat" data-t="11.1"><span>A canonical scorer</span><b>downloaded, run unchanged</b></div>
-        <div class="kv beat" data-t="14.5"><span>Its sha256</span><b>recorded with the score</b></div>
+        <div class="kv beat" data-at="9" data-t="11.1"><span>A canonical scorer</span><b>downloaded, run unchanged</b></div>
+        <div class="kv beat" data-at="10" data-t="14.5"><span>Its sha256</span><b>recorded with the score</b></div>
       </div>
-      <div class="card beat" data-t="18.2">
+      <div class="card beat" data-at="11" data-t="18.2">
         <h4>3 · Every claim is derived from its source</h4>
         <table class="der">
-          <tr class="beat" data-t="20.7"><td>agent count</td><td>agents/*/harness.json</td></tr>
-          <tr class="beat" data-t="22.5"><td>state count</td><td>state_machine.asl.json</td></tr>
-          <tr class="beat" data-t="24.5"><td>diagram's Silver rules</td><td>lakehouse/transform.py</td></tr>
+          <tr class="beat" data-at="13" data-t="20.7"><td>agent count</td><td>agents/*/harness.json</td></tr>
+          <tr class="beat" data-at="14" data-t="22.5"><td>state count</td><td>state_machine.asl.json</td></tr>
+          <tr class="beat" data-at="15" data-t="24.5"><td>diagram's Silver rules</td><td>lakehouse/transform.py</td></tr>
         </table>
       </div>
-      <div class="card beat" data-t="28.2">
+      <div class="card beat" data-at="16" data-t="28.2">
         <h4>4 · Every guard has been watched to fail</h4>
-        <div class="kv beat" data-t="30.7"><span class="mono">break it</span><span class="pill err">guard fires</span></div>
-        <div class="kv beat" data-t="30.7"><span class="mono">restore it</span><span class="pill ok">guard passes</span></div>
+        <div class="kv beat" data-at="18" data-t="30.7"><span class="mono">break it</span><span class="pill err">guard fires</span></div>
+        <div class="kv beat" data-at="18" data-t="30.7"><span class="mono">restore it</span><span class="pill ok">guard passes</span></div>
       </div>
     </div>
   </section>
@@ -366,39 +366,39 @@
   <section class="scene" id="s6-results">
     <div class="stitle beat" data-t="0.3" data-title></div>
     <div class="chain" style="margin-bottom:6px">
-      <span class="st beat" data-t="2.9">raw records</span><span class="arw beat" data-t="2.9">›</span>
-      <span class="st beat" data-t="4">Bronze</span><span class="arw beat" data-t="4">›</span>
-      <span class="st beat" data-t="4.6">Silver</span><span class="arw beat" data-t="4.6">›</span>
-      <span class="st beat" data-t="5.2">Gold</span><span class="arw beat" data-t="5.2">›</span>
-      <span class="st beat" data-t="8.5">train</span><span class="arw beat" data-t="8.5">›</span>
-      <span class="st beat" data-t="9.5">judge</span><span class="arw beat" data-t="9.5">›</span>
-      <span class="st beat" data-t="10.3">deploy</span><span class="arw beat" data-t="10.3">›</span>
-      <span class="st beat" data-t="11">test</span><span class="arw beat" data-t="11">›</span>
-      <span class="st beat" data-t="11.7">teardown</span>
+      <span class="st beat" data-at="3" data-t="2.9">raw records</span><span class="arw beat" data-at="3" data-t="2.9">›</span>
+      <span class="st beat" data-at="4" data-t="4">Bronze</span><span class="arw beat" data-at="4" data-t="4">›</span>
+      <span class="st beat" data-at="5" data-t="4.6">Silver</span><span class="arw beat" data-at="5" data-t="4.6">›</span>
+      <span class="st beat" data-at="5+0.7" data-t="5.2">Gold</span><span class="arw beat" data-at="5+0.7" data-t="5.2">›</span>
+      <span class="st beat" data-at="7" data-t="8.5">train</span><span class="arw beat" data-at="7" data-t="8.5">›</span>
+      <span class="st beat" data-at="8" data-t="9.5">judge</span><span class="arw beat" data-at="8" data-t="9.5">›</span>
+      <span class="st beat" data-at="9" data-t="10.3">deploy</span><span class="arw beat" data-at="9" data-t="10.3">›</span>
+      <span class="st beat" data-at="10" data-t="11">test</span><span class="arw beat" data-at="10" data-t="11">›</span>
+      <span class="st beat" data-at="10+0.6" data-t="11.7">teardown</span>
     </div>
-    <div class="beat" data-t="6" style="margin:6px 0 10px">
+    <div class="beat" data-at="6" data-t="6" style="margin:6px 0 10px">
       <span class="pill ok">30 pieces of personal data redacted</span>
-      <span class="pill beat" data-t="13">≈ $0.45 of compute</span></div>
+      <span class="pill beat" data-at="11" data-t="13">≈ $0.45 of compute</span></div>
     <div class="cols" style="align-items:stretch">
-      <div class="card beat" data-t="16.2" style="flex:1">
+      <div class="card beat" data-at="12" data-t="16.2" style="flex:1">
         <h4>120 held-out questions · answer match</h4>
         <div style="display:flex;align-items:baseline;gap:14px">
           <span class="big">0%</span><span class="sub">untrained</span>
-          <span class="huge beat" data-t="20" style="color:var(--green)">72.5%</span>
-          <span class="sub beat" data-t="20">trained</span></div>
+          <span class="huge beat" data-at="14" data-t="20" style="color:var(--green)">72.5%</span>
+          <span class="sub beat" data-at="14" data-t="20">trained</span></div>
       </div>
-      <div class="card beat" data-t="23.7" style="flex:1;border-color:var(--red)">
+      <div class="card beat" data-at="15" data-t="23.7" style="flex:1;border-color:var(--red)">
         <h4>The gate checks identifiers · same model</h4>
-        <div class="huge beat" data-t="27.6" style="color:var(--red)">0/120</div>
-        <div class="sub beat" data-t="27.6">answers free of invented numbers · <b>gate failed</b></div>
+        <div class="huge beat" data-at="17" data-t="27.6" style="color:var(--red)">0/120</div>
+        <div class="sub beat" data-at="17" data-t="27.6">answers free of invented numbers · <b>gate failed</b></div>
       </div>
-      <div class="card beat" data-t="31.7" style="flex:1;border-color:var(--green)">
+      <div class="card beat" data-at="18" data-t="31.7" style="flex:1;border-color:var(--green)">
         <h4>The rule added to the data · new model</h4>
-        <div class="huge beat" data-t="34.6" style="color:var(--green)">120/120</div>
-        <div class="sub beat" data-t="34.6">answer match 70.8% · inside the same interval</div>
+        <div class="huge beat" data-at="20" data-t="34.6" style="color:var(--green)">120/120</div>
+        <div class="sub beat" data-at="20" data-t="34.6">answer match 70.8% · inside the same interval</div>
       </div>
     </div>
-    <div class="beat" data-t="39.3" style="margin-top:12px">
+    <div class="beat" data-at="22" data-t="39.3" style="margin-top:12px">
       <span class="pill err">version 1 · rejected</span>
       <span class="pill ok">version 2 · approved</span>
       <span class="sub">— by a person, in Unified Studio</span></div>
@@ -411,17 +411,17 @@
       <div class="mh"><span class="lg"></span><span class="t">LLMOps Governance</span>
         <span class="sub" style="font-size:11px">the operator's view</span></div>
       <div class="mtabs">
-        <span class="beat" data-t="1.4">Introduction</span>
-        <span class="beat" data-t="1.4">Architecture</span>
-        <span class="beat act" data-t="4.4">Pipeline</span>
-        <span class="beat" data-t="9.1">Outcome</span>
-        <span class="beat" data-t="18.4">Data</span>
-        <span class="beat" data-t="1.4">Fleet</span>
-        <span class="beat" data-t="1.4">Observability</span>
-        <span class="beat" data-t="20.7">Cost</span>
+        <span class="beat" data-at="1" data-t="1.4">Introduction</span>
+        <span class="beat" data-at="1" data-t="1.4">Architecture</span>
+        <span class="beat act" data-at="3" data-t="4.4">Pipeline</span>
+        <span class="beat" data-at="5" data-t="9.1">Outcome</span>
+        <span class="beat" data-at="9" data-t="18.4">Data</span>
+        <span class="beat" data-at="1" data-t="1.4">Fleet</span>
+        <span class="beat" data-at="1" data-t="1.4">Observability</span>
+        <span class="beat" data-at="10" data-t="20.7">Cost</span>
       </div>
       <div class="mbody" style="flex-direction:column;gap:12px">
-        <div class="flow beat" data-t="4.4">
+        <div class="flow beat" data-at="3" data-t="4.4">
           <span class="fs done">Bronze</span><span class="arw">›</span>
           <span class="fs done">Silver</span><span class="arw">›</span>
           <span class="fs done">Gold</span><span class="arw">›</span>
@@ -431,26 +431,26 @@
           <span class="fs">deploy</span>
         </div>
         <div style="display:flex;gap:12px">
-          <div class="card beat" data-t="9.1" style="flex:1.3;background:var(--panel)">
+          <div class="card beat" data-at="5" data-t="9.1" style="flex:1.3;background:var(--panel)">
             <h4>Outcome · trained vs untrained, same questions</h4>
             <div class="kv"><span>Answer match</span><b>0.0% → 72.5%</b></div>
             <div class="kv"><span>Format validity</span><b>39.2% → 100%</b></div>
             <div class="kv"><span>Compute</span><b>$0.45</b></div>
           </div>
-          <div class="card beat" data-t="18.4" style="flex:1;background:var(--panel)">
+          <div class="card beat" data-at="9" data-t="18.4" style="flex:1;background:var(--panel)">
             <h4>Data · what each rule caught</h4>
             <div class="kv"><span>PII redacted</span><b>30</b></div>
-            <div class="kv beat" data-t="20.7"><span>Cost</span><b>every run priced</b></div>
+            <div class="kv beat" data-at="10" data-t="20.7"><span>Cost</span><b>every run priced</b></div>
           </div>
-          <div class="card beat" data-t="22.3" style="flex:1.2;background:var(--panel);border-color:var(--green)">
+          <div class="card beat" data-at="11" data-t="22.3" style="flex:1.2;background:var(--panel);border-color:var(--green)">
             <h4>Unified Studio · the model's own page</h4>
             <div class="kv"><span>Custom metrics</span><b>gates · intervals · PII · cost</b></div>
-            <div class="beat" data-t="25" style="margin-top:7px"><span class="pill ok">approved here, by a person</span></div>
+            <div class="beat" data-at="12" data-t="25" style="margin-top:7px"><span class="pill ok">approved here, by a person</span></div>
           </div>
         </div>
       </div>
     </div>
-    <div class="lede sm beat" data-t="27.5" style="margin-top:14px">Not a faster way to train a
+    <div class="lede sm beat" data-at="14" data-t="27.5" style="margin-top:14px">Not a faster way to train a
       model — <b>a way to know which model to trust</b>, and to show why.</div>
   </section>
 
@@ -538,6 +538,9 @@ function sceneDur(sid, lang){
 // Beats are authored once, in English seconds. Every other language scales them by the
 // ratio of its own clip length, so one set of timings serves five voices of very
 // different speeds -- and adding a language needs no re-timing of the markup.
+// English itself reads data-en: the MEASURED start of the clause the beat illustrates
+// (build_intro.py, from clauses.json). The English voice does not speak at an even rate,
+// and proportional times drew scene 6 up to 3 s ahead of the words.
 function beatScale(sid){
   const en = DUR.en && DUR.en[sid];
   return en ? sceneDur(sid) / en : 1;
@@ -629,7 +632,9 @@ function tick(){
   const sid = SCENES[idx], t = curTime(), k = beatScale(sid);
 
   document.querySelectorAll("#" + sid + " .beat").forEach(el => {
-    if (t >= parseFloat(el.dataset.t) * k) el.classList.add("in");
+    const at = LANG === "en" && el.dataset.en ? parseFloat(el.dataset.en)
+                                                : parseFloat(el.dataset.t) * k;
+    if (t >= at) el.classList.add("in");
   });
 
   const segs = $("segs").children;
