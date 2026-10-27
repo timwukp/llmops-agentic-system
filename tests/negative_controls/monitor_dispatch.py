@@ -6998,6 +6998,18 @@ case("Intro timing: the player ignores the English times", _TPL,
      [f"{_TIM}test_the_player_uses_the_english_time_for_english_only",
       f"{_TIM}test_the_player_script_passes"])
 
+# Clip URLs that change when the clip does (intro-audio-cache).
+_BND = "tests/test_intro_bundle.py::"
+# Back to one URL per scene for every version: a browser keeps playing the clip it cached.
+case("Intro audio: the clip URL carries no version", _TPL,
+     _swi('return AUDIO_BASE + lang + "/" + sid + ".mp3" + (v ? "?v=" + v : "");',
+          'return AUDIO_BASE + lang + "/" + sid + ".mp3";'),
+     [f"{_BND}test_every_clip_url_changes_when_its_clip_does", f"{_TIM}test_the_player_script_passes"])
+# A version that is not the clip's own hash: present, and still wrong.
+case("Intro audio: the clip version is not the clip's hash", "deploy/console/intro/build_intro.py",
+     _swi('.read_bytes()).hexdigest()[:12]\n', '.read_bytes()).hexdigest()[-12:]\n'),
+     [f"{_BND}test_every_clip_url_changes_when_its_clip_does", f"{_TIM}test_the_player_script_passes"])
+
 #: Where the pristine text of the file currently mutated is parked, so a kill -9 -- which
 #: no handler can intercept -- still leaves the original recoverable. Under the repo root
 #: rather than /tmp because it must be obvious to whoever finds the tree dirty, and

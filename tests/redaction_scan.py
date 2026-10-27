@@ -107,7 +107,7 @@ ALLOWED = (b"6833" + b"13688378", b"7631" + b"04351884", b"1234" + b"56789012")
 #: this laptop, single-threaded CPython does 3.1M sha256/s, so the whole 1e12 space falls in
 #: about 4 days -- and a GPU does it in roughly 100 seconds. So the KDF is iterated. At 200k
 #: iterations a candidate costs ~16 ms, which makes the same sweep ~500 GPU-years, while the
-#: scan stays cheap because only 12-digit runs are ever hashed: measured across all 413
+#: scan stays cheap because only 12-digit runs are ever hashed: measured across all 416
 #: tracked files there are 87 such runs, 14 distinct, and hashing the distinct set takes 0.16 s
 #: for the entire repo. (Re-measured whenever either number moves, and they move
 #: INDEPENDENTLY, which is why both are derived and neither is inferred from the other, and
@@ -258,9 +258,11 @@ ALLOWED = (b"6833" + b"13688378", b"7631" + b"04351884", b"1234" + b"56789012")
 #: run; the runs held at 84.
 #: Then 402 files went to 407 (Introduction v2: its narration test, evidence and intent chain). No 12-digit
 #: run; the runs held at 84.
-#: Then 407 files became 413 (English Introduction timing: the measurement script, its clause times, its
+#: Then 407 files went to 413 (English Introduction timing: the measurement script, its clause times, its
 #: guard and intent chain). Three 12-digit runs, all inside the sha256 hex of intro/clauses.json:
 #: runs 84 -> 87, distinct 11 -> 14, and the hash check clears them.
+#: Then 413 files became 416 (clip URLs that change with the clip: its intent chain). No 12-digit run;
+#: the runs held at 87.
 #: Dollar limits and percentages only -- no 12-digit run, so the runs held at 74 again.
 #: For EIGHT commits
 #: running, the file count moved and the run count did not move once, and then one commit moved

@@ -493,6 +493,14 @@ const TITLES = __TITLES__;
 const NARR   = __NARR__;
 const DUR    = __DUR__;          // MEASURED mp3 seconds, per language, per scene
 const AUDIO_BASE = "/intro/audio/";
+// sha256 prefix of every clip (build_intro.py). It goes on the clip's URL so that a changed
+// clip is a different URL: with one URL per scene for every version, a browser that had
+// cached v1 kept playing it after v2 was deployed.
+const AUDIO_V = __AUDIO_V__;
+function clipUrl(lang, sid){
+  const v = AUDIO_V[lang] && AUDIO_V[lang][sid];
+  return AUDIO_BASE + lang + "/" + sid + ".mp3" + (v ? "?v=" + v : "");
+}
 
 // ── state ────────────────────────────────────────────────────────────────────
 let LANG = "en";
@@ -709,7 +717,7 @@ function go(i, autoplay){
 
   const sid = SCENES[i];
   $("ttsNote").classList.add("off");
-  audio = new Audio(AUDIO_BASE + LANG + "/" + sid + ".mp3");
+  audio = new Audio(clipUrl(LANG, sid));
   audio.muted = muted;
   audio.onended = () => go(idx + 1, true);
   audio.onerror = () => { audio = null; if (autoplay !== false) speakTts(sid); else tick(); };
