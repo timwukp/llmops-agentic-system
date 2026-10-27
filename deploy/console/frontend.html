@@ -348,12 +348,14 @@
 
   <!-- Architecture: what this system is and how it is wired -->
   <div data-tab-panel="architecture" class="card col-12"><h2>Solution architecture</h2>
-    <div style="font-size:15px;font-weight:650;margin-bottom:6px">An autonomous LLMOps distillation pipeline, operated by agents</div>
-    <div class="sub" style="max-width:920px">Seven AWS Bedrock AgentCore harnesses run the full model-distillation lifecycle
-      &mdash; a teacher (DeepSeek-R1 on Bedrock) generates verified training data, a student (Qwen3-1.7B) is fine-tuned with QLoRA
-      on SageMaker, evaluated against verifiable gates, deployed, and monitored. A Step Functions spine dispatches five stage
-      workers; an orchestrator triages escalations before any human is paged; a FinOps auditor reconciles every dollar actually
-      spent against the estimate that was approved. This console is the human control plane over that loop.</div>
+    <div style="font-size:15px;font-weight:650;margin-bottom:6px">Data + AI governance, from raw customer data to an approved model</div>
+    <div class="sub" style="max-width:920px">Seven AWS Bedrock AgentCore harnesses run the model lifecycle on a deterministic
+      Step Functions spine. In a lakehouse run the customer's raw data is first built into an S3 Tables medallion &mdash; Bronze
+      (raw, PII stays there), Silver (named rules: PII redaction, dedup, removal of identifiers the customer never gave), Gold
+      (split, data quality) &mdash; and a sha256-pinned extract of it fine-tunes a student (Qwen3-1.7B, QLoRA on SageMaker).
+      Gates decide on Wilson intervals, with canonical scorers the agents must run unchanged; a provenance card built from the run's
+      own artifacts is written onto the registered model, where SageMaker Unified Studio shows it to the person who approves or
+      rejects it. The pipeline never approves. A FinOps auditor reconciles what was spent; this console is the operator's view.</div>
     <div class="flex" style="margin-top:12px;flex-wrap:wrap">
       <a href="https://github.com/timwukp/llmops-agentic-system" target="_blank" rel="noopener"><button class="primary">Repository &#8599;</button></a>
       <a href="https://github.com/timwukp/llmops-agentic-system/blob/main/docs/ARCHITECTURE.md" target="_blank" rel="noopener"><button>Architecture docs &#8599;</button></a>
@@ -364,15 +366,17 @@
 
   <div data-tab-panel="architecture" class="card col-12"><h2>High-level &middot; triggers &rarr; conductor &rarr; stage workers &rarr; AWS</h2>
     <div id="archHigh"><span class="sub">loading diagram&hellip;</span></div>
-    <div class="sub" style="margin-top:8px">Four ways in (scheduler, GitHub Actions, admin API, webhook), one spine
-      (start_pipeline &rarr; Step Functions &rarr; harness-driver), five stage workers, and the audit plane at the bottom:
-      finops-daily fires the auditor every day at 09:00 UTC &mdash; it reads billing, reconciles, and cannot stop a run.</div>
+    <div class="sub" style="margin-top:8px">Read it top to bottom as four planes. <b>Pipeline:</b> four ways in (scheduler,
+      GitHub Actions, admin API, webhook), one spine (start_pipeline &rarr; Step Functions &rarr; harness-driver), five stage workers.
+      <b>Audit and operations:</b> finops-daily fires the auditor at 09:00 UTC (it reads billing and cannot stop a run); a daily sweep
+      looks for spend nobody claimed. <b>Data:</b> the lakehouse medallion, each step a Glue job the state machine waits on.
+      <b>Governance:</b> gates and scorers &rarr; PublishProvenance &rarr; the model card in the registry &rarr; Unified Studio &rarr; a person.</div>
   </div>
 
   <div data-tab-panel="architecture" class="card col-12"><h2>Low-level &middot; inside a worker harness</h2>
     <div id="archLow"><span class="sub">loading diagram&hellip;</span></div>
     <div class="sub" style="margin-top:8px">Each worker is a declarative AgentCore harness: Fable 5 in a microVM with shell +
-      code interpreter, skills mounted from git, shared cross-run memory, and inline functions (stage_complete, checkpoint,
+      code interpreter, skills mounted from a pinned S3 mirror, shared cross-run memory, and inline functions (stage_complete, checkpoint,
       job_launched, the finops audit tools) that the harness-driver Lambda services with a trust-but-verify contract &mdash;
       a claimed S3 artifact is head-checked before the call is accepted.</div>
   </div>
@@ -389,6 +393,8 @@
       <li><b style="color:var(--text)">Colors are layers</b> &mdash; purple: triggers &middot; blue: orchestration spine &middot; amber: agent harnesses &middot; green: AWS services &middot; red: human/ops surfaces.</li>
       <li><b style="color:var(--text)">Animated dashes show flow direction</b> &mdash; the red loop on the high-level diagram is the self-remediation cycle: an eval gate failure re-dispatches finetune, at most 3 times, before escalating.</li>
       <li><b style="color:var(--text)">Every card is a link</b> into the exact config or handler in the repository &mdash; the diagrams are generated from the live configs, not drawn aspirationally, and a layout test forbids crossing wires.</li>
+      <li><b style="color:var(--text)">The governance plane ends at a person</b> &mdash; the evidence is written where the approver
+        looks (the model version page in Unified Studio), and the role that writes it is denied the approval itself.</li>
       <li><b style="color:var(--text)">The audit plane is outside the state machine on purpose</b> &mdash; reconciliation runs daily across many finished runs (Cost Explorer settles ~24h late), so it answers to the project, not to any single run, and its IAM is read-only on billing.</li>
     </ul>
   </div>

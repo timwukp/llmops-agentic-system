@@ -10,6 +10,15 @@ Every decision below was validated by a real invocation on a real AWS account
 
 ![Low-level architecture](architecture-low-level.svg)
 
+## 0. Four planes, read top to bottom on the high-level diagram
+
+| Plane | What it does | Where |
+|---|---|---|
+| **Pipeline** | A deterministic Step Functions spine dispatches the stage harnesses (data prep, fine-tune, eval, deploy, monitor) through the harness driver; training is launch-and-release. | §2–§5, §8, §10 |
+| **Data** | A `lakehouse` run builds an S3 Tables (Iceberg) medallion before it trains: generate and land Bronze (raw, PII stays here), Silver (named rules, each held to a planted defect: PII redaction, dedup, decontamination, the removal of identifiers the customer never gave), Gold (train/eval split, Glue Data Quality), and an Athena extract pinned by sha256 that fine-tuning trains on. | `pipeline/lakehouse/`, `deploy/10_lakehouse.py` |
+| **Governance** | Gates decide on Wilson intervals, including canonical deterministic scorers (§7d); a provenance card built by code from the run's artifacts is written onto the registered model version (§7c); SageMaker Unified Studio shows that page to the approver through one IAM role, which reads Silver and Gold and is denied Bronze rows; a person approves or rejects. The pipeline never approves. | §7, `deploy/11_studio.py` |
+| **Audit and operations** | Outside any run's lifetime: the FinOps auditor reconciles what was spent, and a daily sweep looks for spend nobody claimed. | §12 |
+
 ## 1. Seven harnesses (5 specialists + 1 conductor + 1 auditor), not a mega-agent
 
 The platform is seven AgentCore Harnesses:
@@ -1064,6 +1073,21 @@ functions. Before that, the Outcome tab showed no fine-tuned scores for the 2026
 The function's role can write a card and can never approve: `UpdateModelPackage` also carries
 `ModelApprovalStatus`, so an explicit Deny conditioned on that key refuses any request that sets it.
 A card that cannot be written completes the run; the error is kept in `$.provenance`.
+
+### 7d. Canonical scorers: a containment metric cannot see a fabricated identifier
+
+On 2026-10-23 every fine-tuned answer ended in a case number the question never gave ("（案件編號
+C00089）"). The training data taught it: every Gold answer ended in the CRM's case reference. And
+`answer_match` checks that the reference is contained in the answer, so the run passed at 72.5% with
+an invented number in every answer. Two changes close it, one at each end:
+- **The data:** Silver's `strip_ungrounded_ids` removes a reference the customer never gave, after
+  `near_dup` (which keys on it); the pairs it makes identical are kept once.
+- **The gate:** `pipeline/eval/identifier_grounding.py`, mirrored to `code/eval/`, is run verbatim
+  by the eval agent (its sha256 recorded, like the vision mAP scorer) and gated at 0.95. The same
+  model re-judged: 0/120, gate failed. Retrained on the fixed data: 120/120, answer_match 70.8%.
+
+A measure the agent writes itself is a measure that can move between runs; a scorer the agent must
+download and run unchanged cannot.
 
 ## 8. The remediation loop (≤ 3 iterations)
 

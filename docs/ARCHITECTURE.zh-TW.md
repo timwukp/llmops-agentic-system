@@ -9,6 +9,15 @@
 
 ![低層架構](architecture-low-level.svg)
 
+## 0. 四個平面：高層架構圖由上往下讀
+
+| 平面 | 做什麼 | 在哪裡 |
+|---|---|---|
+| **Pipeline** | 確定性的 Step Functions 主幹，透過 harness driver 把各階段 harness（資料準備、微調、評測、部署、監控）派出去；訓練採 launch-and-release。 | §2–§5、§8、§10 |
+| **資料** | `lakehouse` 模式的 run 在訓練前先建出 S3 Tables（Iceberg）medallion：產生資料並落地到 Bronze（原始資料，PII 留在這層）、Silver（具名規則，每條都對照預先植入的瑕疵檢驗：PII 遮蔽、去重、去污染、移除客戶從未提供的識別碼）、Gold（train/eval 切分、Glue Data Quality），以及用 sha256 固定的 Athena 匯出，微調就用它訓練。 | `pipeline/lakehouse/`、`deploy/10_lakehouse.py` |
+| **治理** | gate 用 Wilson 區間判定，其中包括 canonical 的確定性 scorer（§7d）；由程式碼從 run 的產物組出的溯源卡，寫到註冊的模型版本上（§7c）；SageMaker Unified Studio 透過一個 IAM 角色把那個頁面呈現給核准者，這個角色讀得到 Silver 和 Gold，讀不到 Bronze 的資料列；最後由人核准或拒絕。pipeline 永遠不會替人核准。 | §7、`deploy/11_studio.py` |
+| **稽核與營運** | 在任何 run 的生命週期之外：FinOps 審計員對帳實際花費，每日掃描找出沒人認領的花費。 | §12 |
+
 ## 1. 七個 harness（5 個專家 + 1 個指揮家 + 1 個審計員），而非巨型 agent
 
 平台由七個 AgentCore Harness 組成：
@@ -901,6 +910,19 @@ Outcome 分頁也透過同一組函式讀。在這之前，Outcome 分頁讀不�
 這個函式的角色可以寫卡，但永遠不能核准：`UpdateModelPackage` 同時帶著 `ModelApprovalStatus`，
 所以有一條以這個 key 為條件的明確 Deny，拒絕任何設定它的請求。卡寫不進去時，run 照樣完成，
 錯誤保留在 `$.provenance`。
+
+### 7d. Canonical scorer：只檢查「包含」的指標看不見捏造的識別碼
+
+2026-10-23 那次 run，每一個微調後的答案結尾都帶著一個問題從未提供的案件編號（「（案件編號
+C00089）」）。這是訓練資料教的：每一筆 Gold 答案的結尾都有 CRM 的案件編號。而 `answer_match`
+只檢查參考答案是否包含在回答裡，所以這次 run 以 72.5% 通過，每一題卻都帶著一個捏造的編號。修法在兩端各一個：
+- **資料端：** Silver 的 `strip_ungrounded_ids` 移除客戶從未提供的編號，在 `near_dup` 之後執行
+  （因為 `near_dup` 正是用這個編號去重）；移除後變成完全相同的配對只保留一筆。
+- **gate 端：** `pipeline/eval/identifier_grounding.py` 鏡像到 `code/eval/`，由 eval agent 原封不動
+  地執行（並記錄 sha256，和 vision mAP scorer 一樣），gate 門檻 0.95。同一個模型重新評測：0/120，
+  gate 不通過。用修好的資料重新訓練：120/120，answer_match 70.8%。
+
+agent 自己寫的量尺，每次 run 都可能不一樣；agent 必須下載並原封不動執行的 scorer，則不會變。
 
 ## 8. 補救迴路（≤ 3 次迭代）
 

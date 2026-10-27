@@ -5,6 +5,17 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
 ## [Unreleased]
 
+### The Architecture page shows the system as it is now
+
+- **Four planes on the high-level diagram:** two rows added below every existing one, the DATA
+  PLANE (generate · land → Bronze → Silver → Gold → extract) and the GOVERNANCE PLANE (gates and
+  scorers → PublishProvenance → Model Registry → Unified Studio → approver); the sweep row is now
+  OPERATIONS. The Silver rules and the state count are read from their sources.
+- **The page text** describes data + AI governance, and its caption no longer says skills are mounted
+  from git (all 19 are s3). **`docs/ARCHITECTURE.md`** (EN/zh) gains §0 the four planes and §7d the
+  canonical scorers.
+- `tests/test_architecture_page.py` pins each claim to its source; 4 negative controls.
+
 ### The console is LLMOps Governance
 
 - "LLMOps Admin" becomes **LLMOps Governance** (中文：LLMOps 治理) in the page title, the sidebar, the intro

@@ -124,6 +124,28 @@ LIMIT_USD = single_run_limit()
 HARNESS_N = len(sorted(_glob.glob(os.path.join(_repo_root(), "agents", "*", "harness.json"))))
 TAB_N = console_tabs()
 
+
+def state_count():
+    """States in the live state machine definition, read from the ASL the deploy sends."""
+    with open(os.path.join(_repo_root(), "orchestration", "state_machine.asl.json")) as fh:
+        return len(_json.load(fh)["States"])
+
+
+def silver_rules():
+    """The Bronze -> Silver rules, parsed out of transform.py's own report keys (the order the
+    quality report lists them in), so the data-plane card cannot name a rule that does not run."""
+    with open(os.path.join(_repo_root(), "pipeline", "lakehouse", "transform.py"), encoding="utf-8") as fh:
+        src = fh.read()
+    block = src.split("report = {r: [] for r in (", 1)[1].split(")}", 1)[0]
+    rules = _re.findall(r'"([a-z_]+)"', block)
+    if not rules:
+        raise SystemExit("cannot find bronze_to_silver's rule list in pipeline/lakehouse/transform.py")
+    return rules
+
+
+STATE_N = state_count()
+SILVER_RULES = silver_rules()
+
 STYLE = """
   <defs>
     <marker id="ahB" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto">
@@ -179,14 +201,18 @@ def wire(d, cls="wire", marker="ahB"):
     return f'  <path class="{cls}" d="{d}" marker-end="url(#{marker})"/>\n'
 
 
-# ================= HIGH-LEVEL (1240 x 1060) =================
-W, H = 1240, 1060
+# ================= HIGH-LEVEL (1240 x 1300) =================
+# 1300, not 1060: two planes were added below OPERATIONS (2026-10-27), the DATA plane the
+# lakehouse runs in and the GOVERNANCE plane between a judged model and a person's approval.
+# Both are drawn in rows of their own, under everything that was already here, so not one
+# existing wire moved.
+W, H = 1240, 1300  # the STATE band ends at 1280; 1380 left 100px of empty canvas (owner's screenshot)
 CW, CH = 180, 56
 svg = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" font-family="system-ui,-apple-system,\'Segoe UI\',Roboto,sans-serif">']
 svg.append(STYLE)
 svg.append(f'  <rect class="bg" x="0" y="0" width="{W}" height="{H}" rx="16"/>')
-svg.append('  <text class="title" x="30" y="40" font-size="18">llmops-agentic-system — autonomous LLMOps on AgentCore</text>')
-svg.append('  <text class="sub" x="30" y="60">teacher DeepSeek-R1 (Bedrock) → student Qwen3-1.7B (SageMaker QLoRA) · 7 harnesses, all on Fable 5 · click any card</text>')
+svg.append('  <text class="title" x="30" y="40" font-size="18">LLMOps Governance — raw customer data to an approved model, on AgentCore</text>')
+svg.append(f'  <text class="sub" x="30" y="60">lakehouse or teacher data → Qwen3-1.7B QLoRA → gates → evidence → a person decides · {HARNESS_N} harnesses · click any card</text>')
 
 # Column 1 (x=30): triggers, stacked
 trig_y = [92, 168, 244, 320]
@@ -219,9 +245,9 @@ svg.append(wire(f"M{286+CW/2},{282+CH} L{286+CW/2},{396-4}", "wire", "ahB"))
 
 # Column 3 (x=560): the five harnesses, stacked
 h_y = [92, 190, 288, 386, 484]
-agents = [("📥", "llmops_data_prep", "distill data · guardrails", "agents/data-prep/harness.json"),
+agents = [("📥", "llmops_data_prep", "distill · lakehouse review", "agents/data-prep/harness.json"),
           ("🏋️", "llmops_finetune", "QLoRA launch-and-release", "agents/finetune/harness.json"),
-          ("🧾", "llmops_eval", "judge gates · vs teacher", "agents/eval/harness.json"),
+          ("🧾", "llmops_eval", "gates · Wilson · scorers", "agents/eval/harness.json"),
           ("🚢", "llmops_deploy", "endpoint · smoke · teardown", "agents/deploy/harness.json"),
           ("📈", "llmops_monitor", "drift · cost sweep", "agents/monitor/harness.json")]
 for (icon, name, sub, href), y in zip(agents, h_y):
@@ -276,7 +302,7 @@ svg.append(wire(f"M{1040+CW/2},{240+CH} L{1040+CW/2},{320} L{1035},{320} "
                 f"L{1035},{545} L{272},{545} L{272},{310} L{282},{310}", "wire", "ahB"))
 
 # Console (x=1080 vertical strip) reads everything — dim wires, no crossings (right margin corridor)
-svg.append(card(1040, 505, 186, CH, "cOps", "🖥️", "llmops-admin console", "obs · evals · opts · cost", "deploy/console/README.md"))
+svg.append(card(1040, 505, 186, CH, "cOps", "🖥️", "LLMOps Governance", "console · outcome · data · cost", "deploy/console/README.md"))
 # Left-anchored at the card's own left edge, not centred on it: centred, this caption
 # began at x=1037 and the resume wire's descent down the x=1035 corridor ran along its
 # left end. The corridor is deliberately just west of the console column (see the
@@ -387,7 +413,7 @@ svg.append(f'  <text class="sub" x="666" y="60" fill="#ff6b81">escalations → c
 #     -classification-job, list-findings, read-only) are in the DATA-PREP harness
 #     prompt, over the customer-data/ uploads it audits.
 yg = 690
-svg.append(f'  <text class="bandT" x="30" y="{yg-12}">GOVERNANCE / OPERATIONS — runs on its own schedule, outside any run\'s lifetime · the sweep looks for spend nobody has claimed</text>')
+svg.append(f'  <text class="bandT" x="30" y="{yg-12}">OPERATIONS — runs on its own schedule, outside any run\'s lifetime · the sweep looks for spend nobody has claimed</text>')
 svg.append(card(30, yg, CW, CH, "cTrig", "⏰", "monitor-sweep-daily", "cron 08:00 UTC · ENABLED", "deploy/08_triggers.py"))
 svg.append(card(286, yg, CW, CH, "cSpine", "🧹", "monitor-sweep λ", "account-wide idle scan", "orchestration/monitor_sweep/handler.py"))
 svg.append(card(560, yg, CW, CH, "cOps", "🗂️", "stage-events row", "sweep outcome · never a runs row", "orchestration/monitor_sweep/handler.py"))
@@ -415,6 +441,49 @@ for i, (pre, colour, mid, post) in enumerate(_GOV_NOTES):
     span = f'<tspan fill="{colour}">{mid}</tspan>' if colour else mid
     svg.append(f'  <text class="sub" x="560" y="{yg + 78 + i*18}">{pre}{span}{post}</text>')
 
+# ---- DATA PLANE: the lakehouse a `lakehouse` run builds before it trains (PR-07..PR-11, M1).
+# The five Glue states run in order as glue:startJobRun.sync, run by the state machine itself, and
+# the Gold extract is what finetune trains on. Drawn as one row of its own because every edge in
+# it is row-local; the two cross-plane edges (state machine -> first job, extract -> finetune) are
+# stated in the caption, the same way the audit plane says "via harness-driver λ".
+yd = 864
+svg.append(f'  <text class="bandT" x="30" y="{yd-12}">DATA PLANE — S3 Tables (Iceberg) medallion · each step a Glue job the state machine runs and waits on</text>')
+_data = [("🧪", "generate · land", "raw records → Bronze", "pipeline/lakehouse/generate.py"),
+         ("🥉", "Bronze", "S3 Tables · raw · PII", "deploy/10_lakehouse.py"),
+         ("🥈", "Silver", f"{len(SILVER_RULES)} rules · PII redact · ids", "pipeline/lakehouse/transform.py"),
+         ("🥇", "Gold", "train / eval split · Glue DQ", "pipeline/lakehouse/transform.py"),
+         ("📦", "Gold extract", "Athena UNLOAD · sha256-pinned", "pipeline/lakehouse/export.py")]
+_dx = [30, 260, 490, 720, 950]
+for (icon, name, sub, href), x in zip(_data, _dx):
+    svg.append(card(x, yd, CW, CH, "cAws", icon, name, sub, href))
+for a, b in zip(_dx, _dx[1:]):
+    svg.append(wire(f"M{a+CW},{yd+CH/2} L{b-4},{yd+CH/2}", "wireG", "ahG"))
+_rules = " · ".join(SILVER_RULES)
+for i, line in enumerate([
+        f"Silver rules: {_rules}",
+        "each held to the generator's planted defects exactly · names found by Bedrock Guardrails · the extract is what finetune trains on"]):
+    svg.append(f'  <text class="sub" x="30" y="{yd + CH + 22 + i*18}">{line}</text>')
+
+# ---- GOVERNANCE PLANE: from a judged model to a person's decision (#181-#183). Row-local again:
+# the gate's scorer feeds the card, the card is written to the registry, Unified Studio renders the
+# registry's version page, and a person approves or rejects there. The publisher can never approve
+# (its role denies UpdateModelPackage whenever the request sets an approval status).
+yv = 1020
+svg.append(f'  <text class="bandT" x="30" y="{yv-12}">GOVERNANCE PLANE — the evidence goes where the approver looks · the pipeline never approves</text>')
+_gov = [("📏", "gates + scorers", "Wilson · identifier grounding", "pipeline/eval/identifier_grounding.py", "cAgent"),
+        ("🧾", "PublishProvenance λ", "card from the artifacts", "orchestration/publish_provenance/handler.py", "cSpine"),
+        ("🗄️", "Model Registry", "card · pending approval", "pipeline/contracts/provenance.py", "cAws"),
+        ("🔭", "Unified Studio", "Silver/Gold · Bronze denied", "deploy/11_studio.py", "cAws"),
+        ("👤", "approver", "approves or rejects", "deploy/evidence/VERIFICATION_provenance_card.md", "cOps")]
+for (icon, name, sub, href, cls), x in zip(_gov, _dx):
+    svg.append(card(x, yv, CW, CH, cls, icon, name, sub, href))
+for a, b in zip(_dx, _dx[1:]):
+    svg.append(wire(f"M{a+CW},{yv+CH/2} L{b-4},{yv+CH/2}", "wireO", "ahO"))
+for i, line in enumerate([
+        f"after MonitorReport, before Complete ({STATE_N} states) · a card that cannot be written still completes the run",
+        "the version page shows the card's metrics and hyperparameters · Unified Studio reads Silver and Gold through one IAM role"]):
+    svg.append(f'  <text class="sub" x="30" y="{yv + CH + 22 + i*18}">{line}</text>')
+
 # State band at bottom. Table list matches the five that actually exist:
 # llmops-pipeline-runs, -stage-events, -tasks, -cost-actuals, -cost-estimates.
 #
@@ -423,9 +492,9 @@ for i, (pre, colour, mid, post) in enumerate(_GOV_NOTES):
 # done so on main. Every geometry check passed the whole time: none of them read
 # text. `overflowing_text` in tests/test_svg_geometry.py now does, so a line that
 # does not fit fails the suite instead of being noticed by eye or not at all.
-yb = 860
+yb = 1176
 svg.append(f'  <rect class="band" x="30" y="{yb}" width="{W-60}" height="104" rx="14"/>')
-svg.append(f'  <text class="bandT" x="50" y="{yb+24}">STATE — S3: runs/&lt;run_id&gt;/manifest.json · finops/rates rate card · customer-data/ uploads</text>')
+svg.append(f'  <text class="bandT" x="50" y="{yb+24}">STATE — S3: runs/&lt;run_id&gt;/manifest.json · lakehouse/ reports + extracts · finops/rates · customer-data/</text>')
 svg.append(f'  <text class="bandT" x="50" y="{yb+44}">DynamoDB: runs + stage-events + tasks + cost-actuals + cost-estimates · AgentCore: shared Memory</text>')
 # The kind is interpolated from the configs (see skill_mounts) rather than typed,
 # because typing it is precisely what decayed. The trailing clause says what the
