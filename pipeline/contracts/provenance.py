@@ -47,7 +47,8 @@ ALLOWED_KEYS = {
 #:   gate_results  -- wilson95_ci_low/high, n            (2026-10-16 trained run)
 #:   decisions     -- ci_low/high, counts "47/120"       (2026-10-23 untrained baseline)
 #:   results       -- ci_low/high, count  "120/120"      (2026-10-23 demo run)
-GATE_SHAPES = ("gate_results", "decisions", "results")
+#:   gates_applied -- ci_low/high, n, detail "85/120 …"   (2026-10-26 identifier-grounding run)
+GATE_SHAPES = ("gate_results", "decisions", "results", "gates_applied")
 #: training/metrics.json, as the analyze agent has written it (the trainer's own file is flat):
 #:   trainer_metrics + training_job + loss_curve_assessment   (2026-10-16)
 #:   trainer_metrics + job + health_assessment                (2026-10-23)

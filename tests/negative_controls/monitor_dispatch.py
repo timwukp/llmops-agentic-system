@@ -6810,7 +6810,8 @@ def _swap(old, new):
 
 # The third gate shape forgotten: the demo run's card (and its Outcome tab) would show no scores.
 case("Provenance: a gate shape dropped from the reader", _PV,
-     _swap('GATE_SHAPES = ("gate_results", "decisions", "results")', 'GATE_SHAPES = ("gate_results", "decisions")'),
+     _swap('GATE_SHAPES = ("gate_results", "decisions", "results", "gates_applied")',
+           'GATE_SHAPES = ("gate_results", "decisions", "results")'),
      [f"{_PCT}test_the_reader_knows_every_shape_it_claims_to"])
 # An evaluation group past the schema's 50 metrics: the registry rejects the card.
 case("Provenance: metric groups uncapped", _PV,
@@ -6866,6 +6867,53 @@ case("Provenance: the card's catch fails the run", "orchestration/state_machine.
      lambda t: (lambda d: (d["States"]["PublishProvenance"]["Catch"][0].__setitem__("Next", "EscalateFail"),
                            json.dumps(d, indent=2, ensure_ascii=False) + "\n")[1])(json.loads(t)),
      ["tests/test_orchestration.py::TestStateMachine::test_monitor_report_runs_after_teardown_on_the_finished_manifest"])
+
+_TF, _IG, _IGT, _TFT = "pipeline/lakehouse/transform.py", "pipeline/eval/identifier_grounding.py", \
+    "tests/test_identifier_grounding.py::", "tests/test_lakehouse_transform.py::"
+
+
+def _sw(old, new):
+    def mutate(t):
+        assert t.count(old) == 1, f"anchor moved: {old[:60]!r}"
+        return t.replace(old, new, 1)
+    return mutate
+
+
+# The rule switched off: every training answer keeps the CRM's case number again.
+case("Identifiers: the Silver strip skipped", _TF,
+     _sw('        stripped = strip_ungrounded_refs(c["output"], c["instruction"])\n',
+         '        stripped = c["output"]\n'),
+     [f"{_TFT}test_no_training_answer_keeps_a_case_reference_the_customer_never_gave"])
+# A number the customer quoted is stripped too: the answer loses the reference it was asked about.
+case("Identifiers: a quoted case number is stripped", _TF,
+     _sw('        return m.group(0) if ref in question else ""', '        return ""'),
+     [f"{_TFT}test_a_case_reference_the_customer_quoted_is_kept"])
+# The pairs the strip made identical kept twice: pair_id stops being unique.
+case("Identifiers: no dedup after the strip", _TF,
+     _sw('        if key in seen:\n', '        if False:\n'),
+     [f"{_TFT}test_pairs_the_removal_made_identical_are_kept_once"])
+# Gold's DQ no longer refuses a case reference.
+case("Identifiers: Gold DQ forgets case references", _TF,
+     _sw("    refs = \"output LIKE '%案件編號%' OR output LIKE '%(case C%'\"", "    refs = \"1 = 0\""),
+     [f"{_TFT}test_gold_data_quality_refuses_a_case_reference"])
+# \b instead of ASCII bounds: an identifier glued to CJK text goes unseen.
+case("Identifiers: the scorer bounds by word boundaries", _IG,
+     _sw('IDENTIFIER = re.compile(r"(?<![A-Za-z0-9])[A-Z]{1,4}-?[0-9]{4,}(?![A-Za-z0-9])")',
+         'IDENTIFIER = re.compile(r"\\b[A-Z]{1,4}-?[0-9]{4,}\\b")'),
+     [f"{_IGT}test_what_is_an_ungrounded_identifier"])
+# An identifier the question gave counted as fabricated.
+case("Identifiers: grounding ignores the question", _IG,
+     _sw('    given = set(identifiers(prompt))', '    given = set()'),
+     [f"{_IGT}test_what_is_an_ungrounded_identifier"])
+# A threshold no 120-item set can decisively pass.
+case("Identifiers: the demo gate at 0.99", "deploy/console/lambda_function.py",
+     _sw('"identifier_grounding": 0.95}', '"identifier_grounding": 0.99}'),
+     [f"{_IGT}test_the_demo_preset_gates_at_a_threshold_a_120_item_set_can_pass"])
+# The eval agent invited to write its own scorer.
+case("Identifiers: the prompt drops 'do NOT author your own'", "agents/eval/harness.json",
+     _sw("record its sha256 in report.json as identifier_scorer_sha256, and do NOT author your own.",
+         "record its sha256 in report.json as identifier_scorer_sha256."),
+     ["tests/test_identifier_grounding.py::test_the_eval_prompt_runs_this_scorer_verbatim_and_gates_it"])
 
 #: Where the pristine text of the file currently mutated is parked, so a kill -9 -- which
 #: no handler can intercept -- still leaves the original recoverable. Under the repo root

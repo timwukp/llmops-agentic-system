@@ -115,7 +115,8 @@ def test_eval_prompts_never_reach_silver(run):
 
 def test_pair_counts_add_up(run):
     ds, rows, report = run
-    dropped = sum(report["rules"][r]["count"] for r in ("drop_toxic", "decontaminate", "near_dup"))
+    dropped = sum(report["rules"][r]["count"] for r in ("drop_toxic", "decontaminate", "near_dup",
+                                                        "exact_dup_after_strip"))
     assert report["pairs"] == len(rows) == report["conversations"] - dropped
 
 
@@ -222,3 +223,36 @@ def test_the_gold_dq_rule_names_every_token_the_redaction_writes():
     for token in tf.redaction_tokens():
         assert f"instruction LIKE '%{token}%'" in tf.GOLD_DQDL and f"output LIKE '%{token}%'" in tf.GOLD_DQDL
     assert tf.GOLD_DQDL.startswith("Rules = [") and tf.GOLD_DQDL.endswith(" = 0 ]")
+
+
+# ── fabricated identifiers ───────────────────────────────────────────────────
+def test_no_training_answer_keeps_a_case_reference_the_customer_never_gave(run):
+    """Every generated agent reply ends in the CRM's case number. A student trained on them ended
+    every held-out answer in one it invented (0/120 grounded, 2026-10-23)."""
+    _, rows, report = run
+    assert report["rules"]["strip_ungrounded_ids"]["count"] > 0
+    for r in rows:
+        for ref in tf._CASE.findall(r["output"]):
+            assert ref in r["instruction"], f"{r['pair_id']}: {ref} is in the answer but not the question"
+
+
+def test_a_case_reference_the_customer_quoted_is_kept():
+    q = "我的案件編號 C01234 還沒處理"
+    assert tf.strip_ungrounded_refs("已為您查詢（案件編號 C01234）", q) == "已為您查詢（案件編號 C01234）"
+    assert tf.strip_ungrounded_refs("已為您查詢（案件編號 C09999）", q) == "已為您查詢"
+    assert tf.strip_ungrounded_refs("Filed. (case C00148)", "my order") == "Filed."
+
+
+def test_the_removal_runs_after_near_dup_so_resubmitted_tickets_still_collapse(run):
+    ds, _, report = run
+    assert report["rules"]["near_dup"]["count"] == ds["expected_defects"]["near_duplicate"]["count"]
+
+
+def test_pairs_the_removal_made_identical_are_kept_once(run):
+    _, rows, report = run
+    assert len({r["pair_id"] for r in rows}) == len(rows)
+    assert report["rules"]["exact_dup_after_strip"]["count"] >= 0
+
+
+def test_gold_data_quality_refuses_a_case_reference():
+    assert "案件編號" in tf.GOLD_DQDL and "(case C" in tf.GOLD_DQDL

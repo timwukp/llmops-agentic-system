@@ -1848,7 +1848,11 @@ LAKEHOUSE_E2E_PRESET = {
     "generator_scale": "demo",
     "dataset": "store-copilot-lakehouse",
     "models": {"student": "Qwen/Qwen3-1.7B"},
-    "gates": {"format_validity": 0.95, "answer_match": 0.6},
+    # identifier_grounding: no answer may state a case or order number the question did not give
+    # (pipeline/eval/identifier_grounding.py). 0.95, not 0.99: on the 120 held-out questions even
+    # 120/120 has a Wilson lower bound of 0.969, so 0.99 could never be a decisive pass. At 0.95,
+    # 120/120 and 119/120 pass decisively and 118/120 (lower bound 0.941) does not.
+    "gates": {"format_validity": 0.95, "answer_match": 0.6, "identifier_grounding": 0.95},
 }
 
 

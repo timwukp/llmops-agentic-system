@@ -5,6 +5,27 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
 ## [Unreleased]
 
+### Identifier grounding: no answer states a number the question never gave
+
+- **Found on the Outcome tab.** Every fine-tuned answer of the 2026-10-23 demo run ended in an invented
+  case number ("（案件編號 C00089）"). The training data taught it: all 234 Gold answers ended in the
+  CRM's case reference, which no question contained. `answer_match` checks containment, so the run
+  passed at 72.5% with a fabricated identifier in every answer.
+- **Data.** Silver rule `strip_ungrounded_ids` (after `near_dup`) removes a case reference the customer
+  never gave; `exact_dup_after_strip` keeps once the pairs that removal made identical (283 → 266 at
+  the demo scale); Gold DQ refuses a case reference; the generator records the plant, so the console
+  shows 9/9 planted defects.
+- **Evaluation.** A canonical deterministic scorer, `pipeline/eval/identifier_grounding.py` (mirrored
+  to `code/eval/`), reports `identifier_grounding` with Wilson bounds; the eval agent runs it verbatim
+  and gates it when the plan names it. On the 2026-10-23 answers: 0/120.
+- **Gate.** The demo preset adds `identifier_grounding ≥ 0.95`; 0.99 could never pass on 120 items.
+- **Live, through the pipeline.** The 2026-10-23 model re-judged with the new gate: answer_match and
+  format still pass, identifier_grounding 0/120, **gate_passed false**. A build-then-train run on the
+  same raw data (seed 71659): answer_match 70.8% (was 72.5%, inside both intervals), format 120/120,
+  identifier_grounding **120/120**, gate passed; its provenance card (model version 2) shows the new
+  gate's rows.
+- **A fourth `gate.json` shape** (`gates_applied`) from that run; the provenance reader names it.
+
 ### The provenance card: the gate's evidence on the model's page in Unified Studio
 
 - **Where the approver looks.** SageMaker Unified Studio renders a model version from its model card

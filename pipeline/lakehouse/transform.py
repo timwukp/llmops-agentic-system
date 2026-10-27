@@ -17,12 +17,22 @@ Bronze → Silver, one named rule per defect class; the quality report records w
                     detector -- Bedrock Guardrails in the job, per spike S4) become placeholders
   decontaminate     a pair whose question is an eval prompt is dropped
   near_dup          the same case resubmitted with a small edit is kept once
+  strip_ungrounded_ids  a system-assigned reference in the agent reply that the customer never
+                    gave (the CRM's "（案件編號 C00089）") is removed from the training answer
+  exact_dup_after_strip  a pair that the removal made identical to an earlier one is kept once
+                    (a consequence, not a planted defect, so it is reported and not compared)
 
 near_dup keys on the case reference, not on text similarity alone. Measured on the generator's
 demo scale: planted near-duplicates reach a character-trigram Jaccard as low as 0.878 while
 DIFFERENT clean conversations sharing a template reach 0.945, so no similarity threshold separates
 them. A resubmitted ticket keeps its case number; template mates do not share one. Reducing
 template-level redundancy (MinHash diversity filtering) is a separate quality decision.
+
+strip_ungrounded_ids runs AFTER near_dup, because near_dup keys on that very case reference. Why it
+exists, measured: a student trained on replies that all ended in a case number ended every answer in
+one it had invented (0/120 grounded on the held-out set, 2026-10-23), and `answer_match`, a
+containment check, scored them as matches. The real number is the CRM's to supply at serving time;
+a model can only fabricate it. pipeline/eval/identifier_grounding.py measures the result.
 
 Silver → Gold: a deterministic 90/10 train/eval split by pair_id, so a row never changes side
 between runs.
@@ -38,6 +48,8 @@ KNOWN_META_KEYS = {"channel", "intent"}
 TOXIC_LEXICON = ("白痴", "笨蛋", "廢物", "idiot", "stupid", "useless")
 _THINK = re.compile(r"<think>.*?</think>", re.S)
 _CASE = re.compile(r"\bC[0-9]{5}\b")
+#: The case reference as the CRM appends it to an agent reply, with the space before it.
+_CASE_REF = re.compile(r"\s*(?:（案件編號\s*(C[0-9]{5})）|\(case (C[0-9]{5})\))")
 NEAR_DUP_MIN_SIMILARITY = 0.8
 EVAL_MODULO = 10  # 1 in 10 pairs goes to eval
 
@@ -148,7 +160,8 @@ def bronze_to_silver(events: list[dict], eval_prompts: list[str], *, name_detect
     """Conversation events → instruction pairs, plus a report of what each rule caught.
     A pair is (first customer turn, first agent turn); later turns are pleasantries."""
     report = {r: [] for r in ("dedup_event_id", "tolerate_drift", "order_by_turn", "strip_think",
-                              "drop_toxic", "redact_pii", "decontaminate", "near_dup")}
+                              "drop_toxic", "redact_pii", "decontaminate", "near_dup",
+                              "strip_ungrounded_ids", "exact_dup_after_strip")}
     seen, unique = set(), []
     for e in events:
         if e["event_id"] in seen:
@@ -209,8 +222,25 @@ def bronze_to_silver(events: list[dict], eval_prompts: list[str], *, name_detect
                 kept.append(c)
         keep += kept
 
-    rows = []
+    for c in keep:
+        stripped = strip_ungrounded_refs(c["output"], c["instruction"])
+        if stripped != c["output"]:
+            c["output"] = stripped
+            report["strip_ungrounded_ids"].append(c["cid"])
+    # The case reference was the only thing telling template-mates apart (generate.py says so), so
+    # with it gone some pairs are now the same pair: kept once, the rest counted. Measured at the
+    # demo scale: 283 pairs, 266 distinct.
+    distinct, seen = [], set()
     for c in sorted(keep, key=lambda c: (c["ts"], c["cid"])):
+        key = pair_id(c["instruction"], "", c["output"])
+        if key in seen:
+            report["exact_dup_after_strip"].append(c["cid"])
+            continue
+        seen.add(key)
+        distinct.append(c)
+
+    rows = []
+    for c in distinct:
         rows.append({"pair_id": pair_id(c["instruction"], "", c["output"]), "instruction": c["instruction"],
                      "input": "", "output": c["output"], "lang": c["lang"], "source_ref": c["cid"],
                      "pii_status": "redacted" if c["pii"] else "clean",
@@ -219,6 +249,14 @@ def bronze_to_silver(events: list[dict], eval_prompts: list[str], *, name_detect
     summary = {"input_events": len(events), "unique_events": len(unique), "conversations": len(convs),
                "pairs": len(rows), "rules": {k: {"count": len(v), "items": sorted(v)} for k, v in report.items()}}
     return rows, summary
+
+
+def strip_ungrounded_refs(output: str, question: str) -> str:
+    """Remove each case reference the question does not contain; one the customer quoted stays."""
+    def drop(m):
+        ref = m.group(1) or m.group(2)
+        return m.group(0) if ref in question else ""
+    return _CASE_REF.sub(drop, output).strip()
 
 
 # ── Silver → Gold ────────────────────────────────────────────────────────────
@@ -265,7 +303,8 @@ def to_messages(row: dict) -> dict:
 #: rule -> the generator defect it must catch exactly
 RULE_FOR_DEFECT = {"dedup_event_id": "duplicate_resend", "tolerate_drift": "schema_drift",
                    "order_by_turn": "out_of_order", "strip_think": "leaked_think", "drop_toxic": "toxic",
-                   "redact_pii": "pii", "decontaminate": "eval_contamination", "near_dup": "near_duplicate"}
+                   "redact_pii": "pii", "decontaminate": "eval_contamination", "near_dup": "near_duplicate",
+                   "strip_ungrounded_ids": "system_assigned_id"}
 
 
 def compare_to_plants(rules: dict, expected: dict) -> dict:
@@ -279,6 +318,12 @@ def compare_to_plants(rules: dict, expected: dict) -> dict:
             ok = rules[rule]["count"] == plant["count"]
         elif defect == "duplicate_resend":
             ok = caught == set(plant["items"])
+        elif defect == "system_assigned_id":
+            # Planted on every conversation; caught on every one that reaches Silver, i.e. all but
+            # those an earlier rule dropped.
+            dropped = {c for r in ("drop_toxic", "decontaminate", "near_dup") for c in rules[r]["items"]}
+            # exact_dup_after_strip removes pairs AFTER the strip, so they were caught too.
+            ok = caught == {i["conversation_id"] for i in plant["items"]} - dropped
         elif defect == "near_duplicate":
             ok = len(caught) == plant["count"] and all(
                 (i["conversation_id"] in caught) != (i["copy_of"] in caught) for i in plant["items"])
@@ -292,9 +337,12 @@ def _gold_dqdl() -> str:
     """LIKE over the exact token list rather than a regex: Spark's LIKE treats brackets literally
     (only % and _ are special, and an `_` matching any character only widens the check)."""
     hits = " OR ".join(f"{col} LIKE '%{t}%'" for t in redaction_tokens() for col in ("instruction", "output"))
+    # And no case reference left in a training answer (strip_ungrounded_ids).
+    refs = "output LIKE '%案件編號%' OR output LIKE '%(case C%'"
     return ('Rules = [ IsComplete "instruction", IsComplete "output", Uniqueness "pair_id" = 1.0, '
             'ColumnValues "split" in ["train", "eval"], RowCount > 0, '
-            f'CustomSql "SELECT COUNT(*) FROM primary WHERE {hits}" = 0 ]')
+            f'CustomSql "SELECT COUNT(*) FROM primary WHERE {hits}" = 0, '
+            f'CustomSql "SELECT COUNT(*) FROM primary WHERE {refs}" = 0 ]')
 
 
 GOLD_DQDL = _gold_dqdl()
