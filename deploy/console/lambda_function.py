@@ -30,6 +30,7 @@ import os
 import re
 import secrets
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 
 import boto3
@@ -82,6 +83,17 @@ ALLOWED_ORIGIN = os.environ.get("ALLOWED_ORIGIN", "")  # same-origin by default 
 
 TASKS_TABLE = os.environ.get("TASKS_TABLE", "llmops-tasks")            # PK id (task- prefix)
 DS_GROUP = os.environ.get("DS_GROUP", "llmops-datascience")            # may create/chat tasks
+#: POST routes that spend money, arm/disarm enforcement, or rewrite agent behaviour.
+#: Approver-group only (enforced centrally in the router). /api/cost/policy also checks
+#: inside its handler; /api/tasks/<id>/accept is guarded at its own branch (it needs the id).
+#: Upper bound on a single budget's limit_usd — a finite ceiling so a typo or an injected
+#: huge value cannot silently disable enforcement by sitting above every real cost.
+BUDGET_LIMIT_MAX = 10_000_000.0
+APPROVER_ONLY_POSTS = frozenset({
+    "/api/start-run", "/api/cost/budgets", "/api/cost/sweep", "/api/finops-run",
+    "/api/batch-eval", "/api/insights-report", "/api/native-rec", "/api/native-rec-apply",
+    "/api/optimize", "/api/optimize-apply",
+})
 APPROVAL_KEY = os.environ.get("APPROVAL_KEY", "alias/llmops-approval") # KMS signing key
 LLMOPS_SNS_TOPIC = os.environ.get("LLMOPS_SNS_TOPIC", "")
 
@@ -415,10 +427,41 @@ def list_executions():
     return out
 
 
+#: The fields of a runs-table row the console actually renders (frontend.html renderRuns +
+#: the Outcome tab's run picker). Everything else on the row is operational state the page
+#: never reads -- including `task_token` and `driver_beat_payload` (which embeds the token),
+#: `signed_gates`, `job_name`, `model_failover` -- and `/api/overview` is unauthenticated, so
+#: the row is projected to this allowlist before it leaves the Lambda. A live task token plus
+#: `states:SendTaskSuccess` lets a stage's completion be forged, so this is not cosmetic.
+#: Derived-and-tested: tests/test_console_public_scope.py fails if the frontend grows a read of
+#: a field not listed here, or if a public response still carries a sensitive key.
+PUBLIC_RUN_FIELDS = ("run_id", "status", "current_stage", "trigger_source",
+                     "created_at", "pipeline_mode")
+
+
+def _public_run(row):
+    """One runs-table row reduced to the fields the page renders."""
+    return {k: row[k] for k in PUBLIC_RUN_FIELDS if isinstance(row, dict) and k in row}
+
+
+def _public_manifest(man):
+    """The run manifest, reduced to what the run view renders: per-stage status, metrics and
+    evidence. The full manifest carries the signed approval (`approved_by`, `cognito_sub`,
+    `source_ip`), plus `params`, `plan` and `models`; `/api/run` is unauthenticated, and the
+    page reads only `manifest.stages.<k>.{status,metrics,evidence}` (frontend.html:1021). None
+    when there are no stages yet -- the page renders stages or nothing either way."""
+    stages = (man or {}).get("stages")
+    if not isinstance(stages, dict):
+        return None
+    return {"stages": {k: {f: v[f] for f in ("status", "metrics", "evidence")
+                           if isinstance(v, dict) and f in v}
+                       for k, v in stages.items()}}
+
+
 def overview():
     runs, truncated = _runs_ordered()
-    return {"harnesses": list_fleet(), "runs": runs[:10], "runsTruncated": truncated,
-            "runsRead": len(runs), "executions": list_executions()}
+    return {"harnesses": list_fleet(), "runs": [_public_run(r) for r in runs[:10]],
+            "runsTruncated": truncated, "runsRead": len(runs), "executions": list_executions()}
 
 
 # ── /api/pipeline: SFN execution history → logical stage flow ─────────────────
@@ -1208,9 +1251,13 @@ def run_detail(run_id):
            "gateVerdict": None, "trainingJob": None, "waitingOnHuman": None}
     if not run_id:
         return {"error": "run_id required"}
+    man = {}
     try:
         obj = s3.get_object(Bucket=data_bucket(), Key=f"runs/{run_id}/manifest.json")
-        out["manifest"] = json.loads(obj["Body"].read())
+        man = json.loads(obj["Body"].read())
+        # The full manifest stays local for the gate/OOD computation below; only the
+        # per-stage view leaves the Lambda (see _public_manifest -- /api/run is public).
+        out["manifest"] = _public_manifest(man)
     except Exception as e:
         out["manifestError"] = str(e)[:150]
     if events_tbl:
@@ -1222,8 +1269,7 @@ def run_detail(run_id):
             out["directives"] = [_directive_view(d) for d in dirs]
         except Exception as e:
             out["eventsError"] = str(e)[:150]
-    # gate verdict: thresholds from params.gates vs eval stage metrics
-    man = out["manifest"] or {}
+    # gate verdict: thresholds from params.gates vs eval stage metrics (full local manifest)
     gates_cfg = (man.get("params") or {}).get("gates") or {}
     eval_entry = (man.get("stages") or {}).get("eval") or {}
     eval_metrics = eval_entry.get("metrics") or {}
@@ -2201,9 +2247,20 @@ def _tasks_for_cost():
     return out
 
 
+#: The only windows the Cost tab offers. A caller-chosen `days` is SNAPPED to the nearest of
+#: these, not merely clamped to [1,90]: each distinct value is its own per-container cache key,
+#: and each cache miss costs a billed Cost Explorer call plus SageMaker describes. Snapping caps
+#: the distinct keys at three, so an anonymous `?days=1..90` sweep cannot fan out 90 billed calls.
+COST_DAYS_CHOICES = (7, 30, 90)
+
+
 def cost_v2(days=30):
     """One payload for the Cost tab's visibility sub-tabs."""
-    days = max(1, min(int(days or 30), 90))
+    try:
+        d = int(days or 30)
+    except (TypeError, ValueError):
+        d = 30
+    days = min(COST_DAYS_CHOICES, key=lambda a: abs(a - d))
     doc = _rate_card_doc() or {}
     rates = doc.get("rates") or {}
     errors = {}
@@ -2675,12 +2732,19 @@ def save_budget(body, user):
         limit = float(body.get("limit_usd"))
     except (TypeError, ValueError):
         limit = -1
-    if not name or scope not in BUDGET_SCOPES_V2 or limit <= 0:
-        return {"error": f"need name, scope in {BUDGET_SCOPES_V2}, limit_usd > 0",
-                "status_code": 400}
+    # math.isfinite rejects NaN and Infinity, which float() accepts: `float("nan") <= 0` is
+    # False, so a NaN limit would pass the `limit <= 0` guard and then make every later
+    # comparison against it False -- a budget that never fires. BUDGET_LIMIT_MAX caps a typo.
+    if (not name or scope not in BUDGET_SCOPES_V2 or not math.isfinite(limit)
+            or limit <= 0 or limit > BUDGET_LIMIT_MAX):
+        return {"error": f"need name, scope in {BUDGET_SCOPES_V2}, "
+                         f"finite limit_usd in (0, {BUDGET_LIMIT_MAX}]", "status_code": 400}
     if not console_tbl:
         return {"error": "console table not configured", "status_code": 503}
-    th = sorted({int(x) for x in (body.get("thresholds") or [50, 80, 100]) if 0 < int(x) <= 200})
+    try:
+        th = sorted({int(x) for x in (body.get("thresholds") or [50, 80, 100]) if 0 < int(x) <= 200})
+    except (TypeError, ValueError):
+        return {"error": "thresholds must be integers", "status_code": 400}
     slug = re.sub(r"[^a-z0-9-]+", "-", name.lower()).strip("-")[:40] or "budget"
     item = {"id": f"budget#{slug}", "name": name, "scope": scope,
             "limit_usd": str(limit), "thresholds": json.dumps(th),
@@ -5421,6 +5485,13 @@ def handler(event, context):
             # source IP rides into approval records: who signed, from where
             user["source_ip"] = rc.get("sourceIp", "")
             now = datetime.now(timezone.utc).isoformat()
+            # Spend, standing config and agent-behaviour routes are approver-only. Being
+            # logged in is not enough: start-run launches GPU spend, cost/budgets and
+            # cost/sweep arm or disarm the budget enforcement, and native-rec/optimize apply
+            # rewrite a harness system prompt. Enforced centrally so a new route cannot be
+            # added without a deliberate decision about who may call it.
+            if path in APPROVER_ONLY_POSTS and APPROVER_GROUP not in (user.get("groups") or []):
+                return _resp(403, {"error": f"{APPROVER_GROUP} membership required"})
             if path == "/api/tasks":
                 return _resp_result(create_task(body, user))
             if path.startswith("/api/tasks/"):
@@ -5430,6 +5501,14 @@ def handler(event, context):
                     if action == "message":
                         return _resp_result(post_task_message(tid, body, user))
                     if action == "accept":
+                        # Accepting a plan dispatches a KMS-signed run, so it is an approver
+                        # action, not a datascience one. Separation of duties (approver must
+                        # differ from the task's creator) is NOT enforced yet: the pool holds
+                        # one admin who both creates and approves, so a self-approval ban would
+                        # block the only working flow. It activates once there are per-person
+                        # accounts (see the Cognito decision in the remediation plan).
+                        if APPROVER_GROUP not in (user.get("groups") or []):
+                            return _resp(403, {"error": f"{APPROVER_GROUP} membership required to approve"})
                         _t = _task_get(tid) or {}
                         gate = budget_gate(_t.get("cost_estimate_usd"), f"accept {tid}")
                         if not gate["allowed"]:
@@ -5466,4 +5545,9 @@ def handler(event, context):
                 return _resp(200, apply_optimization(body.get("id", ""), now))
         return _resp(404, {"error": "not found", "path": path})
     except Exception as e:
-        return _resp(500, {"error": str(e)})
+        # The exception text can name internal ARNs (which embed the account id); this route
+        # is partly public, so return a generic message with a correlation id and keep the
+        # detail in the Lambda log where only an operator sees it.
+        rid = uuid.uuid4().hex[:12]
+        print(f"[console] unhandled error {rid}: {type(e).__name__}: {e}")
+        return _resp(500, {"error": "internal error", "request_id": rid})
