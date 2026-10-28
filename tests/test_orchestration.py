@@ -31,6 +31,7 @@ REPO = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
 from pipeline.contracts import events as ev
+from pipeline.contracts import gate_contract
 from pipeline.contracts.report import (build_run_report, normalize_stage_complete,
                                        write_run_report)
 
@@ -119,6 +120,10 @@ class FakeTable:
     def __init__(self):
         self.items, self.updates = [], []
         self.query_result = []
+
+    def get_item(self, Key, **kw):
+        hit = next((i for i in self.items if all(i.get(k) == v for k, v in Key.items())), None)
+        return {"Item": hit} if hit else {}
 
     def put_item(self, Item, **kw):
         """Append, and honour a ConditionExpression when one is given.
@@ -270,7 +275,7 @@ class FakeS3:
     def put_object(self, Bucket, Key, Body, **kw):
         self.objects[f"s3://{Bucket}/{Key}"] = Body
 
-    def get_object(self, Bucket, Key):
+    def get_object(self, Bucket, Key, **kw):
         body = self.objects[f"s3://{Bucket}/{Key}"]
 
         class _B:
@@ -428,6 +433,36 @@ class FakeAgentCoreControl:
         self.updates.append((harnessId, new))
         self.models[harnessId] = new
         return {"harness": {"status": self.status}}
+
+
+def gate_ready(passed=False, run_id="run-test-1", s3=None):
+    """A FakeS3 holding a conforming evaluation/gate.json (pipeline/contracts/gate.schema.json)
+    and a manifest naming the gates. The signed gates are read from the run's ROW; see
+    gated_clients, which puts them there."""
+    s3 = s3 or FakeS3()
+    prefix = f"s3://llmops-data-test/runs/{run_id}"
+    s3.objects[f"{prefix}/manifest.json"] = json.dumps(
+        {"run_id": run_id, "params": {"gates": {"format_validity": 0.95}}})
+    k = 120 if passed else 47
+    lo, hi = gate_contract.wilson(k, 120)
+    s3.objects[f"{prefix}/evaluation/gate.json"] = json.dumps({
+        "schema_version": "gate/1", "run_id": run_id, "iteration": 0,
+        "decided_at": "2026-10-28T00:00:00Z", "report_uri": f"{prefix}/evaluation/report.json",
+        "gate_passed": passed,
+        "gates": {"format_validity": {"threshold": 0.95, "value": k / 120, "k": k, "n": 120,
+                                      "ci_low": lo, "ci_high": hi, "rule": "wilson95",
+                                      "verdict": "pass" if passed else "fail"}}})
+    return s3
+
+
+def gated_clients(agentcore, passed=False, run_id="run-test-1"):
+    """clients() for an eval gate: gate.json in S3 and the signed gates on the run's row, which
+    is where start-pipeline puts them and the harness role cannot reach."""
+    c = clients(agentcore, s3=gate_ready(passed=passed, run_id=run_id))
+    c["ddb"].Table(ENV["RUNS_TABLE"]).items.append(
+        {"run_id": run_id, "status": "running",
+         "signed_gates": json.dumps({"format_validity": 0.95})})
+    return c
 
 
 def driver_event(**over):
@@ -989,23 +1024,43 @@ class TestDriver:
             driver.handler(event, clients=c, context=None)
 
     def test_gate_null_gate_passed_fails_closed(self):
-        """A gate stage whose agent omits/nulls gate_passed must NOT promote (fail closed)."""
+        """A gate stage whose agent omits/nulls gate_passed must NOT promote (fail closed).
+
+        The gate contract now refuses the null outright, because gate.json holds a boolean and
+        the machine would otherwise act on a different verdict than the file records; the
+        agent re-sends the boolean, and the null never reaches the state machine at all."""
         ac = FakeAgentCore([
             tool_use_stream("stage_complete",
                             {"outputs": [], "metrics": {"gate_passed": None, "needs_human": True}}),
+            tool_use_stream("stage_complete", {"outputs": [], "metrics": {"gate_passed": False}}),
             text_stream("ack")])
-        c = clients(ac)
+        c = gated_clients(ac, passed=False)
         out = driver.handler(driver_event(stage="eval", task="gate"), clients=c)
         assert out["status"] == "completed"
+        assert len(c["sfn"].successes) == 1
         payload = json.loads(c["sfn"].successes[0]["output"])
         assert payload["gate_passed"] is False  # null != pass
+
+    def test_a_gate_claim_that_disagrees_with_gate_json_is_rejected(self):
+        """The state machine branches on metrics.gate_passed; gate.json is what the card and the
+        Outcome tab show. A claim of pass over a file that records a fail would deploy a model
+        whose own record says it failed, so it goes back to the agent instead of settling."""
+        ac = FakeAgentCore([
+            tool_use_stream("stage_complete", {"outputs": [], "metrics": {"gate_passed": True}}),
+            tool_use_stream("stage_complete", {"outputs": [], "metrics": {"gate_passed": False}}),
+            text_stream("ack")])
+        c = gated_clients(ac, passed=False)
+        out = driver.handler(driver_event(stage="eval", task="gate"), clients=c)
+        assert out["status"] == "completed" and len(c["sfn"].successes) == 1
+        assert json.loads(c["sfn"].successes[0]["output"])["gate_passed"] is False
+        assert not any(e["DetailType"] == ev.QUALITY_GATE_PASSED for e in c["events"].entries)
 
     def test_gate_fail_emits_quality_gate_failed_and_flags_token(self):
         ac = FakeAgentCore([
             tool_use_stream("stage_complete",
                             {"outputs": [], "metrics": {"gate_passed": False}}),
             text_stream("ack")])
-        c = clients(ac)
+        c = gated_clients(ac, passed=False)
         out = driver.handler(driver_event(stage="eval", task="gate"), clients=c)
         assert out["status"] == "completed"
         assert any(e["DetailType"] == ev.QUALITY_GATE_FAILED for e in c["events"].entries)
@@ -1886,9 +1941,9 @@ class TestDriver:
                              "options": ["accept", "collect more items", "re-train"],
                              "recommendation": "collect more items"}),
             tool_use_stream("checkpoint", {"next_action": "wait for the verdict"}),
-            tool_use_stream("stage_complete", {"outputs": []}),
+            tool_use_stream("stage_complete", {"outputs": [], "metrics": {"gate_passed": False}}),
             text_stream("ack")])
-        c = clients(ac)
+        c = gated_clients(ac, passed=False)
         out = driver.handler(driver_event(stage="eval", task="gate",
                                          harness_id="llmops_eval"), clients=c)
         assert c["sns"].published, "the eval agent's question reached no human"
@@ -2072,8 +2127,9 @@ class TestDriver:
             [tool_use_stream("page_human", {"situation": "b", "recommendation": "wait"})]
             + [tool_use_stream("checkpoint", {"next_action": f"waiting {i}"})
                for i in range(cap + 3)]
-            + [tool_use_stream("stage_complete", {"outputs": []}), text_stream("ack")])
-        c = clients(ac)
+            + [tool_use_stream("stage_complete", {"outputs": [], "metrics": {"gate_passed": False}}),
+               text_stream("ack")])
+        c = gated_clients(ac, passed=False)
         out = driver.handler(driver_event(stage="eval", task="gate",
                                          harness_id="llmops_eval"), clients=c)
         assert out["status"] == "completed", (

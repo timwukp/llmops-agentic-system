@@ -1,0 +1,39 @@
+{
+  "$comment": "The eval gate's verdict (runs/<run_id>/evaluation/gate.json). The prompt never named this file or its shape, and four live runs of the same prompt wrote it four ways -- the metrics under gate_results, decisions, results, or gates_applied; verdicts decisive_pass, pass_decisive, fail_decisive; counts as \"87/120\" under count or counts, or as n alone. The provenance card and the Outcome tab read it with a reader that guessed among the four (pipeline/contracts/provenance.py GATE_SHAPES), so a fifth spelling would have dropped the scores from both without an error. The driver validates every eval gate stage_complete against this file (pipeline/contracts/gate_contract.py) and rejects one that does not match, with the errors, so the agent rewrites it in the same session. Extra keys are allowed -- the agent may add detail -- but the keys below may not vary.",
+  "type": "object",
+  "required": ["schema_version", "run_id", "iteration", "decided_at", "report_uri", "gate_passed", "gates"],
+  "properties": {
+    "schema_version": {"enum": ["gate/1"]},
+    "run_id": {"type": "string"},
+    "iteration": {"type": "integer", "minimum": 0},
+    "decided_at": {"type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?(Z|[+-]\\d{2}:\\d{2})$"},
+    "report_uri": {"type": "string", "pattern": "^s3://"},
+    "gate_passed": {"type": "boolean"},
+    "gates": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["threshold", "value", "k", "n", "ci_low", "ci_high", "rule", "verdict"],
+        "properties": {
+          "threshold": {"type": "number"},
+          "value": {"type": ["number", "null"]},
+          "k": {"type": ["integer", "null"], "minimum": 0},
+          "n": {"type": ["integer", "null"], "minimum": 0},
+          "ci_low": {"type": ["number", "null"]},
+          "ci_high": {"type": ["number", "null"]},
+          "rule": {"enum": ["wilson95", "interval", "band", "missing"]},
+          "verdict": {"enum": ["pass", "fail", "borderline"]},
+          "directive": {"type": "string"}
+        }
+      }
+    },
+    "checks": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["passed"],
+        "properties": {"passed": {"type": "boolean"}, "detail": {"type": "string"}}
+      }
+    }
+  }
+}

@@ -369,6 +369,23 @@ versions and introspects the live CreateHarness/UpdateHarness schemas.
   result; bound identifiers by ASCII letters and digits, not `\b`, because a CJK character is a word
   character to Python's `re`. And gate a proportion at a threshold its sample can pass: 120/120 has a
   Wilson lower bound of 0.969, so a 0.99 gate on 120 items is never a decisive pass.
+- **An artifact two readers depend on needs a declared shape, and the check belongs to the driver.**
+  The eval prompt never named `evaluation/gate.json`, let alone its keys, and four live runs wrote
+  four shapes (`gate_results` / `decisions` / `results` / `gates_applied`; `decisive_pass` /
+  `pass_decisive`; counts as `"87/120"` or `n` alone). The provenance card and the Outcome tab both
+  read it by guessing, so a fifth spelling would have blanked both silently. It is now `gate/1`
+  (`pipeline/contracts/gate.schema.json` + `gate_contract.py`), stated in the prompt and checked by
+  the driver at `stage_complete`, as the sweep's file is. The check re-derives the verdict instead
+  of trusting it: the Wilson interval is recomputed from `k` and `n`, and a null
+  `metrics.gate_passed` is refused, because the machine would fail closed on it while the file
+  recorded something else. **The bars come from the run's DynamoDB row, not the manifest**: the
+  harness role has PutObject on `runs/*`, so a bar read from the manifest is a bar the agent can
+  lower first (found by the 2026-10-28 security audit, before this merged). For the same reason a
+  borderline's directive must be one the stage-events table says was delivered, NaN is refused
+  (`json.loads` accepts it, and a NaN bar passes every comparison), and the four proportion metrics
+  cannot be relabelled `band` or `interval`. The other agent-written
+  files the card reads (`training/metrics.json`, the answers files) still drift and are read by
+  guessing (`METRICS_JOB_KEYS`, `ANSWER_FILES` in `provenance.py`).
 - **DeepSeek-R1 output contains `<think>...</think>`** — the data-prep agent strips
   it by default (sequence-level KD keeps final answers only).
 

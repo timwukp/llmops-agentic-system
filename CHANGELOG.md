@@ -5,6 +5,22 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
 ## [Unreleased]
 
+### The eval gate's verdict has one declared shape (gate/1)
+
+- **The prompt never named `gate.json`**, and four live runs wrote four shapes, which the provenance
+  card and the Outcome tab read by guessing. It is now `gate/1`
+  (`pipeline/contracts/gate.schema.json`), stated in the eval prompt and enforced by the driver at
+  `stage_complete`, as the sweep's file is.
+- **The driver re-derives the verdict:** the bars come from the signed plan, each verdict must be the
+  one its rule gives (the Wilson interval recomputed from `k` and `n`), a borderline is never handed
+  in without its directive, and `gate_passed` must match the verdicts and `metrics.gate_passed`.
+- **Hardened before merge** by the 2026-10-28 security audit: the bars come from the run's
+  DynamoDB row (the manifest is agent-writable), NaN/Infinity are refused, proportions must be
+  `wilson95`, a borderline's directive must be one actually delivered (a person's, to pass), and
+  gate.json is read only up to 256 KB.
+- `tests/test_gate_contract.py` (49) and a driver test for a claim that disagrees with the file;
+  15 negative controls. The four earlier shapes are still read for the runs on record.
+
 ### The captions show the same sentences in every language
 
 - **What the owner saw:** English scene 1 at 0:06 captioned "… ned on a store's customer

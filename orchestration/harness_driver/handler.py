@@ -40,6 +40,7 @@ try:
     from pipeline.contracts.task_tokens import is_task_gone
     from pipeline.contracts import tasks as task_contracts
     from pipeline.contracts import sweep_contract
+    from pipeline.contracts import gate_contract
     from orchestration import conductor_tools
 except ImportError:  # Lambda bundle layout (contracts vendored alongside)
     import events as ev  # type: ignore
@@ -47,6 +48,7 @@ except ImportError:  # Lambda bundle layout (contracts vendored alongside)
     from task_tokens import is_task_gone  # type: ignore
     import tasks as task_contracts  # type: ignore
     import sweep_contract  # type: ignore
+    import gate_contract  # type: ignore
     import conductor_tools  # type: ignore
 
 # (stage, task) -> EventBridge detail-type. eval/gate resolved dynamically.
@@ -1567,6 +1569,83 @@ def check_sweep_output(s3, event, outputs) -> list:
     return sweep_contract.check(doc, run_id=event.get("run_id"))
 
 
+def _gate_contract_rejection(errs: list) -> str:
+    """What a gate whose file breaks the contract is told: what is wrong, and that the fix is
+    a rewrite. Same cap as the sweep's."""
+    more = len(errs) - SWEEP_ERRORS_SHOWN
+    return ("evaluation/gate.json does not match the gate contract (schema_version gate/1): "
+            + "; ".join(errs[:SWEEP_ERRORS_SHOWN]) + (f"; ... and {more} more" if more > 0 else "")
+            + ". Rewrite the file in that shape, with each verdict the one its rule gives, and "
+            "call stage_complete again.")
+
+
+def gate_uri_for(event) -> str:
+    """runs/<run_id>/evaluation/gate.json, beside the run's manifest."""
+    return event["manifest_uri"].rsplit("/", 1)[0] + "/evaluation/gate.json"
+
+
+def signed_gates_for(ddb, s3, event):
+    """(the gates this run started with, where they were read from).
+
+    From the run's ROW, which start-pipeline writes and the harness role cannot: the manifest
+    is agent-writable (S3PipelineObjects grants PutObject on runs/*), so bars read from it are
+    bars an agent can lower before it decides against them. A run started before the row
+    carried its gates falls back to the manifest and says so.
+    """
+    row = ddb.Table(os.environ["RUNS_TABLE"]).get_item(
+        Key={"run_id": event["run_id"]}).get("Item") or {}
+    if row.get("signed_gates"):
+        return json.loads(row["signed_gates"]), "run row"
+    return signed_plan_params(_load_manifest(s3, event["manifest_uri"])).get("gates"), \
+        "manifest (run started before its row carried its gates)"
+
+
+def delivered_directives(ddb, run_id: str) -> list:
+    """[{decision, actor}] for every directive delivered to this run, from the stage-events
+    table the harness role cannot write."""
+    rows = ddb.Table(os.environ["EVENTS_TABLE"]).query(
+        KeyConditionExpression=Key("run_id").eq(run_id)
+        & Key("sk").begins_with(DIRECTIVE_SK)).get("Items", [])
+    return [{"decision": r.get("decision", ""), "actor": r.get("actor", "")}
+            for r in rows if str(r.get("sk", "")).startswith(DIRECTIVE_SK) and r.get("delivered")]
+
+
+def check_gate_output(s3, event, metrics: dict, ddb=None) -> list:
+    """The gate's file against pipeline/contracts/gate.schema.json and the signed bars; [] when
+    it conforms.
+
+    Four live runs of one prompt wrote four shapes, and the two readers of the file (the
+    provenance card, the Outcome tab) could only guess among them. The bars come from the
+    run's row, not from the agent's invocation or the agent-writable manifest, so a gate.json
+    cannot pass by deciding a bar of its own; the verdict is re-derived from the file's own
+    numbers; and a borderline's directive must be one this run was actually given. Every
+    lookup that fails is a rejection: this check is the one between a model and Deploy.
+    """
+    uri = gate_uri_for(event)
+    bucket, _, key = uri[5:].partition("/")
+    try:
+        data = s3.get_object(Bucket=bucket, Key=key,
+                             Range=f"bytes=0-{gate_contract.MAX_BYTES}")["Body"].read()
+        if len(data) > gate_contract.MAX_BYTES:
+            return [f"{uri} is over {gate_contract.MAX_BYTES} bytes; a gate verdict is a few KB"]
+        doc = gate_contract.loads(data)
+    except ValueError as exc:
+        return [f"{uri} is not JSON: {exc}"]
+    except Exception as exc:  # noqa: BLE001 -- unreadable is a rejection, never a pass
+        return [f"{uri} could not be read back: {type(exc).__name__}: {str(exc)[:200]}"]
+    try:
+        signed, source = signed_gates_for(ddb, s3, event)
+        given = delivered_directives(ddb, event["run_id"])
+    except Exception as exc:  # noqa: BLE001
+        return [f"the run's signed gates or delivered directives could not be read: "
+                f"{type(exc).__name__}: {str(exc)[:200]}"]
+    print(f"[driver] gate check for {event.get('run_id')}: signed gates from the {source}")
+    return gate_contract.check(doc, run_id=event.get("run_id"), iteration=event.get("iteration"),
+                               signed_gates=signed if isinstance(signed, dict) else None,
+                               claimed_passed=(metrics or {}).get("gate_passed"),
+                               directives=given)
+
+
 def handle_stage_complete(c, event, args) -> dict:
     """Verify → normalize → canonical publish → events → settle token."""
     run_id, stage, task = event["run_id"], event["stage"], event["task"]
@@ -1578,7 +1657,11 @@ def handle_stage_complete(c, event, args) -> dict:
     if stage == "monitor" and task == "sweep":
         invalid = check_sweep_output(c["s3"], event, norm["outputs"])
         if invalid:
-            return {"ok": False, "invalid_outputs": invalid}
+            return {"ok": False, "invalid_outputs": invalid, "contract": "sweep"}
+    if stage == "eval" and task == "gate":
+        invalid = check_gate_output(c["s3"], event, norm.get("metrics", {}), ddb=c["ddb"])
+        if invalid:
+            return {"ok": False, "invalid_outputs": invalid, "contract": "gate"}
 
     _record_stage_event(c["ddb"], run_id, stage, "stage_complete",
                         _stamp_dispatch(norm, stage, task))
@@ -3380,15 +3463,19 @@ def _run_stage(event, context=None, c=None):
                 result = handle_stage_complete(c, event, args)
                 if not result["ok"]:
                     if result.get("invalid_outputs"):
-                        # The sweep contract (pipeline/contracts/sweep.schema.json). Its own
-                        # branch, ending in `continue`, so the missing-outputs path below never
-                        # sees a result that has no missing_outputs key.
+                        # An output contract (pipeline/contracts/sweep.schema.json or
+                        # gate.schema.json). Its own branch, ending in `continue`, so the
+                        # missing-outputs path below never sees a result that has no
+                        # missing_outputs key.
+                        contract = result.get("contract", "sweep")
                         print(f"[driver] stage_complete REJECTED stage={event.get('stage')} "
-                              f"task={event.get('task')}: sweep contract, "
+                              f"task={event.get('task')}: {contract} contract, "
                               f"{len(result['invalid_outputs'])} error(s)")
+                        reject = (_gate_contract_rejection if contract == "gate"
+                                  else _sweep_contract_rejection)
                         messages = _answer(tu, {
                             "status": "rejected",
-                            "reason": _sweep_contract_rejection(result["invalid_outputs"])})
+                            "reason": reject(result["invalid_outputs"])})
                         continue
                     # .get: a rejection for another reason (a contract check) may carry no
                     # missing_outputs, and a KeyError here would crash the turn, not reject it.

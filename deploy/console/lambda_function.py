@@ -2515,8 +2515,9 @@ def _eval_files(run_id):
 def _gate_view(gate):
     """A gate verdict in one shape, whichever of the shapes the eval agent wrote.
 
-    gate.json is written by the agent, and runs of the same prompt wrote it three ways
-    (gate_results / decisions / results, see pipeline/contracts/provenance.py). The reader is
+    gate.json is written by the agent. Since the gate contract it has one shape (gate/1, enforced
+    by the driver); before it, runs of the same prompt wrote four (see GATE_SHAPES in
+    pipeline/contracts/provenance.py), and those runs are still read. The reader is
     the provenance card's, so the Outcome tab and the model's card cannot disagree about a run:
     with a reader of its own this page showed no tuned scores for the 2026-10-23 demo run, whose
     gate.json was the third shape.

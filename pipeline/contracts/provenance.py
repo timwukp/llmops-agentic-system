@@ -43,7 +43,11 @@ ALLOWED_KEYS = {
                                "custom_details"},
 }
 
-#: gate.json, as the eval agent has written it:
+#: gate.json since the gate contract (pipeline/contracts/gate.schema.json): one shape, enforced by
+#: the driver at stage_complete. Kept as a literal so this module stays importable on its own in
+#: the console and publisher bundles; tests/test_gate_contract.py holds it equal to the contract's.
+GATE_SCHEMA = "gate/1"
+#: gate.json before the contract, as the eval agent wrote it. Read for the runs already on record:
 #:   gate_results  -- wilson95_ci_low/high, n            (2026-10-16 trained run)
 #:   decisions     -- ci_low/high, counts "47/120"       (2026-10-23 untrained baseline)
 #:   results       -- ci_low/high, count  "120/120"      (2026-10-23 demo run)
@@ -74,9 +78,19 @@ def _pct(v) -> str:
 
 # ── readers: one shape out, whichever shape went in ──────────────────────────
 def gate_view(gate: dict | None) -> dict | None:
-    """A gate verdict in one shape. `shape` names the source key it was read from, or `unknown`."""
+    """A gate verdict in one shape. `shape` is `gate/1`, the legacy source key it was read from,
+    or `unknown`."""
     if not gate:
         return None
+    if gate.get("schema_version") == GATE_SCHEMA and isinstance(gate.get("gates"), dict):
+        return {"gate_passed": gate.get("gate_passed"), "decided_at": gate.get("decided_at"),
+                "shape": GATE_SCHEMA,
+                "metrics": {name: {"value": _num(g.get("value")), "threshold": _num(g.get("threshold")),
+                                   "ci_low": _num(g.get("ci_low")), "ci_high": _num(g.get("ci_high")),
+                                   "k": None if g.get("k") is None else str(g["k"]),
+                                   "n": None if g.get("n") is None else str(g["n"]),
+                                   "verdict": g.get("verdict")}
+                            for name, g in gate["gates"].items() if isinstance(g, dict)}}
     found = [k for k in GATE_SHAPES if isinstance(gate.get(k), dict)]
     metrics = {}
     for key in found:
