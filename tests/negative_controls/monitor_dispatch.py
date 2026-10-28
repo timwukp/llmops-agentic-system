@@ -4564,9 +4564,9 @@ case("console lists: a reader that stopped at its page cap reports a complete li
 
 
 def m257(t):
-    old = '"runs": runs[:10], "runsTruncated": truncated,'
+    old = '"runsTruncated": truncated, "runsRead": len(runs)'
     assert t.count(old) == 1, "the overview payload has moved"
-    return t.replace(old, '"runs": runs[:10], "runsTruncated": False,', 1)
+    return t.replace(old, '"runsTruncated": False, "runsRead": len(runs)', 1)
 
 
 case("console overview: the truncation flag is computed and then dropped before the payload",
@@ -7098,6 +7098,37 @@ case("Gate contract: the run row carries no gates", "orchestration/start_pipelin
      _swi('        **({"signed_gates": json.dumps(manifest["params"]["gates"])}',
           '        **({"no_signed_gates": json.dumps(manifest["params"]["gates"])}'),
      [f"{_GCT}test_start_pipeline_puts_the_gates_on_the_run_row"])
+
+# ── Batch 1: console hardening (2026-10-28 security audit) ───────────────────────────────────
+_LF, _PSCOPE = "deploy/console/lambda_function.py", "tests/test_console_public_scope.py::"
+# The runs list stops being projected: the raw row (with the live task token) goes out again.
+case("console: /api/overview leaks the raw run row", _LF,
+     _swi("[_public_run(r) for r in runs[:10]]", "runs[:10]"),
+     [f"{_PSCOPE}test_overview_projects_every_run_row"])
+# The manifest goes out whole again: approver identity, params, plan, models.
+case("console: /api/run leaks the whole manifest", _LF,
+     _swi('out["manifest"] = _public_manifest(man)', 'out["manifest"] = man'),
+     [f"{_PSCOPE}test_run_detail_does_not_leak_the_manifest_but_still_decides_the_gate"])
+# The central approver guard is disabled: any logged-in user reaches spend/config routes.
+case("console: the approver guard on spend routes is off", _LF,
+     _swi("if path in APPROVER_ONLY_POSTS and APPROVER_GROUP not in (user.get(\"groups\") or []):",
+          "if False and APPROVER_GROUP not in (user.get(\"groups\") or []):"),
+     [f"{_PSCOPE}test_a_group_less_user_cannot_reach_a_spend_or_config_route[/api/start-run]"])
+# Accept stops requiring the approver group.
+case("console: accept no longer requires approver", _LF,
+     _swi('if APPROVER_GROUP not in (user.get("groups") or []):\n                            '
+          'return _resp(403, {"error": f"{APPROVER_GROUP} membership required to approve"})',
+          'if False:\n                            '
+          'return _resp(403, {"error": f"{APPROVER_GROUP} membership required to approve"})'),
+     [f"{_PSCOPE}test_accept_requires_the_approver_group"])
+# The non-finite budget guard is removed: a NaN limit is accepted and never fires.
+case("console: a NaN budget limit is accepted", _LF,
+     _swi("or not math.isfinite(limit)", "or False"),
+     [f"{_PSCOPE}test_save_budget_rejects_non_finite_limits[nan]"])
+# days is no longer snapped: a caller can fan out distinct cache keys and billed CE calls.
+case("console: cost days are not snapped", _LF,
+     _swi("days = min(COST_DAYS_CHOICES, key=lambda a: abs(a - d))", "days = d"),
+     [f"{_PSCOPE}test_cost_days_are_snapped_to_the_fixed_set"])
 
 #: Where the pristine text of the file currently mutated is parked, so a kill -9 -- which
 #: no handler can intercept -- still leaves the original recoverable. Under the repo root

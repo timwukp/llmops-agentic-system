@@ -5,6 +5,17 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
 ## [Unreleased]
 
+### The console does not leak live tokens, and spend/config routes are approver-only (security Batch 1)
+
+- **Fixed a live leak:** the unauthenticated `/api/overview` returned raw run rows carrying the
+  Step Functions `task_token` (a live token forges a stage's completion), and `/api/run` returned the
+  signed approver's identity. Both responses are now projected to the fields the page renders
+  (`_public_run`, `_public_manifest`); the full manifest stays server-side for the gate computation.
+- **Authorization:** the spend / standing-config / agent-behaviour POST routes and task accept now
+  require the approver group. (Self-approval stays allowed while there is a single admin account.)
+- **Hardening:** budgets reject non-finite limits; `/api/cost/v2` snaps its window to {7,30,90}; 500s
+  are generic with a request id. The field allowlist is derived from the frontend and guarded.
+
 ### The eval gate's verdict has one declared shape (gate/1)
 
 - **The prompt never named `gate.json`**, and four live runs wrote four shapes, which the provenance

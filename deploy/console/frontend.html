@@ -1553,7 +1553,7 @@ function taskFlowNote(t, st){
     const tail = st.status === "dispatched" ? " — follow it on Pipeline / Cost"
                : ` at ${esc(t.closed_at || "an unrecorded time")} — see Pipeline / Cost`;
     const col = st.status === "failed" ? "var(--red)" : "var(--muted)";
-    return `<div class="sub" style="color:${col}">run <a href="#" onclick="showTab('pipeline');loadRun('${esc(t.run_id)}');return false" style="color:var(--accent)" class="mono">${esc(t.run_id)}</a> ${verb}${tail}</div>`;
+    return `<div class="sub" style="color:${col}">run <a href="#" onclick="showTab('pipeline');loadRun(${jstr(t.run_id)});return false" style="color:var(--accent)" class="mono">${esc(t.run_id)}</a> ${verb}${tail}</div>`;
   }
   if (st.status === "error")
     return `<div class="sub" style="color:var(--red)">error: ${esc(t.error_msg||"")}</div>`;
@@ -1941,7 +1941,7 @@ async function loadTasks(){
       ? `<div class="sub" style="padding:4px 2px">newest ${items.length} of ${d.total||items.length}`+
         `${d.truncated?" read — the table holds more than the reader's page cap":""}</div>` : "";
     $("taskList").innerHTML = items.length ? hdr+items.map(t=>
-      `<div class="th${t.id===TASK_SEL?" sel":""}" onclick="selectTask('${esc(t.id)}')">`+
+      `<div class="th${t.id===TASK_SEL?" sel":""}" onclick="selectTask(${jstr(t.id)})">`+
       `<div class="thgoal">${esc(t.goal||t.id)}</div>`+
       `<div class="sub" style="display:flex;justify-content:space-between;gap:6px;margin-top:3px">`+
       `<span style="overflow:hidden;text-overflow:ellipsis">${esc(String(t.updated_at||"").slice(0,16))}</span>`+
