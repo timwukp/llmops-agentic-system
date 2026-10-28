@@ -1065,10 +1065,21 @@ Lambda invoke (`llmops-publish-provenance`), which writes a card built by code
 - **Observations and details:** the data journey (Silver pairs, PII redactions, Gold rows), the cost
   of the run's SageMaker jobs, and every artifact read, by URI and sha256.
 
-The files it reads are agent-written, and their shapes drift between runs of the same prompt (three
+The files it reads are agent-written, and their shapes drifted between runs of the same prompt (four
 `gate.json` shapes and two `metrics.json` shapes are on record). So the reader names every shape it
 accepts, the card records the shape it met, and the console's Outcome tab reads through the same
 functions. Before that, the Outcome tab showed no fine-tuned scores for the 2026-10-23 demo run.
+
+`gate.json` now has one shape, `gate/1` (`pipeline/contracts/gate.schema.json`), stated in the eval
+prompt and enforced by the driver: an eval gate `stage_complete` whose file does not conform is
+rejected back into the turn with the errors. Beyond the schema, the driver re-derives the verdict.
+Every gate the run started with (read from its DynamoDB row, which the agents cannot write; the
+manifest they can) is decided at that bar and none is invented; each verdict
+is the one its rule gives, with the Wilson interval recomputed from `k` and `n`; a borderline is never
+handed in without a directive this run was actually delivered (a person's, to count as a pass);
+NaN and Infinity are refused; and `gate_passed` matches both the verdicts and
+the `metrics.gate_passed` the state machine branches on. The four earlier shapes are still read, for
+the runs already on record.
 
 The function's role can write a card and can never approve: `UpdateModelPackage` also carries
 `ModelApprovalStatus`, so an explicit Deny conditioned on that key refuses any request that sets it.

@@ -7022,6 +7022,83 @@ case("Intro captions: a named break begins no sentence", _NJ,
      _swi('"s6-results": {"ja": [null, "次にゲートが識別子を"]}', '"s6-results": {"ja": [null, "次にゲートは識別子を"]}'),
      [f"{_CAP}test_the_captions_build_with_no_complaint"])
 
+# ── the gate contract: one gate.json shape, verdicts re-derived (gate-contract) ──────────────
+_GC, _GCT = "pipeline/contracts/gate_contract.py", "tests/test_gate_contract.py::"
+# The Wilson interval taken on trust instead of recomputed from k and n.
+case("Gate contract: the interval is not recomputed", _GC,
+     _swi("        if abs(lo - wl) > TOL or abs(hi - wh) > TOL:\n", "        if False:\n"),
+     [f"{_GCT}test_an_interval_that_is_not_the_wilson_interval_of_k_and_n_is_rejected"])
+# A gate.json decides against a bar of its own.
+case("Gate contract: the signed bar is not compared", _GC,
+     _swi("            if want is not None and abs(float(want) - g[\"threshold\"]) > 1e-9:",
+          "            if False:"),
+     [f"{_GCT}test_a_bar_other_than_the_signed_one_is_rejected"])
+# An unresolved borderline is handed in.
+case("Gate contract: a borderline needs no directive", _GC,
+     _swi('        if g["verdict"] == "borderline" and not g.get("directive", "").strip():',
+          '        if False:'),
+     [f"{_GCT}test_an_unresolved_borderline_is_never_handed_in"])
+# A null gate_passed claim accepted, so the file and the machine can disagree.
+case("Gate contract: a null claim is let through", _GC,
+     _swi("    if claimed_passed is not UNSET and claimed_passed is not doc[\"gate_passed\"]:",
+          "    if claimed_passed is not None and claimed_passed is not doc[\"gate_passed\"]:"),
+     [f"{_GCT}test_the_stage_complete_claim_must_be_the_same_boolean"])
+# The driver stops checking the gate.
+case("Gate contract: the driver does not check gate.json", "orchestration/harness_driver/handler.py",
+     _swi('    if stage == "eval" and task == "gate":\n        invalid = check_gate_output(',
+          '    if False:\n        invalid = check_gate_output('),
+     [f"{_GCT}test_only_the_gate_task_is_held_to_the_gate_contract",
+      "tests/test_orchestration.py::TestDriver::test_a_gate_claim_that_disagrees_with_gate_json_is_rejected"])
+# The prompt stops offering one of the rules the driver accepts.
+case("Gate contract: the prompt drops the band rule", "agents/eval/harness.json",
+     _swi('\\"rule\\": \\"wilson95\\" | \\"interval\\" | \\"band\\" | \\"missing\\"',
+          '\\"rule\\": \\"wilson95\\" | \\"interval\\" | \\"missing\\"'),
+     [f"{_GCT}test_the_gate_clause_names_every_required_key_and_every_allowed_value"])
+# The driver bundle ships without the schema gate_contract reads at import.
+case("Gate contract: the bundle drops the schema", "deploy/07_lambdas.py",
+     _swi('VENDOR_DATA = ("manifest.schema.json", "sweep.schema.json", "gate.schema.json")',
+          'VENDOR_DATA = ("manifest.schema.json", "sweep.schema.json")'),
+     [f"{_GCT}test_the_driver_bundle_carries_the_contract_and_its_schema"])
+# The shared reader no longer knows the contract shape: the card and the Outcome tab go blank.
+case("Gate contract: the reader ignores gate/1", "pipeline/contracts/provenance.py",
+     _swi('    if gate.get("schema_version") == GATE_SCHEMA and isinstance(gate.get("gates"), dict):',
+          '    if False:'),
+     [f"{_GCT}test_the_shared_reader_reads_the_contract_shape"])
+
+# The gate contract, hardened after the 2026-10-28 security audit.
+_DRV = "orchestration/harness_driver/handler.py"
+# NaN parsed as a number: a NaN bar passes the bar check and makes every verdict borderline.
+case("Gate contract: NaN is parsed", _GC,
+     _swi("    return json.loads(data, parse_constant=_no_constant)", "    return json.loads(data)"),
+     [f"{_GCT}test_nan_and_infinity_are_not_numbers_here"])
+# A proportion relabelled band and passed on a bare value.
+case("Gate contract: a proportion may pick its rule", _GC,
+     _swi('        if name in WILSON_METRICS and g["rule"] not in ("wilson95", "missing"):',
+          '        if False:'),
+     [f"{_GCT}test_a_proportion_is_decided_by_its_interval_and_nothing_else"])
+# Any non-empty string accepted as the directive that resolved a borderline.
+case("Gate contract: an invented directive is accepted", _GC,
+     _swi("            if not match:\n", "            if False:\n"),
+     [f"{_GCT}test_a_borderline_directive_must_be_one_the_run_was_given"])
+# The conductor agent's directive counted as a person's.
+case("Gate contract: the conductor may pass a borderline", _GC,
+     _swi('            elif doc["gate_passed"] and all(d.get("actor") == "conductor" for d in match):',
+          '            elif False:'),
+     [f"{_GCT}test_a_borderline_pass_needs_a_person_not_the_conductor"])
+# The bars read from the agent-writable manifest even when the row has them.
+case("Gate contract: the bars come from the manifest", _DRV,
+     _swi('    if row.get("signed_gates"):\n', '    if False:\n'),
+     [f"{_GCT}test_the_bars_come_from_the_run_row_not_the_agent_writable_manifest"])
+# gate.json read whole, whatever its size.
+case("Gate contract: no size cap on gate.json", _DRV,
+     _swi("        if len(data) > gate_contract.MAX_BYTES:\n", "        if False:\n"),
+     [f"{_GCT}test_an_oversized_file_is_refused_unread"])
+# start-pipeline stops putting the bars where the agent cannot reach them.
+case("Gate contract: the run row carries no gates", "orchestration/start_pipeline/handler.py",
+     _swi('        **({"signed_gates": json.dumps(manifest["params"]["gates"])}',
+          '        **({"no_signed_gates": json.dumps(manifest["params"]["gates"])}'),
+     [f"{_GCT}test_start_pipeline_puts_the_gates_on_the_run_row"])
+
 #: Where the pristine text of the file currently mutated is parked, so a kill -9 -- which
 #: no handler can intercept -- still leaves the original recoverable. Under the repo root
 #: rather than /tmp because it must be obvious to whoever finds the tree dirty, and

@@ -96,3 +96,11 @@ the app; then "好，照這個方向，翻譯成另外三種語言" after review
   which `caption_breaks` now names. English turns pages on the measured clause.
 - **Checked.** The player test reproduces the screenshot against the deployed page ("… ed on a
   store's customer conversations") and passes on this branch in all five languages at 0:06.
+
+## Captions confirmed by the owner (2026-10-28)
+
+- After #189 was deployed (09:24 UTC; the package, the page served over HTTP and the build from main
+  all `7002390f…`; 35/35 clips identical), the owner reloaded and compared: **"英文和中文一致"**,
+  English and Chinese captions agree. A two-pages-per-scene variant was tried in a working copy while
+  the owner was still looking at a page cached from before the deploy; it was withdrawn uncommitted
+  when the deployed three-page version was confirmed.

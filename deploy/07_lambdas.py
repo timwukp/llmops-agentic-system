@@ -160,7 +160,8 @@ VENDOR_DIRS = (CONTRACTS, REPO / "orchestration")
 #: an import scan cannot see a file nothing imports.
 #: sweep.schema.json is read at import time by sweep_contract (the driver's sweep check), so a
 #: bundle without it fails on the first import, not on the first sweep.
-VENDOR_DATA = ("manifest.schema.json", "sweep.schema.json")
+#: gate.schema.json is the same for gate_contract (the driver's eval-gate check).
+VENDOR_DATA = ("manifest.schema.json", "sweep.schema.json", "gate.schema.json")
 
 def flat_imports(text: str) -> list:
     """Module names imported inside an `except ImportError:` handler, in source order.

@@ -903,9 +903,17 @@ Unified Studio 打開它的頁面。那個頁面是從版本的 model card 畫�
 - **觀察與細節：** 資料旅程（Silver 配對數、PII 遮蔽數、Gold 列數）、這次 run 的 SageMaker 作業
   成本，以及讀過的每個產物的 URI 和 sha256。
 
-它讀的檔案是 agent 寫的，同一個 prompt 跑出來的形狀會變（目前有三種 `gate.json`、兩種
-`metrics.json` 的紀錄）。所以讀取器明列它接受的每一種形狀，卡上記錄讀到的是哪一種，console 的
+它讀的檔案是 agent 寫的，同一個 prompt 跑出來的形狀曾經會變（紀錄上有四種 `gate.json`、兩種
+`metrics.json`）。所以讀取器明列它接受的每一種形狀，卡上記錄讀到的是哪一種，console 的
 Outcome 分頁也透過同一組函式讀。在這之前，Outcome 分頁讀不到 2026-10-23 demo run 的微調分數。
+
+`gate.json` 現在只有一種形狀 `gate/1`（`pipeline/contracts/gate.schema.json`），寫在 eval 的 prompt
+裡，由 driver 強制：eval gate 的 `stage_complete` 如果檔案不合格式，會連同錯誤退回給 agent 重寫。
+除了格式，driver 也重新推導判定：這次 run 開始時的每道關卡（從 DynamoDB 的 run 列讀，agent 寫不到；
+manifest 則寫得到）都要按那個門檻判定，不能自己加關卡；
+每個判定都必須是它的規則給出的結果（Wilson 區間由 `k`、`n` 重新計算）；borderline 必須附上這次
+run 真的送達過的指示，要算通過還必須是人的指示；NaN 和 Infinity 一律退回；`gate_passed` 要和各關卡的判定、以及狀態機據以分支的 `metrics.gate_passed` 一致。先前的
+四種形狀仍然讀得到，給紀錄上已有的 run 用。
 
 這個函式的角色可以寫卡，但永遠不能核准：`UpdateModelPackage` 同時帶著 `ModelApprovalStatus`，
 所以有一條以這個 key 為條件的明確 Deny，拒絕任何設定它的請求。卡寫不進去時，run 照樣完成，

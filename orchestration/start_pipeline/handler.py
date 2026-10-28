@@ -631,6 +631,11 @@ def handler(event, context=None, clients=None):
         # claim that the quality gate was met, which is the one claim this platform has
         # never yet been able to make.
         "pipeline_mode": manifest["params"].get("pipeline_mode", "full"),
+        # The bars the eval gate is decided against, where an agent cannot reach them. The
+        # manifest carries them too, but the harness role can rewrite the manifest; the driver's
+        # gate check (gate_contract) reads them from here.
+        **({"signed_gates": json.dumps(manifest["params"]["gates"])}
+           if isinstance(manifest["params"].get("gates"), dict) else {}),
     })
 
     ev.emit_event(os.environ["EVENT_BUS"], ev.PIPELINE_STARTED,
