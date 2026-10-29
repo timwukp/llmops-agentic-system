@@ -12,15 +12,23 @@
       "Resource": "arn:aws:logs:REGION:ACCOUNT_ID:*"
     },
     {
-      "Sid": "AgentCoreControl",
+      "Sid": "AgentCoreList",
       "Effect": "Allow",
       "Action": [
         "bedrock-agentcore:ListHarnesses",
-        "bedrock-agentcore:GetHarness",
-        "bedrock-agentcore:UpdateHarness",
         "bedrock-agentcore:ListAgentRuntimes"
       ],
       "Resource": "*"
+    },
+    {
+      "_comment": "GetHarness returns a harness's env vars and systemPrompt, and UpdateHarness rewrites its prompt on the DEFAULT endpoint every run invokes through. On Resource '*' these reached every harness in the account, including other projects' -- a logged-in console user could repoint any agent's behaviour (2026-10-28 security audit, Batch 2a). Scoped to this project's harnesses; the console only ever reads/optimises llmops_* and the handlers also require the approver group now.",
+      "Sid": "AgentCoreOwnHarness",
+      "Effect": "Allow",
+      "Action": [
+        "bedrock-agentcore:GetHarness",
+        "bedrock-agentcore:UpdateHarness"
+      ],
+      "Resource": "arn:aws:bedrock-agentcore:REGION:ACCOUNT_ID:harness/llmops_*"
     },
     {
       "Sid": "EvalRead",
@@ -113,7 +121,6 @@
       "Effect": "Allow",
       "Action": [
         "logs:DescribeLogGroups",
-        "logs:PutRetentionPolicy",
         "logs:CreateLogGroup",
         "logs:CreateLogStream",
         "logs:PutLogEvents"
@@ -184,14 +191,6 @@
         "ssm:GetParameters"
       ],
       "Resource": "arn:aws:ssm:REGION:ACCOUNT_ID:parameter/llmops/*"
-    },
-    {
-      "Sid": "Secrets",
-      "Effect": "Allow",
-      "Action": [
-        "secretsmanager:GetSecretValue"
-      ],
-      "Resource": "arn:aws:secretsmanager:REGION:ACCOUNT_ID:secret:llmops-admin/*"
     },
     {
       "Sid": "DDBConsole",

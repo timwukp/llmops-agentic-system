@@ -6797,6 +6797,12 @@ class TestConductorDispatch:
         detector run without the pipeline substituting an ARC one.
         """
         for field, arc_default in sorted(start_pipeline.DEFAULT_PARAMS.items()):
+            # model_package_approval_status is the one field NO input may set, not even a
+            # signed plan: registering a model as Approved is a separate human action in the
+            # registry, never bundled into plan-signing (Batch 2a / H-8). Its
+            # non-displaceability is asserted on its own below.
+            if field == "model_package_approval_status":
+                continue
             other = ({"map50": 0.75} if isinstance(arc_default, dict)
                      else not arc_default if isinstance(arc_default, bool)
                      else arc_default + 1 if isinstance(arc_default, (int, float))

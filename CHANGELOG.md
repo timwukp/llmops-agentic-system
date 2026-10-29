@@ -5,6 +5,20 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
 ## [Unreleased]
 
+### The harness and console roles are scoped down (security Batch 2a)
+
+- **Harness role:** removed `events:PutEvents` (a hijacked agent could forge pipeline events and drive
+  a conductor triage); made `contracts/*`, `pipeline/contracts/*` and `reports/*` read-only with an
+  explicit Deny on write (the agent can no longer rewrite `cost_model.py`, the gate checker, or the
+  canonical report it is judged by); added a `NeverApprove` Deny on model-package registration.
+- **No input may approve a model:** start-pipeline forces `model_package_approval_status` to
+  PendingManualApproval regardless of params, webhook, or signed plan — approval stays a separate
+  human action in the registry. This is the guarantee that does not depend on the IAM condition key.
+- **Console role:** `UpdateHarness`/`GetHarness` scoped to this project's harnesses (was `*`), and the
+  unused Secrets-Manager and log-retention grants removed.
+- Deferred to Batch 2b (needs a usage inventory + canary): SageMaker instance/runtime caps, ECR
+  pinning, Bedrock scoping, and the per-agent role split + VPC. `tests/test_iam_scopedown.py`; 5 controls.
+
 ### The console does not leak live tokens, and spend/config routes are approver-only (security Batch 1)
 
 - **Fixed a live leak:** the unauthenticated `/api/overview` returned raw run rows carrying the

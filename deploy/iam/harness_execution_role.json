@@ -157,13 +157,37 @@
         ],
         "Resource": [
           "arn:aws:s3:::<DATA_BUCKET>/runs/*",
-          "arn:aws:s3:::<DATA_BUCKET>/reports/*",
           "arn:aws:s3:::<DATA_BUCKET>/finops/*",
-          "arn:aws:s3:::<DATA_BUCKET>/contracts/*",
-          "arn:aws:s3:::<DATA_BUCKET>/pipeline/contracts/*",
           "arn:aws:s3:::<DATA_BUCKET>/monitoring/*",
           "arn:aws:s3:::<DATA_BUCKET>/cost/*",
           "arn:aws:s3:::<DATA_BUCKET>/models-mirror/*"
+        ]
+      },
+      {
+        "_comment": "contracts/* and pipeline/contracts/* hold the canonical instruments an agent is judged by or executes (cost_model.py, the gate schema+checker, tasks.py); reports/* holds the driver-written canonical per-run report. The finops agent READS contracts/cost_model.py; nothing an agent does writes any of these. They were in S3PipelineObjects' Get+Put set, which is the same 'an agent can rewrite the instructions it is judged against' hole AGENTS.md closed for skills/*. Get-only here, and the explicit Deny below makes a future widening of some other Allow unable to re-grant the write (2026-10-28 security audit, Batch 2a).",
+        "Sid": "S3InstrumentsReadOnly",
+        "Effect": "Allow",
+        "Action": "s3:GetObject",
+        "Resource": [
+          "arn:aws:s3:::<DATA_BUCKET>/contracts/*",
+          "arn:aws:s3:::<DATA_BUCKET>/pipeline/contracts/*",
+          "arn:aws:s3:::<DATA_BUCKET>/reports/*"
+        ]
+      },
+      {
+        "_comment": "Explicit Deny on every write verb to the instruments and the canonical code/skills trees. code/* and skills/* are already Get-only by omission; naming them in a Deny means no later Allow (a broadened prefix, a new statement) can silently re-grant write to the files that define how the agent behaves and how it is scored. Deny beats Allow, so this is the backstop for S3InstrumentsReadOnly and S3SkillsReadOnly.",
+        "Sid": "S3DenyInstrumentWrites",
+        "Effect": "Deny",
+        "Action": [
+          "s3:PutObject",
+          "s3:DeleteObject"
+        ],
+        "Resource": [
+          "arn:aws:s3:::<DATA_BUCKET>/contracts/*",
+          "arn:aws:s3:::<DATA_BUCKET>/pipeline/contracts/*",
+          "arn:aws:s3:::<DATA_BUCKET>/reports/*",
+          "arn:aws:s3:::<DATA_BUCKET>/code/*",
+          "arn:aws:s3:::<DATA_BUCKET>/skills/*"
         ]
       },
       {
@@ -303,6 +327,21 @@
         ]
       },
       {
+        "_comment": "Approving a model package is the human decision the KMS-signed spine exists to protect; an agent registering an Approved model bypasses it. The same Deny the publish_provenance role already carries (lambda_roles.json NeverApprove), on both Create and Update. start-pipeline also forces model_package_approval_status to PendingManualApproval regardless of caller input (_merge_params), which is the guarantee that does NOT depend on whether the sagemaker:ModelApprovalStatus condition key is populated for CreateModelPackage at call time -- verify that with simulate_principal_policy against the live account at deploy (2026-10-28 security audit, Batch 2a).",
+        "Sid": "NeverApproveAtRegistration",
+        "Effect": "Deny",
+        "Action": [
+          "sagemaker:CreateModelPackage",
+          "sagemaker:UpdateModelPackage"
+        ],
+        "Resource": "*",
+        "Condition": {
+          "StringEquals": {
+            "sagemaker:ModelApprovalStatus": "Approved"
+          }
+        }
+      },
+      {
         "_comment": "Account-wide READ of endpoint shape, split out of SageMakerLifecycleScoped after the first live sweep proved the scoped version unusable for the job. That sweep found the account's one real orphan (jumpstart-dft-hf-asr-whisper-large-v2, InService 842 days as the sweep read it on 2026-08-01 -- 843 by its deletion the next day, 0 invocations over both a 2h and a 7d window) and then had to file this in its own output: \"sagemaker:DescribeEndpoint / DescribeEndpointConfig denied to llmops-harness-execution -- instance type and instance count could not be confirmed; cost figures are estimates based on JumpStart defaults\". So it reported ~$1106/month and ~$30.6k since creation as a GUESS at the JumpStart default instance type. A cost control whose headline number is an assumption is one an owner can dismiss, and dismissing it correctly -- the whole value of the finding is the figure. Same shape as the ListTags argument one statement below: you cannot describe only the endpoints you already know are yours and expect to characterise the ones you do not. Resource \"*\" and Describe-only; every mutation (Create/Update/Delete/AddTags) stays scoped to llmops-* in SageMakerLifecycleScoped, so the sweep can fully characterise an orphan it still cannot touch -- exactly the authority its prompt grants ('do NOT delete endpoints yourself -- report them').",
         "Sid": "SageMakerDescribeReadOnly",
         "Effect": "Allow",
@@ -377,12 +416,6 @@
           "arn:aws:logs:<REGION>:<ACCOUNT_ID>:log-group:/aws/sagemaker/*",
           "arn:aws:logs:<REGION>:<ACCOUNT_ID>:log-group:/aws/sagemaker/*:log-stream:*"
         ]
-      },
-      {
-        "Sid": "PutPipelineEvents",
-        "Effect": "Allow",
-        "Action": "events:PutEvents",
-        "Resource": "arn:aws:events:<REGION>:<ACCOUNT_ID>:event-bus/llmops-pipeline"
       },
       {
         "_comment": "For llmops_finops (the audit runtime). READ-ONLY on billing, by design: an auditor able to change what it audits is not an auditor. Every verb here is a read -- notably NO ce:CreateCostCategoryDefinition, NO ce:UpdateCostAllocationTagsStatus, NO budgets:ModifyBudget. budgets:ViewBudget is the read: the Budgets API authorizes DescribeBudgets against the IAM action budgets:ViewBudget, so a policy naming only budgets:DescribeBudgets denies the call (live AccessDeniedException named budgets:ViewBudget). Both are listed -- ViewBudget is the one enforced. Resource must be * because ce:* and pricing:* have no resource-level ARNs; the scoping is the verb list. All six harnesses share this role, so the other five gain read-only billing visibility they do not use -- the alternative is a second execution role, which the harness create path does not support today.",
