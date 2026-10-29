@@ -7160,6 +7160,34 @@ case("IAM: the console can update any harness", _CROLE,
            '"Resource": "*"'),
      [_IAMT + "test_the_console_can_only_touch_this_projects_harnesses"])
 
+# ── Batch 3: cap agent-written reads (2026-10-29 security audit) ─────────────────
+_DRV3, _CT3, _PV3 = ("orchestration/harness_driver/handler.py", "orchestration/conductor_tools.py",
+                     "orchestration/publish_provenance/handler.py")
+_RC = "tests/test_driver_read_caps.py::"
+# The manifest size cap is removed: a giant manifest would OOM the driver again.
+case("read-cap: the manifest is read without a size cap", _DRV3,
+     _swap("        if too_big:\n            print(f\"[driver] manifest {manifest_uri} exceeds {MAX_AGENT_JSON_BYTES} bytes; \"",
+           "        if False:\n            print(f\"[driver] manifest {manifest_uri} exceeds {MAX_AGENT_JSON_BYTES} bytes; \""),
+     [_RC + "test_load_manifest_refuses_an_oversized_file"])
+# The sweep size cap is removed.
+case("read-cap: the sweep file is read without a size cap", _DRV3,
+     _swap("        if too_big:\n            return [f\"{uri} is over {MAX_AGENT_JSON_BYTES} bytes; a sweep file is a few KB\"]",
+           "        if False:\n            return [f\"{uri} is over {MAX_AGENT_JSON_BYTES} bytes; a sweep file is a few KB\"]"),
+     [_RC + "test_check_sweep_output_rejects_an_oversized_file"])
+# The extract stream stops enforcing its cap.
+case("read-cap: the gold extract stream has no cap", _DRV3,
+     _swap("            if total > MAX_EXTRACT_BYTES:", "            if total > MAX_EXTRACT_BYTES * 10**9:"),
+     [_RC + "test_verify_gold_extract_refuses_an_oversized_extract"])
+# The conductor plan read stops raising past the cap.
+case("read-cap: the plan read has no cap", _CT3,
+     _swap("    if len(data) > MAX_PLAN_BYTES:", "    if False and len(data) > MAX_PLAN_BYTES:"),
+     [_RC + "test_read_s3_uri_raises_on_an_oversized_plan"])
+# The provenance reader stops refusing an oversized input.
+case("read-cap: the provenance reader has no cap", _PV3,
+     _swap("            if len(body) > self.MAX_BYTES:\n                return None",
+           "            if False and len(body) > self.MAX_BYTES:\n                return None"),
+     [_RC + "test_reader_json_returns_none_for_an_oversized_input"])
+
 #: Where the pristine text of the file currently mutated is parked, so a kill -9 -- which
 #: no handler can intercept -- still leaves the original recoverable. Under the repo root
 #: rather than /tmp because it must be obvious to whoever finds the tree dirty, and
