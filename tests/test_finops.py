@@ -909,6 +909,7 @@ def _readable_prefixes():
     misses cancelling out is why this returned green while granting nothing.
     """
     return (_prefixes("S3PipelineObjects")
+            | _prefixes("S3InstrumentsReadOnly")
             | _prefixes("S3CustomerDataReadOnly")
             | _prefixes("S3SkillsReadOnly")
             | _prefixes("S3CanonicalCodeReadOnly")
@@ -926,10 +927,13 @@ def test_every_s3_prefix_the_auditor_writes_is_one_its_role_can_write():
     prefix added to the prompt fails here instead of at 09:00 UTC in production.
     """
     prompt = _finops_prompt()
-    granted = {r.rsplit("/", 1)[0].split("/", 1)[-1]
-               for r in _harness_s3("S3PipelineObjects")["Resource"]}
+    granted = _prefixes("S3PipelineObjects")
+    # contracts/ is the auditor's one READ (cost_model.py); it is now read-only by design
+    # (Batch 2a), so a prompt URI under it must be reachable, not writable.
+    readonly = _prefixes("S3InstrumentsReadOnly")
     for prefix in {u.split("/")[3] for u in re.findall(r"s3://<bucket>/\S+", prompt)}:
-        assert prefix in granted, f"prompt writes {prefix}/ but the role cannot"
+        assert prefix in granted or prefix in readonly, \
+            f"prompt uses {prefix}/ but the role cannot reach it"
 
 
 def test_every_s3_prefix_any_agent_prompt_uses_is_one_the_role_can_reach():

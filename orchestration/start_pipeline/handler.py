@@ -52,6 +52,9 @@ DEFAULT_PARAMS = {
     # prompts return non-empty strings.
     "model_package_approval_status": "PendingManualApproval",
 }
+#: The only model-registry approval status the pipeline may ever set. _merge_params forces
+#: this regardless of caller input, so no trigger can register an Approved model.
+APPROVAL_STATUS_DEFAULT = DEFAULT_PARAMS["model_package_approval_status"]
 
 #: Sentinel for "this run was not dispatched from a conductor task".
 #
@@ -313,7 +316,18 @@ def _merge_params(params: dict, plan: dict) -> dict:
             "these keys, or seek a fresh acceptance for the plan you actually want. "
             "Refusing rather than picking a side, because a disagreement here means the "
             "approval path and the dispatch path describe different spends.")
-    return {**DEFAULT_PARAMS, **params, **plan_params}
+    merged = {**DEFAULT_PARAMS, **params, **plan_params}
+    # Model-registry approval is never a pipeline decision (see DEFAULT_PARAMS above), so no
+    # input may set it: a webhook body, a conductor launch_run, or even a signed plan asking
+    # for "Approved" would register a human-approved model with no human. The value is forced
+    # back to the default, regardless of what params or the plan carried. The IAM NeverApprove
+    # Deny on the harness role is the second barrier, but THIS is the one that does not depend
+    # on whether the sagemaker:ModelApprovalStatus condition key is populated at call time.
+    if merged.get("model_package_approval_status") != APPROVAL_STATUS_DEFAULT:
+        print(f"[start-pipeline] ignoring caller-supplied model_package_approval_status="
+              f"{merged.get('model_package_approval_status')!r}; approval is a human decision")
+        merged["model_package_approval_status"] = APPROVAL_STATUS_DEFAULT
+    return merged
 
 
 #: What each pipeline_mode a run may declare needs in params before it is legal to start.

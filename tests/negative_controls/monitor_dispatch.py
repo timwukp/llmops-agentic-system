@@ -3075,9 +3075,9 @@ case("prompt: reads a model param the driver never supplies",
 
 # 171. The merge drops the plan again -- the original bug, byte for byte.
 def m171(t):
-    old = "    return {**DEFAULT_PARAMS, **params, **plan_params}"
+    old = "    merged = {**DEFAULT_PARAMS, **params, **plan_params}"
     assert t.count(old) == 1, f"the params merge has moved; found {t.count(old)}"
-    return t.replace(old, "    return {**DEFAULT_PARAMS, **params}", 1)
+    return t.replace(old, "    merged = {**DEFAULT_PARAMS, **params}", 1)
 
 
 case("resolver: the signed plan's stage settings are dropped for ARC defaults", _RESOLVER,
@@ -3089,9 +3089,9 @@ case("resolver: the signed plan's stage settings are dropped for ARC defaults", 
 # 172. The ARC defaults outrank the plan -- the same merge written the other way round,
 #      which is the version that looks correct and silently discards the signature.
 def m172(t):
-    old = "    return {**DEFAULT_PARAMS, **params, **plan_params}"
+    old = "    merged = {**DEFAULT_PARAMS, **params, **plan_params}"
     assert t.count(old) == 1, f"the params merge has moved; found {t.count(old)}"
-    return t.replace(old, "    return {**params, **plan_params, **DEFAULT_PARAMS}", 1)
+    return t.replace(old, "    merged = {**params, **plan_params, **DEFAULT_PARAMS}", 1)
 
 
 case("resolver: DEFAULT_PARAMS outranks the plan a human signed", _RESOLVER, m172,
@@ -7129,6 +7129,36 @@ case("console: a NaN budget limit is accepted", _LF,
 case("console: cost days are not snapped", _LF,
      _swi("days = min(COST_DAYS_CHOICES, key=lambda a: abs(a - d))", "days = d"),
      [f"{_PSCOPE}test_cost_days_are_snapped_to_the_fixed_set"])
+
+# ── Batch 2a: IAM scope-down (2026-10-28 security audit) ─────────────────────────
+_HROLE, _CROLE, _SP = ("deploy/iam/harness_execution_role.json", "deploy/console/iam-policy.json",
+                       "orchestration/start_pipeline/handler.py")
+_IAMT = "tests/test_iam_scopedown.py::"
+# The harness role gets events:PutEvents back on an Allow: a hijacked agent can forge bus events.
+case("IAM: the harness role can put pipeline events", _HROLE,
+     _swap('"Sid": "AgentCoreHarnessReadOwn",\n        "Effect": "Allow",\n        "Action": "bedrock-agentcore:GetHarness",',
+           '"Sid": "AgentCoreHarnessReadOwn",\n        "Effect": "Allow",\n        "Action": "events:PutEvents",'),
+     [_IAMT + "test_the_harness_role_cannot_put_pipeline_events"])
+# contracts/ becomes writable again: the agent can rewrite cost_model.py / the gate checker.
+case("IAM: the instruments are writable again", _HROLE,
+     _swap('"arn:aws:s3:::<DATA_BUCKET>/cost/*",\n          "arn:aws:s3:::<DATA_BUCKET>/models-mirror/*"',
+           '"arn:aws:s3:::<DATA_BUCKET>/cost/*",\n          "arn:aws:s3:::<DATA_BUCKET>/contracts/*",\n          "arn:aws:s3:::<DATA_BUCKET>/models-mirror/*"'),
+     [_IAMT + "test_the_instruments_are_not_writable"])
+# The NeverApprove Deny is flipped to Allow.
+case("IAM: the model-approval Deny is removed", _HROLE,
+     _swap('"Sid": "NeverApproveAtRegistration",\n        "Effect": "Deny"',
+           '"Sid": "NeverApproveAtRegistration",\n        "Effect": "Allow"'),
+     [_IAMT + "test_the_harness_role_denies_registering_an_approved_model"])
+# start-pipeline stops forcing the approval status: a param can set Approved.
+case("IAM: an input can set the approval status", _SP,
+     _swap('    if merged.get("model_package_approval_status") != APPROVAL_STATUS_DEFAULT:',
+           '    if False and merged.get("model_package_approval_status") != APPROVAL_STATUS_DEFAULT:'),
+     [_IAMT + "test_no_input_can_register_an_approved_model[params]"])
+# The console wildcard UpdateHarness comes back.
+case("IAM: the console can update any harness", _CROLE,
+     _swap('"Resource": "arn:aws:bedrock-agentcore:REGION:ACCOUNT_ID:harness/llmops_*"',
+           '"Resource": "*"'),
+     [_IAMT + "test_the_console_can_only_touch_this_projects_harnesses"])
 
 #: Where the pristine text of the file currently mutated is parked, so a kill -9 -- which
 #: no handler can intercept -- still leaves the original recoverable. Under the repo root
