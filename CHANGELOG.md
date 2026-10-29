@@ -5,6 +5,16 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
 ## [Unreleased]
 
+### An oversized agent-written file can no longer OOM the driver (security Batch 3)
+
+- The driver and the publish-provenance Lambda read several agent-written files (manifest, sweep
+  file, Gold extract, the conductor's plan, the card's inputs) whole. A harness can write any size to
+  its own run prefix, and a multi-GB file would OOM a 512 MB Lambda — an uncatchable OOM that hangs
+  the stage to its timeout and triggers replays. Every such read is now bounded: JSON under a few-MB
+  Range read, the Gold extract streamed and hashed with an upper bound. `tests/test_driver_read_caps.py`;
+  5 controls. The dispatch-trust items (typed-call recovery scope, bus-triage authenticity,
+  one-approval-one-run, webhook replay) are a later slice.
+
 ### The harness and console roles are scoped down (security Batch 2a)
 
 - **Harness role:** removed `events:PutEvents` (a hijacked agent could forge pipeline events and drive

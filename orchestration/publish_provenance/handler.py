@@ -58,9 +58,20 @@ class Reader:
     def __init__(self, s3, bucket):
         self.s3, self.bucket, self.sources = s3, bucket, {}
 
+    #: The card's inputs (gate.json, report.json, metrics) are small; an agent-written
+    #: multi-GB object at one of these keys would OOM this Lambda if read whole.
+    MAX_BYTES = 8 * 1024 * 1024
+
     def json(self, key: str, name: str | None = None):
         try:
-            body = self.s3.get_object(Bucket=self.bucket, Key=key)["Body"].read()
+            try:  # real S3 honours Range; only an old test double rejects the kwarg
+                resp = self.s3.get_object(Bucket=self.bucket, Key=key,
+                                          Range=f"bytes=0-{self.MAX_BYTES}")
+            except TypeError:
+                resp = self.s3.get_object(Bucket=self.bucket, Key=key)
+            body = resp["Body"].read()
+            if len(body) > self.MAX_BYTES:
+                return None
         except Exception:  # noqa: BLE001 -- a missing artifact is recorded as missing, not fatal
             return None
         if name:

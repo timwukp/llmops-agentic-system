@@ -109,9 +109,21 @@ def verify_record(kms, record: dict) -> bool:
         return False
 
 
+#: A plan is a few KB. Read whole, an agent-written multi-GB object at the same key would OOM
+#: whatever runs this (the driver, or the console Lambda). Range-limited; a larger object raises.
+MAX_PLAN_BYTES = 4 * 1024 * 1024
+
+
 def _read_s3_uri(s3, uri: str) -> bytes:
     bucket, _, key = uri[5:].partition("/")
-    return s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+    try:  # real S3 honours Range; only an old test double rejects the kwarg
+        resp = s3.get_object(Bucket=bucket, Key=key, Range=f"bytes=0-{MAX_PLAN_BYTES}")
+    except TypeError:
+        resp = s3.get_object(Bucket=bucket, Key=key)
+    data = resp["Body"].read()
+    if len(data) > MAX_PLAN_BYTES:
+        raise ValueError(f"{uri} exceeds {MAX_PLAN_BYTES} bytes; a plan is a few KB")
+    return data
 
 
 def service_launch_run(lam, s3, kms, args: dict, start_fn: str,

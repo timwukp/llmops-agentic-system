@@ -986,20 +986,61 @@ def _verify_gold_extract(s3, bucket: str, metrics: dict) -> dict:
         return att
     key = uri[len(f"s3://{bucket}/"):]
     try:
-        body = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+        # Streamed, not read whole: an extract is what training reads and can be large, but it
+        # is still an agent-written file that must not OOM the driver. iter_chunks keeps only a
+        # chunk in memory; the real StreamingBody has it, the test double falls back to read().
+        body = s3.get_object(Bucket=bucket, Key=key)["Body"]
+        chunks = body.iter_chunks(1 << 20) if hasattr(body, "iter_chunks") else [body.read()]
+        h, rows, total = hashlib.sha256(), 0, 0
+        for chunk in chunks:
+            total += len(chunk)
+            if total > MAX_EXTRACT_BYTES:
+                att["error"] = f"refused: extract exceeds {MAX_EXTRACT_BYTES} bytes"
+                return att
+            h.update(chunk)
+            rows += chunk.count(b"\n")
     except Exception as exc:  # noqa: BLE001 -- an unreadable extract is a finding, not a raise
         att["error"] = f"{type(exc).__name__}: {exc}"
         return att
-    att["computed_sha256"] = hashlib.sha256(body).hexdigest()
-    att["rows"] = body.count(b"\n")
+    att["computed_sha256"] = h.hexdigest()
+    att["rows"] = rows
     att["verified"] = bool(claimed) and claimed == att["computed_sha256"]
     return att
+
+
+#: A Lambda has 512 MB. An agent can write a multi-GB file to its own run prefix, and
+#: get_object()["Body"].read() would OOM the driver -- an OOM the handler's `except` cannot
+#: catch, so the task token never settles and the run hangs to its stage timeout, then async
+#: retries and the resurrector replay it. So every read of an agent-written file is bounded:
+#: JSON is small, and the Gold extract (below) is streamed. gate.json has its own
+#: cap (gate_contract.MAX_BYTES).
+MAX_AGENT_JSON_BYTES = 4 * 1024 * 1024
+MAX_EXTRACT_BYTES = 256 * 1024 * 1024
+
+
+def _get_capped(s3, bucket: str, key: str, max_bytes: int):
+    """(bytes, too_big). A Range request so an oversized object is never fully fetched: it
+    returns at most max_bytes+1 bytes, and too_big is True when the object is larger.
+
+    Real S3 always honours Range; only a test double that predates this raises TypeError for
+    the kwarg, and there the fallback full read is a small fixture, so the cap still holds."""
+    try:
+        resp = s3.get_object(Bucket=bucket, Key=key, Range=f"bytes=0-{max_bytes}")
+    except TypeError:
+        resp = s3.get_object(Bucket=bucket, Key=key)
+    data = resp["Body"].read()
+    return data, len(data) > max_bytes
 
 
 def _load_manifest(s3, manifest_uri: str) -> dict:
     bucket, _, key = manifest_uri[5:].partition("/")
     try:
-        return json.loads(s3.get_object(Bucket=bucket, Key=key)["Body"].read())
+        data, too_big = _get_capped(s3, bucket, key, MAX_AGENT_JSON_BYTES)
+        if too_big:
+            print(f"[driver] manifest {manifest_uri} exceeds {MAX_AGENT_JSON_BYTES} bytes; "
+                  "refusing to load it into the driver")
+            return {}
+        return json.loads(data)
     except Exception:
         return {}
 
@@ -1561,7 +1602,10 @@ def check_sweep_output(s3, event, outputs) -> list:
         return ["no sweep file: write it to params.sweep_uri and list it in outputs"]
     bucket, _, key = uri[5:].partition("/")
     try:
-        doc = json.loads(s3.get_object(Bucket=bucket, Key=key)["Body"].read())
+        data, too_big = _get_capped(s3, bucket, key, MAX_AGENT_JSON_BYTES)
+        if too_big:
+            return [f"{uri} is over {MAX_AGENT_JSON_BYTES} bytes; a sweep file is a few KB"]
+        doc = json.loads(data)
     except ValueError as exc:
         return [f"{uri} is not JSON: {exc}"]
     except Exception as exc:  # noqa: BLE001 -- unreadable is a rejection, never a pass
