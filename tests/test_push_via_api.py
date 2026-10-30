@@ -30,6 +30,14 @@ def _load(name: str, rel: str):
 push = _load("push_via_api", "tools/push_via_api.py")
 
 
+@pytest.fixture(autouse=True)
+def _stub_redaction_preflight(monkeypatch):
+    """These tests drive main() with a fake git, so the real redaction preflight (which reads
+    the on-disk tracked tree) has nothing to read and would wrongly block. Stub it clean; the
+    preflight's own behaviour is covered by tests/test_ci_hardening.py."""
+    monkeypatch.setattr(push, "_preflight_redaction_scan", lambda: 0)
+
+
 def raw(*records: str) -> bytes:
     """Build a `git diff --raw -z` payload from ':meta\\0path' style strings."""
     return b"".join(r.encode() + b"\0" for r in records)

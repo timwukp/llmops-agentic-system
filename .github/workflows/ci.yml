@@ -4,6 +4,12 @@ on:
   push:
   pull_request:
 
+# Least privilege: this workflow only reads the repo and runs tests. Without this it
+# inherits the repo-default token scope, which may be write-all, while running repo code
+# and pip-installed packages (2026-10-30 security audit).
+permissions:
+  contents: read
+
 jobs:
   validate:
     runs-on: ubuntu-latest

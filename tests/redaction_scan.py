@@ -107,7 +107,7 @@ ALLOWED = (b"6833" + b"13688378", b"7631" + b"04351884", b"1234" + b"56789012")
 #: this laptop, single-threaded CPython does 3.1M sha256/s, so the whole 1e12 space falls in
 #: about 4 days -- and a GPU does it in roughly 100 seconds. So the KDF is iterated. At 200k
 #: iterations a candidate costs ~16 ms, which makes the same sweep ~500 GPU-years, while the
-#: scan stays cheap because only 12-digit runs are ever hashed: measured across all 442
+#: scan stays cheap because only 12-digit runs are ever hashed: measured across all 447
 #: tracked files there are 87 such runs, 14 distinct, and hashing the distinct set takes 0.16 s
 #: for the entire repo. (Re-measured whenever either number moves, and they move
 #: INDEPENDENTLY, which is why both are derived and neither is inferred from the other, and
@@ -270,8 +270,10 @@ ALLOWED = (b"6833" + b"13688378", b"7631" + b"04351884", b"1234" + b"56789012")
 #: 12-digit run; the runs held at 87.
 #: Then 432 files went to 437 (IAM scope-down Batch 2a: its guard, evidence and intent chain). No
 #: 12-digit run; the runs held at 87.
-#: Then 437 files became 442 (driver read caps Batch 3: its guard, evidence and intent chain). No
+#: Then 437 files went to 442 (driver read caps Batch 3: its guard, evidence and intent chain). No
 #: 12-digit run; the runs held at 87.
+#: Then 442 files became 447 (CI/supply-chain hardening Batch 4: its guard, evidence and intent chain).
+#: No 12-digit run; the runs held at 87.
 #: No 12-digit run; the runs held at 87.
 #: Dollar limits and percentages only -- no 12-digit run, so the runs held at 74 again.
 #: For EIGHT commits
@@ -332,8 +334,18 @@ def account_digest(candidate: bytes) -> str:
 HIGH_SIGNAL = (
     ("AWS access key id", re.compile(rb"AKIA[0-9A-Z]{16}")),
     ("AWS temporary access key id", re.compile(rb"ASIA[0-9A-Z]{16}")),
-    ("AWS secret key assignment", re.compile(rb"aws_secret_access_key")),
+    ("AWS secret key assignment", re.compile(rb"(?i)aws_secret_access_key\s*[:=]\s*[\"']?[A-Za-z0-9/+]{40}")),
     ("account-bearing ARN", re.compile(rb"arn:aws[a-z-]*:[a-z0-9-]+:[a-z0-9-]*:[0-9]{12}")),
+    # ECR image URIs are the commonest way an account id leaks, and GENERIC_ACCOUNT_ID skips a
+    # 12-digit run followed by a '.' (the dkr host), so this names the shape explicitly.
+    ("ECR registry account id", re.compile(rb"[0-9]{12}\.dkr\.ecr\.")),
+    # Third-party tokens and private keys -- none of these existed before 2026-10-28; a GitHub
+    # PAT, a Hugging Face or Anthropic key, or a pasted private key would have shipped unflagged.
+    ("GitHub token", re.compile(rb"gh[pousr]_[A-Za-z0-9]{36,}")),
+    ("Hugging Face token", re.compile(rb"hf_[A-Za-z0-9]{34,}")),
+    ("Anthropic API key", re.compile(rb"sk-ant-[A-Za-z0-9_-]{20,}")),
+    ("Slack token", re.compile(rb"xox[baprs]-[A-Za-z0-9-]{10,}")),
+    ("private key block", re.compile(rb"-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----")),
 )
 
 #: Live front-door hostnames. An API Gateway id is not a credential, and every rule above is
@@ -517,8 +529,11 @@ def main(argv=None) -> int:
 
     try:
         if args.staged:
+            # ACMR, not ACM: a file renamed-and-edited has status R, which ACM skipped -- so a
+            # secret added while moving a file slipped past the hook. R is included here; the
+            # name is the new path, which _read_staged reads from the index.
             names = _git("diff", "--cached", "--name-only",
-                         "--diff-filter=ACM").split("\n")
+                         "--diff-filter=ACMR").split("\n")
             reader = _read_staged
         elif args.tracked:
             names = _git("ls-files").split("\n")
