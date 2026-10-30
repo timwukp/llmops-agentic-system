@@ -13,7 +13,8 @@
 1. `tests/redaction_scan.py`, `hooks/pre-commit`, `tools/push_via_api.py`,
    `.github/workflows/run-pipeline.yml`, `.github/workflows/ci.yml`, `.github/workflows/redaction-check.yml`.
 2. Tests: `tests/test_ci_hardening.py` (new), `tests/negative_controls/monitor_dispatch.py`,
-   `tests/test_redaction_scan.py`.
+   `tests/test_redaction_scan.py`, `tests/test_push_via_api.py` (an autouse fixture stubs the
+   new push-time redaction preflight so the existing fake-git tests don't run the real scan).
 3. Records: `CHANGELOG.md`, `docs/TEST_RESULTS.md`, `docs/TEST_RESULTS.zh-TW.md`,
    `deploy/evidence/VERIFICATION_ci_hardening.md` (new), `intent/ci-hardening/{intent,spec,plan}.md`, `.sdlc/active`.
 
