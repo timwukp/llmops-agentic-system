@@ -11,7 +11,10 @@
 ## Files changed
 
 1. `pipeline/v2/verify_sandbox.py`, `deploy/03_storage.py`.
-2. Tests: `tests/test_audit_hardening.py` (new), `tests/negative_controls/monitor_dispatch.py`.
+2. Tests: `tests/test_audit_hardening.py` (new), `tests/negative_controls/monitor_dispatch.py`,
+   `tests/redaction_scan.py`, `tests/test_redaction_scan.py` (the redaction census counts its own
+   tracked-file total; adding this batch's files moves it from 442 to 447, which the assert-doc-claims
+   guard requires be updated in the same change — not separate work).
 3. Records: `CHANGELOG.md`, `docs/TEST_RESULTS.md`, `docs/TEST_RESULTS.zh-TW.md`,
    `deploy/evidence/VERIFICATION_audit_hardening.md` (new),
    `intent/audit-hardening/{intent,spec,plan}.md`, `.sdlc/active`.
