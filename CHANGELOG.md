@@ -22,6 +22,16 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
   to tables that already existed as well as new ones — closing the gap where a pitr-on-create-only
   path missed `llmops-stage-events`, the only durable record of an escalation, now deployed with
   PITR. `tests/test_audit_hardening.py`; 5 controls. Deploy: `deploy/03_storage.py` (idempotent).
+### A secret cannot slip past the scanner, and a workflow input cannot run code (security Batch 4)
+
+- **Redaction scanner:** added rules for ECR-registry account ids (the leak the bare 12-digit rule
+  skips), GitHub / Hugging Face / Anthropic / Slack tokens and private keys; the aws-secret rule now
+  requires a value; the staged scan uses `--diff-filter=ACMR` so a renamed-and-edited file is scanned.
+- **The documented push path (`tools/push_via_api.py`)** now runs the scan and fails closed before any
+  API call — commits are hook-blocked, so this was the one path reaching the public remote unscanned.
+- **`run-pipeline.yml`** passes its inputs through `env:` (a `note` could previously break out of the
+  `run:` script in the step holding the assumed AWS role); `ci.yml` and `redaction-check.yml` take
+  `permissions: contents: read`. `tests/test_ci_hardening.py`; 5 controls.
 
 ### An oversized agent-written file can no longer OOM the driver (security Batch 3)
 
