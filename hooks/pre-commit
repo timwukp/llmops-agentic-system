@@ -4,7 +4,7 @@
 set -e
 cd "$(git rev-parse --show-toplevel)"
 
-STAGED=$(git diff --cached --name-only --diff-filter=ACM)
+STAGED=$(git diff --cached --name-only --diff-filter=ACMR)
 [ -z "$STAGED" ] && exit 0
 
 fail=0

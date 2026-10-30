@@ -7188,6 +7188,32 @@ case("read-cap: the provenance reader has no cap", _PV3,
            "            if False and len(body) > self.MAX_BYTES:\n                return None"),
      [_RC + "test_reader_json_returns_none_for_an_oversized_input"])
 
+# ── Batch 4: CI / supply-chain hardening (2026-10-30 security audit) ─────────────
+_RSCAN, _PUSH, _RUNYML = ("tests/redaction_scan.py", "tools/push_via_api.py",
+                          ".github/workflows/run-pipeline.yml")
+_CIT = "tests/test_ci_hardening.py::"
+# The GitHub-token rule is removed: a PAT would ship unflagged again.
+case("ci: the scanner loses the GitHub-token rule", _RSCAN,
+     _swap('("GitHub token", re.compile(rb"gh[pousr]_[A-Za-z0-9]{36,}")),', ""),
+     [_CIT + "test_the_scanner_flags_the_new_secret_shapes[github]"])
+# The ECR-account-id rule is removed: an account id leaks through an image URI again.
+case("ci: the scanner loses the ECR rule", _RSCAN,
+     _swap('("ECR registry account id", re.compile(rb"[0-9]{12}\\.dkr\\.ecr\\.")),', ""),
+     [_CIT + "test_a_plain_12_digit_run_before_a_dot_is_still_caught_as_ecr"])
+# The staged scan goes back to ACM: a renamed+edited file is skipped.
+case("ci: the staged scan skips renamed files again", _RSCAN,
+     _swap('"--diff-filter=ACMR"', '"--diff-filter=ACM"'),
+     [_CIT + "test_the_staged_scan_includes_renamed_files"])
+# The push tool stops scanning before it pushes.
+case("ci: the push path no longer scans first", _PUSH,
+     _swap("    if not args.dry_run and _preflight_redaction_scan() != 0:",
+           "    if False and _preflight_redaction_scan() != 0:"),
+     [_CIT + "test_push_via_api_refuses_before_any_api_call_when_the_scan_finds_a_secret"])
+# run-pipeline interpolates the note into the script again (command injection).
+case("ci: the workflow interpolates an input into the script", _RUNYML,
+     _swap("            --arg note \"$NOTE\" \\", "            --arg note \"${{ inputs.note }}\" \\"),
+     [_CIT + "test_the_workflow_passes_inputs_through_env_not_the_script"])
+
 #: Where the pristine text of the file currently mutated is parked, so a kill -9 -- which
 #: no handler can intercept -- still leaves the original recoverable. Under the repo root
 #: rather than /tmp because it must be obvious to whoever finds the tree dirty, and
