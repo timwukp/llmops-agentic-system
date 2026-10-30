@@ -7331,3 +7331,32 @@ if __name__ == "__main__":
     print()
     print("all guards caught their break" if not failed else f"UNCAUGHT: {failed}")
     sys.exit(1 if failed else 0)
+
+# ── Batch 5: process isolation + storage hardening (2026-10-28 security audit) ───
+_VS, _ST = "pipeline/v2/verify_sandbox.py", "deploy/03_storage.py"
+_AHT = "tests/test_audit_hardening.py::"
+# The isolate default flips to False: every existing call site runs untrusted code in-process.
+case("sandbox: isolation is off by default", _VS,
+     _swap("                      timeout_sec: int = 5, isolate: bool = True) -> dict:",
+           "                      timeout_sec: int = 5, isolate: bool = False) -> dict:"),
+     [_AHT + "test_isolate_defaults_to_on"])
+# The credential scrub is neutered: the forked child keeps the parent's AWS_ secrets.
+case("sandbox: the worker stops scrubbing credentials", _VS,
+     _swap("            os.environ.pop(k, None)", "            pass"),
+     [_AHT + "test_the_isolated_child_cannot_see_the_credential",
+      _AHT + "test_the_worker_scrubs_every_credential_shaped_variable"])
+# The TLS deny is inverted: it would deny HTTPS and allow plaintext.
+case("storage: the TLS deny is inverted", _ST,
+     _swap('"aws:SecureTransport": "false"', '"aws:SecureTransport": "true"'),
+     [_AHT + "test_the_bucket_gets_a_tls_only_deny"])
+# Deletion protection is dropped: a stray DeleteTable can drop the audit trail.
+case("storage: tables lose deletion protection", _ST,
+     _swap("    ddb.update_table(TableName=name, DeletionProtectionEnabled=True)",
+           "    pass  # ddb.update_table(TableName=name, DeletionProtectionEnabled=True)"),
+     [_AHT + "test_a_new_table_is_created_then_gains_pitr_and_deletion_protection",
+      _AHT + "test_deletion_protection_is_applied_even_without_pitr"])
+# The stage-events table loses its PITR flag: its loss becomes unrecoverable.
+case("storage: the stage-events table loses PITR", _ST,
+     _swap('}, args.dry_run, pitr=True),\n        "schema": "PK run_id (S), SK sk (S), on-demand, PITR on",',
+           '}, args.dry_run),\n        "schema": "PK run_id (S), SK sk (S), on-demand, PITR on",'),
+     [_AHT + "test_the_run_events_table_is_deployed_with_pitr"])

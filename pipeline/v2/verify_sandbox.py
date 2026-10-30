@@ -14,6 +14,7 @@ requires numpy).
 """
 from __future__ import annotations
 
+import multiprocessing
 import signal
 import threading
 import traceback
@@ -88,15 +89,13 @@ def _in_main_thread() -> bool:
     return threading.current_thread() is threading.main_thread()
 
 
-def execute_transform(code: str, input_grid: list[list[int]],
-                      timeout_sec: int = 5) -> dict:
-    """Execute `transform(input_grid)` defined by `code` in the sandbox.
+#: Address-space ceiling for the isolated worker (bytes). A transform that tries to allocate
+#: past it gets MemoryError, not the whole process's 512 MB.
+_WORKER_MAX_BYTES = 768 * 1024 * 1024
 
-    Returns {"status": "success", "output": grid} or
-    {"status": "error"|"timeout", "error": msg}.
-    Signal-based timeout: valid in the main thread of any process
-    (driver or multiprocessing worker).
-    """
+
+def _run_in_namespace(code: str, input_grid, timeout_sec: int) -> dict:
+    """The actual exec, with the signal timeout. Shared by the in-process and worker paths."""
     namespace = build_namespace()
     use_signal = _in_main_thread()
     if use_signal:
@@ -126,6 +125,60 @@ def execute_transform(code: str, input_grid: list[list[int]],
             except SandboxTimeoutError:
                 signal.alarm(0)
                 signal.signal(signal.SIGALRM, old_handler)
+
+
+def _worker(code, input_grid, timeout_sec, q):
+    """Runs in a forked child: scrub credentials, cap resources, then exec. The restricted
+    namespace is correctness, not the boundary -- THIS is the boundary. Even if the code
+    escapes to os/subprocess, the environment carries no AWS_* credentials and no IMDS token,
+    and the address-space rlimit stops it exhausting the host."""
+    import os
+    import resource
+    for k in list(os.environ):
+        if k.startswith(("AWS_", "AWS")) or k in ("AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN",
+                                                   "AWS_ACCESS_KEY_ID") or "TOKEN" in k or "SECRET" in k:
+            os.environ.pop(k, None)
+    os.environ.pop("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", None)
+    os.environ.pop("AWS_CONTAINER_CREDENTIALS_FULL_URI", None)
+    try:
+        resource.setrlimit(resource.RLIMIT_AS, (_WORKER_MAX_BYTES, _WORKER_MAX_BYTES))
+        resource.setrlimit(resource.RLIMIT_CPU, (timeout_sec + 2, timeout_sec + 2))
+    except (ValueError, OSError):
+        pass
+    q.put(_run_in_namespace(code, input_grid, timeout_sec))
+
+
+def execute_transform(code: str, input_grid: list[list[int]],
+                      timeout_sec: int = 5, isolate: bool = True) -> dict:
+    """Execute `transform(input_grid)` defined by model-written `code`.
+
+    Returns {"status": "success", "output": grid} or {"status": "error"|"timeout", "error": msg}.
+
+    By default the code runs in a FORKED child with AWS credentials scrubbed from its
+    environment and an address-space rlimit, then is killed if it overruns the wall clock.
+    The in-process restricted namespace is NOT a security boundary -- attribute-walk escapes
+    (`().__class__.__bases__[0].__subclasses__()`) are plain syntax no builtin filter can stop
+    -- so the process isolation is what makes running untrusted code safe. `isolate=False`
+    keeps the old in-process path for a trusted caller that has already sandboxed itself.
+    """
+    if not isolate:
+        return _run_in_namespace(code, input_grid, timeout_sec)
+    ctx = multiprocessing.get_context("fork")
+    q = ctx.Queue()
+    proc = ctx.Process(target=_worker, args=(code, input_grid, timeout_sec, q))
+    proc.start()
+    proc.join(timeout_sec + 2)
+    if proc.is_alive():
+        proc.terminate()
+        proc.join(1)
+        if proc.is_alive():
+            proc.kill()
+            proc.join()
+        return {"status": "timeout", "error": f"Execution exceeded {timeout_sec}s (killed)"}
+    try:
+        return q.get_nowait()
+    except Exception:  # noqa: BLE001 -- a worker that died without a result (OOM kill, segfault)
+        return {"status": "error", "error": f"worker exited (code {proc.exitcode}) with no result"}
 
 
 def grids_equal(expected: list[list[int]], actual) -> bool:

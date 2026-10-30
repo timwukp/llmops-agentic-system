@@ -5,6 +5,23 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
 ## [Unreleased]
 
+### Untrusted transform code is isolated, and the durable stores are hardened (security Batch 5)
+
+- **The ARC verification sandbox was not a sandbox.** `pipeline/v2/verify_sandbox.py` ran
+  model-written `transform(grid)` under a restricted-builtins namespace — which is correctness
+  scaffolding, not a boundary: `np.__builtins__['__import__']('os')` and the `__subclasses__()` walk
+  reach `os`, hence the process's AWS credentials and the IMDS token, and can allocate without bound.
+  `execute_transform(..., isolate=True)` (the default) now runs the code in a forked child whose
+  environment has every credential-shaped variable scrubbed and whose address space + CPU are
+  rlimited, and the parent kills an overrun. The restricted namespace stays as cheap
+  mistake-catching; `isolate=False` keeps the in-process path for a trusted caller. Proven by a real
+  escape returning `[[0,0]]` isolated vs `[[1,1]]` in-process.
+- **The durable stores had no in-transit deny, no PITR, and no deletion protection.** `ensure_bucket`
+  now attaches a `DenyInsecureTransport` policy to the data bucket (customer data, signed approvals,
+  provenance cards); `ensure_table` applies PITR (where asked) and deletion protection idempotently
+  to tables that already existed as well as new ones — closing the gap where a pitr-on-create-only
+  path missed `llmops-stage-events`, the only durable record of an escalation, now deployed with
+  PITR. `tests/test_audit_hardening.py`; 5 controls. Deploy: `deploy/03_storage.py` (idempotent).
 ### A secret cannot slip past the scanner, and a workflow input cannot run code (security Batch 4)
 
 - **Redaction scanner:** added rules for ECR-registry account ids (the leak the bare 12-digit rule

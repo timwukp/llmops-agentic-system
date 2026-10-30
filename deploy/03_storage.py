@@ -179,6 +179,21 @@ def ensure_bucket(s3, bucket, region, dry):
         }]})
     s3.put_bucket_tagging(Bucket=bucket,
                           Tagging={"TagSet": [{"Key": TAG_KEY, "Value": TAG_VAL}]})
+    # TLS-only: refuse any request that is not over HTTPS. The data bucket holds customer data,
+    # the signed approval records and the provenance cards; a plaintext request to any of them is
+    # never legitimate (every SDK uses TLS), and the deny closes a downgrade path the default
+    # encryption does not (that protects data at rest, not in transit). Idempotent put.
+    s3.put_bucket_policy(Bucket=bucket, Policy=json.dumps({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Sid": "DenyInsecureTransport",
+            "Effect": "Deny",
+            "Principal": "*",
+            "Action": "s3:*",
+            "Resource": [f"arn:aws:s3:::{bucket}", f"arn:aws:s3:::{bucket}/*"],
+            "Condition": {"Bool": {"aws:SecureTransport": "false"}},
+        }],
+    }))
     return "exists" if exists else "created"
 
 
@@ -474,24 +489,30 @@ def ensure_skills(s3, bucket, dry, src=None, repo=None):
 
 
 def ensure_table(ddb, name, spec, dry, pitr=False):
+    exists = False
     try:
         ddb.describe_table(TableName=name)
-        return "exists"
+        exists = True
     except ClientError as e:
         if e.response["Error"]["Code"] != "ResourceNotFoundException":
             raise
     except Exception:
-        pass  # no credentials in offline dry-run
+        pass  # no credentials in offline dry-run -> treat as would-create
     if dry:
-        return "would create"
-    ddb.create_table(TableName=name, BillingMode="PAY_PER_REQUEST",
-                     Tags=[{"Key": TAG_KEY, "Value": TAG_VAL}], **spec)
-    ddb.get_waiter("table_exists").wait(TableName=name)
+        return "exists" if exists else "would create"
+    if not exists:
+        ddb.create_table(TableName=name, BillingMode="PAY_PER_REQUEST",
+                         Tags=[{"Key": TAG_KEY, "Value": TAG_VAL}], **spec)
+        ddb.get_waiter("table_exists").wait(TableName=name)
+    # Idempotent, and applied whether the table was created now or pre-dates this: a table
+    # that already existed (e.g. the stage-events audit trail) still gains PITR and deletion
+    # protection, which is where a hand-maintained pitr-on-create-only missed it.
     if pitr:
         ddb.update_continuous_backups(
             TableName=name,
             PointInTimeRecoverySpecification={"PointInTimeRecoveryEnabled": True})
-    return "created"
+    ddb.update_table(TableName=name, DeletionProtectionEnabled=True)
+    return "exists" if exists else "created"
 
 
 def ensure_approval_key(kms_client, account_id, dry):
@@ -846,8 +867,8 @@ def main():
                 {"AttributeName": "run_id", "KeyType": "HASH"},
                 {"AttributeName": "sk", "KeyType": "RANGE"},
             ],
-        }, args.dry_run),
-        "schema": "PK run_id (S), SK sk (S), on-demand",
+        }, args.dry_run, pitr=True),
+        "schema": "PK run_id (S), SK sk (S), on-demand, PITR on",
     }
     results[ESTIMATES_TABLE] = {
         "status": ensure_table(ddb, ESTIMATES_TABLE, {
