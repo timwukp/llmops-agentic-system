@@ -15,7 +15,15 @@ Creates (all tagged project=llmops-agentic-system):
       account's knowledge bases): aoss data access on the one collection, s3 read on the
       corpus prefix ONLY, InvokeModel on the one embedding model
   - OpenSearch Serverless: encryption/network/data-access policies + VECTORSEARCH
-      collection llmops-retrieval + one knn_vector index (1024-dim, titan-embed-v2)
+      collection llmops-retrieval + one knn_vector index (1024-dim, titan-embed-v2).
+      The network policy's steady state is Bedrock service access only
+      (AllowFromPublic false, SourceServices bedrock.amazonaws.com). A public
+      collection is what AWS SpringClean revokes, by swapping in a dummy VPC endpoint:
+      the collection is not deleted, it becomes unreachable to Bedrock as well and keeps
+      billing. The one caller that needs the endpoint from outside AWS is this script's
+      index PUT, so a full deploy opens the policy for the index build only and seals it
+      in a `finally`, read back. --seal-network seals an existing collection and
+      touches nothing else.
   - Corpus objects: the customer's JSONL exploded to ONE OBJECT PER ROW under
       customer-data/kb-corpus/ — a Bedrock KB S3 data source treats each object as one
       document, so a single 300-row JSONL would ingest as ONE arbitrarily-chunked document
@@ -45,6 +53,7 @@ Usage:
       --customer-eval-key customer-data/<task>/id_acceptance.jsonl \
       --ood-eval-key customer-data/<task>/ood_acceptance.jsonl \
       [--ingest] [--dry-run]
+  python deploy/09_retrieval.py --region us-east-1 --seal-network [--dry-run]
   python deploy/09_retrieval.py --region us-east-1 --teardown
 """
 import argparse
@@ -78,6 +87,14 @@ VECTOR_FIELD = "bedrock-knowledge-base-default-vector"
 TEXT_FIELD = "AMAZON_BEDROCK_TEXT_CHUNK"
 METADATA_FIELD = "AMAZON_BEDROCK_METADATA"
 SSM_PREFIX = "/llmops/retrieval/"
+NETWORK_POLICY = f"{COLLECTION}-net"
+#: Bedrock's ingest and retrieve paths reach the collection as an AWS service, so a sealed
+#: collection still serves every agent's `bedrock-agent-runtime retrieve`.
+NETWORK_SOURCE_SERVICES = ["bedrock.amazonaws.com"]
+#: How long --seal-network waits for the endpoint to stop answering after the policy reads
+#: back sealed: a network policy takes effect asynchronously.
+SEAL_PROBE_TRIES = 12
+SEAL_PROBE_WAIT_S = 10
 #: AOSS bills per OCU-hour with a 2-OCU floor (1 indexing + 1 search) while the collection
 #: exists. Disclosed on every create/exists line; priced per run via the plan's
 #: kb_ocu_hours (pipeline/contracts/cost_model.py, category retrieval_index).
@@ -296,7 +313,11 @@ def ensure_kb_role(iam, account_id, region, bucket, dry):
 
 
 def ensure_aoss_policies(aoss, account_id, region, deployer_arn, dry):
-    """Encryption, network and data-access policies the collection cannot exist without.
+    """Encryption and data-access policies the collection cannot exist without.
+
+    The network policy is NOT written here: create-or-"exists" is how a public network
+    policy survived every re-run. set_network_policy owns it, and main() opens it only
+    around the index build.
 
     Data access lists TWO principals: the KB role (Bedrock's ingest/query path) and the
     DEPLOYER (this script must create the index — boto3 has no index API for AOSS, the
@@ -304,19 +325,14 @@ def ensure_aoss_policies(aoss, account_id, region, deployer_arn, dry):
     """
     kb_role_arn = f"arn:aws:iam::{account_id}:role/{KB_ROLE}"
     if dry:
-        return {"status": "would create/verify 3 policies "
-                          f"(encryption/network/data) for collection {COLLECTION}"}
+        return {"status": "would create/verify 2 policies "
+                          f"(encryption/data) for collection {COLLECTION}"}
     made = []
     enc = json.dumps({
         "Rules": [{"ResourceType": "collection",
                    "Resource": [f"collection/{COLLECTION}"]}],
         "AWSOwnedKey": True,
     })
-    net = json.dumps([{
-        "Rules": [{"ResourceType": "collection",
-                   "Resource": [f"collection/{COLLECTION}"]}],
-        "AllowFromPublic": True,
-    }])
     data = json.dumps([{
         "Rules": [
             {"ResourceType": "collection",
@@ -333,7 +349,6 @@ def ensure_aoss_policies(aoss, account_id, region, deployer_arn, dry):
         "Principal": [kb_role_arn, deployer_arn],
     }])
     for name, ptype, doc in ((f"{COLLECTION}-enc", "encryption", enc),
-                             (f"{COLLECTION}-net", "network", net),
                              (f"{COLLECTION}-data", "data", data)):
         api = "create_access_policy" if ptype == "data" else "create_security_policy"
         try:
@@ -344,6 +359,106 @@ def ensure_aoss_policies(aoss, account_id, region, deployer_arn, dry):
                 raise
             made.append(f"{name}: exists")
     return {"status": made}
+
+
+def network_policy(public):
+    """The collection's network policy document. Sealed (public=False) is the steady state;
+    the public form exists only for the deployer's index build."""
+    doc = {"Rules": [{"ResourceType": "collection",
+                      "Resource": [f"collection/{COLLECTION}"]}]}
+    if public:
+        doc.update(AllowFromPublic=True)
+    else:
+        doc.update(AllowFromPublic=False, SourceServices=list(NETWORK_SOURCE_SERVICES))
+    return [doc]
+
+
+def _same_policy(a, b):
+    """Compare parsed documents, ignoring empty members the API may echo back."""
+    def norm(doc):
+        return [{k: v for k, v in rs.items() if v not in ([], None, "")}
+                for rs in (doc or [])]
+    return norm(a) == norm(b)
+
+
+def set_network_policy(aoss, public, dry):
+    """Create, update or keep the network policy so it equals network_policy(public), then
+    read it back. An acknowledged update is not a policy in force; a read-back that differs
+    is a refusal. Returns the document it replaced: that is the rollback."""
+    want = network_policy(public)
+    state = "public" if public else f"sealed to {', '.join(NETWORK_SOURCE_SERVICES)}"
+    if dry:
+        return {"policy": NETWORK_POLICY, "public": public,
+                "status": f"would set {state}"}
+    previous, version = None, None
+    try:
+        detail = aoss.get_security_policy(name=NETWORK_POLICY,
+                                          type="network")["securityPolicyDetail"]
+        previous, version = detail.get("policy"), detail.get("policyVersion")
+    except ClientError as e:
+        if e.response["Error"]["Code"] != "ResourceNotFoundException":
+            raise
+    description = f"{state} -- deploy/09_retrieval.py"
+    if previous is None:
+        aoss.create_security_policy(name=NETWORK_POLICY, type="network",
+                                    policy=json.dumps(want), description=description)
+        status = "created"
+    elif not _same_policy(previous, want):
+        aoss.update_security_policy(name=NETWORK_POLICY, type="network",
+                                    policyVersion=version, policy=json.dumps(want),
+                                    description=description)
+        status = "updated"
+    else:
+        status = "unchanged"
+    got = aoss.get_security_policy(name=NETWORK_POLICY,
+                                   type="network")["securityPolicyDetail"].get("policy")
+    if not _same_policy(got, want):
+        raise SystemExit(f"{NETWORK_POLICY} did not read back as written ({state}): "
+                         f"got {json.dumps(got)}. Refusing to report the network {state}.")
+    return {"policy": NETWORK_POLICY, "public": public, "status": status,
+            "previous": previous, "read_back": "verified"}
+
+
+def probe_endpoint(endpoint, region):
+    """One signed GET against the collection from wherever this runs (outside AWS).
+    Returns the HTTP code, or the connection error as text: either non-2xx means refused."""
+    try:
+        code, _ = _signed_request("GET", f"{endpoint}/{INDEX}/_count", region)
+        return code
+    except OSError as e:
+        return f"unreachable: {e}"
+
+
+def _answered(code):
+    return isinstance(code, int) and 200 <= code < 300
+
+
+def seal_network(aoss, region, dry):
+    """--seal-network: seal an EXISTING collection and touch nothing else. The probe is the
+    proof, before and after: a policy that reads back sealed while the endpoint still
+    answers a signed request from outside AWS is not sealed."""
+    if dry:
+        return {"network": set_network_policy(aoss, public=False, dry=True),
+                "probe": "skipped (dry run)"}
+    got = aoss.batch_get_collection(names=[COLLECTION]).get("collectionDetails", [])
+    endpoint = got[0].get("collectionEndpoint") if got else None
+    out = {"collection": COLLECTION if endpoint else
+           f"{COLLECTION} absent -- policy set, nothing to probe"}
+    if endpoint:
+        out["probe_before"] = probe_endpoint(endpoint, region)
+    out["network"] = set_network_policy(aoss, public=False, dry=False)
+    if not endpoint:
+        return out
+    for _ in range(SEAL_PROBE_TRIES):
+        code = probe_endpoint(endpoint, region)
+        if not _answered(code):
+            out["probe_after"] = code
+            return out
+        time.sleep(SEAL_PROBE_WAIT_S)
+    raise SystemExit(
+        f"{NETWORK_POLICY} reads back sealed but {COLLECTION} still answers a signed "
+        f"request from outside AWS after {SEAL_PROBE_TRIES * SEAL_PROBE_WAIT_S}s. "
+        f"Not reporting it sealed.")
 
 
 def ensure_collection(aoss, dry):
@@ -608,7 +723,7 @@ def teardown(region, account_id, dry):
     else:
         out["collection"] = "absent -- no standing cost"
     for name, ptype in ((f"{COLLECTION}-data", "data"),
-                        (f"{COLLECTION}-net", "network"),
+                        (NETWORK_POLICY, "network"),
                         (f"{COLLECTION}-enc", "encryption")):
         api = "delete_access_policy" if ptype == "data" else "delete_security_policy"
         try:
@@ -657,11 +772,22 @@ def main():
     ap.add_argument("--ingest", action="store_true",
                     help="StartIngestionJob and reconcile document counts. Billable "
                          "(embedding tokens); a deploy decision, never an agent's.")
-    ap.add_argument("--teardown", action="store_true",
-                    help=f"delete everything this script creates, in reverse order. "
-                         f"This is what stops the OCU bill.")
+    mode = ap.add_mutually_exclusive_group()
+    mode.add_argument("--teardown", action="store_true",
+                      help=f"delete everything this script creates, in reverse order. "
+                           f"This is what stops the OCU bill.")
+    mode.add_argument("--seal-network", action="store_true",
+                      help=f"seal {NETWORK_POLICY} to Bedrock service access on an existing "
+                           f"collection and probe the endpoint before and after. Touches "
+                           f"nothing else; needs no corpus or eval arguments.")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
+
+    if args.seal_network:
+        aoss = safe_client("opensearchserverless", args.region, args.dry_run)
+        print(json.dumps({"seal_network": seal_network(aoss, args.region, args.dry_run),
+                          "dry_run": args.dry_run}, indent=2))
+        return 0
 
     account_id = args.account_id
     if not account_id:
@@ -701,9 +827,18 @@ def main():
                                         args.dry_run)
     results["aoss_policies"] = ensure_aoss_policies(aoss, account_id, args.region,
                                                     deployer_arn, args.dry_run)
-    coll = ensure_collection(aoss, args.dry_run)
-    results["collection"] = coll
-    results["index"] = ensure_index(coll.get("endpoint", ""), args.region, args.dry_run)
+    # The index PUT is the one call that needs the endpoint from outside AWS. Open for it,
+    # and seal in a `finally`, so a deploy that stops halfway does not leave it public.
+    opened = time.monotonic()
+    results["network_open"] = set_network_policy(aoss, public=True, dry=args.dry_run)
+    try:
+        coll = ensure_collection(aoss, args.dry_run)
+        results["collection"] = coll
+        results["index"] = ensure_index(coll.get("endpoint", ""), args.region,
+                                        args.dry_run)
+    finally:
+        results["network"] = set_network_policy(aoss, public=False, dry=args.dry_run)
+        results["network_window_s"] = round(time.monotonic() - opened, 1)
     corpus = ensure_corpus_objects(s3, bucket, args.source_uri, args.dry_run)
     results["corpus"] = corpus
     kb = ensure_kb(bedrock_agent, account_id, args.region,
