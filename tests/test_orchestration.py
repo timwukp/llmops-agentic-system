@@ -11,6 +11,7 @@ Run: .venv/bin/python -m pytest tests/test_orchestration.py -q
 from __future__ import annotations
 
 import ast
+import base64
 import datetime
 import fnmatch
 import hashlib
@@ -10317,6 +10318,316 @@ def test_the_harness_kb_grant_is_exactly_retrieve(retrieval_mod):
                       "bedrock:DeleteKnowledgeBase"):
         assert forbidden not in granted, (
             f"{forbidden} crept into the harness role — index content is gate integrity")
+
+
+# ── the collection's network: open only while the index is built, sealed otherwise ──
+# A public AOSS network policy is what AWS SpringClean revokes, by swapping in a dummy VPC
+# endpoint: the collection is not deleted, it becomes unreachable to Bedrock too and keeps
+# billing. The steady state is Bedrock service access only. The one caller that needs the
+# endpoint from outside AWS is the deployer's index PUT, so a full deploy opens for that
+# and seals in a `finally`. Written out literally here, not derived from the module: a
+# guard that reads the expected document from the code under test agrees with any bug.
+_SEALED_NET = [{"Rules": [{"ResourceType": "collection",
+                           "Resource": ["collection/llmops-retrieval"]}],
+                "AllowFromPublic": False,
+                "SourceServices": ["bedrock.amazonaws.com"]}]
+_PUBLIC_NET = [{"Rules": [{"ResourceType": "collection",
+                           "Resource": ["collection/llmops-retrieval"]}],
+                "AllowFromPublic": True}]
+
+
+def _aoss_validate(op, kwargs):
+    """Validate a call against botocore's OFFLINE opensearchserverless model. A fake that
+    accepts `version=` for `policyVersion=` passes here and fails at the live seal."""
+    import botocore.session
+    import botocore.validate
+    model = botocore.session.get_session().get_service_model("opensearchserverless")
+    botocore.validate.validate_parameters(kwargs, model.operation_model(op).input_shape)
+
+
+def _policy_version(n):
+    """The API's shape: base64 of "<epoch ms>_<n>", 20 characters (the model's minimum). A
+    short fake version is rejected by the offline validation above, which is how this
+    fake's first draft ("v1") was caught."""
+    return base64.b64encode(f"{1_786_623_414_576}_{n}".encode()).decode()
+
+
+def _client_error(code, op):
+    from botocore.exceptions import ClientError
+    return ClientError({"Error": {"Code": code, "Message": code}}, op)
+
+
+class _FakeAoss:
+    """Security/access policies with versions; every call model-validated and noted on the
+    world's timeline together with the network policy in force at that moment."""
+
+    def __init__(self, world, net, collection):
+        self.world = world
+        self.policies = {}
+        if net is not None:
+            self.policies[("llmops-retrieval-net", "network")] = {
+                "policy": json.loads(json.dumps(net)), "version": _policy_version(1)}
+        self.collection = collection
+        self.ignore_updates = False
+
+    def net(self):
+        p = self.policies.get(("llmops-retrieval-net", "network"))
+        return json.loads(json.dumps(p["policy"])) if p else None
+
+    def _call(self, op, kw):
+        _aoss_validate(op, kw)
+        self.world.note("aoss", op)
+
+    def _detail(self, key):
+        p = self.policies[key]
+        return {"securityPolicyDetail": {"name": key[0], "type": key[1],
+                                         "policy": json.loads(json.dumps(p["policy"])),
+                                         "policyVersion": p["version"]}}
+
+    def get_security_policy(self, **kw):
+        self._call("GetSecurityPolicy", kw)
+        key = (kw["name"], kw["type"])
+        if key not in self.policies:
+            raise _client_error("ResourceNotFoundException", "GetSecurityPolicy")
+        return self._detail(key)
+
+    def create_security_policy(self, **kw):
+        self._call("CreateSecurityPolicy", kw)
+        key = (kw["name"], kw["type"])
+        if key in self.policies:
+            raise _client_error("ConflictException", "CreateSecurityPolicy")
+        self.policies[key] = {"policy": json.loads(kw["policy"]), "version": _policy_version(1)}
+        return self._detail(key)
+
+    def update_security_policy(self, **kw):
+        self._call("UpdateSecurityPolicy", kw)
+        key = (kw["name"], kw["type"])
+        if key not in self.policies:
+            raise _client_error("ResourceNotFoundException", "UpdateSecurityPolicy")
+        p = self.policies[key]
+        if kw["policyVersion"] != p["version"]:
+            raise _client_error("ConflictException", "UpdateSecurityPolicy")
+        if not self.ignore_updates:
+            p["policy"] = json.loads(kw["policy"])
+            p["version"] = _policy_version(int(
+                base64.b64decode(p["version"]).decode().rsplit("_", 1)[1]) + 1)
+        return self._detail(key)
+
+    def create_access_policy(self, **kw):
+        self._call("CreateAccessPolicy", kw)
+        key = (kw["name"], kw["type"])
+        if key in self.policies:
+            raise _client_error("ConflictException", "CreateAccessPolicy")
+        self.policies[key] = {"policy": json.loads(kw["policy"]), "version": _policy_version(1)}
+        return {}
+
+    def batch_get_collection(self, **kw):
+        self._call("BatchGetCollection", kw)
+        if not self.collection:
+            return {"collectionDetails": []}
+        return {"collectionDetails": [{
+            "id": "cid", "name": "llmops-retrieval", "status": "ACTIVE",
+            "arn": "arn:aws:aoss:us-east-1:acct:collection/cid",
+            "collectionEndpoint": "https://cid.us-east-1.aoss.amazonaws.com"}]}
+
+    def create_collection(self, **kw):
+        self._call("CreateCollection", kw)
+        self.collection = True
+        return {}
+
+
+class _Noting:
+    """Delegates to a fake (or answers from a table) and notes every call on the timeline."""
+
+    def __init__(self, world, who, inner=None, answers=None):
+        self._world, self._who = world, who
+        self._inner, self._answers = inner, answers or {}
+
+    def __getattr__(self, op):
+        if op.startswith("_"):
+            raise AttributeError(op)
+
+        def call(*a, **kw):
+            self._world.note(self._who, op)
+            if self._inner is not None:
+                return getattr(self._inner, op)(*a, **kw)
+            r = self._answers.get(op, {})
+            return r(*a, **kw) if callable(r) else r
+        return call
+
+
+class _NetWorld:
+    """Every AWS surface main() touches, sharing one timeline. The data plane answers a
+    signed request from outside AWS only while the network policy is public -- unless
+    `always_reachable` pretends the seal did not take."""
+
+    def __init__(self, net=None, collection=False, put_code=200, always_reachable=False):
+        self.timeline = []
+        self.services = []
+        self.put_code = put_code
+        self.always_reachable = always_reachable
+        self.aoss = _FakeAoss(self, net, collection)
+        self.s3 = _FakeKbS3({"cust/corpus.jsonl":
+                             b'{"id": "t1", "ticket": "locked out", "resolution": "reset"}\n'})
+
+    def note(self, who, op):
+        self.timeline.append((who, op, self.aoss.net()))
+
+    def signed_request(self, method, url, region, body=None):
+        self.note("dataplane", method)
+        if method == "PUT":
+            return (self.put_code, {"acknowledged": True} if self.put_code == 200
+                    else {"error": {"type": "internal_error"}})
+        net = self.aoss.net()
+        public = bool(net) and net[0].get("AllowFromPublic") is True
+        if public or self.always_reachable:
+            return (200, {"count": 1})
+        return (403, {"message": "Forbidden"})
+
+    def client(self, service, region_name=None, **kw):
+        self.services.append(service)
+
+        def pager(name):
+            pages = {"list_knowledge_bases": {"knowledgeBaseSummaries": [
+                         {"name": "llmops-org-facts", "knowledgeBaseId": "KB1"}]},
+                     "list_data_sources": {"dataSourceSummaries": [
+                         {"name": "llmops-org-facts-s3", "dataSourceId": "DS1"}]}}
+
+            class _P:
+                def paginate(self, **kw):
+                    yield pages[name]
+            return _P()
+
+        return {
+            "opensearchserverless": self.aoss,
+            "s3": _Noting(self, "s3", inner=self.s3),
+            "sts": _Noting(self, "sts", answers={"get_caller_identity": {
+                "Account": "acct", "Arn": "arn:aws:iam::acct:user/deployer"}}),
+            "iam": _Noting(self, "iam"),
+            "ssm": _Noting(self, "ssm"),
+            "bedrock-agent": _Noting(self, "bedrock-agent",
+                                     answers={"get_paginator": pager}),
+        }[service]
+
+
+_FULL_DEPLOY = ["09_retrieval.py", "--region", "us-east-1",
+                "--source-uri", "s3://cust/corpus.jsonl",
+                "--customer-eval-key", "customer-data/t/id_acceptance.jsonl",
+                "--ood-eval-key", "customer-data/t/ood_acceptance.jsonl"]
+_SEAL = ["09_retrieval.py", "--region", "us-east-1", "--seal-network"]
+
+
+def _run_09(monkeypatch, mod, world, argv):
+    monkeypatch.setattr(mod.boto3, "client", world.client)
+    monkeypatch.setattr(mod, "_signed_request", world.signed_request)
+    monkeypatch.setattr(mod.time, "sleep", lambda s: None)
+    monkeypatch.setattr(sys, "argv", list(argv))
+    return mod.main()
+
+
+def test_the_sealed_network_policy_is_not_public_and_admits_only_bedrock(retrieval_mod):
+    """The steady state, as data: one rule set over the one collection, not public, and
+    Bedrock's service access the only way in. The public form exists only for the build."""
+    assert retrieval_mod.NETWORK_POLICY == "llmops-retrieval-net"
+    assert retrieval_mod.network_policy(False) == _SEALED_NET, (
+        "the sealed network policy is not 'Bedrock service access only' -- a public "
+        "collection is exactly what SpringClean revokes")
+    assert retrieval_mod.network_policy(True) == _PUBLIC_NET
+
+
+def test_a_fresh_deploy_builds_the_index_open_and_ends_sealed(retrieval_mod, monkeypatch,
+                                                              capsys):
+    """Order, not just the end state: the index PUT is the one call that needs the endpoint
+    from outside AWS, so it must see the collection open, and everything the deploy does
+    after it -- corpus, KB, data source, SSM -- must already run sealed."""
+    world = _NetWorld(net=None, collection=False)
+    assert _run_09(monkeypatch, retrieval_mod, world, _FULL_DEPLOY) == 0
+    assert world.aoss.net() == _SEALED_NET, (
+        f"a full deploy left the collection's network as {world.aoss.net()} -- "
+        "public is what SpringClean revokes, and nothing after the index build needs it")
+    tl = world.timeline
+    puts = [i for i, (who, op, _) in enumerate(tl) if who == "dataplane" and op == "PUT"]
+    assert puts, "the deploy never built the index"
+    for i in puts:
+        assert tl[i][2] == _PUBLIC_NET, (
+            "the index PUT ran against a sealed collection -- the deployer cannot reach "
+            "the endpoint, so the PUT 403s for the whole retry budget")
+    later = [(who, op, net) for who, op, net in tl[puts[-1] + 1:] if who != "aoss"]
+    assert any(who == "bedrock-agent" for who, _, _ in later), (
+        "the KB steps did not run after the index -- this test no longer drives a deploy")
+    for who, op, net in later:
+        assert net == _SEALED_NET, (
+            f"{who}.{op} ran while the collection was still public; the seal must come "
+            f"straight after the index build")
+
+
+def test_a_failed_index_build_still_seals_the_network(retrieval_mod, monkeypatch):
+    """The window is closed in a `finally`. An index PUT that fails is the likeliest way a
+    deploy stops halfway, and stopping halfway must not leave the collection public."""
+    world = _NetWorld(net=None, collection=False, put_code=500)
+    with pytest.raises(SystemExit, match="index PUT failed"):
+        _run_09(monkeypatch, retrieval_mod, world, _FULL_DEPLOY)
+    assert world.aoss.net() == _SEALED_NET, (
+        "a deploy that failed at the index build left the collection public")
+
+
+def test_a_redeploy_over_a_public_policy_heals_it(retrieval_mod, monkeypatch):
+    """The live collection has a public policy today, and `ConflictException -> "exists"`
+    left it that way on every re-run. A re-run must END sealed, by an update that carries
+    the policyVersion it read (the fake refuses a stale one, as the API does)."""
+    world = _NetWorld(net=_PUBLIC_NET, collection=True)
+    assert _run_09(monkeypatch, retrieval_mod, world, _FULL_DEPLOY) == 0
+    assert world.aoss.net() == _SEALED_NET, (
+        "a re-run over the live public policy left it public -- the code can no longer "
+        "heal the state SpringClean flags")
+    assert ("aoss", "UpdateSecurityPolicy") in [(w, o) for w, o, _ in world.timeline]
+
+
+def test_seal_network_needs_no_corpus_arguments_and_touches_only_the_network_policy(
+        retrieval_mod, monkeypatch, capsys):
+    """The live fix: seal an EXISTING collection without re-exploding the corpus or
+    re-running anything else. Only the network policy is written, and the run proves the
+    seal from outside: reachable before, refused after."""
+    world = _NetWorld(net=_PUBLIC_NET, collection=True)
+    assert _run_09(monkeypatch, retrieval_mod, world, _SEAL) == 0
+    assert world.aoss.net() == _SEALED_NET
+    assert set(world.services) == {"opensearchserverless"}, (
+        f"--seal-network built clients for {sorted(set(world.services))}; it must touch "
+        "the network policy and nothing else")
+    writes = [o for w, o, _ in world.timeline
+              if w == "aoss" and o.startswith(("Create", "Update", "Delete"))]
+    assert writes == ["UpdateSecurityPolicy"], writes
+    out = json.loads(capsys.readouterr().out)["seal_network"]
+    assert out["probe_before"] == 200 and out["probe_after"] == 403, out
+    assert out["network"]["previous"] == _PUBLIC_NET, (
+        "the run must print the document it replaced -- that is the rollback")
+
+
+def test_a_seal_that_does_not_read_back_is_a_failure(retrieval_mod):
+    """An update the API acknowledged is not a policy in force. Read it back."""
+    world = _NetWorld(net=_PUBLIC_NET, collection=True)
+    world.aoss.ignore_updates = True
+    with pytest.raises(SystemExit, match="read back"):
+        retrieval_mod.set_network_policy(world.aoss, public=False, dry=False)
+
+
+def test_a_sealed_policy_with_the_endpoint_still_answering_is_a_failure(
+        retrieval_mod, monkeypatch):
+    """A policy that reads back sealed while the endpoint still answers a signed request
+    from outside AWS is not sealed. The probe is the proof, so its failure is a refusal."""
+    world = _NetWorld(net=_PUBLIC_NET, collection=True, always_reachable=True)
+    with pytest.raises(SystemExit, match="still answer"):
+        _run_09(monkeypatch, retrieval_mod, world, _SEAL)
+
+
+def test_seal_network_dry_run_writes_nothing(retrieval_mod, monkeypatch, capsys):
+    world = _NetWorld(net=_PUBLIC_NET, collection=True)
+    assert _run_09(monkeypatch, retrieval_mod, world, _SEAL + ["--dry-run"]) == 0
+    assert world.aoss.net() == _PUBLIC_NET
+    assert not [o for w, o, _ in world.timeline
+                if o.startswith(("Create", "Update", "Delete")) or w == "dataplane"], (
+        "a dry run wrote or probed")
+    assert "would" in json.dumps(json.loads(capsys.readouterr().out))
 
 
 # ── a global name with a regional body: the second-region deploy ───────────────────
