@@ -57,11 +57,15 @@ Next: v2 experiments — code-as-reasoning distillation + augmentation; Kimi K3 
 | Build runner | VPC `llmops-build-runner` (10.44.0.0/16: public 10.44.0.0/24 with IGW + NAT gateway + EIP, private 10.44.1.0/24, use1-az1), security group with 0 ingress rules, instance m7i.large AL2023 (IMDSv2, encrypted gp3, no key, no public IP; id in SSM `/llmops/runner/instance_id`), role `llmops-build-runner-role` + instance profile `llmops-build-runner-profile`, managed policy `llmops-spike-boundary` | tools/runner/runner.py up, 2026-10-13 | long build/test jobs only (tools/runner/README.md). Billable while it exists: the instance and the NAT gateway. `runner.py down` deletes all of it |
 | Spike leftovers (temporary) | VPCs tagged `spike=s6_vpc_harness` (10.43.0.0/16, 3 subnets + 1 security group each), one per S6 run that created a harness | tools/spikes/s6_vpc_harness.py, 2026-10-13 | no charge; held by AgentCore `agentic_ai` ENIs (documented to persist up to 8 h after the harness is deleted). `python3 tools/spikes/s6_vpc_harness.py cleanup` deletes every VPC whose ENIs are gone and reports the rest. All billable endpoints and NAT gateways already deleted |
 
-_Not deployed: retrieval Knowledge Base (deploy/09_retrieval.py, added for the r6d RAFT
-run) — an AOSS vector collection bills ~$11.52/day (min 2 OCU) while it EXISTS, so it is
-created per-run under explicit human authorization and torn down (`--teardown`) when the
-run's eval is done. This is the project's one deliberate, disclosed exception to the
-zero-standing-resources posture; nothing is standing right now._
+_**Deployed and standing**, which this line denied until 2026-11-21: the retrieval Knowledge
+Base (deploy/09_retrieval.py, r6d RAFT run). Read live 2026-11-21: collection `llmops-retrieval`
+ACTIVE since 2026-08-13 with standby replicas ENABLED; KB `llmops-org-facts` ACTIVE; one ingestion
+(2026-08-13, 300 documents); last search 2026-08-18; SSM `/llmops/retrieval/*` (3). The r6d
+protocol's same-day `--teardown` never ran. An AOSS vector collection bills ~$11.52/day (min 2 OCU)
+or more while it exists, queried or not (not yet checked against Cost Explorer). Network policy
+`llmops-retrieval-net`: **public** (`AllowFromPublic: true`), flagged by an AWS SpringClean dry-run
+on 2026-11-21. Sealing it to Bedrock service access (`09_retrieval.py --seal-network`, from merged
+`main`) is `retrieval-network-private-live`. Keeping or tearing it down is an open owner decision._
 
 _Not deployed: VPC + endpoints (deploy/02_network.py) — confirmed 2026-08-10 by
 `describe-vpcs` and `describe-vpc-endpoints` on `tag:project=llmops-agentic-system` in
@@ -75,7 +79,8 @@ gateway endpoints are still built, so a prod config has something to be written 
 
 ## Standing cost posture
 
-Zero standing billable resources CREATED BY THIS PROJECT: no llmops-* SageMaker
+Zero standing billable resources CREATED BY THIS PROJECT except one, the retrieval
+collection `llmops-retrieval` (above; ~$11.52/day or more since 2026-08-13): no llmops-* SageMaker
 endpoint, pipeline scheduler DISABLED, serverless spine idles free. Total v1 build cost
 ≈ $12–15. That scoping is load-bearing and used to be missing: the account also carries
 `jumpstart-dft-hf-asr-whisper-large-v2`, InService since 2024-04-11 with **0 invocations

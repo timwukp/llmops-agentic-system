@@ -5,6 +5,28 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
 ## [Unreleased]
 
+### llmops-retrieval stops being public, so SpringClean has nothing to revoke
+
+- **The one collection SpringClean flagged as this project's was public by construction.**
+  `deploy/09_retrieval.py` wrote `llmops-retrieval-net` with `AllowFromPublic: true`, and a re-run
+  reported the existing policy `exists` without comparing it, so no deploy could heal it. When
+  SpringClean (dry-run notice, 2026-11-21) leaves dry-run it swaps in a dummy VPC endpoint. The
+  collection is not deleted: it becomes unreachable to Bedrock as well, so every agent's
+  `bedrock-agent-runtime retrieve` fails while the collection keeps billing.
+- **The steady state is now Bedrock service access only** (`AllowFromPublic: false`,
+  `SourceServices: ["bedrock.amazonaws.com"]`). A full deploy opens the policy only around the index
+  build (the deployer's SigV4 PUT is the one caller outside AWS) and seals it in a `finally`, read
+  back. `--seal-network` seals an existing collection and touches nothing else. It probes the
+  endpoint before and after, and a policy that reads back sealed while the endpoint still answers
+  is a failure.
+- **Tests:** 8 guards, written first and seen failing against the old script; 6 negative controls.
+  The fake validates every call against botocore's offline `opensearchserverless` model, which
+  caught the fake's own unrealistic `policyVersion`.
+- **Not yet applied live.** The seal runs from merged `main` in `retrieval-network-private-live`.
+- **PROJECT_STATE said the retrieval KB was not deployed.** It has stood since 2026-08-13: last
+  searched 2026-08-18, with the r6d same-day teardown never run. Keeping or tearing it down is an
+  open owner decision.
+
 ### Untrusted transform code is isolated, and the durable stores are hardened (security Batch 5)
 
 - **The ARC verification sandbox was not a sandbox.** `pipeline/v2/verify_sandbox.py` ran

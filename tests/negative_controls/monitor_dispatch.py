@@ -5090,6 +5090,101 @@ case("retrieval deploy: the standing-cost note restates half the real number ins
      [f"{_TO}test_the_standing_cost_is_derived_from_the_constants_and_names_the_exit"])
 
 
+# The collection's network: sealed to Bedrock service access, open only for the index build.
+_RNET = "deploy/09_retrieval.py"
+
+
+def m_rnet_sealed_is_public(t):
+    old = "        doc.update(AllowFromPublic=False, SourceServices=list(NETWORK_SOURCE_SERVICES))"
+    assert t.count(old) == 1, "the sealed network document has moved"
+    # The "sealed" document quietly public again: the exact state SpringClean revokes,
+    # written by the code whose job is to stop writing it.
+    return t.replace(old, old.replace("AllowFromPublic=False", "AllowFromPublic=True"), 1)
+
+
+case("retrieval network: the sealed policy document is public, so every deploy and every "
+     "--seal-network writes what SpringClean revokes",
+     _RNET, m_rnet_sealed_is_public,
+     [f"{_TO}test_the_sealed_network_policy_is_not_public_and_admits_only_bedrock",
+      f"{_TO}test_a_fresh_deploy_builds_the_index_open_and_ends_sealed",
+      f"{_TO}test_seal_network_needs_no_corpus_arguments_and_touches_only_the_network_policy"])
+
+
+def m_rnet_no_finally(t):
+    old = ("    finally:\n"
+           "        results[\"network\"] = set_network_policy(aoss, public=False, "
+           "dry=args.dry_run)")
+    assert t.count(old) == 1, "the finally-seal around the index build has moved"
+    # Seal only on success: the deploy that stops at a failed index PUT -- the likeliest
+    # halfway stop -- leaves the collection public.
+    return t.replace(old, old.replace("    finally:\n",
+                                      "    except BaseException:\n        raise\n    else:\n"),
+                     1)
+
+
+case("retrieval network: the seal runs only when the index build succeeds, so a failed "
+     "deploy leaves the collection public",
+     _RNET, m_rnet_no_finally,
+     [f"{_TO}test_a_failed_index_build_still_seals_the_network"])
+
+
+def m_rnet_exists_returns_early(t):
+    old = "    description = f\"{state} -- deploy/09_retrieval.py\"\n"
+    assert t.count(old) == 1, "set_network_policy's write path has moved"
+    # The original defect, re-introduced: an existing policy is reported as "exists" and
+    # never compared, so the live public policy can never be healed.
+    return t.replace(old, "    if previous is not None:\n"
+                          "        return {\"policy\": NETWORK_POLICY, \"status\": \"exists\"}\n"
+                     + old, 1)
+
+
+case("retrieval network: an existing policy is reported 'exists' and never updated, so the "
+     "live public policy survives every re-run",
+     _RNET, m_rnet_exists_returns_early,
+     [f"{_TO}test_a_redeploy_over_a_public_policy_heals_it",
+      f"{_TO}test_seal_network_needs_no_corpus_arguments_and_touches_only_the_network_policy"])
+
+
+def m_rnet_no_read_back(t):
+    old = "    if not _same_policy(got, want):\n        raise SystemExit("
+    assert t.count(old) == 1, "the network read-back has moved"
+    # An acknowledged update taken for a policy in force.
+    return t.replace(old, "    if False:\n        raise SystemExit(", 1)
+
+
+case("retrieval network: the read-back is skipped, so an update the API acknowledged but "
+     "did not apply reports the collection sealed",
+     _RNET, m_rnet_no_read_back,
+     [f"{_TO}test_a_seal_that_does_not_read_back_is_a_failure"])
+
+
+def m_rnet_probe_always_refused(t):
+    old = "        if not _answered(code):"
+    assert t.count(old) == 1, "the post-seal probe check has moved"
+    # Any response counts as refused: a 200 from outside AWS after the seal is reported
+    # as proof the seal took.
+    return t.replace(old, "        if True:", 1)
+
+
+case("retrieval network: the post-seal probe treats an answer as a refusal, so a seal "
+     "that did not take is reported done",
+     _RNET, m_rnet_probe_always_refused,
+     [f"{_TO}test_a_sealed_policy_with_the_endpoint_still_answering_is_a_failure"])
+
+
+def m_rnet_dry_writes(t):
+    old = ("    if dry:\n"
+           "        return {\"network\": set_network_policy(aoss, public=False, dry=True),")
+    assert t.count(old) == 1, "--seal-network's dry-run branch has moved"
+    # The dry run falls through to the real seal: a rehearsal that changes production.
+    return t.replace(old, old.replace("    if dry:\n", "    if False:\n"), 1)
+
+
+case("retrieval network: --seal-network --dry-run probes and writes the live policy",
+     _RNET, m_rnet_dry_writes,
+     [f"{_TO}test_seal_network_dry_run_writes_nothing"])
+
+
 def m293(t):
     old = "            if scanned != expected_rows or failed:"
     assert t.count(old) == 1, "the ingest reconciliation has moved"

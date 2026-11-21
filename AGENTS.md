@@ -274,6 +274,16 @@ versions and introspects the live CreateHarness/UpdateHarness schemas.
   stands on its own regardless
   — a channel that works today is still the wrong thing to gate a token settle on).
   Wrap each notification separately and order them so the state-releasing call is last.
+- **A public OpenSearch Serverless network policy is revoked by AWS SpringClean, and revocation
+  is not deletion.** SpringClean swaps in a dummy VPC endpoint: the collection stays, unreachable
+  to everyone including Bedrock, and keeps billing. `llmops-retrieval-net` was written
+  `AllowFromPublic: true`, and a re-run reported the existing policy `exists` without comparing
+  it, so no deploy could heal it (flagged by a dry-run notice, 2026-11-21). The steady state is
+  `SourceServices: ["bedrock.amazonaws.com"]`. The deployer's SigV4 index PUT is the one caller
+  outside AWS, so `09_retrieval.py` opens only around it and seals in a `finally`, read back.
+  `--seal-network` fixes a live collection, and its proof is the outside probe being refused,
+  not the read-back alone. The console's `_verify_kb` uses the `bedrock-agent` control plane,
+  which no network policy governs, so it reads "verified" either way.
 - **An Athena workgroup that sets result encryption cannot write a CMK-encrypted S3 Table.**
   With `ResultConfiguration.EncryptionConfiguration` set, every `INSERT` into a table in
   `llmops-curated` failed `INTERNAL_ERROR_QUERY_ENGINE` (`Retryable: False`, empty message), and
