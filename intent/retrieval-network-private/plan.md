@@ -4,7 +4,8 @@
 - **Author:** Claude (AI agent)
 - **Accepted-by:** Tim WU
 - **Accepted-for:** 0459fbc6c169fc0e392e8e75516de8e6b1c722ce
-- **Status:** accepted
+- **Status:** shipped
+- **Shipped-in:** #196, merged as `4e8aa1c` on 2026-11-21. Further work opens a new chain.
 
 Accepted on the owner's reply of 2026-11-21 (chat): "Accept plan".
 

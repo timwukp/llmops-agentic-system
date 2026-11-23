@@ -63,9 +63,13 @@ ACTIVE since 2026-08-13 with standby replicas ENABLED; KB `llmops-org-facts` ACT
 (2026-08-13, 300 documents); last search 2026-08-18; SSM `/llmops/retrieval/*` (3). The r6d
 protocol's same-day `--teardown` never ran. An AOSS vector collection bills ~$11.52/day (min 2 OCU)
 or more while it exists, queried or not (not yet checked against Cost Explorer). Network policy
-`llmops-retrieval-net`: **public** (`AllowFromPublic: true`), flagged by an AWS SpringClean dry-run
-on 2026-11-21. Sealing it to Bedrock service access (`09_retrieval.py --seal-network`, from merged
-`main`) is `retrieval-network-private-live`. Keeping or tearing it down is an open owner decision._
+`llmops-retrieval-net`: **sealed to Bedrock service access** (`AllowFromPublic: false`, `SourceServices:
+bedrock.amazonaws.com`) since 2026-11-21 12:12:33Z, by `09_retrieval.py --seal-network` run from
+`main` at `4e8aa1c`. It had been public since creation, which is what an AWS SpringClean dry-run
+flagged that day; the owner reports SpringClean's 2026-11-23 report no longer lists it. The replaced
+public document, the rollback, is recorded in
+`deploy/evidence/VERIFICATION_retrieval_network_private.md`. Keeping or tearing the collection down
+is an open owner decision._
 
 _Not deployed: VPC + endpoints (deploy/02_network.py) — confirmed 2026-08-10 by
 `describe-vpcs` and `describe-vpc-endpoints` on `tag:project=llmops-agentic-system` in

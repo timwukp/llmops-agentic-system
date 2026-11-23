@@ -4,7 +4,8 @@
 - **Author:** Claude (AI agent)
 - **Date:** 2026-11-21
 - **Accepted-by:** Tim WU
-- **Status:** accepted
+- **Status:** shipped
+- **Shipped-in:** #196, merged as `4e8aa1c` on 2026-11-21. Further work opens a new chain.
 
 Raised by the owner on 2026-11-21 (chat), from an AWS SpringClean dry-run notice: "if yes, before
 SpringClean delete it, we need protect it". Process asked for: spec-driven, TDD, plan → design →
