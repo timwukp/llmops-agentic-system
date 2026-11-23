@@ -4,7 +4,8 @@
 - **Author:** Claude (AI agent)
 - **Signed-off-by:** Tim WU
 - **Accepted-by:** Tim WU
-- **Status:** signed-off
+- **Status:** shipped
+- **Shipped-in:** #197, merged as `3a83977` on 2026-11-23. Further work opens a new chain.
 
 Signed off with the intent, on the owner's request of 2026-11-21 (chat): "已合併，開始上線".
 

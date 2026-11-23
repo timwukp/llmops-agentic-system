@@ -4,7 +4,8 @@
 - **Author:** Claude (AI agent)
 - **Accepted-by:** Tim WU
 - **Accepted-for:** 4e8aa1c4a24e1c20929d7cb255969682c40fe190
-- **Status:** accepted
+- **Status:** shipped
+- **Shipped-in:** #197, merged as `3a83977` on 2026-11-23. Further work opens a new chain.
 
 Accepted with the intent, on the owner's request of 2026-11-21 (chat): "已合併，開始上線".
 `Accepted-for` is `main` at acceptance (#196's merge).

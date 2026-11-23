@@ -26,9 +26,19 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
   - An outside signed request got 200 before the seal and 401 after; the policy reads back sealed.
   - After the seal, a Bedrock-console Retrieve by the owner returned 5 results with no error.
   - `simulate_principal_policy` shows `llmops-harness-execution` allowed `bedrock:Retrieve` on the KB.
-  - Not run: a live retrieve issued by a harness, and the console intake verifier. The console's
-    Sign in uses `window.prompt()`, which the agent's browser cannot show.
+  - Not run on 11-21: a live retrieve issued by a harness, and the console intake verifier. The
+    console's Sign in uses `window.prompt()`, which the agent's browser cannot show.
   - `deploy/evidence/VERIFICATION_retrieval_network_private.md`.
+- **End to end under the seal, 2026-11-23** (`retrieval-network-e2e`).
+  - One `llmops_orchestrator` turn through `InvokeHarness` ran as `llmops-harness-execution` and
+    retrieved 5 results with no error. All five are among the 12 corpus rows that contain the query
+    sentence verbatim. The planned "own document in the top 5" check was ill-posed for 12 equal
+    matches and is recorded as not met.
+  - `09_retrieval.py --ingest` ran its first live window: open, then index exists, then sealed in
+    5.2 s and read back. Ingestion COMPLETE 300/300, 0 failed.
+  - It changed no document, and the collection's metrics show no ingestion request after the seal.
+    So Bedrock *writing* to a sealed collection is still not exercised, and neither is the console
+    intake verifier. Evidence §6.
 - **PROJECT_STATE said the retrieval KB was not deployed.** It has stood since 2026-08-13: last
   searched 2026-08-18, with the r6d same-day teardown never run. Keeping or tearing it down is an
   open owner decision.
