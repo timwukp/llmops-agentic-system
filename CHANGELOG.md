@@ -22,7 +22,13 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 - **Tests:** 8 guards, written first and seen failing against the old script; 6 negative controls.
   The fake validates every call against botocore's offline `opensearchserverless` model, which
   caught the fake's own unrealistic `policyVersion`.
-- **Not yet applied live.** The seal runs from merged `main` in `retrieval-network-private-live`.
+- **Applied live 2026-11-21** from merged `main` (`4e8aa1c`, `retrieval-network-private-live`).
+  - An outside signed request got 200 before the seal and 401 after; the policy reads back sealed.
+  - After the seal, a Bedrock-console Retrieve by the owner returned 5 results with no error.
+  - `simulate_principal_policy` shows `llmops-harness-execution` allowed `bedrock:Retrieve` on the KB.
+  - Not run: a live retrieve issued by a harness, and the console intake verifier. The console's
+    Sign in uses `window.prompt()`, which the agent's browser cannot show.
+  - `deploy/evidence/VERIFICATION_retrieval_network_private.md`.
 - **PROJECT_STATE said the retrieval KB was not deployed.** It has stood since 2026-08-13: last
   searched 2026-08-18, with the r6d same-day teardown never run. Keeping or tearing it down is an
   open owner decision.

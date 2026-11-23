@@ -4,7 +4,8 @@
 - **Author:** Claude (AI agent)
 - **Signed-off-by:** Tim WU
 - **Accepted-by:** Tim WU
-- **Status:** signed-off
+- **Status:** shipped
+- **Shipped-in:** #196, merged as `4e8aa1c` on 2026-11-21. Further work opens a new chain.
 
 Signed off on the owner's reply of 2026-11-21 (chat): "Sign off".
 
