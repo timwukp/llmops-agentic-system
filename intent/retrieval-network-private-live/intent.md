@@ -4,7 +4,8 @@
 - **Author:** Claude (AI agent)
 - **Date:** 2026-11-21
 - **Accepted-by:** Tim WU
-- **Status:** accepted
+- **Status:** shipped
+- **Shipped-in:** #197, merged as `3a83977` on 2026-11-23. Further work opens a new chain.
 
 Accepted on the owner's request of 2026-11-21 (chat): "已合併，開始上線", after merging #196
 (`4e8aa1c`). This is the follow-up chain that `intent/retrieval-network-private/intent.md` and its

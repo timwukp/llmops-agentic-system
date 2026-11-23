@@ -12,8 +12,13 @@
   - The harness role is allowed to Retrieve (IAM simulation).
   - The owner reports that SpringClean's 2026-11-23 report no longer lists `llmops-retrieval`.
 
-  Two checks the intent named did not run (§5): a live retrieve issued by a harness, and the
-  console's intake verifier.
+  2026-11-23 end to end (§6):
+  - a harness turn as `llmops-harness-execution` retrieved 5 matching results with no error;
+  - an `--ingest` ran under the seal to COMPLETE (300/300, 0 failed), and its 5.2 s window
+    re-sealed and read back.
+
+  Still not exercised (§5): Bedrock *writing* to the sealed collection (that ingest changed
+  nothing, so it wrote nothing), and the console's intake verifier.
 
 ## 1. Before (read-only, 2026-11-21 12:12:00Z)
 
@@ -102,17 +107,18 @@ The refused probes after the seal do not appear as searches: they were stopped a
 
 ## 5. What this does not cover
 
-- **A live retrieve issued by a harness** as `llmops-harness-execution`, the intent's planned check.
-  Its two halves are covered separately (the network path by the console Retrieve, the permission by
-  simulation), but no agent turn ran it end to end.
+- ~~**A live retrieve issued by a harness** as `llmops-harness-execution`.~~ Run end to end on
+  2026-11-23: see §6.1.
 - **The console's intake verifier** (`_verify_kb`) was not run. It reads the KB through the
   `bedrock-agent` control plane, which no network policy governs, so this change cannot affect it.
 - The console Retrieve and the 04:45–04:50Z search are consistent in time, but nothing here proves
   they are the same event. The network claim does not depend on it: after the seal, any search
   that reaches the collection came through Bedrock.
-- **Ingestion under the seal is not exercised live.** Retrieve is one Bedrock path into the
-  collection and ingestion (`StartIngestionJob`) is another. The same `SourceServices` rule is
-  expected to cover both, but the next `09_retrieval.py --ingest` is the first live test of it.
+- **Bedrock writing to the sealed collection is still not exercised.** The 2026-11-23
+  `09_retrieval.py --ingest` (§6.2) ran an ingestion job under the seal to COMPLETE, but all 300
+  documents were unchanged (0 new, 0 modified). The collection's own metrics show no ingestion
+  request after the seal, so Bedrock wrote nothing to it. The first ingest that changes a document
+  is the first live test of Bedrock's write path under `SourceServices`.
 - **"Refused" is read from a 401, which is inferred, not documented.** The collection answered 401
   with an empty body, not the 403 a network denial might be expected to return. It is read as the
   seal for three reasons:
@@ -124,7 +130,77 @@ The refused probes after the seal do not appear as searches: they were stopped a
 - **SpringClean's report dropping the collection supports "fixed" only if that report still lists
   the other four collections.** The owner reported the absence; whether the others are still listed
   has not been confirmed.
-- A *fresh* full deploy under the new flow (open → build index → seal) is exercised offline only
-  (T2/T3 in `tests/test_orchestration.py`). This run sealed an existing collection.
+- A *fresh* full deploy, one that creates the collection and the index, is exercised offline only
+  (T2/T3 in `tests/test_orchestration.py`). The window itself (open → index step → seal in the
+  `finally`) has now run live once, over an existing collection (§6.2).
 - Whether to keep the collection at all (~$11.52/day or more, standing since 2026-08-13) is an open
   owner decision.
+
+## 6. End to end, 2026-11-23 (`retrieval-network-e2e`)
+
+Requested by the owner ("pls run an end to end test") for the two §5 gaps. Run from `main` at
+`3a83977`.
+
+### 6.1 A harness retrieves, as `llmops-harness-execution`
+
+The harness was called through `InvokeHarness`, the same data-plane call the console makes, not
+through the console UI, whose Sign in the agent's browser cannot show. The call was one turn of
+`llmops_orchestrator`, isolated as `tools/probe_orchestrator_intake.py` isolates its probes: a fresh
+session, `actorId` `probe-retrieval-e2e-<hex>` (the shared memory is partitioned by actorId), and no
+inline function serviced. The message asked for two shell commands and their raw output, with no
+plan and no inline call. The query was the user sentence of corpus ticket `row-00002`, without its
+personal details: *"New phone, MFA app has no accounts in it. Locked out of everything."*
+
+| | |
+|---|---|
+| Turn | started 07:06:28Z, 42.6 s wall, 2 rounds, tools `shell` × 2, `stopReason: end_turn`, no stream error, no inline function called |
+| `aws sts get-caller-identity` | `arn:aws:sts::<ACCOUNT_ID>:assumed-role/llmops-harness-execution/BedrockAgentCore-<session>` |
+| `aws bedrock-agent-runtime retrieve` (`ULI5VFC3OR`, k = 5) | **5 results, no error**: `row-00288` 1.8283, `row-00080` 1.8273, `row-00132` 1.8273, `row-00184` 1.8200, `row-00236` 1.8195 (all `customer-data/kb-corpus/`) |
+| Collection metrics | 1 search in 07:05–07:10Z |
+
+**The self-retrieval criterion, as written, was not met:** `row-00002` itself is not in the five.
+The criterion was ill-posed for this corpus. **12 of its 300 rows contain the query sentence
+verbatim** (every 26th row: 2, 28, 54 … 288), and all five results are among those 12, all
+`category: mfa`, with scores within 0.009 of each other. Five slots, twelve equal matches. The
+property the criterion was meant to show, that results are the query's own ticket and not noise,
+holds 5/5.
+
+### 6.2 An ingest under the seal
+
+The run was pre-checked read-only to change no content:
+- the source's 300 rows render to the same 300 keys with identical bytes;
+- the `llmops-kb-service` inline policy and trust are identical to what the script writes;
+- the caller is still in `llmops-retrieval-data`.
+
+`--dry-run` came first, then:
+
+`python deploy/09_retrieval.py --region us-east-1 --source-uri s3://<bucket>/customer-data/helpdesk-demo/helpdesk_tickets.jsonl --customer-eval-key customer-data/helpdesk-demo/helpdesk_id_acceptance.jsonl --ood-eval-key customer-data/helpdesk-demo/helpdesk_acceptance.jsonl --ingest`, 07:08:36Z → 07:12:55Z, exit 0:
+
+| Step | Result |
+|---|---|
+| `network_open` | `updated`, `previous` = the sealed document, `read_back: verified` |
+| `collection` / `index` | `exists` / `exists` (the index PUT answered `resource_already_exists_exception`) |
+| `network` (the `finally` seal) | `updated`, `previous` = the public document, `read_back: verified` |
+| `network_window_s` | **5.2** |
+| `corpus` | 300 rows, read back, `stale_removed: 0` |
+| KB / data source | `exists` (`ULI5VFC3OR` / `DEGCHBZXWT`) |
+| `ingestion` | **COMPLETE, scanned 300, failed 0, reconciled against 300**; indexed new 0, modified 0 |
+
+Afterwards, independently:
+- `get-security-policy` reads `AllowFromPublic: false`, `SourceServices: ["bedrock.amazonaws.com"]`,
+  version `…_4` (`_3` was the window);
+- an outside probe at 07:13:29Z got **401**.
+
+**What the collection's metrics show the ingest touched:**
+- 07:05–07:10Z: exactly 1 `IngestionRequestRate` and 1 `IngestionRequestErrors`. That is the
+  index PUT during the window, which errored because the index exists.
+- After that: **no ingestion request at all**.
+
+So Bedrock's ingestion job ran under the seal and completed, but it wrote nothing to the
+collection, because nothing had changed. §5 keeps the write path as not exercised.
+
+### 6.3 Console intake verifier
+
+Not run. Its Sign in uses `window.prompt()`, which the agent's in-app browser cannot show, and no
+owner session cookie was imported. It reads the KB through the `bedrock-agent` control plane, which
+no network policy governs.
