@@ -68,8 +68,9 @@ bedrock.amazonaws.com`) since 2026-11-21 12:12:33Z, by `09_retrieval.py --seal-n
 `main` at `4e8aa1c`. It had been public since creation, which is what an AWS SpringClean dry-run
 flagged that day; the owner reports SpringClean's 2026-11-23 report no longer lists it. The replaced
 public document, the rollback, is recorded in
-`deploy/evidence/VERIFICATION_retrieval_network_private.md`. Keeping or tearing the collection down
-is an open owner decision._
+`deploy/evidence/VERIFICATION_retrieval_network_private.md`. **Kept by owner decision on 2026-11-24**,
+so its standing cost is deliberate, not residue. Stop it with `python deploy/09_retrieval.py --region
+us-east-1 --teardown` if that changes._
 
 _Not deployed: VPC + endpoints (deploy/02_network.py) — confirmed 2026-08-10 by
 `describe-vpcs` and `describe-vpc-endpoints` on `tag:project=llmops-agentic-system` in
@@ -84,7 +85,8 @@ gateway endpoints are still built, so a prod config has something to be written 
 ## Standing cost posture
 
 Zero standing billable resources CREATED BY THIS PROJECT except one, the retrieval
-collection `llmops-retrieval` (above; ~$11.52/day or more since 2026-08-13): no llmops-* SageMaker
+collection `llmops-retrieval` (above; ~$11.52/day or more since 2026-08-13, kept by owner decision on
+2026-11-24): no llmops-* SageMaker
 endpoint, pipeline scheduler DISABLED, serverless spine idles free. Total v1 build cost
 ≈ $12–15. That scoping is load-bearing and used to be missing: the account also carries
 `jumpstart-dft-hf-asr-whisper-large-v2`, InService since 2024-04-11 with **0 invocations

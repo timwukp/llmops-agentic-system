@@ -42,6 +42,9 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 - **PROJECT_STATE said the retrieval KB was not deployed.** It has stood since 2026-08-13: last
   searched 2026-08-18, with the r6d same-day teardown never run. Keeping or tearing it down is an
   open owner decision.
+- **Kept by owner decision, 2026-11-24** (`retrieval-keep-decision`). The collection's standing cost
+  (~$11.52/day or more) is now deliberate. PROJECT_STATE, the evidence and the `deploy/README.md`
+  09 row say so. The Bedrock write-path test under the seal is deferred, also by owner decision.
 
 ### Untrusted transform code is isolated, and the durable stores are hardened (security Batch 5)
 
