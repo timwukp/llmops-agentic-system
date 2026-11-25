@@ -4,7 +4,8 @@
 - **Author:** Claude (AI agent)
 - **Date:** 2026-11-23
 - **Accepted-by:** Tim WU
-- **Status:** accepted
+- **Status:** shipped
+- **Shipped-in:** #198, merged as `60b6e08` on 2026-11-24. Further work opens a new chain.
 
 Accepted on the owner's request of 2026-11-23 (chat): "pls run an end to end test". The request
 quoted the two gaps that `deploy/evidence/VERIFICATION_retrieval_network_private.md` §5 lists as

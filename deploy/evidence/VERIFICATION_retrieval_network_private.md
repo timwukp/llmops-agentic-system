@@ -118,7 +118,9 @@ The refused probes after the seal do not appear as searches: they were stopped a
   `09_retrieval.py --ingest` (§6.2) ran an ingestion job under the seal to COMPLETE, but all 300
   documents were unchanged (0 new, 0 modified). The collection's own metrics show no ingestion
   request after the seal, so Bedrock wrote nothing to it. The first ingest that changes a document
-  is the first live test of Bedrock's write path under `SourceServices`.
+  is the first live test of Bedrock's write path under `SourceServices`. A deliberate test of it
+  was deferred by owner decision on 2026-11-24: it would mean changing the content of the index
+  the student retrieves from.
 - **"Refused" is read from a 401, which is inferred, not documented.** The collection answered 401
   with an empty body, not the 403 a network denial might be expected to return. It is read as the
   seal for three reasons:
@@ -133,8 +135,9 @@ The refused probes after the seal do not appear as searches: they were stopped a
 - A *fresh* full deploy, one that creates the collection and the index, is exercised offline only
   (T2/T3 in `tests/test_orchestration.py`). The window itself (open → index step → seal in the
   `finally`) has now run live once, over an existing collection (§6.2).
-- Whether to keep the collection at all (~$11.52/day or more, standing since 2026-08-13) is an open
-  owner decision.
+- ~~Whether to keep the collection at all.~~ **Kept by owner decision on 2026-11-24.** Its standing
+  cost (~$11.52/day or more, since 2026-08-13) is therefore deliberate; `09_retrieval.py --teardown`
+  stops it if that changes.
 
 ## 6. End to end, 2026-11-23 (`retrieval-network-e2e`)
 

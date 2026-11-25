@@ -4,7 +4,8 @@
 - **Author:** Claude (AI agent)
 - **Accepted-by:** Tim WU
 - **Accepted-for:** 3a839771021eb7d6d333907fc7a3120457eb1522
-- **Status:** accepted
+- **Status:** shipped
+- **Shipped-in:** #198, merged as `60b6e08` on 2026-11-24. Further work opens a new chain.
 
 Accepted with the intent, on the owner's request of 2026-11-23 (chat): "pls run an end to end test".
 `Accepted-for` is `main` at acceptance (#197's merge).
