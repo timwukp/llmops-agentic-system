@@ -4,7 +4,8 @@
 - **Author:** Claude (AI agent)
 - **Signed-off-by:** Tim WU
 - **Accepted-by:** Tim WU
-- **Status:** signed-off
+- **Status:** shipped
+- **Shipped-in:** #199, merged as `c318138` on 2026-11-27. Further work opens a new chain.
 
 Signed off with the intent, on the owner's request of 2026-11-24 (chat): "Yes, record it".
 

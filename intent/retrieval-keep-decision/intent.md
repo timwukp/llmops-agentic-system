@@ -4,7 +4,8 @@
 - **Author:** Claude (AI agent)
 - **Date:** 2026-11-24
 - **Accepted-by:** Tim WU
-- **Status:** accepted
+- **Status:** shipped
+- **Shipped-in:** #199, merged as `c318138` on 2026-11-27. Further work opens a new chain.
 
 Accepted on the owner's request of 2026-11-24 (chat): "保留collection", then "Yes, record it".
 
