@@ -41,9 +41,9 @@ page is its ledger.
 
 | Check | Result | How to reproduce |
 |---|---|---|
-| Unit tests (contracts, cost model, driver loop, Lambdas, state machine document) | **2568/2568 passed** | `.venv/bin/python -m pytest tests/ -q --ignore=tests/golden` |
+| Unit tests (contracts, cost model, driver loop, Lambdas, state machine document) | **2569/2569 passed** | `.venv/bin/python -m pytest tests/ -q --ignore=tests/golden` |
 | Shell suite — N-way capacity race guard (`tests/test_capacity_race_guard.sh`) | **10/10 assertions** | `bash tests/test_capacity_race_guard.sh` |
-| Negative controls — every guard broken in turn, confirmed to fail | **565/565 negative controls** | `.venv/bin/python tests/negative_controls/monitor_dispatch.py` |
+| Negative controls — every guard broken in turn, confirmed to fail | **566/566 negative controls** | `.venv/bin/python tests/negative_controls/monitor_dispatch.py` |
 | Harness config validation (5 specialists + conductor + auditor) | **7/7 `RESULT: OK`** | `python deploy/validate_config.py --config agents/<a>/harness.json` |
 | Architecture SVG geometry (no wire crossings, no wire through a card) | **CLEAN** | `python tests/test_svg_geometry.py docs/architecture-*.svg` |
 | Redaction scan (account IDs, credentials, account-bearing ARNs) | CLEAN | `.github/workflows/redaction-check.yml` |
@@ -152,14 +152,14 @@ Full record: [VERIFICATION_finops.md](../deploy/evidence/VERIFICATION_finops.md)
 
 | Check | Result | How to reproduce |
 |---|---|---|
-| Unit tests (all suites, incl. `test_cost_model.py` + `test_finops.py`) | **2568 passed** | `.venv/bin/python -m pytest tests/ -q` |
+| Unit tests (all suites, incl. `test_cost_model.py` + `test_finops.py`) | **2569 passed** | `.venv/bin/python -m pytest tests/ -q` |
 | Harness config validation, 7 agents | **`RESULT: OK`** | `python deploy/validate_config.py --config agents/finops/harness.json` |
 | Live fleet | **7 harnesses READY** | `list_harnesses` via the repo's vendored boto3 |
 | Canonical module has a distribution path | prints `would upload 4 contract files` | `python deploy/03_storage.py --region us-east-1 --account-id 123456789012 --dry-run` |
 
 Every guard added in this work was **mutation-checked**: the asserted behaviour was
-reverted one at a time and the test confirmed to fail — **565/565 negative controls**, 480
-mutations asserting 565 (guard, mutation) pairs, one printed PASS line each. A test that
+reverted one at a time and the test confirmed to fail — **566/566 negative controls**, 481
+mutations asserting 566 (guard, mutation) pairs, one printed PASS line each. A test that
 passes both with and against the behaviour it names is not a test.
 
 The count is in the sentence on purpose. "Mutation-checked" is an adjective, and an
@@ -191,6 +191,21 @@ other case says `1 failed`), which nothing reads. Both the runner and
 a `.py` file and refuse one that does not parse — Python sources only, because breaking a JSON or
 Markdown parser is frequently the exact break a control asserts. A mutation has to reach the code
 to prove the guard watches it.
+
+Two more gaps between the documented count and the run turned up together, while verifying the
+retrieval network-seal change. **Batch 5's 5 controls (7 pairs) never ran.** They were appended
+below the runner loop, so they registered after the loop had finished. The runner printed
+`all guards caught their break` without attempting them, and the count derived from the
+registrations included them. **m315 could not be caught the way the runner requires.** The
+start-pipeline handler reads `DEFAULT_PARAMS["model_package_approval_status"]` at import, so
+deleting that entry is a `KeyError` at import (pytest exit 4), not a missing default, and its 3
+pairs printed UNCAUGHT on every run. So the count this page stated (556/556, then 565/565)
+included 7 pairs never attempted and 3 that could not pass. The runner block now sits last in
+the file, and `test_no_negative_control_is_registered_after_the_runner_loop` fails on any
+registration below it (control m401 appends one). m315 also turns that lookup into `.get()`, so
+the module imports and its 3 tests fail by their own assertions. The mutation count in the
+sentence above is now checked too. A full run printed 566 PASS lines for 566 registered pairs
+([VERIFICATION_negative_control_runner.md](../deploy/evidence/VERIFICATION_negative_control_runner.md)).
 
 The counts above also went up for a reason worth stating, because it is the opposite of the usual
 one: **two of the newest controls exist because a guard was pinning a bug.** The eval prompt

@@ -5,6 +5,22 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versioning: SemVer.
 
 ## [Unreleased]
 
+### The negative-control runner runs every pair the docs credit it with
+
+- **Batch 5's 5 controls (7 pairs) never ran.** They were appended below the runner loop in
+  `tests/negative_controls/monitor_dispatch.py`, so they registered after the loop had finished.
+  The runner said `all guards caught their break`, and the documented count, derived from the
+  registrations, included them. The runner block now sits last in the file.
+  `test_no_negative_control_is_registered_after_the_runner_loop` fails on any `case(...)` (or
+  other addition to `CASES`) below it, and control m401 proves it does.
+- **m315 broke the import, not the behaviour.** Since the start-pipeline handler reads
+  `DEFAULT_PARAMS["model_package_approval_status"]` at import, deleting the entry is a `KeyError`
+  (pytest exit 4), and its 3 pairs printed UNCAUGHT on every run. The mutation now also turns the
+  lookup into `.get()`, so the module imports with no approval status supplied, and the 3 tests
+  fail by their own assertions.
+- The count guard now also checks the mutation count the TEST_RESULTS sentence states, which was
+  typed by hand. Counts: **566/566 negative controls**, 481 mutations; 2569 tests.
+
 ### llmops-retrieval stops being public, so SpringClean has nothing to revoke
 
 - **The one collection SpringClean flagged as this project's was public by construction.**

@@ -40,9 +40,9 @@
 
 | 檢查 | 結果 | 復現方式 |
 |---|---|---|
-| 單元測試（契約、成本模型、driver 迴圈、Lambda、狀態機文檔） | **2568/2568 通過** | `.venv/bin/python -m pytest tests/ -q --ignore=tests/golden` |
+| 單元測試（契約、成本模型、driver 迴圈、Lambda、狀態機文檔） | **2569/2569 通過** | `.venv/bin/python -m pytest tests/ -q --ignore=tests/golden` |
 | Shell 測試套件 —— N 路 capacity race guard（`tests/test_capacity_race_guard.sh`） | **10/10 斷言** | `bash tests/test_capacity_race_guard.sh` |
-| 反向控制 —— 逐一破壞每道 guard，確認它會失敗 | **565/565 反向控制** | `.venv/bin/python tests/negative_controls/monitor_dispatch.py` |
+| 反向控制 —— 逐一破壞每道 guard，確認它會失敗 | **566/566 反向控制** | `.venv/bin/python tests/negative_controls/monitor_dispatch.py` |
 | Harness 配置驗證（5 個專家 + 指揮家 + 審計員） | **7/7 `RESULT: OK`** | `python deploy/validate_config.py --config agents/<a>/harness.json` |
 | 架構 SVG 幾何檢查（虛線零交叉、零穿框） | **CLEAN** | `python tests/test_svg_geometry.py docs/architecture-*.svg` |
 | 遮蔽掃描（帳號 ID、憑證、帶帳號的 ARN） | CLEAN | `.github/workflows/redaction-check.yml` |
@@ -140,13 +140,13 @@ endpoint、五輪 e2e 迭代 —— 花費比這個帳戶單日花在一個沒�
 
 | 檢查 | 結果 | 重現方式 |
 |---|---|---|
-| 單元測試(全部套件,含 `test_cost_model.py` + `test_finops.py`) | **2568 passed** | `.venv/bin/python -m pytest tests/ -q` |
+| 單元測試(全部套件,含 `test_cost_model.py` + `test_finops.py`) | **2569 passed** | `.venv/bin/python -m pytest tests/ -q` |
 | Harness 配置驗證,7 個 agent | **`RESULT: OK`** | `python deploy/validate_config.py --config agents/finops/harness.json` |
 | 線上艦隊 | **7 個 harness READY** | 用 repo 內建 boto3 呼叫 `list_harnesses` |
 | 正典模組有散佈路徑 | 印出 `would upload 4 contract files` | `python deploy/03_storage.py --region us-east-1 --account-id 123456789012 --dry-run` |
 
 本次新增的每一道 guard 都做過 **mutation check**:逐一還原被斷言的行為,確認測試會
-失敗 —— **565/565 反向控制**,480 個 mutation 斷言 565 組（guard, mutation）配對,runner 各印
+失敗 —— **566/566 反向控制**,481 個 mutation 斷言 566 組（guard, mutation）配對,runner 各印
 一行 PASS。一個「有這行為也過、沒這行為也過」的測試,不是測試。
 
 這個數字是刻意寫進句子裡的。「做過 mutation check」是一個形容詞,而形容詞不會過期:
@@ -173,6 +173,18 @@ collection error 和斷言失敗回的都是 `1`,所以 runner 自己的檢查(`
 `test_every_negative_control_still_matches_the_code_it_mutates` 都會對每一個 `.py` 檔的 mutation 做
 `compile()`,不能 parse 的就拒收 —— 只限 Python 原始碼,因為把 JSON 或 Markdown 的 parser 弄壞,
 常常正是某個 control 要斷言的那個 break。一個 mutation 必須真的走到那段程式碼,才能證明 guard 在看它。
+
+文件寫的數字和實際跑的結果之間,還有兩個落差是一起被發現的(在驗證 retrieval 網路封閉那次變更時)。
+**Batch 5 的 5 個 control(7 組配對)從來沒跑過。** 它們被接在 runner 迴圈的下面,所以是在迴圈跑完
+之後才註冊。runner 印出 `all guards caught their break`,卻一個都沒試;而從註冊推導出的數字照樣把
+它們算了進去。**m315 無法以 runner 要求的方式被抓到。** start-pipeline handler 在 import 時就讀
+`DEFAULT_PARAMS["model_package_approval_status"]`,所以刪掉那一項是 import 時的 `KeyError`(pytest
+exit 4),不是「沒有預設值」,它的 3 組配對每次跑都印 UNCAUGHT。所以本頁原本寫的數字(556/556,
+後來是 565/565)裡,有 7 組從沒被嘗試、3 組不可能通過。現在 runner 區塊固定在檔案最後,
+`test_no_negative_control_is_registered_after_the_runner_loop` 會在它下方出現任何註冊時失敗(control
+m401 就是接一個上去)。m315 也把那個讀取改成 `.get()`,讓模組照常 import,它的 3 個測試都由自己的
+斷言失敗。上面那句話裡的 mutation 數量現在也一併檢查。完整跑一次:566 組註冊配對,印出 566 行 PASS
+([VERIFICATION_negative_control_runner.md](../deploy/evidence/VERIFICATION_negative_control_runner.md))。
 
 上面那些數字這次往上走,理由值得單獨說,因為它和平常的理由相反:**最新這幾個 control 裡有兩個之所以
 存在,是因為原本的 guard 在替一個 bug 站崗。** eval prompt 對「沒有報區間的純量 gate」是用固定的
