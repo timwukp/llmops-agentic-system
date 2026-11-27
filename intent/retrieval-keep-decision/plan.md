@@ -4,7 +4,8 @@
 - **Author:** Claude (AI agent)
 - **Accepted-by:** Tim WU
 - **Accepted-for:** 60b6e08b743208696c1a320e860f8c27e0230654
-- **Status:** accepted
+- **Status:** shipped
+- **Shipped-in:** #199, merged as `c318138` on 2026-11-27. Further work opens a new chain.
 
 Accepted with the intent, on the owner's request of 2026-11-24 (chat): "Yes, record it".
 `Accepted-for` is `main` at acceptance (#198's merge).
