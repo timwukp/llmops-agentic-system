@@ -1020,6 +1020,61 @@ def test_the_documented_negative_control_count_matches_the_runner():
             assert passed == total, (
                 f"{doc.name} claims {passed}/{total} controls passing; a documented "
                 "result with a failing control in it is not evidence of anything")
+        # The same sentence states how many mutations there are, and nothing checked that
+        # number: it was typed by hand next to a derived one.
+        mutations = re.search(r"(\d+)\s*(?:mutations asserting|個 mutation)", claim)
+        assert mutations, (
+            f"{doc.name}'s mutation-check claim no longer states how many mutations there "
+            f"are:\n{claim}")
+        assert int(mutations.group(1)) == n_cases, (
+            f"{doc.name} claims {mutations.group(1)} mutations, the runner registers "
+            f"{n_cases} case(...) calls")
+
+
+def test_no_negative_control_is_registered_after_the_runner_loop():
+    """A case registered below the runner loop is counted by the docs and never run.
+
+    The guard above derives the documented count from the ``case(...)`` registrations in the
+    source, which is only the number of pairs the runner verifies if every registration runs
+    before the loop does. Batch 5's 5 cases (7 pairs) were appended at the bottom of the file,
+    below the loop and its summary. The runner printed ``all guards caught their break``,
+    exited 0 and never attempted them, while the docs said 556/556 with those 7 included.
+    Nothing compared where a registration sits against where the loop sits, and appending a
+    block at the end of a long file is the natural way to add one.
+    """
+    src = (REPO / "tests/negative_controls/monitor_dispatch.py").read_text()
+    tree = ast.parse(src)
+    loops = [s for s in tree.body if isinstance(s, ast.For)
+             and any(isinstance(n, ast.Name) and n.id == "CASES" for n in ast.walk(s.iter))]
+    assert len(loops) == 1, (
+        f"expected exactly one module-level loop over CASES, found {len(loops)}; the runner's "
+        "shape changed, so this guard no longer knows where registration has to stop")
+    loop = loops[0]
+
+    def adds_to_cases(node):
+        if isinstance(node, ast.Call):
+            if getattr(node.func, "id", None) == "case":
+                return True
+            f = node.func
+            return (isinstance(f, ast.Attribute) and f.attr in ("append", "extend", "insert")
+                    and getattr(f.value, "id", None) == "CASES")
+        if isinstance(node, (ast.Assign, ast.AugAssign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            return any(getattr(t, "id", None) == "CASES" for t in targets)
+        return False
+
+    # `def case` is where every registration goes through, so its own CASES.append is not one.
+    exempt = set()
+    for stmt in tree.body:
+        if isinstance(stmt, ast.FunctionDef) and stmt.name == "case":
+            exempt |= {id(n) for n in ast.walk(stmt)}
+    late = sorted(n.lineno for n in ast.walk(tree)
+                  if id(n) not in exempt and adds_to_cases(n) and n.lineno > loop.lineno)
+    assert not late, (
+        f"{len(late)} registration(s) at line(s) {late} come after the runner loop at line "
+        f"{loop.lineno}. They run after the loop has finished, so the runner never attempts "
+        "them, while the documented count, derived from the registrations, includes them. "
+        "Register them above the runner block, which has to stay last in the file.")
 
 
 def test_the_control_runner_restores_its_mutation_even_when_signalled():

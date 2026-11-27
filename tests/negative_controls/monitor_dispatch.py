@@ -5530,9 +5530,20 @@ def m315(t):
     # Boundary 3 broken: the prompt still reads the approval status, nothing supplies one,
     # and the agent improvises on the field separating a rehearsal from a release. This is
     # bug #20's shape, and the param existed nowhere until this work.
+    #
+    # Deleting the entry alone no longer models that. Since 1d406ce the handler reads
+    # APPROVAL_STATUS_DEFAULT = DEFAULT_PARAMS["model_package_approval_status"] at import, so
+    # the bare deletion is a KeyError at import: pytest exits 4, which the runner rightly
+    # refuses to score as a catch, and the 3 pairs below reported UNCAUGHT on every run. The
+    # lookup becomes .get(), so the module imports, APPROVAL_STATUS_DEFAULT is None, and
+    # _merge_params sets the merged value to None: nothing supplies a status.
     m = re.search(r'\n *"model_package_approval_status": "PendingManualApproval",', t)
     assert m, "the DEFAULT_PARAMS approval-status entry moved"
-    return t[:m.start()] + t[m.end():]
+    t = t[:m.start()] + t[m.end():]
+    old = 'APPROVAL_STATUS_DEFAULT = DEFAULT_PARAMS["model_package_approval_status"]'
+    assert t.count(old) == 1, "the import-time read of the approval-status default moved"
+    return t.replace(old, 'APPROVAL_STATUS_DEFAULT = '
+                          'DEFAULT_PARAMS.get("model_package_approval_status")')
 
 
 case("start-pipeline: the registry approval status loses its default",
@@ -7350,6 +7361,60 @@ def _die_on_signal(signum, _frame):
     raise KeyboardInterrupt(f"terminated by signal {signum}")
 
 
+# ── Batch 5: process isolation + storage hardening (2026-10-28 security audit) ───
+_VS, _ST = "pipeline/v2/verify_sandbox.py", "deploy/03_storage.py"
+_AHT = "tests/test_audit_hardening.py::"
+# The isolate default flips to False: every existing call site runs untrusted code in-process.
+case("sandbox: isolation is off by default", _VS,
+     _swap("                      timeout_sec: int = 5, isolate: bool = True) -> dict:",
+           "                      timeout_sec: int = 5, isolate: bool = False) -> dict:"),
+     [_AHT + "test_isolate_defaults_to_on"])
+# The credential scrub is neutered: the forked child keeps the parent's AWS_ secrets.
+case("sandbox: the worker stops scrubbing credentials", _VS,
+     _swap("            os.environ.pop(k, None)", "            pass"),
+     [_AHT + "test_the_isolated_child_cannot_see_the_credential",
+      _AHT + "test_the_worker_scrubs_every_credential_shaped_variable"])
+# The TLS deny is inverted: it would deny HTTPS and allow plaintext.
+case("storage: the TLS deny is inverted", _ST,
+     _swap('"aws:SecureTransport": "false"', '"aws:SecureTransport": "true"'),
+     [_AHT + "test_the_bucket_gets_a_tls_only_deny"])
+# Deletion protection is dropped: a stray DeleteTable can drop the audit trail.
+case("storage: tables lose deletion protection", _ST,
+     _swap("    ddb.update_table(TableName=name, DeletionProtectionEnabled=True)",
+           "    pass  # ddb.update_table(TableName=name, DeletionProtectionEnabled=True)"),
+     [_AHT + "test_a_new_table_is_created_then_gains_pitr_and_deletion_protection",
+      _AHT + "test_deletion_protection_is_applied_even_without_pitr"])
+# The stage-events table loses its PITR flag: its loss becomes unrecoverable.
+case("storage: the stage-events table loses PITR", _ST,
+     _swap('}, args.dry_run, pitr=True),\n        "schema": "PK run_id (S), SK sk (S), on-demand, PITR on",',
+           '}, args.dry_run),\n        "schema": "PK run_id (S), SK sk (S), on-demand, PITR on",'),
+     [_AHT + "test_the_run_events_table_is_deployed_with_pitr"])
+
+
+# ── The runner's own shape ─────────────────────────────────────────────────────────
+_NC = "tests/negative_controls/monitor_dispatch.py"
+
+
+def m401(t):
+    # Batch 5's shape: a block of cases appended at the bottom of this file, below the loop
+    # that has already run by the time they register. The runner never attempts them, and
+    # the documented count, derived from the registrations, includes them anyway.
+    assert t.rstrip().endswith("sys.exit(1 if failed else 0)"), "the runner block is not last"
+    return t + ('\ncase("a late case", "README.md", lambda t: t + "x",\n'
+                '     ["tests/test_docs_claims.py::test_the_late_case_never_runs"])\n')
+
+
+case("runner: a control is registered below the runner loop", _NC, m401,
+     ["tests/test_docs_claims.py::test_no_negative_control_is_registered_after_the_runner_loop"])
+
+
+#: THIS BLOCK STAYS LAST IN THE FILE. The loop runs over CASES as it is at this line, so a
+#: case(...) registered below it is never attempted, while the documented count, which
+#: test_docs_claims.py derives from every registration in the file, still includes it. Batch
+#: 5's 5 cases (7 pairs) sat below this block from the day they merged: the runner printed
+#: "all guards caught their break" without trying them. Add new cases ABOVE this comment;
+#: test_no_negative_control_is_registered_after_the_runner_loop fails otherwise.
+#:
 #: Everything below mutates tracked files, so it runs ONLY as a script. Importing this
 #: module has to be safe and side-effect-free, because the fast anchor check in
 #: test_docs_claims.py imports it to call every ``mutate`` against in-memory text -- the
@@ -7426,32 +7491,3 @@ if __name__ == "__main__":
     print()
     print("all guards caught their break" if not failed else f"UNCAUGHT: {failed}")
     sys.exit(1 if failed else 0)
-
-# ── Batch 5: process isolation + storage hardening (2026-10-28 security audit) ───
-_VS, _ST = "pipeline/v2/verify_sandbox.py", "deploy/03_storage.py"
-_AHT = "tests/test_audit_hardening.py::"
-# The isolate default flips to False: every existing call site runs untrusted code in-process.
-case("sandbox: isolation is off by default", _VS,
-     _swap("                      timeout_sec: int = 5, isolate: bool = True) -> dict:",
-           "                      timeout_sec: int = 5, isolate: bool = False) -> dict:"),
-     [_AHT + "test_isolate_defaults_to_on"])
-# The credential scrub is neutered: the forked child keeps the parent's AWS_ secrets.
-case("sandbox: the worker stops scrubbing credentials", _VS,
-     _swap("            os.environ.pop(k, None)", "            pass"),
-     [_AHT + "test_the_isolated_child_cannot_see_the_credential",
-      _AHT + "test_the_worker_scrubs_every_credential_shaped_variable"])
-# The TLS deny is inverted: it would deny HTTPS and allow plaintext.
-case("storage: the TLS deny is inverted", _ST,
-     _swap('"aws:SecureTransport": "false"', '"aws:SecureTransport": "true"'),
-     [_AHT + "test_the_bucket_gets_a_tls_only_deny"])
-# Deletion protection is dropped: a stray DeleteTable can drop the audit trail.
-case("storage: tables lose deletion protection", _ST,
-     _swap("    ddb.update_table(TableName=name, DeletionProtectionEnabled=True)",
-           "    pass  # ddb.update_table(TableName=name, DeletionProtectionEnabled=True)"),
-     [_AHT + "test_a_new_table_is_created_then_gains_pitr_and_deletion_protection",
-      _AHT + "test_deletion_protection_is_applied_even_without_pitr"])
-# The stage-events table loses its PITR flag: its loss becomes unrecoverable.
-case("storage: the stage-events table loses PITR", _ST,
-     _swap('}, args.dry_run, pitr=True),\n        "schema": "PK run_id (S), SK sk (S), on-demand, PITR on",',
-           '}, args.dry_run),\n        "schema": "PK run_id (S), SK sk (S), on-demand, PITR on",'),
-     [_AHT + "test_the_run_events_table_is_deployed_with_pitr"])
